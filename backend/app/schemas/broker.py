@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel
 
@@ -21,6 +22,12 @@ class BrokerAccountOut(BaseModel):
     connection_status: str
     last_error: str | None
     created_at: datetime
+
+    cash: Decimal | None = None
+    buying_power: Decimal | None = None
+    total_equity: Decimal | None = None
+    currency: str | None = None
+    balance_updated_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

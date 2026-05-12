@@ -9,6 +9,30 @@ function statusColor(s: BrokerAccount["connection_status"]): string {
   return s === "connected" ? "var(--good)" : s === "error" ? "var(--bad)" : "var(--muted)";
 }
 
+function fmtMoney(amount: string | null, currency: string | null): string {
+  if (amount === null) return "—";
+  const v = Number(amount);
+  if (!Number.isFinite(v)) return "—";
+  try {
+    return v.toLocaleString(undefined, {
+      style: "currency",
+      currency: currency || "USD",
+      maximumFractionDigits: 2,
+    });
+  } catch {
+    return `${v.toFixed(2)} ${currency ?? ""}`.trim();
+  }
+}
+
+function fmtRelative(iso: string | null): string {
+  if (!iso) return "never";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60_000) return "just now";
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+  return `${Math.floor(ms / 86_400_000)}d ago`;
+}
+
 export default function BrokersPage() {
   const params = useSearchParams();
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
@@ -73,6 +97,19 @@ export default function BrokersPage() {
     load();
   }
 
+  const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+  async function refreshBalance(id: string) {
+    setRefreshing(p => ({ ...p, [id]: true }));
+    try {
+      const updated = await api<BrokerAccount>(`/api/brokers/${id}/refresh-balance`, { method: "POST" });
+      setAccounts(cur => cur.map(a => (a.id === id ? updated : a)));
+    } catch (e) {
+      setErr(e instanceof ApiError ? String(e.detail) : "balance refresh failed");
+    } finally {
+      setRefreshing(p => ({ ...p, [id]: false }));
+    }
+  }
+
   return (
     <div className="space-y-8 max-w-4xl">
       <div className="flex items-center justify-between">
@@ -125,35 +162,69 @@ export default function BrokersPage() {
           {accounts.map(a => (
             <div
               key={a.id}
-              className="p-4 rounded border flex items-center justify-between"
+              className="p-4 rounded border"
               style={{ borderColor: "var(--border)", background: "var(--panel)" }}
             >
-              <div>
-                <div className="font-medium">
-                  {a.label}
-                  <span className="text-xs uppercase ml-2" style={{ color: "var(--muted)" }}>
-                    {a.broker}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
-                  </span>
-                </div>
-                <div className="text-xs mt-1" style={{ color: statusColor(a.connection_status) }}>
-                  ● {a.connection_status}
-                </div>
-                {a.broker_account_number && (
-                  <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
-                    account: {a.broker_account_number}
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="font-medium">
+                    {a.label}
+                    <span className="text-xs uppercase ml-2" style={{ color: "var(--muted)" }}>
+                      {a.broker}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
+                    </span>
                   </div>
-                )}
-                {a.last_error && (
-                  <div className="text-xs mt-1" style={{ color: "var(--bad)" }}>{a.last_error}</div>
-                )}
+                  <div className="text-xs mt-1" style={{ color: statusColor(a.connection_status) }}>
+                    ● {a.connection_status}
+                  </div>
+                  {a.broker_account_number && (
+                    <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+                      account: {a.broker_account_number}
+                    </div>
+                  )}
+                  {a.last_error && (
+                    <div className="text-xs mt-1" style={{ color: "var(--bad)" }}>{a.last_error}</div>
+                  )}
+                </div>
+                <button
+                  onClick={() => remove(a.id)}
+                  className="px-3 py-1 text-sm rounded border"
+                  style={{ borderColor: "var(--bad)", color: "var(--bad)" }}
+                >
+                  Disconnect
+                </button>
               </div>
-              <button
-                onClick={() => remove(a.id)}
-                className="px-3 py-1 text-sm rounded border"
-                style={{ borderColor: "var(--bad)", color: "var(--bad)" }}
-              >
-                Disconnect
-              </button>
+
+              {/* balance row */}
+              <div className="mt-3 pt-3 border-t flex items-end justify-between" style={{ borderColor: "var(--border)" }}>
+                <div className="grid grid-cols-3 gap-6 flex-1">
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Cash</div>
+                    <div className="text-sm font-medium mt-0.5">{fmtMoney(a.cash, a.currency)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Buying power</div>
+                    <div className="text-sm font-medium mt-0.5">{fmtMoney(a.buying_power, a.currency)}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Total equity</div>
+                    <div className="text-sm font-medium mt-0.5">{fmtMoney(a.total_equity, a.currency)}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 ml-4">
+                  <span className="text-[10px]" style={{ color: "var(--muted)" }}>
+                    updated {fmtRelative(a.balance_updated_at)}
+                  </span>
+                  <button
+                    onClick={() => refreshBalance(a.id)}
+                    disabled={refreshing[a.id]}
+                    className="px-2 py-1 text-sm rounded border"
+                    style={{ borderColor: "var(--border)" }}
+                    title="Refresh balance"
+                  >
+                    {refreshing[a.id] ? "…" : "↻"}
+                  </button>
+                </div>
+              </div>
             </div>
           ))}
         </div>

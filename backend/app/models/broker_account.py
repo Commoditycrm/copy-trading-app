@@ -1,6 +1,8 @@
 import uuid
+from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,6 +37,14 @@ class BrokerAccount(Base, TimestampMixin):
     broker_account_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Balance snapshot — refreshed on broker sync or via the refresh-balance endpoint.
+    # Nullable because we may not have polled yet; balance_updated_at = NULL signals "never fetched".
+    cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    buying_power: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    total_equity: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    balance_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="broker_accounts")
     orders = relationship("Order", back_populates="broker_account", cascade="all, delete-orphan")

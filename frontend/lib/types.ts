@@ -19,6 +19,12 @@ export interface BrokerAccount {
   connection_status: "pending" | "connected" | "error";
   last_error: string | null;
   created_at: string;
+
+  cash: string | null;             // Decimal as string from API
+  buying_power: string | null;
+  total_equity: string | null;
+  currency: string | null;
+  balance_updated_at: string | null;
 }
 
 export interface SyncResult {

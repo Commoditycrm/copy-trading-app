@@ -14,6 +14,7 @@ Flow:
        Removes the brokerage authorization at SnapTrade and deletes the row.
 """
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -28,6 +29,21 @@ from app.schemas.broker import BrokerAccountOut, PortalUrlOut, SyncResultOut
 from app.services import audit, snaptrade as st
 
 router = APIRouter(prefix="/api/brokers", tags=["brokers"])
+
+
+def _refresh_balance_into(db: Session, acct: BrokerAccount, secret: str) -> None:
+    """Pull the latest balance from SnapTrade and write it onto `acct`. Does
+    not commit. Best-effort — a failure here is logged into last_error but does
+    not raise (so a balance hiccup doesn't block other operations like sync)."""
+    try:
+        bal = st.get_account_balance(acct.user_id, secret, acct.snaptrade_account_id)
+        acct.cash = bal["cash"]
+        acct.buying_power = bal["buying_power"]
+        acct.total_equity = bal["total_equity"]
+        acct.currency = bal["currency"]
+        acct.balance_updated_at = datetime.now(timezone.utc)
+    except Exception as exc:  # noqa: BLE001
+        acct.last_error = f"balance fetch failed: {str(exc)[:400]}"
 
 
 def _ensure_snaptrade_user(db: Session, user: User) -> str:
@@ -140,7 +156,11 @@ def sync_accounts(
                 connection_status="connected",
             )
             db.add(row)
+            db.flush()  # need row.id for any subsequent FK use
             added += 1
+        # Refresh balance inline. Adds N SnapTrade round-trips to sync but keeps
+        # the UI honest about cash/equity without a separate user action.
+        _refresh_balance_into(db, row, secret)
 
     removed = 0
     for sid, row in existing.items():
@@ -178,6 +198,33 @@ def list_my_brokers(
             )
         ).scalars()
     )
+
+
+@router.post("/{account_id}/refresh-balance", response_model=BrokerAccountOut)
+def refresh_balance(
+    account_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> BrokerAccount:
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if not user.encrypted_snaptrade_user_secret:
+        raise HTTPException(409, "snaptrade_not_registered")
+    secret = st.decrypt_secret(user.encrypted_snaptrade_user_secret)
+    _refresh_balance_into(db, acct, secret)
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="broker.balance_refreshed",
+        entity_type="broker_account",
+        entity_id=acct.id,
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    return acct
 
 
 @router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)

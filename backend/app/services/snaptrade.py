@@ -83,6 +83,76 @@ def list_accounts(app_user_id: uuid.UUID, user_secret: str) -> list[dict[str, An
     return body  # SDK returns list
 
 
+def get_account_balance(
+    app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str
+) -> dict[str, Any]:
+    """Fetch the latest balance for one account.
+
+    SnapTrade returns a list of per-currency balances + a total_value object.
+    We normalize to a flat dict the API/UI can consume:
+        {"cash": Decimal, "buying_power": Decimal, "total_equity": Decimal, "currency": "USD"}
+    Any field SnapTrade doesn't return comes back as None.
+    """
+    from decimal import Decimal
+
+    resp = _client().account_information.get_user_account_balance(
+        user_id=str(app_user_id),
+        user_secret=user_secret,
+        account_id=snaptrade_account_id,
+    )
+    body: Any = resp.body if hasattr(resp, "body") else resp
+
+    # Pick the first balance entry (single-currency accounts) — multi-currency
+    # accounts would need to expose all entries; out of scope for v1.
+    first = body[0] if isinstance(body, list) and body else (body or {})
+
+    def _dec(v: Any) -> Decimal | None:
+        if v is None:
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:  # noqa: BLE001
+            return None
+
+    cash = first.get("cash") if isinstance(first, dict) else None
+    buying_power = first.get("buying_power") if isinstance(first, dict) else None
+    currency = None
+    if isinstance(first, dict):
+        cur_obj = first.get("currency")
+        if isinstance(cur_obj, dict):
+            currency = cur_obj.get("code")
+        elif isinstance(cur_obj, str):
+            currency = cur_obj
+
+    # total_equity isn't in get_user_account_balance — it's in get_user_account_details.
+    # Pull it separately so the UI can show net liquidation value.
+    total_equity = None
+    try:
+        det = _client().account_information.get_user_account_details(
+            user_id=str(app_user_id),
+            user_secret=user_secret,
+            account_id=snaptrade_account_id,
+        )
+        det_body = det.body if hasattr(det, "body") else det
+        if isinstance(det_body, dict):
+            balance_obj = det_body.get("balance") or {}
+            total_obj = balance_obj.get("total") if isinstance(balance_obj, dict) else None
+            if isinstance(total_obj, dict):
+                total_equity = total_obj.get("amount")
+            elif isinstance(total_obj, (int, float, str)):
+                total_equity = total_obj
+    except Exception:  # noqa: BLE001
+        # Details endpoint can fail without the balance call failing — soft-skip.
+        pass
+
+    return {
+        "cash": _dec(cash),
+        "buying_power": _dec(buying_power),
+        "total_equity": _dec(total_equity),
+        "currency": currency,
+    }
+
+
 def delete_account(app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str) -> None:
     # SnapTrade exposes connection-level disconnect; account removal happens
     # when the underlying connection is removed. Best-effort.
