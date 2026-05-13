@@ -2,15 +2,178 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Design tokens — modern fintech (deep dark + lime green accent)
+   Change values here; everything inherits.
+   ───────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg: #0b0d12;
-  --panel: #131722;
-  --border: #1f2533;
-  --text: #e6e9ef;
-  --muted: #8b94a7;
-  --accent: #4ea1ff;
-  --good: #22c55e;
-  --bad: #ef4444;
+  /* Surfaces */
+  --bg:           #07090a;          /* near-black with a hint of cool green */
+  --bg-tint:      #0a0e0c;          /* card surface base */
+  --panel:        #0e1411;          /* one shade above bg */
+  --panel-2:      #131a16;          /* slightly elevated */
+  --border:       rgba(255, 255, 255, 0.06);
+  --border-strong:rgba(255, 255, 255, 0.10);
+
+  /* Type */
+  --text:         #e9efe8;          /* off-white, slight green tint */
+  --text-2:       #c5cdc4;
+  --muted:        #6e7972;          /* greenish-grey */
+  --faint:        #3a423d;          /* almost-invisible labels */
+
+  /* Brand accent — lime green */
+  --accent:       #b6ff3c;
+  --accent-2:     #d1ff7a;
+  --accent-ink:   #0a1404;          /* readable foreground over lime */
+  --accent-glow:  rgba(182, 255, 60, 0.22);
+
+  /* Semantic */
+  --good:         #b6ff3c;          /* same as accent — gains are "on brand" */
+  --good-soft:    rgba(182, 255, 60, 0.12);
+  --bad:          #ff6b6b;
+  --bad-soft:     rgba(255, 107, 107, 0.10);
+  --warn:         #ffc857;
+
+  /* Gradients — buttons / pill toggles. 135° gives a soft "light from upper-left" feel. */
+  --grad-accent:    linear-gradient(135deg, #d1ff7a 0%, #b6ff3c 45%, #7fcb1e 100%);
+  --grad-accent-hi: linear-gradient(135deg, #e0ffa0 0%, #c8ff5a 45%, #93de2e 100%);
+  --grad-bad:       linear-gradient(135deg, #ff9d9d 0%, #ff6b6b 50%, #d63d3d 100%);
+  --grad-bad-hi:    linear-gradient(135deg, #ffb6b6 0%, #ff8585 50%, #e85555 100%);
+  --grad-ghost:     linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%);
+
+  /* Radii */
+  --r-sm: 8px;
+  --r:    14px;
+  --r-lg: 20px;
 }
 
-html, body { background: var(--bg); color: var(--text); }
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
+               Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "tnum" 1, "cv11" 1;   /* tabular nums for money */
+}
+
+body {
+  /* Subtle ambient green glow in the top-right corner of the viewport */
+  background-image:
+    radial-gradient(1200px 600px at 85% -10%, rgba(182, 255, 60, 0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(182, 255, 60, 0.03), transparent 60%);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* ─── Component utilities ─────────────────────────────────────────────── */
+
+/* Card — every "section" box in the app should use this */
+.card {
+  background: linear-gradient(180deg, var(--panel) 0%, var(--bg-tint) 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.02) inset,
+    0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+/* Subtle inset divider line */
+.hairline {
+  border-top: 1px solid var(--border);
+}
+
+/* Pill / chip — small status badges */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+}
+.chip-good { background: var(--good-soft); color: var(--good); border-color: rgba(182,255,60,0.25); }
+.chip-bad  { background: var(--bad-soft);  color: var(--bad);  border-color: rgba(255,107,107,0.25); }
+
+/* Primary CTA — gradient lime pill */
+.btn-primary {
+  background: var(--grad-accent);
+  color: var(--accent-ink);
+  border: 1px solid rgba(182, 255, 60, 0.35);
+  border-radius: 999px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
+  box-shadow:
+    0 8px 24px -8px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.btn-primary:hover  { background: var(--grad-accent-hi); box-shadow: 0 10px 28px -8px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,0.35); }
+.btn-primary:active { transform: translateY(1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; filter: saturate(0.7); }
+
+/* Danger CTA — gradient red pill */
+.btn-danger {
+  background: var(--grad-bad);
+  color: var(--accent-ink);
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  border-radius: 999px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
+  box-shadow:
+    0 8px 24px -8px rgba(255, 107, 107, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.btn-danger:hover  { background: var(--grad-bad-hi); }
+.btn-danger:active { transform: translateY(1px); }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; filter: saturate(0.7); }
+
+/* Ghost button — secondary actions, subtle gradient on hover */
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.btn-ghost:hover { background: var(--grad-ghost); border-color: var(--border-strong); color: var(--text); }
+
+/* Inputs */
+input[type="text"], input[type="email"], input[type="password"],
+input[type="number"], input[type="date"], select, textarea {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: rgba(182, 255, 60, 0.04);
+}
+input::placeholder { color: var(--faint); }
+
+/* Tables — softer dividers */
+table { border-collapse: separate; border-spacing: 0; }
+thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; font-size: 11px; }
+
+/* Scrollbar polish — dark + thin */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--panel-2); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; }
+
+/* Selection */
+::selection { background: var(--accent); color: var(--accent-ink); }
+
+/* Numeric emphasis */
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+.num-lg { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+.num-xl { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; }

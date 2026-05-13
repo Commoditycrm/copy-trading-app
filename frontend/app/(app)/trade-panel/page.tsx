@@ -66,16 +66,27 @@ function SegBtn({
   active: boolean; onClick: () => void; children: React.ReactNode;
   color?: "good" | "bad" | "accent";
 }) {
-  const activeColor = color === "good" ? "var(--good)" : color === "bad" ? "var(--bad)" : "var(--accent)";
+  // Active state uses the matching gradient + a subtle inner highlight; inactive
+  // is a quiet outlined chip. Border colour matches the gradient family for
+  // a consistent edge.
+  const grad =
+    color === "bad" ? "var(--grad-bad)" :
+    "var(--grad-accent)";   // good + accent both use lime gradient
+  const edge =
+    color === "bad" ? "rgba(255, 107, 107, 0.35)" :
+    "rgba(182, 255, 60, 0.35)";
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex-1 px-3 py-2 rounded text-sm font-medium transition-colors"
+      className="flex-1 px-3 py-2 rounded text-sm font-medium transition-all"
       style={{
-        border: `1px solid ${active ? activeColor : "var(--border)"}`,
-        background: active ? activeColor : "transparent",
-        color: active ? "#06121f" : "var(--text)",
+        border: `1px solid ${active ? edge : "var(--border)"}`,
+        background: active ? grad : "transparent",
+        color: active ? "var(--accent-ink)" : "var(--text)",
+        boxShadow: active
+          ? "inset 0 1px 0 rgba(255,255,255,0.25), 0 6px 18px -8px " + (color === "bad" ? "rgba(255,107,107,0.35)" : "var(--accent-glow)")
+          : "none",
       }}
     >
       {children}
@@ -377,11 +388,7 @@ export default function TradePanelPage() {
 
       <button
         disabled={submitting || !acctId}
-        className="w-full p-3 rounded font-semibold text-base transition-opacity disabled:opacity-50"
-        style={{
-          background: side === "buy" ? "var(--good)" : "var(--bad)",
-          color: "#06121f",
-        }}
+        className={side === "buy" ? "btn-primary w-full p-3 text-base" : "btn-danger w-full p-3 text-base"}
       >
         {submitting
           ? "Placing…"
