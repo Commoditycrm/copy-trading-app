@@ -142,7 +142,7 @@ body {
   color: var(--text-2);
   transition: background 120ms ease, border-color 120ms ease;
 }
-.btn-ghost:hover { background: var(--grad-ghost); border-color: var(--border-strong); color: var(--text); }
+.btn-ghost { background: var(--grad-ghost); border-color: var(--border-strong); color: var(--text); }
 
 /* Inputs */
 input[type="text"], input[type="email"], input[type="password"],
