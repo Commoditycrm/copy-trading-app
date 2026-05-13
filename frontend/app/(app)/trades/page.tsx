@@ -23,7 +23,21 @@ export default function TradesPage() {
   const [flashId, setFlashId] = useState<string | null>(null);
 
   useEffect(() => {
-    api<Order[]>("/api/trades").then(setOrders).finally(() => setLoading(false));
+    let cancelled = false;
+    (async () => {
+      // Try to sync fresh fills first; whether it succeeds or not, render
+      // whatever's in our DB after.
+      try {
+        await api("/api/trades/sync-fills", { method: "POST" });
+      } catch { /* non-blocking */ }
+      if (cancelled) return;
+      const o = await api<Order[]>("/api/trades");
+      if (!cancelled) {
+        setOrders(o);
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEventStream((evt) => {

@@ -83,6 +83,32 @@ def list_accounts(app_user_id: uuid.UUID, user_secret: str) -> list[dict[str, An
     return body  # SDK returns list
 
 
+def list_account_activities(
+    app_user_id: uuid.UUID,
+    user_secret: str,
+    snaptrade_account_id: str,
+) -> list[dict[str, Any]]:
+    """Pull all activities (fills, dividends, fees, etc.) for one account.
+
+    Response is wrapped: {"data": [...], "pagination": {...}}. We unwrap.
+    Caller is responsible for filtering down to types they care about
+    (typically "BUY" / "SELL" for fills).
+    """
+    resp = _client().account_information.get_account_activities(
+        user_id=str(app_user_id),
+        user_secret=user_secret,
+        account_id=snaptrade_account_id,
+    )
+    body: Any = resp.body if hasattr(resp, "body") else resp
+    if isinstance(body, dict):
+        data = body.get("data")
+        if isinstance(data, list):
+            return data
+    if isinstance(body, list):
+        return body
+    return []
+
+
 def get_account_balance(
     app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str
 ) -> dict[str, Any]:
@@ -151,6 +177,112 @@ def get_account_balance(
         "total_equity": _dec(total_equity),
         "currency": currency,
     }
+
+
+def resolve_universal_symbol_id(
+    app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str, ticker: str
+) -> str | None:
+    """Translate a human ticker (e.g. "AAPL") into SnapTrade's universal
+    symbol UUID — required by the options-chain endpoint. Returns None if
+    the broker doesn't list it.
+
+    We use the per-account search (not the global one) because what's tradeable
+    depends on the broker behind the account. Picks the result whose ticker
+    exactly matches; falls back to the first hit if there's no exact match.
+    """
+    resp = _client().reference_data.symbol_search_user_account(
+        user_id=str(app_user_id),
+        user_secret=user_secret,
+        account_id=snaptrade_account_id,
+        substring=ticker,
+    )
+    body: Any = resp.body if hasattr(resp, "body") else resp
+    if not isinstance(body, list) or not body:
+        return None
+
+    target = ticker.upper()
+    # Each hit is shaped like: {"id": "<uuid>", "symbol": "AAPL", ...} or
+    # {"id": "<uuid>", "raw_symbol": "AAPL", "universal_symbol": {...}, ...}
+    def _get_ticker(hit: dict) -> str | None:
+        for k in ("symbol", "raw_symbol", "ticker"):
+            v = hit.get(k)
+            if isinstance(v, str):
+                return v.upper()
+        us = hit.get("universal_symbol")
+        if isinstance(us, dict):
+            return _get_ticker(us)
+        return None
+
+    def _get_id(hit: dict) -> str | None:
+        v = hit.get("id")
+        if isinstance(v, str):
+            return v
+        us = hit.get("universal_symbol")
+        if isinstance(us, dict):
+            return _get_id(us)
+        return None
+
+    exact = next((h for h in body if isinstance(h, dict) and _get_ticker(h) == target), None)
+    chosen = exact or (body[0] if isinstance(body[0], dict) else None)
+    return _get_id(chosen) if chosen else None
+
+
+def get_options_chain(
+    app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """Return SnapTrade's raw options chain for `symbol` on this account.
+
+    SnapTrade's chain endpoint requires a *universal symbol UUID*, not the
+    ticker string. We look up the UUID first, then fetch the chain.
+    Returns [] if the symbol isn't tradable at this broker.
+
+    Shape varies between brokers — most return an array of expiration entries,
+    each with strikes. Caller is responsible for extracting whatever it needs.
+    """
+    universal_id = resolve_universal_symbol_id(
+        app_user_id, user_secret, snaptrade_account_id, symbol
+    )
+    if not universal_id:
+        return []
+
+    resp = _client().options.get_options_chain(
+        user_id=str(app_user_id),
+        user_secret=user_secret,
+        account_id=snaptrade_account_id,
+        symbol=universal_id,
+    )
+    body: Any = resp.body if hasattr(resp, "body") else resp
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        for key in ("chain", "expirations", "options"):
+            if key in body and isinstance(body[key], list):
+                return body[key]
+    return []
+
+
+def list_option_expiries(
+    app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str, symbol: str
+) -> list[str]:
+    """Extract sorted unique expiry dates (YYYY-MM-DD) from the options chain.
+
+    Defensive about the response shape — different brokers via SnapTrade use
+    different field names. We look for the obvious ones and skip entries we
+    can't parse.
+    """
+    chain = get_options_chain(app_user_id, user_secret, snaptrade_account_id, symbol)
+    seen: set[str] = set()
+    for entry in chain:
+        if not isinstance(entry, dict):
+            continue
+        for k in ("expiration_date", "expirationDate", "expiry", "expiry_date", "date"):
+            v = entry.get(k)
+            if v:
+                # Normalize to YYYY-MM-DD (strip time / tz if present)
+                if isinstance(v, str):
+                    seen.add(v[:10])
+                break
+    return sorted(seen)
 
 
 def delete_account(app_user_id: uuid.UUID, user_secret: str, snaptrade_account_id: str) -> None:

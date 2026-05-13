@@ -35,6 +35,7 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, events, snaptrade as st
+from app.services.pnl import today_realized_pnl
 
 MAX_PARALLEL = 32
 
@@ -102,6 +103,40 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
                 status="skipped_no_snaptrade",
             ))
             continue
+
+        # Daily-loss kill switch: if today's realized loss already exceeds the
+        # subscriber's limit, flip copy off and skip. We check BEFORE placing
+        # the order so we never blow past the limit even by one trade.
+        if sub_settings.daily_loss_limit is not None:
+            todays_pnl = today_realized_pnl(db, sub_settings.user_id)
+            if todays_pnl <= -sub_settings.daily_loss_limit:
+                sub_settings.copy_enabled = False
+                audit.record(
+                    db,
+                    actor_user_id=sub_settings.user_id,
+                    action="copy.auto_paused_daily_loss",
+                    entity_type="subscriber_settings",
+                    entity_id=sub_settings.user_id,
+                    metadata={
+                        "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "trigger_order_id": str(trader_order.id),
+                    },
+                )
+                events.publish(sub_settings.user_id, {
+                    "type": "copy.auto_paused",
+                    "reason": "daily_loss_limit",
+                    "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                    "todays_realized_pnl": str(todays_pnl),
+                })
+                results.append(FanoutResult(
+                    subscriber_user_id=sub_settings.user_id,
+                    broker_account_id=uuid.UUID(int=0),
+                    order_id=None,
+                    status="skipped_daily_loss_limit",
+                ))
+                continue
+
         sub_secret = st.decrypt_secret(sub_user.encrypted_snaptrade_user_secret)
 
         sub_accounts = (

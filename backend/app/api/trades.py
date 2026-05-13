@@ -10,9 +10,10 @@ from app.brokers import BrokerOrderRequest, SnapTradeBrokerAdapter
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
-from app.models.user import User
+from app.models.settings import SubscriberSettings
+from app.models.user import User, UserRole
 from app.schemas.order import DailyPnL, OrderOut, PlaceOrderIn
-from app.services import audit, copy_engine, events, snaptrade as st
+from app.services import audit, copy_engine, events, fills_sync, snaptrade as st
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -194,8 +195,46 @@ def calendar_pnl(
     user: User = Depends(current_user),
     from_: date = Query(..., alias="from"),
     to: date = Query(...),
+    user_id: uuid.UUID | None = Query(
+        default=None,
+        description="Trader-only: view another user's P&L (must be a subscriber following you).",
+    ),
 ) -> list[DailyPnL]:
     if from_ > to:
         raise HTTPException(422, "from must be <= to")
-    daily = realized_pnl_by_day(db, user.id, start=from_, end=to)
+
+    # View-as: trader can request a subscriber's calendar. Subscribers can
+    # only view their own.
+    target_user_id = user.id
+    if user_id is not None and user_id != user.id:
+        if user.role != UserRole.TRADER:
+            raise HTTPException(403, "trader_only")
+        sub = db.get(SubscriberSettings, user_id)
+        if not sub or sub.following_trader_id != user.id:
+            raise HTTPException(404, "not_a_subscriber")
+        target_user_id = user_id
+
+    daily = realized_pnl_by_day(db, target_user_id, start=from_, end=to)
     return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(daily.items())]
+
+
+@router.post("/trades/sync-fills")
+def sync_fills(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Pull activities from every connected broker and upsert fills locally.
+    The Calendar + Trades pages call this on load so realized P&L stays fresh.
+    """
+    result = fills_sync.sync_user_fills(db, user.id)
+    if result["fills_added"] or result["orders_added"]:
+        audit.record(
+            db,
+            actor_user_id=user.id,
+            action="fills.synced",
+            metadata=result,
+            ip_address=client_ip(request),
+        )
+    db.commit()
+    return result

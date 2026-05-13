@@ -6,15 +6,18 @@ import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import type { User } from "@/lib/types";
 
-const NAV_COMMON = [
-  { href: "/brokers", label: "Brokers" },
-  { href: "/trades", label: "Trades & P&L" },
-  { href: "/calendar", label: "Calendar" },
-  { href: "/settings", label: "Settings" },
-];
-const NAV_TRADER_EXTRA = [
+const NAV_TRADER = [
   { href: "/trade-panel", label: "Trade Panel" },
+  { href: "/trades", label: "Order History" },
+  { href: "/calendar", label: "Calendar" },
   { href: "/subscribers", label: "Subscribers" },
+  { href: "/brokers", label: "Brokers" },
+];
+const NAV_SUBSCRIBER = [
+  { href: "/trades", label: "Order History" },
+  { href: "/calendar", label: "Calendar" },
+  { href: "/brokers", label: "Brokers" },
+  { href: "/settings", label: "Settings" },
 ];
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
@@ -42,7 +45,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   if (loading) return <div className="p-8" style={{color: "var(--muted)"}}>Loading…</div>;
   if (!user) return null;
 
-  const nav = user.role === "trader" ? [...NAV_COMMON, ...NAV_TRADER_EXTRA] : NAV_COMMON;
+  const nav = user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER;
 
   return (
     <div className="min-h-screen flex">

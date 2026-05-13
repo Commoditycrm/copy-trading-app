@@ -84,7 +84,8 @@ export interface SubscriberSettings {
   following_trader_id: string | null;
   copy_enabled: boolean;
   multiplier: string;
-  subscription_tier: string;
+  daily_loss_limit: string | null;
+  todays_realized_pnl: string | null;
 }
 
 export interface TraderSettings {
@@ -98,7 +99,6 @@ export interface SubscriberSummary {
   display_name: string | null;
   copy_enabled: boolean;
   multiplier: string;
-  subscription_tier: string;
   broker_count: number;
   realized_pnl_30d: string;
 }

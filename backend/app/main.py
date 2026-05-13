@@ -3,7 +3,7 @@ import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, brokers, events, settings, subscribers, trades
+from app.api import auth, brokers, events, options, settings, subscribers, trades
 from app.config import get_settings
 from app.services import events as events_bus
 
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     app.include_router(settings.router)
     app.include_router(subscribers.router)
     app.include_router(events.router)
+    app.include_router(options.router)
 
     @app.on_event("startup")
     async def _bind_loop() -> None:

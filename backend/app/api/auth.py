@@ -54,7 +54,6 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
                 user_id=user.id,
                 copy_enabled=False,
                 multiplier=Decimal("1.000"),
-                subscription_tier="basic",
             )
         )
 

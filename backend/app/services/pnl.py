@@ -38,6 +38,18 @@ def _instrument_key(o: Order) -> tuple:
     return ("STK", o.symbol)
 
 
+def today_realized_pnl(db: Session, user_id: uuid.UUID) -> Decimal:
+    """Realized P&L for the current UTC day. Negative = loss.
+
+    Uses the same FIFO matching as `realized_pnl_by_day`. Cheap enough at
+    small fill counts; cache or materialize once you have many fills/user/day.
+    """
+    today = datetime.now(timezone.utc).date()
+    daily = realized_pnl_by_day(db, user_id, start=today, end=today)
+    pnl, _ = daily.get(today, (Decimal(0), 0))
+    return pnl
+
+
 def realized_pnl_by_day(
     db: Session, user_id: uuid.UUID, start: date | None = None, end: date | None = None
 ) -> dict[date, tuple[Decimal, int]]:

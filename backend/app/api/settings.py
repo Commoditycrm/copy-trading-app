@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.settings import (
+    DailyLossLimitIn,
     FollowTraderIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
@@ -14,6 +15,7 @@ from app.schemas.settings import (
     TraderSettingsOut,
     TraderToggleIn,
 )
+from app.services.pnl import today_realized_pnl
 from app.services import audit
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -22,11 +24,54 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 @router.get("/subscriber", response_model=SubscriberSettingsOut)
 def get_subscriber_settings(
     db: Session = Depends(get_db), user: User = Depends(require_subscriber)
-) -> SubscriberSettings:
+) -> SubscriberSettingsOut:
     s = db.get(SubscriberSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
-    return s
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+    )
+
+
+@router.patch("/subscriber/daily-loss-limit", response_model=SubscriberSettingsOut)
+def set_daily_loss_limit(
+    payload: DailyLossLimitIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_loss_limit
+    s.daily_loss_limit = payload.daily_loss_limit
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_loss_limit_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_loss_limit) if payload.daily_loss_limit is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+    )
 
 
 @router.patch("/subscriber/copy", response_model=SubscriberSettingsOut)

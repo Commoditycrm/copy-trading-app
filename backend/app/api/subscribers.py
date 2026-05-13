@@ -46,7 +46,6 @@ def list_subscribers(
                 display_name=u.display_name,
                 copy_enabled=s.copy_enabled,
                 multiplier=s.multiplier,
-                subscription_tier=s.subscription_tier,
                 broker_count=broker_count,
                 realized_pnl_30d=pnl_30d,
             )
@@ -65,9 +64,8 @@ def set_multiplier(
     s = db.get(SubscriberSettings, subscriber_id)
     if not s or s.following_trader_id != trader.id:
         raise HTTPException(404, "subscriber_not_found")
-    old = {"multiplier": str(s.multiplier), "tier": s.subscription_tier}
+    old_multiplier = str(s.multiplier)
     s.multiplier = payload.multiplier
-    s.subscription_tier = payload.subscription_tier
     audit.record(
         db,
         actor_user_id=trader.id,
@@ -75,8 +73,8 @@ def set_multiplier(
         entity_type="subscriber_settings",
         entity_id=subscriber_id,
         metadata={
-            "old": old,
-            "new": {"multiplier": str(payload.multiplier), "tier": payload.subscription_tier},
+            "old_multiplier": old_multiplier,
+            "new_multiplier": str(payload.multiplier),
         },
         ip_address=client_ip(request),
     )
