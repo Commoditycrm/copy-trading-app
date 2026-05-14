@@ -37,11 +37,11 @@ export default function TradesPage() {
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
 
-  // Action UI state — keyed by order id
-  const [actingId, setActingId] = useState<string | null>(null);    // in-flight cancel/close
-  const [closeFor, setCloseFor] = useState<string | null>(null);    // which row is expanded
-  const [closeType, setCloseType] = useState<"market" | "limit">("market");
-  const [closePrice, setClosePrice] = useState("");
+  // Action UI state — tracks WHICH button on WHICH row is in flight, so only
+  // that button shows "…" (not its sibling).
+  const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
+  // Per-row limit-price input for the inline "Close at Limit" action.
+  const [closePrices, setClosePrices] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -106,7 +106,7 @@ export default function TradesPage() {
   });
 
   async function cancelOrder(id: string) {
-    setActingId(id);
+    setActingFor({ id, kind: "cancel" });
     try {
       const updated = await api<Order>(`/api/trades/${id}/cancel`, { method: "POST" });
       setOrders(cur => cur.map(o => o.id === id ? updated : o));
@@ -114,31 +114,34 @@ export default function TradesPage() {
     } catch (e) {
       notify.fromError(e, "cancel failed");
     } finally {
-      setActingId(null);
+      setActingFor(null);
     }
   }
 
-  function openCloseFor(id: string) {
-    setCloseFor(id);
-    setCloseType("market");
-    setClosePrice("");
-  }
-
-  async function submitClose(id: string) {
-    setActingId(id);
+  /** One-shot close: type=market → fires immediately, type=limit → uses the
+   *  per-row price input. */
+  async function closeAt(id: string, type: "market" | "limit") {
+    if (type === "limit") {
+      const price = closePrices[id];
+      if (!price || Number(price) <= 0) {
+        notify.warn("Enter a limit price");
+        return;
+      }
+    }
+    setActingFor({ id, kind: type });
     try {
-      const body: Record<string, unknown> = { order_type: closeType };
-      if (closeType === "limit") body.limit_price = closePrice;
+      const body: Record<string, unknown> = { order_type: type };
+      if (type === "limit") body.limit_price = closePrices[id];
       const newOrder = await api<Order>(`/api/trades/${id}/close`, {
         method: "POST", body: JSON.stringify(body),
       });
       setOrders(cur => [newOrder, ...cur]);
-      setCloseFor(null);
-      notify.success(`Close placed: ${newOrder.side.toUpperCase()} ${newOrder.symbol}`);
+      if (type === "limit") setClosePrices(p => ({ ...p, [id]: "" }));
+      notify.success(`Close placed: ${newOrder.side.toUpperCase()} ${newOrder.symbol} (${type})`);
     } catch (e) {
       notify.fromError(e, "close failed");
     } finally {
-      setActingId(null);
+      setActingFor(null);
     }
   }
 
@@ -179,7 +182,6 @@ export default function TradesPage() {
               const isMine = !o.parent_order_id;     // own order (not a mirror)
               const canCancel = isOpen;
               const canClose = isFilled && user?.role === "trader" && isMine;
-              const expanded = closeFor === o.id;
               return (
                 <Fragment key={o.id}>
                   <tr
@@ -192,36 +194,67 @@ export default function TradesPage() {
                     {/* Symbol — ticker only */}
                     <td className="px-5 py-3 font-medium">{o.symbol}</td>
 
-                    <td className="px-5 py-3">{o.instrument_type}</td>
+                    <td className="px-5 py-3 capitalize">{o.instrument_type}</td>
                     <td className="px-5 py-3 uppercase font-medium" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
                     <td className="px-5 py-3 num">{fmt(o.quantity, 0)}</td>
 
-                    {/* Actions */}
+                    {/* Actions — inline, no expand step.
+                        Open orders → [Cancel].
+                        Filled own orders (trader) → [Close at Market] [limit input] [Close at Limit]. */}
                     <td className="px-5 py-3">
-                      <div className="flex gap-2 items-center">
+                      <div className="flex gap-2 items-center whitespace-nowrap">
                         {canCancel && (
                           <button
-                            disabled={actingId === o.id}
+                            disabled={actingFor?.id === o.id}
                             onClick={() => cancelOrder(o.id)}
-                            className="px-3 py-1 text-xs"
-                            style={{
-                              border: "1px solid rgba(255,107,107,0.4)",
-                              color: "var(--bad)",
-                              background: "var(--bad-soft)",
-                              borderRadius: "var(--r-sm)",   // matches btn-ghost (Close)
-                            }}
+                            className="btn-danger-soft px-3 py-1 text-xs"
                           >
-                            {actingId === o.id ? "…" : "Cancel"}
+                            {actingFor?.id === o.id && actingFor.kind === "cancel" ? "…" : "Cancel"}
                           </button>
                         )}
-                        {canClose && !expanded && (
-                          <button
-                            onClick={() => openCloseFor(o.id)}
-                            className="btn-ghost px-3 py-1 text-xs"
-                          >
-                            Close
-                          </button>
+
+                        {canClose && (
+                          <>
+                            <button
+                              disabled={actingFor?.id === o.id}
+                              onClick={() => closeAt(o.id, "market")}
+                              className="btn-ghost px-3 py-1 text-xs"
+                            >
+                              {"Close at Market"}
+                            </button>
+                            {/* Limit input + Close button — joined as one compact unit */}
+                            <div className="flex items-stretch">
+                              <input
+                                type="number" step="0.01" min="0.01"
+                                placeholder="Limit"
+                                value={closePrices[o.id] ?? ""}
+                                onChange={e => setClosePrices(p => ({ ...p, [o.id]: e.target.value }))}
+                                className="w-20 px-2 py-1 text-xs"
+                                style={{
+                                  borderTopLeftRadius: "var(--r-sm)",
+                                  borderBottomLeftRadius: "var(--r-sm)",
+                                  borderTopRightRadius: 0,
+                                  borderBottomRightRadius: 0,
+                                  borderRight: "none",
+                                }}
+                              />
+                              <button
+                                disabled={actingFor?.id === o.id || !closePrices[o.id]}
+                                onClick={() => closeAt(o.id, "limit")}
+                                className="btn-accent-solid px-3 py-1 text-xs font-medium"
+                                style={{
+                                  borderTopLeftRadius: 0,
+                                  borderBottomLeftRadius: 0,
+                                  borderTopRightRadius: "var(--r-sm)",
+                                  borderBottomRightRadius: "var(--r-sm)",
+                                }}
+                              >
+                                {"Close"}
+                              </button>
+                            </div>
+                          </>
                         )}
+
                         {!canCancel && !canClose && (
                           <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
                         )}
@@ -270,62 +303,6 @@ export default function TradesPage() {
                         : <span style={{ color: "var(--faint)" }}>—</span>}
                     </td>
                   </tr>
-
-                  {/* Close form — inline expansion */}
-                  {expanded && (
-                    <tr style={{ borderTop: "1px solid var(--border)", background: "var(--panel)" }}>
-                      <td colSpan={11} className="px-4 py-3">
-                        <div className="flex flex-wrap items-center gap-3">
-                          <span className="text-xs uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-                            Close {o.symbol} ({fmt(o.filled_quantity, 0)} {o.side === "buy" ? "→ SELL" : "→ BUY"})
-                          </span>
-
-                          <div className="flex gap-1 p-0.5 rounded-full" style={{ border: "1px solid var(--border)", background: "var(--bg-tint)" }}>
-                            <button
-                              type="button" onClick={() => setCloseType("market")}
-                              className="px-3 py-1 text-xs rounded-full transition-colors"
-                              style={{
-                                background: closeType === "market" ? "var(--grad-accent)" : "transparent",
-                                color: closeType === "market" ? "var(--accent-ink)" : "var(--text-2)",
-                                fontWeight: closeType === "market" ? 600 : 500,
-                              }}
-                            >Market</button>
-                            <button
-                              type="button" onClick={() => setCloseType("limit")}
-                              className="px-3 py-1 text-xs rounded-full transition-colors"
-                              style={{
-                                background: closeType === "limit" ? "var(--grad-accent)" : "transparent",
-                                color: closeType === "limit" ? "var(--accent-ink)" : "var(--text-2)",
-                                fontWeight: closeType === "limit" ? 600 : 500,
-                              }}
-                            >Limit</button>
-                          </div>
-
-                          {closeType === "limit" && (
-                            <input
-                              type="number" step="0.01" min="0.01" placeholder="Limit price"
-                              value={closePrice} onChange={e => setClosePrice(e.target.value)}
-                              className="w-32 px-2 py-1 text-sm"
-                            />
-                          )}
-
-                          <button
-                            disabled={actingId === o.id || (closeType === "limit" && !closePrice)}
-                            onClick={() => submitClose(o.id)}
-                            className="btn-primary px-4 py-1.5 text-xs"
-                          >
-                            {actingId === o.id ? "Placing…" : "Place close"}
-                          </button>
-                          <button
-                            onClick={() => setCloseFor(null)}
-                            className="btn-ghost px-3 py-1.5 text-xs"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
                 </Fragment>
               );
             })}

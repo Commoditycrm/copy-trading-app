@@ -160,8 +160,13 @@ export default function TradePanelPage() {
         );
         setExpiries(res.expiries);
         setExpiriesFor(cacheKey);
-        // If current selection is no longer valid, clear it.
-        if (expiry && !res.expiries.includes(expiry)) setExpiry("");
+        // Auto-pick the soonest expiry: keep the user's existing choice if
+        // it's still valid, otherwise default to the first (closest) date.
+        if (res.expiries.length === 0) {
+          setExpiry("");
+        } else if (!expiry || !res.expiries.includes(expiry)) {
+          setExpiry(res.expiries[0]);
+        }
       } catch (e) {
         setExpiries([]);
         setExpiriesErr(e instanceof ApiError ? String(e.detail) : "could not load expiries");

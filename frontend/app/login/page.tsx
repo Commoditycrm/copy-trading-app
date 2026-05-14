@@ -21,7 +21,6 @@ export default function LoginPage() {
         { method: "POST", body: JSON.stringify({ email, password }), auth: false }
       );
       setTokens(res.access_token, res.refresh_token);
-      notify.success("Welcome back");
       // Root page handles role-aware landing (trader → /trade-panel, subscriber → /trades).
       router.replace("/");
     } catch (e) {

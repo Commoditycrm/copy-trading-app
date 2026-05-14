@@ -140,9 +140,42 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   color: var(--text-2);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.btn-ghost:hover {
+  background: var(--grad-ghost);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Soft-danger button — outlined red pill (used for inline Cancel in tables) */
+.btn-danger-soft {
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-radius: var(--r-sm);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.btn-danger-soft:hover {
+  background: rgba(255, 107, 107, 0.18);
+  border-color: rgba(255, 107, 107, 0.65);
+  color: #ff8a8a;
+}
+.btn-danger-soft:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Solid accent button — small inline action (used for Close at Limit) */
+.btn-accent-solid {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent);
   transition: background 120ms ease, border-color 120ms ease;
 }
-.btn-ghost { background: var(--grad-ghost); border-color: var(--border-strong); color: var(--text); }
+.btn-accent-solid:hover {
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+}
+.btn-accent-solid:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Inputs */
 input[type="text"], input[type="email"], input[type="password"],
@@ -159,6 +192,19 @@ input:focus, select:focus, textarea:focus {
   background: rgba(10, 115, 168, 0.04);
 }
 input::placeholder { color: var(--faint); }
+
+/* Hide the native number-input spinner arrows everywhere — WebKit + Firefox.
+   Users can still type or paste; arrow keys still work. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
 
 /* Tables — softer dividers */
 table { border-collapse: separate; border-spacing: 0; }
