@@ -2,15 +2,251 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Design tokens — modern fintech (deep dark + cerulean blue accent)
+   Change values here; everything inherits.
+   ───────────────────────────────────────────────────────────────────────── */
 :root {
-  --bg: #0b0d12;
-  --panel: #131722;
-  --border: #1f2533;
-  --text: #e6e9ef;
-  --muted: #8b94a7;
-  --accent: #4ea1ff;
-  --good: #22c55e;
-  --bad: #ef4444;
+  /* Surfaces */
+  --bg:           #07090b;          /* near-black with a faint cool tint */
+  --bg-tint:      #0a0d10;          /* card surface base */
+  --panel:        #0e1318;          /* one shade above bg */
+  --panel-2:      #131a20;          /* slightly elevated */
+  --border:       rgba(255, 255, 255, 0.06);
+  --border-strong:rgba(255, 255, 255, 0.10);
+
+  /* Type */
+  --text:         #e7ecf2;          /* off-white, slight cool tint */
+  --text-2:       #c1c8d1;
+  --muted:        #6c7682;          /* cool grey */
+  --faint:        #3a414a;          /* almost-invisible labels */
+
+  /* Brand accent — deeper cerulean */
+  --accent:       #0a73a8;
+  --accent-2:     #2c93c5;
+  --accent-ink:   #ffffff;          /* readable foreground over blue */
+  --accent-glow:  rgba(10, 115, 168, 0.22);
+
+  /* Semantic — gains green, losses red. Toned down from neon. */
+  --good:         #22c55e;
+  --good-soft:    rgba(34, 197, 94, 0.12);
+  --bad:          #ef4444;
+  --bad-soft:     rgba(239, 68, 68, 0.10);
+  --warn:         #ffc857;
+
+  /* Gradients — buttons / pill toggles. 135° gives a soft "light from upper-left" feel. */
+  --grad-accent:    linear-gradient(135deg, #2c93c5 0%, #0a73a8 45%, #074d70 100%);
+  --grad-accent-hi: linear-gradient(135deg, #3da4d4 0%, #1383bb 45%, #0a5a82 100%);
+  --grad-bad:       linear-gradient(135deg, #f87171 0%, #ef4444 50%, #c92626 100%);
+  --grad-bad-hi:    linear-gradient(135deg, #fb8a8a 0%, #f55858 50%, #d63838 100%);
+  --grad-ghost:     linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%);
+
+  /* Radii */
+  --r-sm: 8px;
+  --r:    14px;
+  --r-lg: 20px;
 }
 
-html, body { background: var(--bg); color: var(--text); }
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
+               Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "tnum" 1, "cv11" 1;   /* tabular nums for money */
+}
+
+body {
+  /* Subtle ambient cerulean glow in the corners of the viewport */
+  background-image:
+    radial-gradient(1200px 600px at 85% -10%, rgba(10, 115, 168, 0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(10, 115, 168, 0.03), transparent 60%);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* ─── Component utilities ─────────────────────────────────────────────── */
+
+/* Card — every "section" box in the app should use this */
+.card {
+  background: linear-gradient(180deg, var(--panel) 0%, var(--bg-tint) 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.02) inset,
+    0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+/* Subtle inset divider line */
+.hairline {
+  border-top: 1px solid var(--border);
+}
+
+/* Pill / chip — small status badges */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+}
+.chip-good { background: var(--good-soft); color: var(--good); border-color: rgba(34,197,94,0.25); }
+.chip-bad  { background: var(--bad-soft);  color: var(--bad);  border-color: rgba(255,107,107,0.25); }
+
+/* Primary CTA — gradient lime pill */
+.btn-primary {
+  background: var(--grad-accent);
+  color: var(--accent-ink);
+  border: 1px solid rgba(10, 115, 168, 0.35);
+  border-radius: var(--r-sm);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
+  box-shadow:
+    0 8px 24px -8px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.btn-primary:hover  { background: var(--grad-accent-hi); box-shadow: 0 10px 28px -8px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,0.35); }
+.btn-primary:active { transform: translateY(1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; filter: saturate(0.7); }
+
+/* Danger CTA — gradient red pill */
+.btn-danger {
+  background: var(--grad-bad);
+  color: var(--accent-ink);
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  border-radius: var(--r-sm);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
+  box-shadow:
+    0 8px 24px -8px rgba(255, 107, 107, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.btn-danger:hover  { background: var(--grad-bad-hi); }
+.btn-danger:active { transform: translateY(1px); }
+.btn-danger:disabled { opacity: 0.5; cursor: not-allowed; box-shadow: none; filter: saturate(0.7); }
+
+/* Ghost button — secondary actions, subtle gradient on hover */
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.btn-ghost:hover {
+  background: var(--grad-ghost);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Soft-danger button — outlined red pill (used for inline Cancel in tables) */
+.btn-danger-soft {
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-radius: var(--r-sm);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.btn-danger-soft:hover {
+  background: rgba(255, 107, 107, 0.18);
+  border-color: rgba(255, 107, 107, 0.65);
+  color: #ff8a8a;
+}
+.btn-danger-soft:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Solid accent button — small inline action (used for Close at Limit) */
+.btn-accent-solid {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.btn-accent-solid:hover {
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+}
+.btn-accent-solid:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Inputs */
+input[type="text"], input[type="email"], input[type="password"],
+input[type="number"], input[type="date"], select, textarea {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: rgba(10, 115, 168, 0.04);
+}
+input::placeholder { color: var(--faint); }
+
+/* Hide the native number-input spinner arrows everywhere — WebKit + Firefox.
+   Users can still type or paste; arrow keys still work. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* Tables — softer dividers */
+table { border-collapse: separate; border-spacing: 0; }
+thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; font-size: 11px; }
+
+/* Scrollbar polish — dark + thin. The corner where horizontal + vertical
+   scrollbars meet defaults to system white in WebKit; transparent it. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--panel-2); border-radius: var(--r-sm); border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; }
+
+/* Selection */
+::selection { background: var(--accent); color: var(--accent-ink); }
+
+/* Numeric emphasis */
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+.num-lg { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+.num-xl { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; }
+
+/* ── react-toastify dark + cerulean theming ────────────────────────────── */
+.Toastify__toast {
+  background: var(--panel) !important;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm) !important;
+  color: var(--text) !important;
+  font-family: inherit;
+  font-size: 13px;
+  min-height: 0;
+  padding: 10px 14px;
+  box-shadow: 0 8px 28px -10px rgba(0, 0, 0, 0.6);
+}
+.Toastify__toast-body {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 0;
+  margin: 0 6px 0 0;
+}
+.Toastify__progress-bar--success { background: var(--good) !important; }
+.Toastify__progress-bar--error   { background: var(--bad) !important; }
+.Toastify__progress-bar--info    { background: var(--accent) !important; }
+.Toastify__progress-bar--warning { background: var(--warn) !important; }
+.Toastify__close-button { color: var(--muted); opacity: 0.8; }
+.Toastify__close-button:hover { color: var(--text); opacity: 1; }

@@ -1,7 +1,7 @@
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import Boolean, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, ForeignKey, Numeric
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,7 +35,12 @@ class SubscriberSettings(Base, TimestampMixin):
     )
     copy_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     multiplier: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal("1.000"), nullable=False)
-    subscription_tier: Mapped[str] = mapped_column(String(40), default="basic", nullable=False)
+
+    # Daily realized-loss kill switch. Stored as a positive amount (e.g. 500 means
+    # "stop after $500 loss today"). NULL disables the feature.
+    # When today's realized P&L falls below -daily_loss_limit, copy_enabled is
+    # auto-flipped to false and an audit + SSE event are emitted.
+    daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
 
     user = relationship("User", back_populates="subscriber_settings", foreign_keys=[user_id])
     following_trader = relationship("User", foreign_keys=[following_trader_id])

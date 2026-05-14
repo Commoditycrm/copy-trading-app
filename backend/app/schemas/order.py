@@ -73,3 +73,20 @@ class DailyPnL(BaseModel):
     day: date
     realized_pnl: Decimal
     trade_count: int
+
+
+class CloseOrderIn(BaseModel):
+    """Close (reverse) a filled order. Quantity defaults to the original
+    filled_quantity, but the trader can specify less for partial close."""
+
+    order_type: OrderType = OrderType.MARKET   # market or limit
+    limit_price: Decimal | None = Field(default=None, gt=0)
+    quantity: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "CloseOrderIn":
+        if self.order_type == OrderType.LIMIT and self.limit_price is None:
+            raise ValueError("limit_price required for limit close")
+        if self.order_type not in (OrderType.MARKET, OrderType.LIMIT):
+            raise ValueError("close only supports market or limit")
+        return self

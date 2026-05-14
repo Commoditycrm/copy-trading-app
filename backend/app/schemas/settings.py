@@ -9,7 +9,8 @@ class SubscriberSettingsOut(BaseModel):
     following_trader_id: uuid.UUID | None
     copy_enabled: bool
     multiplier: Decimal
-    subscription_tier: str
+    daily_loss_limit: Decimal | None
+    todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
 
     model_config = {"from_attributes": True}
 
@@ -32,6 +33,12 @@ class SubscriberSelfMultiplierIn(BaseModel):
     multiplier: Decimal = Field(gt=0, le=10)
 
 
+class DailyLossLimitIn(BaseModel):
+    """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
+
+    daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
 class FollowTraderIn(BaseModel):
     trader_id: uuid.UUID | None  # null to unfollow
 
@@ -41,10 +48,21 @@ class TraderToggleIn(BaseModel):
 
 
 class SubscriberMultiplierIn(BaseModel):
-    """Trader-only — set a subscriber's multiplier (subscription tier change)."""
+    """Trader-only override of a subscriber's multiplier."""
 
     multiplier: Decimal = Field(gt=0, le=100)
-    subscription_tier: str = Field(min_length=1, max_length=40)
+
+
+class BulkCopyStateOut(BaseModel):
+    """Aggregate copy_enabled state across a trader's subscribers.
+    `enabled` = how many have copy on; `total` = how many follow this trader."""
+
+    total: int
+    enabled: int
+
+
+class BulkCopyToggleIn(BaseModel):
+    enabled: bool
 
 
 class SubscriberSummary(BaseModel):
@@ -53,6 +71,5 @@ class SubscriberSummary(BaseModel):
     display_name: str | None
     copy_enabled: bool
     multiplier: Decimal
-    subscription_tier: str
     broker_count: int
     realized_pnl_30d: Decimal

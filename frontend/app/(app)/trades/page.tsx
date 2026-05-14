@@ -1,9 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { fmtDateTime } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
-import type { Order } from "@/lib/types";
+import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
+import type { Order, OrderStatus, User } from "@/lib/types";
+
+const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
 
 function fmt(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined) return "—";
@@ -12,18 +17,49 @@ function fmt(n: string | null | undefined, dp = 2): string {
   return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
-function realizedFor(order: Order): number {
+/** Notional value of fills. For options multiply by 100 (contract multiplier). */
+function notionalFor(order: Order): number {
   if (!order.filled_quantity || !order.filled_avg_price) return 0;
-  return Number(order.filled_quantity) * Number(order.filled_avg_price);
+  const base = Number(order.filled_quantity) * Number(order.filled_avg_price);
+  return order.instrument_type === "option" ? base * 100 : base;
+}
+
+/** "Expected" price the user asked for: the limit (or stop) price they set,
+ *  or null for market orders. */
+function expectedPrice(o: Order): string | null {
+  if (o.order_type === "limit" || o.order_type === "stop_limit") return o.limit_price;
+  if (o.order_type === "stop") return o.stop_price;
+  return null;
 }
 
 export default function TradesPage() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+
+  // Action UI state — tracks WHICH button on WHICH row is in flight, so only
+  // that button shows "…" (not its sibling).
+  const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
+  // Per-row limit-price input for the inline "Close at Limit" action.
+  const [closePrices, setClosePrices] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    api<Order[]>("/api/trades").then(setOrders).finally(() => setLoading(false));
+    let cancelled = false;
+    (async () => {
+      try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
+      if (cancelled) return;
+      const [o, u] = await Promise.all([
+        api<Order[]>("/api/trades"),
+        api<User>("/api/auth/me"),
+      ]);
+      if (!cancelled) {
+        setOrders(o);
+        setUser(u);
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEventStream((evt) => {
@@ -37,8 +73,6 @@ export default function TradesPage() {
     const incoming = evt.order;
     setOrders((cur) => {
       const idx = cur.findIndex((o) => o.id === incoming.id);
-      // Build a minimally-shaped Order from the SSE payload — `fills` is
-      // unknown until we re-fetch, so default to [].
       const merged: Order = {
         id: incoming.id,
         parent_order_id: incoming.parent_order_id,
@@ -72,58 +106,210 @@ export default function TradesPage() {
     setTimeout(() => setFlashId((f) => (f === incoming.id ? null : f)), 2000);
   });
 
+  async function cancelOrder(id: string) {
+    setActingFor({ id, kind: "cancel" });
+    try {
+      const updated = await api<Order>(`/api/trades/${id}/cancel`, { method: "POST" });
+      setOrders(cur => cur.map(o => o.id === id ? updated : o));
+      notify.success(`Order canceled: ${updated.symbol}`);
+    } catch (e) {
+      notify.fromError(e, "cancel failed");
+    } finally {
+      setActingFor(null);
+    }
+  }
+
+  /** One-shot close: type=market → fires immediately, type=limit → uses the
+   *  per-row price input. */
+  async function closeAt(id: string, type: "market" | "limit") {
+    if (type === "limit") {
+      const price = closePrices[id];
+      if (!price || Number(price) <= 0) {
+        notify.warn("Enter a limit price");
+        return;
+      }
+    }
+    setActingFor({ id, kind: type });
+    try {
+      const body: Record<string, unknown> = { order_type: type };
+      if (type === "limit") body.limit_price = closePrices[id];
+      const newOrder = await api<Order>(`/api/trades/${id}/close`, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      setOrders(cur => [newOrder, ...cur]);
+      if (type === "limit") setClosePrices(p => ({ ...p, [id]: "" }));
+      notify.success(`Close placed: ${newOrder.side.toUpperCase()} ${newOrder.symbol} (${type})`);
+    } catch (e) {
+      notify.fromError(e, "close failed");
+    } finally {
+      setActingFor(null);
+    }
+  }
+
   if (loading) return <p style={{ color: "var(--muted)" }}>Loading trades…</p>;
 
   return (
-    <div className="space-y-4 max-w-6xl">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Trades</h1>
-        <span className="text-xs px-2 py-1 rounded" style={{ background: "rgba(34,197,94,0.12)", color: "var(--good)" }}>
-          ● live
-        </span>
-      </div>
-      <p className="text-sm" style={{ color: "var(--muted)" }}>
-        Realized P&amp;L by day is on the <a href="/calendar" className="underline">Calendar</a> page.
-      </p>
-      <div className="overflow-x-auto rounded border" style={{ borderColor: "var(--border)" }}>
-        <table className="w-full text-sm">
-          <thead style={{ background: "var(--panel)" }}>
+    // Flex column with full height so the table can claim all leftover vertical
+    // space below the (optional) error banner.
+    <div className="flex flex-col h-full max-w-6xl space-y-4">
+      {/* Table wrapper fills remaining height. min-h-0 lets it shrink within
+          the flex parent so its own overflow-auto can take over. */}
+      <div
+        className="flex-1 min-h-0 overflow-auto rounded border"
+        style={{ borderColor: "var(--border)" }}
+      >
+        {/* min-w-full keeps the table at least as wide as the wrapper, but
+            lets it grow wider when content needs it — triggers horizontal
+            scroll on the wrapper. whitespace-nowrap on every header keeps
+            column widths predictable. */}
+        <table className="min-w-full text-sm">
+          <thead
+            className="sticky top-0 z-10"
+            style={{ background: "var(--panel)" }}
+          >
             <tr>
-              {["When", "Symbol", "Type", "Side", "Qty", "Filled @", "Status", "Notional"].map(h => (
-                <th key={h} className="text-left px-3 py-2 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
+              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Expires at"].map(h => (
+                <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {orders.length === 0 && (
-              <tr><td colSpan={8} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
+              <tr><td colSpan={11} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
-            {orders.map(o => (
-              <tr
-                key={o.id}
-                className="border-t transition-colors"
-                style={{
-                  borderColor: "var(--border)",
-                  background: flashId === o.id ? "rgba(78,161,255,0.16)" : "transparent",
-                }}
-              >
-                <td className="px-3 py-2">{new Date(o.created_at).toLocaleString()}</td>
-                <td className="px-3 py-2 font-medium">
-                  {o.symbol}
-                  {o.instrument_type === "option" && o.option_expiry && (
-                    <span className="ml-1 text-xs" style={{ color: "var(--muted)" }}>
-                      {o.option_expiry} {o.option_strike} {o.option_right?.toUpperCase()[0]}
-                    </span>
-                  )}
-                </td>
-                <td className="px-3 py-2">{o.instrument_type}</td>
-                <td className="px-3 py-2 uppercase" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
-                <td className="px-3 py-2">{fmt(o.quantity, 0)}</td>
-                <td className="px-3 py-2">{fmt(o.filled_avg_price, 2)}</td>
-                <td className="px-3 py-2">{o.status}{o.parent_order_id ? " · copy" : ""}</td>
-                <td className="px-3 py-2">{fmt(String(realizedFor(o)))}</td>
-              </tr>
-            ))}
+            {orders.map(o => {
+              const isOpen = OPEN_STATUSES.includes(o.status);
+              const isFilled = o.status === "filled";
+              const isMine = !o.parent_order_id;     // own order (not a mirror)
+              const canCancel = isOpen;
+              const canClose = isFilled && user?.role === "trader" && isMine;
+              return (
+                <Fragment key={o.id}>
+                  <tr
+                    className="border-t transition-colors"
+                    style={{
+                      borderColor: "var(--border)",
+                      background: flashId === o.id ? "var(--good-soft)" : "transparent",
+                    }}
+                  >
+                    {/* Symbol — ticker only */}
+                    <td className="px-5 py-3 font-medium">{o.symbol}</td>
+
+                    <td className="px-5 py-3 capitalize">{o.instrument_type}</td>
+                    <td className="px-5 py-3 uppercase font-medium" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
+                    <td className="px-5 py-3 num">{fmt(o.quantity, 0)}</td>
+
+                    {/* Actions — inline, no expand step.
+                        Open orders → [Cancel].
+                        Filled own orders (trader) → [Close at Market] [limit input] [Close at Limit]. */}
+                    <td className="px-5 py-3">
+                      <div className="flex gap-2 items-center whitespace-nowrap">
+                        {canCancel && (
+                          <button
+                            disabled={actingFor?.id === o.id}
+                            onClick={() => cancelOrder(o.id)}
+                            className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                          >
+                            <span>Cancel</span>
+                            {actingFor?.id === o.id && actingFor.kind === "cancel" && <Spinner />}
+                          </button>
+                        )}
+
+                        {canClose && (
+                          <>
+                            <button
+                              disabled={actingFor?.id === o.id}
+                              onClick={() => closeAt(o.id, "market")}
+                              className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                            >
+                              <span>Close at Market</span>
+                              {actingFor?.id === o.id && actingFor.kind === "market" && <Spinner />}
+                            </button>
+                            {/* Limit input + Close button — joined as one compact unit */}
+                            <div className="flex items-stretch">
+                              <input
+                                type="number" step="0.01" min="0.01"
+                                placeholder="Limit"
+                                value={closePrices[o.id] ?? ""}
+                                onChange={e => setClosePrices(p => ({ ...p, [o.id]: e.target.value }))}
+                                className="w-20 px-2 py-1 text-xs"
+                                style={{
+                                  borderTopLeftRadius: "var(--r-sm)",
+                                  borderBottomLeftRadius: "var(--r-sm)",
+                                  borderTopRightRadius: 0,
+                                  borderBottomRightRadius: 0,
+                                  borderRight: "none",
+                                }}
+                              />
+                              <button
+                                disabled={actingFor?.id === o.id || !closePrices[o.id]}
+                                onClick={() => closeAt(o.id, "limit")}
+                                className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
+                                style={{
+                                  borderTopLeftRadius: 0,
+                                  borderBottomLeftRadius: 0,
+                                  borderTopRightRadius: "var(--r-sm)",
+                                  borderBottomRightRadius: "var(--r-sm)",
+                                }}
+                              >
+                                <span>Close</span>
+                                {actingFor?.id === o.id && actingFor.kind === "limit" && <Spinner />}
+                              </button>
+                            </div>
+                          </>
+                        )}
+
+                        {!canCancel && !canClose && (
+                          <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Expected price — what the user asked for (limit/stop) */}
+                    <td className="px-5 py-3 num">{fmt(expectedPrice(o), 2)}</td>
+                    {/* Filled price — actual avg execution price */}
+                    <td className="px-5 py-3 num">{fmt(o.filled_avg_price, 2)}</td>
+                    {/* Notional — qty × price (× 100 for options) */}
+                    <td className="px-5 py-3 num">
+                      {notionalFor(o)
+                        ? fmt(String(notionalFor(o)))
+                        : <span style={{ color: "var(--faint)" }}>—</span>}
+                    </td>
+                    {/* Status — color-coded pill */}
+                    <td className="px-5 py-3">
+                      <span
+                        className="text-[11px] uppercase tracking-wider px-2 py-[4px] rounded whitespace-nowrap font-medium"
+                        style={{
+                          background:
+                            o.status === "filled"     ? "var(--good-soft)" :
+                            o.status === "rejected"   ? "var(--bad-soft)"  :
+                            o.status === "canceled"   ? "rgba(255,255,255,0.04)" :
+                                                        "rgba(10,115,168,0.10)",
+                          color:
+                            o.status === "filled"     ? "var(--good)" :
+                            o.status === "rejected"   ? "var(--bad)"  :
+                            o.status === "canceled"   ? "var(--muted)" :
+                                                        "var(--accent)",
+                        }}
+                      >
+                        {o.status}{o.parent_order_id ? " · copy" : ""}
+                      </span>
+                    </td>
+                    {/* Submitted at — fallback to created_at for orders that
+                        never reached the broker (rejected pre-submit) */}
+                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                      {fmtDateTime(o.submitted_at ?? o.created_at)}
+                    </td>
+                    {/* Expires at — option contract expiry; "—" for stocks */}
+                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                      {o.option_expiry
+                        ? fmtDateTime(o.option_expiry)
+                        : <span style={{ color: "var(--faint)" }}>—</span>}
+                    </td>
+                  </tr>
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>

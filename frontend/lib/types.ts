@@ -8,24 +8,26 @@ export interface User {
   is_active: boolean;
 }
 
+export type BrokerName = "alpaca";
+
 export interface BrokerAccount {
   id: string;
-  broker: string;                  // free-form, returned by SnapTrade (e.g. "ALPACA", "SCHWAB")
+  broker: BrokerName;
   label: string;
   is_paper: boolean;
   supports_fractional: boolean;
-  snaptrade_account_id: string;
   broker_account_number: string | null;
   connection_status: "pending" | "connected" | "error";
   last_error: string | null;
   created_at: string;
+
+  cash: string | null;             // Decimal as string from API
+  buying_power: string | null;
+  total_equity: string | null;
+  currency: string | null;
+  balance_updated_at: string | null;
 }
 
-export interface SyncResult {
-  added: number;
-  removed: number;
-  accounts: BrokerAccount[];
-}
 
 export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
@@ -67,6 +69,22 @@ export interface Order {
   fills: Fill[];
 }
 
+export interface Position {
+  broker_account_id: string;
+  broker_symbol: string;              // canonical broker id; unique key for the position
+  symbol: string;
+  instrument_type: InstrumentType;
+  quantity: string;                  // signed: positive = long, negative = short
+  avg_entry_price: string | null;
+  current_price: string | null;
+  market_value: string | null;
+  unrealized_pnl: string | null;
+  cost_basis: string | null;
+  option_expiry: string | null;
+  option_strike: string | null;
+  option_right: OptionRight | null;
+}
+
 export interface DailyPnL {
   day: string;
   realized_pnl: string;
@@ -78,7 +96,8 @@ export interface SubscriberSettings {
   following_trader_id: string | null;
   copy_enabled: boolean;
   multiplier: string;
-  subscription_tier: string;
+  daily_loss_limit: string | null;
+  todays_realized_pnl: string | null;
 }
 
 export interface TraderSettings {
@@ -92,7 +111,6 @@ export interface SubscriberSummary {
   display_name: string | null;
   copy_enabled: boolean;
   multiplier: string;
-  subscription_tier: string;
   broker_count: number;
   realized_pnl_30d: string;
 }

@@ -1,4 +1,4 @@
-"""Copy-trade fan-out (SnapTrade-backed, parallel execution).
+"""Copy-trade fan-out (direct broker, parallel execution).
 
 When the trader places an order, fan out to every active subscriber's broker
 account, scaled by their multiplier. Quantity rounding rule:
@@ -8,7 +8,7 @@ account, scaled by their multiplier. Quantity rounding rule:
 Execution model:
   Phase 1 (serial, fast): for each subscriber × broker_account, compute the
                           scaled qty, insert a child Order row in PENDING state.
-  Phase 2 (parallel, slow): fire all SnapTrade orders concurrently in a thread
+  Phase 2 (parallel, slow): fire all broker calls concurrently in a thread
                             pool. Each thread only does the HTTP call, no DB.
   Phase 3 (serial): apply the broker responses back to the child Order rows
                     and audit-log each result. Publish an SSE event per
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -29,12 +29,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.brokers import BrokerOrderRequest, BrokerOrderResult, SnapTradeBrokerAdapter
+from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
-from app.services import audit, events, snaptrade as st
+from app.services import audit, events
+from app.services.crypto import decrypt_json
+from app.services.pnl import today_realized_pnl
 
 MAX_PARALLEL = 32
 
@@ -44,19 +46,19 @@ class FanoutResult:
     subscriber_user_id: uuid.UUID
     broker_account_id: uuid.UUID
     order_id: uuid.UUID | None
-    status: str       # "submitted" | "skipped_zero_qty" | "skipped_no_broker" | "skipped_no_snaptrade" | "error"
+    status: str       # "submitted" | "skipped_zero_qty" | "skipped_no_broker" | "error"
     detail: str | None = None
 
 
 @dataclass
 class _PendingMirror:
-    """Phase-1 output: a child Order row already inserted, plus what the
-    SnapTrade call needs."""
+    """Phase-1 output: a child Order row already inserted, plus a constructed
+    adapter ready to place. We resolve the adapter in phase 1 (one DB read for
+    credentials) so phase 2 can be pure parallel HTTP."""
     child_order_id: uuid.UUID
     subscriber_user_id: uuid.UUID
     broker_account_id: uuid.UUID
-    snaptrade_account_id: str
-    user_secret: str
+    adapter: Any                                # BrokerAdapter, pre-built
     request: BrokerOrderRequest
 
 
@@ -94,15 +96,41 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
 
     for sub_settings in sub_rows:
         sub_user = db.get(User, sub_settings.user_id)
-        if not sub_user or not sub_user.encrypted_snaptrade_user_secret:
-            results.append(FanoutResult(
-                subscriber_user_id=sub_settings.user_id,
-                broker_account_id=uuid.UUID(int=0),
-                order_id=None,
-                status="skipped_no_snaptrade",
-            ))
+        if not sub_user:
             continue
-        sub_secret = st.decrypt_secret(sub_user.encrypted_snaptrade_user_secret)
+
+        # Daily-loss kill switch: if today's realized loss already exceeds the
+        # subscriber's limit, flip copy off and skip. We check BEFORE placing
+        # the order so we never blow past the limit even by one trade.
+        if sub_settings.daily_loss_limit is not None:
+            todays_pnl = today_realized_pnl(db, sub_settings.user_id)
+            if todays_pnl <= -sub_settings.daily_loss_limit:
+                sub_settings.copy_enabled = False
+                audit.record(
+                    db,
+                    actor_user_id=sub_settings.user_id,
+                    action="copy.auto_paused_daily_loss",
+                    entity_type="subscriber_settings",
+                    entity_id=sub_settings.user_id,
+                    metadata={
+                        "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "trigger_order_id": str(trader_order.id),
+                    },
+                )
+                events.publish(sub_settings.user_id, {
+                    "type": "copy.auto_paused",
+                    "reason": "daily_loss_limit",
+                    "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                    "todays_realized_pnl": str(todays_pnl),
+                })
+                results.append(FanoutResult(
+                    subscriber_user_id=sub_settings.user_id,
+                    broker_account_id=uuid.UUID(int=0),
+                    order_id=None,
+                    status="skipped_daily_loss_limit",
+                ))
+                continue
 
         sub_accounts = (
             db.execute(
@@ -164,12 +192,27 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
             db.add(child)
             db.flush()
 
+            try:
+                sub_creds = decrypt_json(acct.encrypted_credentials)
+                sub_adapter = adapter_for(acct, sub_creds)
+            except Exception as exc:  # noqa: BLE001
+                child.status = OrderStatus.REJECTED
+                child.reject_reason = f"credentials_error: {exc}"[:480]
+                child.closed_at = datetime.now(timezone.utc)
+                results.append(FanoutResult(
+                    subscriber_user_id=sub_settings.user_id,
+                    broker_account_id=acct.id,
+                    order_id=child.id,
+                    status="error",
+                    detail=str(exc)[:200],
+                ))
+                continue
+
             pending.append(_PendingMirror(
                 child_order_id=child.id,
                 subscriber_user_id=sub_settings.user_id,
                 broker_account_id=acct.id,
-                snaptrade_account_id=acct.snaptrade_account_id,
-                user_secret=sub_secret,
+                adapter=sub_adapter,
                 request=BrokerOrderRequest(
                     instrument_type=child.instrument_type,
                     symbol=child.symbol,
@@ -188,12 +231,7 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
     # ── Phase 2: fire all broker calls in parallel ─────────────────────────
     def _place(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, str | None]:
         try:
-            adapter = SnapTradeBrokerAdapter(
-                app_user_id=item.subscriber_user_id,
-                user_secret=item.user_secret,
-                snaptrade_account_id=item.snaptrade_account_id,
-            )
-            return item, adapter.place_order(item.request), None
+            return item, item.adapter.place_order(item.request), None
         except Exception as exc:  # noqa: BLE001
             return item, None, str(exc)[:480]
 
