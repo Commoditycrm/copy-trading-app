@@ -62,8 +62,8 @@ function initials(s: string | null | undefined, fallback: string) {
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
-  const [user, setUser] = useState<User | null>(() => loadCachedUser());
-  const [loading, setLoading] = useState(() => loadCachedUser() === null);
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
   // Trader-only master switch for copying to subscribers. `null` while
   // unloaded so we can hide the toggle until we know the state.
   const [bulkCopy, setBulkCopy] = useState<BulkCopyState | null>(null);
@@ -71,6 +71,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
+    // Hydrate from cache first so a remount (or hard refresh) renders the
+    // shell instantly instead of flashing "Loading…". Then revalidate.
+    const cached = loadCachedUser();
+    if (cached) {
+      setUser(cached);
+      setLoading(false);
+    }
     api<User>("/api/auth/me")
       .then((u) => {
         setUser(u);
