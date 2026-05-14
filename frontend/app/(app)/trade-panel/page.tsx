@@ -344,7 +344,7 @@ export default function TradePanelPage() {
     <form onSubmit={submit} className="space-y-5 p-5 rounded border" style={sectionStyle}>
 
       {/* Account */}
-      <div>
+      {/* <div>
         <Label>Broker account</Label>
         <select
           value={acctId} onChange={e => setAcctId(e.target.value)} required
@@ -364,7 +364,7 @@ export default function TradePanelPage() {
             Cash: {fmtMoney(selectedAcct.cash ? Number(selectedAcct.cash) : null)}
           </div>
         )}
-      </div>
+      </div> */}
 
       {/* Instrument toggle */}
       <div>
@@ -378,7 +378,7 @@ export default function TradePanelPage() {
       {/* Symbol + Quantity in one row — the two fields you always need */}
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <Label hint="e.g. AAPL, TSLA, NVDA">Symbol</Label>
+          <Label>Symbol</Label>
           <input
             className="w-full p-2 rounded bg-transparent border uppercase tracking-wide font-medium" style={inputStyle}
             placeholder="AAPL" value={symbol}
@@ -386,7 +386,7 @@ export default function TradePanelPage() {
           />
         </div>
         <div>
-          <Label hint={instrument === "option" ? "contracts" : "shares"}>Quantity</Label>
+          <Label>Quantity</Label>
           <input
             type="number" step="1" min="1"
             className="w-full p-2 rounded bg-transparent border" style={inputStyle}

@@ -15,12 +15,12 @@ const NAV_TRADER = [
   { href: "/trades", label: "Order History" },
   { href: "/calendar", label: "Calendar" },
   { href: "/subscribers", label: "Subscribers" },
-  { href: "/brokers", label: "Brokers" },
+  { href: "/brokers", label: "Broker" },
 ];
 const NAV_SUBSCRIBER = [
   { href: "/trades", label: "Order History" },
   { href: "/calendar", label: "Calendar" },
-  { href: "/brokers", label: "Brokers" },
+  { href: "/brokers", label: "Broker" },
   { href: "/settings", label: "Settings" },
 ];
 

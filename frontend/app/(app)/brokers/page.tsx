@@ -175,6 +175,7 @@ export default function BrokersPage() {
         </div>
       </section>
 
+      {accounts.some(a => a.broker === "alpaca") ? null : (
       <section className="card p-5 space-y-4 max-w-lg">
         <h2 className="font-semibold">Connect an Alpaca account</h2>
         <p className="text-xs" style={{ color: "var(--muted)" }}>
@@ -204,6 +205,7 @@ export default function BrokersPage() {
           </button>
         </form>
       </section>
+      )}
     </div>
   );
 }
