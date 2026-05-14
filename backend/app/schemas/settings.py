@@ -53,6 +53,18 @@ class SubscriberMultiplierIn(BaseModel):
     multiplier: Decimal = Field(gt=0, le=100)
 
 
+class BulkCopyStateOut(BaseModel):
+    """Aggregate copy_enabled state across a trader's subscribers.
+    `enabled` = how many have copy on; `total` = how many follow this trader."""
+
+    total: int
+    enabled: int
+
+
+class BulkCopyToggleIn(BaseModel):
+    enabled: bool
+
+
 class SubscriberSummary(BaseModel):
     user_id: uuid.UUID
     email: str

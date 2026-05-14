@@ -1,10 +1,28 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
-import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
+import { Spinner } from "@/components/Spinner";
+import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight, Position } from "@/lib/types";
+
+function fmtNum(n: string | null | undefined, dp = 2): string {
+  if (n === null || n === undefined || n === "") return "—";
+  const v = Number(n);
+  if (!Number.isFinite(v)) return String(n);
+  return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+function fmtSignedMoney(n: string | null | undefined): { text: string; sign: 1 | -1 | 0 | null } {
+  if (n === null || n === undefined || n === "") return { text: "—", sign: null };
+  const v = Number(n);
+  if (!Number.isFinite(v)) return { text: String(n), sign: null };
+  return {
+    text: v.toLocaleString(undefined, { style: "currency", currency: "USD" }),
+    sign: v === 0 ? 0 : v > 0 ? 1 : -1,
+  };
+}
 
 // ── small helpers ────────────────────────────────────────────────────────────
 
@@ -38,7 +56,10 @@ const sectionStyle: React.CSSProperties = {
   background: "var(--panel)",
 };
 
-const inputStyle: React.CSSProperties = { borderColor: "var(--border)" };
+const inputStyle: React.CSSProperties = {
+  borderColor: "var(--border)",
+  background: "var(--bg)",   // darker than the panel they sit on
+};
 
 function ChevronDown() {
   return (
@@ -80,10 +101,10 @@ function SegBtn({
   // a consistent edge.
   const grad =
     color === "bad" ? "var(--grad-bad)" :
-    "var(--grad-accent)";   // good + accent both use lime gradient
+      "var(--grad-accent)";   // good + accent both use lime gradient
   const edge =
     color === "bad" ? "rgba(255, 107, 107, 0.35)" :
-    "rgba(10, 115, 168, 0.35)";
+      "rgba(10, 115, 168, 0.35)";
   return (
     <button
       type="button"
@@ -124,7 +145,13 @@ export default function TradePanelPage() {
   const [last, setLast] = useState<Order | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
-  // Expiries fetched from SnapTrade per (symbol, account). Cached client-side
+  // Open positions shown below the panel.
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [positionsLoading, setPositionsLoading] = useState(true);
+  const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
+  const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+
+  // Expiries fetched per (symbol, account). Cached client-side
   // so retyping the same symbol doesn't trigger a re-fetch.
   const [expiries, setExpiries] = useState<string[]>([]);
   const [expiriesLoading, setExpiriesLoading] = useState(false);
@@ -136,7 +163,7 @@ export default function TradePanelPage() {
       setAccts(a);
       if (a.length && !acctId) setAcctId(a[0].id);
     });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Fetch option expiries from SnapTrade when (symbol, account) change.
@@ -177,10 +204,61 @@ export default function TradePanelPage() {
       }
     }, 500);
     return () => clearTimeout(t);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, symbol, acctId]);
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
+
+  // Load positions on mount.
+  useEffect(() => {
+    refreshPositions();
+  }, []);
+
+  async function refreshPositions() {
+    try {
+      const res = await api<Position[]>("/api/positions");
+      setPositions(res);
+    } catch (e) {
+      notify.fromError(e, "failed to load positions");
+    } finally {
+      setPositionsLoading(false);
+    }
+  }
+
+  /** Use the broker's canonical symbol (OCC for options, ticker for stocks)
+   *  so a stock and an option with the same root don't collide. */
+  function posKey(p: Position): string {
+    return `${p.broker_account_id}:${p.broker_symbol}`;
+  }
+
+  async function closePosition(p: Position, type: "market" | "limit") {
+    const key = posKey(p);
+    if (type === "limit") {
+      const price = closeLimitPrices[key];
+      if (!price || Number(price) <= 0) {
+        notify.warn("Enter a limit price");
+        return;
+      }
+    }
+    setClosing({ key, kind: type });
+    try {
+      const body: Record<string, unknown> = { order_type: type };
+      if (type === "limit") body.limit_price = closeLimitPrices[key];
+      const order = await api<Order>(
+        `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
+        { method: "POST", body: JSON.stringify(body) },
+      );
+      notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} (${type})`);
+      if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+      // Refresh — for market orders the position usually disappears; for limit
+      // it stays until the close fills.
+      refreshPositions();
+    } catch (e) {
+      notify.fromError(e, "close failed");
+    } finally {
+      setClosing(null);
+    }
+  }
 
   // OCC symbol preview for the right-side summary panel.
   const occ = useMemo(
@@ -384,17 +462,19 @@ export default function TradePanelPage() {
           type="button"
           disabled={submitting || !acctId}
           onClick={() => placeOrder({ overrideSide: "buy", overrideType: "market" })}
-          className="btn-primary w-full p-2.5 text-sm"
+          className="btn-primary w-full p-2.5 text-sm inline-flex items-center justify-center gap-2"
         >
-          {submitting ? "Placing…" : "BUY at MARKET"}
+          <span>BUY at MARKET</span>
+          {submitting && <Spinner />}
         </button>
         <button
           type="button"
           disabled={submitting || !acctId}
           onClick={() => placeOrder({ overrideSide: "sell", overrideType: "market" })}
-          className="btn-danger w-full p-2.5 text-sm"
+          className="btn-danger w-full p-2.5 text-sm inline-flex items-center justify-center gap-2"
         >
-          {submitting ? "Placing…" : "SELL at MARKET"}
+          <span>SELL at MARKET</span>
+          {submitting && <Spinner />}
         </button>
       </div>
 
@@ -451,11 +531,10 @@ export default function TradePanelPage() {
           <button
             type="submit"
             disabled={submitting || !acctId}
-            className={side === "buy" ? "btn-primary w-full p-2.5 text-sm" : "btn-danger w-full p-2.5 text-sm"}
+            className={(side === "buy" ? "btn-primary" : "btn-danger") + " w-full p-2.5 text-sm capitalize inline-flex items-center justify-center gap-2"}
           >
-            {submitting
-              ? "Placing…"
-              : `Place ${side === "buy" ? "Buy" : "Sell"} ${orderType.replace("_", "-")} order`}
+            <span>{`${side === "buy" ? "Buy" : "Sell"} ${orderType.replace("_", "-")} order`}</span>
+            {submitting && <Spinner />}
           </button>
         </div>
       </div>
@@ -558,27 +637,6 @@ export default function TradePanelPage() {
     </div>
   );
 
-  // ── Last submitted order toast ─────────────────────────────────────────────
-  const lastSubmitted = last && (
-    <div className="p-3 rounded border text-sm" style={sectionStyle}>
-      <div className="flex items-baseline gap-2">
-        <span className="font-medium">Last order</span>
-        <span className="text-xs uppercase px-2 py-0.5 rounded" style={{
-          background: last.status === "rejected" ? "rgba(239,68,68,0.15)" : "rgba(34,197,94,0.15)",
-          color: last.status === "rejected" ? "var(--bad)" : "var(--good)",
-        }}>
-          {last.status}
-        </span>
-      </div>
-      <div className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
-        Broker order id: <span className="font-mono">{last.broker_order_id ?? "—"}</span>
-      </div>
-      {last.reject_reason && (
-        <div className="mt-1 text-xs" style={{ color: "var(--bad)" }}>{last.reject_reason}</div>
-      )}
-    </div>
-  );
-
   return (
     <div className="space-y-5">
       <div>
@@ -593,8 +651,114 @@ export default function TradePanelPage() {
         <div>{summaryCard}</div>
       </div>
 
-      <div className="lg:max-w-[calc(100%-380px)]">
-        {lastSubmitted}
+
+      {/* ── Open positions — held shares/contracts; Close fires reverse order ── */}
+      <div className="pt-2">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-semibold">Open Positions</h2>
+          <span className="text-xs" style={{ color: "var(--muted)" }}>
+            {positionsLoading ? "loading…" : `${positions.length} held`}
+          </span>
+        </div>
+
+        <div
+          className="overflow-auto rounded border"
+          style={{ borderColor: "var(--border)" }}
+        >
+          <table className="min-w-full text-sm">
+            <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
+              <tr>
+                {["Symbol", "Type", "Side", "Quantity", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L"].map(h => (
+                  <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {!positionsLoading && positions.length === 0 && (
+                <tr>
+                  <td colSpan={9} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                    No open positions.
+                  </td>
+                </tr>
+              )}
+              {positions.map(p => {
+                const key = posKey(p);
+                const qtyNum = Number(p.quantity);
+                const isLong = qtyNum > 0;
+                const pnl = fmtSignedMoney(p.unrealized_pnl);
+                const inFlight = closing?.key === key;
+                return (
+                  <Fragment key={key}>
+                    <tr className="border-t" style={{ borderColor: "var(--border)" }}>
+                      <td className="px-5 py-3 font-medium">{p.symbol}</td>
+                      <td className="px-5 py-3 capitalize">{p.instrument_type}</td>
+                      <td
+                        className="px-5 py-3 uppercase font-medium"
+                        style={{ color: isLong ? "var(--good)" : "var(--bad)" }}
+                      >
+                        {isLong ? "long" : "short"}
+                      </td>
+                      <td className="px-5 py-3 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
+                      <td className="px-5 py-3">
+                        <div className="flex gap-2 items-center whitespace-nowrap">
+                          <button
+                            disabled={inFlight}
+                            onClick={() => closePosition(p, "market")}
+                            className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                          >
+                            <span>Close at Market</span>
+                            {inFlight && closing.kind === "market" && <Spinner />}
+                          </button>
+                          <div className="flex items-stretch">
+                            <input
+                              type="number" step="0.01" min="0.01"
+                              placeholder="Limit"
+                              value={closeLimitPrices[key] ?? ""}
+                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
+                              className="w-20 px-2 py-1 text-xs border"
+                              style={{
+                                borderColor: "var(--border)",
+                                background: "var(--bg)",
+                                borderTopLeftRadius: "var(--r-sm)",
+                                borderBottomLeftRadius: "var(--r-sm)",
+                                borderTopRightRadius: 0,
+                                borderBottomRightRadius: 0,
+                                borderRight: "none",
+                              }}
+                            />
+                            <button
+                              disabled={inFlight || !closeLimitPrices[key]}
+                              onClick={() => closePosition(p, "limit")}
+                              className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
+                              style={{
+                                borderTopLeftRadius: 0,
+                                borderBottomLeftRadius: 0,
+                                borderTopRightRadius: "var(--r-sm)",
+                                borderBottomRightRadius: "var(--r-sm)",
+                              }}
+                            >
+                              <span>Close</span>
+                              {inFlight && closing.kind === "limit" && <Spinner />}
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-5 py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
+                      <td className="px-5 py-3 num">{fmtNum(p.current_price, 2)}</td>
+                      <td className="px-5 py-3 num">{fmtNum(p.market_value, 2)}</td>
+                      <td
+                        className="px-5 py-3 num"
+                        style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}
+                      >
+                        {pnl.text}
+                      </td>
+                    </tr>
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );

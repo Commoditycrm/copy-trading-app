@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
 import type { BrokerAccount } from "@/lib/types";
 
 function statusColor(s: BrokerAccount["connection_status"]): string {
@@ -161,10 +162,11 @@ export default function BrokersPage() {
                   <button
                     onClick={() => refreshBalance(a.id)}
                     disabled={refreshing[a.id]}
-                    className="btn-ghost px-2 py-1 text-sm"
+                    className="btn-ghost px-2 py-1 text-sm inline-flex items-center gap-1.5"
                     title="Refresh balance"
                   >
-                    {refreshing[a.id] ? "…" : "↻"}
+                    <span>↻</span>
+                    {refreshing[a.id] && <Spinner />}
                   </button>
                 </div>
               </div>
@@ -196,8 +198,9 @@ export default function BrokersPage() {
             <input type="checkbox" checked={paper} onChange={e => setPaper(e.target.checked)} />
             <span>Paper-trading account (recommended for testing)</span>
           </label>
-          <button disabled={busy} className="btn-primary px-4 py-2 text-sm">
-            {busy ? "Verifying…" : "Connect"}
+          <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
+            <span>Connect</span>
+            {busy && <Spinner />}
           </button>
         </form>
       </section>

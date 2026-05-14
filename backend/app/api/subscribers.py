@@ -12,7 +12,12 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.settings import SubscriberSettings
 from app.models.user import User
-from app.schemas.settings import SubscriberMultiplierIn, SubscriberSummary
+from app.schemas.settings import (
+    BulkCopyStateOut,
+    BulkCopyToggleIn,
+    SubscriberMultiplierIn,
+    SubscriberSummary,
+)
 from app.services import audit
 from app.services.pnl import realized_pnl_by_day
 
@@ -51,6 +56,59 @@ def list_subscribers(
             )
         )
     return out
+
+
+@router.get("/copy-state", response_model=BulkCopyStateOut)
+def get_bulk_copy_state(
+    db: Session = Depends(get_db), trader: User = Depends(require_trader)
+) -> BulkCopyStateOut:
+    """Aggregate copy_enabled count across all subscribers following this trader."""
+    rows = db.execute(
+        select(SubscriberSettings.copy_enabled).where(
+            SubscriberSettings.following_trader_id == trader.id
+        )
+    ).all()
+    total = len(rows)
+    enabled = sum(1 for (e,) in rows if e)
+    return BulkCopyStateOut(total=total, enabled=enabled)
+
+
+@router.patch("/copy-state", response_model=BulkCopyStateOut)
+def set_bulk_copy_state(
+    payload: BulkCopyToggleIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> BulkCopyStateOut:
+    """Flip copy_enabled for every subscriber currently following this trader.
+    Useful as a master kill switch the trader controls from the sidebar."""
+    subs = db.execute(
+        select(SubscriberSettings).where(
+            SubscriberSettings.following_trader_id == trader.id
+        )
+    ).scalars().all()
+    changed = 0
+    for s in subs:
+        if s.copy_enabled != payload.enabled:
+            s.copy_enabled = payload.enabled
+            changed += 1
+    audit.record(
+        db,
+        actor_user_id=trader.id,
+        action="trader.bulk_copy_toggle",
+        entity_type="trader",
+        entity_id=trader.id,
+        metadata={
+            "target_state": str(payload.enabled),
+            "subscribers_total": len(subs),
+            "subscribers_changed": changed,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    total = len(subs)
+    enabled = sum(1 for s in subs if s.copy_enabled)
+    return BulkCopyStateOut(total=total, enabled=enabled)
 
 
 @router.patch("/{subscriber_id}/multiplier")

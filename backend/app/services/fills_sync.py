@@ -157,27 +157,60 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
 
         trade_at = _as_dt(_attr(entry, "transaction_time")) or datetime.now(timezone.utc)
 
-        order = Order(
-            user_id=acct.user_id,
-            broker_account_id=acct.id,
-            instrument_type=instrument,
-            symbol=display_symbol,
-            option_expiry=option_expiry,
-            option_strike=option_strike,
-            option_right=option_right,
-            side=side,
-            order_type=OrderType.MARKET,
-            quantity=units,
-            status=OrderStatus.FILLED,
-            broker_order_id=activity_id,
-            filled_quantity=units,
-            filled_avg_price=price,
-            submitted_at=trade_at,
-            closed_at=trade_at,
-        )
-        db.add(order)
-        db.flush()
-        orders_added += 1
+        # If the activity references a broker order_id that matches an Order
+        # we already placed, update THAT order in place. Otherwise (external
+        # trades placed in Alpaca's UI directly, or pre-existing fills) create
+        # a synthetic order so the activity still surfaces in the UI.
+        broker_oid = str(_attr(entry, "order_id") or "") or None
+        order: Order | None = None
+        if broker_oid:
+            order = db.execute(
+                select(Order).where(
+                    Order.broker_account_id == acct.id,
+                    Order.broker_order_id == broker_oid,
+                )
+            ).scalar_one_or_none()
+
+        if order is None:
+            order = Order(
+                user_id=acct.user_id,
+                broker_account_id=acct.id,
+                instrument_type=instrument,
+                symbol=display_symbol,
+                option_expiry=option_expiry,
+                option_strike=option_strike,
+                option_right=option_right,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=units,
+                status=OrderStatus.FILLED,
+                broker_order_id=broker_oid or activity_id,
+                filled_quantity=units,
+                filled_avg_price=price,
+                submitted_at=trade_at,
+                closed_at=trade_at,
+            )
+            db.add(order)
+            db.flush()
+            orders_added += 1
+        else:
+            # Accumulate qty + recompute volume-weighted avg fill price across
+            # all fills we've seen on this order so far.
+            prev_qty = _dec(order.filled_quantity)
+            prev_avg = _dec(order.filled_avg_price)
+            new_qty = prev_qty + units
+            order.filled_quantity = new_qty
+            order.filled_avg_price = (
+                (prev_qty * prev_avg + units * price) / new_qty
+                if new_qty > 0 else price
+            )
+            # Mark filled if this completes the order quantity; otherwise
+            # partial-fill. Float-tolerant compare (Decimal).
+            if new_qty >= _dec(order.quantity):
+                order.status = OrderStatus.FILLED
+                order.closed_at = trade_at
+            else:
+                order.status = OrderStatus.PARTIALLY_FILLED
 
         fill = Fill(
             order_id=order.id,

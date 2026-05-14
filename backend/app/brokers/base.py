@@ -47,6 +47,30 @@ class BrokerOrderResult:
     reject_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class BrokerPosition:
+    """Snapshot of one held position at the broker. Quantity is signed:
+    positive = long, negative = short.
+
+    `broker_symbol` is the broker's canonical id for the position (e.g. the
+    OCC symbol for options, plain ticker for stocks) — use it whenever you
+    need a unique key. `symbol` is the human-friendly root for display."""
+
+    broker_symbol: str
+    symbol: str
+    instrument_type: InstrumentType
+    quantity: Decimal
+    avg_entry_price: Decimal | None
+    current_price: Decimal | None
+    market_value: Decimal | None
+    unrealized_pnl: Decimal | None
+    cost_basis: Decimal | None = None
+    # Option-only fields parsed from OCC symbol; null for stocks.
+    option_expiry: date | None = None
+    option_strike: Decimal | None = None
+    option_right: OptionRight | None = None
+
+
 class BrokerAdapter(ABC):
     """One instance per BrokerAccount. Hold decrypted credentials in-memory only."""
 
@@ -67,4 +91,8 @@ class BrokerAdapter(ABC):
     def get_order(self, broker_order_id: str) -> BrokerOrderResult: ...
 
     def cancel_order(self, broker_order_id: str) -> None:
+        raise NotImplementedError
+
+    def get_positions(self) -> list[BrokerPosition]:
+        """List currently held positions at this broker account."""
         raise NotImplementedError

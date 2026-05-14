@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { fmtDateTime } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
 import type { Order, OrderStatus, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
@@ -207,9 +208,10 @@ export default function TradesPage() {
                           <button
                             disabled={actingFor?.id === o.id}
                             onClick={() => cancelOrder(o.id)}
-                            className="btn-danger-soft px-3 py-1 text-xs"
+                            className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5"
                           >
-                            {actingFor?.id === o.id && actingFor.kind === "cancel" ? "…" : "Cancel"}
+                            <span>Cancel</span>
+                            {actingFor?.id === o.id && actingFor.kind === "cancel" && <Spinner />}
                           </button>
                         )}
 
@@ -218,9 +220,10 @@ export default function TradesPage() {
                             <button
                               disabled={actingFor?.id === o.id}
                               onClick={() => closeAt(o.id, "market")}
-                              className="btn-ghost px-3 py-1 text-xs"
+                              className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
                             >
-                              {"Close at Market"}
+                              <span>Close at Market</span>
+                              {actingFor?.id === o.id && actingFor.kind === "market" && <Spinner />}
                             </button>
                             {/* Limit input + Close button — joined as one compact unit */}
                             <div className="flex items-stretch">
@@ -241,7 +244,7 @@ export default function TradesPage() {
                               <button
                                 disabled={actingFor?.id === o.id || !closePrices[o.id]}
                                 onClick={() => closeAt(o.id, "limit")}
-                                className="btn-accent-solid px-3 py-1 text-xs font-medium"
+                                className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
                                 style={{
                                   borderTopLeftRadius: 0,
                                   borderBottomLeftRadius: 0,
@@ -249,7 +252,8 @@ export default function TradesPage() {
                                   borderBottomRightRadius: "var(--r-sm)",
                                 }}
                               >
-                                {"Close"}
+                                <span>Close</span>
+                                {actingFor?.id === o.id && actingFor.kind === "limit" && <Spinner />}
                               </button>
                             </div>
                           </>

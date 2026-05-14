@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 export default function SettingsPage() {
@@ -159,10 +160,11 @@ export default function SettingsPage() {
               <button
                 onClick={saveMultiplier}
                 disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
-                className="px-4 py-2 rounded font-medium"
+                className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
                 style={{background: "var(--accent)", color: "#06121f"}}
               >
-                {multBusy ? "Saving…" : "Save"}
+                <span>Save</span>
+                {multBusy && <Spinner />}
               </button>
               {parseFloat(multInput) !== parseFloat(sub.multiplier) && (
                 <button
@@ -230,10 +232,11 @@ export default function SettingsPage() {
               <button
                 onClick={saveLimit}
                 disabled={limitBusy || limitInput === (sub.daily_loss_limit ?? "")}
-                className="px-4 py-2 rounded font-medium"
+                className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
                 style={{background: "var(--accent)", color: "#06121f"}}
               >
-                {limitBusy ? "Saving…" : "Save"}
+                <span>Save</span>
+                {limitBusy && <Spinner />}
               </button>
               {sub.daily_loss_limit !== null && (
                 <button

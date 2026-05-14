@@ -3,6 +3,7 @@ from app.brokers.base import (
     BrokerAdapter,
     BrokerOrderRequest,
     BrokerOrderResult,
+    BrokerPosition,
     ConnectionInfo,
 )
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -20,6 +21,7 @@ __all__ = [
     "BrokerAdapter",
     "BrokerOrderRequest",
     "BrokerOrderResult",
+    "BrokerPosition",
     "ConnectionInfo",
     "adapter_for",
     "build_occ_symbol",

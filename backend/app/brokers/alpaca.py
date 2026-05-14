@@ -9,6 +9,7 @@ request types for both — only the symbol shape distinguishes them.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -30,9 +31,10 @@ from app.brokers.base import (
     BrokerAdapter,
     BrokerOrderRequest,
     BrokerOrderResult,
+    BrokerPosition,
     ConnectionInfo,
 )
-from app.models.order import InstrumentType, OrderSide, OrderStatus, OrderType
+from app.models.order import InstrumentType, OptionRight, OrderSide, OrderStatus, OrderType
 
 # Map Alpaca → our enums
 _SIDE_OUT = {OrderSide.BUY: AlpacaSide.BUY, OrderSide.SELL: AlpacaSide.SELL}
@@ -53,6 +55,42 @@ _STATUS_IN = {
     AlpacaStatus.SUSPENDED: OrderStatus.SUBMITTED,
     AlpacaStatus.CALCULATED: OrderStatus.FILLED,
 }
+
+
+def _dec_or_none(v: Any) -> Decimal | None:
+    if v is None or v == "":
+        return None
+    try:
+        return Decimal(str(v))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_OCC_RE = re.compile(r"^([A-Z.]{1,6})(\d{6})([CP])(\d{8})$")
+
+
+def _looks_like_occ(s: str) -> bool:
+    return bool(_OCC_RE.match(s))
+
+
+def _parse_occ(s: str) -> tuple[str, date, Decimal, OptionRight] | None:
+    """OCC 21-char option symbol → (root, expiry, strike, right). Returns
+    None if it doesn't match the format."""
+    m = _OCC_RE.match(s)
+    if not m:
+        return None
+    root, yymmdd, cp, strike_str = m.groups()
+    try:
+        yy = int(yymmdd[:2])
+        # OCC uses 2-digit years; convention is 20XX (good for any near-future
+        # expiry — Alpaca options listings rarely go past 2050 anyway).
+        year = 2000 + yy
+        expiry = date(year, int(yymmdd[2:4]), int(yymmdd[4:6]))
+    except ValueError:
+        return None
+    strike = Decimal(strike_str) / Decimal(1000)
+    right = OptionRight.CALL if cp == "C" else OptionRight.PUT
+    return root, expiry, strike, right
 
 
 def build_occ_symbol(symbol: str, expiry: date, strike: Decimal, right: str) -> str:
@@ -170,6 +208,46 @@ class AlpacaAdapter(BrokerAdapter):
 
     def cancel_order(self, broker_order_id: str) -> None:
         self._c().cancel_order_by_id(broker_order_id)
+
+    # ── positions ─────────────────────────────────────────────────────────
+
+    def get_positions(self) -> list[BrokerPosition]:
+        """Return currently held positions. Alpaca returns one row per symbol
+        per account (net qty). asset_class distinguishes stock vs option."""
+        raw = self._c().get_all_positions() or []
+        out: list[BrokerPosition] = []
+        for p in raw:
+            sym = str(p.symbol)
+            asset_class = str(getattr(p, "asset_class", "") or "").lower()
+            is_option = "option" in asset_class or _looks_like_occ(sym)
+            instrument = InstrumentType.OPTION if is_option else InstrumentType.STOCK
+
+            # alpaca-py returns qty as a signed string; "side" is "long"/"short"
+            # but the sign on qty is the canonical signal.
+            qty = _dec_or_none(getattr(p, "qty", None)) or Decimal(0)
+
+            expiry = strike = right = None
+            display_symbol = sym
+            if is_option:
+                parsed = _parse_occ(sym)
+                if parsed:
+                    display_symbol, expiry, strike, right = parsed
+
+            out.append(BrokerPosition(
+                broker_symbol=sym,
+                symbol=display_symbol,
+                instrument_type=instrument,
+                quantity=qty,
+                avg_entry_price=_dec_or_none(getattr(p, "avg_entry_price", None)),
+                current_price=_dec_or_none(getattr(p, "current_price", None)),
+                market_value=_dec_or_none(getattr(p, "market_value", None)),
+                unrealized_pnl=_dec_or_none(getattr(p, "unrealized_pl", None)),
+                cost_basis=_dec_or_none(getattr(p, "cost_basis", None)),
+                option_expiry=expiry,
+                option_strike=strike,
+                option_right=right,
+            ))
+        return out
 
     # ── reads — used by sync, balance refresh, options chain ──────────────
 

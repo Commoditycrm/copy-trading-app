@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -78,9 +79,10 @@ export default function LoginPage() {
 
         <button
           disabled={loading}
-          className="btn-primary w-full py-2.5 text-sm"
+          className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center gap-2"
         >
-          {loading ? "Signing in…" : "Sign in"}
+          <span>Sign in</span>
+          {loading && <Spinner />}
         </button>
 
         <div className="text-center text-sm" style={{ color: "var(--muted)" }}>

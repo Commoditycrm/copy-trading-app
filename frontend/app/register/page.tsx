@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -99,8 +100,9 @@ export default function RegisterPage() {
           </div>
         </div>
 
-        <button disabled={loading} className="btn-primary w-full py-2.5 text-sm">
-          {loading ? "Creating…" : "Create account"}
+        <button disabled={loading} className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center gap-2">
+          <span>Create account</span>
+          {loading && <Spinner />}
         </button>
 
         <div className="text-center text-sm" style={{ color: "var(--muted)" }}>

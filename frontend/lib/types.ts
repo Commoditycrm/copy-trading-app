@@ -69,6 +69,22 @@ export interface Order {
   fills: Fill[];
 }
 
+export interface Position {
+  broker_account_id: string;
+  broker_symbol: string;              // canonical broker id; unique key for the position
+  symbol: string;
+  instrument_type: InstrumentType;
+  quantity: string;                  // signed: positive = long, negative = short
+  avg_entry_price: string | null;
+  current_price: string | null;
+  market_value: string | null;
+  unrealized_pnl: string | null;
+  cost_basis: string | null;
+  option_expiry: string | null;
+  option_strike: string | null;
+  option_right: OptionRight | null;
+}
+
 export interface DailyPnL {
   day: string;
   realized_pnl: string;
