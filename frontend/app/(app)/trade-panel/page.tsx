@@ -1,11 +1,12 @@
 "use client";
 
-import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
-import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight, Position } from "@/lib/types";
+import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
+import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined || n === "") return "—";
@@ -145,11 +146,9 @@ export default function TradePanelPage() {
   const [last, setLast] = useState<Order | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
-  // Open positions shown below the panel.
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [positionsLoading, setPositionsLoading] = useState(true);
-  const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
-  const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+  // Open positions table — owned by the shared component. We keep a ref so
+  // we can ask it to refresh after a fresh order or exit-all.
+  const positionsRef = useRef<OpenPositionsTableHandle>(null);
   const [exitBusy, setExitBusy] = useState(false);
 
   // Expiries fetched per (symbol, account). Cached client-side
@@ -210,22 +209,6 @@ export default function TradePanelPage() {
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
 
-  // Load positions on mount.
-  useEffect(() => {
-    refreshPositions();
-  }, []);
-
-  async function refreshPositions() {
-    try {
-      const res = await api<Position[]>("/api/positions");
-      setPositions(res);
-    } catch (e) {
-      notify.fromError(e, "failed to load positions");
-    } finally {
-      setPositionsLoading(false);
-    }
-  }
-
   async function exitAll() {
     if (!confirm("Close ALL open positions at market across every connected broker? This cannot be undone.")) return;
     setExitBusy(true);
@@ -240,46 +223,11 @@ export default function TradePanelPage() {
       } else {
         notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
       }
-      refreshPositions();
+      positionsRef.current?.refresh();
     } catch (e) {
       notify.fromError(e, "Exit all failed");
     } finally {
       setExitBusy(false);
-    }
-  }
-
-  /** Use the broker's canonical symbol (OCC for options, ticker for stocks)
-   *  so a stock and an option with the same root don't collide. */
-  function posKey(p: Position): string {
-    return `${p.broker_account_id}:${p.broker_symbol}`;
-  }
-
-  async function closePosition(p: Position, type: "market" | "limit") {
-    const key = posKey(p);
-    if (type === "limit") {
-      const price = closeLimitPrices[key];
-      if (!price || Number(price) <= 0) {
-        notify.warn("Enter a limit price");
-        return;
-      }
-    }
-    setClosing({ key, kind: type });
-    try {
-      const body: Record<string, unknown> = { order_type: type };
-      if (type === "limit") body.limit_price = closeLimitPrices[key];
-      const order = await api<Order>(
-        `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
-        { method: "POST", body: JSON.stringify(body) },
-      );
-      notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} (${type})`);
-      if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
-      // Refresh — for market orders the position usually disappears; for limit
-      // it stays until the close fills.
-      refreshPositions();
-    } catch (e) {
-      notify.fromError(e, "close failed");
-    } finally {
-      setClosing(null);
     }
   }
 
@@ -349,6 +297,8 @@ export default function TradePanelPage() {
       notify.success(
         `${useSide.toUpperCase()} ${qty} ${symbol.toUpperCase()} (${useType.replace("_", "-")}) — ${res.status}`
       );
+      // Refresh the embedded positions table so a new fill appears below.
+      positionsRef.current?.refresh();
     } catch (e) {
       notify.fromError(e, "Order placement failed");
     } finally {
@@ -687,114 +637,7 @@ export default function TradePanelPage() {
       </div>
 
 
-      {/* ── Open positions — held shares/contracts; Close fires reverse order ── */}
-      <div className="pt-2">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-semibold">Open Positions</h2>
-          <span className="text-xs" style={{ color: "var(--muted)" }}>
-            {positionsLoading ? "loading…" : `${positions.length} held`}
-          </span>
-        </div>
-
-        <div
-          className="overflow-auto rounded border"
-          style={{ borderColor: "var(--border)" }}
-        >
-          <table className="min-w-full text-sm">
-            <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
-              <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L"].map(h => (
-                  <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {!positionsLoading && positions.length === 0 && (
-                <tr>
-                  <td colSpan={9} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
-                    No open positions.
-                  </td>
-                </tr>
-              )}
-              {positions.map(p => {
-                const key = posKey(p);
-                const qtyNum = Number(p.quantity);
-                const isLong = qtyNum > 0;
-                const pnl = fmtSignedMoney(p.unrealized_pnl);
-                const inFlight = closing?.key === key;
-                return (
-                  <Fragment key={key}>
-                    <tr className="border-t" style={{ borderColor: "var(--border)" }}>
-                      <td className="px-5 py-3 font-medium">{p.symbol}</td>
-                      <td className="px-5 py-3 capitalize">{p.instrument_type}</td>
-                      <td
-                        className="px-5 py-3 uppercase font-medium"
-                        style={{ color: isLong ? "var(--good)" : "var(--bad)" }}
-                      >
-                        {isLong ? "long" : "short"}
-                      </td>
-                      <td className="px-5 py-3 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
-                      <td className="px-5 py-3">
-                        <div className="flex gap-2 items-center whitespace-nowrap">
-                          <button
-                            disabled={inFlight}
-                            onClick={() => closePosition(p, "market")}
-                            className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
-                          >
-                            <span>Close at Market</span>
-                            {inFlight && closing.kind === "market" && <Spinner />}
-                          </button>
-                          <div className="flex items-stretch">
-                            <input
-                              type="number" step="0.01" min="0.01"
-                              placeholder="Limit"
-                              value={closeLimitPrices[key] ?? ""}
-                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
-                              className="w-20 px-2 py-1 text-xs border"
-                              style={{
-                                borderColor: "var(--border)",
-                                background: "var(--bg)",
-                                borderTopLeftRadius: "var(--r-sm)",
-                                borderBottomLeftRadius: "var(--r-sm)",
-                                borderTopRightRadius: 0,
-                                borderBottomRightRadius: 0,
-                                borderRight: "none",
-                              }}
-                            />
-                            <button
-                              disabled={inFlight || !closeLimitPrices[key]}
-                              onClick={() => closePosition(p, "limit")}
-                              className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
-                              style={{
-                                borderTopLeftRadius: 0,
-                                borderBottomLeftRadius: 0,
-                                borderTopRightRadius: "var(--r-sm)",
-                                borderBottomRightRadius: "var(--r-sm)",
-                              }}
-                            >
-                              <span>Close</span>
-                              {inFlight && closing.kind === "limit" && <Spinner />}
-                            </button>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-5 py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                      <td className="px-5 py-3 num">{fmtNum(p.current_price, 2)}</td>
-                      <td className="px-5 py-3 num">{fmtNum(p.market_value, 2)}</td>
-                      <td
-                        className="px-5 py-3 num"
-                        style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}
-                      >
-                        {pnl.text}
-                      </td>
-                    </tr>
-                  </Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      <OpenPositionsTable ref={positionsRef} className="pt-2" />
     </div>
   );
 }

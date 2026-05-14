@@ -22,12 +22,14 @@ function loadCachedUser(): User | null {
 
 const NAV_TRADER = [
   { href: "/trade-panel", label: "Trade Panel" },
+  { href: "/positions", label: "Positions" },
   { href: "/trades", label: "Order History" },
   { href: "/calendar", label: "Calendar" },
   { href: "/subscribers", label: "Subscribers" },
   { href: "/brokers", label: "Broker" },
 ];
 const NAV_SUBSCRIBER = [
+  { href: "/positions", label: "Positions" },
   { href: "/trades", label: "Order History" },
   { href: "/calendar", label: "Calendar" },
   { href: "/brokers", label: "Broker" },
