@@ -1,16 +1,12 @@
-"""Sync filled trades from SnapTrade into our local fills + orders tables.
+"""Sync filled trades from Alpaca into our local fills + orders tables.
 
-For each BUY/SELL activity SnapTrade reports for a broker account, we:
-  1. Dedup by activity.id (mapped to Fill.broker_fill_id) — already-synced
-     activities are skipped.
-  2. Upsert a synthetic Order row (status=FILLED) — activities don't carry a
-     broker_order_id we can match to our existing Orders, so we treat each
-     activity as a self-contained order. This means fills from external trades
-     (placed in Alpaca's UI directly) also surface in our Trades / Calendar.
+For each FILL activity Alpaca reports, we:
+  1. Dedup by activity.id (mapped to Fill.broker_fill_id).
+  2. Create a synthetic Order row (status=FILLED) — activities don't always
+     carry a usable order_id linkage, so we treat each activity as a
+     self-contained order. This means fills from external trades (placed
+     in Alpaca's UI directly) also surface in our Trades / Calendar.
   3. Insert a Fill row attached to that Order.
-
-Stocks only for now — options activities are skipped (we can't trade them
-through SnapTrade on the test tier anyway).
 
 Caller commits the session.
 """
@@ -25,9 +21,11 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.brokers import adapter_for
+from app.brokers.alpaca import AlpacaAdapter
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
-from app.services import snaptrade as st
+from app.services.crypto import decrypt_json
 
 
 @dataclass
@@ -35,17 +33,7 @@ class SyncResult:
     fills_added: int
     orders_added: int
     activities_seen: int
-    skipped: int   # non-buy/sell or already-synced
-
-
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    # SnapTrade returns ISO8601 with trailing 'Z'. fromisoformat in 3.11+ handles it.
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
+    skipped: int
 
 
 def _dec(v: Any) -> Decimal:
@@ -57,18 +45,47 @@ def _dec(v: Any) -> Decimal:
         return Decimal(0)
 
 
-def sync_account_fills(db: Session, acct: BrokerAccount, user_secret: str) -> SyncResult:
-    """Pull activities for `acct` from SnapTrade and upsert fills locally.
+def _as_dt(v: Any) -> datetime | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    s = str(v)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _attr(obj: Any, *names: str, default: Any = None) -> Any:
+    """SDK responses are pydantic-ish objects but sometimes dicts; tolerant lookup."""
+    for n in names:
+        if isinstance(obj, dict):
+            v = obj.get(n)
+        else:
+            v = getattr(obj, n, None)
+        if v is not None:
+            return v
+    return default
+
+
+def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
+    """Pull activities for `acct` from its broker and upsert fills locally.
     Idempotent — re-runs are safe."""
-    activities = st.list_account_activities(acct.user_id, user_secret, acct.snaptrade_account_id)
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    if not isinstance(adapter, AlpacaAdapter):
+        return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
+
+    activities = adapter.list_recent_activities()
 
     fills_added = 0
     orders_added = 0
     skipped = 0
 
-    # Pre-fetch existing fills for this account (by broker_fill_id) so we don't
-    # round-trip the DB once per activity.
-    existing_fill_ids: set[str] = set(
+    # Pre-fetch existing fill ids for this account so we don't round-trip
+    # the DB once per activity.
+    existing: set[str] = set(
         r[0] for r in db.execute(
             select(Fill.broker_fill_id)
             .join(Order, Fill.order_id == Order.id)
@@ -77,55 +94,82 @@ def sync_account_fills(db: Session, acct: BrokerAccount, user_secret: str) -> Sy
     )
 
     for entry in activities:
-        if not isinstance(entry, dict):
+        # Alpaca's account-activities endpoint returns mixed types.
+        # We only care about FILL events. activity_type is e.g. "FILL", "DIV", "FEE".
+        atype = str(_attr(entry, "activity_type")).upper()
+        if atype != "FILL":
             skipped += 1
             continue
 
-        # Stocks only. SnapTrade activity `type` for fills is "BUY" or "SELL".
-        # Other types (DIVIDEND, FEE, DEPOSIT, etc.) are skipped.
-        atype = (entry.get("type") or "").upper()
-        if atype not in ("BUY", "SELL"):
+        # FILL fields: id, transaction_time, type (fill/partial_fill), price,
+        # qty, side (buy/sell), symbol, order_id, cum_qty, leaves_qty, ...
+        activity_id = str(_attr(entry, "id") or "")
+        if not activity_id or activity_id in existing:
             skipped += 1
             continue
 
-        # Skip option activities — different lifecycle, not in scope.
-        if entry.get("option_symbol") is not None:
+        side_raw = str(_attr(entry, "side") or "").lower()
+        if side_raw not in ("buy", "sell"):
+            skipped += 1
+            continue
+        side = OrderSide.BUY if side_raw == "buy" else OrderSide.SELL
+
+        symbol_full = str(_attr(entry, "symbol") or "")
+        if not symbol_full:
             skipped += 1
             continue
 
-        activity_id = entry.get("id")
-        if not activity_id or str(activity_id) in existing_fill_ids:
-            skipped += 1
-            continue
+        # OCC option symbols are 21 chars (root padded to 6 + 6 date + 1 cp + 8 strike).
+        # Heuristic: anything 18+ chars with C/P at position -9 is an option.
+        is_option = len(symbol_full) >= 18 and symbol_full[-9] in ("C", "P")
+        if is_option:
+            # Parse OCC: ROOT(6) + YYMMDD(6) + CP(1) + STRIKE*1000(8)
+            # The root might be padded with trailing chars; just split by position.
+            ticker_root = symbol_full[:-15].strip()
+            yymmdd = symbol_full[-15:-9]
+            cp = symbol_full[-9]
+            strike_str = symbol_full[-8:]
+            from datetime import date as _date
+            try:
+                expiry = _date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+                strike = Decimal(int(strike_str)) / Decimal(1000)
+            except Exception:  # noqa: BLE001
+                skipped += 1
+                continue
+            from app.models.order import OptionRight
+            instrument = InstrumentType.OPTION
+            display_symbol = ticker_root
+            option_expiry = expiry
+            option_strike = strike
+            option_right = OptionRight.CALL if cp == "C" else OptionRight.PUT
+        else:
+            instrument = InstrumentType.STOCK
+            display_symbol = symbol_full.upper()
+            option_expiry = None
+            option_strike = None
+            option_right = None
 
-        sym_obj = entry.get("symbol") or {}
-        ticker = sym_obj.get("symbol") or sym_obj.get("raw_symbol")
-        if not ticker:
-            skipped += 1
-            continue
-
-        units = _dec(entry.get("units"))
-        price = _dec(entry.get("price"))
-        fee = _dec(entry.get("fee"))
+        units = _dec(_attr(entry, "qty"))
+        price = _dec(_attr(entry, "price"))
         if units <= 0 or price <= 0:
             skipped += 1
             continue
 
-        trade_at = _parse_dt(entry.get("trade_date")) or datetime.now(timezone.utc)
-        side = OrderSide.BUY if atype == "BUY" else OrderSide.SELL
+        trade_at = _as_dt(_attr(entry, "transaction_time")) or datetime.now(timezone.utc)
 
-        # Synthetic Order. Use activity_id as broker_order_id for cross-run dedup
-        # and so the FIFO calculator has the side/instrument metadata it needs.
         order = Order(
             user_id=acct.user_id,
             broker_account_id=acct.id,
-            instrument_type=InstrumentType.STOCK,
-            symbol=ticker.upper(),
+            instrument_type=instrument,
+            symbol=display_symbol,
+            option_expiry=option_expiry,
+            option_strike=option_strike,
+            option_right=option_right,
             side=side,
             order_type=OrderType.MARKET,
             quantity=units,
             status=OrderStatus.FILLED,
-            broker_order_id=str(activity_id),
+            broker_order_id=activity_id,
             filled_quantity=units,
             filled_avg_price=price,
             submitted_at=trade_at,
@@ -139,16 +183,15 @@ def sync_account_fills(db: Session, acct: BrokerAccount, user_secret: str) -> Sy
             order_id=order.id,
             quantity=units,
             price=price,
-            fee=fee,
+            fee=Decimal(0),
             filled_at=trade_at,
-            broker_fill_id=str(activity_id),
+            broker_fill_id=activity_id,
         )
         db.add(fill)
         fills_added += 1
-        existing_fill_ids.add(str(activity_id))
+        existing.add(activity_id)
 
     acct.last_activity_sync_at = datetime.now(timezone.utc)
-
     return SyncResult(
         fills_added=fills_added,
         orders_added=orders_added,
@@ -158,15 +201,7 @@ def sync_account_fills(db: Session, acct: BrokerAccount, user_secret: str) -> Sy
 
 
 def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
-    """Sync every connected broker for one app user. Best-effort: per-broker
-    failures don't abort the whole sync."""
-    from app.models.user import User
-    user = db.get(User, user_id)
-    if not user or not user.encrypted_snaptrade_user_secret:
-        return {"per_account": [], "fills_added": 0, "orders_added": 0}
-
-    secret = st.decrypt_secret(user.encrypted_snaptrade_user_secret)
-
+    """Sync every connected broker for one app user."""
     accts = list(db.execute(
         select(BrokerAccount).where(BrokerAccount.user_id == user_id)
     ).scalars())
@@ -176,10 +211,10 @@ def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
     total_orders = 0
     for acct in accts:
         try:
-            res = sync_account_fills(db, acct, secret)
+            res = sync_account_fills(db, acct)
             per_account.append({
                 "broker_account_id": str(acct.id),
-                "broker": acct.broker,
+                "broker": acct.broker.value,
                 "fills_added": res.fills_added,
                 "orders_added": res.orders_added,
                 "skipped": res.skipped,
@@ -189,7 +224,7 @@ def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             per_account.append({
                 "broker_account_id": str(acct.id),
-                "broker": acct.broker,
+                "broker": acct.broker.value,
                 "error": str(exc)[:300],
             })
 

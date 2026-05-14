@@ -3,42 +3,42 @@
 @tailwind utilities;
 
 /* ─────────────────────────────────────────────────────────────────────────
-   Design tokens — modern fintech (deep dark + lime green accent)
+   Design tokens — modern fintech (deep dark + cerulean blue accent)
    Change values here; everything inherits.
    ───────────────────────────────────────────────────────────────────────── */
 :root {
   /* Surfaces */
-  --bg:           #07090a;          /* near-black with a hint of cool green */
-  --bg-tint:      #0a0e0c;          /* card surface base */
-  --panel:        #0e1411;          /* one shade above bg */
-  --panel-2:      #131a16;          /* slightly elevated */
+  --bg:           #07090b;          /* near-black with a faint cool tint */
+  --bg-tint:      #0a0d10;          /* card surface base */
+  --panel:        #0e1318;          /* one shade above bg */
+  --panel-2:      #131a20;          /* slightly elevated */
   --border:       rgba(255, 255, 255, 0.06);
   --border-strong:rgba(255, 255, 255, 0.10);
 
   /* Type */
-  --text:         #e9efe8;          /* off-white, slight green tint */
-  --text-2:       #c5cdc4;
-  --muted:        #6e7972;          /* greenish-grey */
-  --faint:        #3a423d;          /* almost-invisible labels */
+  --text:         #e7ecf2;          /* off-white, slight cool tint */
+  --text-2:       #c1c8d1;
+  --muted:        #6c7682;          /* cool grey */
+  --faint:        #3a414a;          /* almost-invisible labels */
 
-  /* Brand accent — lime green */
-  --accent:       #b6ff3c;
-  --accent-2:     #d1ff7a;
-  --accent-ink:   #0a1404;          /* readable foreground over lime */
-  --accent-glow:  rgba(182, 255, 60, 0.22);
+  /* Brand accent — deeper cerulean */
+  --accent:       #0a73a8;
+  --accent-2:     #2c93c5;
+  --accent-ink:   #ffffff;          /* readable foreground over blue */
+  --accent-glow:  rgba(10, 115, 168, 0.22);
 
-  /* Semantic */
-  --good:         #b6ff3c;          /* same as accent — gains are "on brand" */
-  --good-soft:    rgba(182, 255, 60, 0.12);
-  --bad:          #ff6b6b;
-  --bad-soft:     rgba(255, 107, 107, 0.10);
+  /* Semantic — gains green, losses red. Toned down from neon. */
+  --good:         #22c55e;
+  --good-soft:    rgba(34, 197, 94, 0.12);
+  --bad:          #ef4444;
+  --bad-soft:     rgba(239, 68, 68, 0.10);
   --warn:         #ffc857;
 
   /* Gradients — buttons / pill toggles. 135° gives a soft "light from upper-left" feel. */
-  --grad-accent:    linear-gradient(135deg, #d1ff7a 0%, #b6ff3c 45%, #7fcb1e 100%);
-  --grad-accent-hi: linear-gradient(135deg, #e0ffa0 0%, #c8ff5a 45%, #93de2e 100%);
-  --grad-bad:       linear-gradient(135deg, #ff9d9d 0%, #ff6b6b 50%, #d63d3d 100%);
-  --grad-bad-hi:    linear-gradient(135deg, #ffb6b6 0%, #ff8585 50%, #e85555 100%);
+  --grad-accent:    linear-gradient(135deg, #2c93c5 0%, #0a73a8 45%, #074d70 100%);
+  --grad-accent-hi: linear-gradient(135deg, #3da4d4 0%, #1383bb 45%, #0a5a82 100%);
+  --grad-bad:       linear-gradient(135deg, #f87171 0%, #ef4444 50%, #c92626 100%);
+  --grad-bad-hi:    linear-gradient(135deg, #fb8a8a 0%, #f55858 50%, #d63838 100%);
   --grad-ghost:     linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 100%);
 
   /* Radii */
@@ -58,10 +58,10 @@ html, body {
 }
 
 body {
-  /* Subtle ambient green glow in the top-right corner of the viewport */
+  /* Subtle ambient cerulean glow in the corners of the viewport */
   background-image:
-    radial-gradient(1200px 600px at 85% -10%, rgba(182, 255, 60, 0.06), transparent 60%),
-    radial-gradient(900px 500px at -10% 110%, rgba(182, 255, 60, 0.03), transparent 60%);
+    radial-gradient(1200px 600px at 85% -10%, rgba(10, 115, 168, 0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(10, 115, 168, 0.03), transparent 60%);
   background-attachment: fixed;
   min-height: 100vh;
 }
@@ -89,7 +89,7 @@ body {
   align-items: center;
   gap: 4px;
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--r-sm);
   font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.02em;
@@ -97,15 +97,15 @@ body {
   background: var(--panel);
   color: var(--muted);
 }
-.chip-good { background: var(--good-soft); color: var(--good); border-color: rgba(182,255,60,0.25); }
+.chip-good { background: var(--good-soft); color: var(--good); border-color: rgba(34,197,94,0.25); }
 .chip-bad  { background: var(--bad-soft);  color: var(--bad);  border-color: rgba(255,107,107,0.25); }
 
 /* Primary CTA — gradient lime pill */
 .btn-primary {
   background: var(--grad-accent);
   color: var(--accent-ink);
-  border: 1px solid rgba(182, 255, 60, 0.35);
-  border-radius: 999px;
+  border: 1px solid rgba(10, 115, 168, 0.35);
+  border-radius: var(--r-sm);
   font-weight: 600;
   letter-spacing: 0.01em;
   transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
@@ -122,7 +122,7 @@ body {
   background: var(--grad-bad);
   color: var(--accent-ink);
   border: 1px solid rgba(255, 107, 107, 0.35);
-  border-radius: 999px;
+  border-radius: var(--r-sm);
   font-weight: 600;
   letter-spacing: 0.01em;
   transition: background 160ms ease, transform 120ms ease, box-shadow 160ms ease;
@@ -156,7 +156,7 @@ input[type="number"], input[type="date"], select, textarea {
 input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
-  background: rgba(182, 255, 60, 0.04);
+  background: rgba(10, 115, 168, 0.04);
 }
 input::placeholder { color: var(--faint); }
 
@@ -164,10 +164,12 @@ input::placeholder { color: var(--faint); }
 table { border-collapse: separate; border-spacing: 0; }
 thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; font-size: 11px; }
 
-/* Scrollbar polish — dark + thin */
+/* Scrollbar polish — dark + thin. The corner where horizontal + vertical
+   scrollbars meet defaults to system white in WebKit; transparent it. */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--panel-2); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--panel-2); border-radius: var(--r-sm); border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; }
 
 /* Selection */
@@ -177,3 +179,28 @@ thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; 
 .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
 .num-lg { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
 .num-xl { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; }
+
+/* ── react-toastify dark + cerulean theming ────────────────────────────── */
+.Toastify__toast {
+  background: var(--panel) !important;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm) !important;
+  color: var(--text) !important;
+  font-family: inherit;
+  font-size: 13px;
+  min-height: 0;
+  padding: 10px 14px;
+  box-shadow: 0 8px 28px -10px rgba(0, 0, 0, 0.6);
+}
+.Toastify__toast-body {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 0;
+  margin: 0 6px 0 0;
+}
+.Toastify__progress-bar--success { background: var(--good) !important; }
+.Toastify__progress-bar--error   { background: var(--bad) !important; }
+.Toastify__progress-bar--info    { background: var(--accent) !important; }
+.Toastify__progress-bar--warning { background: var(--warn) !important; }
+.Toastify__close-button { color: var(--muted); opacity: 0.8; }
+.Toastify__close-button:hover { color: var(--text); opacity: 1; }

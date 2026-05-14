@@ -1,20 +1,27 @@
+import enum
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
 
 
-class BrokerAccount(Base, TimestampMixin):
-    """One row per brokerage account connected via SnapTrade.
+class BrokerName(str, enum.Enum):
+    """Brokers we directly integrate with. Adding a new one means writing an
+    adapter under app/brokers/."""
+    ALPACA = "alpaca"
 
-    SnapTrade is the only broker integration layer; we don't store broker
-    credentials directly. The snaptrade_account_id is the canonical identifier
-    used for all subsequent API calls (orders, positions, balances).
+
+class BrokerAccount(Base, TimestampMixin):
+    """One connected brokerage account, owned by one app user.
+
+    Credentials are stored encrypted (Fernet) in `encrypted_credentials` as a
+    JSON blob whose shape depends on the broker. For Alpaca it's
+    `{"api_key": "...", "api_secret": "...", "paper": true}`.
     """
 
     __tablename__ = "broker_accounts"
@@ -24,22 +31,27 @@ class BrokerAccount(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
-    # Broker name as reported by SnapTrade (e.g. "ALPACA", "SCHWAB", "WEBULL").
-    # Free-form string — different brokers come and go on SnapTrade's platform.
-    broker: Mapped[str] = mapped_column(String(60), nullable=False)
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
-    is_paper: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    supports_fractional: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-    snaptrade_account_id: Mapped[str] = mapped_column(
-        String(120), unique=True, nullable=False, index=True
+    # values_callable tells SQLAlchemy to send enum.value (e.g. "alpaca") instead
+    # of enum.name ("ALPACA") to Postgres. The DB-side enum was created with the
+    # lowercase value, so this keeps Python ↔ Postgres in sync.
+    broker: Mapped[BrokerName] = mapped_column(
+        Enum(BrokerName, name="broker_name",
+             values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
     )
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    supports_fractional: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # Encrypted JSON blob. Decrypt via services.crypto.decrypt_json.
+    encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Broker's own account number/id for display
     broker_account_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # Balance snapshot — refreshed on broker sync or via the refresh-balance endpoint.
-    # Nullable because we may not have polled yet; balance_updated_at = NULL signals "never fetched".
+    # Cached balance snapshot
     cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
     buying_power: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
     total_equity: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)

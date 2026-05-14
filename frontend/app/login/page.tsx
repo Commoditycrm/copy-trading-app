@@ -3,18 +3,17 @@
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { api, ApiError, setTokens } from "@/lib/api";
+import { api, setTokens } from "@/lib/api";
+import { notify } from "@/lib/toast";
 
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    setErr(null);
     setLoading(true);
     try {
       const res = await api<{ access_token: string; refresh_token: string }>(
@@ -22,10 +21,11 @@ export default function LoginPage() {
         { method: "POST", body: JSON.stringify({ email, password }), auth: false }
       );
       setTokens(res.access_token, res.refresh_token);
+      notify.success("Welcome back");
       // Root page handles role-aware landing (trader → /trade-panel, subscriber → /trades).
       router.replace("/");
     } catch (e) {
-      setErr(e instanceof ApiError ? String(e.detail) : "login failed");
+      notify.fromError(e, "login failed");
     } finally {
       setLoading(false);
     }
@@ -43,7 +43,7 @@ export default function LoginPage() {
             style={{
               width: 40, height: 40,
               clipPath: "polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0% 50%)",
-              background: "linear-gradient(135deg, var(--accent) 0%, #6fd920 100%)",
+              background: "linear-gradient(135deg, var(--accent) 0%, #006fa3 100%)",
             }}
           >
             <span style={{ color: "var(--accent-ink)", fontWeight: 800 }}>Ƈ</span>
@@ -76,12 +76,6 @@ export default function LoginPage() {
             />
           </div>
         </div>
-
-        {err && (
-          <div className="text-sm p-3 rounded" style={{ background: "var(--bad-soft)", color: "var(--bad)" }}>
-            {err}
-          </div>
-        )}
 
         <button
           disabled={loading}

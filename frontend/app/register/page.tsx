@@ -3,7 +3,8 @@
 import { FormEvent, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { api, ApiError, setTokens } from "@/lib/api";
+import { api, setTokens } from "@/lib/api";
+import { notify } from "@/lib/toast";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -12,12 +13,10 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<Role>("subscriber");
   const [displayName, setDisplayName] = useState("");
-  const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    setErr(null);
     setLoading(true);
     try {
       await api("/api/auth/register", {
@@ -30,9 +29,10 @@ export default function RegisterPage() {
         { method: "POST", body: JSON.stringify({ email, password }), auth: false }
       );
       setTokens(tok.access_token, tok.refresh_token);
+      notify.success("Account created");
       router.replace("/");
     } catch (e) {
-      setErr(e instanceof ApiError ? String(e.detail) : "registration failed");
+      notify.fromError(e, "registration failed");
     } finally {
       setLoading(false);
     }
@@ -47,7 +47,7 @@ export default function RegisterPage() {
             style={{
               width: 40, height: 40,
               clipPath: "polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0% 50%)",
-              background: "linear-gradient(135deg, var(--accent) 0%, #6fd920 100%)",
+              background: "linear-gradient(135deg, var(--accent) 0%, #006fa3 100%)",
             }}
           >
             <span style={{ color: "var(--accent-ink)", fontWeight: 800 }}>Ƈ</span>
@@ -81,7 +81,7 @@ export default function RegisterPage() {
                 className="p-2.5 rounded-full text-sm transition-colors"
                 style={{
                   border: `1px solid ${role === "subscriber" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "subscriber" ? "rgba(182,255,60,0.10)" : "transparent",
+                  background: role === "subscriber" ? "rgba(10,115,168,0.12)" : "transparent",
                   color: role === "subscriber" ? "var(--accent)" : "var(--text-2)",
                   fontWeight: role === "subscriber" ? 600 : 500,
                 }}
@@ -90,7 +90,7 @@ export default function RegisterPage() {
                 className="p-2.5 rounded-full text-sm transition-colors"
                 style={{
                   border: `1px solid ${role === "trader" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "trader" ? "rgba(182,255,60,0.10)" : "transparent",
+                  background: role === "trader" ? "rgba(10,115,168,0.12)" : "transparent",
                   color: role === "trader" ? "var(--accent)" : "var(--text-2)",
                   fontWeight: role === "trader" ? 600 : 500,
                 }}
@@ -98,10 +98,6 @@ export default function RegisterPage() {
             </div>
           </div>
         </div>
-
-        {err && (
-          <div className="text-sm p-3 rounded" style={{ background: "var(--bad-soft)", color: "var(--bad)" }}>{err}</div>
-        )}
 
         <button disabled={loading} className="btn-primary w-full py-2.5 text-sm">
           {loading ? "Creating…" : "Create account"}

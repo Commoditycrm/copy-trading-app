@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
+import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
@@ -12,12 +13,8 @@ export default function SettingsPage() {
   const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string }[]>([]);
   const [multInput, setMultInput] = useState("");
   const [multBusy, setMultBusy] = useState(false);
-  const [multErr, setMultErr] = useState<string | null>(null);
   const [limitInput, setLimitInput] = useState("");
   const [limitBusy, setLimitBusy] = useState(false);
-  const [limitErr, setLimitErr] = useState<string | null>(null);
-  const [autoPaused, setAutoPaused] = useState<{ at: number; reason: string; pnl: string; limit: string } | null>(null);
-  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -32,7 +29,7 @@ export default function SettingsPage() {
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
       }
-    })().catch(e => setErr(e instanceof ApiError ? String(e.detail) : String(e)));
+    })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
 
   // Listen for the auto-pause event from the backend so the UI reacts instantly
@@ -41,12 +38,10 @@ export default function SettingsPage() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
     if (e?.type === "copy.auto_paused") {
-      setAutoPaused({
-        at: Date.now(),
-        reason: e.reason,
-        pnl: e.todays_realized_pnl,
-        limit: e.daily_loss_limit,
-      });
+      notify.error(
+        `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily limit ($${e.daily_loss_limit}).`,
+        { autoClose: false }   // sticky — important enough to require dismissal
+      );
       // Pull fresh settings so the UI's copy toggle now shows OFF.
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
     }
@@ -63,12 +58,8 @@ export default function SettingsPage() {
     }));
   }
   async function saveMultiplier() {
-    setMultErr(null);
     setMultBusy(true);
     try {
-      // Round to 1 decimal so manual typing of e.g. "1.234" cleans to "1.2"
-      // before hitting the API. Backend column is Numeric(6,3) — accepts more,
-      // but product rule is "one decimal max".
       const n = Number(multInput);
       if (!Number.isFinite(n) || n <= 0 || n > 10) {
         throw new ApiError(422, "multiplier must be between 0.1 and 10");
@@ -80,14 +71,14 @@ export default function SettingsPage() {
       });
       setSub(s);
       setMultInput(parseFloat(s.multiplier).toString());
+      notify.success(`Multiplier set to ×${parseFloat(s.multiplier).toString()}`);
     } catch (e) {
-      setMultErr(e instanceof ApiError ? String(e.detail) : "could not update multiplier");
+      notify.fromError(e, "Could not update multiplier");
     } finally {
       setMultBusy(false);
     }
   }
   async function saveLimit() {
-    setLimitErr(null);
     setLimitBusy(true);
     try {
       const trimmed = limitInput.trim();
@@ -98,8 +89,9 @@ export default function SettingsPage() {
       });
       setSub(s);
       setLimitInput(s.daily_loss_limit ?? "");
+      notify.success(s.daily_loss_limit ? `Daily loss limit set to $${s.daily_loss_limit}` : "Daily loss limit cleared");
     } catch (e) {
-      setLimitErr(e instanceof ApiError ? String(e.detail) : "could not update limit");
+      notify.fromError(e, "Could not update daily loss limit");
     } finally {
       setLimitBusy(false);
     }
@@ -110,7 +102,6 @@ export default function SettingsPage() {
     }));
   }
 
-  if (err) return <p style={{color: "var(--bad)"}}>{err}</p>;
   if (!user) return <p style={{color: "var(--muted)"}}>Loading…</p>;
 
   // Helper to format a Decimal-like string as USD; "$" sign + 2 dp.
@@ -138,12 +129,6 @@ export default function SettingsPage() {
 
       {user.role === "subscriber" && sub && (
         <>
-          {autoPaused && (
-            <div className="p-3 rounded border" style={{borderColor: "var(--bad)", background: "rgba(239,68,68,0.08)", color: "var(--bad)"}}>
-              <strong>Copy trading auto-paused</strong> · today&rsquo;s realized loss ({fmt(autoPaused.pnl)}) hit your daily limit ({fmt(autoPaused.limit)}). Re-enable below if you want to keep trading.
-            </div>
-          )}
-
           <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
             <h2 className="font-medium">Following trader</h2>
             <select
@@ -181,7 +166,7 @@ export default function SettingsPage() {
               </button>
               {parseFloat(multInput) !== parseFloat(sub.multiplier) && (
                 <button
-                  onClick={() => { setMultInput(parseFloat(sub.multiplier).toString()); setMultErr(null); }}
+                  onClick={() => setMultInput(parseFloat(sub.multiplier).toString())}
                   className="px-3 py-2 text-sm rounded border"
                   style={{borderColor: "var(--border)", color: "var(--muted)"}}
                 >
@@ -192,7 +177,6 @@ export default function SettingsPage() {
                 current: ×{fmtMultiplier(sub.multiplier)}
               </span>
             </div>
-            {multErr && <p className="text-sm" style={{color: "var(--bad)"}}>{multErr}</p>}
           </section>
 
           <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
@@ -262,7 +246,6 @@ export default function SettingsPage() {
                 </button>
               )}
             </div>
-            {limitErr && <p className="text-sm" style={{color: "var(--bad)"}}>{limitErr}</p>}
           </section>
 
           <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>

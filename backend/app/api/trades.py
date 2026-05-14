@@ -6,14 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
-from app.brokers import BrokerOrderRequest, SnapTradeBrokerAdapter
+from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
-from app.services import audit, copy_engine, events, fills_sync, snaptrade as st
+from app.services import audit, copy_engine, events, fills_sync
+from app.services.crypto import decrypt_json
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -103,9 +104,7 @@ def _place_trader_order(
         raise HTTPException(404, "broker_account_not_found")
     if acct.connection_status != "connected":
         raise HTTPException(409, "broker_not_connected")
-    if not trader.encrypted_snaptrade_user_secret:
-        raise HTTPException(409, "snaptrade_not_registered")
-    trader_secret = st.decrypt_secret(trader.encrypted_snaptrade_user_secret)
+    creds = decrypt_json(acct.encrypted_credentials)
 
     order = Order(
         user_id=trader.id,
@@ -125,11 +124,7 @@ def _place_trader_order(
     db.add(order)
     db.flush()
 
-    adapter = SnapTradeBrokerAdapter(
-        app_user_id=trader.id,
-        user_secret=trader_secret,
-        snaptrade_account_id=acct.snaptrade_account_id,
-    )
+    adapter = adapter_for(acct, creds)
     try:
         result = adapter.place_order(
             BrokerOrderRequest(
@@ -213,23 +208,17 @@ def cancel_trade(
         OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED
     ):
         raise HTTPException(409, f"not_cancellable: status is {order.status.value}")
-    if not user.encrypted_snaptrade_user_secret:
-        raise HTTPException(409, "snaptrade_not_registered")
 
     acct = db.get(BrokerAccount, order.broker_account_id)
-    secret = st.decrypt_secret(user.encrypted_snaptrade_user_secret)
+    if acct is None:
+        raise HTTPException(404, "broker_account_missing")
 
     # Best-effort broker call. If the broker rejects (e.g. order already filled),
     # surface the error but DON'T mutate local state — DB stays accurate.
     if order.broker_order_id:
         try:
-            from app.services.snaptrade import _client as _st_client
-            _st_client().trading.cancel_user_account_order(
-                user_id=str(user.id),
-                user_secret=secret,
-                account_id=acct.snaptrade_account_id,
-                brokerage_order_id=order.broker_order_id,
-            )
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter_for(acct, creds).cancel_order(order.broker_order_id)
         except Exception as exc:  # noqa: BLE001
             audit.record(
                 db, actor_user_id=user.id, action="order.cancel_failed",

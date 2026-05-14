@@ -8,15 +8,15 @@ import type { User } from "@/lib/types";
 
 const NAV_TRADER = [
   { href: "/trade-panel", label: "Trade Panel" },
-  { href: "/trades",      label: "Order History" },
-  { href: "/calendar",    label: "Calendar" },
+  { href: "/trades", label: "Order History" },
+  { href: "/calendar", label: "Calendar" },
   { href: "/subscribers", label: "Subscribers" },
-  { href: "/brokers",     label: "Brokers" },
+  { href: "/brokers", label: "Brokers" },
 ];
 const NAV_SUBSCRIBER = [
-  { href: "/trades",   label: "Order History" },
+  { href: "/trades", label: "Order History" },
   { href: "/calendar", label: "Calendar" },
-  { href: "/brokers",  label: "Brokers" },
+  { href: "/brokers", label: "Brokers" },
   { href: "/settings", label: "Settings" },
 ];
 
@@ -28,7 +28,7 @@ function LogoMark() {
       style={{
         width: 36, height: 36,
         clipPath: "polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0% 50%)",
-        background: "linear-gradient(135deg, var(--accent) 0%, #6fd920 100%)",
+        background: "linear-gradient(135deg, var(--accent) 0%, #006fa3 100%)",
       }}
     >
       <span style={{ color: "var(--accent-ink)", fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em" }}>
@@ -94,9 +94,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <LogoMark />
           <div className="leading-tight">
             <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>COPYTRADE</div>
-            <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
-              {user.role}
-            </div>
           </div>
         </div>
 
@@ -106,7 +103,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             className="grid place-items-center rounded-full"
             style={{
               width: 36, height: 36,
-              background: "linear-gradient(135deg, #1f2a23 0%, #0e1411 100%)",
+              background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
               border: "1px solid var(--border)",
               color: "var(--accent)",
               fontWeight: 700, fontSize: 17,
@@ -116,7 +113,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-sm truncate" style={{ fontWeight: 600 }}>{displayName}</div>
-            <div className="text-[11px] truncate" style={{ color: "var(--muted)" }}>{user.email}</div>
+            <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
+              {user.role}
+            </div>
           </div>
         </div>
 
@@ -131,11 +130,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 className="block px-4 py-2.5 rounded-full text-sm transition-colors"
                 style={{
                   background: active
-                    ? "linear-gradient(90deg, rgba(182,255,60,0.14), rgba(182,255,60,0.04))"
+                    ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
                     : "transparent",
                   color: active ? "var(--accent)" : "var(--text-2)",
                   fontWeight: active ? 600 : 500,
-                  border: active ? "1px solid rgba(182,255,60,0.25)" : "1px solid transparent",
+                  border: active ? "1px solid rgba(10,115,168,0.30)" : "1px solid transparent",
                   boxShadow: active ? "0 0 24px -6px var(--accent-glow)" : "none",
                 }}
               >

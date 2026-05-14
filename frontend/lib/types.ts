@@ -8,13 +8,14 @@ export interface User {
   is_active: boolean;
 }
 
+export type BrokerName = "alpaca";
+
 export interface BrokerAccount {
   id: string;
-  broker: string;                  // free-form, returned by SnapTrade (e.g. "ALPACA", "SCHWAB")
+  broker: BrokerName;
   label: string;
   is_paper: boolean;
   supports_fractional: boolean;
-  snaptrade_account_id: string;
   broker_account_number: string | null;
   connection_status: "pending" | "connected" | "error";
   last_error: string | null;
@@ -27,11 +28,6 @@ export interface BrokerAccount {
   balance_updated_at: string | null;
 }
 
-export interface SyncResult {
-  added: number;
-  removed: number;
-  accounts: BrokerAccount[];
-}
 
 export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";

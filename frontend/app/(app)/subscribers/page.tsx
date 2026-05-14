@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { notify } from "@/lib/toast";
 import type { SubscriberSummary } from "@/lib/types";
 
 // Drop trailing zeros from the backend's "1.300" → "1.3", "1.000" → "1".
@@ -12,40 +13,38 @@ const fmtMultiplier = (v: string): string => {
 
 export default function SubscribersPage() {
   const [rows, setRows] = useState<SubscriberSummary[]>([]);
-  const [err, setErr] = useState<string | null>(null);
   const [editing, setEditing] = useState<Record<string, { multiplier: string }>>({});
 
   async function load() {
     try { setRows(await api<SubscriberSummary[]>("/api/subscribers")); }
-    catch (e) { setErr(e instanceof ApiError ? String(e.detail) : String(e)); }
+    catch (e) { notify.fromError(e, "Could not load subscribers"); }
   }
   useEffect(() => { load(); }, []);
 
   async function save(id: string) {
     const cur = editing[id];
     if (!cur) return;
-    // Round to 1 decimal so manual typing of "1.234" cleans to "1.2"
-    // before hitting the API. Matches the subscriber's own settings page.
     const n = Number(cur.multiplier);
     if (!Number.isFinite(n) || n <= 0 || n > 100) {
-      setErr("multiplier must be between 0.1 and 100");
+      notify.warn("Multiplier must be between 0.1 and 100");
       return;
     }
     const rounded = (Math.round(n * 10) / 10).toFixed(1);
-    await api(`/api/subscribers/${id}/multiplier`, {
-      method: "PATCH",
-      body: JSON.stringify({ multiplier: rounded }),
-    });
-    setEditing(prev => { const n = {...prev}; delete n[id]; return n; });
-    load();
+    try {
+      await api(`/api/subscribers/${id}/multiplier`, {
+        method: "PATCH",
+        body: JSON.stringify({ multiplier: rounded }),
+      });
+      setEditing(prev => { const n = {...prev}; delete n[id]; return n; });
+      notify.success(`Multiplier set to ×${rounded}`);
+      load();
+    } catch (e) {
+      notify.fromError(e, "Could not save multiplier");
+    }
   }
-
-  if (err) return <p style={{color: "var(--bad)"}}>{err}</p>;
 
   return (
     <div className="space-y-4 max-w-6xl">
-      <h1 className="text-2xl font-semibold">Subscribers</h1>
-      <p className="text-sm" style={{color: "var(--muted)"}}>People currently following you. Adjust their multiplier to change copy size.</p>
       <div className="overflow-x-auto rounded border" style={{borderColor: "var(--border)"}}>
         <table className="w-full text-sm">
           <thead style={{background: "var(--panel)"}}>
