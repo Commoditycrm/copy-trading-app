@@ -1,4 +1,5 @@
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
@@ -9,7 +10,7 @@ from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
@@ -54,6 +55,97 @@ def get_trade(
     if not order or order.user_id != user.id:
         raise HTTPException(404, "not_found")
     return order
+
+
+_CANCELLABLE_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
+def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
+    """When a trader cancels their root order, cascade-cancel every still-open
+    subscriber mirror at the subscriber's broker. Runs after the trader's HTTP
+    response is sent. Per-mirror failures are audited, not raised."""
+    with SessionLocal() as db:
+        children = list(db.execute(
+            select(Order).where(
+                Order.parent_order_id == trader_order_id,
+                Order.status.in_(_CANCELLABLE_STATUSES),
+            )
+        ).scalars())
+        if not children:
+            return
+
+        pending: list[tuple[Order, object]] = []  # (child, adapter)
+        for child in children:
+            if not child.broker_order_id:
+                # Never made it to the broker — just mark cancelled locally.
+                child.status = OrderStatus.CANCELED
+                child.closed_at = datetime.now(timezone.utc)
+                continue
+            acct = db.get(BrokerAccount, child.broker_account_id)
+            if acct is None:
+                child.status = OrderStatus.CANCELED
+                child.closed_at = datetime.now(timezone.utc)
+                continue
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=child.user_id, action="order.mirror_cancel_creds_error",
+                    entity_type="order", entity_id=child.id,
+                    metadata={"parent_order_id": str(trader_order_id), "error": str(exc)[:300]},
+                )
+                child.status = OrderStatus.CANCELED
+                child.closed_at = datetime.now(timezone.utc)
+                continue
+            pending.append((child, adapter))
+
+        def _cancel(item: tuple[Order, object]) -> tuple[Order, str | None]:
+            ch, ad = item
+            try:
+                ad.cancel_order(ch.broker_order_id)  # type: ignore[attr-defined]
+                return ch, None
+            except Exception as exc:  # noqa: BLE001
+                return ch, str(exc)[:300]
+
+        if pending:
+            with ThreadPoolExecutor(max_workers=min(32, len(pending))) as pool:
+                results = list(pool.map(_cancel, pending))
+            for child, err in results:
+                # Re-fetch through the session in case SQLAlchemy needs it.
+                ch = db.get(Order, child.id)
+                if ch is None:
+                    continue
+                if err is None:
+                    ch.status = OrderStatus.CANCELED
+                    ch.closed_at = datetime.now(timezone.utc)
+                    audit.record(
+                        db, actor_user_id=ch.user_id, action="order.mirror_cancelled",
+                        entity_type="order", entity_id=ch.id,
+                        metadata={
+                            "parent_order_id": str(trader_order_id),
+                            "broker_order_id": ch.broker_order_id,
+                        },
+                    )
+                    events.publish(ch.user_id, copy_engine._order_event("order.cancelled", ch))
+                else:
+                    # Broker rejected (e.g. mirror already filled before we got
+                    # to it). Don't mutate status — sync-fills will reconcile.
+                    audit.record(
+                        db, actor_user_id=ch.user_id, action="order.mirror_cancel_failed",
+                        entity_type="order", entity_id=ch.id,
+                        metadata={
+                            "parent_order_id": str(trader_order_id),
+                            "broker_order_id": ch.broker_order_id,
+                            "error": err,
+                        },
+                    )
+        db.commit()
 
 
 def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.UUID) -> None:
@@ -193,6 +285,7 @@ def place_trade(
 def cancel_trade(
     order_id: uuid.UUID,
     request: Request,
+    background: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> Order:
@@ -239,6 +332,13 @@ def cancel_trade(
     db.commit()
     db.refresh(order)
     events.publish(user.id, copy_engine._order_event("order.cancelled", order))
+
+    # If a trader cancels their own root order, cascade the cancel to every
+    # open subscriber mirror. Subscribers cancelling their own mirror skip
+    # this — there are no children to propagate to.
+    if order.parent_order_id is None and user.role == UserRole.TRADER:
+        background.add_task(_run_cancel_fanout_in_background, order.id)
+
     return order
 
 

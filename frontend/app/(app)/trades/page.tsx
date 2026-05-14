@@ -1,12 +1,12 @@
 "use client";
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { fmtDateTime } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
-import type { Order, OrderStatus, User } from "@/lib/types";
+import type { Order, OrderStatus, Position, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
 
@@ -32,8 +32,25 @@ function expectedPrice(o: Order): string | null {
   return null;
 }
 
+/** Option expiry rendered as a relative day count ("in 2 days", "Today",
+ *  "Expired 3d ago"). UTC-anchored so timezone offsets don't tip the count. */
+function fmtExpiresIn(isoDate: string | null): { text: string; color: string } | null {
+  if (!isoDate) return null;
+  const target = new Date(isoDate + (isoDate.length === 10 ? "T00:00:00Z" : ""));
+  if (Number.isNaN(target.getTime())) return null;
+  const now = new Date();
+  const t0 = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const t1 = Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate());
+  const d = Math.round((t1 - t0) / 86_400_000);
+  if (d < 0) return { text: `Expired ${-d}d ago`, color: "var(--bad)" };
+  if (d === 0) return { text: "Today", color: "var(--bad)" };
+  if (d === 1) return { text: "Tomorrow", color: "var(--bad)" };
+  return { text: `in ${d} days`, color: "var(--text)" };
+}
+
 export default function TradesPage() {
   const [orders, setOrders] = useState<Order[]>([]);
+  const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -43,19 +60,26 @@ export default function TradesPage() {
   const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
   // Per-row limit-price input for the inline "Close at Limit" action.
   const [closePrices, setClosePrices] = useState<Record<string, string>>({});
+  // Coalesce SSE-triggered sync-fills + reload. SSE delivers a mirror order
+  // moments before Alpaca fills it; without a follow-up sync the row sits at
+  // "submitted" forever (and shows a misleading Cancel button) until you
+  // refresh manually.
+  const reconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
-      const [o, u] = await Promise.all([
+      const [o, u, p] = await Promise.all([
         api<Order[]>("/api/trades"),
         api<User>("/api/auth/me"),
+        api<Position[]>("/api/positions").catch(() => [] as Position[]),
       ]);
       if (!cancelled) {
         setOrders(o);
         setUser(u);
+        setPositions(p);
         setLoading(false);
       }
     })();
@@ -66,7 +90,8 @@ export default function TradesPage() {
     if (
       evt.type !== "order.placed" &&
       evt.type !== "order.copy_submitted" &&
-      evt.type !== "order.copy_failed"
+      evt.type !== "order.copy_failed" &&
+      evt.type !== "order.cancelled"
     ) {
       return;
     }
@@ -104,7 +129,29 @@ export default function TradesPage() {
     });
     setFlashId(incoming.id);
     setTimeout(() => setFlashId((f) => (f === incoming.id ? null : f)), 2000);
+
+    // If the incoming order isn't terminal yet (e.g. a fresh mirror sitting at
+    // SUBMITTED), the broker is likely about to fill it within milliseconds.
+    // Schedule a single sync-fills + reload to catch the real status. Coalesce
+    // repeated events into one round-trip.
+    const terminal = incoming.status === "filled" || incoming.status === "canceled" || incoming.status === "rejected";
+    if (!terminal) {
+      if (reconcileTimer.current) clearTimeout(reconcileTimer.current);
+      reconcileTimer.current = setTimeout(async () => {
+        try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* ignore */ }
+        try {
+          const fresh = await api<Order[]>("/api/trades");
+          setOrders(fresh);
+        } catch { /* ignore */ }
+      }, 1500);
+    }
   });
+
+  // Clear the reconcile timer on unmount so it doesn't fire against
+  // a stale component.
+  useEffect(() => {
+    return () => { if (reconcileTimer.current) clearTimeout(reconcileTimer.current); };
+  }, []);
 
   async function cancelOrder(id: string) {
     setActingFor({ id, kind: "cancel" });
@@ -139,6 +186,9 @@ export default function TradesPage() {
       setOrders(cur => [newOrder, ...cur]);
       if (type === "limit") setClosePrices(p => ({ ...p, [id]: "" }));
       notify.success(`Close placed: ${newOrder.side.toUpperCase()} ${newOrder.symbol} (${type})`);
+      // Re-fetch live positions so the Close buttons hide for the contract
+      // we just closed (the SELL fills almost instantly for market orders).
+      api<Position[]>("/api/positions").then(setPositions).catch(() => {});
     } catch (e) {
       notify.fromError(e, "close failed");
     } finally {
@@ -168,7 +218,7 @@ export default function TradesPage() {
             style={{ background: "var(--panel)" }}
           >
             <tr>
-              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Expires at"].map(h => (
+              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Expires in"].map(h => (
                 <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
@@ -177,12 +227,70 @@ export default function TradesPage() {
             {orders.length === 0 && (
               <tr><td colSpan={11} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
-            {orders.map(o => {
+            {(() => {
+              // Only filled orders whose underlying position is still open
+              // can be "closed". An option position is uniquely identified by
+              // its contract (expiry+strike+right), not just the root ticker —
+              // otherwise closing one AAPL call would still light up Close on
+              // every AAPL row because the user holds AAPL stock.
+              // Strike comes back as "200" from the order payload but "200.000"
+              // from the parsed OCC on positions — normalize to a Number string
+              // ("200") so the two compare cleanly. Same defensive normalize on
+              // expiry just in case the date ever lands as a Date string.
+              const normStrike = (s: string | null) => {
+                if (s == null) return "";
+                const n = Number(s);
+                return Number.isFinite(n) ? String(n) : s;
+              };
+              const normExpiry = (s: string | null) => (s ?? "").slice(0, 10);
+              const posKey = (
+                acctId: string,
+                instrument: string,
+                symbol: string,
+                expiry: string | null,
+                strike: string | null,
+                right: string | null,
+              ) =>
+                instrument === "option"
+                  ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
+                  : `${acctId}:STK:${symbol.toUpperCase()}`;
+
+              const heldKeys = new Set(
+                positions
+                  .filter(p => Number(p.quantity) !== 0)
+                  .map(p => posKey(
+                    p.broker_account_id,
+                    p.instrument_type,
+                    p.symbol,
+                    p.option_expiry,
+                    p.option_strike,
+                    p.option_right,
+                  ))
+              );
+              // Hide rows that correspond to an open position — those live in
+              // the Open Positions table on the Trade Panel. Order History
+              // should be the historical record of closed/cancelled/rejected
+              // activity, not duplicate the live-position view.
+              const visibleOrders = orders.filter(o => {
+                if (o.status !== "filled") return true;     // open / cancelled / rejected — always show
+                return !heldKeys.has(posKey(
+                  o.broker_account_id,
+                  o.instrument_type,
+                  o.symbol,
+                  o.option_expiry,
+                  o.option_strike,
+                  o.option_right,
+                ));
+              });
+
+              return visibleOrders.map(o => {
               const isOpen = OPEN_STATUSES.includes(o.status);
               const isFilled = o.status === "filled";
               const isMine = !o.parent_order_id;     // own order (not a mirror)
               const canCancel = isOpen;
-              const canClose = isFilled && user?.role === "trader" && isMine;
+              // No more Close buttons in Order History — close lives on the
+              // Trade Panel's Open Positions table now.
+              const canClose = false;
               return (
                 <Fragment key={o.id}>
                   <tr
@@ -300,16 +408,32 @@ export default function TradesPage() {
                     <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                       {fmtDateTime(o.submitted_at ?? o.created_at)}
                     </td>
-                    {/* Expires at — option contract expiry; "—" for stocks */}
+                    {/* Filled at — latest fill timestamp, or closed_at as fallback
+                        for terminal-but-fillless rows (rejected etc). */}
                     <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                      {o.option_expiry
-                        ? fmtDateTime(o.option_expiry)
-                        : <span style={{ color: "var(--faint)" }}>—</span>}
+                      {(() => {
+                        const lastFillAt = o.fills?.length
+                          ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
+                          : null;
+                        const t = lastFillAt ?? (o.status === "filled" ? o.closed_at : null);
+                        return t ? fmtDateTime(t) : <span style={{ color: "var(--faint)" }}>—</span>;
+                      })()}
                     </td>
+                    {/* Expires in — option contract expiry rendered as a
+                        relative day count; "—" for stocks. */}
+                    {(() => {
+                      const exp = o.instrument_type === "option" ? fmtExpiresIn(o.option_expiry) : null;
+                      return (
+                        <td className="px-5 py-3 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
+                          {exp ? exp.text : "—"}
+                        </td>
+                      );
+                    })()}
                   </tr>
                 </Fragment>
               );
-            })}
+            });
+            })()}
           </tbody>
         </table>
       </div>

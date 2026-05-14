@@ -6,7 +6,8 @@ import { getAccessToken } from "@/lib/api";
 export type AppEvent =
   | { type: "order.placed"; order: OrderEventPayload }
   | { type: "order.copy_submitted"; order: OrderEventPayload }
-  | { type: "order.copy_failed"; order: OrderEventPayload };
+  | { type: "order.copy_failed"; order: OrderEventPayload }
+  | { type: "order.cancelled"; order: OrderEventPayload };
 
 export interface OrderEventPayload {
   id: string;

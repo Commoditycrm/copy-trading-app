@@ -69,6 +69,53 @@ def _attr(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+_NON_TERMINAL_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
+def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
+    """Poll the broker's order endpoint for every non-terminal order on this
+    account. Alpaca's order resource updates instantly on fill, while the
+    activities feed can lag minutes. This keeps Order History fresh without
+    waiting for activities."""
+    open_orders = list(db.execute(
+        select(Order).where(
+            Order.broker_account_id == acct.id,
+            Order.status.in_(_NON_TERMINAL_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars())
+
+    refreshed = 0
+    for order in open_orders:
+        try:
+            res = adapter.get_order(order.broker_order_id)
+        except Exception:  # noqa: BLE001
+            # Order may have been cancelled at the broker side or the id is
+            # stale — don't fail the whole sync over one bad lookup.
+            continue
+        changed = False
+        if res.status != order.status:
+            order.status = res.status
+            changed = True
+        if res.filled_quantity is not None and _dec(res.filled_quantity) != _dec(order.filled_quantity):
+            order.filled_quantity = res.filled_quantity
+            changed = True
+        if res.filled_avg_price is not None and _dec(res.filled_avg_price) != _dec(order.filled_avg_price):
+            order.filled_avg_price = res.filled_avg_price
+            changed = True
+        if res.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED) and order.closed_at is None:
+            order.closed_at = datetime.now(timezone.utc)
+            changed = True
+        if changed:
+            refreshed += 1
+    return refreshed
+
+
 def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
     """Pull activities for `acct` from its broker and upsert fills locally.
     Idempotent — re-runs are safe."""
@@ -76,6 +123,11 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
     adapter = adapter_for(acct, creds)
     if not isinstance(adapter, AlpacaAdapter):
         return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
+
+    # Fast path: refresh status/qty/price for orders we placed that haven't
+    # terminalized yet. Catches fills the moment they happen, instead of
+    # waiting for the activities feed.
+    _refresh_open_orders(db, acct, adapter)
 
     activities = adapter.list_recent_activities()
 
