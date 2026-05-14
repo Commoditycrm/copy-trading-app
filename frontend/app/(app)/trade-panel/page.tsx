@@ -150,6 +150,7 @@ export default function TradePanelPage() {
   const [positionsLoading, setPositionsLoading] = useState(true);
   const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
   const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+  const [exitBusy, setExitBusy] = useState(false);
 
   // Expiries fetched per (symbol, account). Cached client-side
   // so retyping the same symbol doesn't trigger a re-fetch.
@@ -222,6 +223,28 @@ export default function TradePanelPage() {
       notify.fromError(e, "failed to load positions");
     } finally {
       setPositionsLoading(false);
+    }
+  }
+
+  async function exitAll() {
+    if (!confirm("Close ALL open positions at market across every connected broker? This cannot be undone.")) return;
+    setExitBusy(true);
+    try {
+      const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
+        "/api/positions/close-all", { method: "POST" }
+      );
+      if (res.closed_count === 0 && res.failed_count === 0) {
+        notify.info("No open positions to close.");
+      } else if (res.failed_count === 0) {
+        notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market`);
+      } else {
+        notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
+      }
+      refreshPositions();
+    } catch (e) {
+      notify.fromError(e, "Exit all failed");
+    } finally {
+      setExitBusy(false);
     }
   }
 
@@ -639,11 +662,23 @@ export default function TradePanelPage() {
 
   return (
     <div className="space-y-5">
-      <div>
-        <h1 className="text-2xl font-semibold">Trade panel</h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Orders placed here mirror to all subscribers who have copy trading on, scaled by their multiplier.
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold">Trade panel</h1>
+          <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+            Orders placed here mirror to all subscribers who have copy trading on, scaled by their multiplier.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={exitAll}
+          disabled={exitBusy}
+          title="Close every open position at market across all connected brokers"
+          className="btn-danger-soft shrink-0 px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
+        >
+          <span>Exit All Positions</span>
+          {exitBusy && <Spinner />}
+        </button>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-5 items-start">

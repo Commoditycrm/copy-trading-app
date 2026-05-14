@@ -16,7 +16,7 @@ class TraderSettings(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
-    trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trading_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     user = relationship("User", back_populates="trader_settings")
 

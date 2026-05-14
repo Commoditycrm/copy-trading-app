@@ -47,7 +47,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     db.flush()
 
     if user.role == UserRole.TRADER:
-        db.add(TraderSettings(user_id=user.id, trading_enabled=False))
+        db.add(TraderSettings(user_id=user.id, trading_enabled=True))
     else:
         db.add(
             SubscriberSettings(

@@ -10,6 +10,16 @@ import type { User } from "@/lib/types";
 
 interface BulkCopyState { total: number; enabled: number; }
 
+const USER_CACHE_KEY = "trading-app:user";
+
+function loadCachedUser(): User | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(USER_CACHE_KEY);
+    return raw ? JSON.parse(raw) as User : null;
+  } catch { return null; }
+}
+
 const NAV_TRADER = [
   { href: "/trade-panel", label: "Trade Panel" },
   { href: "/trades", label: "Order History" },
@@ -58,45 +68,33 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // unloaded so we can hide the toggle until we know the state.
   const [bulkCopy, setBulkCopy] = useState<BulkCopyState | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
-  const [exitBusy, setExitBusy] = useState(false);
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
+    // Hydrate from cache first so a remount (or hard refresh) renders the
+    // shell instantly instead of flashing "Loading…". Then revalidate.
+    const cached = loadCachedUser();
+    if (cached) {
+      setUser(cached);
+      setLoading(false);
+    }
     api<User>("/api/auth/me")
       .then((u) => {
         setUser(u);
+        try { sessionStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)); } catch {}
         if (u.role === "trader") {
           api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
         }
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) {
-          clearTokens(); router.replace("/login");
+          clearTokens();
+          try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
+          router.replace("/login");
         }
       })
       .finally(() => setLoading(false));
   }, [router]);
-
-  async function exitAll() {
-    if (!confirm("Close ALL open positions at market across every connected broker? This cannot be undone.")) return;
-    setExitBusy(true);
-    try {
-      const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
-        "/api/positions/close-all", { method: "POST" }
-      );
-      if (res.closed_count === 0 && res.failed_count === 0) {
-        notify.info("No open positions to close.");
-      } else if (res.failed_count === 0) {
-        notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market`);
-      } else {
-        notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
-      }
-    } catch (e) {
-      notify.fromError(e, "Exit all failed");
-    } finally {
-      setExitBusy(false);
-    }
-  }
 
   async function toggleBulkCopy() {
     if (!bulkCopy) return;
@@ -255,24 +253,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               </div>
             );
           })()}
-          <div className="flex items-stretch gap-2">
-            <button
-              type="button"
-              onClick={exitAll}
-              disabled={exitBusy}
-              title="Close every open position at market across all connected brokers"
-              className="btn-danger-soft flex-1 min-w-0 px-2 py-2 text-xs font-medium inline-flex items-center justify-center gap-1.5"
-            >
-              <span>Exit All</span>
-              {exitBusy && <Spinner />}
-            </button>
-            <button
-              onClick={() => { clearTokens(); router.replace("/login"); }}
-              className="btn-ghost flex-1 min-w-0 px-2 py-2 text-xs"
-            >
-              Sign out
-            </button>
-          </div>
+          <button
+            onClick={() => {
+              clearTokens();
+              try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
+              router.replace("/login");
+            }}
+            className="btn-ghost w-full px-3 py-2 text-sm"
+          >
+            Sign out
+          </button>
         </div>
       </aside>
 
