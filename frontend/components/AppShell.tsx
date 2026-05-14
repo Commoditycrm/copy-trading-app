@@ -201,78 +201,78 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           })}
         </nav>
 
-        {/* Footer — Exit All + copy-trading master switch (trader only) + sign out */}
+        {/* Footer — copy-trading master switch (trader only) + Exit All + Sign out */}
         <div className="p-3 space-y-2">
           {user.role === "trader" && bulkCopy && (() => {
             const allOff = bulkCopy.enabled === 0;
             const isOn = !allOff;   // any-on collapses to ON (next toggle turns all off)
             const disabled = bulkBusy || bulkCopy.total === 0;
             return (
-              <div className="flex items-stretch gap-2">
+              <div
+                className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
+                style={{
+                  borderColor: "var(--border)",
+                  background: "rgba(255,255,255,0.02)",
+                }}
+              >
+                <div className="text-sm font-medium truncate">Copy trading</div>
                 <button
                   type="button"
-                  onClick={exitAll}
-                  disabled={exitBusy}
-                  title="Close every open position at market across all connected brokers"
-                  className="btn-danger-soft flex-1 min-w-0 px-2 py-2 text-xs font-medium inline-flex items-center justify-center gap-1.5"
-                >
-                  <span>Exit All</span>
-                  {exitBusy && <Spinner />}
-                </button>
-                <div
-                  className="flex-1 min-w-0 flex items-center justify-between gap-2 rounded-lg border px-2 py-2"
+                  onClick={toggleBulkCopy}
+                  disabled={disabled}
+                  role="switch"
+                  aria-checked={isOn}
+                  title={
+                    bulkCopy.total === 0
+                      ? "No subscribers following you yet"
+                      : isOn ? "Turn copy off for all subscribers"
+                      : "Turn copy on for all subscribers"
+                  }
+                  className="relative shrink-0 rounded-full transition-colors"
                   style={{
-                    borderColor: "var(--border)",
-                    background: "rgba(255,255,255,0.02)",
+                    width: 32, height: 18,
+                    background: isOn ? "var(--good)" : "var(--border)",
+                    opacity: disabled ? 0.5 : 1,
+                    cursor: disabled ? "not-allowed" : "pointer",
                   }}
                 >
-                  <div className="text-xs font-medium truncate">Copy</div>
-                  <button
-                    type="button"
-                    onClick={toggleBulkCopy}
-                    disabled={disabled}
-                    role="switch"
-                    aria-checked={isOn}
-                    title={
-                      bulkCopy.total === 0
-                        ? "No subscribers following you yet"
-                        : isOn ? "Turn copy off for all subscribers"
-                        : "Turn copy on for all subscribers"
-                    }
-                    className="relative shrink-0 rounded-full transition-colors"
+                  <span
+                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
                     style={{
-                      width: 32, height: 18,
-                      background: isOn ? "var(--good)" : "var(--border)",
-                      opacity: disabled ? 0.5 : 1,
-                      cursor: disabled ? "not-allowed" : "pointer",
+                      width: 14, height: 14,
+                      left: isOn ? 16 : 2,
+                      background: "#fff",
+                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
                     }}
                   >
-                    <span
-                      className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
-                      style={{
-                        width: 14, height: 14,
-                        left: isOn ? 16 : 2,
-                        background: "#fff",
-                        boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                      }}
-                    >
-                      {bulkBusy && (
-                        <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
-                          <Spinner />
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                </div>
+                    {bulkBusy && (
+                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
+                        <Spinner />
+                      </span>
+                    )}
+                  </span>
+                </button>
               </div>
             );
           })()}
-          <button
-            onClick={() => { clearTokens(); router.replace("/login"); }}
-            className="btn-ghost w-full px-3 py-2 text-sm"
-          >
-            Sign out
-          </button>
+          <div className="flex items-stretch gap-2">
+            <button
+              type="button"
+              onClick={exitAll}
+              disabled={exitBusy}
+              title="Close every open position at market across all connected brokers"
+              className="btn-danger-soft flex-1 min-w-0 px-2 py-2 text-xs font-medium inline-flex items-center justify-center gap-1.5"
+            >
+              <span>Exit All</span>
+              {exitBusy && <Spinner />}
+            </button>
+            <button
+              onClick={() => { clearTokens(); router.replace("/login"); }}
+              className="btn-ghost flex-1 min-w-0 px-2 py-2 text-xs"
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </aside>
 
