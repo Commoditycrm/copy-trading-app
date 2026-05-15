@@ -82,6 +82,12 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
     results: list[FanoutResult] = []
     pending: list[_PendingMirror] = []
 
+    # Trader master pause — skip all fanout when set. Subscribers' own
+    # copy_enabled flags are unaffected; they just don't receive this trade.
+    ts = db.get(TraderSettings, trader.id)
+    if ts is not None and ts.copy_paused:
+        return results
+
     # ── Phase 1: build child orders + skip records ─────────────────────────
     sub_rows = (
         db.execute(
