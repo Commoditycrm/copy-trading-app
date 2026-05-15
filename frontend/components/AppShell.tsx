@@ -8,7 +8,7 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
 
-interface BulkCopyState { total: number; enabled: number; }
+interface BulkCopyState { total: number; enabled: number; paused: boolean; }
 
 const USER_CACHE_KEY = "trading-app:user";
 
@@ -117,8 +117,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   async function toggleBulkCopy() {
     if (!bulkCopy) return;
-    // Mixed state and any-on collapse to "off". All-off → "on".
-    const next = bulkCopy.enabled === 0;
+    // Toggle master pause. `enabled` in the payload means "fanout enabled" —
+    // resume when currently paused, pause when currently running.
+    const next = bulkCopy.paused;
     setBulkBusy(true);
     try {
       const res = await api<BulkCopyState>("/api/subscribers/copy-state", {
@@ -127,8 +128,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       setBulkCopy(res);
       notify.success(
         next
-          ? `Copy trading ON for ${res.enabled}/${res.total} subscribers`
-          : `Copy trading OFF for all subscribers`
+          ? "Copy trading resumed for subscribers"
+          : "Copy trading paused — subscribers will not receive new trades"
       );
     } catch (e) {
       notify.fromError(e, "Could not update copy trading");
@@ -227,9 +228,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <div className="p-3 space-y-2">
           {user.role === "subscriber" && subCopy && (() => {
             const isOn = subCopy.copy_enabled;
-            // Subscriber can't enable while the trader is paused.
-            const lockedByTrader = !!subCopy.trader_paused && !isOn;
-            const disabled = subCopyBusy || lockedByTrader;
+            const disabled = subCopyBusy;
             return (
               <div
                 className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
@@ -245,11 +244,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   disabled={disabled}
                   role="switch"
                   aria-checked={isOn}
-                  title={
-                    lockedByTrader
-                      ? "Trader has paused copy trading"
-                      : isOn ? "Turn copy off" : "Turn copy on"
-                  }
+                  title={isOn ? "Turn copy off" : "Turn copy on"}
                   className="relative shrink-0 rounded-full transition-colors"
                   style={{
                     width: 32, height: 18,
@@ -278,9 +273,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             );
           })()}
           {user.role === "trader" && bulkCopy && (() => {
-            const allOff = bulkCopy.enabled === 0;
-            const isOn = !allOff;   // any-on collapses to ON (next toggle turns all off)
-            const disabled = bulkBusy || bulkCopy.total === 0;
+            // The toggle reflects the trader-side master fanout gate, not
+            // subscribers' individual flags. ON = fanout active, OFF = paused.
+            const isOn = !bulkCopy.paused;
+            const disabled = bulkBusy;
             return (
               <div
                 className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
@@ -296,12 +292,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   disabled={disabled}
                   role="switch"
                   aria-checked={isOn}
-                  title={
-                    bulkCopy.total === 0
-                      ? "No subscribers following you yet"
-                      : isOn ? "Turn copy off for all subscribers"
-                      : "Turn copy on for all subscribers"
-                  }
+                  title={isOn ? "Pause copy trading" : "Resume copy trading"}
                   className="relative shrink-0 rounded-full transition-colors"
                   style={{
                     width: 32, height: 18,

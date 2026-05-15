@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import client_ip, require_trader
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
-from app.models.settings import SubscriberSettings
+from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User
 from app.schemas.settings import (
     BulkCopyStateOut,
@@ -58,19 +58,23 @@ def list_subscribers(
     return out
 
 
-@router.get("/copy-state", response_model=BulkCopyStateOut)
-def get_bulk_copy_state(
-    db: Session = Depends(get_db), trader: User = Depends(require_trader)
-) -> BulkCopyStateOut:
-    """Aggregate copy_enabled count across all subscribers following this trader."""
+def _bulk_state(db: Session, trader_id) -> BulkCopyStateOut:
     rows = db.execute(
         select(SubscriberSettings.copy_enabled).where(
-            SubscriberSettings.following_trader_id == trader.id
+            SubscriberSettings.following_trader_id == trader_id
         )
     ).all()
     total = len(rows)
     enabled = sum(1 for (e,) in rows if e)
-    return BulkCopyStateOut(total=total, enabled=enabled)
+    ts = db.get(TraderSettings, trader_id)
+    return BulkCopyStateOut(total=total, enabled=enabled, paused=bool(ts and ts.copy_paused))
+
+
+@router.get("/copy-state", response_model=BulkCopyStateOut)
+def get_bulk_copy_state(
+    db: Session = Depends(get_db), trader: User = Depends(require_trader)
+) -> BulkCopyStateOut:
+    return _bulk_state(db, trader.id)
 
 
 @router.patch("/copy-state", response_model=BulkCopyStateOut)
@@ -80,35 +84,24 @@ def set_bulk_copy_state(
     db: Session = Depends(get_db),
     trader: User = Depends(require_trader),
 ) -> BulkCopyStateOut:
-    """Flip copy_enabled for every subscriber currently following this trader.
-    Useful as a master kill switch the trader controls from the sidebar."""
-    subs = db.execute(
-        select(SubscriberSettings).where(
-            SubscriberSettings.following_trader_id == trader.id
-        )
-    ).scalars().all()
-    changed = 0
-    for s in subs:
-        if s.copy_enabled != payload.enabled:
-            s.copy_enabled = payload.enabled
-            changed += 1
+    """Master fanout gate. `enabled=false` pauses fanout to all subscribers
+    without touching their individual copy_enabled flags. `enabled=true`
+    resumes — subscribers' own preferences take over again."""
+    ts = db.get(TraderSettings, trader.id)
+    if ts is None:
+        raise HTTPException(404, "settings_missing")
+    ts.copy_paused = not payload.enabled
     audit.record(
         db,
         actor_user_id=trader.id,
-        action="trader.bulk_copy_toggle",
-        entity_type="trader",
+        action="trader.copy_paused" if ts.copy_paused else "trader.copy_resumed",
+        entity_type="trader_settings",
         entity_id=trader.id,
-        metadata={
-            "target_state": str(payload.enabled),
-            "subscribers_total": len(subs),
-            "subscribers_changed": changed,
-        },
+        metadata={"copy_paused": ts.copy_paused},
         ip_address=client_ip(request),
     )
     db.commit()
-    total = len(subs)
-    enabled = sum(1 for s in subs if s.copy_enabled)
-    return BulkCopyStateOut(total=total, enabled=enabled)
+    return _bulk_state(db, trader.id)
 
 
 @router.patch("/{subscriber_id}/multiplier")

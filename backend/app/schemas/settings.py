@@ -54,11 +54,13 @@ class SubscriberMultiplierIn(BaseModel):
 
 
 class BulkCopyStateOut(BaseModel):
-    """Aggregate copy_enabled state across a trader's subscribers.
-    `enabled` = how many have copy on; `total` = how many follow this trader."""
+    """`total`/`enabled` reflect subscribers' own copy flags (informational).
+    `paused` is the trader-side master fanout gate — when True, no mirrors
+    are placed regardless of subscribers' individual settings."""
 
     total: int
     enabled: int
+    paused: bool = False
 
 
 class BulkCopyToggleIn(BaseModel):

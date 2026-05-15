@@ -17,6 +17,10 @@ class TraderSettings(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     trading_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Pause fanout to subscribers. Pure gate — subscribers' own copy_enabled
+    # flags are NOT touched when this flips. When True, fanout skips everyone
+    # regardless of their preference.
+    copy_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     user = relationship("User", back_populates="trader_settings")
 
