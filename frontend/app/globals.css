@@ -193,6 +193,29 @@ input:focus, select:focus, textarea:focus {
 }
 input::placeholder { color: var(--faint); }
 
+/* Browser autofill paints a yellow/white background on Chrome/Edge that
+   ignores our `background` property. The canonical workaround is a giant
+   inset box-shadow in our own bg color (since autofill _will_ honor
+   box-shadow), plus -webkit-text-fill-color so the typed text stays in
+   our theme color. The 5000s transition delay handles deferred autofill
+   on focus. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px var(--bg) inset !important;
+  box-shadow: 0 0 0 1000px var(--bg) inset !important;
+  -webkit-text-fill-color: var(--text) !important;
+  caret-color: var(--text);
+  transition: background-color 5000s ease-in-out 0s;
+}
+
 /* Hide the native number-input spinner arrows everywhere — WebKit + Firefox.
    Users can still type or paste; arrow keys still work. */
 input[type="number"]::-webkit-inner-spin-button,

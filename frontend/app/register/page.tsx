@@ -43,18 +43,15 @@ export default function RegisterPage() {
     <main className="min-h-screen grid place-items-center p-6">
       <form onSubmit={submit} className="card w-full max-w-md p-8 space-y-5">
         <div className="flex items-center gap-3">
-          <div
-            className="grid place-items-center"
-            style={{
-              width: 40, height: 40,
-              clipPath: "polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0% 50%)",
-              background: "linear-gradient(135deg, var(--accent) 0%, #006fa3 100%)",
-            }}
-          >
-            <span style={{ color: "var(--accent-ink)", fontWeight: 800 }}>Ƈ</span>
-          </div>
+          <img
+            src="/brand-icon.avif"
+            alt="The Option Haven"
+            width={45}
+            height={45}
+            style={{ width: 45, height: 45, borderRadius: 8, objectFit: "cover" }}
+          />
           <div>
-            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>COPYTRADE</div>
+            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>The Option Haven</div>
             <div className="text-xs" style={{ color: "var(--muted)" }}>Create an account</div>
           </div>
         </div>

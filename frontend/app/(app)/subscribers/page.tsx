@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { Spinner } from "@/components/Spinner";
 import type { SubscriberSummary } from "@/lib/types";
 
 // Drop trailing zeros from the backend's "1.300" → "1.3", "1.000" → "1".
@@ -14,10 +15,12 @@ const fmtMultiplier = (v: string): string => {
 export default function SubscribersPage() {
   const [rows, setRows] = useState<SubscriberSummary[]>([]);
   const [editing, setEditing] = useState<Record<string, { multiplier: string }>>({});
+  const [loading, setLoading] = useState(true);
 
   async function load() {
     try { setRows(await api<SubscriberSummary[]>("/api/subscribers")); }
     catch (e) { notify.fromError(e, "Could not load subscribers"); }
+    finally { setLoading(false); }
   }
   useEffect(() => { load(); }, []);
 
@@ -55,7 +58,17 @@ export default function SubscribersPage() {
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
+            {loading && (
+              <tr>
+                <td colSpan={6} className="px-3 py-8 text-center" style={{color: "var(--muted)"}}>
+                  <span className="inline-flex items-center gap-2">
+                    <Spinner />
+                    <span>Loading subscribers…</span>
+                  </span>
+                </td>
+              </tr>
+            )}
+            {!loading && rows.length === 0 && (
               <tr><td colSpan={6} className="px-3 py-6 text-center" style={{color: "var(--muted)"}}>No subscribers yet.</td></tr>
             )}
             {rows.map(r => {
