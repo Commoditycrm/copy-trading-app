@@ -48,11 +48,8 @@ export default function SettingsPage() {
     }
   });
 
-  async function toggleCopy(next: boolean) {
-    setSub(await api<SubscriberSettings>("/api/settings/subscriber/copy", {
-      method: "PATCH", body: JSON.stringify({ copy_enabled: next })
-    }));
-  }
+  // Copy on/off lives in the sidebar now — keep the patch path documented
+  // there only.
   async function follow(traderId: string | null) {
     setSub(await api<SubscriberSettings>("/api/settings/subscriber/follow", {
       method: "PATCH", body: JSON.stringify({ trader_id: traderId })
@@ -251,23 +248,6 @@ export default function SettingsPage() {
             </div>
           </section>
 
-          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="font-medium">Copy trading</h2>
-                <p className="text-sm" style={{color: "var(--muted)"}}>
-                  When ON, your linked broker accounts mirror the trader at multiplier ×{fmtMultiplier(sub.multiplier)}.
-                </p>
-              </div>
-              <button
-                onClick={() => toggleCopy(!sub.copy_enabled)}
-                className="px-4 py-2 rounded font-medium"
-                style={{background: sub.copy_enabled ? "var(--good)" : "var(--border)", color: sub.copy_enabled ? "#06121f" : "var(--text)"}}
-              >
-                {sub.copy_enabled ? "ON" : "OFF"}
-              </button>
-            </div>
-          </section>
         </>
       )}
 

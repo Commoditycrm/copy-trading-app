@@ -171,7 +171,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
           : `${acctId}:STK:${symbol.toUpperCase()}`;
 
-      const byKey = new Map<string, { submitted_at: string | null; filled_at: string | null }>();
+      const byKey = new Map<string, {
+        submitted_at: string | null;
+        filled_at: string | null;
+        filled_avg_price: string | null;
+      }>();
       for (const o of orders) {
         if (o.status !== "filled" && o.status !== "partially_filled") continue;
         const k = key(o.broker_account_id, o.instrument_type, o.symbol, o.option_expiry, o.option_strike, o.option_right);
@@ -181,7 +185,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         const prev = byKey.get(k);
         // Keep the latest record per contract (by fill time).
         if (!prev || (lastFillAt ?? "") > (prev.filled_at ?? "")) {
-          byKey.set(k, { submitted_at: o.submitted_at ?? o.created_at, filled_at: lastFillAt });
+          byKey.set(k, {
+            submitted_at: o.submitted_at ?? o.created_at,
+            filled_at: lastFillAt,
+            filled_avg_price: o.filled_avg_price,
+          });
         }
       }
       return { byKey, key };
@@ -236,7 +244,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
+                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
@@ -244,7 +252,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={13} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={14} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                     <span className="inline-flex items-center gap-2">
                       <Spinner />
                       <span>Loading positions…</span>
@@ -254,7 +262,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               )}
               {!loading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={14} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
                     {positions.length === 0
                       ? "No open positions."
                       : filter === "option" ? "No open option positions."
@@ -357,6 +365,17 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       </td>
                       <td className="px-5 py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
                       <td className="px-5 py-3 num">{fmtNum(p.current_price, 2)}</td>
+                      {(() => {
+                        const t = orderTimestamps.byKey.get(orderTimestamps.key(
+                          p.broker_account_id, p.instrument_type, p.symbol,
+                          p.option_expiry, p.option_strike, p.option_right,
+                        ));
+                        return (
+                          <td className="px-5 py-3 num">
+                            {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
+                          </td>
+                        );
+                      })()}
                       <td className="px-5 py-3 num">{fmtNum(p.market_value, 2)}</td>
                       <td
                         className="px-5 py-3 num"
