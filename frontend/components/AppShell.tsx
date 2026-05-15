@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
-import type { User } from "@/lib/types";
+import type { SubscriberSettings, User } from "@/lib/types";
 
 interface BulkCopyState { total: number; enabled: number; }
 
@@ -65,6 +65,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // unloaded so we can hide the toggle until we know the state.
   const [bulkCopy, setBulkCopy] = useState<BulkCopyState | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Subscriber-only personal copy switch (same UX, different endpoint).
+  const [subCopy, setSubCopy] = useState<SubscriberSettings | null>(null);
+  const [subCopyBusy, setSubCopyBusy] = useState(false);
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
@@ -81,6 +84,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         try { sessionStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)); } catch {}
         if (u.role === "trader") {
           api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+        } else {
+          api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
         }
       })
       .catch((e) => {
@@ -92,6 +97,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       })
       .finally(() => setLoading(false));
   }, [router]);
+
+  async function toggleSubscriberCopy() {
+    if (!subCopy) return;
+    const next = !subCopy.copy_enabled;
+    setSubCopyBusy(true);
+    try {
+      const updated = await api<SubscriberSettings>("/api/settings/subscriber/copy", {
+        method: "PATCH", body: JSON.stringify({ copy_enabled: next }),
+      });
+      setSubCopy(updated);
+      notify.success(next ? "Copy trading ON" : "Copy trading OFF");
+    } catch (e) {
+      notify.fromError(e, "Could not update copy trading");
+    } finally {
+      setSubCopyBusy(false);
+    }
+  }
 
   async function toggleBulkCopy() {
     if (!bulkCopy) return;
@@ -179,6 +201,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               <Link
                 key={item.href}
                 href={item.href}
+                // Disable prefetch: a failed RSC prefetch (auth wall, CDN
+                // hiccup, etc.) on Vercel poisons the next click into a hard
+                // reload. Sidebar has 5-6 routes, prefetch is not worth the
+                // failure mode.
+                prefetch={false}
                 className="block px-4 py-2.5 rounded-full text-sm transition-colors"
                 style={{
                   background: active
@@ -196,8 +223,60 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           })}
         </nav>
 
-        {/* Footer — copy-trading master switch (trader only) + Exit All + Sign out */}
+        {/* Footer — copy-trading switch (trader: master; subscriber: own) + Sign out */}
         <div className="p-3 space-y-2">
+          {user.role === "subscriber" && subCopy && (() => {
+            const isOn = subCopy.copy_enabled;
+            // Subscriber can't enable while the trader is paused.
+            const lockedByTrader = !!subCopy.trader_paused && !isOn;
+            const disabled = subCopyBusy || lockedByTrader;
+            return (
+              <div
+                className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
+                style={{
+                  borderColor: "var(--border)",
+                  background: "rgba(255,255,255,0.02)",
+                }}
+              >
+                <div className="text-sm font-medium truncate">Copy trading</div>
+                <button
+                  type="button"
+                  onClick={toggleSubscriberCopy}
+                  disabled={disabled}
+                  role="switch"
+                  aria-checked={isOn}
+                  title={
+                    lockedByTrader
+                      ? "Trader has paused copy trading"
+                      : isOn ? "Turn copy off" : "Turn copy on"
+                  }
+                  className="relative shrink-0 rounded-full transition-colors"
+                  style={{
+                    width: 32, height: 18,
+                    background: isOn ? "var(--good)" : "var(--border)",
+                    opacity: disabled ? 0.5 : 1,
+                    cursor: disabled ? "not-allowed" : "pointer",
+                  }}
+                >
+                  <span
+                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
+                    style={{
+                      width: 14, height: 14,
+                      left: isOn ? 16 : 2,
+                      background: "#fff",
+                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+                    }}
+                  >
+                    {subCopyBusy && (
+                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
+                        <Spinner />
+                      </span>
+                    )}
+                  </span>
+                </button>
+              </div>
+            );
+          })()}
           {user.role === "trader" && bulkCopy && (() => {
             const allOff = bulkCopy.enabled === 0;
             const isOn = !allOff;   // any-on collapses to ON (next toggle turns all off)

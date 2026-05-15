@@ -51,6 +51,13 @@ function fmtMoney(n: number | null | undefined): string {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
 
+// Top-10 most-traded US underlyings (by option-volume reputation, not a feed).
+// Used for the quick-pick chip row above the Symbol input.
+const POPULAR_SYMBOLS = [
+  "AAPL", "NVDA", "TSLA", "AMZN", "MSFT",
+  "META", "GOOGL", "AMD",
+];
+
 // ── shared style helpers ─────────────────────────────────────────────────────
 
 const sectionStyle: React.CSSProperties = {
@@ -145,7 +152,7 @@ export default function TradePanelPage() {
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
   const [last, setLast] = useState<Order | null>(null);
-  const [summaryOpen, setSummaryOpen] = useState(true);
+  const [summaryOpen, setSummaryOpen] = useState(false);
 
   // Open positions table — owned by the shared component. We keep a ref so
   // we can ask it to refresh after a fresh order or exit-all.
@@ -347,6 +354,32 @@ export default function TradePanelPage() {
         <div className="flex gap-2">
           <SegBtn active={instrument === "option"} onClick={() => setInstrument("option")}>Options</SegBtn>
           <SegBtn active={instrument === "stock"} onClick={() => setInstrument("stock")}>Stocks</SegBtn>
+        </div>
+      </div>
+
+      {/* Quick-pick: most-traded US underlyings. Click sets the Symbol field. */}
+      <div>
+        <Label>Popular symbols</Label>
+        <div className="flex flex-wrap gap-2">
+          {POPULAR_SYMBOLS.map((tk) => {
+            const selected = symbol.trim().toUpperCase() === tk;
+            return (
+              <button
+                key={tk}
+                type="button"
+                onClick={() => setSymbol(tk)}
+                aria-pressed={selected}
+                className="px-3 py-1 text-xs font-medium rounded-full transition-colors"
+                style={{
+                  border: `1px solid ${selected ? "rgba(10,115,168,0.5)" : "var(--border)"}`,
+                  background: selected ? "var(--accent)" : "transparent",
+                  color: selected ? "var(--accent-ink)" : "var(--text-2)",
+                }}
+              >
+                {tk}
+              </button>
+            );
+          })}
         </div>
       </div>
 
