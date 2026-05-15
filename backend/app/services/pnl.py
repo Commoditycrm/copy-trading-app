@@ -54,25 +54,55 @@ def realized_pnl_by_day(
     db: Session, user_id: uuid.UUID, start: date | None = None, end: date | None = None
 ) -> dict[date, tuple[Decimal, int]]:
     """Returns {day: (realized_pnl, trade_count)}. trade_count is the number of
-    closing fills on that day."""
-    q = (
-        select(Fill, Order)
-        .join(Order, Fill.order_id == Order.id)
-        .where(Order.user_id == user_id)
-        .order_by(Fill.filled_at.asc())
-    )
-    rows: list[tuple[Fill, Order]] = list(db.execute(q).all())
+    closing fills on that day.
+
+    Source of truth is the `fills` table. For freshly filled orders whose
+    detailed Fill rows haven't synced from the broker's activity feed yet,
+    we synthesize a single fill from the order's aggregate `filled_quantity`
+    + `filled_avg_price` so P&L shows up immediately instead of lagging
+    minutes behind the broker.
+    """
+    # All orders the user owns that have any fill quantity recorded.
+    orders: list[Order] = list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+    ).scalars())
+
+    # All Fill rows for those orders (one query, then bucket).
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    if order_ids:
+        for f in db.execute(
+            select(Fill).where(Fill.order_id.in_(order_ids))
+        ).scalars():
+            fills_by_order[f.order_id].append(f)
+
+    # Flatten to a sortable timeline of (when, qty, price, order). If the order
+    # has explicit fills, use them; otherwise synthesize one from the aggregate.
+    timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []
+    for o in orders:
+        fs = fills_by_order.get(o.id)
+        if fs:
+            for f in fs:
+                timeline.append((f.filled_at, f.quantity, f.price, o))
+        else:
+            when = o.closed_at or o.submitted_at or o.created_at
+            timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
+    timeline.sort(key=lambda e: e[0])
 
     open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
     daily: dict[date, tuple[Decimal, int]] = defaultdict(lambda: (Decimal(0), 0))
 
-    for fill, order in rows:
+    for filled_at, fill_qty, fill_price, order in timeline:
         key = _instrument_key(order)
         # Options P&L multiplier — 100 shares per contract for standard US options.
         unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
-        qty = fill.quantity
-        price = fill.price
-        day = fill.filled_at.astimezone(timezone.utc).date()
+        qty = fill_qty
+        price = fill_price
+        day = filled_at.astimezone(timezone.utc).date()
         if start and day < start:
             pass  # we still need to walk earlier fills to keep lots correct
         if end and day > end:
