@@ -196,7 +196,8 @@ export default function TradesPage() {
     }
   }
 
-  if (loading) return <p style={{ color: "var(--muted)" }}>Loading trades…</p>;
+  // Don't early-return — render the table shell immediately so the headers
+  // are visible while the data is loading; a spinner row goes inside the body.
 
   return (
     // Flex column with full height so the table can claim all leftover vertical
@@ -224,8 +225,18 @@ export default function TradesPage() {
             </tr>
           </thead>
           <tbody>
-            {orders.length === 0 && (
-              <tr><td colSpan={11} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
+            {loading && (
+              <tr>
+                <td colSpan={12} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <span className="inline-flex items-center gap-2">
+                    <Spinner />
+                    <span>Loading orders…</span>
+                  </span>
+                </td>
+              </tr>
+            )}
+            {!loading && orders.length === 0 && (
+              <tr><td colSpan={12} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
             {(() => {
               // Only filled orders whose underlying position is still open

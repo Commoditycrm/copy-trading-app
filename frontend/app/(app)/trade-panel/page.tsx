@@ -401,7 +401,7 @@ export default function TradePanelPage() {
                     {expiriesLoading
                       ? "loading…"
                       : !symbol
-                        ? "Enter symbol first"
+                        ? "Expiry"
                         : expiries.length === 0
                           ? "no expiries"
                           : "— select —"}
@@ -548,7 +548,7 @@ export default function TradePanelPage() {
             <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>
               {isOption ? "OCC symbol" : "Symbol"}
             </div>
-            <div className="font-mono text-sm break-all p-2 mt-1 rounded" style={{ background: "rgba(255,255,255,0.03)" }}>
+            <div className="font-mono text-xs break-all p-2 mt-1 rounded" style={{ background: "rgba(255,255,255,0.03)" }}>
               {isOption
                 ? (occ ?? <span style={{ color: "var(--muted)" }}>fill in expiry, strike & right</span>)
                 : (symbol ? symbol.toUpperCase() : <span style={{ color: "var(--muted)" }}>enter a ticker</span>)
@@ -575,7 +575,7 @@ export default function TradePanelPage() {
               <Row
                 label="Quantity"
                 value={qty
-                  ? `${qty} ${isOption ? `contract${Number(qty) === 1 ? "" : "s"}` : `share${Number(qty) === 1 ? "" : "s"}`}`
+                  ? `${qty} ${isOption ? `Contract${Number(qty) === 1 ? "" : "s"}` : `share${Number(qty) === 1 ? "" : "s"}`}`
                   : "—"}
               />
               <Row label="Order type" value={orderType.replace("_", "-")} />
@@ -663,7 +663,7 @@ function Row({
   return (
     <div className="flex justify-between gap-2">
       <dt style={{ color: "var(--muted)" }}>{label}</dt>
-      <dd className="font-medium text-right" style={valueColor ? { color: valueColor } : undefined}>
+      <dd className="font-medium text-right capitalize" style={valueColor ? { color: valueColor } : undefined}>
         {value}
       </dd>
     </div>

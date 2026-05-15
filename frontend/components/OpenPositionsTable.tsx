@@ -61,8 +61,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [loading, setLoading] = useState(true);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+    // Per-row close size as a percentage of the held quantity. Defaults to 100%.
+    const [closePercents, setClosePercents] = useState<Record<string, number>>({});
     // Filter: default to options since that's the most common workflow here.
     const [filter, setFilter] = useState<"all" | "stock" | "option">("option");
+
+    /** Translate a chosen percentage into a concrete close quantity. Options
+     *  trade in whole contracts; stocks allow up to 6 decimals (Alpaca's
+     *  fractional precision). Returns null if the result rounds to zero. */
+    function quantityForPercent(p: Position, pct: number): number | null {
+      const total = Math.abs(Number(p.quantity));
+      if (!Number.isFinite(total) || total <= 0) return null;
+      let qty = total * (pct / 100);
+      if (p.instrument_type === "option") qty = Math.floor(qty);
+      else qty = Math.round(qty * 1e6) / 1e6;
+      return qty > 0 ? qty : null;
+    }
 
     const refresh = useCallback(async () => {
       try {
@@ -110,15 +124,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           return;
         }
       }
+      const pct = closePercents[key] ?? 100;
+      const qty = quantityForPercent(p, pct);
+      if (qty == null) {
+        notify.warn(`Can't close ${pct}% of this position — would round to zero.`);
+        return;
+      }
       setClosing({ key, kind: type });
       try {
         const body: Record<string, unknown> = { order_type: type };
+        if (pct < 100) body.quantity = String(qty);   // 100% lets the backend default to full size
         if (type === "limit") body.limit_price = closeLimitPrices[key];
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
-        notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} (${type})`);
+        notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} ×${qty} (${type})`);
         if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
         refresh();
       } catch (e) {
@@ -215,15 +236,25 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
+                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
+              {loading && (
+                <tr>
+                  <td colSpan={13} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                    <span className="inline-flex items-center gap-2">
+                      <Spinner />
+                      <span>Loading positions…</span>
+                    </span>
+                  </td>
+                </tr>
+              )}
               {!loading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={12} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={13} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
                     {positions.length === 0
                       ? "No open positions."
                       : filter === "option" ? "No open option positions."
@@ -249,6 +280,37 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         {isLong ? "long" : "short"}
                       </td>
                       <td className="px-5 py-3 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
+                      {/* Close % — pick a fraction of the position to close.
+                          Pills that would round to zero (e.g. 25% of one
+                          contract) are disabled. */}
+                      <td className="px-5 py-3">
+                        <div className="flex gap-1">
+                          {[25, 50, 75, 100].map(pct => {
+                            const computedQty = quantityForPercent(p, pct);
+                            const disabled = computedQty == null;
+                            const selected = (closePercents[key] ?? 100) === pct;
+                            return (
+                              <button
+                                key={pct}
+                                type="button"
+                                disabled={disabled}
+                                onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
+                                title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
+                                className="px-2 py-0.5 text-[10px] rounded transition-colors"
+                                style={{
+                                  border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                                  background: selected ? "rgba(10,115,168,0.16)" : "transparent",
+                                  color: disabled ? "var(--faint)" : selected ? "var(--accent)" : "var(--text-2)",
+                                  cursor: disabled ? "not-allowed" : "pointer",
+                                  opacity: disabled ? 0.5 : 1,
+                                }}
+                              >
+                                {pct}%
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </td>
                       <td className="px-5 py-3">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           <button
