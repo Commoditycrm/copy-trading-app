@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
@@ -198,16 +197,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="flex-1 min-h-0 overflow-y-auto px-3 space-y-1">
           {nav.map((item) => {
             const active = pathname?.startsWith(item.href);
+            // Use programmatic router.push instead of <Link>. <Link>'s built-in
+            // navigation can fall back to a hard reload on Vercel when the
+            // RSC payload fetch returns an unexpected shape (auth wall, CDN
+            // weirdness). router.push goes strictly through the client router
+            // — no prefetch, no MPA fallback.
             return (
-              <Link
+              <a
                 key={item.href}
                 href={item.href}
-                // Disable prefetch: a failed RSC prefetch (auth wall, CDN
-                // hiccup, etc.) on Vercel poisons the next click into a hard
-                // reload. Sidebar has 5-6 routes, prefetch is not worth the
-                // failure mode.
-                prefetch={false}
-                className="block px-4 py-2.5 rounded-full text-sm transition-colors"
+                onClick={(e) => {
+                  // Let modified clicks (cmd/ctrl/middle) open in a new tab
+                  // as usual; intercept only the plain click.
+                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                  e.preventDefault();
+                  if (item.href !== pathname) router.push(item.href);
+                }}
+                className="block px-4 py-2.5 rounded-full text-sm transition-colors no-underline"
                 style={{
                   background: active
                     ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
@@ -219,7 +225,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 }}
               >
                 {item.label}
-              </Link>
+              </a>
             );
           })}
         </nav>
