@@ -181,14 +181,18 @@ def _place_trader_order(
     background: BackgroundTasks,
     request: Request,
 ) -> Order:
-    """Core trader order-placement flow used by both /api/trades (new orders)
-    and /api/trades/{id}/close (reverse the position). Builds Order, submits
-    to broker, updates status, audits, fires SSE + fan-out background task.
+    """Core order-placement flow. Used by /api/trades for trader-originated
+    orders (which fan out to subscribers) and by close endpoints. Also reused
+    for subscriber-originated closes — in that case we skip the trader
+    kill-switch check and don't fan anything out.
 
     Returns the persisted Order. Caller commits nothing — this function
     commits before returning.
     """
-    if not copy_engine.trader_can_trade(db, trader):
+    is_trader = trader.role == UserRole.TRADER
+    # Trader kill switch only applies to traders. Subscribers can always
+    # manage (close/cancel) their own broker accounts.
+    if is_trader and not copy_engine.trader_can_trade(db, trader):
         raise HTTPException(409, "trading_disabled")
 
     acct = db.get(BrokerAccount, broker_account_id)
@@ -265,7 +269,10 @@ def _place_trader_order(
     db.refresh(order)
 
     events.publish(trader.id, copy_engine._order_event("order.placed", order))
-    background.add_task(_run_fanout_in_background, order.id, trader.id)
+    # Only trader-originated orders fan out to subscribers. Subscribers placing
+    # their own close don't propagate to anyone.
+    if is_trader:
+        background.add_task(_run_fanout_in_background, order.id, trader.id)
     return order
 
 
@@ -349,26 +356,20 @@ def close_trade(
     request: Request,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
-    trader: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> Order:
     """Close a filled order by placing a reverse-side order of the same size
-    (or smaller, if `quantity` is given). The reverse order is itself a normal
-    trader order — it fans out to subscribers, audit-logs, etc.
-
-    Trader-only because closes act like new orders and need to propagate.
-    Subscribers wait for the trader to close (their mirror will get a
-    matching reverse from the fan-out).
+    (or smaller, if `quantity` is given). The reverse is itself a normal
+    order — for a trader it fans out to subscribers; for a subscriber it
+    just executes against their own broker.
     """
     original = db.execute(
         select(Order).where(Order.id == order_id)
     ).scalar_one_or_none()
-    if not original or original.user_id != trader.id:
+    if not original or original.user_id != user.id:
         raise HTTPException(404, "not_found")
     if original.status != OrderStatus.FILLED:
         raise HTTPException(409, f"not_closeable: original status is {original.status.value}")
-    if original.parent_order_id is not None:
-        # Shouldn't happen for a trader, but defensive.
-        raise HTTPException(409, "cannot_close_mirror")
 
     # Reverse the side; default qty to whatever filled on the original.
     close_qty = payload.quantity if payload.quantity is not None else original.filled_quantity
@@ -393,11 +394,11 @@ def close_trade(
     )
 
     new_order = _place_trader_order(
-        db, trader, new_payload, original.broker_account_id, background, request
+        db, user, new_payload, original.broker_account_id, background, request
     )
 
     audit.record(
-        db, actor_user_id=trader.id, action="order.closed",
+        db, actor_user_id=user.id, action="order.closed",
         entity_type="order", entity_id=original.id,
         metadata={
             "closed_with_order_id": str(new_order.id),

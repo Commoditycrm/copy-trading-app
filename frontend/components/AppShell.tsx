@@ -36,21 +36,16 @@ const NAV_SUBSCRIBER = [
   { href: "/settings", label: "Settings" },
 ];
 
-/** Hex-shaped logo mark — drawn inline so we don't need an asset. */
-function LogoMark() {
+/** Brand mark — uses the uploaded icon from /public. */
+function LogoMark({ size = 40 }: { size?: number }) {
   return (
-    <div
-      className="grid place-items-center"
-      style={{
-        width: 36, height: 36,
-        clipPath: "polygon(25% 5%, 75% 5%, 100% 50%, 75% 95%, 25% 95%, 0% 50%)",
-        background: "linear-gradient(135deg, var(--accent) 0%, #006fa3 100%)",
-      }}
-    >
-      <span style={{ color: "var(--accent-ink)", fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em" }}>
-        Ƈ
-      </span>
-    </div>
+    <img
+      src="/brand-icon.avif"
+      alt="The Option Haven"
+      width={size}
+      height={size}
+      style={{ width: size, height: size, borderRadius: 8, objectFit: "cover" }}
+    />
   );
 }
 
@@ -150,7 +145,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex items-center gap-3 px-5 pt-6 pb-7">
           <LogoMark />
           <div className="leading-tight">
-            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>COPYTRADE</div>
+            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
           </div>
         </div>
 

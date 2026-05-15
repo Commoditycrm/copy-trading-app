@@ -4,8 +4,13 @@ import type { Metadata } from "next";
 import { ToastContainer } from "react-toastify";
 
 export const metadata: Metadata = {
-  title: "Copy Trading Platform",
+  title: "The Option Haven",
   description: "Stock & options copy trading",
+  icons: {
+    icon: "/brand-icon.avif",
+    shortcut: "/brand-icon.avif",
+    apple: "/brand-icon.avif",
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

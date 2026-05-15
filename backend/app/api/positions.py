@@ -18,7 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, require_trader
+from app.api.deps import current_user
 from app.api.trades import _place_trader_order
 from app.brokers import adapter_for
 from app.database import get_db
@@ -82,17 +82,17 @@ def close_all_positions(
     request: Request,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
-    trader: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Flatten every open position across all the trader's connected broker
-    accounts by placing a market reverse order for each. Each close routes
-    through _place_trader_order, so audit, SSE, and copy fan-out behave
-    exactly like manual closes. Per-position failures don't abort the rest —
-    we return a per-position result list.
+    """Flatten every open position across the caller's connected broker
+    accounts by placing a market reverse order for each. For traders this
+    fans out to subscribers; for subscribers it only affects their own
+    accounts. Per-position failures don't abort the rest — we return a
+    per-position result list.
     """
     accts = db.execute(
         select(BrokerAccount).where(
-            BrokerAccount.user_id == trader.id,
+            BrokerAccount.user_id == user.id,
             BrokerAccount.connection_status == "connected",
         )
     ).scalars().all()
@@ -131,7 +131,7 @@ def close_all_positions(
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
             )
             try:
-                order = _place_trader_order(db, trader, payload, acct.id, background, request)
+                order = _place_trader_order(db, user, payload, acct.id, background, request)
                 closed.append({
                     "broker_account_id": str(acct.id),
                     "symbol": pos.symbol,
@@ -157,7 +157,7 @@ def close_position(
     background: BackgroundTasks,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
     db: Session = Depends(get_db),
-    trader: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> Order:
     """Place a reverse-side order to close the position on the given account.
 
@@ -166,11 +166,12 @@ def close_position(
     same root (e.g. AAPL stock + AAPL option) is held simultaneously.
 
     Re-reads the live position from the broker so the close size and side are
-    based on what actually exists right now, not stale client data. The new
-    order fans out to subscribers via the normal _place_trader_order path.
+    based on what actually exists right now, not stale client data. For a
+    trader this fans out to subscribers; for a subscriber it just runs
+    against their own broker.
     """
     acct = db.get(BrokerAccount, broker_account_id)
-    if not acct or acct.user_id != trader.id:
+    if not acct or acct.user_id != user.id:
         raise HTTPException(404, "broker_account_not_found")
     if acct.connection_status != "connected":
         raise HTTPException(409, "broker_not_connected")
@@ -208,4 +209,4 @@ def close_position(
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
 
-    return _place_trader_order(db, trader, new_payload, acct.id, background, request)
+    return _place_trader_order(db, user, new_payload, acct.id, background, request)

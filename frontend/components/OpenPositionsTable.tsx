@@ -43,10 +43,10 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
   if (!isoDate) return { text: "—", color: "var(--faint)" };
   const d = daysUntil(isoDate);
   if (!Number.isFinite(d)) return { text: "—", color: "var(--faint)" };
-  if (d < 0) return { text: `Expired ${-d}d ago`, color: "var(--bad)" };
+  // "Today" reads better than "0"; everything else stays numeric.
   if (d === 0) return { text: "Today", color: "var(--bad)" };
-  if (d === 1) return { text: "Tomorrow", color: "var(--bad)" };
-  return { text: `in ${d} days`, color: "var(--text)" };
+  if (d === 1) return { text: String(d), color: "var(--bad)" };
+  return { text: String(d), color: "var(--text)" };
 }
 
 export interface OpenPositionsTableHandle {
@@ -215,7 +215,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in"].map(h => (
+                {["Symbol", "Type", "Side", "Quantity", "Actions", "Avg entry", "Current price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>

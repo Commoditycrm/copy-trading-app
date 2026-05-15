@@ -42,10 +42,10 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } |
   const t0 = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const t1 = Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate());
   const d = Math.round((t1 - t0) / 86_400_000);
-  if (d < 0) return { text: `Expired ${-d}d ago`, color: "var(--bad)" };
+  // "Today" reads better than "0"; everything else stays numeric.
   if (d === 0) return { text: "Today", color: "var(--bad)" };
-  if (d === 1) return { text: "Tomorrow", color: "var(--bad)" };
-  return { text: `in ${d} days`, color: "var(--text)" };
+  if (d === 1) return { text: String(d), color: "var(--bad)" };
+  return { text: String(d), color: "var(--text)" };
 }
 
 export default function TradesPage() {
@@ -218,7 +218,7 @@ export default function TradesPage() {
             style={{ background: "var(--panel)" }}
           >
             <tr>
-              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Expires in"].map(h => (
+              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Expires in Days"].map(h => (
                 <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>

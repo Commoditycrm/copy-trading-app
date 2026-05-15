@@ -6,6 +6,7 @@ import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
+import { ConfirmModal } from "@/components/ConfirmModal";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
@@ -144,12 +145,13 @@ export default function TradePanelPage() {
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
   const [last, setLast] = useState<Order | null>(null);
-  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summaryOpen, setSummaryOpen] = useState(true);
 
   // Open positions table — owned by the shared component. We keep a ref so
   // we can ask it to refresh after a fresh order or exit-all.
   const positionsRef = useRef<OpenPositionsTableHandle>(null);
   const [exitBusy, setExitBusy] = useState(false);
+  const [exitConfirmOpen, setExitConfirmOpen] = useState(false);
 
   // Expiries fetched per (symbol, account). Cached client-side
   // so retyping the same symbol doesn't trigger a re-fetch.
@@ -209,8 +211,7 @@ export default function TradePanelPage() {
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
 
-  async function exitAll() {
-    if (!confirm("Close ALL open positions at market across every connected broker? This cannot be undone.")) return;
+  async function doExitAll() {
     setExitBusy(true);
     try {
       const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
@@ -224,6 +225,7 @@ export default function TradePanelPage() {
         notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
       }
       positionsRef.current?.refresh();
+      setExitConfirmOpen(false);
     } catch (e) {
       notify.fromError(e, "Exit all failed");
     } finally {
@@ -621,7 +623,7 @@ export default function TradePanelPage() {
         </div>
         <button
           type="button"
-          onClick={exitAll}
+          onClick={() => setExitConfirmOpen(true)}
           disabled={exitBusy}
           title="Close every open position at market across all connected brokers"
           className="btn-danger-soft shrink-0 px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
@@ -631,13 +633,23 @@ export default function TradePanelPage() {
         </button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-5 items-start">
+      <div className="grid grid-cols-1 lg:grid-cols-[640px_304px] gap-5 items-start">
         <div>{formBody}</div>
         <div>{summaryCard}</div>
       </div>
 
 
       <OpenPositionsTable ref={positionsRef} className="pt-2" />
+      <ConfirmModal
+        open={exitConfirmOpen}
+        title="Exit all positions?"
+        message="This will close every open position at market across every connected broker. The action cannot be undone."
+        confirmLabel="Exit all at market"
+        variant="danger"
+        busy={exitBusy}
+        onConfirm={doExitAll}
+        onCancel={() => setExitConfirmOpen(false)}
+      />
     </div>
   );
 }
