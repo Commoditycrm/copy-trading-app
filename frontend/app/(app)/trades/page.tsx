@@ -66,10 +66,11 @@ export default function TradesPage() {
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
-  // "My Orders" = root orders the caller placed themselves (no parent_order_id).
-  // "All Orders" = everything they own, including subscriber mirrors copied
-  // from the trader they follow.
-  const [tab, setTab] = useState<"mine" | "all">("mine");
+  // "All Orders" = everything they own, including subscriber mirrors and
+  // trader orders that fanned out.
+  // "My Orders" = orders private to the caller (no parent_order_id AND not
+  // broadcast). Default is "all" so the user sees the full picture first.
+  const [tab, setTab] = useState<"all" | "mine">("all");
 
   // Action UI state — tracks WHICH button on WHICH row is in flight, so only
   // that button shows "…" (not its sibling).
@@ -284,8 +285,8 @@ export default function TradesPage() {
         };
         return (
           <div className="flex gap-2 items-center">
-            <Tab k="mine" label="My Orders" count={mineCount} />
             <Tab k="all" label="All Orders" count={allCount} />
+            <Tab k="mine" label="My Orders" count={mineCount} />
           </div>
         );
       })()}
