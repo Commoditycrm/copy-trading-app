@@ -1,6 +1,8 @@
 "use client";
 
 import { Fragment, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { fmtDateTime } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
@@ -49,6 +51,18 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } |
 }
 
 export default function TradesPage() {
+  const searchParams = useSearchParams();
+  // Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filter (used by Calendar drill-in).
+  // `from` is inclusive, `to` is inclusive on the calendar view; we widen `to`
+  // by 1 day on the API call below so trades from the entire end-date day
+  // are included (the backend's filter is `< to`).
+  const fromParam = searchParams?.get("from") ?? null;
+  const toParam = searchParams?.get("to") ?? null;
+  // When the user drills in from Calendar, the URL carries `only=closes` so
+  // we hide opening orders and show just what closed on that day —
+  // matching the realized-P&L tile's count.
+  const onlyParam = searchParams?.get("only") ?? null;
+
   const [orders, setOrders] = useState<Order[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
@@ -71,8 +85,22 @@ export default function TradesPage() {
     (async () => {
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
+      // Build the trades URL, narrowing it when the caller arrived from a
+      // calendar tile. The backend filter is `created_at < to`, so we push
+      // `to` to the day AFTER the chosen end-date to make the range inclusive.
+      let tradesUrl = "/api/trades";
+      if (fromParam || toParam) {
+        const q = new URLSearchParams();
+        if (fromParam) q.set("from", fromParam);
+        if (toParam) {
+          const t = new Date(toParam + "T00:00:00Z");
+          t.setUTCDate(t.getUTCDate() + 1);
+          q.set("to", t.toISOString().slice(0, 10));
+        }
+        tradesUrl = `/api/trades?${q.toString()}`;
+      }
       const [o, u, p] = await Promise.all([
-        api<Order[]>("/api/trades"),
+        api<Order[]>(tradesUrl),
         api<User>("/api/auth/me"),
         api<Position[]>("/api/positions").catch(() => [] as Position[]),
       ]);
@@ -84,7 +112,8 @@ export default function TradesPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fromParam, toParam]);
 
   useEventStream((evt) => {
     if (
@@ -203,6 +232,27 @@ export default function TradesPage() {
     // Flex column with full height so the table can claim all leftover vertical
     // space below the (optional) error banner.
     <div className="flex flex-col h-full max-w-6xl space-y-4">
+      {(fromParam || toParam) && (
+        <div
+          className="flex items-center justify-between gap-3 px-3 py-2 rounded border text-sm"
+          style={{ borderColor: "var(--border)", background: "rgba(10,115,168,0.06)" }}
+        >
+          <div style={{ color: "var(--text-2)" }}>
+            {onlyParam === "closes" ? "Showing closes for " : "Showing trades for "}
+            <strong>
+              {fromParam === toParam || !toParam ? fromParam : `${fromParam} → ${toParam}`}
+            </strong>
+          </div>
+          <Link
+            href="/trades"
+            prefetch={false}
+            className="underline text-xs"
+            style={{ color: "var(--accent)" }}
+          >
+            Clear filter
+          </Link>
+        </div>
+      )}
       {/* Table wrapper fills remaining height. min-h-0 lets it shrink within
           the flex parent so its own overflow-auto can take over. */}
       <div
@@ -282,7 +332,34 @@ export default function TradesPage() {
               // the Open Positions table on the Trade Panel. Order History
               // should be the historical record of closed/cancelled/rejected
               // activity, not duplicate the live-position view.
+              // Date-range bound for the "closes only" filter. Inclusive on
+              // both ends, anchored to UTC midnight to match how Calendar
+              // buckets fills by day.
+              const closesFromMs = fromParam ? Date.UTC(
+                Number(fromParam.slice(0, 4)),
+                Number(fromParam.slice(5, 7)) - 1,
+                Number(fromParam.slice(8, 10)),
+              ) : null;
+              const closesToMs = toParam ? Date.UTC(
+                Number(toParam.slice(0, 4)),
+                Number(toParam.slice(5, 7)) - 1,
+                Number(toParam.slice(8, 10)),
+              ) + 86_400_000 - 1 : null;
+
               const visibleOrders = orders.filter(o => {
+                // "Closes only" path (Calendar drill-in): show only filled
+                // SELL orders that terminated on the picked date — those are
+                // the exits that contributed to that day's realized P&L on
+                // a long-only book (the common copy-trading case). Approximate
+                // for short books but still tighter than "all orders".
+                if (onlyParam === "closes") {
+                  if (o.status !== "filled" || !o.closed_at) return false;
+                  if (o.side !== "sell") return false;
+                  const t = new Date(o.closed_at).getTime();
+                  if (closesFromMs !== null && t < closesFromMs) return false;
+                  if (closesToMs !== null && t > closesToMs) return false;
+                  return true;
+                }
                 if (o.status !== "filled") return true;     // open / cancelled / rejected — always show
                 return !heldKeys.has(posKey(
                   o.broker_account_id,
