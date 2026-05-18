@@ -180,6 +180,7 @@ def _place_trader_order(
     broker_account_id: uuid.UUID,
     background: BackgroundTasks,
     request: Request,
+    skip_fanout: bool = False,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -270,8 +271,9 @@ def _place_trader_order(
 
     events.publish(trader.id, copy_engine._order_event("order.placed", order))
     # Only trader-originated orders fan out to subscribers. Subscribers placing
-    # their own close don't propagate to anyone.
-    if is_trader:
+    # their own close don't propagate to anyone. Callers (e.g. close-all with
+    # "mine only" scope) can also opt out via skip_fanout.
+    if is_trader and not skip_fanout:
         background.add_task(_run_fanout_in_background, order.id, trader.id)
     return order
 
