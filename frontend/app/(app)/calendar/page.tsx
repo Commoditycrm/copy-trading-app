@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
@@ -9,6 +10,7 @@ function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1
 function iso(d: Date) { return d.toISOString().slice(0, 10); }
 
 export default function CalendarPage() {
+  const router = useRouter();
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
   const [data, setData] = useState<DailyPnL[]>([]);
   const [loading, setLoading] = useState(true);
@@ -147,11 +149,25 @@ export default function CalendarPage() {
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
           const has = !!day;
+          const onClick = has
+            // `only=closes` tells Order History to show just the orders that
+            // closed positions on this date — matches the Calendar count.
+            ? () => router.push(`/trades?from=${key}&to=${key}&only=closes`)
+            : undefined;
           return (
-            <div key={i} className="h-24 p-2 rounded border flex flex-col" style={{
-              borderColor: "var(--border)",
-              background: has ? (pnl >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)") : "var(--panel)",
-            }}>
+            <button
+              key={i}
+              type="button"
+              onClick={onClick}
+              disabled={!has}
+              title={has ? `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}` : undefined}
+              className="h-24 p-2 rounded border flex flex-col text-left transition-colors"
+              style={{
+                borderColor: "var(--border)",
+                background: has ? (pnl >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)") : "var(--panel)",
+                cursor: has ? "pointer" : "default",
+              }}
+            >
               <div className="text-xs" style={{ color: "var(--muted)" }}>{d.getDate()}</div>
               {has && (
                 <>
@@ -161,7 +177,7 @@ export default function CalendarPage() {
                   <div className="text-xs" style={{ color: "var(--muted)" }}>{day.trade_count} trade{day.trade_count === 1 ? "" : "s"}</div>
                 </>
               )}
-            </div>
+            </button>
           );
         })}
       </div>
