@@ -203,6 +203,12 @@ def _place_trader_order(
         raise HTTPException(409, "broker_not_connected")
     creds = decrypt_json(acct.encrypted_credentials)
 
+    # Will this order be broadcast to subscribers? Pre-compute so we can
+    # stamp the flag on the row at creation time (immutable record of intent).
+    from app.models.settings import TraderSettings  # local import — avoid cycle
+    ts = db.get(TraderSettings, trader.id) if is_trader else None
+    will_fanout = is_trader and not skip_fanout and not (ts and ts.copy_paused)
+
     order = Order(
         user_id=trader.id,
         broker_account_id=acct.id,
@@ -217,6 +223,7 @@ def _place_trader_order(
         limit_price=payload.limit_price,
         stop_price=payload.stop_price,
         status=OrderStatus.PENDING,
+        fanned_out_to_subscribers=will_fanout,
     )
     db.add(order)
     db.flush()
@@ -272,8 +279,10 @@ def _place_trader_order(
     events.publish(trader.id, copy_engine._order_event("order.placed", order))
     # Only trader-originated orders fan out to subscribers. Subscribers placing
     # their own close don't propagate to anyone. Callers (e.g. close-all with
-    # "mine only" scope) can also opt out via skip_fanout.
-    if is_trader and not skip_fanout:
+    # "mine only" scope) can also opt out via skip_fanout. The trader's master
+    # pause is also checked at the start of fanout itself — we record the
+    # intended-fanout flag (`will_fanout`) on the order row above.
+    if will_fanout:
         background.add_task(_run_fanout_in_background, order.id, trader.id)
     return order
 
@@ -419,6 +428,10 @@ def calendar_pnl(
     user: User = Depends(current_user),
     from_: date = Query(..., alias="from"),
     to: date = Query(...),
+    tz: str | None = Query(
+        default=None,
+        description="IANA timezone (e.g. 'Asia/Calcutta'). Fills are bucketed by this TZ so the calendar matches what the user sees as 'today'. Defaults to US/Eastern when omitted.",
+    ),
     user_id: uuid.UUID | None = Query(
         default=None,
         description="Trader-only: view another user's P&L (must be a subscriber following you).",
@@ -438,7 +451,20 @@ def calendar_pnl(
             raise HTTPException(404, "not_a_subscriber")
         target_user_id = user_id
 
-    daily = realized_pnl_by_day(db, target_user_id, start=from_, end=to)
+    # Pull the latest fills for the target user before computing P&L. The
+    # frontend already runs sync-fills for the caller on mount, but when a
+    # trader views a *subscriber's* P&L the subscriber's mirror orders may
+    # still be at status=submitted with filled_quantity=0 — they'd be
+    # excluded from the P&L query and the day would look empty. Sync first
+    # so freshly-filled mirrors land on the right day.
+    try:
+        fills_sync.sync_user_fills(db, target_user_id)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        # Sync failures are non-fatal; we still return whatever P&L exists.
+        db.rollback()
+
+    daily = realized_pnl_by_day(db, target_user_id, start=from_, end=to, tz_name=tz)
     return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(daily.items())]
 
 

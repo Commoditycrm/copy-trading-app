@@ -64,6 +64,7 @@ class OrderOut(BaseModel):
     closed_at: datetime | None
     reject_reason: str | None
     created_at: datetime
+    fanned_out_to_subscribers: bool = False
     fills: list[FillOut] = []
 
     model_config = {"from_attributes": True}

@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { api } from "@/lib/api";
-import { fmtDateTime } from "@/lib/format";
+import { fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
@@ -43,7 +43,9 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
   if (!isoDate) return { text: "—", color: "var(--faint)" };
   const d = daysUntil(isoDate);
   if (!Number.isFinite(d)) return { text: "—", color: "var(--faint)" };
-  // "Today" reads better than "0"; everything else stays numeric.
+  // Past expiries collapse to "Expired" (in red); "Today" reads better
+  // than "0"; otherwise show the raw day count.
+  if (d < 0) return { text: "Expired", color: "var(--bad)" };
   if (d === 0) return { text: "Today", color: "var(--bad)" };
   if (d === 1) return { text: String(d), color: "var(--bad)" };
   return { text: String(d), color: "var(--text)" };
@@ -244,7 +246,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Expires in Days"].map(h => (
+                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
@@ -252,7 +254,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={14} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={15} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                     <span className="inline-flex items-center gap-2">
                       <Spinner />
                       <span>Loading positions…</span>
@@ -262,7 +264,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               )}
               {!loading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={14} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={15} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
                     {positions.length === 0
                       ? "No open positions."
                       : filter === "option" ? "No open option positions."
@@ -393,10 +395,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         return (
                           <>
                             <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                              {sub ? fmtDateTime(sub) : <span style={{ color: "var(--faint)" }}>—</span>}
+                              {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                             </td>
                             <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                              {fill ? fmtDateTime(fill) : <span style={{ color: "var(--faint)" }}>—</span>}
+                              {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                            </td>
+                            <td className="px-5 py-3 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
+                              {sub && fill ? fmtDuration(sub, fill) : "—"}
                             </td>
                           </>
                         );

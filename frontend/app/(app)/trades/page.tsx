@@ -4,7 +4,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
-import { fmtDateTime } from "@/lib/format";
+import { fmtDateTime, fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -44,7 +44,9 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } |
   const t0 = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const t1 = Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate());
   const d = Math.round((t1 - t0) / 86_400_000);
-  // "Today" reads better than "0"; everything else stays numeric.
+  // Past expiries collapse to "Expired" (in red); "Today" reads better
+  // than "0"; otherwise show the raw day count.
+  if (d < 0) return { text: "Expired", color: "var(--bad)" };
   if (d === 0) return { text: "Today", color: "var(--bad)" };
   if (d === 1) return { text: String(d), color: "var(--bad)" };
   return { text: String(d), color: "var(--text)" };
@@ -58,16 +60,16 @@ export default function TradesPage() {
   // are included (the backend's filter is `< to`).
   const fromParam = searchParams?.get("from") ?? null;
   const toParam = searchParams?.get("to") ?? null;
-  // When the user drills in from Calendar, the URL carries `only=closes` so
-  // we hide opening orders and show just what closed on that day —
-  // matching the realized-P&L tile's count.
-  const onlyParam = searchParams?.get("only") ?? null;
 
   const [orders, setOrders] = useState<Order[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
+  // "My Orders" = root orders the caller placed themselves (no parent_order_id).
+  // "All Orders" = everything they own, including subscriber mirrors copied
+  // from the trader they follow.
+  const [tab, setTab] = useState<"mine" | "all">("mine");
 
   // Action UI state — tracks WHICH button on WHICH row is in flight, so only
   // that button shows "…" (not its sibling).
@@ -238,7 +240,7 @@ export default function TradesPage() {
           style={{ borderColor: "var(--border)", background: "rgba(10,115,168,0.06)" }}
         >
           <div style={{ color: "var(--text-2)" }}>
-            {onlyParam === "closes" ? "Showing closes for " : "Showing trades for "}
+            {"Showing trades for "}
             <strong>
               {fromParam === toParam || !toParam ? fromParam : `${fromParam} → ${toParam}`}
             </strong>
@@ -253,6 +255,40 @@ export default function TradesPage() {
           </Link>
         </div>
       )}
+
+      {(() => {
+        // Live counts so each tab can show how many orders it'd surface.
+        // Keep this in sync with the body-side `visibleOrders` filter.
+        const mineCount = orders.filter(
+          o => !o.parent_order_id && !o.fanned_out_to_subscribers
+        ).length;
+        const allCount = orders.length;
+        const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number }) => {
+          const active = tab === k;
+          return (
+            <button
+              key={k}
+              type="button"
+              onClick={() => setTab(k)}
+              className="px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
+              style={{
+                border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                background: active ? "rgba(10,115,168,0.16)" : "transparent",
+                color: active ? "var(--accent)" : "var(--text-2)",
+              }}
+            >
+              {label}{" "}
+              <span style={{ color: active ? "var(--accent)" : "var(--muted)" }}>({count})</span>
+            </button>
+          );
+        };
+        return (
+          <div className="flex gap-2 items-center">
+            <Tab k="mine" label="My Orders" count={mineCount} />
+            <Tab k="all" label="All Orders" count={allCount} />
+          </div>
+        );
+      })()}
       {/* Table wrapper fills remaining height. min-h-0 lets it shrink within
           the flex parent so its own overflow-auto can take over. */}
       <div
@@ -269,7 +305,7 @@ export default function TradesPage() {
             style={{ background: "var(--panel)" }}
           >
             <tr>
-              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Expires in Days"].map(h => (
+              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                 <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
@@ -277,7 +313,7 @@ export default function TradesPage() {
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={12} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={13} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading orders…</span>
@@ -286,7 +322,7 @@ export default function TradesPage() {
               </tr>
             )}
             {!loading && orders.length === 0 && (
-              <tr><td colSpan={12} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
+              <tr><td colSpan={13} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
             {(() => {
               // Only filled orders whose underlying position is still open
@@ -332,34 +368,25 @@ export default function TradesPage() {
               // the Open Positions table on the Trade Panel. Order History
               // should be the historical record of closed/cancelled/rejected
               // activity, not duplicate the live-position view.
-              // Date-range bound for the "closes only" filter. Inclusive on
-              // both ends, anchored to UTC midnight to match how Calendar
-              // buckets fills by day.
-              const closesFromMs = fromParam ? Date.UTC(
-                Number(fromParam.slice(0, 4)),
-                Number(fromParam.slice(5, 7)) - 1,
-                Number(fromParam.slice(8, 10)),
-              ) : null;
-              const closesToMs = toParam ? Date.UTC(
-                Number(toParam.slice(0, 4)),
-                Number(toParam.slice(5, 7)) - 1,
-                Number(toParam.slice(8, 10)),
-              ) + 86_400_000 - 1 : null;
-
               const visibleOrders = orders.filter(o => {
-                // "Closes only" path (Calendar drill-in): show only filled
-                // SELL orders that terminated on the picked date — those are
-                // the exits that contributed to that day's realized P&L on
-                // a long-only book (the common copy-trading case). Approximate
-                // for short books but still tighter than "all orders".
-                if (onlyParam === "closes") {
-                  if (o.status !== "filled" || !o.closed_at) return false;
-                  if (o.side !== "sell") return false;
-                  const t = new Date(o.closed_at).getTime();
-                  if (closesFromMs !== null && t < closesFromMs) return false;
-                  if (closesToMs !== null && t > closesToMs) return false;
-                  return true;
+                // Tab filter — "My Orders" = orders that are private to the
+                // caller. For subscribers that means: not a mirror copied
+                // from the trader (parent_order_id is null). For traders that
+                // means: not broadcast to subscribers (fanned_out is false —
+                // e.g. orders placed while copy was paused or with the
+                // "Just me" Exit All scope). "All Orders" shows everything.
+                if (tab === "mine") {
+                  if (o.parent_order_id) return false;
+                  if (o.fanned_out_to_subscribers) return false;
                 }
+
+                // Date-range filter (from Calendar drill-in): the backend
+                // already narrowed by `created_at` via the from/to query
+                // params, so we don't need to re-filter here — just bypass
+                // the "hide if held" rule so opens/closes for the picked
+                // day both surface.
+                if (fromParam || toParam) return true;
+
                 if (o.status !== "filled") return true;     // open / cancelled / rejected — always show
                 return !heldKeys.has(posKey(
                   o.broker_account_id,
@@ -494,19 +521,27 @@ export default function TradesPage() {
                     {/* Submitted at — fallback to created_at for orders that
                         never reached the broker (rejected pre-submit) */}
                     <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                      {fmtDateTime(o.submitted_at ?? o.created_at)}
+                      {fmtDateTimeMs(o.submitted_at ?? o.created_at, "America/New_York")}
                     </td>
                     {/* Filled at — latest fill timestamp, or closed_at as fallback
                         for terminal-but-fillless rows (rejected etc). */}
-                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                      {(() => {
-                        const lastFillAt = o.fills?.length
-                          ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
-                          : null;
-                        const t = lastFillAt ?? (o.status === "filled" ? o.closed_at : null);
-                        return t ? fmtDateTime(t) : <span style={{ color: "var(--faint)" }}>—</span>;
-                      })()}
-                    </td>
+                    {(() => {
+                      const lastFillAt = o.fills?.length
+                        ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
+                        : null;
+                      const fillTs = lastFillAt ?? (o.status === "filled" ? o.closed_at : null);
+                      const submittedTs = o.submitted_at ?? o.created_at;
+                      return (
+                        <>
+                          <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                            {fillTs ? fmtDateTimeMs(fillTs, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                          </td>
+                          <td className="px-5 py-3 whitespace-nowrap num" style={{ color: fillTs ? "var(--text-2)" : "var(--faint)" }}>
+                            {fillTs ? fmtDuration(submittedTs, fillTs) : "—"}
+                          </td>
+                        </>
+                      );
+                    })()}
                     {/* Expires in — option contract expiry rendered as a
                         relative day count; "—" for stocks. */}
                     {(() => {

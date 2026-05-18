@@ -56,20 +56,32 @@ def _instrument_key(o: Order) -> tuple:
     return ("STK", o.symbol)
 
 
-def today_realized_pnl(db: Session, user_id: uuid.UUID) -> Decimal:
-    """Realized P&L for the current UTC day. Negative = loss.
+def _tz_or_market(tz_name: str | None) -> "ZoneInfo | timezone":
+    """Resolve the bucketing timezone. Falls back to the market timezone if
+    the caller didn't supply one or the name is unknown."""
+    if not tz_name:
+        return _MARKET_TZ
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return _MARKET_TZ
 
-    Uses the same FIFO matching as `realized_pnl_by_day`. Cheap enough at
-    small fill counts; cache or materialize once you have many fills/user/day.
-    """
-    today = datetime.now(_MARKET_TZ).date()
-    daily = realized_pnl_by_day(db, user_id, start=today, end=today)
+
+def today_realized_pnl(db: Session, user_id: uuid.UUID, tz_name: str | None = None) -> Decimal:
+    """Realized P&L for "today" in the chosen timezone. Negative = loss."""
+    tz = _tz_or_market(tz_name)
+    today = datetime.now(tz).date()
+    daily = realized_pnl_by_day(db, user_id, start=today, end=today, tz_name=tz_name)
     pnl, _ = daily.get(today, (Decimal(0), 0))
     return pnl
 
 
 def realized_pnl_by_day(
-    db: Session, user_id: uuid.UUID, start: date | None = None, end: date | None = None
+    db: Session,
+    user_id: uuid.UUID,
+    start: date | None = None,
+    end: date | None = None,
+    tz_name: str | None = None,
 ) -> dict[date, tuple[Decimal, int]]:
     """Returns {day: (realized_pnl, trade_count)}. trade_count is the number of
     closing fills on that day.
@@ -111,6 +123,7 @@ def realized_pnl_by_day(
             timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
     timeline.sort(key=lambda e: e[0])
 
+    bucket_tz = _tz_or_market(tz_name)
     open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
     daily: dict[date, tuple[Decimal, int]] = defaultdict(lambda: (Decimal(0), 0))
 
@@ -120,7 +133,7 @@ def realized_pnl_by_day(
         unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
         qty = fill_qty
         price = fill_price
-        day = filled_at.astimezone(_MARKET_TZ).date()
+        day = filled_at.astimezone(bucket_tz).date()
         if start and day < start:
             pass  # we still need to walk earlier fills to keep lots correct
         if end and day > end:

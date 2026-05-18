@@ -66,6 +66,10 @@ export interface Order {
   closed_at: string | null;
   reject_reason: string | null;
   created_at: string;
+  /** True when this order was broadcast to subscribers via copy fanout.
+   *  False for subscribers' orders, trader orders placed while copy was
+   *  paused, and trader orders placed with the "Just me" scope. */
+  fanned_out_to_subscribers?: boolean;
   fills: Fill[];
 }
 

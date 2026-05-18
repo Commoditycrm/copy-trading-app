@@ -7,7 +7,20 @@ import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
-function iso(d: Date) { return d.toISOString().slice(0, 10); }
+/** Local-date string. `toISOString()` is UTC and shifts the date for users
+ *  east/west of UTC — that's why a cell labeled "18" was getting key "17". */
+function iso(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+/** The user's IANA timezone (e.g. "Asia/Calcutta"). Sent to the backend so
+ *  fills are bucketed against the same calendar the user is looking at. */
+function browserTz(): string {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; }
+  catch { return "UTC"; }
+}
 
 export default function CalendarPage() {
   const router = useRouter();
@@ -27,7 +40,7 @@ export default function CalendarPage() {
   const loadPnL = useCallback(() => {
     setLoading(true);
     const qs = viewingUserId ? `&user_id=${viewingUserId}` : "";
-    api<DailyPnL[]>(`/api/calendar/pnl?from=${range.from}&to=${range.to}${qs}`)
+    api<DailyPnL[]>(`/api/calendar/pnl?from=${range.from}&to=${range.to}&tz=${encodeURIComponent(browserTz())}${qs}`)
       .then(setData)
       .finally(() => setLoading(false));
   }, [range.from, range.to, viewingUserId]);
@@ -150,9 +163,9 @@ export default function CalendarPage() {
           const pnl = day ? Number(day.realized_pnl) : 0;
           const has = !!day;
           const onClick = has
-            // `only=closes` tells Order History to show just the orders that
-            // closed positions on this date — matches the Calendar count.
-            ? () => router.push(`/trades?from=${key}&to=${key}&only=closes`)
+            // Show every order (buys + sells) on the picked date, not just
+            // the closing legs.
+            ? () => router.push(`/trades?from=${key}&to=${key}`)
             : undefined;
           return (
             <button

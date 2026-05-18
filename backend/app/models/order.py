@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, Enum, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -94,6 +94,14 @@ class Order(Base, TimestampMixin):
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # True when this order was broadcast to subscribers via the copy-engine
+    # fanout. False for: subscriber-owned orders, trader orders placed while
+    # copy was paused, and orders placed with skip_fanout (e.g. Exit All "Just
+    # me" scope). Powers the "My Orders" tab in Order History.
+    fanned_out_to_subscribers: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
 
     broker_account = relationship("BrokerAccount", back_populates="orders")
     fills = relationship("Fill", back_populates="order", cascade="all, delete-orphan")
