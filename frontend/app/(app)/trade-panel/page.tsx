@@ -6,7 +6,7 @@ import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
-import { ConfirmModal } from "@/components/ConfirmModal";
+import { ExitAllModal } from "@/components/ExitAllModal";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
@@ -218,16 +218,17 @@ export default function TradePanelPage() {
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
 
-  async function doExitAll() {
+  async function doExitAll(includeSubscribers: boolean) {
     setExitBusy(true);
     try {
       const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
-        "/api/positions/close-all", { method: "POST" }
+        `/api/positions/close-all?include_subscribers=${includeSubscribers}`,
+        { method: "POST" },
       );
       if (res.closed_count === 0 && res.failed_count === 0) {
         notify.info("No open positions to close.");
       } else if (res.failed_count === 0) {
-        notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market`);
+        notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market${includeSubscribers ? " (fanned out to subscribers)" : ""}`);
       } else {
         notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
       }
@@ -673,14 +674,10 @@ export default function TradePanelPage() {
 
 
       <OpenPositionsTable ref={positionsRef} className="pt-2" />
-      <ConfirmModal
+      <ExitAllModal
         open={exitConfirmOpen}
-        title="Exit all positions?"
-        message="This will close every open position at market across every connected broker. The action cannot be undone."
-        confirmLabel="Exit all at market"
-        variant="danger"
         busy={exitBusy}
-        onConfirm={doExitAll}
+        onConfirm={(includeSubs) => doExitAll(includeSubs)}
         onCancel={() => setExitConfirmOpen(false)}
       />
     </div>

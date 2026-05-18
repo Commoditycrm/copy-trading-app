@@ -81,14 +81,18 @@ def list_positions(
 def close_all_positions(
     request: Request,
     background: BackgroundTasks,
+    include_subscribers: bool = Query(
+        default=True,
+        description="When false, suppress the trader→subscriber fanout. Only the caller's own positions are closed. No-op semantic when caller is a subscriber.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
     """Flatten every open position across the caller's connected broker
     accounts by placing a market reverse order for each. For traders this
-    fans out to subscribers; for subscribers it only affects their own
-    accounts. Per-position failures don't abort the rest — we return a
-    per-position result list.
+    normally fans out to subscribers; pass `include_subscribers=false` to
+    close only the trader's own positions without propagating. Per-position
+    failures don't abort the rest — we return a per-position result list.
     """
     accts = db.execute(
         select(BrokerAccount).where(
@@ -99,6 +103,7 @@ def close_all_positions(
 
     closed: list[dict] = []
     failed: list[dict] = []
+    skip_fanout = not include_subscribers
 
     for acct in accts:
         try:
@@ -131,7 +136,10 @@ def close_all_positions(
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
             )
             try:
-                order = _place_trader_order(db, user, payload, acct.id, background, request)
+                order = _place_trader_order(
+                    db, user, payload, acct.id, background, request,
+                    skip_fanout=skip_fanout,
+                )
                 closed.append({
                     "broker_account_id": str(acct.id),
                     "symbol": pos.symbol,
