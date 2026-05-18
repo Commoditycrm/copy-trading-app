@@ -4,7 +4,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
-import { fmtDateTime, fmtDateTimeMs, fmtDuration } from "@/lib/format";
+import { fmtDate, fmtDateTime, fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -305,7 +305,7 @@ export default function TradesPage() {
             style={{ background: "var(--panel)" }}
           >
             <tr>
-              {["Symbol", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
+              {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                 <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
@@ -313,7 +313,7 @@ export default function TradesPage() {
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={13} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={14} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading orders…</span>
@@ -322,7 +322,7 @@ export default function TradesPage() {
               </tr>
             )}
             {!loading && orders.length === 0 && (
-              <tr><td colSpan={13} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
+              <tr><td colSpan={14} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
             {(() => {
               // Only filled orders whose underlying position is still open
@@ -417,6 +417,10 @@ export default function TradesPage() {
                   >
                     {/* Symbol — ticker only */}
                     <td className="px-5 py-3 font-medium">{o.symbol}</td>
+                    {/* Expiry Date — absolute date for options, "—" for stocks. */}
+                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: o.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
+                      {o.option_expiry ? fmtDate(o.option_expiry) : "—"}
+                    </td>
 
                     <td className="px-5 py-3 capitalize">{o.instrument_type}</td>
                     <td className="px-5 py-3 uppercase font-medium" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
