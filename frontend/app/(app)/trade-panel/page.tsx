@@ -7,6 +7,7 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { ExitAllModal } from "@/components/ExitAllModal";
+import { StrikePicker } from "@/components/StrikePicker";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
@@ -526,24 +527,21 @@ export default function TradePanelPage() {
                   </div>
                 </>
               ) : (
-                <select
-                  className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                  value={strike} onChange={e => setStrike(e.target.value)}
-                  required disabled={strikesLoading || strikes.length === 0}
-                >
-                  <option value="">
-                    {strikesLoading
-                      ? "loading…"
-                      : !expiry
-                        ? "Strike"
-                        : strikes.length === 0
-                          ? "no strikes"
-                          : "— select —"}
-                  </option>
-                  {strikes.map(s => (
-                    <option key={s} value={s}>{s.toLocaleString(undefined, { minimumFractionDigits: 2 })}</option>
-                  ))}
-                </select>
+                <StrikePicker
+                  value={strike}
+                  strikes={strikes}
+                  loading={strikesLoading}
+                  disabled={strikesLoading || strikes.length === 0}
+                  placeholder={
+                    !expiry
+                      ? "Strike"
+                      : strikes.length === 0
+                        ? "no strikes"
+                        : "— select —"
+                  }
+                  onChange={setStrike}
+                  style={inputStyle}
+                />
               )}
             </div>
             <div>
