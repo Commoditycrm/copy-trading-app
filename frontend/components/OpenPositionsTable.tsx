@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { api } from "@/lib/api";
-import { fmtDateTimeMs, fmtDuration } from "@/lib/format";
+import { fmtDate, fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
@@ -246,7 +246,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
+                {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
@@ -254,7 +254,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={15} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={16} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                     <span className="inline-flex items-center gap-2">
                       <Spinner />
                       <span>Loading positions…</span>
@@ -264,7 +264,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               )}
               {!loading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={15} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={16} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
                     {positions.length === 0
                       ? "No open positions."
                       : filter === "option" ? "No open option positions."
@@ -282,6 +282,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Fragment key={key}>
                     <tr className="border-t" style={{ borderColor: "var(--border)" }}>
                       <td className="px-5 py-3 font-medium">{p.symbol}</td>
+                      {/* Expiry Date — absolute date for options, "—" for stocks. */}
+                      <td className="px-5 py-3 whitespace-nowrap" style={{ color: p.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
+                        {p.option_expiry ? fmtDate(p.option_expiry) : "—"}
+                      </td>
                       <td className="px-5 py-3 capitalize">{p.instrument_type}</td>
                       <td
                         className="px-5 py-3 uppercase font-medium"
