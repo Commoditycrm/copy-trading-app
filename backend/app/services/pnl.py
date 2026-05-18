@@ -4,7 +4,10 @@ Per-user, per-symbol, per-instrument FIFO matching. Open lots roll forward.
 For options we key on the full contract identity (symbol + expiry + strike + right).
 For now we ignore commissions/fees beyond the per-fill `fee` column.
 
-Returns daily realized P&L within [start, end] inclusive (UTC dates).
+Returns daily realized P&L within [start, end] inclusive, bucketed by the
+US market timezone (America/New_York). All US equities & options trade on
+that clock, so the day boundary matches what traders perceive as "today's
+session" regardless of where they're sitting.
 """
 from __future__ import annotations
 
@@ -13,11 +16,26 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.order import Fill, InstrumentType, Order, OrderSide
+
+try:
+    _MARKET_TZ = ZoneInfo("America/New_York")
+except ZoneInfoNotFoundError:
+    # Some minimal Python images ship without tzdata. Fall back to a fixed
+    # ET offset (good enough — we only use this for day-bucketing, not for
+    # rendering times. EDT is wrong for half the year by 1 hour but never
+    # by a whole day, so daily P&L still buckets correctly.)
+    from datetime import timedelta as _td
+
+    class _FixedET(timezone):
+        def __init__(self):
+            super().__init__(_td(hours=-5), name="ET")
+    _MARKET_TZ = _FixedET()  # type: ignore[assignment]
 
 
 @dataclass
@@ -44,7 +62,7 @@ def today_realized_pnl(db: Session, user_id: uuid.UUID) -> Decimal:
     Uses the same FIFO matching as `realized_pnl_by_day`. Cheap enough at
     small fill counts; cache or materialize once you have many fills/user/day.
     """
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(_MARKET_TZ).date()
     daily = realized_pnl_by_day(db, user_id, start=today, end=today)
     pnl, _ = daily.get(today, (Decimal(0), 0))
     return pnl
@@ -102,7 +120,7 @@ def realized_pnl_by_day(
         unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
         qty = fill_qty
         price = fill_price
-        day = filled_at.astimezone(timezone.utc).date()
+        day = filled_at.astimezone(_MARKET_TZ).date()
         if start and day < start:
             pass  # we still need to walk earlier fills to keep lots correct
         if end and day > end:

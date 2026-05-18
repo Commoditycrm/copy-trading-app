@@ -19,20 +19,86 @@ function loadCachedUser(): User | null {
   } catch { return null; }
 }
 
+// Inline SVG icons — all share the same stroke style so the sidebar reads
+// consistently. 16×16 viewBox, stroke=currentColor so they inherit nav color.
+function IconBolt() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+    </svg>
+  );
+}
+function IconLayers() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <polygon points="12 2 2 7 12 12 22 7 12 2" />
+      <polyline points="2 17 12 22 22 17" />
+      <polyline points="2 12 12 17 22 12" />
+    </svg>
+  );
+}
+function IconList() {
+  // Clipboard with lines — reads as "orders / records list".
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+      <line x1="9" y1="12" x2="15" y2="12" />
+      <line x1="9" y1="16" x2="15" y2="16" />
+    </svg>
+  );
+}
+function IconCalendar() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+      <line x1="16" y1="2" x2="16" y2="6" />
+      <line x1="8" y1="2" x2="8" y2="6" />
+      <line x1="3" y1="10" x2="21" y2="10" />
+    </svg>
+  );
+}
+function IconUsers() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+function IconLink() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  );
+}
+function IconSettings() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
+
 const NAV_TRADER = [
-  { href: "/trade-panel", label: "Trade Panel" },
-  { href: "/positions", label: "Positions" },
-  { href: "/trades", label: "Order History" },
-  { href: "/calendar", label: "Calendar" },
-  { href: "/subscribers", label: "Subscribers" },
-  { href: "/brokers", label: "Broker" },
+  { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
+  { href: "/positions", label: "Positions", Icon: IconLayers },
+  { href: "/trades", label: "Order History", Icon: IconList },
+  { href: "/calendar", label: "P&L", Icon: IconCalendar },
+  { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
+  { href: "/brokers", label: "Broker", Icon: IconLink },
 ];
 const NAV_SUBSCRIBER = [
-  { href: "/positions", label: "Positions" },
-  { href: "/trades", label: "Order History" },
-  { href: "/calendar", label: "Calendar" },
-  { href: "/brokers", label: "Broker" },
-  { href: "/settings", label: "Settings" },
+  { href: "/positions", label: "Positions", Icon: IconLayers },
+  { href: "/trades", label: "Order History", Icon: IconList },
+  { href: "/calendar", label: "P&L", Icon: IconCalendar },
+  { href: "/brokers", label: "Broker", Icon: IconLink },
+  { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 
 /** Brand mark — uses the uploaded icon from /public. */
@@ -213,7 +279,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   e.preventDefault();
                   if (item.href !== pathname) router.push(item.href);
                 }}
-                className="block px-4 py-2.5 rounded-full text-sm transition-colors no-underline"
+                className="flex items-center gap-2.5 px-4 py-2.5 rounded-full text-sm transition-colors no-underline"
                 style={{
                   background: active
                     ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
@@ -224,7 +290,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   boxShadow: active ? "0 0 24px -6px var(--accent-glow)" : "none",
                 }}
               >
-                {item.label}
+                <item.Icon />
+                <span>{item.label}</span>
               </a>
             );
           })}

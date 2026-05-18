@@ -167,6 +167,26 @@ export default function TradePanelPage() {
   const [expiriesErr, setExpiriesErr] = useState<string | null>(null);
   const [expiriesFor, setExpiriesFor] = useState<string>("");  // "<acctId>:<SYMBOL>"
 
+  // Strikes fetched per (symbol, account, expiry, right). Same caching shape
+  // as expiries — keyed by the full tuple so swapping right or expiry
+  // triggers a fresh fetch but nothing else does.
+  const [strikes, setStrikes] = useState<number[]>([]);
+  const [strikesLoading, setStrikesLoading] = useState(false);
+  const [strikesErr, setStrikesErr] = useState<string | null>(null);
+  const [strikesFor, setStrikesFor] = useState<string>("");
+
+  // When the symbol changes, drop the previous chain's strikes immediately.
+  // Without this the old list lingers until the new expiry resolves and the
+  // strikes effect re-fires — and worse, an intermediate fetch with the
+  // stale (new symbol, old expiry) pair can poison the cache.
+  useEffect(() => {
+    setStrikes([]);
+    setStrike("");
+    setStrikesFor("");
+    setStrikesErr(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
+
   useEffect(() => {
     api<BrokerAccount[]>("/api/brokers").then(a => {
       setAccts(a);
@@ -215,6 +235,52 @@ export default function TradePanelPage() {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, symbol, acctId]);
+
+  // Fetch option strikes whenever (symbol, account, expiry, right) changes.
+  // Debounced so back-to-back changes coalesce into one round-trip. Reuses
+  // the same caching/auto-pick pattern as expiries.
+  useEffect(() => {
+    if (instrument !== "option") return;
+    const sym = symbol.trim().toUpperCase();
+    if (!sym || !acctId || !expiry || !right) {
+      setStrikes([]); setStrikesErr(null); setStrikesFor("");
+      return;
+    }
+    const cacheKey = `${acctId}:${sym}:${expiry}:${right}`;
+    if (cacheKey === strikesFor) return;
+
+    const t = setTimeout(async () => {
+      setStrikesLoading(true);
+      setStrikesErr(null);
+      try {
+        const res = await api<{ symbol: string; expiry: string; right: string; strikes: number[] }>(
+          `/api/options/strikes?account_id=${acctId}&symbol=${encodeURIComponent(sym)}&expiry=${expiry}&right=${right}`
+        );
+        setStrikes(res.strikes);
+        setStrikesFor(cacheKey);
+        // Always re-pick the ATM-ish strike on a fresh fetch — Alpaca's
+        // chains are roughly symmetric around the underlying so the median
+        // of the returned list is the nearest-to-ATM. Preserving a previous
+        // strike that "happens to be in the new list" looked broken to the
+        // user (e.g. AAPL 200 carried over to TSLA's chain even though
+        // TSLA is at ~$400).
+        if (res.strikes.length === 0) {
+          setStrike("");
+        } else {
+          setStrike(String(res.strikes[Math.floor(res.strikes.length / 2)]));
+        }
+      } catch (e) {
+        setStrikes([]);
+        setStrikesErr(e instanceof ApiError ? String(e.detail) : "could not load strikes");
+        setStrikesFor(cacheKey);
+        setStrike("");
+      } finally {
+        setStrikesLoading(false);
+      }
+    }, 500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument, symbol, acctId, expiry, right]);
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
 
@@ -448,11 +514,37 @@ export default function TradePanelPage() {
             </div>
             <div>
               <Label>Strike</Label>
-              <input
-                type="number" step="0.01" min="0.01"
-                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                placeholder="200" value={strike} onChange={e => setStrike(e.target.value)} required
-              />
+              {strikesErr ? (
+                <>
+                  <input
+                    type="number" step="0.01" min="0.01"
+                    className="w-full p-2 rounded bg-transparent border" style={inputStyle}
+                    placeholder="200" value={strike} onChange={e => setStrike(e.target.value)} required
+                  />
+                  <div className="text-[10px] mt-1" style={{ color: "var(--bad)" }}>
+                    {strikesErr} — enter a strike manually
+                  </div>
+                </>
+              ) : (
+                <select
+                  className="w-full p-2 rounded bg-transparent border" style={inputStyle}
+                  value={strike} onChange={e => setStrike(e.target.value)}
+                  required disabled={strikesLoading || strikes.length === 0}
+                >
+                  <option value="">
+                    {strikesLoading
+                      ? "loading…"
+                      : !expiry
+                        ? "Strike"
+                        : strikes.length === 0
+                          ? "no strikes"
+                          : "— select —"}
+                  </option>
+                  {strikes.map(s => (
+                    <option key={s} value={s}>{s.toLocaleString(undefined, { minimumFractionDigits: 2 })}</option>
+                  ))}
+                </select>
+              )}
             </div>
             <div>
               <Label>Right</Label>
