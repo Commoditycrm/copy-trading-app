@@ -254,10 +254,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           top: 26,
           // Centered on the sidebar's right border — half the button sits
           // inside the sidebar, half outside, so it reads as a hinge.
-          // Width trimmed ~15% (28 → 24) so the hinge is slimmer; height
-          // stays 28 to keep the chevron readable.
-          left: SIDEBAR_W - 12,
-          width: 24,
+          // Width trimmed another ~10% (24 → 22); height stays 28 so the
+          // chevron icon doesn't crowd the button.
+          left: SIDEBAR_W - 11,
+          width: 22,
           height: 28,
           zIndex: 50,
           borderRadius: 6,
