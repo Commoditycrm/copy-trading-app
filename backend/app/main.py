@@ -1,11 +1,15 @@
 import asyncio
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, brokers, events, options, positions, settings, subscribers, trades
+from app.api import auth, brokers, events, listener as listener_api, options, positions, settings, subscribers, trades
 from app.config import get_settings
 from app.services import events as events_bus
+from app.services import trade_listener
+
+log = logging.getLogger(__name__)
 
 DISCLAIMER = (
     "Educational software. Not investment advice. Copy trading involves substantial risk "
@@ -38,10 +42,25 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.include_router(options.router)
     app.include_router(positions.router)
+    app.include_router(listener_api.router)
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
         events_bus.bind_loop(asyncio.get_running_loop())
+        # Spawn Alpaca trade_updates listeners for every active trader with a
+        # connected Alpaca account. Requires a long-running process — won't
+        # work on Vercel serverless.
+        try:
+            await trade_listener.start_all_listeners()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start trade listeners")
+
+    @app.on_event("shutdown")
+    async def _stop_listeners() -> None:
+        try:
+            await trade_listener.stop_all_listeners()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop trade listeners cleanly")
 
     @app.get("/api/health")
     def health() -> dict:

@@ -7,7 +7,15 @@ export type AppEvent =
   | { type: "order.placed"; order: OrderEventPayload }
   | { type: "order.copy_submitted"; order: OrderEventPayload }
   | { type: "order.copy_failed"; order: OrderEventPayload }
-  | { type: "order.cancelled"; order: OrderEventPayload };
+  | { type: "order.cancelled"; order: OrderEventPayload }
+  | { type: "listener.state_changed"; trader_id: string; status: ListenerStatus };
+
+export interface ListenerStatus {
+  state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader";
+  last_event_at: string | null;
+  state_changed_at: string | null;
+  last_error: string | null;
+}
 
 export interface OrderEventPayload {
   id: string;

@@ -6,6 +6,7 @@ import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
+import { ListenerPill } from "@/components/ListenerPill";
 
 interface BulkCopyState { total: number; enabled: number; paused: boolean; }
 
@@ -216,10 +217,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const displayName = user.display_name || user.email.split("@")[0];
 
   return (
-    // h-screen + overflow-hidden lock the outer frame to viewport height.
-    // The sidebar fills it; only <main> scrolls internally when content overflows.
+    // Row: full-height sidebar on the left, then a column (navbar + main)
+    // on the right. h-screen + overflow-hidden locks the outer frame; only
+    // <main> scrolls internally.
     <div className="h-screen flex overflow-hidden">
-      {/* ── Sidebar ─────────────────────────────────────────────────────── */}
+      {/* ── Sidebar (full viewport height) ──────────────────────────────── */}
       <aside
         className="flex flex-col h-full shrink-0"
         style={{
@@ -234,28 +236,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <LogoMark />
           <div className="leading-tight">
             <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
-          </div>
-        </div>
-
-        {/* User card */}
-        <div className="mx-3 mb-4 card p-3 flex items-center gap-3">
-          <div
-            className="grid place-items-center rounded-full"
-            style={{
-              width: 36, height: 36,
-              background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
-              border: "1px solid var(--border)",
-              color: "var(--accent)",
-              fontWeight: 700, fontSize: 17,
-            }}
-          >
-            {initials(user.display_name, user.email)}
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="text-sm truncate" style={{ fontWeight: 600 }}>{displayName}</div>
-            <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
-              {user.role}
-            </div>
           </div>
         </div>
 
@@ -406,8 +386,45 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      {/* ── Main ────────────────────────────────────────────────────────── */}
-      <main className="flex-1 min-w-0 h-full overflow-y-auto p-8">{children}</main>
+      {/* ── Right column: navbar on top, scrollable main below ──────────── */}
+      <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
+        <header
+          className="flex items-center justify-between px-5 py-3 shrink-0"
+          style={{
+            background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
+            borderBottom: "1px solid var(--border)",
+            backdropFilter: "blur(8px)",
+          }}
+        >
+          {/* Left: listener health pill — connection status first. */}
+          <div className="flex items-center">
+            <ListenerPill role={user.role as "trader" | "subscriber"} />
+          </div>
+          {/* Right: who's signed in + role chip. */}
+          <div className="flex items-center gap-3">
+            <div
+              className="grid place-items-center rounded-full"
+              style={{
+                width: 32, height: 32,
+                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
+                border: "1px solid var(--border)",
+                color: "var(--accent)",
+                fontWeight: 700, fontSize: 14,
+              }}
+            >
+              {initials(user.display_name, user.email)}
+            </div>
+            <div className="leading-tight text-right">
+              <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
+              <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
+                {user.role}
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main className="flex-1 min-w-0 overflow-y-auto p-5">{children}</main>
+      </div>
     </div>
   );
 }

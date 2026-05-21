@@ -267,8 +267,22 @@ class AlpacaAdapter(BrokerAdapter):
         }
 
     def list_recent_activities(self) -> list[Any]:
-        """Activities = fills, dividends, etc. Caller filters by type."""
-        return self._c().get_account_activities()
+        """Activities = fills, dividends, etc. Caller filters by type.
+
+        The alpaca-py SDK doesn't expose a typed helper for /v2/account/activities
+        in current versions, so we hit the raw endpoint and return the list of
+        dicts as-is. Downstream code uses `_attr` for tolerant dict-or-object
+        access so both shapes work.
+        """
+        try:
+            resp = self._c().get("/account/activities")
+        except Exception:  # noqa: BLE001
+            return []
+        # Some SDK versions wrap the response in {"data": [...]}; most return a
+        # bare list. Normalise to list.
+        if isinstance(resp, dict) and "data" in resp:
+            return list(resp["data"]) if isinstance(resp["data"], list) else []
+        return list(resp) if isinstance(resp, list) else []
 
     def list_option_contracts(
         self,
