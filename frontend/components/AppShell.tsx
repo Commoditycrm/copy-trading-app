@@ -204,6 +204,22 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }
   }
 
+  // Sidebar collapse state, persisted across reloads so the user's pref
+  // sticks. Initial render uses `false` to match SSR; the stored value is
+  // applied in a layout-effect-ish useEffect (avoids hydration mismatch).
+  const [collapsed, setCollapsed] = useState(false);
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("trading-app:sidebar-collapsed");
+      if (stored === "1") setCollapsed(true);
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem("trading-app:sidebar-collapsed", collapsed ? "1" : "0");
+    } catch { /* ignore */ }
+  }, [collapsed]);
+
   if (loading) {
     return (
       <div className="min-h-screen grid place-items-center" style={{ color: "var(--muted)" }}>
@@ -215,28 +231,76 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   const nav = user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER;
   const displayName = user.display_name || user.email.split("@")[0];
+  const SIDEBAR_W = collapsed ? 72 : 244;
 
   return (
     // Row: full-height sidebar on the left, then a column (navbar + main)
     // on the right. h-screen + overflow-hidden locks the outer frame; only
     // <main> scrolls internally.
-    <div className="h-screen flex overflow-hidden">
+    <div className="h-screen flex overflow-hidden relative">
+      {/* Edge toggle — anchored to the seam between sidebar and main, rendered
+          last in the outer container so it stacks above both. Vertically
+          centered with the navbar strip. */}
+      <button
+        type="button"
+        onClick={() => setCollapsed(c => !c)}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        className="absolute grid place-items-center transition-[left] duration-200"
+        style={{
+          // Floating navbar starts at mt-3 (12px) with py-3 padding. A 28px
+          // square button centered on the navbar's vertical midline:
+          // 12 (offset) + (56-28)/2 = 26.
+          top: 26,
+          // Centered on the sidebar's right border — half the button sits
+          // inside the sidebar, half outside, so it reads as a hinge.
+          // Width trimmed ~15% (28 → 24) so the hinge is slimmer; height
+          // stays 28 to keep the chevron readable.
+          left: SIDEBAR_W - 12,
+          width: 24,
+          height: 28,
+          zIndex: 50,
+          borderRadius: 6,
+          border: "1px solid var(--border)",
+          background: "var(--accent)",
+          color: "var(--accent-ink)",
+          boxShadow: "0 4px 12px -4px rgba(0,0,0,0.4)",
+        }}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden
+          style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
+        >
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+      </button>
+
       {/* ── Sidebar (full viewport height) ──────────────────────────────── */}
       <aside
-        className="flex flex-col h-full shrink-0"
+        className="flex flex-col h-full shrink-0 transition-[width] duration-200 relative"
         style={{
-          width: 244,
+          width: SIDEBAR_W,
           background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
           borderRight: "1px solid var(--border)",
           backdropFilter: "blur(8px)",
         }}
       >
-        {/* Logo */}
-        <div className="flex items-center gap-3 px-5 pt-6 pb-7">
+        {/* Logo (always visible — wordmark hidden when collapsed) */}
+        <div className={`flex items-center gap-3 ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
           <LogoMark />
-          <div className="leading-tight">
-            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
-          </div>
+          {!collapsed && (
+            <div className="leading-tight">
+              <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
+            </div>
+          )}
         </div>
 
         {/* Nav — scrolls within sidebar if it ever overflows */}
@@ -252,6 +316,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               <a
                 key={item.href}
                 href={item.href}
+                title={collapsed ? item.label : undefined}
                 onClick={(e) => {
                   // Let modified clicks (cmd/ctrl/middle) open in a new tab
                   // as usual; intercept only the plain click.
@@ -259,7 +324,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   e.preventDefault();
                   if (item.href !== pathname) router.push(item.href);
                 }}
-                className="flex items-center gap-2.5 px-4 py-2.5 rounded-full text-sm transition-colors no-underline"
+                className={`flex items-center gap-2.5 ${collapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline`}
                 style={{
                   background: active
                     ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
@@ -271,7 +336,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 }}
               >
                 <item.Icon />
-                <span>{item.label}</span>
+                {!collapsed && <span>{item.label}</span>}
               </a>
             );
           })}
@@ -284,13 +349,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             const disabled = subCopyBusy;
             return (
               <div
-                className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
+                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
                 style={{
                   borderColor: "var(--border)",
                   background: "rgba(255,255,255,0.02)",
                 }}
               >
-                <div className="text-sm font-medium truncate">Copy trading</div>
+                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
                 <button
                   type="button"
                   onClick={toggleSubscriberCopy}
@@ -332,13 +397,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             const disabled = bulkBusy;
             return (
               <div
-                className="w-full flex items-center justify-between gap-2 rounded-lg border px-3 py-2"
+                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
                 style={{
                   borderColor: "var(--border)",
                   background: "rgba(255,255,255,0.02)",
                 }}
               >
-                <div className="text-sm font-medium truncate">Copy trading</div>
+                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
                 <button
                   type="button"
                   onClick={toggleBulkCopy}
@@ -379,9 +444,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
               router.replace("/login");
             }}
-            className="btn-ghost w-full px-3 py-2 text-sm"
+            title={collapsed ? "Sign out" : undefined}
+            className={`btn-ghost w-full ${collapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2`}
           >
-            Sign out
+            {/* Door-arrow icon — always visible; label hidden in collapsed mode. */}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <polyline points="16 17 21 12 16 7" />
+              <line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
+            {!collapsed && <span>Sign out</span>}
           </button>
         </div>
       </aside>
@@ -389,14 +461,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* ── Right column: navbar on top, scrollable main below ──────────── */}
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <header
-          className="flex items-center justify-between px-5 py-3 shrink-0"
+          className="flex items-center justify-between px-5 py-3 shrink-0 mx-4 mt-3 rounded-xl"
           style={{
-            background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
-            borderBottom: "1px solid var(--border)",
-            backdropFilter: "blur(8px)",
+            background: "linear-gradient(180deg, rgba(14,20,17,0.75) 0%, rgba(7,9,10,0.5) 100%)",
+            border: "1px solid var(--border)",
+            backdropFilter: "blur(10px)",
+            boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
           }}
         >
-          {/* Left: listener health pill — connection status first. */}
+          {/* Left: listener health pill. Margin-left clears the sidebar
+              collapse tab so the pill doesn't sit underneath it. */}
           <div className="flex items-center">
             <ListenerPill role={user.role as "trader" | "subscriber"} />
           </div>

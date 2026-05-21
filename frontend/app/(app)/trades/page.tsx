@@ -234,7 +234,7 @@ export default function TradesPage() {
   return (
     // Flex column with full height so the table can claim all leftover vertical
     // space below the (optional) error banner.
-    <div className="flex flex-col h-full max-w-6xl space-y-4">
+    <div className="flex flex-col h-full space-y-4">
       {(fromParam || toParam) && (
         <div
           className="flex items-center justify-between gap-3 px-3 py-2 rounded border text-sm"

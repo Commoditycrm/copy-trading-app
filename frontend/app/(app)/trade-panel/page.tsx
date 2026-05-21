@@ -752,7 +752,7 @@ export default function TradePanelPage() {
           title="Close every open position at market across all connected brokers"
           className="btn-danger-soft shrink-0 px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
         >
-          <span>Exit All Positions</span>
+          <span>Exit All</span>
           {exitBusy && <Spinner />}
         </button>
       </div>

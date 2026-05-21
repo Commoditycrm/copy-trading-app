@@ -47,7 +47,7 @@ export default function SubscribersPage() {
   }
 
   return (
-    <div className="space-y-4 max-w-6xl">
+    <div className="space-y-4">
       <div className="overflow-x-auto rounded border" style={{borderColor: "var(--border)"}}>
         <table className="w-full text-sm">
           <thead style={{background: "var(--panel)"}}>
