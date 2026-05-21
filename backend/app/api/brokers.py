@@ -25,7 +25,7 @@ from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.broker import BrokerAccountOut, ConnectBrokerIn
 from app.services import audit
 from app.services.crypto import decrypt_json, encrypt_json
@@ -106,6 +106,17 @@ def connect(
     )
     db.commit()
     db.refresh(acct)
+
+    # If the connecting user is a trader, spin up the Alpaca trade_updates
+    # listener for this account so trades placed directly on Alpaca propagate
+    # to subscribers.
+    if user.role == UserRole.TRADER and acct.broker == BrokerName.ALPACA:
+        try:
+            from app.services import trade_listener
+            trade_listener.start_listener(user.id, acct.id)
+        except Exception:  # noqa: BLE001
+            pass
+
     return acct
 
 
@@ -157,5 +168,16 @@ def delete_broker(
         metadata={"broker": acct.broker.value, "label": acct.label},
         ip_address=client_ip(request),
     )
+    was_trader_alpaca = (
+        user.role == UserRole.TRADER and acct.broker == BrokerName.ALPACA
+    )
     db.delete(acct)
     db.commit()
+
+    # Stop the Alpaca listener if this was the trader's Alpaca account.
+    if was_trader_alpaca:
+        try:
+            from app.services import trade_listener
+            trade_listener.stop_listener(user.id)
+        except Exception:  # noqa: BLE001
+            pass
