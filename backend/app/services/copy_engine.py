@@ -121,6 +121,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
     for sub in subs:
+        # Lifecycle: the moment the engine picks this subscriber up for
+        # processing. Applied to every child Order created in this iteration
+        # below. Captured here (not inside the inner per-account loop) so it
+        # reflects the per-subscriber pick, not per-account.
+        subscriber_picked_at = datetime.now(timezone.utc)
+
         sub_user = db.get(User, sub.user_id)
         if not sub_user:
             continue
@@ -196,6 +202,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 continue
 
+            # Lifecycle: passed all eligibility checks (no daily-loss kill,
+            # has broker accounts, scaled qty > 0). About to insert the child
+            # row and call the broker.
+            subscriber_accepted_at = datetime.now(timezone.utc)
+
             child = Order(
                 user_id=sub.user_id,
                 broker_account_id=acct.id,
@@ -211,6 +222,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 limit_price=trader_order.limit_price,
                 stop_price=trader_order.stop_price,
                 status=OrderStatus.PENDING,
+                subscriber_picked_at=subscriber_picked_at,
+                subscriber_accepted_at=subscriber_accepted_at,
             )
             db.add(child)
             db.flush()
@@ -280,6 +293,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             child.status = resp.status
             child.broker_order_id = resp.broker_order_id
             child.submitted_at = resp.submitted_at
+            # Lifecycle: the subscriber's broker accepted the child order.
+            # Prefer the broker's own timestamp when supplied; fall back to
+            # 'now' so the field is never NULL on a successful submit.
+            child.broker_accepted_at = resp.submitted_at or datetime.now(timezone.utc)
             child.filled_quantity = resp.filled_quantity
             child.filled_avg_price = resp.filled_avg_price
             audit.record(
@@ -300,6 +317,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 order_id=child.id,
                 status="submitted",
             ))
+            # Lifecycle: stamp broadcast moment before publishing.
+            child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", child))
         else:
             child.status = OrderStatus.REJECTED
@@ -320,6 +339,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 status="error",
                 detail=err[:200] if err else None,
             ))
+            # Lifecycle: even on failure, stamp broadcast moment.
+            child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
 
     return results

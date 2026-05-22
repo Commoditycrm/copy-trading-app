@@ -1,0 +1,106 @@
+name: Deploy to Lightsail
+
+# Triggers:
+#   - every push to main (so merging a PR auto-deploys)
+#   - manually via the Actions tab "Run workflow" button
+#
+# Required GitHub repo Secrets (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST     : 3.149.150.222
+#   DEPLOY_USER     : admin
+#   DEPLOY_SSH_KEY  : full PRIVATE key (PEM, including BEGIN/END lines) for a
+#                     dedicated deploy keypair whose PUBLIC key sits in
+#                     /home/admin/.ssh/authorized_keys on the Lightsail box.
+#                     Generate fresh — don't reuse the LightsailDefaultKey.
+#
+# What it does, on the server, as `admin`:
+#   1. cd into the project, fetch the latest main
+#   2. rebuild backend + frontend Docker images
+#   3. run alembic upgrade head (in a throwaway backend container)
+#   4. recreate containers via docker compose up -d
+#   5. prune dangling images so disk doesn't grow forever
+#   6. health-check /api/health (fails the job if the app doesn't come back up)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Prevent two deploys racing — second push waits for the first to finish.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build + migrate + restart on Lightsail
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Sanity check secrets are configured
+        run: |
+          missing=()
+          [ -z "${{ secrets.DEPLOY_HOST }}" ] && missing+=("DEPLOY_HOST")
+          [ -z "${{ secrets.DEPLOY_USER }}" ] && missing+=("DEPLOY_USER")
+          [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ] && missing+=("DEPLOY_SSH_KEY")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Missing required secret(s): ${missing[*]}"
+            echo "See .github/workflows/deploy.yml header for setup instructions."
+            exit 1
+          fi
+          echo "Secrets present."
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Fail fast and log every step.
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            PROJECT_DIR="$HOME/copy-trading-app"
+            cd "$PROJECT_DIR"
+
+            echo "── git pull ──────────────────────────────────────────────"
+            git fetch --prune origin main
+            git reset --hard origin/main
+            git log -1 --oneline
+
+            echo "── docker compose build ─────────────────────────────────"
+            docker compose build backend frontend
+
+            echo "── alembic upgrade head ─────────────────────────────────"
+            # Use `run --rm` instead of exec so we don't depend on the old
+            # container being up. The throwaway container inherits the same
+            # env_file and DB network, so it can reach Postgres.
+            docker compose run --rm backend alembic upgrade head
+
+            echo "── docker compose up -d (recreate updated services) ─────"
+            docker compose up -d --remove-orphans
+
+            echo "── docker image prune ───────────────────────────────────"
+            docker image prune -f
+
+            echo "── health check ─────────────────────────────────────────"
+            # Give containers up to 60s to be ready.
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 3 http://localhost/api/health > /tmp/health.json; then
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "Health check failed after 60s. Last logs:"
+              docker compose logs --tail=80 backend caddy frontend || true
+              exit 1
+            fi
+            echo "Healthy:"
+            cat /tmp/health.json
+            echo
+
+            echo "── deploy complete ──────────────────────────────────────"

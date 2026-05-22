@@ -30,6 +30,16 @@ interface FanoutChild {
   created_at: string | null;
   reject_reason: string | null;
   subscriber_lag_ms: number | null;
+
+  // New per-step lifecycle timestamps + lags (alembic e7a1d2c40f01).
+  subscriber_picked_at: string | null;
+  subscriber_accepted_at: string | null;
+  broker_accepted_at: string | null;
+  redis_published_at: string | null;
+  pick_lag_ms: number | null;
+  eligibility_lag_ms: number | null;
+  broker_lag_ms: number | null;
+  publish_lag_ms: number | null;
 }
 interface FanoutRow {
   parent_order_id: string;
@@ -43,6 +53,15 @@ interface FanoutRow {
   detection_lag_ms: number | null;
   fanout_duration_ms: number | null;
   total_ms: number | null;
+
+  // New per-step lifecycle timestamps + lags.
+  trader_submitted_at: string | null;
+  socket_received_at: string | null;
+  redis_published_at: string | null;
+  api_to_broker_lag_ms: number | null;
+  socket_lag_ms: number | null;
+  publish_lag_ms: number | null;
+
   subscribers: SubscriberCounts;
   children: FanoutChild[];
 }
@@ -617,7 +636,24 @@ export default function PerformancePage() {
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
           <thead>
             <tr style={{ color: "var(--muted)" }}>
-              {["Symbol","Side","Qty","Broker Accepted At","Detected At","Fanout Completed At","Detection Lag","Fanout Duration","Total","Subscribers"].map(h => (
+              {[
+                "Symbol",
+                "Side",
+                "Qty",
+                "Trader Submitted At",
+                "Broker Accepted At",
+                "Socket Received At",
+                "Detected At",
+                "Redis Published At",
+                "Fanout Completed At",
+                "API→Broker Lag",
+                "Socket Lag",
+                "Publish Lag",
+                "Detection Lag",
+                "Fanout Duration",
+                "Total",
+                "Subscribers",
+              ].map(h => (
                 <th
                   key={h}
                   className="text-left px-3 py-3 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
@@ -631,7 +667,7 @@ export default function PerformancePage() {
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={10} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={16} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -641,7 +677,7 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={10} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={16} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   No fanouts yet. Place a trade to see latency metrics here.
                 </td>
               </tr>
@@ -679,13 +715,31 @@ export default function PerformancePage() {
                     </td>
                     <td className="px-3 py-3 tabular-nums">{f.quantity}</td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                      {fmtClock(f.trader_submitted_at)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.broker_accepted_at)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                      {fmtClock(f.socket_received_at)}
                     </td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.detected_at)}
                     </td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                      {fmtClock(f.redis_published_at)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.fanout_completed_at)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.api_to_broker_lag_ms) }}>
+                      {fmtMs(f.api_to_broker_lag_ms)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.socket_lag_ms) }}>
+                      {fmtMs(f.socket_lag_ms)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.publish_lag_ms) }}>
+                      {fmtMs(f.publish_lag_ms)}
                     </td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.detection_lag_ms) }}>
                       {fmtMs(f.detection_lag_ms)}
@@ -704,7 +758,7 @@ export default function PerformancePage() {
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={10} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
+                      <td colSpan={16} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                         <div className="px-5 py-4">
                           <div
                             className="text-[10px] uppercase tracking-widest mb-3"
@@ -729,7 +783,15 @@ export default function PerformancePage() {
                                     "Qty",
                                     "Filled Qty",
                                     "Created At",
+                                    "Picked At",
+                                    "Accepted At",
+                                    "Broker Accepted At",
+                                    "Published At",
                                     "Submitted At",
+                                    "Pick Lag",
+                                    "Eligibility Lag",
+                                    "Broker Lag",
+                                    "Publish Lag",
                                     "Subscriber Lag",
                                     "Broker Order ID",
                                     "Reject Reason",
@@ -807,7 +869,55 @@ export default function PerformancePage() {
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: "var(--muted)" }}
                                       >
+                                        {fmtClock(c.subscriber_picked_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.subscriber_accepted_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.broker_accepted_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.redis_published_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
                                         {fmtClock(c.submitted_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.pick_lag_ms) }}
+                                      >
+                                        {fmtMs(c.pick_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.eligibility_lag_ms) }}
+                                      >
+                                        {fmtMs(c.eligibility_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.broker_lag_ms) }}
+                                      >
+                                        {fmtMs(c.broker_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.publish_lag_ms) }}
+                                      >
+                                        {fmtMs(c.publish_lag_ms)}
                                       </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
@@ -859,15 +969,27 @@ export default function PerformancePage() {
       </div>
 
       {/* ── Footnote (matches the screenshot terminology) ──────────────── */}
-      <div className="text-xs leading-relaxed" style={{ color: "var(--muted)" }}>
-        <strong style={{ color: "var(--text-2)" }}>Detection lag</strong> = time between Alpaca accepting your order and
-        our backend creating the parent Order row (≈0ms for orders placed via our API; meaningful only for
-        orders detected via the Alpaca trade_updates WebSocket).{" "}
-        <strong style={{ color: "var(--text-2)" }}>Fanout duration</strong> = time from our detection to the last
-        subscriber&apos;s order being accepted at their broker (parallel via asyncio.gather + per-broker semaphore).{" "}
-        <strong style={{ color: "var(--text-2)" }}>Total</strong> = end-to-end (Alpaca-accept → last subscriber
-        submitted). <strong style={{ color: "var(--text-2)" }}>Subscriber lag</strong> (per row when expanded) = our
-        detection → that subscriber&apos;s broker accept.
+      <div className="text-xs leading-relaxed space-y-2" style={{ color: "var(--muted)" }}>
+        <p>
+          <strong style={{ color: "var(--text-2)" }}>Detection lag</strong> = time between Alpaca accepting your order and
+          our backend creating the parent Order row (≈0ms for orders placed via our API; meaningful only for
+          orders detected via the Alpaca trade_updates WebSocket).{" "}
+          <strong style={{ color: "var(--text-2)" }}>Fanout duration</strong> = time from our detection to the last
+          subscriber&apos;s order being accepted at their broker (parallel via asyncio.gather + per-broker semaphore).{" "}
+          <strong style={{ color: "var(--text-2)" }}>Total</strong> = end-to-end (Alpaca-accept → last subscriber
+          submitted). <strong style={{ color: "var(--text-2)" }}>Subscriber lag</strong> (per row when expanded) = our
+          detection → that subscriber&apos;s broker accept.
+        </p>
+        <p>
+          New per-step lifecycle stamps (alembic <code>e7a1d2c40f01</code>):{" "}
+          <strong style={{ color: "var(--text-2)" }}>Trader Submitted At</strong> = our backend received the trader&apos;s
+          submit (or Alpaca&apos;s receive time for externally-placed orders).{" "}
+          <strong style={{ color: "var(--text-2)" }}>Socket Received At</strong> = our Alpaca trade_updates listener
+          heard the event (NULL for in-app orders).{" "}
+          <strong style={{ color: "var(--text-2)" }}>Redis Published At</strong> = SSE event broadcast to subscribers.{" "}
+          <strong style={{ color: "var(--text-2)" }}>Picked At / Accepted At / Broker Accepted At</strong> (per-child) =
+          when copy_engine picked the subscriber, passed eligibility, and their broker accepted, respectively.
+        </p>
       </div>
     </div>
   );

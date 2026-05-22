@@ -95,6 +95,36 @@ class Order(Base, TimestampMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # ── Copy-trade pipeline lifecycle timestamps (Performance page) ──────
+    # All nullable; parent-only fields are NULL on child rows and vice versa.
+    # Filled by trades.py, trade_listener.py, copy_engine.py, services/events.py
+    # at the corresponding step. See alembic migration e7a1d2c40f01 for the
+    # field-by-field meanings.
+
+    # Parent-only:
+    trader_submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    socket_received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Both parent and child (set when the SSE event for the order is published):
+    redis_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Child-only:
+    subscriber_picked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    subscriber_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    broker_accepted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # True when this order was broadcast to subscribers via the copy-engine
     # fanout. False for: subscriber-owned orders, trader orders placed while
     # copy was paused, and orders placed with skip_fanout (e.g. Exit All "Just

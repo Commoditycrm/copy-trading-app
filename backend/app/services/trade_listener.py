@@ -315,9 +315,18 @@ async def _handle_trade_update(
     """Per-event entry point. Defers DB + fanout to a thread so the async
     listener stays responsive."""
     _bump_last_event(trader_user_id)
+    # Lifecycle: capture the moment our WS handler received the event,
+    # BEFORE we hop to the threadpool. Used by the Performance page to
+    # compute socket_lag (= socket_received_at - trader_submitted_at) for
+    # externally-placed orders.
+    socket_received_at = datetime.now(timezone.utc)
     try:
         await asyncio.to_thread(
-            _persist_and_fanout, trader_user_id, broker_account_id, update
+            _persist_and_fanout,
+            trader_user_id,
+            broker_account_id,
+            update,
+            socket_received_at,
         )
     except Exception:  # noqa: BLE001
         log.exception("listener[%s] handler error", trader_user_id)
@@ -327,6 +336,7 @@ def _persist_and_fanout(
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
     update: Any,
+    socket_received_at: datetime,
 ) -> None:
     """Sync — runs in a thread. Saves the order to DB (insert or update) and
     triggers fanout when appropriate."""
@@ -344,6 +354,12 @@ def _persist_and_fanout(
             # We already know about this order (Trade Panel placement, or an
             # earlier event for the same order). Just update status / fills.
             _apply_event_to_existing(db, existing, alpaca_order, update, event_name)
+            # Lifecycle: stamp the first WS sighting of this order (only on
+            # first event; later events keep the original timestamp so the
+            # field reflects the *initial* notification latency).
+            if existing.socket_received_at is None:
+                existing.socket_received_at = socket_received_at
+            existing.redis_published_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(existing)
             events.publish(
@@ -370,6 +386,12 @@ def _persist_and_fanout(
             db, trader_user_id, broker_account_id, alpaca_order
         )
 
+        # Lifecycle: for externally-placed orders we know two distinct
+        # moments — when Alpaca itself accepted the order (alpaca_order
+        # carries `submitted_at`) and when our WS handler heard about it.
+        order.trader_submitted_at = getattr(alpaca_order, "submitted_at", None)
+        order.socket_received_at = socket_received_at
+
         # Audit so the trail shows where the order came from.
         audit.record(
             db,
@@ -385,6 +407,8 @@ def _persist_and_fanout(
                 "qty": str(order.quantity),
             },
         )
+        # Lifecycle: stamp the broadcast moment before publishing.
+        order.redis_published_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(order)
 

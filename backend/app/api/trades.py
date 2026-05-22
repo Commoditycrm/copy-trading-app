@@ -210,6 +210,11 @@ def _place_trader_order(
     ts = db.get(TraderSettings, trader.id) if is_trader else None
     will_fanout = is_trader and not skip_fanout and not (ts and ts.copy_paused)
 
+    # Lifecycle: the moment the trader's submit hit our backend. Used by the
+    # Performance page to compute api_to_broker_lag (= broker_accepted_at -
+    # trader_submitted_at).
+    trader_submitted_at = datetime.now(timezone.utc)
+
     order = Order(
         user_id=trader.id,
         broker_account_id=acct.id,
@@ -225,6 +230,7 @@ def _place_trader_order(
         stop_price=payload.stop_price,
         status=OrderStatus.PENDING,
         fanned_out_to_subscribers=will_fanout,
+        trader_submitted_at=trader_submitted_at,
     )
     db.add(order)
     db.flush()
@@ -274,6 +280,9 @@ def _place_trader_order(
         ip_address=client_ip(request),
     )
 
+    # Lifecycle: stamp the broadcast time before publishing so the row
+    # carries the timestamp the very first time it surfaces in the API.
+    order.redis_published_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(order)
 

@@ -54,6 +54,11 @@ def _ms_between(a: datetime | None, b: datetime | None) -> int | None:
 
 def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> dict[str, Any]:
     accepted_at = child.submitted_at
+    # New lifecycle stamps — see Order model / alembic e7a1d2c40f01.
+    picked = child.subscriber_picked_at
+    sub_accepted = child.subscriber_accepted_at
+    broker_accepted = child.broker_accepted_at
+    redis_pub = child.redis_published_at
     return {
         "order_id": str(child.id),
         "subscriber_user_id": str(child.user_id),
@@ -69,6 +74,22 @@ def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> di
         # Subscriber lag: from our backend detecting the parent → that
         # subscriber's broker accepting the mirror.
         "subscriber_lag_ms": _ms_between(parent.created_at, accepted_at),
+
+        # New per-step lifecycle timestamps.
+        "subscriber_picked_at": picked.isoformat() if picked else None,
+        "subscriber_accepted_at": sub_accepted.isoformat() if sub_accepted else None,
+        "broker_accepted_at": broker_accepted.isoformat() if broker_accepted else None,
+        "redis_published_at": redis_pub.isoformat() if redis_pub else None,
+
+        # Derived per-step lags (ms).
+        # pick_lag: parent detected → engine picked this subscriber.
+        "pick_lag_ms": _ms_between(parent.created_at, picked),
+        # eligibility_lag: pick → passed checks (daily-loss, broker, qty>0).
+        "eligibility_lag_ms": _ms_between(picked, sub_accepted),
+        # broker_lag: our submit → broker accepted.
+        "broker_lag_ms": _ms_between(sub_accepted, broker_accepted),
+        # publish_lag: broker accept → SSE broadcast.
+        "publish_lag_ms": _ms_between(broker_accepted, redis_pub),
     }
 
 
@@ -84,6 +105,11 @@ def _serialize_fanout(parent: Order, children: list[Order], subscribers: dict[uu
     fanout_duration = _ms_between(parent.created_at, last_accept_at)
     total_ms = _ms_between(parent.submitted_at, last_accept_at)
 
+    # New parent-side lifecycle stamps.
+    trader_submitted = parent.trader_submitted_at
+    socket_received = parent.socket_received_at
+    redis_pub = parent.redis_published_at
+
     return {
         "parent_order_id": str(parent.id),
         "symbol": parent.symbol,
@@ -96,6 +122,23 @@ def _serialize_fanout(parent: Order, children: list[Order], subscribers: dict[uu
         "detection_lag_ms": detection_lag,
         "fanout_duration_ms": fanout_duration,
         "total_ms": total_ms,
+
+        # New per-step parent timestamps.
+        "trader_submitted_at": trader_submitted.isoformat() if trader_submitted else None,
+        "socket_received_at": socket_received.isoformat() if socket_received else None,
+        "redis_published_at": redis_pub.isoformat() if redis_pub else None,
+
+        # Derived per-step parent lags (ms).
+        # api_to_broker_lag: our backend received → broker accepted.
+        # ≈0 for in-app orders; large for externally-placed orders where
+        # trader_submitted_at = Alpaca's own receive time.
+        "api_to_broker_lag_ms": _ms_between(trader_submitted, parent.submitted_at),
+        # socket_lag: broker accept → our WS handler heard.
+        # Only meaningful for externally-placed orders (NULL otherwise).
+        "socket_lag_ms": _ms_between(parent.submitted_at, socket_received),
+        # publish_lag: backend detection → SSE broadcast.
+        "publish_lag_ms": _ms_between(parent.created_at, redis_pub),
+
         "subscribers": {
             "total": total,
             "submitted": submitted,
