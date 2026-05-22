@@ -16,7 +16,7 @@ from app.schemas.settings import (
     TraderToggleIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit
+from app.services import audit, cache
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -64,6 +64,8 @@ def set_daily_loss_limit(
     )
     db.commit()
     db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
@@ -96,6 +98,8 @@ def toggle_copy(
     )
     db.commit()
     db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return s
 
 
@@ -122,6 +126,8 @@ def set_own_multiplier(
     )
     db.commit()
     db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return s
 
 
@@ -139,6 +145,7 @@ def follow_trader(
         trader = db.get(User, payload.trader_id)
         if not trader or trader.role != UserRole.TRADER:
             raise HTTPException(404, "trader_not_found")
+    old_trader_id = s.following_trader_id
     s.following_trader_id = payload.trader_id
     audit.record(
         db,
@@ -151,6 +158,10 @@ def follow_trader(
     )
     db.commit()
     db.refresh(s)
+    if old_trader_id:
+        cache.invalidate_subscribers_for_trader(old_trader_id)
+    if payload.trader_id:
+        cache.invalidate_subscribers_for_trader(payload.trader_id)
     return s
 
 

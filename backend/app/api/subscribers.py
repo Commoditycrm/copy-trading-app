@@ -18,7 +18,7 @@ from app.schemas.settings import (
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
-from app.services import audit
+from app.services import audit, cache
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api/subscribers", tags=["subscribers"])
@@ -101,6 +101,7 @@ def set_bulk_copy_state(
         ip_address=client_ip(request),
     )
     db.commit()
+    cache.invalidate_subscribers_for_trader(trader.id)
     return _bulk_state(db, trader.id)
 
 
@@ -130,4 +131,5 @@ def set_multiplier(
         ip_address=client_ip(request),
     )
     db.commit()
+    cache.invalidate_subscribers_for_trader(trader.id)
     return {"ok": True}

@@ -148,15 +148,16 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
-def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.UUID) -> None:
-    """Runs after the response is sent. Opens its own DB session because the
-    request-scoped session is closed by the time this fires."""
+async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.UUID) -> None:
+    """Runs after the response is sent. Async so we can fan out 200 broker
+    calls concurrently on the same event loop. Opens its own DB session
+    because the request-scoped session is closed by the time this fires."""
     with SessionLocal() as db:
         order = db.get(Order, trader_order_id)
         trader = db.get(User, trader_id)
         if order is None or trader is None:
             return
-        fan_results = copy_engine.fanout(db, order, trader)
+        fan_results = await copy_engine.fanout_async(db, order, trader)
         audit.record(
             db,
             actor_user_id=trader.id,

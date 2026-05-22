@@ -69,6 +69,14 @@ function IconUsers() {
     </svg>
   );
 }
+function IconActivity() {
+  // Activity / waveform — reads as "performance / latency".
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  );
+}
 function IconLink() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -92,6 +100,7 @@ const NAV_TRADER = [
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
+  { href: "/performance", label: "Performance", Icon: IconActivity },
   { href: "/brokers", label: "Broker", Icon: IconLink },
 ];
 const NAV_SUBSCRIBER = [

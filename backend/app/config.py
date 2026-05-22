@@ -13,6 +13,16 @@ class Settings(BaseSettings):
     credential_encryption_key: str
     cors_origins: str = "http://localhost:3000"
     frontend_base_url: str = "http://localhost:3000"
+    redis_url: str = "redis://localhost:6379/0"
+    # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
+    broker_concurrency_alpaca: int = 200
+    # asyncio.to_thread() uses the default ThreadPoolExecutor (default size
+    # min(32, cpu+4) — way too small for 200 concurrent broker calls). We
+    # bump this at startup so all 200 actually run in parallel.
+    fanout_threadpool_size: int = 256
+    # Cache TTLs (seconds) — short by design; invalidated on writes too.
+    cache_ttl_subscribers: int = 60
+    cache_ttl_broker_accounts: int = 300
 
     @property
     def cors_origins_list(self) -> list[str]:

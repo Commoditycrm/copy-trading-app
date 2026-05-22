@@ -27,7 +27,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.user import User, UserRole
 from app.schemas.broker import BrokerAccountOut, ConnectBrokerIn
-from app.services import audit
+from app.services import audit, cache
 from app.services.crypto import decrypt_json, encrypt_json
 
 router = APIRouter(prefix="/api/brokers", tags=["brokers"])
@@ -106,6 +106,7 @@ def connect(
     )
     db.commit()
     db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
 
     # If the connecting user is a trader, spin up the Alpaca trade_updates
     # listener for this account so trades placed directly on Alpaca propagate
@@ -173,6 +174,7 @@ def delete_broker(
     )
     db.delete(acct)
     db.commit()
+    cache.invalidate_broker_accounts(user.id)
 
     # Stop the Alpaca listener if this was the trader's Alpaca account.
     if was_trader_alpaca:
