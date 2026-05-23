@@ -4,9 +4,19 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+
+function IconBell() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+    </svg>
+  );
+}
 
 interface BulkCopyState { total: number; enabled: number; paused: boolean; }
 
@@ -124,6 +134,58 @@ function LogoMark({ size = 40 }: { size?: number }) {
   );
 }
 
+/** Small pill mirroring ListenerPill's visual language, but for the SSE
+ *  connection itself rather than the broker stream. Hidden while
+ *  everything's healthy so the header stays quiet during normal
+ *  operation; surfaces during reconnect / unauthorized / cold connect. */
+function SseStatusPill({ state, lastEventAt }: { state: import("@/lib/sse").SseState; lastEventAt: string | null }) {
+  // Hide entirely once we're connected AND have recent traffic. Without
+  // the lastEventAt check, the pill flashes "Connected" briefly on every
+  // mount and adds visual noise.
+  if (state === "connected") {
+    const fresh = lastEventAt && (Date.now() - new Date(lastEventAt).getTime()) < 60_000;
+    if (fresh) return null;
+    // Connected but quiet — still don't show, the listener pill covers
+    // "is anything live?" already. Keep this off unless something is wrong.
+    return null;
+  }
+  if (state === "disconnected") return null;
+
+  const { color, label, title } = (() => {
+    switch (state) {
+      case "connecting":
+        return { color: "#94a3b8", label: "Connecting…", title: "Opening event stream" };
+      case "reconnecting":
+        return { color: "#facc15", label: "Reconnecting…", title: "Lost event stream — retrying" };
+      case "unauthorized":
+        return { color: "#ef4444", label: "Disconnected — please re-login", title: "Session expired" };
+      default:
+        return { color: "#94a3b8", label: state, title: state };
+    }
+  })();
+
+  return (
+    <div
+      title={title}
+      className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[10px] font-medium"
+      style={{
+        border: `1px solid ${color}55`,
+        background: `${color}15`,
+        color,
+      }}
+    >
+      <span
+        className="inline-block rounded-full"
+        style={{
+          width: 6, height: 6, background: color,
+          boxShadow: state === "reconnecting" ? `0 0 6px ${color}` : "none",
+        }}
+      />
+      <span className="whitespace-nowrap">{label}</span>
+    </div>
+  );
+}
+
 function initials(s: string | null | undefined, fallback: string) {
   const t = (s || fallback).trim();
   if (!t) return "·";
@@ -143,6 +205,28 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Subscriber-only personal copy switch (same UX, different endpoint).
   const [subCopy, setSubCopy] = useState<SubscriberSettings | null>(null);
   const [subCopyBusy, setSubCopyBusy] = useState(false);
+  // Bell badge. Hydrated from /unread-count, bumped by SSE on
+  // notification.created, and refreshed on a 30s poll as a backstop
+  // for SSE drops we didn't fully recover from.
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+
+  async function refreshUnreadCount() {
+    try {
+      const r = await api<{ unread: number }>("/api/notifications/unread-count");
+      setUnreadCount(r.unread);
+    } catch { /* tolerate — bell just doesn't show a badge */ }
+  }
+
+  // Drive the bell badge via SSE. Also doubles as the AppShell's
+  // canonical SseStatus source — the connection-status pill in the
+  // header reads from this same return value so we don't open two
+  // EventSources from the same component tree.
+  const sseStatus = useEventStream((evt) => {
+    if (evt.type === "notification.created") {
+      setUnreadCount(c => c + 1);
+      notify.warn(evt.notification.message, { autoClose: 8000 });
+    }
+  });
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
@@ -162,6 +246,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         } else {
           api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
         }
+        // Hydrate bell badge for both roles. Today only subscribers
+        // receive notifications (copy.retry_failed) but the table is
+        // generic so future trader-side types work without UI changes.
+        refreshUnreadCount();
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) {
@@ -172,6 +260,16 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       })
       .finally(() => setLoading(false));
   }, [router]);
+
+  // Backstop poll for the bell badge. SSE keeps it fresh in real time,
+  // but a missed event (during reconnect, brief 5xx, etc.) shouldn't
+  // leave the count stale forever. Every 30s is cheap and matches what
+  // users would manually do anyway.
+  useEffect(() => {
+    if (!user) return;
+    const id = setInterval(refreshUnreadCount, 30_000);
+    return () => clearInterval(id);
+  }, [user]);
 
   async function toggleSubscriberCopy() {
     if (!subCopy) return;
@@ -478,13 +576,48 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
           }}
         >
-          {/* Left: listener health pill. Margin-left clears the sidebar
-              collapse tab so the pill doesn't sit underneath it. */}
-          <div className="flex items-center">
+          {/* Left: listener health pill + SSE connection-status pill.
+              Margin-left clears the sidebar collapse tab so the pill
+              doesn't sit underneath it. */}
+          <div className="flex items-center gap-2">
             <ListenerPill role={user.role as "trader" | "subscriber"} />
+            <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
           </div>
-          {/* Right: who's signed in + role chip. */}
+          {/* Right: bell + who's signed in + role chip. */}
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => router.push("/notifications")}
+              title={unreadCount > 0 ? `${unreadCount} unread notification(s)` : "Notifications"}
+              aria-label="Notifications"
+              className="relative grid place-items-center rounded-full transition-colors"
+              style={{
+                width: 32, height: 32,
+                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
+                border: "1px solid var(--border)",
+                color: unreadCount > 0 ? "var(--accent)" : "var(--text-2)",
+              }}
+            >
+              <IconBell />
+              {unreadCount > 0 && (
+                <span
+                  className="absolute text-[10px] font-bold rounded-full grid place-items-center"
+                  style={{
+                    top: -4,
+                    right: -4,
+                    minWidth: 16,
+                    height: 16,
+                    padding: "0 4px",
+                    background: "var(--bad)",
+                    color: "#fff",
+                    border: "1px solid var(--panel)",
+                    lineHeight: 1,
+                  }}
+                >
+                  {unreadCount > 99 ? "99+" : unreadCount}
+                </span>
+              )}
+            </button>
             <div
               className="grid place-items-center rounded-full"
               style={{
