@@ -391,6 +391,11 @@ def close_trade(
         raise HTTPException(404, "not_found")
     if original.status != OrderStatus.FILLED:
         raise HTTPException(409, f"not_closeable: original status is {original.status.value}")
+    if original.broker_account_id is None:
+        # Broker was disconnected after the order filled. Can't place a
+        # reverse order — no broker to send it to. UI should disable the
+        # Close button for these rows.
+        raise HTTPException(409, "broker_disconnected: cannot close — reconnect the broker first")
 
     # Reverse the side; default qty to whatever filled on the original.
     close_qty = payload.quantity if payload.quantity is not None else original.filled_quantity

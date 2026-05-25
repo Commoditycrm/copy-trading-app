@@ -30,7 +30,8 @@ export interface ListenerStatus {
 export interface OrderEventPayload {
   id: string;
   parent_order_id: string | null;
-  broker_account_id: string;
+  // Nullable: orders survive when their broker is disconnected.
+  broker_account_id: string | null;
   symbol: string;
   side: string;
   order_type: string;

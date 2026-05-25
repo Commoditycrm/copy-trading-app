@@ -45,7 +45,9 @@ class FillOut(BaseModel):
 class OrderOut(BaseModel):
     id: uuid.UUID
     parent_order_id: uuid.UUID | None
-    broker_account_id: uuid.UUID
+    # Nullable: orders survive when their broker is disconnected (SET NULL
+    # at the DB level). See models/order.py for the rationale.
+    broker_account_id: uuid.UUID | None
     instrument_type: InstrumentType
     symbol: str
     side: OrderSide

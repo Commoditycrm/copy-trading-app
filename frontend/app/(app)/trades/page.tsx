@@ -390,8 +390,12 @@ export default function TradesPage() {
                 if (fromParam || toParam) return true;
 
                 if (o.status !== "filled") return true;     // open / cancelled / rejected — always show
+                // broker_account_id can be null for orders whose broker was
+                // disconnected after the trade — they have no current position
+                // to match against, so always show them ("" key won't match
+                // any held position).
                 return !heldKeys.has(posKey(
-                  o.broker_account_id,
+                  o.broker_account_id ?? "",
                   o.instrument_type,
                   o.symbol,
                   o.option_expiry,
