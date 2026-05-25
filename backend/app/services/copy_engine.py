@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
@@ -37,11 +37,22 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
-from app.models.settings import SubscriberSettings, TraderSettings
+from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
+from app.services.order_retry import classify_error
 from app.services.pnl import today_realized_pnl
+
+
+# Map subscriber's RetryInterval enum value → wall-clock minutes to wait
+# before the retry_scheduler picks the order back up.
+_RETRY_INTERVAL_MINUTES: dict[RetryInterval, int] = {
+    RetryInterval.ONE_M: 1,
+    RetryInterval.TWO_M: 2,
+    RetryInterval.THREE_M: 3,
+    RetryInterval.FIVE_M: 5,
+}
 
 # Per-broker semaphores. Lazily created on the running event loop so they
 # bind to the right loop (FastAPI's). Sized from settings.
@@ -268,7 +279,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
 
     # ── Phase 2: fire all broker calls in parallel via asyncio ────────────
-    async def _place_one(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, str | None]:
+    # _place_one returns the actual exception object (not just its string)
+    # so Phase 3 can call classify_error on it for retry routing. The string
+    # form is still used downstream as reject_reason — we just str() it
+    # there instead of here.
+    async def _place_one(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None]:
         sem = _broker_sem(item.broker)
         async with sem:
             try:
@@ -276,9 +291,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 resp = await asyncio.to_thread(item.adapter.place_order, item.request)
                 return item, resp, None
             except Exception as exc:  # noqa: BLE001
-                return item, None, str(exc)[:480]
+                return item, None, exc
 
-    broker_results: list[tuple[_PendingMirror, BrokerOrderResult | None, str | None]]
+    broker_results: list[tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None]]
     if pending:
         broker_results = await asyncio.gather(
             *(_place_one(p) for p in pending), return_exceptions=False
@@ -287,7 +302,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         broker_results = []
 
     # ── Phase 3: apply results, audit, publish events ──────────────────────
-    for item, resp, err in broker_results:
+    for item, resp, exc in broker_results:
+        err = str(exc)[:480] if exc is not None else None
         child = db.get(Order, item.child_order_id)
         if resp is not None:
             child.status = resp.status
@@ -321,27 +337,122 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", child))
         else:
-            child.status = OrderStatus.REJECTED
-            child.reject_reason = err
-            child.closed_at = datetime.now(timezone.utc)
-            audit.record(
-                db,
-                actor_user_id=item.subscriber_user_id,
-                action="copy.error",
-                entity_type="order",
-                entity_id=child.id,
-                metadata={"parent_order_id": str(trader_order.id), "error": err},
+            # Broker call failed. Classify the error to decide between:
+            #   1. User-fixable (insufficient buying power, after-hours
+            #      market order, etc.) → REJECTED with a clean message,
+            #      no retry — it'd just fail the same way next time.
+            #   2. Transient (5xx, 429, timeout, connection reset) AND
+            #      subscriber opted in to retries → RETRY_PENDING, the
+            #      retry_scheduler picks it up at retry_at.
+            #   3. Anything else → REJECTED with the raw error (pre-retry
+            #      behaviour).
+            #
+            # TODO(is_closing): detecting open-vs-close requires position-
+            # aware logic this branch doesn't have yet. Always treat as
+            # opening for now (`is_closing=False`, retry_interval_open is
+            # the only knob consulted). Closing-detection is a follow-up.
+            sub_settings = db.get(SubscriberSettings, item.subscriber_user_id)
+            interval = (
+                sub_settings.retry_interval_open
+                if sub_settings is not None
+                else RetryInterval.NEVER
             )
-            results.append(FanoutResult(
-                subscriber_user_id=item.subscriber_user_id,
-                broker_account_id=item.broker_account_id,
-                order_id=child.id,
-                status="error",
-                detail=err[:200] if err else None,
-            ))
-            # Lifecycle: even on failure, stamp broadcast moment.
-            child.redis_published_at = datetime.now(timezone.utc)
-            events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
+            cls = classify_error(exc) if exc is not None else None
+
+            if cls is not None and cls.clean_message is not None:
+                # User-fixable: present the clean message, no retry.
+                child.status = OrderStatus.REJECTED
+                child.reject_reason = cls.clean_message[:480]
+                child.closed_at = datetime.now(timezone.utc)
+                audit.record(
+                    db,
+                    actor_user_id=item.subscriber_user_id,
+                    action="copy.error",
+                    entity_type="order",
+                    entity_id=child.id,
+                    metadata={
+                        "parent_order_id": str(trader_order.id),
+                        "friendly": cls.clean_message,
+                        "raw": err,
+                        "classification": "user_fixable",
+                    },
+                )
+                results.append(FanoutResult(
+                    subscriber_user_id=item.subscriber_user_id,
+                    broker_account_id=item.broker_account_id,
+                    order_id=child.id,
+                    status="error",
+                    detail=cls.clean_message[:200],
+                ))
+                child.redis_published_at = datetime.now(timezone.utc)
+                events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
+
+            elif (
+                cls is not None
+                and cls.transient
+                and interval != RetryInterval.NEVER
+            ):
+                # Transient + subscriber wants retries → schedule one.
+                # IMPORTANT: keep lifecycle stamps (subscriber_picked_at,
+                # subscriber_accepted_at, broker_accepted_at,
+                # redis_published_at) intact. The retry flow continues
+                # the same order's lifecycle, not a new one.
+                minutes = _RETRY_INTERVAL_MINUTES[interval]
+                child.status = OrderStatus.RETRY_PENDING
+                child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+                child.is_closing = False  # TODO: close-detection
+                child.reject_reason = "transient broker error, will retry"
+                # Don't set closed_at — order isn't terminal.
+                audit.record(
+                    db,
+                    actor_user_id=item.subscriber_user_id,
+                    action="copy.retry_scheduled",
+                    entity_type="order",
+                    entity_id=child.id,
+                    metadata={
+                        "parent_order_id": str(trader_order.id),
+                        "error": err,
+                        "retry_at": child.retry_at.isoformat(),
+                        "interval_minutes": minutes,
+                    },
+                )
+                results.append(FanoutResult(
+                    subscriber_user_id=item.subscriber_user_id,
+                    broker_account_id=item.broker_account_id,
+                    order_id=child.id,
+                    status="retry_scheduled",
+                    detail=err[:200] if err else None,
+                ))
+                child.redis_published_at = datetime.now(timezone.utc)
+                # New event type — frontend's SSE union must accept it.
+                events.publish(
+                    item.subscriber_user_id,
+                    _order_event("order.copy_retry_scheduled", child),
+                )
+
+            else:
+                # Either unknown error, transient but retries disabled,
+                # or no classifier verdict. Fall back to original behaviour.
+                child.status = OrderStatus.REJECTED
+                child.reject_reason = err
+                child.closed_at = datetime.now(timezone.utc)
+                audit.record(
+                    db,
+                    actor_user_id=item.subscriber_user_id,
+                    action="copy.error",
+                    entity_type="order",
+                    entity_id=child.id,
+                    metadata={"parent_order_id": str(trader_order.id), "error": err},
+                )
+                results.append(FanoutResult(
+                    subscriber_user_id=item.subscriber_user_id,
+                    broker_account_id=item.broker_account_id,
+                    order_id=child.id,
+                    status="error",
+                    detail=err[:200] if err else None,
+                ))
+                child.redis_published_at = datetime.now(timezone.utc)
+                events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
 
     return results
 

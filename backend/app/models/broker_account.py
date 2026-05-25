@@ -14,6 +14,12 @@ class BrokerName(str, enum.Enum):
     """Brokers we directly integrate with. Adding a new one means writing an
     adapter under app/brokers/."""
     ALPACA = "alpaca"
+    # Test-only mock broker — see app/brokers/fake.py. NEVER ROUTE A REAL
+    # SUBSCRIBER TO THIS. Calls to place_order() sleep + return synthetic
+    # results; no order is sent anywhere. Used by
+    # scripts/seed_fake_subscribers.py for load-testing the fanout pipeline
+    # without hitting Alpaca's rate limits or burning paper accounts.
+    FAKE = "fake"
 
 
 class BrokerAccount(Base, TimestampMixin):

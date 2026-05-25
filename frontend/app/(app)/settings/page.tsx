@@ -5,7 +5,15 @@ import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
-import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
+import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
+
+const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
+  { value: "never", label: "Never (REJECT immediately)" },
+  { value: "1m",    label: "Retry after 1 minute" },
+  { value: "2m",    label: "Retry after 2 minutes" },
+  { value: "3m",    label: "Retry after 3 minutes" },
+  { value: "5m",    label: "Retry after 5 minutes" },
+];
 
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
@@ -94,6 +102,27 @@ export default function SettingsPage() {
       setLimitBusy(false);
     }
   }
+  async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
+    try {
+      const body = direction === "open"
+        ? { retry_interval_open: value }
+        : { retry_interval_close: value };
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/retry-interval",
+        { method: "PATCH", body: JSON.stringify(body) },
+      );
+      setSub(s);
+      const verb = direction === "open" ? "opening" : "closing";
+      notify.success(
+        value === "never"
+          ? `Retry for ${verb} positions disabled`
+          : `Retry for ${verb} positions set to ${RETRY_OPTIONS.find(o => o.value === value)?.label}`
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update retry interval");
+    }
+  }
+
   async function toggleTrading(next: boolean) {
     setTrd(await api<TraderSettings>("/api/settings/trader", {
       method: "PATCH", body: JSON.stringify({ trading_enabled: next })
@@ -245,6 +274,60 @@ export default function SettingsPage() {
                   Clear
                 </button>
               )}
+            </div>
+          </section>
+
+          {/* Retry mirror orders on broker errors — wraps the per-direction
+              policy from anitha-workspace into a single section keyed to
+              main's section styling. */}
+          <section className="p-4 rounded border space-y-4" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+            <div>
+              <h2 className="font-medium">Retry mirror orders on broker errors</h2>
+              <p className="text-sm" style={{color: "var(--muted)"}}>
+                If your broker is unreachable when a mirror order is placed (network blip,
+                5xx error, rate limit), the platform can wait and try once more. Set &ldquo;Never&rdquo;
+                to keep the old behaviour (immediately reject). User-fixable errors
+                (insufficient buying power, expired option, etc.) never retry regardless &mdash;
+                they&rsquo;d just fail the same way next time.
+              </p>
+              <p className="text-xs mt-2" style={{color: "var(--muted)"}}>
+                If the retry also fails, you&rsquo;ll get a notification in your inbox.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium block">Opening positions</label>
+                <select
+                  className="w-full p-2 rounded border bg-transparent"
+                  style={{borderColor: "var(--border)"}}
+                  value={sub.retry_interval_open}
+                  onChange={(e) => setRetryInterval("open", e.target.value as RetryInterval)}
+                >
+                  {RETRY_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+                <p className="text-xs" style={{color: "var(--muted)"}}>
+                  Applies to new positions the trader opens (BUY mirrors).
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium block">Closing positions</label>
+                <select
+                  className="w-full p-2 rounded border bg-transparent"
+                  style={{borderColor: "var(--border)"}}
+                  value={sub.retry_interval_close}
+                  onChange={(e) => setRetryInterval("close", e.target.value as RetryInterval)}
+                >
+                  {RETRY_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+                <p className="text-xs" style={{color: "var(--muted)"}}>
+                  Applies to exit / close-position orders. Late closes can affect P&amp;L &mdash;
+                  consider a shorter interval here than for opens.
+                </p>
+              </div>
             </div>
           </section>
 

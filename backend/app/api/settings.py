@@ -4,11 +4,12 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user, require_subscriber, require_trader
 from app.database import get_db
-from app.models.settings import SubscriberSettings, TraderSettings
+from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
     FollowTraderIn,
+    RetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
     SubscriberToggleIn,
@@ -35,6 +36,8 @@ def get_subscriber_settings(
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
     )
 
 
@@ -73,6 +76,65 @@ def set_daily_loss_limit(
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
+    )
+
+
+@router.patch("/subscriber/retry-interval", response_model=SubscriberSettingsOut)
+def set_retry_interval(
+    payload: RetryIntervalIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Update the subscriber's retry intervals (open and/or close). Either
+    field may be omitted — only the supplied ones change. Invalid enum
+    values return 422 so the frontend's dropdown stays the source of
+    truth for valid options."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+
+    def _parse(value: str) -> RetryInterval:
+        try:
+            return RetryInterval(value)
+        except ValueError:
+            raise HTTPException(422, f"invalid retry_interval: {value!r}")
+
+    changes: dict[str, str] = {}
+    if payload.retry_interval_open is not None:
+        new_open = _parse(payload.retry_interval_open)
+        if new_open != s.retry_interval_open:
+            changes["retry_interval_open"] = new_open.value
+            s.retry_interval_open = new_open
+    if payload.retry_interval_close is not None:
+        new_close = _parse(payload.retry_interval_close)
+        if new_close != s.retry_interval_close:
+            changes["retry_interval_close"] = new_close.value
+            s.retry_interval_close = new_close
+
+    if changes:
+        audit.record(
+            db,
+            actor_user_id=user.id,
+            action="subscriber.retry_interval_changed",
+            entity_type="subscriber_settings",
+            entity_id=user.id,
+            metadata=changes,
+            ip_address=client_ip(request),
+        )
+    db.commit()
+    db.refresh(s)
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
     )
 
 

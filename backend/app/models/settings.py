@@ -1,11 +1,24 @@
+import enum
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import Boolean, ForeignKey, Numeric
+from sqlalchemy import Boolean, Enum, ForeignKey, Numeric
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
+
+
+class RetryInterval(str, enum.Enum):
+    """How long to wait before retrying a transient-failed mirror order.
+    NEVER disables retry entirely — failed orders go straight to REJECTED
+    just like before this feature existed (no behaviour change)."""
+
+    NEVER = "never"
+    ONE_M = "1m"
+    TWO_M = "2m"
+    THREE_M = "3m"
+    FIVE_M = "5m"
 
 
 class TraderSettings(Base, TimestampMixin):
@@ -45,6 +58,20 @@ class SubscriberSettings(Base, TimestampMixin):
     # When today's realized P&L falls below -daily_loss_limit, copy_enabled is
     # auto-flipped to false and an audit + SSE event are emitted.
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+
+    # Retry policy for transient broker errors. Two separate intervals so a
+    # subscriber can be aggressive about closing positions (late close hurts
+    # P&L) and conservative about opening (late open is usually fine — skip
+    # the trade rather than enter at a worse price). NEVER → no retry, the
+    # order goes straight to REJECTED on broker error (pre-retry behaviour).
+    retry_interval_open: Mapped[RetryInterval] = mapped_column(
+        Enum(RetryInterval, name="retry_interval"),
+        default=RetryInterval.NEVER, server_default="never", nullable=False,
+    )
+    retry_interval_close: Mapped[RetryInterval] = mapped_column(
+        Enum(RetryInterval, name="retry_interval"),
+        default=RetryInterval.NEVER, server_default="never", nullable=False,
+    )
 
     user = relationship("User", back_populates="subscriber_settings", foreign_keys=[user_id])
     following_trader = relationship("User", foreign_keys=[following_trader_id])

@@ -123,6 +123,7 @@ export default function TradesPage() {
       evt.type !== "order.placed" &&
       evt.type !== "order.copy_submitted" &&
       evt.type !== "order.copy_failed" &&
+      evt.type !== "order.copy_retry_scheduled" &&
       evt.type !== "order.cancelled"
     ) {
       return;
@@ -509,15 +510,17 @@ export default function TradesPage() {
                         className="text-[11px] uppercase tracking-wider px-2 py-[4px] rounded whitespace-nowrap font-medium"
                         style={{
                           background:
-                            o.status === "filled"     ? "var(--good-soft)" :
-                            o.status === "rejected"   ? "var(--bad-soft)"  :
-                            o.status === "canceled"   ? "rgba(255,255,255,0.04)" :
-                                                        "rgba(10,115,168,0.10)",
+                            o.status === "filled"        ? "var(--good-soft)" :
+                            o.status === "rejected"      ? "var(--bad-soft)"  :
+                            o.status === "canceled"      ? "rgba(255,255,255,0.04)" :
+                            o.status === "retry_pending" ? "rgba(250, 204, 21, 0.10)" :
+                                                           "rgba(10,115,168,0.10)",
                           color:
-                            o.status === "filled"     ? "var(--good)" :
-                            o.status === "rejected"   ? "var(--bad)"  :
-                            o.status === "canceled"   ? "var(--muted)" :
-                                                        "var(--accent)",
+                            o.status === "filled"        ? "var(--good)" :
+                            o.status === "rejected"      ? "var(--bad)"  :
+                            o.status === "canceled"      ? "var(--muted)" :
+                            o.status === "retry_pending" ? "#facc15" :
+                                                           "var(--accent)",
                         }}
                       >
                         {o.status}{o.parent_order_id ? " · copy" : ""}

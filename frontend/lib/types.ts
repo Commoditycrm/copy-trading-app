@@ -33,7 +33,12 @@ export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
 export type OrderStatus =
   | "pending" | "submitted" | "accepted" | "partially_filled"
-  | "filled" | "canceled" | "rejected" | "expired";
+  | "filled" | "canceled" | "rejected" | "expired"
+  | "retry_pending";
+
+/** Subscriber's wait-before-retry policy on transient broker errors.
+ *  "never" = no retry, order fails immediately (pre-feature behaviour). */
+export type RetryInterval = "never" | "1m" | "2m" | "3m" | "5m";
 export type InstrumentType = "stock" | "option";
 export type OptionRight = "call" | "put";
 
@@ -105,6 +110,21 @@ export interface SubscriberSettings {
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
   trader_paused?: boolean;
+  /** Retry policy for transient broker errors when *opening* a position. */
+  retry_interval_open: RetryInterval;
+  /** Retry policy for transient broker errors when *closing* a position. */
+  retry_interval_close: RetryInterval;
+}
+
+/** In-app notification (mirror retry failed, etc.). Persisted server-side
+ *  for 30 days and dismissible via the inbox. */
+export interface AppNotification {
+  id: string;
+  type: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  read_at: string | null;
+  created_at: string;
 }
 
 export interface TraderSettings {

@@ -1,7 +1,8 @@
+import enum
 import uuid
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SubscriberSettingsOut(BaseModel):
@@ -11,6 +12,21 @@ class SubscriberSettingsOut(BaseModel):
     multiplier: Decimal
     daily_loss_limit: Decimal | None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
+    # Retry policy for transient broker errors. "never" disables retry.
+    # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
+    # frontend can render dropdowns without a separate mapping. Validator
+    # coerces a passed-in enum member to its `.value` so the
+    # response_model path (which auto-builds this from a SubscriberSettings
+    # ORM row) doesn't end up with "RetryInterval.NEVER".
+    retry_interval_open: str = "never"
+    retry_interval_close: str = "never"
+
+    @field_validator("retry_interval_open", "retry_interval_close", mode="before")
+    @classmethod
+    def _enum_to_value(cls, v):
+        if isinstance(v, enum.Enum):
+            return v.value
+        return v
 
     model_config = {"from_attributes": True}
 
@@ -37,6 +53,15 @@ class DailyLossLimitIn(BaseModel):
     """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
 
     daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class RetryIntervalIn(BaseModel):
+    """Subscriber-set retry policy. Either or both fields may be present —
+    only the supplied ones are updated, the rest stay as-is. Valid values:
+    "never", "1m", "2m", "3m", "5m"."""
+
+    retry_interval_open: str | None = None
+    retry_interval_close: str | None = None
 
 
 class FollowTraderIn(BaseModel):

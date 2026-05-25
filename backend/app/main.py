@@ -1,14 +1,27 @@
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, brokers, events, listener as listener_api, options, performance, positions, settings, subscribers, trades
+from app.api import (
+    auth,
+    brokers,
+    events,
+    listener as listener_api,
+    notifications as notifications_api,
+    options,
+    performance,
+    positions,
+    settings,
+    subscribers,
+    trades,
+)
 from app.config import get_settings
 from app.services import events as events_bus
-from app.services import recovery, trade_listener
+from app.services import recovery, retry_scheduler, trade_listener
 from app.services.redis_client import close_async_redis
 
 log = logging.getLogger(__name__)
@@ -46,6 +59,12 @@ def create_app() -> FastAPI:
     app.include_router(positions.router)
     app.include_router(performance.router)
     app.include_router(listener_api.router)
+    app.include_router(notifications_api.router)
+
+    # Shared across the startup/shutdown hooks so the retry scheduler
+    # thread can be signalled to exit cleanly when uvicorn shuts down.
+    shutdown_event = threading.Event()
+    scheduler_thread: threading.Thread | None = None
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
@@ -77,8 +96,27 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start trade listeners")
 
+        # Start the retry scheduler in a daemon thread. It polls every 10s
+        # for RETRY_PENDING orders whose retry_at has elapsed and runs the
+        # broker call again. Daemon=True so the thread doesn't keep
+        # uvicorn alive on a hard stop, and the shutdown_event lets the
+        # graceful path tell it to exit at the top of the next iteration.
+        nonlocal scheduler_thread
+        scheduler_thread = threading.Thread(
+            target=retry_scheduler.poll_loop,
+            kwargs={"shutdown_check": shutdown_event.is_set},
+            name="retry-scheduler",
+            daemon=True,
+        )
+        scheduler_thread.start()
+
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
+        # Signal the retry scheduler to exit at its next poll tick. We
+        # don't join — daemon=True takes care of hard termination if it
+        # doesn't notice in time, and joining would block shutdown on
+        # the (up to 10s) sleep at the bottom of the loop.
+        shutdown_event.set()
         try:
             await trade_listener.stop_all_listeners()
         except Exception:  # noqa: BLE001

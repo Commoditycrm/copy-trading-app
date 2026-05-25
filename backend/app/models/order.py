@@ -31,6 +31,10 @@ class OrderStatus(str, enum.Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    # Broker rejected the order with a transient error (5xx / 429 / timeout /
+    # connection reset). retry_scheduler will pick this up at retry_at and
+    # try once more; on success → SUBMITTED, on failure → REJECTED.
+    RETRY_PENDING = "retry_pending"
 
 
 class InstrumentType(str, enum.Enum):
@@ -123,6 +127,23 @@ class Order(Base, TimestampMixin):
     )
     broker_accepted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # ── Retry policy (transient broker errors) ──────────────────────────
+    # Set on a child order whose broker call returned a transient error
+    # (5xx, 429, timeout, connection reset). The retry_scheduler picks
+    # rows up where retry_at <= now() AND retry_attempted=false and tries
+    # the broker call once more. is_closing distinguishes opening vs
+    # closing intent so the subscriber's open/close retry interval can
+    # be applied. See alembic migration b3c1d4e2a51f for details.
+    retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    retry_attempted: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    is_closing: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
     )
 
     # True when this order was broadcast to subscribers via the copy-engine
