@@ -88,6 +88,21 @@ _tasks: dict[uuid.UUID, asyncio.Task] = {}
 # stop_ws() before cancelling the task (cleaner shutdown).
 _streams: dict[uuid.UUID, TradingStream] = {}
 
+# Reference to the main FastAPI event loop, captured at app startup. We need
+# this because start_listener() can be called from sync request handler
+# threads (POST /api/brokers) — those threads have no event loop of their
+# own, so we route create_task through the main loop via
+# call_soon_threadsafe. Without this, the listener silently fails to start
+# when a new broker is connected at runtime.
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Called once from FastAPI startup so off-loop callers (sync request
+    handlers) can schedule listener tasks on the right loop."""
+    global _main_loop
+    _main_loop = loop
+
 
 def get_status(trader_user_id: uuid.UUID) -> ListenerStatus | None:
     return _status.get(trader_user_id)
@@ -173,8 +188,10 @@ async def start_all_listeners() -> None:
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     """Spawn (or replace) the listener task for one (trader, account) pair.
 
-    Safe to call from a sync handler — uses ``asyncio.get_event_loop`` to
-    schedule the task on the FastAPI loop.
+    Safe to call from:
+      - an async coroutine running on the FastAPI loop (uses get_running_loop)
+      - a sync FastAPI handler thread (uses the loop captured by bind_loop
+        at startup, scheduled via call_soon_threadsafe)
     """
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
@@ -183,15 +200,39 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         log.info("listener[%s] restart requested", trader_user_id)
         stop_listener(trader_user_id)
 
+    # Prefer the running loop when we're already on it (avoids the
+    # call_soon_threadsafe hop for the common startup path).
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        on_loop = True
     except RuntimeError:
-        log.warning("listener[%s] no running loop; deferring", trader_user_id)
+        loop = _main_loop
+        on_loop = False
+
+    if loop is None:
+        # bind_loop() was never called — FastAPI startup didn't run yet, or
+        # we're being imported from a context that has no main loop at all
+        # (e.g. an alembic script). Nothing we can do.
+        log.warning(
+            "listener[%s] no main loop bound; start_listener is a no-op "
+            "(did FastAPI startup run?)",
+            trader_user_id,
+        )
         return
 
-    task = loop.create_task(_run_listener(trader_user_id, broker_account_id))
-    _tasks[trader_user_id] = task
-    _set_state(trader_user_id, "connecting")
+    if on_loop:
+        task = loop.create_task(_run_listener(trader_user_id, broker_account_id))
+        _tasks[trader_user_id] = task
+        _set_state(trader_user_id, "connecting")
+    else:
+        # Called from a sync handler thread — schedule task creation on the
+        # main loop and store the resulting Task once it exists.
+        def _schedule() -> None:
+            task = loop.create_task(_run_listener(trader_user_id, broker_account_id))
+            _tasks[trader_user_id] = task
+            _set_state(trader_user_id, "connecting")
+
+        loop.call_soon_threadsafe(_schedule)
 
 
 def stop_listener(trader_user_id: uuid.UUID) -> None:
