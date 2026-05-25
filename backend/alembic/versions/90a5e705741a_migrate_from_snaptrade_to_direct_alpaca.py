@@ -30,8 +30,16 @@ def upgrade() -> None:
     # Drop any orphaned enum type from earlier failed runs.
     op.execute("DROP TYPE IF EXISTS broker_name")
 
-    # 3. Re-create broker_accounts with the new shape. create_table auto-creates
-    #    the broker_name enum from the Column definition.
+    # 3. Re-create the enum type explicitly. We had relied on
+    #    op.create_table's auto-create behaviour below, but
+    #    SQLAlchemy's checkfirst can skip the CREATE TYPE in this
+    #    just-after-DROP path, leading to "type broker_name does not
+    #    exist" on a fresh DB. Doing the CREATE TYPE inline keeps
+    #    the migration deterministic.
+    op.execute("CREATE TYPE broker_name AS ENUM ('alpaca')")
+
+    # 4. Re-create broker_accounts. create_type=False because we just
+    #    created the type ourselves above.
     op.create_table(
         "broker_accounts",
         sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
@@ -41,7 +49,11 @@ def upgrade() -> None:
             sa.ForeignKey("users.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("broker", sa.Enum("alpaca", name="broker_name"), nullable=False),
+        sa.Column(
+            "broker",
+            sa.Enum("alpaca", name="broker_name", create_type=False),
+            nullable=False,
+        ),
         sa.Column("label", sa.String(120), nullable=False),
         sa.Column("is_paper", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.Column("supports_fractional", sa.Boolean(), nullable=False, server_default=sa.true()),
