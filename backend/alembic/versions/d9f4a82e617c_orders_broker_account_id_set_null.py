@@ -57,7 +57,15 @@ def upgrade() -> None:
     )
 
     # 2. Replace the CASCADE FK with SET NULL.
-    op.drop_constraint(_FK_NAME, "orders", type_="foreignkey")
+    # Use DROP CONSTRAINT IF EXISTS instead of op.drop_constraint because on
+    # databases initialised from scratch the FK was already cascaded out by
+    # earlier migrations 4e2dad6c1805 / 90a5e705741a (each does DROP TABLE
+    # broker_accounts CASCADE which pulls down the FK on orders, but neither
+    # re-creates it). On existing prod DBs the constraint is still there
+    # and this drops it cleanly.
+    op.execute(
+        f"ALTER TABLE orders DROP CONSTRAINT IF EXISTS {_FK_NAME}"
+    )
     op.create_foreign_key(
         _FK_NAME,
         "orders",
