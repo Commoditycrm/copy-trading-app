@@ -596,10 +596,17 @@ def _cascade_cancel_to_mirrors(parent_order_id: uuid.UUID) -> None:
 def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     """Sync — runs in a thread. Pulls Alpaca activities for this trader's
     account and upserts fills. Catches orders placed while the listener was
-    offline. Does NOT trigger fanout here (sync just rebuilds DB state);
-    fanout for orders we'd never seen is handled by the regular trade_updates
-    handler when the next event arrives, OR by a one-shot pass over the
-    backfilled orders that have fanned_out_to_subscribers=False."""
+    offline. After the upsert runs a one-shot fanout pass over any
+    backfilled parent orders that haven't been broadcast yet — so
+    subscribers receive copies of trades the trader placed while the
+    listener was offline.
+
+    Idempotent — ``fanned_out_to_subscribers=True`` after fanout prevents
+    double-fanout on subsequent backfill cycles, and ``copy_engine.fanout``
+    itself dedupes per child broker_account.
+    """
+    from sqlalchemy import select  # local — avoid top-level cycle risk
+
     with SessionLocal() as db:
         acct = db.get(BrokerAccount, broker_account_id)
         if acct is None:
@@ -609,4 +616,54 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
             db.commit()
         except Exception:  # noqa: BLE001
             log.exception("listener backfill failed for %s", broker_account_id)
+            db.rollback()
+            return
+
+        # ── One-shot fanout for orders missed while the listener was offline ──
+        # Without this pass, trades placed externally on Alpaca while we were
+        # disconnected sit in the DB with fanned_out_to_subscribers=False
+        # forever; subscribers never receive copies and the Performance page
+        # stays empty. Only fanout orders in working/terminal-success states
+        # — PENDING/REJECTED parents shouldn't be broadcast.
+        trader = db.get(User, trader_user_id)
+        if trader is None:
+            return
+        unfanned = db.execute(
+            select(Order).where(
+                Order.user_id == trader_user_id,
+                Order.parent_order_id.is_(None),
+                Order.fanned_out_to_subscribers.is_(False),
+                Order.status.in_(
+                    [
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                        OrderStatus.FILLED,
+                    ]
+                ),
+            )
+        ).scalars().all()
+        if not unfanned:
+            return
+
+        fanned = 0
+        for o in unfanned:
+            try:
+                copy_engine.fanout(db, o, trader)
+                o.fanned_out_to_subscribers = True
+                fanned += 1
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "listener backfill fanout failed for order %s", o.id
+                )
+        try:
+            db.commit()
+            log.info(
+                "listener[%s] backfilled-fanout %d/%d orders",
+                trader_user_id,
+                fanned,
+                len(unfanned),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("listener backfill fanout commit failed")
             db.rollback()
