@@ -70,6 +70,12 @@ def create_app() -> FastAPI:
     async def _bind_loop() -> None:
         loop = asyncio.get_running_loop()
         events_bus.bind_loop(loop)
+        # Capture the main loop reference so sync request handlers (POST
+        # /api/brokers) can schedule the trade_updates listener on the right
+        # loop without needing to be async themselves. Without this, adding
+        # a broker at runtime silently fails to start its listener and the
+        # user has to restart the backend container.
+        trade_listener.bind_loop(loop)
         # Replace the default ThreadPoolExecutor (capped at min(32, cpu+4)) so
         # asyncio.to_thread() can actually run 200 broker calls in parallel
         # during fanout. Without this, the semaphore is misleading — calls
