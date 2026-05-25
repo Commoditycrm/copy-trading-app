@@ -60,10 +60,17 @@ class Order(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+    # Nullable + ON DELETE SET NULL on purpose. When a user disconnects a
+    # broker, we DO NOT want to lose every Order tied to it (that would wipe
+    # the Performance / Order History audit trail). The previous CASCADE was
+    # a silent footgun — see the broker-reconnect-clears-performance
+    # incident. Orders whose broker was later removed survive with this
+    # column NULL; they stay visible in history but cancel/close endpoints
+    # 404 since there's no broker to talk to any more.
+    broker_account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("broker_accounts.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("broker_accounts.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
     parent_order_id: Mapped[uuid.UUID | None] = mapped_column(

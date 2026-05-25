@@ -66,4 +66,9 @@ class BrokerAccount(Base, TimestampMixin):
     last_activity_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="broker_accounts")
-    orders = relationship("Order", back_populates="broker_account", cascade="all, delete-orphan")
+    # No delete-orphan cascade — see Order.broker_account_id for the
+    # rationale. Orders must survive their broker being disconnected so the
+    # Performance / Order History audit trail stays intact. SET NULL at the
+    # DB level handles the orphan transition; the Order row stays, just
+    # without a broker pointer.
+    orders = relationship("Order", back_populates="broker_account")

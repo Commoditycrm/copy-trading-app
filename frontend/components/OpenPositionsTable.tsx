@@ -180,6 +180,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }>();
       for (const o of orders) {
         if (o.status !== "filled" && o.status !== "partially_filled") continue;
+        // Skip orphan orders (broker_account_id is null because the broker
+        // was disconnected after the trade) — they can't match any current
+        // position. Including them with a "" key would corrupt dedup keys.
+        if (!o.broker_account_id) continue;
         const k = key(o.broker_account_id, o.instrument_type, o.symbol, o.option_expiry, o.option_strike, o.option_right);
         const lastFillAt = o.fills?.length
           ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at

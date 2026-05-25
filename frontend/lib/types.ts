@@ -52,7 +52,9 @@ export interface Fill {
 export interface Order {
   id: string;
   parent_order_id: string | null;
-  broker_account_id: string;
+  // Nullable: orders survive when their broker is disconnected. See
+  // backend/app/models/order.py for the rationale.
+  broker_account_id: string | null;
   instrument_type: InstrumentType;
   symbol: string;
   side: OrderSide;
