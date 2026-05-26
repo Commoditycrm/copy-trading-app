@@ -92,14 +92,20 @@ function fmtMs(ms: number | null | undefined): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
-/** HH:MM:SS.mmm in the user's local timezone — matches the screenshot. */
+/** HH:MM:SS.mmm in Eastern Time (ET). */
+const _ET_PARTS_FMT = new Intl.DateTimeFormat("en-US", {
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hour12: false,
+  timeZone: "America/New_York",
+});
 function fmtClock(iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
+  const parts = _ET_PARTS_FMT.formatToParts(d);
+  const hh = parts.find(p => p.type === "hour")?.value ?? "00";
+  const mm = parts.find(p => p.type === "minute")?.value ?? "00";
+  const ss = parts.find(p => p.type === "second")?.value ?? "00";
   const ms = String(d.getMilliseconds()).padStart(3, "0");
   return `${hh}:${mm}:${ss}.${ms}`;
 }
@@ -869,12 +875,12 @@ export default function PerformancePage() {
                 ["Symbol", "Ticker symbol the trader bought or sold."],
                 ["Side", "BUY or SELL."],
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
-                ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
-                ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
-                ["Socket Received At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
-                ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
-                ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
-                ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
+                ["Trader Submitted At (ET)", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order. All times shown in Eastern Time."],
+                ["Broker Accepted At (ET)", "When the trader's broker (Alpaca) confirmed acceptance of the order. Eastern Time."],
+                ["Socket Received At (ET)", "When our Alpaca trade-updates WebSocket heard the order event from the broker. Eastern Time."],
+                ["Detected At (ET)", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers. Eastern Time."],
+                ["Redis Published At (ET)", "When we broadcast the order via SSE so the trader's open browser tabs update in real time. Eastern Time."],
+                ["Fanout Completed At (ET)", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time. Eastern Time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
                 ["Socket Lag", "Trader submit → our WebSocket hearing about it. Socket Received At − Trader Submitted At."],
                 ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],

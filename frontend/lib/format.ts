@@ -2,9 +2,13 @@
  * Date / time formatting helpers — single source of truth so the whole app
  * shows dates the same way.
  *
- * Format target: "May 15, 2026, 01:30:00 AM" for full timestamps,
- *                "May 15, 2026"               for date-only fields.
+ * All timestamps are displayed in Eastern Time (America/New_York — ET/EDT/EST).
+ * Format target: "May 15, 2026, 01:30:00 AM ET" for full timestamps,
+ *                "May 15, 2026"                  for date-only fields.
  */
+
+/** IANA timezone for the whole platform — Eastern Time. */
+export const ET = "America/New_York";
 
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   month: "short",
@@ -14,6 +18,7 @@ const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   minute: "2-digit",
   second: "2-digit",
   hour12: true,
+  timeZone: ET,
 };
 
 const DATE_OPTS: Intl.DateTimeFormatOptions = {
@@ -30,20 +35,20 @@ export function fmtDateTime(input: string | number | Date | null | undefined): s
   return d.toLocaleString("en-US", DATETIME_OPTS);
 }
 
-/** Full timestamp with milliseconds — e.g. "May 15, 2026, 01:30:00.842 AM".
- *  Used for trade rows where sub-second ordering matters. When `timeZone`
- *  is given (an IANA name like "America/New_York"), the time is rendered
- *  in that zone with a short abbreviation appended (EDT/EST). */
+/** Full timestamp with milliseconds — e.g. "May 15, 2026, 01:30:00.842 AM ET".
+ *  Used for trade rows where sub-second ordering matters. Defaults to Eastern
+ *  Time; pass a different IANA name to override. */
 export function fmtDateTimeMs(
   input: string | number | Date | null | undefined,
-  timeZone?: string,
+  timeZone: string = ET,
 ): string {
   if (!input) return "—";
   const d = input instanceof Date ? input : new Date(input);
   if (Number.isNaN(d.getTime())) return "—";
   const opts: Intl.DateTimeFormatOptions = {
     ...DATETIME_OPTS,
-    ...(timeZone ? { timeZone, timeZoneName: "short" } : {}),
+    timeZone,
+    timeZoneName: "short",
   };
   const base = d.toLocaleString("en-US", opts);
   // The base looks like "May 15, 2026, 01:30:00 AM EDT" — insert ".NNN" after
@@ -94,5 +99,5 @@ export function fmtDate(input: string | Date | null | undefined): string {
     d = new Date(input);
   }
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("en-US", DATE_OPTS);
+  return d.toLocaleDateString("en-US", { ...DATE_OPTS, timeZone: ET });
 }

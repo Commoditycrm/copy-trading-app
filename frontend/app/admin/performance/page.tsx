@@ -53,14 +53,16 @@ function ms(v: number | null) {
   return <span style={{ color, fontFamily: "monospace" }}>{v.toLocaleString()}ms</span>;
 }
 
+const _ET = "America/New_York";
+
 function fmt(iso: string | null) {
   if (!iso) return "—";
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return new Date(iso).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: _ET });
 }
 
 function fmtDate(iso: string | null) {
   if (!iso) return "—";
-  return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: _ET });
 }
 
 const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
