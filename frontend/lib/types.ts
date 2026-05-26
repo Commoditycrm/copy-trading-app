@@ -8,7 +8,7 @@ export interface User {
   is_active: boolean;
 }
 
-export type BrokerName = "alpaca";
+export type BrokerName = "alpaca" | "webull" | "snaptrade";
 
 export interface BrokerAccount {
   id: string;

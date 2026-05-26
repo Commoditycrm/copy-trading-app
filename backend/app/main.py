@@ -22,7 +22,7 @@ from app.api import (
 )
 from app.config import get_settings
 from app.services import events as events_bus
-from app.services import recovery, retry_scheduler, trade_listener
+from app.services import listeners, recovery, retry_scheduler
 from app.services.redis_client import close_async_redis
 
 log = logging.getLogger(__name__)
@@ -73,11 +73,13 @@ def create_app() -> FastAPI:
         loop = asyncio.get_running_loop()
         events_bus.bind_loop(loop)
         # Capture the main loop reference so sync request handlers (POST
-        # /api/brokers) can schedule the trade_updates listener on the right
-        # loop without needing to be async themselves. Without this, adding
-        # a broker at runtime silently fails to start its listener and the
-        # user has to restart the backend container.
-        trade_listener.bind_loop(loop)
+        # /api/brokers) can schedule listener tasks on the right loop
+        # without needing to be async themselves. Without this, adding a
+        # broker at runtime silently fails to start its listener and the
+        # user has to restart the backend container. Both the Alpaca
+        # WebSocket listener and the Webull poll listener share this
+        # captured loop.
+        listeners.bind_loop(loop)
         # Replace the default ThreadPoolExecutor (capped at min(32, cpu+4)) so
         # asyncio.to_thread() can actually run 200 broker calls in parallel
         # during fanout. Without this, the semaphore is misleading — calls
@@ -96,11 +98,11 @@ def create_app() -> FastAPI:
                 log.info("recovery sweep replayed %d orphaned PENDING orders", recovered)
         except Exception:  # noqa: BLE001
             log.exception("recovery sweep failed")
-        # Spawn Alpaca trade_updates listeners for every active trader with a
-        # connected Alpaca account. Requires a long-running process — won't
-        # work on Vercel serverless.
+        # Spawn listeners for every active trader's connected broker —
+        # Alpaca WebSocket and/or Webull poll loop. Requires a long-running
+        # process; won't work on Vercel serverless.
         try:
-            await trade_listener.start_all_listeners()
+            await listeners.start_all_listeners()
         except Exception:  # noqa: BLE001
             log.exception("failed to start trade listeners")
 
@@ -126,7 +128,7 @@ def create_app() -> FastAPI:
         # the (up to 10s) sleep at the bottom of the loop.
         shutdown_event.set()
         try:
-            await trade_listener.stop_all_listeners()
+            await listeners.stop_all_listeners()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop trade listeners cleanly")
         try:

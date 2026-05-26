@@ -56,17 +56,24 @@ function fmtRel(iso: string | null): string {
 export function ListenerPill({ role }: Props) {
   const [status, setStatus] = useState<StatusPayload | null>(null);
 
-  // Initial fetch on mount.
-  useEffect(() => {
-    let cancelled = false;
+  // Fetch helper used by mount, SSE-reconnect re-sync, and the polling backstop.
+  const refetch = () => {
     api<StatusPayload>("/api/listener/status")
-      .then(s => { if (!cancelled) setStatus(s); })
-      .catch(() => { /* ignore — pill renders as Offline if we have nothing */ });
-    return () => { cancelled = true; };
+      .then(s => setStatus(s))
+      .catch(() => { /* ignore — pill keeps last-known state */ });
+  };
+
+  // Initial fetch on mount + periodic backstop poll. The poll catches state
+  // changes that fire while our SSE subscription is briefly down (Redis
+  // pub/sub is fire-and-forget — no replay on reconnect).
+  useEffect(() => {
+    refetch();
+    const id = setInterval(refetch, 30_000);
+    return () => clearInterval(id);
   }, []);
 
   // Live updates via SSE.
-  useEventStream((evt) => {
+  const sse = useEventStream((evt) => {
     if (evt.type !== "listener.state_changed") return;
     setStatus((prev) => ({
       // Preserve trader_id + viewer; only the inner status changes.
@@ -75,6 +82,12 @@ export function ListenerPill({ role }: Props) {
       ...evt.status,
     }));
   });
+
+  // Whenever the SSE socket (re)connects, re-sync from the source of truth
+  // in case we missed a state_changed event during the disconnected window.
+  useEffect(() => {
+    if (sse.state === "connected") refetch();
+  }, [sse.state]);
 
   const s = status?.state ?? "disconnected";
   const color = STATE_COLOR[s];

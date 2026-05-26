@@ -7,6 +7,8 @@ from app.brokers.base import (
     ConnectionInfo,
 )
 from app.brokers.fake import FakeBrokerAdapter
+from app.brokers.snaptrade import SnapTradeAdapter
+from app.brokers.webull import WebullAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
 
 
@@ -14,6 +16,10 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
     """Construct an adapter for the broker_account using its decrypted credentials."""
     if broker_account.broker == BrokerName.ALPACA:
         return AlpacaAdapter(credentials)
+    if broker_account.broker == BrokerName.WEBULL:
+        return WebullAdapter(credentials)
+    if broker_account.broker == BrokerName.SNAPTRADE:
+        return SnapTradeAdapter(credentials)
     if broker_account.broker == BrokerName.FAKE:
         # Test-only — see app/brokers/fake.py. The credentials dict is
         # ignored; we keep the same call signature so copy_engine doesn't
@@ -31,6 +37,8 @@ __all__ = [
     "BrokerPosition",
     "ConnectionInfo",
     "FakeBrokerAdapter",
+    "SnapTradeAdapter",
+    "WebullAdapter",
     "adapter_for",
     "build_occ_symbol",
 ]

@@ -178,7 +178,7 @@ body {
 .btn-accent-solid:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Inputs */
-input[type="text"], input[type="email"], input[type="password"],
+input:not([type]), input[type="text"], input[type="email"], input[type="password"],
 input[type="number"], input[type="date"], select, textarea {
   background: rgba(255, 255, 255, 0.02);
   color: var(--text);
@@ -203,6 +203,10 @@ input:-webkit-autofill,
 input:-webkit-autofill:hover,
 input:-webkit-autofill:focus,
 input:-webkit-autofill:active,
+input:not([type]):-webkit-autofill,
+input:not([type]):-webkit-autofill:hover,
+input:not([type]):-webkit-autofill:focus,
+input:not([type]):-webkit-autofill:active,
 select:-webkit-autofill,
 select:-webkit-autofill:hover,
 select:-webkit-autofill:focus,

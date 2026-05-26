@@ -14,6 +14,16 @@ class BrokerName(str, enum.Enum):
     """Brokers we directly integrate with. Adding a new one means writing an
     adapter under app/brokers/."""
     ALPACA = "alpaca"
+    # Webull (via the unofficial `webull` Python SDK). Real-time order
+    # updates are *polled* (not socket) every ~2s — the SDK does not expose
+    # a stable MQTT order channel. See app/services/webull_listener.py.
+    WEBULL = "webull"
+    # SnapTrade aggregator. User connects through SnapTrade's hosted portal
+    # — we never see the underlying broker credentials. Order updates are
+    # polled every ~5s. Latency is higher than direct integrations because
+    # SnapTrade itself polls the upstream broker, so faster polling on our
+    # side buys nothing. See app/brokers/snaptrade.py.
+    SNAPTRADE = "snaptrade"
     # Test-only mock broker — see app/brokers/fake.py. NEVER ROUTE A REAL
     # SUBSCRIBER TO THIS. Calls to place_order() sleep + return synthetic
     # results; no order is sent anywhere. Used by
