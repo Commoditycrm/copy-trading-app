@@ -142,7 +142,7 @@ export default function SubscribersPage() {
             className="px-3 py-1 text-sm rounded"
             style={{ background: "var(--bad)", color: "#fff" }}
           >
-            Delete selected ({selected.size})
+            Remove selected ({selected.size})
           </button>
         </div>
       </div>
