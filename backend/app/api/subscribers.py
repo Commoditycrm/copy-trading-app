@@ -19,7 +19,7 @@ from app.schemas.settings import (
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
-from app.services import audit, cache
+from app.services import audit, cache, notifications
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api/subscribers", tags=["subscribers"])
@@ -137,16 +137,23 @@ def set_multiplier(
 
 
 def _unfollow(
-    db: Session, s: SubscriberSettings, *, trader_id: uuid.UUID,
+    db: Session, s: SubscriberSettings, *, trader: User,
     request: Request, via: str,
 ) -> None:
-    """Set following_trader_id=NULL and flip copy_enabled off.
+    """Set following_trader_id=NULL, flip copy_enabled off, and notify the
+    subscriber.
 
     The subscriber's account, broker connections, multiplier, P&L history
     and any in-flight mirror orders are preserved — this just stops future
     fanout from THIS trader. The subscriber can re-follow at any time from
     their settings page. Existing positions remain owned by the subscriber.
+
+    A notification is created so the subscriber sees a toast immediately
+    if their app is open AND a persistent bell-icon entry on next login —
+    we don't silently drop them. JWT/session is untouched: there's no
+    security reason to log them out, only a need to inform them.
     """
+    subscriber_id = s.user_id
     s.following_trader_id = None
     # Belt-and-braces: flip the subscriber-side copy flag too so even if
     # the subscriber re-follows by mistake later, fanout doesn't resume
@@ -154,13 +161,40 @@ def _unfollow(
     s.copy_enabled = False
     audit.record(
         db,
-        actor_user_id=trader_id,
+        actor_user_id=trader.id,
         action="trader.subscriber_removed",
         entity_type="subscriber_settings",
-        entity_id=s.user_id,
-        metadata={"subscriber_id": str(s.user_id), "via": via},
+        entity_id=subscriber_id,
+        metadata={"subscriber_id": str(subscriber_id), "via": via},
         ip_address=client_ip(request),
     )
+    # Notify the subscriber. Persistent + SSE-pushed, so a logged-in
+    # browser tab gets a live toast and a closed-tab subscriber sees the
+    # bell badge on next login. Wrapped in try/except: a notification
+    # delivery failure should not roll back the unfollow itself — the
+    # state change is what matters; the notice is a courtesy.
+    trader_label = trader.display_name or trader.email
+    try:
+        notifications.create_notification(
+            db,
+            user_id=subscriber_id,
+            type="trader.unfollowed_you",
+            message=(
+                f"{trader_label} has removed you from their subscribers. "
+                f"You will not receive new copy trades from them. Existing "
+                f"positions in your account are not affected."
+            ),
+            metadata={
+                "trader_id": str(trader.id),
+                "trader_email": trader.email,
+                "trader_display_name": trader.display_name,
+                "via": via,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        # Don't fail the unfollow because notification couldn't be sent.
+        # Audit row above is the source of truth for the action.
+        pass
 
 
 @router.delete("/{subscriber_id}")
@@ -175,7 +209,7 @@ def remove_subscriber(
     s = db.get(SubscriberSettings, subscriber_id)
     if not s or s.following_trader_id != trader.id:
         raise HTTPException(404, "subscriber_not_found")
-    _unfollow(db, s, trader_id=trader.id, request=request, via="single")
+    _unfollow(db, s, trader=trader, request=request, via="single")
     db.commit()
     cache.invalidate_subscribers_for_trader(trader.id)
     return {"ok": True, "removed": 1}
@@ -202,7 +236,7 @@ def bulk_remove_subscribers(
         )
     ).scalars().all()
     for s in rows:
-        _unfollow(db, s, trader_id=trader.id, request=request, via="bulk")
+        _unfollow(db, s, trader=trader, request=request, via="bulk")
     if rows:
         db.commit()
         cache.invalidate_subscribers_for_trader(trader.id)
