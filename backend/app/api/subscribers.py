@@ -15,6 +15,7 @@ from app.models.user import User
 from app.schemas.settings import (
     BulkCopyStateOut,
     BulkCopyToggleIn,
+    SubscriberBulkRemoveIn,
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
@@ -133,3 +134,76 @@ def set_multiplier(
     db.commit()
     cache.invalidate_subscribers_for_trader(trader.id)
     return {"ok": True}
+
+
+def _unfollow(
+    db: Session, s: SubscriberSettings, *, trader_id: uuid.UUID,
+    request: Request, via: str,
+) -> None:
+    """Set following_trader_id=NULL and flip copy_enabled off.
+
+    The subscriber's account, broker connections, multiplier, P&L history
+    and any in-flight mirror orders are preserved — this just stops future
+    fanout from THIS trader. The subscriber can re-follow at any time from
+    their settings page. Existing positions remain owned by the subscriber.
+    """
+    s.following_trader_id = None
+    # Belt-and-braces: flip the subscriber-side copy flag too so even if
+    # the subscriber re-follows by mistake later, fanout doesn't resume
+    # silently — they have to opt in explicitly.
+    s.copy_enabled = False
+    audit.record(
+        db,
+        actor_user_id=trader_id,
+        action="trader.subscriber_removed",
+        entity_type="subscriber_settings",
+        entity_id=s.user_id,
+        metadata={"subscriber_id": str(s.user_id), "via": via},
+        ip_address=client_ip(request),
+    )
+
+
+@router.delete("/{subscriber_id}")
+def remove_subscriber(
+    subscriber_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> dict:
+    """Remove (unfollow) a single subscriber. Preserves the subscriber's
+    account and history — only the follow relationship is broken."""
+    s = db.get(SubscriberSettings, subscriber_id)
+    if not s or s.following_trader_id != trader.id:
+        raise HTTPException(404, "subscriber_not_found")
+    _unfollow(db, s, trader_id=trader.id, request=request, via="single")
+    db.commit()
+    cache.invalidate_subscribers_for_trader(trader.id)
+    return {"ok": True, "removed": 1}
+
+
+@router.post("/bulk-remove")
+def bulk_remove_subscribers(
+    payload: SubscriberBulkRemoveIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> dict:
+    """Bulk version of DELETE /api/subscribers/{id}.
+
+    IDs that don't belong to this trader (already-unfollowed, wrong
+    trader, or just garbage) are silently skipped — partial-success is
+    the right ergonomic for a multi-select UI where the user clicked
+    rows that may have shifted on the server in the meantime.
+    """
+    rows = db.execute(
+        select(SubscriberSettings).where(
+            SubscriberSettings.user_id.in_(payload.subscriber_ids),
+            SubscriberSettings.following_trader_id == trader.id,
+        )
+    ).scalars().all()
+    for s in rows:
+        _unfollow(db, s, trader_id=trader.id, request=request, via="bulk")
+    if rows:
+        db.commit()
+        cache.invalidate_subscribers_for_trader(trader.id)
+    return {"ok": True, "removed": len(rows)}

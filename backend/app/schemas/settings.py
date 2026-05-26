@@ -78,6 +78,18 @@ class SubscriberMultiplierIn(BaseModel):
     multiplier: Decimal = Field(gt=0, le=100)
 
 
+class SubscriberBulkRemoveIn(BaseModel):
+    """Trader-side bulk unfollow.
+
+    Each id should be a SubscriberSettings.user_id that currently has
+    following_trader_id = the calling trader's id. IDs that don't match
+    are silently skipped so the caller doesn't have to filter perfectly
+    before sending — partial-success is the right ergonomic for bulk UI.
+    """
+
+    subscriber_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
+
+
 class BulkCopyStateOut(BaseModel):
     """`total`/`enabled` reflect subscribers' own copy flags (informational).
     `paused` is the trader-side master fanout gate — when True, no mirrors
