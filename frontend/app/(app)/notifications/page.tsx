@@ -18,10 +18,12 @@ function fmtRelative(iso: string): string {
 
 function fmtAbsolute(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleString(undefined, {
+  return d.toLocaleString("en-US", {
     month: "short", day: "numeric", year: "numeric",
     hour: "2-digit", minute: "2-digit",
     hour12: false,
+    timeZone: "America/New_York",
+    timeZoneName: "short",
   });
 }
 

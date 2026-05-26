@@ -246,7 +246,7 @@ export default function AdminUsersPage() {
 
                     {/* Joined */}
                     <td className="px-4 py-3 text-xs" style={{ color: "var(--muted)" }}>
-                      {new Date(u.created_at).toLocaleDateString()}
+                      {new Date(u.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "America/New_York" })}
                     </td>
 
                     {/* Actions */}
