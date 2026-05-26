@@ -6,7 +6,7 @@ They are NOT created through normal registration; use
 scripts/create_admin.py to promote or seed the first admin account.
 
 Revision ID: f1a2b3c4d5e6
-Revises: c8d3f5a92e14
+Revises: a1b2c3d4e5f6
 Create Date: 2026-05-26 10:00:00.000000
 """
 from typing import Sequence, Union
@@ -14,7 +14,12 @@ from typing import Sequence, Union
 from alembic import op
 
 revision: str = "f1a2b3c4d5e6"
-down_revision: Union[str, None] = "c8d3f5a92e14"
+# Re-parented from c8d3f5a92e14 → a1b2c3d4e5f6 (the merge revision that
+# combined the enum-case-drift and set-null heads). Without this,
+# f1a2b3c4d5e6 would be a third sibling head off c8d3f5a92e14 and break
+# `alembic upgrade head` with "Multiple head revisions". The migration
+# itself is unchanged — only its position in the graph moves.
+down_revision: Union[str, None] = "a1b2c3d4e5f6"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
