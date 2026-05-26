@@ -97,8 +97,15 @@ export default function AdminUsersPage() {
 
   // Exclude fake load-test users from this view — they clutter the list
   // and are managed on the Load Test page.
-  const realUsers = filtered.filter(u => !u.email.startsWith("fake-load-test-"));
-  const fakeCount = users.filter(u => u.email.startsWith("fake-load-test-")).length;
+  const isFake = (email: string) => email.startsWith("fake-load-test-");
+  const realUsers = filtered.filter(u => !isFake(u.email));
+  const fakeCount = users.filter(u => isFake(u.email)).length;
+  // Role-chip counts must also exclude the fake test users — otherwise
+  // "Subscribers (66)" includes 50 fake rows that the table hides, which
+  // makes the chips out of sync with what an admin actually sees below.
+  const realByRole = (r: string) =>
+    users.filter(u => !isFake(u.email) && u.role === r).length;
+  const realTotal = users.length - fakeCount;
 
   return (
     <div className="space-y-5">
@@ -151,7 +158,7 @@ export default function AdminUsersPage() {
                 border:     "1px solid " + (filter === r ? "var(--accent)" : "var(--border)"),
               }}
             >
-              {r === "all" ? `All (${users.length})` : `${r}s (${users.filter(u => u.role === r).length})`}
+              {r === "all" ? `All (${realTotal})` : `${r}s (${realByRole(r)})`}
             </button>
           ))}
         </div>
