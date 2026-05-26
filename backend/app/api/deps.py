@@ -48,3 +48,9 @@ def require_subscriber(user: User = Depends(current_user)) -> User:
     if user.role != UserRole.SUBSCRIBER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="subscriber_only")
     return user
+
+
+def require_admin(user: User = Depends(current_user)) -> User:
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="admin_only")
+    return user

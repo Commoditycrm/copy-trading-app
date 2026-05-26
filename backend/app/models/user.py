@@ -11,6 +11,7 @@ from app.models.base import Base, TimestampMixin
 class UserRole(str, enum.Enum):
     TRADER = "trader"
     SUBSCRIBER = "subscriber"
+    ADMIN = "admin"
 
 
 class User(Base, TimestampMixin):

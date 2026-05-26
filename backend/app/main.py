@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
+    admin as admin_api,
     auth,
     brokers,
     events,
@@ -49,6 +50,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(admin_api.router)
     app.include_router(auth.router)
     app.include_router(brokers.router)
     app.include_router(trades.router)
