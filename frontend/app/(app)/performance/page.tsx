@@ -345,6 +345,48 @@ function LegendDot({ color, label, value }: { color: string; label: string; valu
   );
 }
 
+/**
+ * Stacked mini-bar: 🟢 green = Platform lag, 🔵 blue = Broker lag.
+ * Shows the proportional split between what the platform controls vs
+ * what the broker (Alpaca) takes — purely visual, hover for exact ms.
+ */
+function PlatformBrokerBar({
+  platformMs,
+  brokerMs,
+}: {
+  platformMs: number | null;
+  brokerMs: number | null;
+}) {
+  const p = platformMs ?? 0;
+  const b = brokerMs ?? 0;
+  const total = p + b;
+  if (total === 0) return <span style={{ color: "var(--muted)", fontSize: 10 }}>—</span>;
+  const platPct = Math.round((p / total) * 100);
+  const brokerPct = 100 - platPct;
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div
+        style={{
+          display: "flex",
+          width: 80,
+          height: 5,
+          borderRadius: 3,
+          overflow: "hidden",
+          background: "var(--border)",
+        }}
+        title={`Platform: ${p < 1000 ? `${p}ms` : `${(p / 1000).toFixed(2)}s`} · Broker: ${b < 1000 ? `${b}ms` : `${(b / 1000).toFixed(2)}s`}`}
+      >
+        <div style={{ width: `${platPct}%`, background: "var(--good)", height: "100%", transition: "width 200ms" }} />
+        <div style={{ width: `${brokerPct}%`, background: "#3b82f6", height: "100%", transition: "width 200ms" }} />
+      </div>
+      <div className="flex justify-between tabular-nums" style={{ width: 80, fontSize: 9 }}>
+        <span style={{ color: "var(--good)" }}>{fmtMs(p)}</span>
+        <span style={{ color: "#3b82f6" }}>{fmtMs(b)}</span>
+      </div>
+    </div>
+  );
+}
+
 // ── Horizontal bar chart for per-symbol latency ────────────────────────
 
 function SymbolBars({ rows }: { rows: { symbol: string; avg_ms: number; count: number }[] }) {
@@ -495,6 +537,30 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
           : "normal")
     : "";
 
+  // ── Platform vs Broker split ────────────────────────────────────────────────
+  // Platform Lag = pick_lag + eligibility_lag (steps we own: queue + gate checks).
+  // Broker Lag   = broker_lag (the broker's REST call round-trip — external).
+  // Only include mirrors that actually reached the broker (subscriber_lag_ms set).
+  const platformLags: number[] = [];
+  const brokerLagsSplit: number[] = [];
+  for (const c of mirrors) {
+    if (c.subscriber_lag_ms === null || c.subscriber_lag_ms === undefined) continue;
+    platformLags.push((c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0));
+    if (c.broker_lag_ms !== null && c.broker_lag_ms !== undefined) {
+      brokerLagsSplit.push(c.broker_lag_ms);
+    }
+  }
+
+  function medianOf(arr: number[]): number | null {
+    if (arr.length === 0) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    const mid = s.length >> 1;
+    return s.length % 2 === 0 ? Math.round((s[mid - 1] + s[mid]) / 2) : s[mid];
+  }
+
+  const medPlatform = medianOf(platformLags);
+  const medBroker   = medianOf(brokerLagsSplit);
+
   return (
     <div
       className="mb-3 rounded-lg border px-4 py-3"
@@ -544,6 +610,44 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
           </div>
         )}
       </div>
+      {/* ── Platform vs Broker split ──────────────────────────────────── */}
+      {medPlatform !== null && medBroker !== null && (
+        <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+          <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
+            Median Lag Split
+          </div>
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            {/* Total */}
+            {median !== null && (
+              <div className="flex items-baseline gap-1 text-sm">
+                <span style={{ color: "var(--muted)" }}>Total:</span>
+                <span style={{ color: colorFor(median), fontWeight: 600 }}>{fmtMs(median)}</span>
+              </div>
+            )}
+            {/* Platform */}
+            <div className="flex items-center gap-1.5 text-sm">
+              <span
+                aria-hidden
+                style={{ width: 9, height: 9, borderRadius: 2, background: "var(--good)", display: "inline-block", flexShrink: 0 }}
+              />
+              <span style={{ color: "var(--muted)" }}>Platform:</span>
+              <span style={{ color: "var(--good)", fontWeight: 600 }}>{fmtMs(medPlatform)}</span>
+            </div>
+            {/* Broker */}
+            <div className="flex items-center gap-1.5 text-sm">
+              <span
+                aria-hidden
+                style={{ width: 9, height: 9, borderRadius: 2, background: "#3b82f6", display: "inline-block", flexShrink: 0 }}
+              />
+              <span style={{ color: "var(--muted)" }}>Broker (Alpaca):</span>
+              <span style={{ color: "#3b82f6", fontWeight: 600 }}>{fmtMs(medBroker)}</span>
+            </div>
+            {/* Stacked bar */}
+            <PlatformBrokerBar platformMs={medPlatform} brokerMs={medBroker} />
+          </div>
+        </div>
+      )}
+
       <div className="mt-2 text-[11px]" style={{ color: "var(--muted)" }}>
         Note: per-subscriber timings below show <b>trade latency</b> (Subscriber Lag). The
         separate <b>UI Notification Lag</b> column is when the subscriber&apos;s browser
@@ -800,7 +904,7 @@ export default function PerformancePage() {
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={16} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -810,7 +914,7 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={16} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   No fanouts yet. Place a trade to see latency metrics here.
                 </td>
               </tr>
@@ -927,9 +1031,10 @@ export default function PerformancePage() {
                                     ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order."],
                                     ["Published At", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
                                     ["Submitted At", "Broker's own timestamp for when it accepted the order. Usually identical to Broker Accepted At; can differ if the broker's clock is skewed."],
-                                    ["Pick Lag", "Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
-                                    ["Eligibility Lag", "Picked → ready to call broker. Accepted At − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
-                                    ["Broker Lag", "Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip."],
+                                    ["Pick Lag 🟢", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Eligibility Lag 🟢", "Platform-owned. Picked → ready to call broker. Accepted At − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Broker Lag 🔵", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
+                                    ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
                                     ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published At − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
                                     ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
                                     ["Broker Order ID", "Identifier the subscriber's broker assigned to this mirror. Used by support to look up the order on the broker side."],
@@ -1058,6 +1163,13 @@ export default function PerformancePage() {
                                       >
                                         {fmtMs(c.broker_lag_ms)}
                                       </td>
+                                      {/* Split bar — Platform (green) vs Broker (blue) */}
+                                      <td className="px-2 py-2 whitespace-nowrap">
+                                        <PlatformBrokerBar
+                                          platformMs={(c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0)}
+                                          brokerMs={c.broker_lag_ms}
+                                        />
+                                      </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: colorFor(c.publish_lag_ms) }}
@@ -1115,6 +1227,19 @@ export default function PerformancePage() {
 
       {/* ── Footnote (matches the screenshot terminology) ──────────────── */}
       <div className="text-xs leading-relaxed space-y-2" style={{ color: "var(--muted)" }}>
+        {/* Platform vs Broker legend */}
+        <div className="flex flex-wrap gap-x-5 gap-y-1 pb-1" style={{ borderBottom: "1px solid var(--border)" }}>
+          <span className="inline-flex items-center gap-1.5">
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: "var(--good)", display: "inline-block" }} />
+            <strong style={{ color: "var(--good)" }}>Platform Lag</strong>
+            <span>— time from trader&apos;s order detected → copy orders submitted. What the platform controls (detection + queue + eligibility checks).</span>
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: "#3b82f6", display: "inline-block" }} />
+            <strong style={{ color: "#3b82f6" }}>Broker Lag</strong>
+            <span>— time the broker (Alpaca) takes to confirm each copy order after we submit it. External — varies with broker server load, not platform speed.</span>
+          </span>
+        </div>
         <p>
           <strong style={{ color: "var(--text-2)" }}>Detection lag</strong> = time between Alpaca accepting your order and
           our backend creating the parent Order row (≈0ms for orders placed via our API; meaningful only for
