@@ -4,6 +4,10 @@
 .env.*.local
 *.pem
 *.key
+# Real broker credentials passed to scripts/onboard_alpaca_subscribers.py.
+# Keep them on the server, never commit them.
+backend/scripts/subscribers_*.csv
+backend/scripts/subscribers-*.csv
 
 # ── macOS ──────────────────────────────────────────────────────────────────
 .DS_Store
