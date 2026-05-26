@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300
 
+    # SnapTrade integration (gaurav-snaptrade branch). Used by
+    # app/brokers/snaptrade_adapter.py to instantiate the SnapTrade SDK.
+    # Get these from app.snaptrade.com → dashboard. Empty defaults so the
+    # rest of the app boots even when SnapTrade isn't configured locally;
+    # the adapter raises at construction time if either is missing.
+    snaptrade_client_id: str = ""
+    snaptrade_consumer_key: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
