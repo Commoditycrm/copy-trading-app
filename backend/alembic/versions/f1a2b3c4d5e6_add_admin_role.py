@@ -6,7 +6,7 @@ They are NOT created through normal registration; use
 scripts/create_admin.py to promote or seed the first admin account.
 
 Revision ID: f1a2b3c4d5e6
-Revises: c8d3f5a92e14
+Revises: a1b2c3d4e5f6
 Create Date: 2026-05-26 10:00:00.000000
 """
 from typing import Sequence, Union
@@ -14,7 +14,7 @@ from typing import Sequence, Union
 from alembic import op
 
 revision: str = "f1a2b3c4d5e6"
-down_revision: Union[str, None] = "c8d3f5a92e14"
+down_revision: Union[str, None] = "a1b2c3d4e5f6"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
