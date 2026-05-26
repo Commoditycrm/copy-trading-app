@@ -56,7 +56,7 @@ export default function BrokersPage() {
         method: "POST",
         body: JSON.stringify({
           broker: "alpaca",
-          label: label || (paper ? "Alpaca Paper" : "Alpaca"),
+          label: label.trim(),
           alpaca: { api_key: apiKey, api_secret: apiSecret, paper },
         }),
       });
@@ -184,12 +184,12 @@ export default function BrokersPage() {
         </p>
         <form onSubmit={connect} className="space-y-3">
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label (optional)</label>
-            <input className="w-full p-2" placeholder="Alpaca Paper" value={label} onChange={e => setLabel(e.target.value)} />
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
+            <input type="text" className="w-full p-2" placeholder="Alpaca Paper" value={label} onChange={e => setLabel(e.target.value)} required />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>API key ID</label>
-            <input className="w-full p-2 font-mono text-sm" placeholder="PKxxxxxxxxxxxxxxxxxx" value={apiKey} onChange={e => setApiKey(e.target.value)} required />
+            <input type="text" className="w-full p-2 font-mono text-sm" placeholder="PKxxxxxxxxxxxxxxxxxx" value={apiKey} onChange={e => setApiKey(e.target.value)} required />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Secret key</label>
