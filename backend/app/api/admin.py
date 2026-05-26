@@ -54,12 +54,17 @@ def _fake_email(index: int) -> str:
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class UserOut(BaseModel):
-    id: str
+    # Declare the real Python types so Pydantic v2 can serialize them to
+    # JSON itself (UUID → "uuid-string", datetime → ISO 8601). Declaring
+    # these as `str` made Pydantic strict-mode reject ORM values with a
+    # "Input should be a valid string" ResponseValidationError — see
+    # GET /api/admin/users hitting 500 on every fetch.
+    id: uuid.UUID
     email: str
     role: str
     display_name: Optional[str]
     is_active: bool
-    created_at: str
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
