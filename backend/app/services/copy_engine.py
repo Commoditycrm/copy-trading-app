@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
@@ -131,6 +132,17 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # ── Phase 1: build child orders + skip records ─────────────────────────
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
+    # Pre-fetch ALL subscriber User rows in one query instead of N serial
+    # db.get(User, id) calls. With 50 subscribers that's 49 fewer round-trips.
+    _sub_user_map: dict[uuid.UUID, User] = {}
+    if subs:
+        _sub_user_map = {
+            u.id: u
+            for u in db.execute(
+                select(User).where(User.id.in_([s.user_id for s in subs]))
+            ).scalars()
+        }
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
@@ -138,7 +150,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # reflects the per-subscriber pick, not per-account.
         subscriber_picked_at = datetime.now(timezone.utc)
 
-        sub_user = db.get(User, sub.user_id)
+        sub_user = _sub_user_map.get(sub.user_id)  # O(1) — no DB round-trip
         if not sub_user:
             continue
 
@@ -237,7 +249,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 subscriber_accepted_at=subscriber_accepted_at,
             )
             db.add(child)
-            db.flush()
+            # NOTE: no flush here — Order.id is Python-generated (uuid4 default)
+            # so child.id is valid immediately. We do ONE batch flush after the
+            # full loop instead of N serial round-trips.
 
             try:
                 # Need a real BrokerAccount-like object for adapter_for. The
@@ -277,6 +291,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     client_order_id=str(child.id),
                 ),
             ))
+
+    # ── Batch flush: persist all Phase-1 child orders in one round-trip ──────
+    # Previously we called db.flush() after every child order insert (N
+    # round-trips). Order.id uses Python-side uuid4 so ids are valid before
+    # flushing — we only need flush so Phase 3's db.get() calls see the rows
+    # inside the same transaction. One flush here replaces N serial flushes.
+    db.flush()
 
     # ── Phase 2: fire all broker calls in parallel via asyncio ────────────
     # _place_one returns the actual exception object (not just its string)
