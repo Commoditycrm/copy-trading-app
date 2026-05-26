@@ -61,6 +61,14 @@ _USER_FIXABLE_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Insufficient buying power on this account."),
     (re.compile(r"position.*not.*found|no.*position", re.I),
      "No matching position to close on this account."),
+    # SnapTrade returns 403/Forbidden when an authorization is type='read'
+    # and the caller tries to place an order. Distinguish that from a
+    # genuine credentials-expired situation so the user gets actionable
+    # guidance ("upgrade to trade permission" vs. "re-auth").
+    (re.compile(r"read.?only|connection.?type.*read|trade.?permission|not.?authori[sz]ed.*(trade|place|order)", re.I),
+     "This broker connection is read-only. Reconnect with trade permission, "
+     "or pick a different broker (Webull/Robinhood/Schwab via SnapTrade may "
+     "only support read-only — Alpaca direct always supports placement)."),
     (re.compile(r"forbidden|unauthor|permission", re.I),
      "Broker rejected the credentials (re-connect this account)."),
     (re.compile(r"halted|trading.*paused", re.I),

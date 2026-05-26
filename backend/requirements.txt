@@ -13,4 +13,14 @@ cryptography==43.0.3
 httpx==0.27.2
 redis==5.2.0
 alpaca-py==0.33.0
+# Unofficial Webull SDK (reverse-engineered against the mobile app). Pinned
+# because tedchou12/webull breaks roughly quarterly when Webull pushes
+# updates to their internal endpoints. See app/services/webull_listener.py
+# for the polling loop and session-refresh logic that compensate.
+webull==0.6.1
+# SnapTrade aggregator — official SDK. Used by the SnapTrade adapter and
+# listener; requires SNAPTRADE_CLIENT_ID + SNAPTRADE_CONSUMER_KEY env vars
+# (see app/config.py). Endpoints return clean 503 when unset so dev
+# environments without SnapTrade creds aren't broken.
+snaptrade-python-sdk==11.0.197
 python-dateutil==2.9.0

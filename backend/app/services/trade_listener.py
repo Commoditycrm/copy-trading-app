@@ -57,29 +57,20 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, copy_engine, events, fills_sync
+from app.services import audit, copy_engine, events, fills_sync, listener_state
 from app.services.crypto import decrypt_json
+from app.services.listener_state import ListenerState, ListenerStatus
 
 log = logging.getLogger(__name__)
 
 
 # ── Public state surface ────────────────────────────────────────────────────
-
-
-ListenerState = str  # "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid"
-
-
-@dataclass
-class ListenerStatus:
-    state: ListenerState = "connecting"
-    last_event_at: datetime | None = None
-    state_changed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    last_error: str | None = None
-
-
-# One entry per trader user_id. Mutated only from the listener tasks and the
-# start/stop helpers; readers should snapshot before serialising.
-_status: dict[uuid.UUID, ListenerStatus] = {}
+#
+# Status itself lives in ``listener_state._status`` so the Webull listener
+# can share it (one-broker-per-user means only one writes at a time, but
+# both publish via the same SSE event so the frontend stays broker-agnostic).
+# We keep ``get_status``/``_set_state``/``_bump_last_event`` re-exported here
+# for backwards compatibility with existing callers (api/listener.py etc.).
 
 # Active asyncio tasks keyed by trader user_id. Cancelled on stop.
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
@@ -104,62 +95,12 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     _main_loop = loop
 
 
-def get_status(trader_user_id: uuid.UUID) -> ListenerStatus | None:
-    return _status.get(trader_user_id)
-
-
-def _set_state(trader_user_id: uuid.UUID, state: ListenerState, *, error: str | None = None) -> None:
-    """Update the listener's status snapshot and publish an SSE event so any
-    interested user (the trader themselves + subscribers following them)
-    sees the new state."""
-    prev = _status.get(trader_user_id)
-    now = datetime.now(timezone.utc)
-    new = ListenerStatus(
-        state=state,
-        last_event_at=prev.last_event_at if prev else None,
-        state_changed_at=now,
-        last_error=error,
-    )
-    _status[trader_user_id] = new
-    if not prev or prev.state != state:
-        log.info("listener[%s] %s", trader_user_id, state)
-        _broadcast_state_changed(trader_user_id, new)
-
-
-def _bump_last_event(trader_user_id: uuid.UUID) -> None:
-    s = _status.get(trader_user_id)
-    if s is None:
-        s = ListenerStatus(state="connected")
-        _status[trader_user_id] = s
-    s.last_event_at = datetime.now(timezone.utc)
-
-
-def _broadcast_state_changed(trader_user_id: uuid.UUID, status: ListenerStatus) -> None:
-    """Publish ``listener.state_changed`` to the trader and every subscriber
-    following them. Frontend uses this to refresh the status pill in
-    real time."""
-    payload = {
-        "type": "listener.state_changed",
-        "trader_id": str(trader_user_id),
-        "status": {
-            "state": status.state,
-            "last_event_at": status.last_event_at.isoformat() if status.last_event_at else None,
-            "state_changed_at": status.state_changed_at.isoformat(),
-            "last_error": status.last_error,
-        },
-    }
-    # Trader sees their own listener.
-    events.publish(trader_user_id, payload)
-    # Subscribers following this trader also see it.
-    with SessionLocal() as db:
-        from sqlalchemy import select
-        from app.models.settings import SubscriberSettings
-        for sub_id, in db.execute(
-            select(SubscriberSettings.user_id).where(
-                SubscriberSettings.following_trader_id == trader_user_id
-            )
-        ).all():
-            events.publish(sub_id, payload)
+# Thin re-exports so existing callers (api/listener.py and friends) keep
+# working. The actual storage lives in listener_state — see that module
+# for the rationale.
+get_status = listener_state.get_status
+_set_state = listener_state.set_state
+_bump_last_event = listener_state.bump_last_event
 
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────

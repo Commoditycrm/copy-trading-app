@@ -1,9 +1,13 @@
-"""Status of the Alpaca trade_updates WebSocket listener.
+"""Status of the per-trader broker listener.
 
 A trader queries this for their own listener; a subscriber queries it for
 the trader they follow. The frontend shows a small status pill that updates
 both via this endpoint (on mount) and via SSE ``listener.state_changed``
-events (live)."""
+events (live).
+
+The status is broker-agnostic — Alpaca (WebSocket) and Webull (polling)
+both write to the same ``listener_state`` surface, so this endpoint
+doesn't need to know which broker the trader is on."""
 from __future__ import annotations
 
 import uuid
@@ -16,13 +20,13 @@ from app.api.deps import current_user
 from app.database import get_db
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
-from app.services import trade_listener
+from app.services import listener_state
 
 
 router = APIRouter(prefix="/api/listener", tags=["listener"])
 
 
-def _serialize(status: trade_listener.ListenerStatus | None) -> dict[str, Any]:
+def _serialize(status: listener_state.ListenerStatus | None) -> dict[str, Any]:
     if status is None:
         return {
             "state": "disconnected",
@@ -51,7 +55,7 @@ def listener_status(
         return {
             "trader_id": str(user.id),
             "viewer": "trader",
-            **_serialize(trade_listener.get_status(user.id)),
+            **_serialize(listener_state.get_status(user.id)),
         }
 
     sub = db.get(SubscriberSettings, user.id)
@@ -64,7 +68,7 @@ def listener_status(
             "state_changed_at": None,
             "last_error": None,
         }
-    status = trade_listener.get_status(sub.following_trader_id)
+    status = listener_state.get_status(sub.following_trader_id)
     return {
         "trader_id": str(sub.following_trader_id),
         "viewer": "subscriber",

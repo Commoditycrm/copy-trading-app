@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
     broker_concurrency_alpaca: int = 200
+    # SnapTrade credentials — empty by default so dev environments work
+    # without setting them up. The /api/brokers/snaptrade/* endpoints
+    # return 503 when these are blank rather than crashing. Get them from
+    # https://dashboard.snaptrade.com/.
+    snaptrade_client_id: str = ""
+    snaptrade_consumer_key: str = ""
     # asyncio.to_thread() uses the default ThreadPoolExecutor (default size
     # min(32, cpu+4) — way too small for 200 concurrent broker calls). We
     # bump this at startup so all 200 actually run in parallel.
