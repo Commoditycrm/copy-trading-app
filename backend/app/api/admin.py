@@ -15,6 +15,8 @@ PATCH /api/admin/users/{id}/role       Change user role
 GET  /api/admin/load-test/count        Count seeded fake subscribers
 POST /api/admin/load-test/seed         Seed N fake subscribers for a trader
 POST /api/admin/load-test/cleanup      Delete all fake-load-test-* users
+
+GET  /api/admin/performance/fanouts    All fanouts across all traders (admin view)
 """
 from __future__ import annotations
 
@@ -338,3 +340,78 @@ def load_test_cleanup(
             log.warning("could not invalidate cache after cleanup")
 
     return {"deleted": len(before_ids)}
+
+
+# ─── Performance (all traders) ────────────────────────────────────────────────
+
+@router.get("/performance/fanouts")
+def admin_list_fanouts(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    limit: int = 50,
+) -> dict:
+    """All fanouts across every trader — newest first.
+    Same shape as /api/performance/fanouts but not filtered by trader.
+    Includes trader_email so the admin can see who placed each trade.
+    """
+    from app.api.performance import _serialize_fanout  # noqa: PLC0415
+
+    # All parent orders that were fanned out, newest first
+    parents = list(
+        db.execute(
+            select(Order)
+            .where(
+                Order.parent_order_id.is_(None),
+                Order.fanned_out_to_subscribers.is_(True),
+            )
+            .order_by(Order.created_at.desc())
+            .limit(limit)
+        ).scalars()
+    )
+    if not parents:
+        return {"fanouts": [], "metrics": {"fanouts_shown": 0,
+                                            "avg_fanout_ms": None,
+                                            "max_fanout_ms": None}}
+
+    parent_ids = [p.id for p in parents]
+
+    # All child orders for these parents
+    children = list(
+        db.execute(
+            select(Order).where(Order.parent_order_id.in_(parent_ids))
+        ).scalars()
+    )
+    children_by_parent: dict[uuid.UUID, list[Order]] = {pid: [] for pid in parent_ids}
+    for c in children:
+        if c.parent_order_id:
+            children_by_parent.setdefault(c.parent_order_id, []).append(c)
+
+    # All subscriber user rows for display
+    sub_ids = {c.user_id for c in children}
+    subscribers: dict[uuid.UUID, User] = {}
+    if sub_ids:
+        subscribers = {u.id: u for u in db.execute(
+            select(User).where(User.id.in_(sub_ids))
+        ).scalars()}
+
+    # All trader user rows for display
+    trader_ids = {p.user_id for p in parents}
+    traders: dict[uuid.UUID, User] = {u.id: u for u in db.execute(
+        select(User).where(User.id.in_(trader_ids))
+    ).scalars()}
+
+    fanouts = []
+    for p in parents:
+        serialized = _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers)
+        t = traders.get(p.user_id)
+        serialized["trader_email"]        = t.email if t else None
+        serialized["trader_display_name"] = t.display_name if t else None
+        fanouts.append(serialized)
+
+    completed_durations = [f["fanout_duration_ms"] for f in fanouts if f["fanout_duration_ms"]]
+    metrics = {
+        "fanouts_shown": len(fanouts),
+        "avg_fanout_ms": int(sum(completed_durations) / len(completed_durations)) if completed_durations else None,
+        "max_fanout_ms": max(completed_durations) if completed_durations else None,
+    }
+    return {"fanouts": fanouts, "metrics": metrics}

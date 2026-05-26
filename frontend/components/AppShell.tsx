@@ -241,6 +241,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       .then((u) => {
         setUser(u);
         try { sessionStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)); } catch {}
+        // Admins have their own panel — redirect immediately so they never
+        // land on trader/subscriber routes (which would 403 on their API calls).
+        if (u.role === "admin") {
+          router.replace("/admin");
+          return;
+        }
         if (u.role === "trader") {
           api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
         } else {
