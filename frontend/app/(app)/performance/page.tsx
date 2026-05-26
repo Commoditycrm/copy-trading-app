@@ -772,9 +772,10 @@ export default function PerformancePage() {
           Icon={IcoClock}
         />
         <MetricCard
-          label="Total Latency"
+          label="Avg End-to-End"
           value={fmtMs(m?.avg_total_ms ?? null)}
           valueColor={colorFor(m?.avg_total_ms ?? null)}
+          sub="real-time fanouts only"
           Icon={IcoTarget}
         />
       </div>

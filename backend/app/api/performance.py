@@ -211,7 +211,22 @@ def list_fanouts(
     # Aggregate metrics — only over fanouts that actually completed (last
     # accept time present). Avoids dividing by None.
     completed_durations = [f["fanout_duration_ms"] for f in fanouts if f["fanout_duration_ms"] is not None]
-    completed_totals = [f["total_ms"] for f in fanouts if f["total_ms"] is not None]
+
+    # avg_total_ms: exclude externally-detected orders whose detection_lag is
+    # huge (e.g. orders placed through Alpaca dashboard / mobile app and
+    # detected minutes or days later via WebSocket reconnect). Their
+    # total_ms = detection_lag + fanout_duration and would inflate the
+    # average to days. Anything detected in < 30 s is a real-time fanout.
+    _REALTIME_DETECTION_CAP_MS = 30_000
+    completed_totals = [
+        f["total_ms"]
+        for f in fanouts
+        if f["total_ms"] is not None
+        and (
+            f["detection_lag_ms"] is None
+            or f["detection_lag_ms"] <= _REALTIME_DETECTION_CAP_MS
+        )
+    ]
 
     def _avg(xs: list[int]) -> int | None:
         return int(sum(xs) / len(xs)) if xs else None
