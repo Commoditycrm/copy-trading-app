@@ -221,10 +221,6 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 backoff = _BACKOFF_INITIAL
                 continue
 
-            # Backfill anything we missed while disconnected. Cheap and safe;
-            # idempotent because fills_sync dedupes by activity id.
-            await asyncio.to_thread(_run_backfill, trader_user_id, broker_account_id)
-
             stream = TradingStream(
                 creds["api_key"],
                 creds["api_secret"],
@@ -243,8 +239,26 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
 
             stream.subscribe_trade_updates(handler)
 
+            # Mark "connected" BEFORE the (potentially slow) backfill runs.
+            # Backfill calls `_refresh_open_orders` + `list_recent_activities`
+            # against Alpaca — for a trader with any meaningful history
+            # that can take 10-30s per reconnect, and while it runs the
+            # listener can't process anything else. The UI was reading
+            # this as "broker connecting..." indefinitely. Move backfill
+            # off the connect path: schedule it as an independent task
+            # so it can run in parallel with the WebSocket consumer.
             _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
+
+            # Backfill anything we missed while disconnected. Cheap and safe;
+            # idempotent because fills_sync dedupes by activity id. Runs in
+            # parallel with stream consumption — if backfill is slow, it
+            # doesn't block live event handling. Bounded by a hard 60s
+            # timeout so a hung Alpaca call can't pile up tasks across
+            # reconnects.
+            asyncio.create_task(
+                _background_backfill(trader_user_id, broker_account_id)
+            )
 
             # Blocks until disconnected / cancelled.
             await stream._run_forever()  # noqa: SLF001 — public run() is sync
@@ -259,6 +273,42 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
         # Reconnect with exponential backoff capped at 60s.
         await asyncio.sleep(backoff)
         backoff = min(_BACKOFF_MAX, backoff * 2)
+
+
+# Hard ceiling for how long a backfill task is allowed to run before we
+# walk away from it. fills_sync can stall on slow Alpaca activity feeds —
+# without this, a hung backfill from a previous reconnect could still be
+# running by the time the next reconnect tries to schedule another one.
+_BACKFILL_TIMEOUT_S = 60.0
+
+
+async def _background_backfill(
+    trader_user_id: uuid.UUID, broker_account_id: uuid.UUID
+) -> None:
+    """Run fills_sync.sync_account_fills off the listener's main task.
+
+    Failures (including timeouts) are logged and dropped — the listener
+    keeps running and we'll retry on the next reconnect. Backfill is
+    idempotent so a partial run is safe to replay.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_run_backfill, trader_user_id, broker_account_id),
+            timeout=_BACKFILL_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "listener[%s] backfill exceeded %.0fs — abandoning this round",
+            trader_user_id,
+            _BACKFILL_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        # If the listener task is cancelled (e.g. broker disconnect),
+        # the backfill task created on the same loop gets cancelled too.
+        # Don't log — this is expected cleanup.
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("listener[%s] background backfill failed", trader_user_id)
 
 
 def _load_creds(
