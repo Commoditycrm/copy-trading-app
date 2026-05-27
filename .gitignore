@@ -47,3 +47,11 @@ next-env.d.ts
 
 # ── Local Claude Code session state ────────────────────────────────────────
 .claude/
+
+# Webull SDK runtime cache — must not be committed. The unofficial
+# `webull` library writes this after first login. It's runtime state,
+# not source. A copy got committed in PR #34 and was on the
+# compromised Lightsail instance during the AWS abuse case
+# 16220881880 — strip it now and keep stripping it.
+backend/did.bin
+**/did.bin
