@@ -76,6 +76,133 @@ def today_realized_pnl(db: Session, user_id: uuid.UUID, tz_name: str | None = No
     return pnl
 
 
+def today_realized_pnl_bulk(
+    db: Session,
+    user_ids: list[uuid.UUID],
+    tz_name: str | None = None,
+) -> dict[uuid.UUID, Decimal]:
+    """Batched ``today_realized_pnl`` — one P&L number per user, in two
+    queries total instead of 2 per user.
+
+    Used by ``copy_engine.fanout_async`` so a 91-subscriber fanout where
+    many have daily-loss-limit set doesn't issue 182 round-trips before
+    Phase 2 starts. Users with no fills (or no closing trades today)
+    are mapped to ``Decimal(0)``.
+
+    Same FIFO matching as ``realized_pnl_by_day``, just per-user
+    partitioned in memory. Caller pays Python CPU once for the lot
+    walk, no extra SQL.
+    """
+    if not user_ids:
+        return {}
+
+    bucket_tz = _tz_or_market(tz_name)
+    today = datetime.now(bucket_tz).date()
+
+    # Query 1: all orders belonging to any of the requested users that
+    # have any fill quantity recorded. .in_() is bounded by SQLite's
+    # 999-parameter limit; in practice we never exceed a few hundred
+    # subscribers per fanout.
+    orders: list[Order] = list(db.execute(
+        select(Order).where(
+            Order.user_id.in_(user_ids),
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+    ).scalars())
+
+    # Default everyone to 0 so missing-from-orders users still appear in result.
+    result: dict[uuid.UUID, Decimal] = {uid: Decimal(0) for uid in user_ids}
+    if not orders:
+        return result
+
+    # Query 2: every Fill row attached to those orders.
+    orders_by_user: dict[uuid.UUID, list[Order]] = defaultdict(list)
+    for o in orders:
+        orders_by_user[o.user_id].append(o)
+
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    for f in db.execute(
+        select(Fill).where(Fill.order_id.in_(order_ids))
+    ).scalars():
+        fills_by_order[f.order_id].append(f)
+
+    # Per-user FIFO lot walk. Mirrors realized_pnl_by_day but we only
+    # need today's running total — once we pass `today` we can stop
+    # walking that user's timeline (history beyond today has no effect
+    # on the daily-loss-limit check).
+    for uid in user_ids:
+        user_orders = orders_by_user.get(uid)
+        if not user_orders:
+            continue  # already 0
+
+        # Build (when, qty, price, order) timeline.
+        timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []
+        for o in user_orders:
+            fs = fills_by_order.get(o.id)
+            if fs:
+                for f in fs:
+                    timeline.append((f.filled_at, f.quantity, f.price, o))
+            else:
+                when = o.closed_at or o.submitted_at or o.created_at
+                timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
+        timeline.sort(key=lambda e: e[0])
+
+        open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
+        today_pnl = Decimal(0)
+
+        for filled_at, fill_qty, fill_price, order in timeline:
+            day = filled_at.astimezone(bucket_tz).date()
+            if day > today:
+                break  # we don't care about fills after today
+
+            key = _instrument_key(order)
+            unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+            qty = fill_qty
+            price = fill_price
+
+            if order.side == OrderSide.BUY:
+                # Close shorts first (negative lots).
+                if open_lots[key] and open_lots[key][0].qty < 0:
+                    pnl = Decimal(0)
+                    while qty > 0 and open_lots[key] and open_lots[key][0].qty < 0:
+                        lot = open_lots[key][0]
+                        take = min(qty, -lot.qty)
+                        pnl += (lot.price - price) * take * unit
+                        lot.qty += take
+                        qty -= take
+                        if lot.qty == 0:
+                            open_lots[key].popleft()
+                    if day == today:
+                        today_pnl += pnl
+                    if qty > 0:
+                        open_lots[key].append(_Lot(qty=qty, price=price))
+                else:
+                    open_lots[key].append(_Lot(qty=qty, price=price))
+            else:  # SELL — close longs first
+                if open_lots[key] and open_lots[key][0].qty > 0:
+                    pnl = Decimal(0)
+                    while qty > 0 and open_lots[key] and open_lots[key][0].qty > 0:
+                        lot = open_lots[key][0]
+                        take = min(qty, lot.qty)
+                        pnl += (price - lot.price) * take * unit
+                        lot.qty -= take
+                        qty -= take
+                        if lot.qty == 0:
+                            open_lots[key].popleft()
+                    if day == today:
+                        today_pnl += pnl
+                    if qty > 0:
+                        open_lots[key].append(_Lot(qty=-qty, price=price))
+                else:
+                    open_lots[key].append(_Lot(qty=-qty, price=price))
+
+        result[uid] = today_pnl
+
+    return result
+
+
 def realized_pnl_by_day(
     db: Session,
     user_id: uuid.UUID,

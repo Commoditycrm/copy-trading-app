@@ -42,7 +42,7 @@ from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
 from app.services.order_retry import classify_error
-from app.services.pnl import today_realized_pnl
+from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
 
 
 # Map subscriber's RetryInterval enum value → wall-clock minutes to wait
@@ -131,6 +131,23 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # ── Phase 1: build child orders + skip records ─────────────────────────
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
+    # PRE-PHASE-1 BATCH: compute today's realized P&L for every subscriber
+    # who has a daily_loss_limit set, in ONE round-trip instead of N. The
+    # old code called today_realized_pnl(db, sub.user_id) once per
+    # subscriber, and each call SELECTed that user's entire fill history
+    # and walked FIFO lot matching from time zero — for 91 subscribers
+    # that single check was the dominant cost in pick_lag (~9s tail). With
+    # this batch we pay it once, in two SELECTs total.
+    #
+    # Subscribers without a limit set don't appear in the result and are
+    # short-circuited inside the per-sub loop below.
+    sub_ids_with_limit = [s.user_id for s in subs if s.daily_loss_limit is not None]
+    pnl_by_user: dict[uuid.UUID, Decimal] = (
+        await asyncio.to_thread(today_realized_pnl_bulk, db, sub_ids_with_limit)
+        if sub_ids_with_limit
+        else {}
+    )
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
@@ -144,7 +161,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
 
         # Daily-loss kill switch (check BEFORE placing).
         if sub.daily_loss_limit is not None:
-            todays_pnl = today_realized_pnl(db, sub.user_id)
+            todays_pnl = pnl_by_user.get(sub.user_id, Decimal(0))
             if todays_pnl <= -sub.daily_loss_limit:
                 # Flip the DB row off so future fanouts skip cheap. Also bust
                 # the subscriber cache so other workers see it on next read.
@@ -237,7 +254,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 subscriber_accepted_at=subscriber_accepted_at,
             )
             db.add(child)
-            db.flush()
+            # NOTE: no per-child db.flush() here. Order.id has a Python-side
+            # default=uuid.uuid4 (see models/order.py), so child.id is
+            # already populated. We can keep referencing it below without
+            # a round-trip to Postgres. The single db.flush() at the end
+            # of Phase 1 will commit all ~91 child INSERTs in one trip
+            # instead of 91.
 
             try:
                 # Need a real BrokerAccount-like object for adapter_for. The
@@ -277,6 +299,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     client_order_id=str(child.id),
                 ),
             ))
+
+    # End of Phase 1: one batched flush for every child we just added.
+    # Without this we'd have called db.flush() inside the per-account loop
+    # ~91 times (one round-trip each). One flush, one round-trip, all
+    # INSERTs go to Postgres as a single transactional batch.
+    if pending:
+        db.flush()
 
     # ── Phase 2: fire all broker calls in parallel via asyncio ────────────
     # _place_one returns the actual exception object (not just its string)
