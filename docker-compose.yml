@@ -4,10 +4,22 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: trading
+      # SECURITY: production password lives in backend/.env via the server's
+      # docker-compose.override.yml. The literal "trading" here is for local
+      # dev only — same value as the default and only safe because the port
+      # binding below is localhost-only.
       POSTGRES_PASSWORD: trading
       POSTGRES_DB: trading_app
+    # SECURITY: bind to 127.0.0.1 only so Postgres is NOT exposed on the
+    # public internet from a Lightsail/EC2 host. The backend reaches it via
+    # the docker compose internal network (DATABASE_URL=...@db:5432/...);
+    # external exposure was the attack vector behind the May 2026 AWS abuse
+    # case 16220881880 — an unsecured Redis on 6379 was used to drop a
+    # port-scanner. Same hardening applied to redis below. If you actually
+    # need external access for ops, prefer SSH tunnelling instead of
+    # opening these ports.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -19,12 +31,20 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # SECURITY: require a password and bind to localhost only. The password
+    # is interpolated from REDIS_PASSWORD in the host .env so the value
+    # never lives in git. Backend's REDIS_URL should be set to
+    # redis://:<password>@redis:6379/0 to match.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # redis-cli inside the container reads --requirepass via the
+      # connection string. We pass it explicitly so the healthcheck
+      # authenticates correctly.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
