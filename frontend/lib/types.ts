@@ -107,8 +107,24 @@ export interface SubscriberSettings {
   following_trader_id: string | null;
   copy_enabled: boolean;
   multiplier: string;
+
+  // Legacy dollar-based daily loss limit (kept for backward compat).
   daily_loss_limit: string | null;
+
+  // Percentage-based risk controls. null = feature disabled.
+  /** Daily realized loss limit as % of account equity (e.g. "5.000" = 5%). */
+  daily_loss_limit_pct: string | null;
+  /** Per-trade loss limit as % of account equity. */
+  per_trade_loss_limit_pct: string | null;
+  /** Max drawdown protection as % of account equity from baseline. */
+  max_drawdown_pct: string | null;
+  /** Account equity captured when max_drawdown_pct was set. */
+  max_drawdown_equity_baseline: string | null;
+
   todays_realized_pnl: string | null;
+  /** Live account equity from broker (populated on GET, null on PATCH responses). */
+  account_equity: string | null;
+
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
   trader_paused?: boolean;

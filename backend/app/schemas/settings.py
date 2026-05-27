@@ -12,6 +12,17 @@ class SubscriberSettingsOut(BaseModel):
     multiplier: Decimal
     daily_loss_limit: Decimal | None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
+
+    # Percentage-based risk controls (new). NULL = feature disabled.
+    daily_loss_limit_pct: Decimal | None = None
+    per_trade_loss_limit_pct: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
+    max_drawdown_equity_baseline: Decimal | None = None
+
+    # Live account equity from broker_accounts — used by the UI to show
+    # what X% translates to in dollar terms. Only populated on GET.
+    account_equity: Decimal | None = None
+
     # Retry policy for transient broker errors. "never" disables retry.
     # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
     # frontend can render dropdowns without a separate mapping. Validator
@@ -53,6 +64,25 @@ class DailyLossLimitIn(BaseModel):
     """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
 
     daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class DailyLossLimitPctIn(BaseModel):
+    """Daily loss limit as a percentage of account equity (0–100). Pass null to disable."""
+
+    daily_loss_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class PerTradeLossLimitPctIn(BaseModel):
+    """Per-trade loss limit as a percentage of account equity (0–100). Pass null to disable."""
+
+    per_trade_loss_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class MaxDrawdownPctIn(BaseModel):
+    """Max drawdown protection as a percentage of account equity (0–100). Pass null to disable.
+    When set, the current account equity is captured as the baseline."""
+
+    max_drawdown_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
 
 
 class RetryIntervalIn(BaseModel):

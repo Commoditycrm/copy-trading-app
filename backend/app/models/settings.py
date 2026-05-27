@@ -55,9 +55,26 @@ class SubscriberSettings(Base, TimestampMixin):
 
     # Daily realized-loss kill switch. Stored as a positive amount (e.g. 500 means
     # "stop after $500 loss today"). NULL disables the feature.
-    # When today's realized P&L falls below -daily_loss_limit, copy_enabled is
-    # auto-flipped to false and an audit + SSE event are emitted.
+    # LEGACY — kept for backward compatibility. New subscribers use daily_loss_limit_pct.
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+
+    # ── Percentage-based risk controls (new) ──────────────────────────────────
+    # All stored as a positive percentage, e.g. 5.000 = 5%.
+    # NULL = feature disabled.
+
+    # Stop copying if today's realized loss exceeds X% of account equity.
+    daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+
+    # Stop copying if any single trade's realized loss exceeds X% of account equity.
+    per_trade_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+
+    # Stop copying if account equity drops X% below the baseline captured
+    # when protection was enabled (max_drawdown_equity_baseline).
+    max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+
+    # Account equity snapshot taken when max_drawdown_pct is first set.
+    # Compared against broker_accounts.total_equity at fanout time.
+    max_drawdown_equity_baseline: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
 
     # Retry policy for transient broker errors. Two separate intervals so a
     # subscriber can be aggressive about closing positions (late close hurts

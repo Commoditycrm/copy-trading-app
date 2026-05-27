@@ -8,7 +8,10 @@ from app.models.settings import RetryInterval, SubscriberSettings, TraderSetting
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
+    DailyLossLimitPctIn,
     FollowTraderIn,
+    MaxDrawdownPctIn,
+    PerTradeLossLimitPctIn,
     RetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
@@ -16,10 +19,30 @@ from app.schemas.settings import (
     TraderSettingsOut,
     TraderToggleIn,
 )
-from app.services.pnl import today_realized_pnl
+from app.services.pnl import get_account_equity, today_realized_pnl
 from app.services import audit, cache
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+
+def _settings_out(s: SubscriberSettings, db: Session, include_live: bool = False) -> SubscriberSettingsOut:
+    """Build a SubscriberSettingsOut from the ORM row. Pass include_live=True
+    on GET requests to populate todays_realized_pnl and account_equity."""
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        daily_loss_limit_pct=s.daily_loss_limit_pct,
+        per_trade_loss_limit_pct=s.per_trade_loss_limit_pct,
+        max_drawdown_pct=s.max_drawdown_pct,
+        max_drawdown_equity_baseline=s.max_drawdown_equity_baseline,
+        todays_realized_pnl=today_realized_pnl(db, s.user_id) if include_live else None,
+        account_equity=get_account_equity(db, s.user_id) if include_live else None,
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
+    )
 
 
 @router.get("/subscriber", response_model=SubscriberSettingsOut)
@@ -29,16 +52,7 @@ def get_subscriber_settings(
     s = db.get(SubscriberSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-    )
+    return _settings_out(s, db, include_live=True)
 
 
 @router.patch("/subscriber/daily-loss-limit", response_model=SubscriberSettingsOut)
@@ -69,16 +83,111 @@ def set_daily_loss_limit(
     db.refresh(s)
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
+    return _settings_out(s, db, include_live=True)
+
+
+@router.patch("/subscriber/daily-loss-limit-pct", response_model=SubscriberSettingsOut)
+def set_daily_loss_limit_pct(
+    payload: DailyLossLimitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the daily loss limit as a % of account equity."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_loss_limit_pct
+    s.daily_loss_limit_pct = payload.daily_loss_limit_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_loss_limit_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_loss_limit_pct) if payload.daily_loss_limit_pct is not None else None,
+        },
+        ip_address=client_ip(request),
     )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _settings_out(s, db, include_live=True)
+
+
+@router.patch("/subscriber/per-trade-loss-limit", response_model=SubscriberSettingsOut)
+def set_per_trade_loss_limit(
+    payload: PerTradeLossLimitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the per-trade loss limit as a % of account equity."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.per_trade_loss_limit_pct
+    s.per_trade_loss_limit_pct = payload.per_trade_loss_limit_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.per_trade_loss_limit_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.per_trade_loss_limit_pct) if payload.per_trade_loss_limit_pct is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _settings_out(s, db, include_live=True)
+
+
+@router.patch("/subscriber/max-drawdown", response_model=SubscriberSettingsOut)
+def set_max_drawdown(
+    payload: MaxDrawdownPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the max drawdown protection. When enabled, the current
+    account equity is captured as the baseline against which drawdown is measured."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old_pct = s.max_drawdown_pct
+    s.max_drawdown_pct = payload.max_drawdown_pct
+    # Capture equity baseline when protection is first enabled (or re-enabled).
+    if payload.max_drawdown_pct is not None:
+        equity = get_account_equity(db, user.id)
+        s.max_drawdown_equity_baseline = equity
+    else:
+        s.max_drawdown_equity_baseline = None
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.max_drawdown_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old_pct) if old_pct is not None else None,
+            "new": str(payload.max_drawdown_pct) if payload.max_drawdown_pct is not None else None,
+            "equity_baseline": str(s.max_drawdown_equity_baseline) if s.max_drawdown_equity_baseline else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _settings_out(s, db, include_live=True)
 
 
 @router.patch("/subscriber/retry-interval", response_model=SubscriberSettingsOut)
@@ -126,16 +235,7 @@ def set_retry_interval(
         )
     db.commit()
     db.refresh(s)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-    )
+    return _settings_out(s, db, include_live=True)
 
 
 @router.patch("/subscriber/copy", response_model=SubscriberSettingsOut)

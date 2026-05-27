@@ -43,7 +43,7 @@ from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
 from app.services.order_retry import classify_error
-from app.services.pnl import today_realized_pnl
+from app.services.pnl import get_account_equity, last_trade_pnl, today_realized_pnl
 
 
 # Map subscriber's RetryInterval enum value → wall-clock minutes to wait
@@ -92,6 +92,43 @@ class _PendingMirror:
     broker: BrokerName
     adapter: Any                                # BrokerAdapter, pre-built
     request: BrokerOrderRequest
+
+
+def _auto_pause(
+    db: "Session",
+    sub: "SubscriberSettings",
+    trader: "User",
+    trader_order: "Order",
+    results: list,
+    reason: str,
+    metadata: dict,
+) -> None:
+    """Flip copy_enabled off, bust cache, audit-log, and push SSE for any
+    auto-pause trigger (daily loss %, per-trade %, max drawdown).
+    Appends a skipped FanoutResult to `results`."""
+    db_settings = db.get(SubscriberSettings, sub.user_id)
+    if db_settings is not None:
+        db_settings.copy_enabled = False
+    cache.invalidate_subscribers_for_trader(trader.id)
+    audit.record(
+        db,
+        actor_user_id=sub.user_id,
+        action=f"copy.auto_paused_{reason}",
+        entity_type="subscriber_settings",
+        entity_id=sub.user_id,
+        metadata={**metadata, "trigger_order_id": str(trader_order.id)},
+    )
+    events.publish(sub.user_id, {
+        "type": "copy.auto_paused",
+        "reason": reason,
+        **metadata,
+    })
+    results.append(FanoutResult(
+        subscriber_user_id=sub.user_id,
+        broker_account_id=uuid.UUID(int=0),
+        order_id=None,
+        status=f"skipped_{reason}",
+    ))
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -154,41 +191,65 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         if not sub_user:
             continue
 
-        # Daily-loss kill switch (check BEFORE placing).
+        # ── Risk checks — all run BEFORE placing. Any failure pauses copying. ──
+
+        # 1a. Legacy dollar daily-loss kill switch.
         if sub.daily_loss_limit is not None:
             todays_pnl = today_realized_pnl(db, sub.user_id)
             if todays_pnl <= -sub.daily_loss_limit:
-                # Flip the DB row off so future fanouts skip cheap. Also bust
-                # the subscriber cache so other workers see it on next read.
-                db_settings = db.get(SubscriberSettings, sub.user_id)
-                if db_settings is not None:
-                    db_settings.copy_enabled = False
-                cache.invalidate_subscribers_for_trader(trader.id)
-                audit.record(
-                    db,
-                    actor_user_id=sub.user_id,
-                    action="copy.auto_paused_daily_loss",
-                    entity_type="subscriber_settings",
-                    entity_id=sub.user_id,
-                    metadata={
-                        "daily_loss_limit": str(sub.daily_loss_limit),
-                        "todays_realized_pnl": str(todays_pnl),
-                        "trigger_order_id": str(trader_order.id),
-                    },
-                )
-                events.publish(sub.user_id, {
-                    "type": "copy.auto_paused",
-                    "reason": "daily_loss_limit",
+                _auto_pause(db, sub, trader, trader_order, results, "daily_loss_limit", {
                     "daily_loss_limit": str(sub.daily_loss_limit),
                     "todays_realized_pnl": str(todays_pnl),
                 })
-                results.append(FanoutResult(
-                    subscriber_user_id=sub.user_id,
-                    broker_account_id=uuid.UUID(int=0),
-                    order_id=None,
-                    status="skipped_daily_loss_limit",
-                ))
                 continue
+
+        # 1b. Daily loss limit as % of account equity.
+        if sub.daily_loss_limit_pct is not None:
+            equity = get_account_equity(db, sub.user_id)
+            if equity:
+                dollar_limit = equity * sub.daily_loss_limit_pct / Decimal(100)
+                todays_pnl = today_realized_pnl(db, sub.user_id)
+                if todays_pnl <= -dollar_limit:
+                    _auto_pause(db, sub, trader, trader_order, results, "daily_loss_limit_pct", {
+                        "daily_loss_limit_pct": str(sub.daily_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(Decimal("0.01"))),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "account_equity": str(equity),
+                    })
+                    continue
+
+        # 1c. Per-trade loss limit as % of account equity.
+        # Checks the most recently closed round-trip trade's realized P&L.
+        if sub.per_trade_loss_limit_pct is not None:
+            equity = get_account_equity(db, sub.user_id)
+            if equity:
+                dollar_limit = equity * sub.per_trade_loss_limit_pct / Decimal(100)
+                last_pnl = last_trade_pnl(db, sub.user_id)
+                if last_pnl is not None and last_pnl <= -dollar_limit:
+                    _auto_pause(db, sub, trader, trader_order, results, "per_trade_loss_limit", {
+                        "per_trade_loss_limit_pct": str(sub.per_trade_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(Decimal("0.01"))),
+                        "last_trade_pnl": str(last_pnl),
+                        "account_equity": str(equity),
+                    })
+                    continue
+
+        # 1d. Max drawdown protection: stop if account equity has fallen more
+        # than max_drawdown_pct% below the baseline captured when protection was set.
+        if sub.max_drawdown_pct is not None and sub.max_drawdown_equity_baseline is not None:
+            equity = get_account_equity(db, sub.user_id)
+            if equity is not None:
+                min_equity = sub.max_drawdown_equity_baseline * (
+                    1 - sub.max_drawdown_pct / Decimal(100)
+                )
+                if equity <= min_equity:
+                    _auto_pause(db, sub, trader, trader_order, results, "max_drawdown", {
+                        "max_drawdown_pct": str(sub.max_drawdown_pct),
+                        "equity_baseline": str(sub.max_drawdown_equity_baseline),
+                        "current_equity": str(equity),
+                        "min_equity_threshold": str(min_equity.quantize(Decimal("0.01"))),
+                    })
+                    continue
 
         sub_accounts = await cache.get_broker_accounts(db, sub.user_id)
         if not sub_accounts:
