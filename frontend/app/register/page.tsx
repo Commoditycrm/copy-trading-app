@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PasswordInput } from "@/components/PasswordInput";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -64,7 +65,7 @@ export default function RegisterPage() {
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>
-            <input className="w-full p-2.5" type="password" autoComplete="new-password" placeholder="8+ characters"
+            <PasswordInput className="w-full p-2.5" autoComplete="new-password" placeholder="8+ characters"
               value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} />
           </div>
           <div>

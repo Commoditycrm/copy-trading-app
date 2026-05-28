@@ -45,6 +45,48 @@ from app.services.order_retry import classify_error
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
 
 
+# ── Historical-order replay guard ───────────────────────────────────────────
+#
+# When a listener (Alpaca WS / Webull poll / SnapTrade poll) first attaches to
+# a trader's broker, the broker's API returns the trader's RECENT order
+# history — not just brand-new orders. Without a guard we'd treat all of that
+# history as fresh trades and fan it out to every subscriber, dumping stale
+# orders onto their (possibly real-money) accounts the moment they connect.
+#
+# The guard: only mirror orders the trader placed AFTER we started watching
+# their broker — i.e. after the BrokerAccount row's created_at. Anything older
+# is historical and is recorded locally but NOT fanned out.
+
+# Grace window for clock skew / a trade placed in the same minute the broker
+# was connected. Generous on purpose — better to mirror one borderline order
+# than to drop a genuine just-placed trade.
+FANOUT_HISTORICAL_GRACE_S = 120
+
+
+def order_predates_connection(
+    broker_account: BrokerAccount | None,
+    order_placed_at: datetime | None,
+) -> bool:
+    """True if this listener-detected order was placed before we began
+    watching the trader's broker (so it's history and must NOT be
+    mirrored). Compares the order's broker-side placement time against
+    ``broker_account.created_at`` minus a grace window.
+
+    Fail-open (returns False → allow fanout) when either timestamp is
+    missing: dropping a real just-placed trade is worse for copy-trading
+    than occasionally mirroring one borderline historical order. In
+    practice every broker supplies a placement time, and historical
+    orders all carry real (old) timestamps, so the bulk-replay case is
+    reliably caught."""
+    if order_placed_at is None or broker_account is None or broker_account.created_at is None:
+        return False
+    placed = order_placed_at if order_placed_at.tzinfo else order_placed_at.replace(tzinfo=timezone.utc)
+    created = broker_account.created_at
+    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    watermark = created - timedelta(seconds=FANOUT_HISTORICAL_GRACE_S)
+    return placed < watermark
+
+
 # Map subscriber's RetryInterval enum value → wall-clock minutes to wait
 # before the retry_scheduler picks the order back up.
 _RETRY_INTERVAL_MINUTES: dict[RetryInterval, int] = {

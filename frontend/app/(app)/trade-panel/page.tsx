@@ -6,7 +6,7 @@ import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
-import { ExitAllModal } from "@/components/ExitAllModal";
+import { ExitAllModal, type ExitAction } from "@/components/ExitAllModal";
 import { StrikePicker } from "@/components/StrikePicker";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
@@ -285,19 +285,39 @@ export default function TradePanelPage() {
 
   const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
 
-  async function doExitAll(includeSubscribers: boolean) {
+  /** Routes to the right backend endpoint depending on the user's
+   *  step-1 choice in ExitAllModal. Trader-only page, so `include
+   *  subscribers` is always meaningful. */
+  async function doExitAll(action: ExitAction, includeSubscribers: boolean) {
     setExitBusy(true);
     try {
-      const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
-        `/api/positions/close-all?include_subscribers=${includeSubscribers}`,
-        { method: "POST" },
-      );
-      if (res.closed_count === 0 && res.failed_count === 0) {
-        notify.info("No open positions to close.");
-      } else if (res.failed_count === 0) {
-        notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market${includeSubscribers ? " (fanned out to subscribers)" : ""}`);
+      if (action === "orders") {
+        const res = await api<{ cancelled_count: number; failed_count: number; failed: { order_id: string; symbol: string | null; error: string }[] }>(
+          `/api/trades/cancel-all-open?include_subscribers=${includeSubscribers}`,
+          { method: "POST" },
+        );
+        if (res.cancelled_count === 0 && res.failed_count === 0) {
+          notify.info("No open orders to cancel.");
+        } else if (res.failed_count === 0) {
+          notify.success(
+            `Cancelled ${res.cancelled_count} order${res.cancelled_count === 1 ? "" : "s"}` +
+            (includeSubscribers ? " (cascaded to subscriber mirrors)" : "")
+          );
+        } else {
+          notify.warn(`Cancelled ${res.cancelled_count}; ${res.failed_count} failed — check Trades for details`);
+        }
       } else {
-        notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
+        const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
+          `/api/positions/close-all?include_subscribers=${includeSubscribers}`,
+          { method: "POST" },
+        );
+        if (res.closed_count === 0 && res.failed_count === 0) {
+          notify.info("No open positions to close.");
+        } else if (res.failed_count === 0) {
+          notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market${includeSubscribers ? " (fanned out to subscribers)" : ""}`);
+        } else {
+          notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
+        }
       }
       positionsRef.current?.refresh();
       setExitConfirmOpen(false);
@@ -767,7 +787,7 @@ export default function TradePanelPage() {
       <ExitAllModal
         open={exitConfirmOpen}
         busy={exitBusy}
-        onConfirm={(includeSubs) => doExitAll(includeSubs)}
+        onConfirm={(action, includeSubs) => doExitAll(action, includeSubs)}
         onCancel={() => setExitConfirmOpen(false)}
       />
     </div>

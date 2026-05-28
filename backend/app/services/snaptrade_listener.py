@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -46,13 +47,32 @@ log = logging.getLogger(__name__)
 
 
 # Per the module docstring: SnapTrade's own upstream poll cadence sets a
-# floor on useful freshness. 5s is a fine default.
+# floor on useful freshness. 5s is a fine default for the self-poller.
 POLL_INTERVAL_S = 5.0
+# When a webhook secret is configured, SnapTrade's Trade Detection +
+# webhook becomes the primary trigger and our self-poll is only a
+# backstop — so we slow it down to avoid redundant API calls.
+POLL_INTERVAL_BACKSTOP_S = 60.0
 
 
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
 _last_seen: dict[uuid.UUID, dict[str, str]] = {}
+# Per-trader lock so a webhook-triggered immediate poll and the periodic
+# poll can't run _poll_once concurrently for the same trader (which could
+# double-insert a brand-new order — there's no DB unique constraint on
+# broker_order_id, the dedup is a SELECT-then-INSERT inside _poll_once).
+_poll_locks: dict[uuid.UUID, threading.Lock] = {}
 _main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _lock_for(trader_user_id: uuid.UUID) -> "threading.Lock":
+    return _poll_locks.setdefault(trader_user_id, threading.Lock())
+
+
+def _poll_interval() -> float:
+    """5s normally; 60s backstop when a webhook drives detection."""
+    from app.config import get_settings
+    return POLL_INTERVAL_BACKSTOP_S if get_settings().snaptrade_webhook_enabled else POLL_INTERVAL_S
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -124,6 +144,7 @@ def stop_listener(trader_user_id: uuid.UUID) -> None:
     if task and not task.done():
         task.cancel()
     _last_seen.pop(trader_user_id, None)
+    _poll_locks.pop(trader_user_id, None)
     _set_state(trader_user_id, "disconnected")
 
 
@@ -186,7 +207,7 @@ async def _run_listener(
                     )
                     _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
                     break
-                await asyncio.sleep(POLL_INTERVAL_S)
+                await asyncio.sleep(_poll_interval())
 
         except asyncio.CancelledError:
             log.info("snaptrade-listener[%s] cancelled", trader_user_id)
@@ -197,6 +218,45 @@ async def _run_listener(
 
         await asyncio.sleep(backoff)
         backoff = min(_BACKOFF_MAX, backoff * 2)
+
+
+# ── Webhook-triggered immediate poll ────────────────────────────────────────
+
+
+async def poll_now_for_trader(trader_user_id: uuid.UUID) -> bool:
+    """Run one poll immediately for this trader, outside the periodic
+    loop. Called by the SnapTrade Trade-Detection webhook so a new order
+    is picked up the instant SnapTrade notifies us, instead of waiting
+    for the next periodic tick.
+
+    Returns True if a poll ran, False if the trader has no connected
+    SnapTrade account or the poll errored. Shares ``_last_seen`` + the
+    per-trader lock with the periodic loop, so it's safe to run
+    concurrently — the lock serialises the SELECT-then-INSERT in
+    _poll_once. Exception-safe because it runs as a fire-and-forget
+    background task from the webhook handler."""
+    try:
+        with SessionLocal() as db:
+            acct = db.execute(
+                select(BrokerAccount).where(
+                    BrokerAccount.user_id == trader_user_id,
+                    BrokerAccount.broker == BrokerName.SNAPTRADE,
+                    BrokerAccount.connection_status == "connected",
+                )
+            ).scalar_one_or_none()
+            if acct is None:
+                return False
+            broker_account_id = acct.id
+
+        creds = _load_creds(trader_user_id, broker_account_id)
+        if creds is None:
+            return False
+        adapter = SnapTradeAdapter(creds)
+        await asyncio.to_thread(_poll_once, trader_user_id, broker_account_id, adapter)
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("snaptrade poll_now_for_trader failed for %s", trader_user_id)
+        return False
 
 
 # ── Credential helpers ──────────────────────────────────────────────────────
@@ -236,26 +296,31 @@ def _poll_once(
     adapter: SnapTradeAdapter,
 ) -> None:
     """Pull recent orders, diff against last-seen, route changes through
-    the persist+fanout pipeline. Sync — runs in a thread."""
-    orders = adapter.list_recent_activities()
-    listener_state.bump_last_event(trader_user_id)
-    if not orders:
-        return
+    the persist+fanout pipeline. Sync — runs in a thread.
 
-    seen = _last_seen.setdefault(trader_user_id, {})
-    for o in orders:
-        broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
-        if not broker_order_id:
-            continue
-        status_str = str(_attr(o, "status", default="")).upper()
-        prev = seen.get(broker_order_id)
-        if prev == status_str:
-            continue
-        seen[broker_order_id] = status_str
+    Guarded by a per-trader lock so the periodic loop and a
+    webhook-triggered poll (poll_now_for_trader) never race on the
+    SELECT-then-INSERT dedup inside _persist_and_fanout."""
+    with _lock_for(trader_user_id):
+        orders = adapter.list_recent_activities()
+        listener_state.bump_last_event(trader_user_id)
+        if not orders:
+            return
 
-        _persist_and_fanout(
-            trader_user_id, broker_account_id, broker_order_id, status_str, o
-        )
+        seen = _last_seen.setdefault(trader_user_id, {})
+        for o in orders:
+            broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
+            if not broker_order_id:
+                continue
+            status_str = str(_attr(o, "status", default="")).upper()
+            prev = seen.get(broker_order_id)
+            if prev == status_str:
+                continue
+            seen[broker_order_id] = status_str
+
+            _persist_and_fanout(
+                trader_user_id, broker_account_id, broker_order_id, status_str, o
+            )
 
 
 def _persist_and_fanout(
@@ -344,6 +409,27 @@ def _persist_and_fanout(
             },
         )
         order.redis_published_at = datetime.now(timezone.utc)
+
+        # Replay guard: if this order was placed before we started
+        # watching this broker, it's history surfaced by SnapTrade's
+        # recent-orders list — record it but DON'T mirror it to
+        # subscribers. Marking fanned_out_to_subscribers=True means
+        # "fanout resolved" so it's never retried.
+        acct = db.get(BrokerAccount, broker_account_id)
+        if copy_engine.order_predates_connection(acct, order.trader_submitted_at):
+            order.fanned_out_to_subscribers = True
+            db.commit()
+            db.refresh(order)
+            events.publish(
+                trader_user_id,
+                copy_engine._order_event("order.placed", order),  # noqa: SLF001
+            )
+            log.info(
+                "snaptrade-listener[%s] skipping fanout — order %s predates connection",
+                trader_user_id, broker_order_id,
+            )
+            return
+
         db.commit()
         db.refresh(order)
 

@@ -4,7 +4,7 @@ What it is
 ----------
 SnapTrade is a hosted "OAuth for brokerages" service: the user clicks a
 button in our UI, gets redirected to SnapTrade's connection portal,
-picks their broker (Robinhood / E*TRADE / Tradier / IBKR / Webull /
+picks their broker (Robinhood / E*TRADE / Tradier / Webull /
 Schwab / …), and authenticates on SnapTrade's side. We never see the
 broker credentials. We get back a per-connection ``authorization_id``
 and one or more ``account_id``s we can use to read positions / orders
@@ -609,10 +609,10 @@ class SnapTradeAdapter(BrokerAdapter):
                 return _dec_or_none(x.get("amount"))
             return _dec_or_none(x)
 
-        # ``total_value`` only appears on a subset of brokers (Alpaca,
-        # IBKR…). For brokers that don't report it (Webull is one), leave
-        # it None — the UI renders "—" gracefully and the user can compute
-        # it manually from cash + positions.
+        # ``total_value`` only appears on a subset of brokers. For brokers
+        # that don't report it (Webull is one), leave it None — the UI
+        # renders "—" gracefully and the user can compute it manually from
+        # cash + positions.
         return {
             "cash":         _val(_attr(primary, "cash")),
             "buying_power": _val(_attr(primary, "buying_power")),

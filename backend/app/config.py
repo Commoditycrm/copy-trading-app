@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     # https://dashboard.snaptrade.com/.
     snaptrade_client_id: str = ""
     snaptrade_consumer_key: str = ""
+    # Set true once you've configured a SnapTrade webhook listener +
+    # Trade Detection. The webhook then drives near-real-time detection,
+    # so our own SnapTrade poll-listener backs off to a 60s backstop
+    # interval instead of polling every 5s (saves API calls / rate-limit
+    # headroom). False = no webhook, poller stays at its 5s cadence.
+    snaptrade_webhook_enabled: bool = False
     # asyncio.to_thread() uses the default ThreadPoolExecutor (default size
     # min(32, cpu+4) — way too small for 200 concurrent broker calls). We
     # bump this at startup so all 200 actually run in parallel.

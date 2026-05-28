@@ -441,6 +441,24 @@ def _persist_and_fanout(
         )
         # Lifecycle: stamp the broadcast moment before publishing.
         order.redis_published_at = datetime.now(timezone.utc)
+
+        # Replay guard — don't mirror orders the trader placed before we
+        # started watching this Alpaca account (history returned by the
+        # backfill / first connect). See copy_engine.order_predates_connection.
+        acct = db.get(BrokerAccount, broker_account_id)
+        if copy_engine.order_predates_connection(acct, order.trader_submitted_at):
+            order.fanned_out_to_subscribers = True
+            db.commit()
+            db.refresh(order)
+            events.publish(
+                trader_user_id, copy_engine._order_event("order.placed", order)  # noqa: SLF001
+            )
+            log.info(
+                "listener[%s] skipping fanout — order %s predates connection",
+                trader_user_id, order.broker_order_id,
+            )
+            return
+
         db.commit()
         db.refresh(order)
 
@@ -637,8 +655,16 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
         if not unfanned:
             return
 
+        acct = db.get(BrokerAccount, broker_account_id)
         fanned = 0
+        skipped_historical = 0
         for o in unfanned:
+            # Replay guard — orders placed before we started watching this
+            # broker are history; mark them resolved without mirroring.
+            if copy_engine.order_predates_connection(acct, o.trader_submitted_at or o.submitted_at):
+                o.fanned_out_to_subscribers = True
+                skipped_historical += 1
+                continue
             try:
                 copy_engine.fanout(db, o, trader)
                 o.fanned_out_to_subscribers = True
@@ -647,6 +673,11 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
                 log.exception(
                     "listener backfill fanout failed for order %s", o.id
                 )
+        if skipped_historical:
+            log.info(
+                "listener[%s] backfill skipped %d historical orders (pre-connection)",
+                trader_user_id, skipped_historical,
+            )
         try:
             db.commit()
             log.info(
