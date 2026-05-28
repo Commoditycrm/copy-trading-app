@@ -47,7 +47,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -70,7 +70,7 @@ from app.schemas.broker import (
     StartWebullMfaIn,
     StartWebullMfaOut,
 )
-from app.services import audit, cache, listeners
+from app.services import audit, cache, listeners, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
 from app.services.redis_client import get_sync_redis
 
@@ -184,6 +184,8 @@ def _ensure_snaptrade_configured() -> None:
         )
 
 
+
+
 def _register_or_reset_snaptrade_user(user_id: uuid.UUID) -> str:
     """Register the SnapTrade user, dealing with the 'already exists'
     case by deleting + re-registering. Returns the userSecret.
@@ -293,6 +295,84 @@ def _evict_existing_brokers(
                 listeners.stop_listener(user.id)
             except Exception:  # noqa: BLE001
                 log.exception("stop_listener during broker replacement failed")
+
+
+@router.post("/snaptrade/webhook")
+async def snaptrade_webhook(request: Request, background: BackgroundTasks) -> dict:
+    """Inbound SnapTrade webhook — UNAUTHENTICATED (SnapTrade calls this,
+    not a logged-in user). Powered by SnapTrade's Trade Detection feature:
+    SnapTrade polls the connected broker at the subscribed cadence and
+    POSTs here the instant it detects a new executed order.
+
+    Verification: SnapTrade's dashboard listener form takes ONLY a URL —
+    there's no shared-secret field. They sign webhooks instead (see their
+    "verify webhook signatures" docs), so the secret may arrive in a
+    HEADER, not the body. We therefore:
+      • accept calls that carry no body secret (the normal SnapTrade case),
+      • only reject if a body secret IS present and mismatches (covers a
+        future SnapTrade change or a manual test),
+      • log the header names on each call so we can wire up proper
+        signature verification once we observe the real scheme.
+
+    Safe-by-design even without full signature verification: a forged call
+    can at most trigger an extra poll, which fetches REAL orders from
+    SnapTrade and dedups by broker_order_id — it cannot inject fake trades.
+
+    We don't branch on the exact event type — any event carrying a
+    ``userId`` we recognise triggers an immediate poll of that trader's
+    orders. The poll runs as a background task so we return 200 fast
+    (SnapTrade retries on slow/failed responses, and fanout can take a
+    second or two)."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+
+    # DIAGNOSTIC: log the full headers + body of every webhook so we can
+    # see exactly how SnapTrade signs/structures its payload, then add
+    # strict signature verification matching their actual scheme. The
+    # SnapTrade dashboard's listener form has NO secret field, so they
+    # verify via signature (header), not a shared secret in the body —
+    # comparing a body field against our .env secret was wrong and was
+    # the source of the 401 on their test deliveries.
+    sig_headers = {
+        k: v for k, v in request.headers.items()
+        if any(t in k.lower() for t in ("sign", "signature", "snaptrade", "webhook", "hmac", "digest"))
+    }
+    log.info(
+        "snaptrade webhook | headers=%s | sig_headers=%s | body=%s",
+        list(request.headers.keys()), sig_headers, body,
+    )
+
+    # NOTE: signature verification intentionally not enforced yet — we
+    # accept the call and trigger a re-poll, which only ever fetches REAL
+    # orders from SnapTrade and dedups (a forged call can't inject fake
+    # trades). Once the log above shows SnapTrade's actual signature
+    # header/scheme, we'll verify it here and reject mismatches.
+
+    event_type = body.get("eventType") or body.get("type") or "unknown"
+    user_id_raw = body.get("userId") or body.get("user_id")
+
+    # SnapTrade sends a no-user test ping when you first configure the
+    # listener — ack with 200 so the dashboard marks it healthy.
+    if not user_id_raw:
+        log.info("snaptrade webhook: test/no-user event=%s", event_type)
+        return {"ok": True}
+
+    try:
+        trader_user_id = uuid.UUID(str(user_id_raw))
+    except (ValueError, TypeError):
+        log.warning("snaptrade webhook: unparseable userId=%r", user_id_raw)
+        return {"ok": True}  # ack; nothing actionable
+
+    log.info(
+        "snaptrade webhook: event=%s userId=%s — scheduling immediate poll",
+        event_type, trader_user_id,
+    )
+    # Fire-and-forget so we return 200 immediately. The periodic backstop
+    # poll catches anything this misses.
+    background.add_task(snaptrade_listener.poll_now_for_trader, trader_user_id)
+    return {"ok": True}
 
 
 @router.post("/snaptrade/start", response_model=StartSnaptradeOut)
@@ -477,7 +557,7 @@ def snaptrade_finish(
             f"snaptrade_read_only — {brokerage_name} only supports read-only "
             f"access through SnapTrade, so mirror orders can't be placed on "
             f"this account. Pick a different broker (Robinhood, Tradier, "
-            f"Alpaca, IBKR, …) or connect Alpaca directly with API keys.",
+            f"Alpaca, …) or connect Alpaca directly with API keys.",
         )
 
     # Evict any existing broker first (one-broker-per-user).

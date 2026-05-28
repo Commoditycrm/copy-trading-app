@@ -370,6 +370,109 @@ def cancel_trade(
     return order
 
 
+@router.post("/trades/cancel-all-open")
+def cancel_all_open_orders(
+    request: Request,
+    background: BackgroundTasks,
+    include_subscribers: bool = Query(
+        default=True,
+        description=(
+            "Trader-only knob. When True, after cancelling each of the "
+            "trader's root orders we cascade the cancel to every "
+            "subscriber's mirror order (same path as the single-order "
+            "cancel endpoint). When False, only the trader's own root "
+            "orders are cancelled and mirror orders are left alone — "
+            "useful when the trader wants to clean up their own queue "
+            "without yanking trades subscribers may still want filled. "
+            "Ignored when the caller is a subscriber (they have no "
+            "downstream to fan out to)."
+        ),
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel every open order owned by the caller.
+
+    Open = status in (PENDING, SUBMITTED, ACCEPTED, PARTIALLY_FILLED).
+    Mirror-the-shape of /api/positions/close-all so the Exit-All UI can
+    route to either endpoint based on the user's first choice (orders
+    vs. positions). Per-order broker failures don't abort the rest —
+    we surface a count + list so the UI can hint at partial success.
+    """
+    orders = list(db.execute(
+        select(Order)
+        .options(selectinload(Order.fills))
+        .where(Order.user_id == user.id, Order.status.in_(_CANCELLABLE_STATUSES))
+    ).scalars())
+
+    cancelled_ids: list[uuid.UUID] = []
+    failed: list[dict] = []
+
+    # We cancel sequentially. The N here is bounded (a trader rarely has
+    # >50 open orders); parallel cancel adds complexity (per-broker
+    # concurrency limits, lock contention on adapter sessions) without
+    # meaningful win for the typical case. If volume grows we can revisit
+    # using the same ThreadPoolExecutor pattern as _run_cancel_fanout.
+    for order in orders:
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+        try:
+            if acct is not None and order.broker_order_id:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter_for(acct, creds).cancel_order(order.broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            # Broker rejected the cancel (often "order already filled" or
+            # "no such order" — both fine; DB will reflect status on next
+            # listener update). Record + skip rather than mutate state.
+            audit.record(
+                db, actor_user_id=user.id, action="order.cancel_failed",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(exc)[:480], "via": "cancel-all-open"},
+                ip_address=client_ip(request),
+            )
+            failed.append({
+                "order_id": str(order.id),
+                "symbol":   order.symbol,
+                "error":    str(exc)[:300],
+            })
+            continue
+
+        order.status = OrderStatus.CANCELED
+        order.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db, actor_user_id=user.id, action="order.cancelled",
+            entity_type="order", entity_id=order.id,
+            metadata={"via": "cancel-all-open",
+                      "broker_order_id": order.broker_order_id},
+            ip_address=client_ip(request),
+        )
+        cancelled_ids.append(order.id)
+
+    db.commit()
+
+    # Publish SSE *after* commit so subscribers reading from the DB on
+    # event-receipt see the cancelled state.
+    for oid in cancelled_ids:
+        cancelled = db.get(Order, oid)
+        if cancelled is None:
+            continue
+        events.publish(user.id, copy_engine._order_event("order.cancelled", cancelled))
+
+    # Trader-only: cascade cancel to mirror orders for every root order
+    # we just cancelled. Skip the cascade if caller asked for "just me"
+    # OR is a subscriber (subscribers have no downstream).
+    if user.role == UserRole.TRADER and include_subscribers:
+        for oid in cancelled_ids:
+            cancelled = db.get(Order, oid)
+            if cancelled is not None and cancelled.parent_order_id is None:
+                background.add_task(_run_cancel_fanout_in_background, oid)
+
+    return {
+        "cancelled_count": len(cancelled_ids),
+        "failed_count":    len(failed),
+        "failed":          failed,
+    }
+
+
 @router.post("/trades/{order_id}/close", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 def close_trade(
     order_id: uuid.UUID,

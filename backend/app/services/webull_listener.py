@@ -402,6 +402,25 @@ def _persist_and_fanout(
             },
         )
         order.redis_published_at = datetime.now(timezone.utc)
+
+        # Replay guard — don't mirror orders placed before we started
+        # watching this broker (history surfaced by the poll). See
+        # copy_engine.order_predates_connection.
+        acct = db.get(BrokerAccount, broker_account_id)
+        if copy_engine.order_predates_connection(acct, order.trader_submitted_at):
+            order.fanned_out_to_subscribers = True
+            db.commit()
+            db.refresh(order)
+            events.publish(
+                trader_user_id,
+                copy_engine._order_event("order.placed", order),  # noqa: SLF001
+            )
+            log.info(
+                "webull-listener[%s] skipping fanout — order %s predates connection",
+                trader_user_id, broker_order_id,
+            )
+            return
+
         db.commit()
         db.refresh(order)
 

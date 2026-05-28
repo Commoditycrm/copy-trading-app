@@ -6,6 +6,7 @@ import Link from "next/link";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PasswordInput } from "@/components/PasswordInput";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -66,9 +67,9 @@ export default function LoginPage() {
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
               Password
             </label>
-            <input
+            <PasswordInput
               className="w-full p-2.5"
-              type="password" autoComplete="current-password" placeholder="••••••••"
+              autoComplete="current-password" placeholder="••••••••"
               value={password} onChange={(e) => setPassword(e.target.value)} required
             />
           </div>
