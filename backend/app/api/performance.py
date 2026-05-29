@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_trader
 from app.database import get_db
+from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.user import User
 
@@ -52,8 +53,18 @@ def _ms_between(a: datetime | None, b: datetime | None) -> int | None:
     return int((b - a).total_seconds() * 1000)
 
 
-def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> dict[str, Any]:
+def _serialize_child(
+    child: Order,
+    parent: Order,
+    subscriber: User | None,
+    account: BrokerAccount | None = None,
+) -> dict[str, Any]:
     accepted_at = child.submitted_at
+    # Subscriber's connected broker for this mirror — prefer their custom
+    # label (e.g. "Webull via SnapTrade"), fall back to the broker enum value.
+    broker_name = None
+    if account is not None:
+        broker_name = account.label or (account.broker.value if account.broker else None)
     # New lifecycle stamps — see Order model / alembic e7a1d2c40f01.
     picked = child.subscriber_picked_at
     sub_accepted = child.subscriber_accepted_at
@@ -64,6 +75,7 @@ def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> di
         "subscriber_user_id": str(child.user_id),
         "subscriber_email": subscriber.email if subscriber else None,
         "subscriber_name": subscriber.display_name if subscriber else None,
+        "broker_name": broker_name,
         "status": child.status.value,
         "quantity": str(child.quantity),
         "filled_quantity": str(child.filled_quantity or 0),
@@ -96,7 +108,12 @@ def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> di
     }
 
 
-def _serialize_fanout(parent: Order, children: list[Order], subscribers: dict[uuid.UUID, User]) -> dict[str, Any]:
+def _serialize_fanout(
+    parent: Order,
+    children: list[Order],
+    subscribers: dict[uuid.UUID, User],
+    accounts: dict[uuid.UUID, BrokerAccount] | None = None,
+) -> dict[str, Any]:
     accepted_children = [c for c in children if c.submitted_at is not None]
     last_accept_at = max((c.submitted_at for c in accepted_children), default=None)
 
@@ -147,7 +164,7 @@ def _serialize_fanout(parent: Order, children: list[Order], subscribers: dict[uu
             "submitted": submitted,
             "errors": errors,
         },
-        "children": [_serialize_child(c, parent, subscribers.get(c.user_id)) for c in children],
+        "children": [_serialize_child(c, parent, subscribers.get(c.user_id), (accounts or {}).get(c.broker_account_id)) for c in children],
     }
 
 
@@ -207,8 +224,19 @@ def list_fanouts(
         rows = db.execute(select(User).where(User.id.in_(sub_ids))).scalars()
         subscribers = {u.id: u for u in rows}
 
+    # One round-trip for the subscribers' broker accounts (for the broker name).
+    acct_ids = {c.broker_account_id for c in children if c.broker_account_id is not None}
+    accounts: dict[uuid.UUID, BrokerAccount] = {}
+    if acct_ids:
+        accounts = {
+            a.id: a
+            for a in db.execute(
+                select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
+            ).scalars()
+        }
+
     fanouts = [
-        _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers) for p in parents
+        _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers, accounts) for p in parents
     ]
 
     # Aggregate metrics — only over fanouts that actually completed (last

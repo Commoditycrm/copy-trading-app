@@ -473,6 +473,78 @@ def cancel_all_open_orders(
     }
 
 
+@router.post("/trades/cancel-all-subscribers-open")
+def cancel_all_subscribers_open_orders(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Trader-only: cancel every open order across EVERY subscriber following
+    this trader. The trader's OWN orders are not touched. Mirrors the shape of
+    cancel-all-open; per-order broker failures are recorded and skipped."""
+    sub_ids = list(db.execute(
+        select(SubscriberSettings.user_id).where(
+            SubscriberSettings.following_trader_id == user.id
+        )
+    ).scalars())
+    if not sub_ids:
+        return {"cancelled_count": 0, "failed_count": 0, "failed": []}
+
+    orders = list(db.execute(
+        select(Order)
+        .options(selectinload(Order.fills))
+        .where(Order.user_id.in_(sub_ids), Order.status.in_(_CANCELLABLE_STATUSES))
+    ).scalars())
+
+    cancelled_ids: list[uuid.UUID] = []
+    failed: list[dict] = []
+    for order in orders:
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+        try:
+            if acct is not None and order.broker_order_id:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter_for(acct, creds).cancel_order(order.broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            audit.record(
+                db, actor_user_id=user.id, action="order.cancel_failed",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(exc)[:480], "via": "cancel-all-subscribers-open",
+                          "subscriber_user_id": str(order.user_id)},
+                ip_address=client_ip(request),
+            )
+            failed.append({
+                "order_id": str(order.id),
+                "symbol":   order.symbol,
+                "error":    str(exc)[:300],
+            })
+            continue
+
+        order.status = OrderStatus.CANCELED
+        order.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db, actor_user_id=user.id, action="order.cancelled",
+            entity_type="order", entity_id=order.id,
+            metadata={"via": "cancel-all-subscribers-open",
+                      "subscriber_user_id": str(order.user_id),
+                      "broker_order_id": order.broker_order_id},
+            ip_address=client_ip(request),
+        )
+        cancelled_ids.append(order.id)
+
+    db.commit()
+
+    for oid in cancelled_ids:
+        cancelled = db.get(Order, oid)
+        if cancelled is not None:
+            events.publish(cancelled.user_id, copy_engine._order_event("order.cancelled", cancelled))  # noqa: SLF001
+
+    return {
+        "cancelled_count": len(cancelled_ids),
+        "failed_count":    len(failed),
+        "failed":          failed,
+    }
+
+
 @router.post("/trades/{order_id}/close", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 def close_trade(
     order_id: uuid.UUID,

@@ -22,6 +22,7 @@ interface FanoutChild {
   subscriber_user_id: string;
   subscriber_email: string | null;
   subscriber_name: string | null;
+  broker_name: string | null;
   status: string;
   quantity: string;
   filled_quantity: string;
@@ -1045,6 +1046,7 @@ export default function PerformancePage() {
                                     ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
                                     ["Pick Lag 🟢", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
                                     ["Eligibility Lag 🟢", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
                                     ["Broker Lag 🔵", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
                                     ["Broker Response 🔵", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
                                     ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
@@ -1162,6 +1164,9 @@ export default function PerformancePage() {
                                         style={{ color: colorFor(c.eligibility_lag_ms) }}
                                       >
                                         {fmtMs(c.eligibility_lag_ms)}
+                                      </td>
+                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
+                                        {c.broker_name ?? "—"}
                                       </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
