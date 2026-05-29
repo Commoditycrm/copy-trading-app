@@ -50,8 +50,6 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from webull import paper_webull, webull as live_webull
-
 from app.brokers.base import (
     BrokerAdapter,
     BrokerOrderRequest,
@@ -68,6 +66,22 @@ from app.models.order import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _webull_classes() -> tuple[Any, Any]:
+    """Lazily import the unofficial ``webull`` SDK, returning
+    ``(paper_webull, live_webull)``.
+
+    Deliberately NOT a module-level import: that package's code executed on
+    every app boot and was the prime suspect in the 2026-05 supply-chain
+    compromise, so it was removed from requirements.txt pending a security
+    review. Importing the module (``app.brokers.webull``) must stay
+    side-effect-free; only code paths that actually drive a Webull connection
+    reach this function, and they raise a clear ImportError while the package
+    is uninstalled (the broker is not in active use)."""
+    from webull import paper_webull, webull as live_webull  # noqa: PLC0415
+
+    return paper_webull, live_webull
 
 
 # Map Webull → our enums. Webull's status strings are upper-snake; we keep
@@ -110,6 +124,7 @@ def _build_client(credentials: dict[str, Any]) -> Any:
     session state. Does NOT hit the network — only restores attributes.
     A subsequent call (get_account / refresh_login) will exercise auth."""
     paper = bool(credentials.get("paper", True))
+    paper_webull, live_webull = _webull_classes()
     cls = paper_webull if paper else live_webull
     w = cls()
     sess = credentials.get("session") or {}
@@ -158,6 +173,7 @@ def request_mfa(
     ``device_id`` they'll use for the follow-up login_with_mfa call."""
     import json as _json
 
+    paper_webull, live_webull = _webull_classes()
     cls = paper_webull if paper else live_webull
     w = cls()
     if device_id:
@@ -270,6 +286,7 @@ def login_with_mfa(
     mismatch, account locked, …)."""
     import json as _json
 
+    paper_webull, live_webull = _webull_classes()
     cls = paper_webull if paper else live_webull
     w = cls()
     if device_id:
