@@ -90,6 +90,50 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** Auto-pull-orders preferences for a connected broker. UI only for now —
+ *  the parent toggles both children; backend wiring comes later. */
+function AutoPullOrders() {
+  const [bringOpen, setBringOpen] = useState(true);
+  const [bringFilled, setBringFilled] = useState(true);
+  const parentChecked = bringOpen && bringFilled;
+
+  return (
+    <div className="mt-4 pt-4 hairline flex items-center flex-wrap gap-x-5 gap-y-2 text-sm">
+      <label className="flex items-center gap-2 font-medium cursor-pointer select-none">
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={{ accentColor: "var(--accent)" }}
+          checked={parentChecked}
+          onChange={(e) => { setBringOpen(e.target.checked); setBringFilled(e.target.checked); }}
+        />
+        <span>Auto Pull Orders</span>
+      </label>
+      <span aria-hidden className="h-4 w-px" style={{ background: "var(--border)" }} />
+      <label className="flex items-center gap-2 cursor-pointer select-none" style={{ color: "var(--text-2)" }}>
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={{ accentColor: "var(--accent)" }}
+          checked={bringOpen}
+          onChange={(e) => setBringOpen(e.target.checked)}
+        />
+        <span>Bring open orders</span>
+      </label>
+      <label className="flex items-center gap-2 cursor-pointer select-none" style={{ color: "var(--text-2)" }}>
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={{ accentColor: "var(--accent)" }}
+          checked={bringFilled}
+          onChange={(e) => setBringFilled(e.target.checked)}
+        />
+        <span>Bring Filled orders</span>
+      </label>
+    </div>
+  );
+}
+
 /** Paper / Live account-mode radio group. ``value`` true = paper.
  *  ``name`` must be unique per form so the radios don't cross-bind.
  *  Live is tinted red so it's unmistakable before submit. */
@@ -473,6 +517,8 @@ export default function BrokersPage() {
                 <span>Refresh</span>
               </button>
             </div>
+
+            <AutoPullOrders />
           </div>
         );
       })}

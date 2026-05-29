@@ -91,7 +91,12 @@ function fmtMs(ms: number | null | undefined): string {
   if (ms === null || ms === undefined) return "—";
   if (ms < 0) return "—";
   if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(2)}s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
+  // ≥ 60s → minutes + seconds, e.g. "1m 05s", "2m 30s".
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
 /** HH:MM:SS.mmm in US Eastern (America/New_York — auto EST/EDT). */
@@ -885,15 +890,14 @@ export default function PerformancePage() {
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
-                ["Socket Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
+                ["Trader Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
                 ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
                 ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
                 ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
-                ["Socket Lag", "Trader submit → our WebSocket hearing about it. Socket Listened At − Trader Submitted At."],
                 ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
                 ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
-                ["Fanout Duration", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
+                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
                 ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
                 ["Subscribers", "Total subscribers receiving this trade, with submitted-vs-error counts."],
               ] as [string, string][]).map(([h, tip]) => (
@@ -918,7 +922,7 @@ export default function PerformancePage() {
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={15} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -928,7 +932,7 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={15} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   No fanouts yet. Place a trade to see latency metrics here.
                 </td>
               </tr>
@@ -986,9 +990,6 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.api_to_broker_lag_ms) }}>
                       {fmtMs(f.api_to_broker_lag_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.socket_lag_ms) }}>
-                      {fmtMs(f.socket_lag_ms)}
-                    </td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.publish_lag_ms) }}>
                       {fmtMs(f.publish_lag_ms)}
                     </td>
@@ -1009,7 +1010,7 @@ export default function PerformancePage() {
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={16} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
+                      <td colSpan={15} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
@@ -1263,7 +1264,7 @@ export default function PerformancePage() {
           New per-step lifecycle stamps (alembic <code>e7a1d2c40f01</code>):{" "}
           <strong style={{ color: "var(--text-2)" }}>Trader Submitted At</strong> = our backend received the trader&apos;s
           submit (or Alpaca&apos;s receive time for externally-placed orders).{" "}
-          <strong style={{ color: "var(--text-2)" }}>Socket Listened At</strong> = our Alpaca trade_updates listener
+          <strong style={{ color: "var(--text-2)" }}>Trader Listened At</strong> = our Alpaca trade_updates listener
           heard the event (NULL for in-app orders).{" "}
           <strong style={{ color: "var(--text-2)" }}>Redis Published At</strong> = SSE event broadcast to subscribers.{" "}
           <strong style={{ color: "var(--text-2)" }}>Picked At / Accepted At / Broker Accepted At</strong> (per-child) =
