@@ -35,6 +35,9 @@ class BrokerOrderRequest:
     option_strike: Decimal | None = None
     option_right: OptionRight | None = None
     client_order_id: str | None = None
+    # Open vs. close intent. Stock adapters (Alpaca) ignore it; SnapTrade's
+    # options API needs it to pick BUY_TO_OPEN/SELL_TO_CLOSE etc.
+    is_closing: bool = False
 
 
 @dataclass(frozen=True)

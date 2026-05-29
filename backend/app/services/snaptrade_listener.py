@@ -438,11 +438,19 @@ def _persist_and_fanout(
             copy_engine._order_event("order.placed", order),  # noqa: SLF001
         )
 
-        trader = db.get(User, trader_user_id)
-        if trader is not None:
-            copy_engine.fanout(db, order, trader)
-            order.fanned_out_to_subscribers = True
-            db.commit()
+        # Fan out on the main event loop (see copy_engine.fanout_threadsafe)
+        # instead of a throwaway asyncio.run loop, so per-broker semaphores
+        # and the async Redis client stay bound to one stable loop. Without
+        # this, the second detected order hits a cross-loop error and the
+        # mirror silently fails.
+        if _main_loop is not None:
+            copy_engine.fanout_threadsafe(order.id, trader_user_id, _main_loop)
+        else:
+            trader = db.get(User, trader_user_id)
+            if trader is not None:
+                copy_engine.fanout(db, order, trader)
+                order.fanned_out_to_subscribers = True
+                db.commit()
 
 
 def _insert_order_from_snaptrade(

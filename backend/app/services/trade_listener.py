@@ -471,9 +471,15 @@ def _persist_and_fanout(
         # as a fresh trade to mirror. To avoid mirroring twice for the same
         # external order, we set fanned_out_to_subscribers=True and dedupe on
         # subsequent events via the "existing" branch above.
-        copy_engine.fanout(db, order, _load_trader(db, trader_user_id))
-        order.fanned_out_to_subscribers = True
-        db.commit()
+        # Fan out on the main event loop (see copy_engine.fanout_threadsafe)
+        # rather than a throwaway asyncio.run loop, so per-broker semaphores
+        # and the async Redis client stay bound to one stable loop.
+        if _main_loop is not None:
+            copy_engine.fanout_threadsafe(order.id, trader_user_id, _main_loop)
+        else:
+            copy_engine.fanout(db, order, _load_trader(db, trader_user_id))
+            order.fanned_out_to_subscribers = True
+            db.commit()
 
 
 def _apply_event_to_existing(
@@ -666,8 +672,11 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
                 skipped_historical += 1
                 continue
             try:
-                copy_engine.fanout(db, o, trader)
-                o.fanned_out_to_subscribers = True
+                if _main_loop is not None:
+                    copy_engine.fanout_threadsafe(o.id, trader_user_id, _main_loop)
+                else:
+                    copy_engine.fanout(db, o, trader)
+                    o.fanned_out_to_subscribers = True
                 fanned += 1
             except Exception:  # noqa: BLE001
                 log.exception(

@@ -6,6 +6,11 @@
  *                "May 15, 2026"               for date-only fields.
  */
 
+// US trading app: render every timestamp in US Eastern. The IANA zone
+// "America/New_York" auto-handles EST (winter) vs EDT (summer). Centralised
+// here so the whole app is consistent.
+export const APP_TZ = "America/New_York";
+
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   month: "short",
   day: "numeric",
@@ -14,6 +19,8 @@ const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   minute: "2-digit",
   second: "2-digit",
   hour12: true,
+  timeZone: APP_TZ,
+  timeZoneName: "short",
 };
 
 const DATE_OPTS: Intl.DateTimeFormatOptions = {
@@ -36,7 +43,7 @@ export function fmtDateTime(input: string | number | Date | null | undefined): s
  *  in that zone with a short abbreviation appended (EDT/EST). */
 export function fmtDateTimeMs(
   input: string | number | Date | null | undefined,
-  timeZone?: string,
+  timeZone: string = APP_TZ,
 ): string {
   if (!input) return "—";
   const d = input instanceof Date ? input : new Date(input);
@@ -94,5 +101,5 @@ export function fmtDate(input: string | Date | null | undefined): string {
     d = new Date(input);
   }
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleDateString("en-US", DATE_OPTS);
+  return d.toLocaleDateString("en-US", { ...DATE_OPTS, timeZone: APP_TZ });
 }

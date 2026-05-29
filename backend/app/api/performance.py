@@ -88,6 +88,9 @@ def _serialize_child(child: Order, parent: Order, subscriber: User | None) -> di
         "eligibility_lag_ms": _ms_between(picked, sub_accepted),
         # broker_lag: our submit → broker accepted.
         "broker_lag_ms": _ms_between(sub_accepted, broker_accepted),
+        # broker_response: the raw broker place-order call round-trip
+        # (request → response), capturing success AND error responses.
+        "broker_response_ms": child.broker_call_ms,
         # publish_lag: broker accept → SSE broadcast.
         "publish_lag_ms": _ms_between(broker_accepted, redis_pub),
     }

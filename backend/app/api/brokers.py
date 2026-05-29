@@ -475,7 +475,11 @@ def snaptrade_finish(
         )
 
     user_secret = session["user_secret"]
-    label = payload.label or session.get("label") or "SnapTrade"
+    # Prefer the label captured at /start (authoritative — see schema:
+    # "label carries through from start"). The /finish payload can carry a
+    # stale "SnapTrade" default when the portal redirect lands in a new tab
+    # and loses the sessionStorage-stashed label, so it must NOT win.
+    label = session.get("label") or payload.label or "SnapTrade"
     paper = bool(session.get("paper", False))
 
     try:
