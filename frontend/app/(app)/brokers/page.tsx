@@ -19,12 +19,18 @@ const BROKER_META: Record<BrokerName, {
   accent: string;
 }> = {
   alpaca:    { name: "Alpaca",    tagline: "Direct API keys",                    latency: "Realtime", latencyTone: "good", accent: "#f5a623" },
-  webull:    { name: "Webull",    tagline: "Login + MFA",                        latency: "~2s",      latencyTone: "good", accent: "#3b82f6" },
+  // Direct Webull integration removed — Webull is connected via SnapTrade.
+  // Kept in the map so old broker_account rows with broker="webull" still
+  // render with a valid avatar/name in the connected-list, but the picker
+  // no longer surfaces it as a connect option.
+  webull:    { name: "Webull",    tagline: "(via SnapTrade)",                    latency: "5–60s",    latencyTone: "warn", accent: "#3b82f6" },
   snaptrade: { name: "SnapTrade", tagline: "20+ brokers · hosted",               latency: "5–60s",    latencyTone: "warn", accent: "#14b8a6" },
   ibkr:      { name: "IBKR",      tagline: "Interactive Brokers · direct OAuth", latency: "~2–5s",    latencyTone: "good", accent: "#d04a02" },
 };
 
-const BROKER_ORDER: BrokerName[] = ["alpaca", "webull", "snaptrade", "ibkr"];
+// Picker order — "webull" excluded; subscribers should click SnapTrade and
+// pick Webull from inside the SnapTrade portal.
+const BROKER_ORDER: BrokerName[] = ["alpaca", "snaptrade", "ibkr"];
 
 /** Rounded-square avatar with the broker's initial in its brand hue. */
 function BrokerAvatar({ broker, size = 40 }: { broker: BrokerName; size?: number }) {
@@ -233,11 +239,6 @@ function fmtRelative(iso: string | null): string {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
-/** Connecting Webull is a two-step flow (request MFA → submit code).
- *  Tracking that as a phase keeps the form components small and avoids
- *  conditional `disabled` mess inside one giant <form>. */
-type WebullPhase = "idle" | "mfa-sent";
-
 export default function BrokersPage() {
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
 
@@ -251,14 +252,7 @@ export default function BrokersPage() {
   const [apiSecret, setApiSecret] = useState("");
   const [paper, setPaper] = useState(false);   // default Live
 
-  // Webull form state. We keep username/password in state across the
-  // two API hops so the user only types them once.
-  const [wbUsername, setWbUsername] = useState("");
-  const [wbPassword, setWbPassword] = useState("");
-  const [wbMfa, setWbMfa] = useState("");
-  const [wbTradePin, setWbTradePin] = useState("");
-  const [wbPaper, setWbPaper] = useState(false);   // default Live
-  const [wbPhase, setWbPhase] = useState<WebullPhase>("idle");
+  // Direct Webull state removed — connect Webull via SnapTrade below.
 
   // SnapTrade form state — much smaller because the actual auth happens
   // on SnapTrade's hosted portal. We collect a label, optionally a
@@ -346,8 +340,6 @@ export default function BrokersPage() {
 
   function resetConnectForms() {
     setLabel(""); setApiKey(""); setApiSecret(""); setPaper(false);
-    setWbUsername(""); setWbPassword(""); setWbMfa(""); setWbTradePin("");
-    setWbPhase("idle"); setWbPaper(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
     setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
@@ -405,50 +397,7 @@ export default function BrokersPage() {
     }
   }
 
-  async function startWebullMfa(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await api("/api/brokers/webull/start-mfa", {
-        method: "POST",
-        body: JSON.stringify({ username: wbUsername, paper: wbPaper }),
-      });
-      setWbPhase("mfa-sent");
-      notify.success("MFA code sent — check your phone or email");
-    } catch (e) {
-      notify.fromError(e, "Webull MFA request failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function finishWebullConnect(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await api("/api/brokers", {
-        method: "POST",
-        body: JSON.stringify({
-          broker: "webull",
-          label: label.trim(),
-          webull: {
-            username: wbUsername,
-            password: wbPassword,
-            mfa_code: wbMfa,
-            trade_pin: wbTradePin,
-            paper: wbPaper,
-          },
-        }),
-      });
-      resetConnectForms();
-      notify.success("Webull connected — balance fetched");
-      await load();
-    } catch (e) {
-      notify.fromError(e, "Webull connect failed");
-    } finally {
-      setBusy(false);
-    }
-  }
+  // Direct Webull connect handlers removed — see SnapTrade flow below.
 
   async function startSnaptrade(e: FormEvent) {
     e.preventDefault();
@@ -704,97 +653,9 @@ export default function BrokersPage() {
           </>
         )}
 
-        {chosenBroker === "webull" && (
-          <>
-            <div className="flex items-center gap-2.5">
-              <BrokerAvatar broker="webull" size={32} />
-              <h2 className="font-semibold">Connect a Webull account</h2>
-            </div>
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              Webull uses login credentials + MFA (no API keys). Real-time
-              order updates are <em>polled</em> every ~2s — comparable latency
-              to Alpaca&apos;s socket in practice. You&apos;ll also need your
-              6-digit Webull trade PIN.
-            </p>
-            {wbPhase === "idle" && (
-              <form onSubmit={startWebullMfa} className="space-y-3">
-                <div>
-                  <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
-                  <input type="text" className="w-full p-2.5" placeholder="Webull Paper" value={label} onChange={e => setLabel(e.target.value)} required />
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email or phone</label>
-                    <input type="text" className="w-full p-2.5" placeholder="you@example.com" value={wbUsername} onChange={e => setWbUsername(e.target.value)} required />
-                  </div>
-                  <div>
-                    <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>
-                    <input type="password" className="w-full p-2.5" value={wbPassword} onChange={e => setWbPassword(e.target.value)} required />
-                  </div>
-                </div>
-                <PaperLiveRadio
-                  value={wbPaper}
-                  onChange={setWbPaper}
-                  name="webull-mode"
-                  note="Live places real-money orders. Webull paper and live use separate auth endpoints — switching after MFA is sent invalidates the code."
-                />
-                <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
-                  <span>Send MFA code</span>
-                  {busy && <Spinner />}
-                </button>
-              </form>
-            )}
-            {wbPhase === "mfa-sent" && (
-              <form onSubmit={finishWebullConnect} className="space-y-3">
-                <p className="text-xs" style={{ color: "var(--good)" }}>
-                  ✓ MFA code sent to <span className="font-mono">{wbUsername}</span>. Enter it below along with your trade PIN.
-                </p>
-                {/* Confirm-the-mode banner in step 2. Users were missing the
-                    paper checkbox in step 1 and only realising they'd
-                    connected paper after orders weren't going to their
-                    real account. Showing it here gives them a last chance
-                    to bail. */}
-                <div
-                  className="text-xs px-3 py-2 rounded-md"
-                  style={{
-                    border: `1px solid ${wbPaper ? "var(--accent)" : "var(--bad)"}55`,
-                    background: `${wbPaper ? "var(--accent)" : "var(--bad)"}15`,
-                    color: wbPaper ? "var(--accent)" : "var(--bad)",
-                  }}
-                >
-                  Connecting <strong>{wbPaper ? "Paper" : "Live"}</strong> Webull account.
-                  {" "}
-                  {!wbPaper && <>This will place <strong>real-money orders</strong>.</>}
-                  {" "}
-                  Wrong mode? Click <strong>Back</strong> and request a fresh MFA code.
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>MFA code</label>
-                    <input type="text" inputMode="numeric" className="w-full p-2.5 font-mono" placeholder="6-digit code" value={wbMfa} onChange={e => setWbMfa(e.target.value)} required />
-                  </div>
-                  <div>
-                    <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Trade PIN</label>
-                    <input type="password" inputMode="numeric" className="w-full p-2.5 font-mono" placeholder="6-digit trade PIN" value={wbTradePin} onChange={e => setWbTradePin(e.target.value)} required />
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
-                    <span>Connect Webull</span>
-                    {busy && <Spinner />}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setWbPhase("idle"); setWbMfa(""); setWbTradePin(""); }}
-                    className="btn-ghost px-3 py-2 text-sm"
-                  >
-                    Back
-                  </button>
-                </div>
-              </form>
-            )}
-          </>
-        )}
+        {/* Direct Webull connect form removed — users now connect Webull
+            through SnapTrade. The broker picker no longer offers Webull
+            as a standalone option (see BROKER_ORDER). */}
 
         {chosenBroker === "snaptrade" && (
           <>

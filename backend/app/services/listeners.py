@@ -1,12 +1,16 @@
 """Broker-agnostic listener dispatcher.
 
 Callers (FastAPI lifespan, /api/brokers connect/disconnect, etc.) talk to
-this module instead of importing ``trade_listener`` or ``webull_listener``
-directly. Routing is by ``BrokerName``.
+this module instead of importing ``trade_listener`` / ``ibkr_listener`` /
+``snaptrade_listener`` directly. Routing is by ``BrokerName``.
+
+Direct Webull integration has been removed — users connect Webull through
+SnapTrade (which lands as ``BrokerName.SNAPTRADE`` rows handled by
+``snaptrade_listener``).
 
 Status reads are unified: ``listener_state.get_status`` returns the live
-state regardless of which broker actually drives it. Both backends use
-the same shared status dict.
+state regardless of which broker actually drives it. All backends share
+the same status dict.
 """
 from __future__ import annotations
 
@@ -21,7 +25,6 @@ from app.services import (
     listener_state,
     snaptrade_listener,
     trade_listener,
-    webull_listener,
 )
 
 log = logging.getLogger(__name__)
@@ -30,7 +33,6 @@ log = logging.getLogger(__name__)
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     """Forward to every backend. Cheap — just stores a reference."""
     trade_listener.bind_loop(loop)
-    webull_listener.bind_loop(loop)
     snaptrade_listener.bind_loop(loop)
     ibkr_listener.bind_loop(loop)
 
@@ -38,7 +40,6 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
 async def start_all_listeners() -> None:
     """Spawn listeners for every connected broker account on app startup."""
     await trade_listener.start_all_listeners()
-    await webull_listener.start_all_listeners()
     await snaptrade_listener.start_all_listeners()
     await ibkr_listener.start_all_listeners()
 
@@ -46,7 +47,6 @@ async def start_all_listeners() -> None:
 async def stop_all_listeners() -> None:
     """Symmetric shutdown — every backend drains its tasks."""
     await trade_listener.stop_all_listeners()
-    await webull_listener.stop_all_listeners()
     await snaptrade_listener.stop_all_listeners()
     await ibkr_listener.stop_all_listeners()
 
@@ -63,13 +63,13 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         return
     if acct.broker == BrokerName.ALPACA:
         trade_listener.start_listener(trader_user_id, broker_account_id)
-    elif acct.broker == BrokerName.WEBULL:
-        webull_listener.start_listener(trader_user_id, broker_account_id)
     elif acct.broker == BrokerName.SNAPTRADE:
         snaptrade_listener.start_listener(trader_user_id, broker_account_id)
     elif acct.broker == BrokerName.IBKR:
         ibkr_listener.start_listener(trader_user_id, broker_account_id)
     else:
+        # Includes BrokerName.WEBULL (dormant — historical rows only) and
+        # BrokerName.FAKE (no live listener needed).
         log.info(
             "listeners.start_listener: no listener for broker %s",
             acct.broker.value,
@@ -79,14 +79,13 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
 def stop_listener(trader_user_id: uuid.UUID) -> None:
     """Stop whichever backend is currently servicing this trader. One-
     broker-per-user means at most one will have a task — but we call
-    every backend so transitions (Alpaca → Webull → SnapTrade or any
+    every backend so transitions (Alpaca → SnapTrade → IBKR or any
     other permutation) are always clean.
 
     All calls publish a final ``disconnected`` state via
     ``listener_state.set_state``; subsequent calls are no-ops for
     status purposes (already disconnected) but safely remove stragglers."""
     trade_listener.stop_listener(trader_user_id)
-    webull_listener.stop_listener(trader_user_id)
     snaptrade_listener.stop_listener(trader_user_id)
     ibkr_listener.stop_listener(trader_user_id)
     # Drop the entry entirely so the SSE pill doesn't keep showing a

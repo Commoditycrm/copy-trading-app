@@ -57,7 +57,8 @@ from app.brokers.alpaca import AlpacaAdapter
 from app.brokers.ibkr import IBKRAdapter
 from app.brokers import snaptrade as snap
 from app.brokers.snaptrade import SnapTradeAdapter
-from app.brokers.webull import WebullAdapter, login_with_mfa, request_mfa
+# Direct Webull integration removed — users connect Webull via SnapTrade
+# instead, which lands as broker=snaptrade rows handled by snaptrade_listener.
 from app.config import get_settings
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -69,8 +70,6 @@ from app.schemas.broker import (
     FinishSnaptradeIn,
     StartSnaptradeIn,
     StartSnaptradeOut,
-    StartWebullMfaIn,
-    StartWebullMfaOut,
 )
 from app.services import audit, cache, listeners, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
@@ -81,48 +80,14 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/brokers", tags=["brokers"])
 
 
-def _webull_device_id(user_id: uuid.UUID) -> str:
-    """Stable device fingerprint per app user. Webull binds MFA codes
-    to the requesting device's ``_did`` — get_mfa and the follow-up
-    login MUST use the same value or Webull rejects the login with an
-    empty body (manifests as ``Expecting value: line 1 column 1`` from
-    the SDK's response.json() call). Deriving from user.id via uuid5
-    makes the value deterministic across both endpoints without
-    storing anything in Redis."""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"webull-did-{user_id}"))
-
-
 def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, Any]:
     """Build the credentials dict that gets Fernet-encrypted onto the
-    BrokerAccount. For Webull this runs the full login flow because we
-    can't store a username/password alone — we need the session tokens
-    returned by Webull's login endpoint."""
+    BrokerAccount."""
     match payload.broker:
         case BrokerName.ALPACA:
             if not payload.alpaca:
                 raise HTTPException(422, "alpaca credentials required")
             return payload.alpaca.model_dump()
-        case BrokerName.WEBULL:
-            if not payload.webull:
-                raise HTTPException(422, "webull credentials required")
-            w = payload.webull
-            device_id = _webull_device_id(user_id)
-            try:
-                return login_with_mfa(
-                    username=w.username,
-                    password=w.password,
-                    mfa_code=w.mfa_code,
-                    trade_pin=w.trade_pin,
-                    paper=w.paper,
-                    device_id=device_id,
-                )
-            except ValueError as exc:
-                # login_with_mfa raises ValueError with a user-safe message
-                # for bad password / wrong MFA / bad PIN.
-                raise HTTPException(400, str(exc)) from exc
-            except Exception as exc:  # noqa: BLE001
-                log.exception("webull login_with_mfa unexpected failure")
-                raise HTTPException(400, f"webull_error: {exc}") from exc
         case BrokerName.IBKR:
             if not payload.ibkr:
                 raise HTTPException(422, "ibkr credentials required")
@@ -145,7 +110,7 @@ def _refresh_balance_into(acct: BrokerAccount, creds: dict[str, Any]) -> None:
     """Best-effort. Errors are recorded into last_error, not raised."""
     try:
         adapter = adapter_for(acct, creds)
-        if isinstance(adapter, (AlpacaAdapter, WebullAdapter, SnapTradeAdapter)):
+        if isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter)):
             bal = adapter.get_balance_snapshot()
             acct.cash = bal["cash"]
             acct.buying_power = bal["buying_power"]
@@ -593,6 +558,10 @@ def snaptrade_finish(
         encrypted_credentials=encrypt_json(creds),
         connection_status="pending",
         broker_account_number=account_number or None,
+        # Denormalized so the trader-facing fanout table can show the
+        # underlying broker (Webull / Robinhood / IBKR / …) without
+        # paying a Fernet decrypt per child row on every page render.
+        brokerage_name=brokerage_name or None,
     )
     try:
         info = adapter_for(acct, creds).verify_connection()
@@ -650,29 +619,8 @@ def _attr_safe(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
-@router.post("/webull/start-mfa", response_model=StartWebullMfaOut)
-def webull_start_mfa(
-    payload: StartWebullMfaIn,
-    user: User = Depends(current_user),
-) -> StartWebullMfaOut:
-    """Trigger Webull to send the MFA code. Uses the same per-user
-    device_id that the follow-up ``POST /api/brokers`` call will use,
-    so Webull recognises the login as coming from the same device that
-    requested the code (without this, login fails with an empty-body
-    JSON error from the SDK)."""
-    device_id = _webull_device_id(user.id)
-    try:
-        request_mfa(payload.username, paper=payload.paper, device_id=device_id)
-    except ValueError as exc:
-        # request_mfa already converts SDK JSONDecodeError + obvious
-        # rate-limit cases into user-safe ValueError messages.
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"webull_mfa_error: {exc}") from exc
-    return StartWebullMfaOut(
-        sent=True,
-        message="MFA code sent. Enter it on the next step to finish connecting.",
-    )
+# Direct Webull MFA-start endpoint removed — users connect Webull via
+# SnapTrade now. See the SnapTrade portal flow below.
 
 
 @router.post("", response_model=BrokerAccountOut, status_code=status.HTTP_201_CREATED)

@@ -13,12 +13,17 @@ cryptography==43.0.3
 httpx==0.27.2
 redis==5.2.0
 alpaca-py==0.33.0
-# REMOVED 2026-05-31 (security): webull==0.6.1 — unofficial reverse-engineered
-# SDK, root cause of the May 2026 prod supply-chain compromise (outbound
-# port-scan / Kinsing signature). The package executed at import on every boot
-# via app/brokers/webull.py and re-infected every rebuild. Do NOT restore until
-# a vetted/official replacement exists; Webull is not in active use (Alpaca/
-# SnapTrade/IBKR). See AWS abuse cases P01KSPSAGCQ4CBEVA4GE8W4AHTS / 16220881880.
+# REMOVED 2026-05-31 (security + architecture): webull==0.6.1 — unofficial
+# reverse-engineered SDK, root cause of the May 2026 prod supply-chain
+# compromise (outbound port-scan / Kinsing signature). The package executed
+# at import on every boot via app/brokers/webull.py and re-infected every
+# rebuild. See AWS abuse cases P01KSPSAGCQ4CBEVA4GE8W4AHTS / 16220881880.
+#
+# Webull is also no longer in active use as a direct integration — subscribers
+# now connect Webull via SnapTrade (the SnapTrade SDK below handles that
+# path). Do NOT restore tedchou12/webull until BOTH conditions hold: a
+# vetted/official replacement exists AND the architectural decision in
+# snaptrade_decision.md is explicitly reversed.
 # SnapTrade aggregator — official SDK. Used by the SnapTrade adapter and
 # listener; requires SNAPTRADE_CLIENT_ID + SNAPTRADE_CONSUMER_KEY env vars
 # (see app/config.py). Endpoints return clean 503 when unset so dev

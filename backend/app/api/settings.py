@@ -13,6 +13,7 @@ from app.schemas.settings import (
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
     SubscriberToggleIn,
+    SymbolFilterIn,
     TraderSettingsOut,
     TraderToggleIn,
 )
@@ -38,6 +39,8 @@ def get_subscriber_settings(
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
+        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
+        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
     )
 
 
@@ -78,6 +81,8 @@ def set_daily_loss_limit(
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
+        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
+        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
     )
 
 
@@ -135,6 +140,83 @@ def set_retry_interval(
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
+        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
+        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
+    )
+
+
+def _normalize_symbols(syms: list[str]) -> list[str]:
+    """Uppercase, strip, drop empties + duplicates, preserve first-seen
+    order. Caps at 200 (defense in depth — Pydantic already enforces
+    this, but a malformed direct DB write shouldn't blow up callers)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in syms:
+        s = (raw or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= 200:
+            break
+    return out
+
+
+@router.patch("/subscriber/symbol-filter", response_model=SubscriberSettingsOut)
+def set_symbol_filter(
+    payload: SymbolFilterIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Replace one or both per-subscriber symbol filter lists. Either
+    field may be omitted — only the supplied list replaces the stored
+    one. Each list is uppercased + deduped server-side. Empty list means
+    "no filter applied" for that direction (the historic behaviour)."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+
+    changes: dict[str, list[str]] = {}
+    if payload.symbol_exclusion_list is not None:
+        new_excl = _normalize_symbols(payload.symbol_exclusion_list)
+        if list(s.symbol_exclusion_list or []) != new_excl:
+            changes["symbol_exclusion_list"] = new_excl
+            s.symbol_exclusion_list = new_excl
+    if payload.symbol_inclusion_list is not None:
+        new_incl = _normalize_symbols(payload.symbol_inclusion_list)
+        if list(s.symbol_inclusion_list or []) != new_incl:
+            changes["symbol_inclusion_list"] = new_incl
+            s.symbol_inclusion_list = new_incl
+
+    if changes:
+        audit.record(
+            db,
+            actor_user_id=user.id,
+            action="subscriber.symbol_filter_changed",
+            entity_type="subscriber_settings",
+            entity_id=user.id,
+            metadata=changes,
+            ip_address=client_ip(request),
+        )
+    db.commit()
+    db.refresh(s)
+    # Bust the per-trader subscriber cache so copy_engine reads the new
+    # filter on the very next fanout (otherwise it could keep using a
+    # stale snapshot for a few seconds).
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
+        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
+        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
     )
 
 

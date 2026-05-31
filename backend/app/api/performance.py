@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_trader
 from app.database import get_db
-from app.models.broker_account import BrokerAccount
+from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
 from app.models.user import User
 
@@ -60,11 +60,22 @@ def _serialize_child(
     account: BrokerAccount | None = None,
 ) -> dict[str, Any]:
     accepted_at = child.submitted_at
-    # Subscriber's connected broker for this mirror — prefer their custom
-    # label (e.g. "Webull via SnapTrade"), fall back to the broker enum value.
+    # Subscriber's connected broker for this mirror. Precedence:
+    #   1. SnapTrade-routed accounts → the *underlying* broker
+    #      (Webull / Robinhood / IBKR / …) captured at connect time and
+    #      denormalized onto BrokerAccount.brokerage_name. Without this
+    #      every SnapTrade subscriber would render as the generic
+    #      "snaptrade" which hides which actual broker handled each mirror.
+    #   2. Direct broker integrations → the broker enum value
+    #      (alpaca / webull / ibkr).
+    #   3. Fallback to the user-typed label (last resort — the label is
+    #      free-form text and doesn't reliably identify the broker).
     broker_name = None
     if account is not None:
-        broker_name = account.label or (account.broker.value if account.broker else None)
+        if account.broker == BrokerName.SNAPTRADE and account.brokerage_name:
+            broker_name = account.brokerage_name
+        else:
+            broker_name = (account.broker.value if account.broker else None) or account.label
     # New lifecycle stamps — see Order model / alembic e7a1d2c40f01.
     picked = child.subscriber_picked_at
     sub_accepted = child.subscriber_accepted_at

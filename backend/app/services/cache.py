@@ -39,6 +39,11 @@ class CachedSubscriber:
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    # Per-subscriber symbol filters. Empty list = no filter. Stored as
+    # tuple here (frozen dataclass needs hashable fields) but serialized
+    # back/forth as JSON lists.
+    symbol_exclusion_list: tuple[str, ...] = ()
+    symbol_inclusion_list: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,11 @@ def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
         "copy_enabled": bool(s.copy_enabled),
         "multiplier": str(s.multiplier),
         "daily_loss_limit": str(s.daily_loss_limit) if s.daily_loss_limit is not None else None,
+        # JSONB columns come off the ORM as plain lists; CachedSubscriber
+        # stores them as tuples for hashability. Either way, serialize as
+        # JSON lists.
+        "symbol_exclusion_list": list(s.symbol_exclusion_list or []),
+        "symbol_inclusion_list": list(s.symbol_inclusion_list or []),
     }
 
 
@@ -82,6 +92,10 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         copy_enabled=d["copy_enabled"],
         multiplier=Decimal(d["multiplier"]),
         daily_loss_limit=Decimal(d["daily_loss_limit"]) if d["daily_loss_limit"] is not None else None,
+        # Tolerate older cached entries that pre-date the symbol-filter
+        # fields by defaulting to empty tuples (= no filter).
+        symbol_exclusion_list=tuple(d.get("symbol_exclusion_list") or ()),
+        symbol_inclusion_list=tuple(d.get("symbol_inclusion_list") or ()),
     )
 
 
@@ -146,6 +160,8 @@ async def get_subscribers_for_trader(
             copy_enabled=row.copy_enabled,
             multiplier=row.multiplier,
             daily_loss_limit=row.daily_loss_limit,
+            symbol_exclusion_list=tuple(row.symbol_exclusion_list or ()),
+            symbol_inclusion_list=tuple(row.symbol_inclusion_list or ()),
         )
         for row in rows
     ]

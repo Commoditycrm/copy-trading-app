@@ -72,6 +72,14 @@ class BrokerAccount(Base, TimestampMixin):
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Underlying broker when this account is routed through an aggregator.
+    # For ``broker=snaptrade``, this is the real broker the subscriber
+    # connected (e.g. "Webull", "Robinhood", "IBKR") — needed by the trader's
+    # fanout view so they can see which actual broker each mirror went to,
+    # not the generic "snaptrade" label. For direct-API brokers (alpaca /
+    # webull / ibkr) this stays NULL — `broker` itself is already accurate.
+    brokerage_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
     # ── Listener gating ───────────────────────────────────────────────
     # Per-account knobs surfaced in the Brokers UI ("Auto Pull Orders"
     # + "Bring open orders" + "Bring Filled orders"). Govern what the

@@ -239,6 +239,48 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 continue
 
+        # Per-subscriber symbol filter (exclusion / inclusion lists).
+        # Checked BEFORE broker-account lookup so a fully-filtered trade
+        # short-circuits cheaply. Symbol comparison is uppercase on both
+        # sides — _normalize_symbols enforces uppercase storage, but
+        # trader_order.symbol can come from broker callbacks where casing
+        # is unpredictable.
+        trade_symbol = (trader_order.symbol or "").upper()
+        excl = sub.symbol_exclusion_list or ()
+        incl = sub.symbol_inclusion_list or ()
+        if excl and trade_symbol in {s.upper() for s in excl}:
+            audit.record(
+                db,
+                actor_user_id=sub.user_id,
+                action="copy.skipped_excluded_symbol",
+                entity_type="order",
+                entity_id=trader_order.id,
+                metadata={"symbol": trade_symbol, "rule": "exclusion_list"},
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=sub.user_id,
+                broker_account_id=uuid.UUID(int=0),
+                order_id=None,
+                status="skipped_excluded_symbol",
+            ))
+            continue
+        if incl and trade_symbol not in {s.upper() for s in incl}:
+            audit.record(
+                db,
+                actor_user_id=sub.user_id,
+                action="copy.skipped_not_in_inclusion_list",
+                entity_type="order",
+                entity_id=trader_order.id,
+                metadata={"symbol": trade_symbol, "rule": "inclusion_list"},
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=sub.user_id,
+                broker_account_id=uuid.UUID(int=0),
+                order_id=None,
+                status="skipped_not_in_inclusion_list",
+            ))
+            continue
+
         sub_accounts = await cache.get_broker_accounts(db, sub.user_id)
         if not sub_accounts:
             results.append(FanoutResult(

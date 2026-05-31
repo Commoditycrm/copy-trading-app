@@ -20,6 +20,11 @@ class SubscriberSettingsOut(BaseModel):
     # ORM row) doesn't end up with "RetryInterval.NEVER".
     retry_interval_open: str = "never"
     retry_interval_close: str = "never"
+    # Per-subscriber symbol filters. Both default to empty lists, which
+    # means "no filter applied" (mirror every trade). See SubscriberSettings
+    # model for the precedence rules.
+    symbol_exclusion_list: list[str] = []
+    symbol_inclusion_list: list[str] = []
 
     @field_validator("retry_interval_open", "retry_interval_close", mode="before")
     @classmethod
@@ -62,6 +67,16 @@ class RetryIntervalIn(BaseModel):
 
     retry_interval_open: str | None = None
     retry_interval_close: str | None = None
+
+
+class SymbolFilterIn(BaseModel):
+    """Subscriber-set symbol filters. Either field may be omitted — only
+    the supplied list replaces the stored one. Each list is capped at 200
+    symbols so a runaway paste doesn't bloat the row. Symbols are
+    uppercased + deduped server-side before persisting."""
+
+    symbol_exclusion_list: list[str] | None = Field(default=None, max_length=200)
+    symbol_inclusion_list: list[str] | None = Field(default=None, max_length=200)
 
 
 class FollowTraderIn(BaseModel):
