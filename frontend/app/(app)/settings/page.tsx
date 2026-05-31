@@ -24,6 +24,9 @@ export default function SettingsPage() {
   const [multBusy, setMultBusy] = useState(false);
   const [limitInput, setLimitInput] = useState("");
   const [limitBusy, setLimitBusy] = useState(false);
+  // Daily-PROFIT-limit input mirrors the loss-limit one — symmetric.
+  const [profitInput, setProfitInput] = useState("");
+  const [profitBusy, setProfitBusy] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -34,6 +37,7 @@ export default function SettingsPage() {
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
         setLimitInput(s.daily_loss_limit ?? "");
+        setProfitInput(s.daily_profit_limit ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -96,6 +100,23 @@ export default function SettingsPage() {
       setLimitBusy(false);
     }
   }
+  async function saveProfit() {
+    setProfitBusy(true);
+    try {
+      const trimmed = profitInput.trim();
+      const body = { daily_profit_limit: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setProfitInput(s.daily_profit_limit ?? "");
+      notify.success(s.daily_profit_limit ? `Daily profit limit set to $${s.daily_profit_limit}` : "Daily profit limit cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not update daily profit limit");
+    } finally {
+      setProfitBusy(false);
+    }
+  }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
     try {
       const body = direction === "open"
@@ -155,6 +176,12 @@ export default function SettingsPage() {
   const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
   const headroom = limit !== null ? limit + todaysPnL : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
+  // Profit-limit parallels loss: how far is today's gain from the cap?
+  const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
+  const profitHeadroom = profitLimit !== null ? profitLimit - Math.max(0, todaysPnL) : null;
+  const profitPct = profitLimit !== null && profitLimit > 0
+    ? Math.min(100, Math.max(0, (Math.max(0, todaysPnL) / profitLimit) * 100))
+    : 0;
 
   return (
     <div className="space-y-4 max-w-3xl">
@@ -162,90 +189,162 @@ export default function SettingsPage() {
 
       {user.role === "subscriber" && sub && (
         <>
-          {/* ── Following trader (inline) ─────────────────────────── */}
-          <Card title="Following trader">
-            <select
-              value={sub.following_trader_id ?? ""}
-              onChange={e => follow(e.target.value || null)}
-              className="w-full px-2 py-1.5 text-sm rounded bg-transparent border"
-              style={{borderColor: "var(--border)"}}
-            >
-              <option value="">— not following anyone —</option>
-              {traders.map(t => (
-                <option key={t.id} value={t.id}>{t.display_name ?? t.email}</option>
-              ))}
-            </select>
+          {/* ── Trader + Multiplier (single row, single card) ──────────
+              Following selector grows to take the remaining width; the
+              multiplier control sticks to a fixed slot on the right so
+              the two never wrap awkwardly on common screen widths. On
+              mobile they stack via flex-col. */}
+          <Card title="Following Trader & Multiplier">
+            <div className="flex flex-col md:flex-row md:items-center gap-3">
+              {/* Trader selector — 50% of the row on md+ */}
+              <div className="flex-1 min-w-0 md:basis-1/2">
+                <label className="block text-[10px] uppercase tracking-wider mb-1" style={{color: "var(--muted)"}}>
+                  Following
+                </label>
+                <select
+                  value={sub.following_trader_id ?? ""}
+                  onChange={e => follow(e.target.value || null)}
+                  className="w-full px-2 py-1.5 text-sm rounded bg-transparent border"
+                  style={{borderColor: "var(--border)"}}
+                >
+                  <option value="">— not following anyone —</option>
+                  {traders.map(t => (
+                    <option key={t.id} value={t.id}>{t.display_name ?? t.email}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Multiplier — also 50% of the row on md+ */}
+              <div className="flex-1 min-w-0 md:basis-1/2">
+                <label className="block text-[10px] uppercase tracking-wider mb-1" style={{color: "var(--muted)"}}>
+                  Multiplier <span className="opacity-60">· 0.1–10</span>
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" step="0.1" min="0.1" max="10"
+                    className="w-20 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
+                    style={{borderColor: "var(--border)"}}
+                    value={multInput}
+                    onChange={(e) => setMultInput(e.target.value)}
+                  />
+                  <span className="text-xs whitespace-nowrap" style={{color: "var(--muted)"}}>
+                    ×{fmtMultiplier(sub.multiplier)}
+                  </span>
+                  <button
+                    onClick={saveMultiplier}
+                    disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
+                    className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+                    style={{background: "var(--accent)", color: "#06121f"}}
+                  >
+                    {multBusy && <Spinner />}
+                    Save
+                  </button>
+                </div>
+              </div>
+            </div>
           </Card>
 
-          {/* ── Multiplier + Daily Loss Limit (2-up) ────────────────── */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Card title="Trade multiplier" hint="trader_qty × this. 0.1–10.">
-              <div className="flex items-center gap-2">
-                <input
-                  type="number" step="0.1" min="0.1" max="10"
-                  className="w-24 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
-                  style={{borderColor: "var(--border)"}}
-                  value={multInput}
-                  onChange={(e) => setMultInput(e.target.value)}
-                />
-                <span className="text-xs" style={{color: "var(--muted)"}}>
-                  current ×{fmtMultiplier(sub.multiplier)}
-                </span>
-                <button
-                  onClick={saveMultiplier}
-                  disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
-                  className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-                  style={{background: "var(--accent)", color: "#06121f"}}
-                >
-                  {multBusy && <Spinner />}
-                  Save
-                </button>
-              </div>
-            </Card>
+          {/* ── P&L Limit (loss + profit, both auto-resume next day) ──── */}
+          <Card
+            title="P&L Limit"
+            hint="Copy turns OFF for the day when either limit is hit, then auto-resumes the next UTC day."
+          >
+            <div className="flex flex-col md:flex-row gap-3">
+              <PnLLimitPanel
+                kind="loss"
+                input={limitInput}
+                onInput={setLimitInput}
+                onSave={saveLimit}
+                busy={limitBusy}
+                current={sub.daily_loss_limit}
+                todaysPnL={todaysPnL}
+                limit={limit}
+                pct={limitPct}
+                headroom={headroom}
+                fmt={fmt}
+              />
+              <PnLLimitPanel
+                kind="profit"
+                input={profitInput}
+                onInput={setProfitInput}
+                onSave={saveProfit}
+                busy={profitBusy}
+                current={sub.daily_profit_limit}
+                todaysPnL={todaysPnL}
+                limit={profitLimit}
+                pct={profitPct}
+                headroom={profitHeadroom}
+                fmt={fmt}
+              />
+            </div>
+          </Card>
 
-            <Card title="Daily loss limit" hint="copy turns OFF when hit. blank = disabled.">
-              <div className="flex items-center gap-2">
-                <span className="text-sm" style={{color: "var(--muted)"}}>$</span>
-                <input
-                  type="number" step="0.01" min="0" placeholder="no limit"
-                  className="w-28 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
-                  style={{borderColor: "var(--border)"}}
-                  value={limitInput}
-                  onChange={(e) => setLimitInput(e.target.value)}
-                />
-                <button
-                  onClick={saveLimit}
-                  disabled={limitBusy || limitInput === (sub.daily_loss_limit ?? "")}
-                  className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-                  style={{background: "var(--accent)", color: "#06121f"}}
-                >
-                  {limitBusy && <Spinner />}
-                  Save
-                </button>
-              </div>
-
-              {/* compact metric row: pnl / limit / headroom */}
-              <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
-                <Stat label="Today P&L" value={fmt(sub.todays_realized_pnl)}
-                      color={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"} />
-                <Stat label="Limit" value={fmt(sub.daily_loss_limit)} />
-                <Stat label="Headroom" value={limit === null ? "—" : fmt(String(headroom))}
-                      color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"} />
-              </div>
-              {limit !== null && (
-                <div className="h-1 mt-2 rounded overflow-hidden" style={{background: "var(--border)"}}>
-                  <div style={{
-                    width: `${limitPct}%`, height: "100%",
-                    background: limitPct >= 100 ? "var(--bad)" : limitPct >= 75 ? "#f59e0b" : "var(--good)",
-                    transition: "width 0.3s ease",
-                  }} />
+          {/* ── Trade Settings (exclusion + inclusion together) ─────────
+              Both lists live in the same card because they're two sides
+              of the same filter. The flex row collapses to a stack on
+              narrow screens. Counters in each sub-header are at-a-glance
+              "how many symbols am I filtering?" feedback. */}
+          <Card
+            title="Trade Settings"
+            hint="Control which trades get copied to you by symbol."
+          >
+            <div className="flex flex-col gap-3">
+              {/* Exclusion (denylist) — neutral styling, no red tint */}
+              <div
+                className="w-full rounded-md p-2.5 space-y-1.5"
+                style={{
+                  background: "rgba(255,255,255,0.02)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold">Exclusion list</span>
+                  <span className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
+                    {sub.symbol_exclusion_list.length} {sub.symbol_exclusion_list.length === 1 ? "symbol" : "symbols"}
+                  </span>
                 </div>
-              )}
-            </Card>
-          </div>
+                <p className="text-[11px]" style={{color: "var(--muted)"}}>
+                  trades on these symbols are <strong>NOT</strong> copied.
+                </p>
+                <ChipInput
+                  symbols={sub.symbol_exclusion_list}
+                  onChange={(next) => saveSymbolFilter("symbol_exclusion_list", next)}
+                  placeholder="e.g. TSLA — Enter or comma to add"
+                  accent="var(--text)"
+                />
+              </div>
 
-          {/* ── Retry policy (2-up, inline) ─────────────────────────── */}
-          <Card title="Retry mirror orders on broker errors" hint="for transient (network/5xx/rate-limit) failures only.">
+              {/* Inclusion (allowlist) — neutral styling, no green tint */}
+              <div
+                className="w-full rounded-md p-2.5 space-y-1.5"
+                style={{
+                  background: "rgba(255,255,255,0.02)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold">Inclusion list</span>
+                  <span className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
+                    {sub.symbol_inclusion_list.length === 0
+                      ? "all symbols"
+                      : `${sub.symbol_inclusion_list.length} ${sub.symbol_inclusion_list.length === 1 ? "symbol" : "symbols"} only`}
+                  </span>
+                </div>
+                <p className="text-[11px]" style={{color: "var(--muted)"}}>
+                  when non-empty, <strong>ONLY</strong> these symbols are copied.
+                </p>
+                <ChipInput
+                  symbols={sub.symbol_inclusion_list}
+                  onChange={(next) => saveSymbolFilter("symbol_inclusion_list", next)}
+                  placeholder="e.g. AAPL — Enter or comma to add"
+                  accent="var(--text)"
+                />
+              </div>
+            </div>
+          </Card>
+
+            {/* ── Retry policy (2-up, inline) ─────────────────────────── */}
+            <Card title="Retry mirror orders on broker errors" hint="for transient (network/5xx/rate-limit) failures only.">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <RetrySelect
                 label="Opening positions"
@@ -259,32 +358,6 @@ export default function SettingsPage() {
               />
             </div>
           </Card>
-
-          {/* ── Symbol filters (the new feature) ────────────────────── */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Card
-              title="Trade exclusion list"
-              hint="trades on these symbols are NOT copied to you."
-            >
-              <ChipInput
-                symbols={sub.symbol_exclusion_list}
-                onChange={(next) => saveSymbolFilter("symbol_exclusion_list", next)}
-                placeholder="e.g. TSLA — Enter or comma to add"
-                accent="var(--bad)"
-              />
-            </Card>
-            <Card
-              title="Trade inclusion list"
-              hint="when non-empty, ONLY these symbols are copied. Empty = copy everything."
-            >
-              <ChipInput
-                symbols={sub.symbol_inclusion_list}
-                onChange={(next) => saveSymbolFilter("symbol_inclusion_list", next)}
-                placeholder="e.g. AAPL — Enter or comma to add"
-                accent="var(--good)"
-              />
-            </Card>
-          </div>
         </>
       )}
 
@@ -333,6 +406,91 @@ function Stat({ label, value, color }: { label: string; value: string; color?: s
     <div>
       <div className="text-[9px] uppercase tracking-wider" style={{color: "var(--muted)"}}>{label}</div>
       <div className="font-medium mt-0.5 tabular-nums" style={{color: color ?? "var(--text)"}}>{value}</div>
+    </div>
+  );
+}
+
+/** One side of the P&L Limit card — handles both the loss and profit
+ *  panels with the same shape. The two only differ by:
+ *    - kind (decides label, accent color, headroom verb)
+ *    - which save / current / pct / headroom values get plugged in.
+ *  Visual: tinted background + border (red for loss, green for profit),
+ *  $ + input + Save inline, then a 3-up stat row + a progress bar that
+ *  fills up as today's P&L approaches the limit. */
+function PnLLimitPanel({
+  kind, input, onInput, onSave, busy, current, todaysPnL, limit, pct, headroom, fmt,
+}: {
+  kind: "loss" | "profit";
+  input: string;
+  onInput: (v: string) => void;
+  onSave: () => void;
+  busy: boolean;
+  current: string | null;
+  todaysPnL: number;
+  limit: number | null;
+  pct: number;
+  headroom: number | null;
+  fmt: (v: string | null | undefined) => string;
+}) {
+  const isLoss = kind === "loss";
+  const accent = isLoss ? "var(--bad)" : "var(--good)";
+  const tint = isLoss ? "rgba(239,68,68,0.04)" : "rgba(34,197,94,0.04)";
+  const tintBorder = isLoss ? "rgba(239,68,68,0.18)" : "rgba(34,197,94,0.18)";
+  const title = isLoss ? "Daily loss limit" : "Daily profit limit";
+  // Progress bar fills toward the limit. Both go red when ≥100% (limit hit)
+  // because hitting a profit cap is just as much "stop now" as hitting a loss.
+  const barColor = pct >= 100 ? "var(--bad)" : pct >= 75 ? "#f59e0b" : accent;
+  return (
+    <div
+      className="flex-1 min-w-0 rounded-md p-2.5 space-y-2"
+      style={{ background: tint, border: `1px solid ${tintBorder}` }}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          style={{
+            width: 6, height: 6, borderRadius: "50%",
+            background: accent, display: "inline-block",
+          }}
+        />
+        <span className="text-xs font-semibold" style={{color: accent}}>{title}</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-sm" style={{color: "var(--muted)"}}>$</span>
+        <input
+          type="number" step="0.01" min="0" placeholder="no limit"
+          className="w-28 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
+          style={{borderColor: "var(--border)"}}
+          value={input}
+          onChange={(e) => onInput(e.target.value)}
+        />
+        <button
+          onClick={onSave}
+          disabled={busy || input === (current ?? "")}
+          className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+          style={{background: "var(--accent)", color: "#06121f"}}
+        >
+          {busy && <Spinner />}
+          Save
+        </button>
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-xs">
+        <Stat label="Today P&L" value={fmt(String(todaysPnL))}
+              color={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"} />
+        <Stat label="Limit" value={fmt(current)} />
+        <Stat
+          label="Headroom"
+          value={limit === null ? "—" : fmt(String(headroom))}
+          color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+        />
+      </div>
+      {limit !== null && (
+        <div className="h-1 rounded overflow-hidden" style={{background: "var(--border)"}}>
+          <div style={{
+            width: `${pct}%`, height: "100%", background: barColor,
+            transition: "width 0.3s ease",
+          }} />
+        </div>
+      )}
     </div>
   );
 }
@@ -398,14 +556,20 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
       }}
     >
       {symbols.map(sym => (
+        // Flat neutral chip per user-provided mock — dark grey bg, light
+        // text, light × to remove. List identity (excl vs incl) lives on
+        // the container background tint, not on the chips themselves,
+        // which keeps the chip row visually calm even with many entries.
+        // `accent` prop still threaded in case we want to bring back a
+        // subtle hover/border accent later.
         <span
           key={sym}
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] rounded"
+          className="inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded-md"
           style={{
-            background: "rgba(255,255,255,0.06)",
-            border: `1px solid ${accent}`,
-            color: accent,
-            fontWeight: 600,
+            background: "rgba(255,255,255,0.08)",
+            color: "var(--text)",
+            fontWeight: 500,
+            lineHeight: "1.5",
           }}
         >
           {sym}
@@ -413,8 +577,8 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
             type="button"
             onClick={(e) => { e.stopPropagation(); remove(sym); }}
             aria-label={`Remove ${sym}`}
-            className="opacity-70 hover:opacity-100"
-            style={{color: accent}}
+            className="opacity-50 hover:opacity-100 transition-opacity leading-none"
+            style={{color: "var(--text)", fontSize: "14px"}}
           >
             ×
           </button>

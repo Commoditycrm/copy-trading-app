@@ -118,6 +118,9 @@ export interface SubscriberSettings {
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;
+  /** Daily realized-profit auto-pause. When today's realized P&L reaches
+   *  this amount, copy_enabled flips to false. Auto-resumes next UTC day. */
+  daily_profit_limit: string | null;
   todays_realized_pnl: string | null;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
