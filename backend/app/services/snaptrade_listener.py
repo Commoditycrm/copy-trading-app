@@ -349,9 +349,21 @@ def _persist_and_fanout(
         acct_gate = db.get(BrokerAccount, broker_account_id)
         if not broker_filters.should_persist_order(acct_gate, status_enum):
             return
+        # Scope the lookup to *this trader's own* order on *this* account
+        # (parent_order_id IS NULL excludes subscriber mirror orders, which
+        # carry their own broker_order_id from the subscriber's broker).
+        # broker_order_id has no unique constraint, so historical data can
+        # contain duplicates; use LIMIT 1 + .first() so a dup group can never
+        # raise MultipleResultsFound and crash the whole poll loop. The
+        # deterministic order_by makes the chosen row stable across polls.
         existing = db.execute(
-            select(Order).where(Order.broker_order_id == broker_order_id)
-        ).scalar_one_or_none()
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .where(Order.broker_account_id == broker_account_id)
+            .where(Order.parent_order_id.is_(None))
+            .order_by(Order.created_at)
+            .limit(1)
+        ).scalars().first()
 
         if existing is not None:
             if existing.status != status_enum:
