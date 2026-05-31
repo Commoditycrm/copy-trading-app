@@ -18,12 +18,13 @@ const BROKER_META: Record<BrokerName, {
   latencyTone: "good" | "warn";
   accent: string;
 }> = {
-  alpaca:    { name: "Alpaca",    tagline: "Direct API keys",      latency: "Realtime", latencyTone: "good", accent: "#f5a623" },
-  webull:    { name: "Webull",    tagline: "Login + MFA",          latency: "~2s",      latencyTone: "good", accent: "#3b82f6" },
-  snaptrade: { name: "SnapTrade", tagline: "20+ brokers · hosted", latency: "5–60s",    latencyTone: "warn", accent: "#14b8a6" },
+  alpaca:    { name: "Alpaca",    tagline: "Direct API keys",                    latency: "Realtime", latencyTone: "good", accent: "#f5a623" },
+  webull:    { name: "Webull",    tagline: "Login + MFA",                        latency: "~2s",      latencyTone: "good", accent: "#3b82f6" },
+  snaptrade: { name: "SnapTrade", tagline: "20+ brokers · hosted",               latency: "5–60s",    latencyTone: "warn", accent: "#14b8a6" },
+  ibkr:      { name: "IBKR",      tagline: "Interactive Brokers · direct OAuth", latency: "~2–5s",    latencyTone: "good", accent: "#d04a02" },
 };
 
-const BROKER_ORDER: BrokerName[] = ["alpaca", "webull", "snaptrade"];
+const BROKER_ORDER: BrokerName[] = ["alpaca", "webull", "snaptrade", "ibkr"];
 
 /** Rounded-square avatar with the broker's initial in its brand hue. */
 function BrokerAvatar({ broker, size = 40 }: { broker: BrokerName; size?: number }) {
@@ -86,6 +87,76 @@ function Stat({ label, value }: { label: string; value: string }) {
     <div>
       <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</div>
       <div className="text-sm font-semibold mt-1 num">{value}</div>
+    </div>
+  );
+}
+
+/** Listener-gating checkboxes for one connected broker. Controlled by the
+ *  parent (BrokersPage) — each toggle calls onChange with a partial patch
+ *  that the parent applies optimistically + PATCHes to
+ *  /api/brokers/{id}/settings. The three flags are independent:
+ *    - Auto Pull Orders   = master switch (listener on/off)
+ *    - Bring open orders  = include non-FILLED statuses
+ *    - Bring Filled orders = include FILLED status
+ *  When Auto Pull is off, the two child filters are visually dimmed
+ *  because they're effectively no-ops until the master is re-enabled. */
+type GatingPatch = Partial<{
+  auto_pull_orders: boolean;
+  bring_open_orders: boolean;
+  bring_filled_orders: boolean;
+}>;
+
+function AutoPullOrders({ acct, onChange, disabled }: {
+  acct: BrokerAccount;
+  onChange: (patch: GatingPatch) => void;
+  disabled?: boolean;
+}) {
+  const childDim = !acct.auto_pull_orders;
+  const checkboxStyle = { accentColor: "var(--accent)" } as const;
+  return (
+    <div className="mt-4 pt-4 hairline flex items-center flex-wrap gap-x-5 gap-y-2 text-sm">
+      <label className="flex items-center gap-2 font-medium cursor-pointer select-none">
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={checkboxStyle}
+          checked={acct.auto_pull_orders}
+          disabled={disabled}
+          onChange={(e) => onChange({ auto_pull_orders: e.target.checked })}
+        />
+        <span>Auto Pull Orders</span>
+      </label>
+      <span aria-hidden className="h-4 w-px" style={{ background: "var(--border)" }} />
+      <label
+        className="flex items-center gap-2 cursor-pointer select-none"
+        style={{ color: "var(--text-2)", opacity: childDim ? 0.5 : 1 }}
+        title={childDim ? "Enable Auto Pull Orders to use this filter." : undefined}
+      >
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={checkboxStyle}
+          checked={acct.bring_open_orders}
+          disabled={disabled}
+          onChange={(e) => onChange({ bring_open_orders: e.target.checked })}
+        />
+        <span>Bring open orders</span>
+      </label>
+      <label
+        className="flex items-center gap-2 cursor-pointer select-none"
+        style={{ color: "var(--text-2)", opacity: childDim ? 0.5 : 1 }}
+        title={childDim ? "Enable Auto Pull Orders to use this filter." : undefined}
+      >
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5 cursor-pointer"
+          style={checkboxStyle}
+          checked={acct.bring_filled_orders}
+          disabled={disabled}
+          onChange={(e) => onChange({ bring_filled_orders: e.target.checked })}
+        />
+        <span>Bring Filled orders</span>
+      </label>
     </div>
   );
 }
@@ -198,6 +269,18 @@ export default function BrokersPage() {
   const [stBrokerSlug, setStBrokerSlug] = useState("");
   const [stPaper, setStPaper] = useState(false);
 
+  // IBKR direct-OAuth form state. Each field maps 1:1 to the backend's
+  // IbkrCredentialsIn schema. Long fields (signing_key, access_token_secret)
+  // use textareas because IBKR keys can run to several hundred characters
+  // for RSA-style OAuth configurations.
+  const [ibkrLabel, setIbkrLabel] = useState("");
+  const [ibkrAccountId, setIbkrAccountId] = useState("");
+  const [ibkrConsumerKey, setIbkrConsumerKey] = useState("");
+  const [ibkrSigningKey, setIbkrSigningKey] = useState("");
+  const [ibkrAccessToken, setIbkrAccessToken] = useState("");
+  const [ibkrAccessTokenSecret, setIbkrAccessTokenSecret] = useState("");
+  const [ibkrPaper, setIbkrPaper] = useState(false);
+
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
 
@@ -266,6 +349,38 @@ export default function BrokersPage() {
     setWbUsername(""); setWbPassword(""); setWbMfa(""); setWbTradePin("");
     setWbPhase("idle"); setWbPaper(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
+    setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
+    setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
+    setIbkrPaper(false);
+  }
+
+  async function connectIbkr(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api("/api/brokers", {
+        method: "POST",
+        body: JSON.stringify({
+          broker: "ibkr",
+          label: ibkrLabel.trim(),
+          ibkr: {
+            consumer_key:        ibkrConsumerKey.trim(),
+            signing_key:         ibkrSigningKey.trim(),
+            access_token:        ibkrAccessToken.trim(),
+            access_token_secret: ibkrAccessTokenSecret.trim(),
+            account_id:          ibkrAccountId.trim(),
+            paper:               ibkrPaper,
+          },
+        }),
+      });
+      await load();
+      resetConnectForms();
+      notify.success("IBKR connected");
+    } catch (e) {
+      notify.fromError(e, "IBKR connect failed");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function connectAlpaca(e: FormEvent) {
@@ -377,6 +492,26 @@ export default function BrokersPage() {
     }
   }
 
+  /** Optimistic update + PATCH for the listener-gating checkboxes. We flip
+   *  the local state first so the checkbox feels instant, then PATCH;
+   *  on failure we revert and toast so the UI doesn't lie. */
+  async function patchSettings(id: string, patch: GatingPatch) {
+    const prev = accounts.find(a => a.id === id);
+    if (!prev) return;
+    setAccounts(cur => cur.map(a => (a.id === id ? { ...a, ...patch } : a)));
+    try {
+      const updated = await api<BrokerAccount>(`/api/brokers/${id}/settings`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      });
+      setAccounts(cur => cur.map(a => (a.id === id ? updated : a)));
+    } catch (e) {
+      // Revert to the pre-toggle snapshot.
+      setAccounts(cur => cur.map(a => (a.id === id ? prev : a)));
+      notify.fromError(e, "Could not update broker settings");
+    }
+  }
+
   // Open the confirm modal (actual DELETE happens in confirmDisconnect).
   function remove(id: string) {
     setDisconnectId(id);
@@ -400,7 +535,7 @@ export default function BrokersPage() {
   const hasConnected = accounts.length > 0;
 
   return (
-    <div className="space-y-6 max-w-3xl">
+    <div className="space-y-6 max-w-[845px]">
       <div>
         <h1 className="text-2xl font-semibold">Broker connections</h1>
         <p className="text-sm mt-1.5" style={{ color: "var(--muted)" }}>
@@ -473,6 +608,8 @@ export default function BrokersPage() {
                 <span>Refresh</span>
               </button>
             </div>
+
+            <AutoPullOrders acct={a} onChange={(patch) => patchSettings(a.id, patch)} />
           </div>
         );
       })}
@@ -492,7 +629,7 @@ export default function BrokersPage() {
           <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: "var(--muted)" }}>
             Choose a broker to connect
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
             {BROKER_ORDER.map(b => {
               const meta = BROKER_META[b];
               const active = chosenBroker === b;
@@ -716,6 +853,102 @@ export default function BrokersPage() {
                 You&apos;ll be redirected to SnapTrade&apos;s portal to sign in to
                 your broker. After you finish there, you&apos;ll be sent back
                 here automatically.
+              </p>
+            </form>
+          </>
+        )}
+
+        {chosenBroker === "ibkr" && (
+          <>
+            <div className="flex items-center gap-2.5">
+              <BrokerAvatar broker="ibkr" size={32} />
+              <h2 className="font-semibold">Connect Interactive Brokers</h2>
+            </div>
+            <p className="text-xs" style={{ color: "var(--muted)" }}>
+              Direct IBKR integration via their OAuth 1.0a Web API — no
+              aggregator, no local gateway. Generate the four OAuth values
+              in your IBKR Client Portal under{" "}
+              <strong>Settings → API → OAuth</strong> (self-service
+              consumer registration) and paste them here together with
+              your IBKR account number. Mirror latency is typically 2–5s.
+            </p>
+            <form onSubmit={connectIbkr} className="space-y-3">
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
+                <input
+                  type="text"
+                  className="w-full p-2.5"
+                  placeholder="My IBKR account"
+                  value={ibkrLabel}
+                  onChange={e => setIbkrLabel(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Account ID</label>
+                <input
+                  type="text"
+                  className="w-full p-2.5 font-mono text-sm"
+                  placeholder="U1234567"
+                  value={ibkrAccountId}
+                  onChange={e => setIbkrAccountId(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Consumer key</label>
+                <input
+                  type="text"
+                  className="w-full p-2.5 font-mono text-sm"
+                  value={ibkrConsumerKey}
+                  onChange={e => setIbkrConsumerKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Signing key</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={3}
+                  placeholder="Paste your consumer signing key (long base64 / PEM)"
+                  value={ibkrSigningKey}
+                  onChange={e => setIbkrSigningKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Access token</label>
+                <input
+                  type="text"
+                  className="w-full p-2.5 font-mono text-sm"
+                  value={ibkrAccessToken}
+                  onChange={e => setIbkrAccessToken(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Access token secret</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={3}
+                  value={ibkrAccessTokenSecret}
+                  onChange={e => setIbkrAccessTokenSecret(e.target.value)}
+                  required
+                />
+              </div>
+              <PaperLiveRadio
+                value={ibkrPaper}
+                onChange={setIbkrPaper}
+                name="ibkr-mode"
+                note="Set to match the IBKR account behind this access token (paper vs live)."
+              />
+              <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
+                <span>Connect IBKR</span>
+                {busy && <Spinner />}
+              </button>
+              <p className="text-[10px]" style={{ color: "var(--muted)" }}>
+                We verify the credentials with a live IBKR call before
+                saving. Stored Fernet-encrypted at rest; never logged.
               </p>
             </form>
           </>

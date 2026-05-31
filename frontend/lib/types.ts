@@ -8,7 +8,7 @@ export interface User {
   is_active: boolean;
 }
 
-export type BrokerName = "alpaca" | "webull" | "snaptrade";
+export type BrokerName = "alpaca" | "webull" | "snaptrade" | "ibkr";
 
 export interface BrokerAccount {
   id: string;
@@ -26,6 +26,12 @@ export interface BrokerAccount {
   total_equity: string | null;
   currency: string | null;
   balance_updated_at: string | null;
+
+  // Listener-gating flags surfaced in the Brokers UI checkboxes.
+  // PATCH /api/brokers/{id}/settings flips them.
+  auto_pull_orders: boolean;
+  bring_open_orders: boolean;
+  bring_filled_orders: boolean;
 }
 
 

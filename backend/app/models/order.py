@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -135,6 +135,10 @@ class Order(Base, TimestampMixin):
     broker_accepted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Duration (ms) of the subscriber's broker place-order REST call —
+    # request → response, capturing BOTH a success and an error response.
+    # Measured around the SDK call in copy_engine fanout (Phase 2).
+    broker_call_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── Retry policy (transient broker errors) ──────────────────────────
     # Set on a child order whose broker call returned a transient error

@@ -25,6 +25,7 @@ return_exceptions=True on gather + per-task exception capture.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
+from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
@@ -278,6 +280,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             subscriber_accepted_at = datetime.now(timezone.utc)
 
             child = Order(
+                id=uuid.uuid4(),
                 user_id=sub.user_id,
                 broker_account_id=acct.id,
                 parent_order_id=trader_order.id,
@@ -286,6 +289,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 option_expiry=trader_order.option_expiry,
                 option_strike=trader_order.option_strike,
                 option_right=trader_order.option_right,
+                is_closing=trader_order.is_closing,
                 side=trader_order.side,
                 order_type=trader_order.order_type,
                 quantity=scaled,
@@ -338,6 +342,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     option_expiry=child.option_expiry,
                     option_strike=child.option_strike,
                     option_right=child.option_right,
+                    is_closing=child.is_closing,
                     client_order_id=str(child.id),
                 ),
             ))
@@ -354,17 +359,21 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # so Phase 3 can call classify_error on it for retry routing. The string
     # form is still used downstream as reject_reason — we just str() it
     # there instead of here.
-    async def _place_one(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None]:
+    async def _place_one(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None, int]:
         sem = _broker_sem(item.broker)
         async with sem:
+            # Time the broker REST call itself — request → response — for BOTH
+            # success and error, so the Performance page can surface the raw
+            # broker round-trip ("Broker Response" / broker_call_ms).
+            start = time.perf_counter()
             try:
                 # to_thread keeps the event loop free while the sync SDK does I/O.
                 resp = await asyncio.to_thread(item.adapter.place_order, item.request)
-                return item, resp, None
+                return item, resp, None, int((time.perf_counter() - start) * 1000)
             except Exception as exc:  # noqa: BLE001
-                return item, None, exc
+                return item, None, exc, int((time.perf_counter() - start) * 1000)
 
-    broker_results: list[tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None]]
+    broker_results: list[tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None, int]]
     if pending:
         broker_results = await asyncio.gather(
             *(_place_one(p) for p in pending), return_exceptions=False
@@ -373,9 +382,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         broker_results = []
 
     # ── Phase 3: apply results, audit, publish events ──────────────────────
-    for item, resp, exc in broker_results:
+    for item, resp, exc, call_ms in broker_results:
         err = str(exc)[:480] if exc is not None else None
         child = db.get(Order, item.child_order_id)
+        child.broker_call_ms = call_ms
         if resp is not None:
             child.status = resp.status
             child.broker_order_id = resp.broker_order_id
@@ -535,6 +545,41 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
     """Sync entrypoint. Runs the async fanout in a fresh event loop. Prefer
     calling fanout_async directly from async contexts."""
     return asyncio.run(fanout_async(db, trader_order, trader))
+
+
+def fanout_threadsafe(
+    order_id: uuid.UUID,
+    trader_id: uuid.UUID,
+    loop: asyncio.AbstractEventLoop,
+) -> list[FanoutResult]:
+    """Fan out an already-persisted trader order from a listener worker
+    thread, running the async fanout on the app's MAIN event loop.
+
+    Why not the sync ``fanout`` here: ``fanout`` does ``asyncio.run`` which
+    creates a throwaway loop per order. The per-broker ``asyncio.Semaphore``
+    cache (and the async Redis client, keyed by loop id) bind to whatever
+    loop first touched them, so a second listener-detected order on a fresh
+    throwaway loop raises ``Semaphore is bound to a different event loop``
+    and the mirror silently fails. Dispatching onto the single long-lived
+    main loop keeps every order on the same loop.
+
+    Opens its OWN DB session on the loop thread — never shares the caller's
+    worker-thread Session across threads (SQLAlchemy Sessions aren't
+    thread-safe). The trader order must already be committed; we re-load it
+    by id. Marks it fanned-out and commits. Blocks until the fanout finishes.
+    """
+    async def _run() -> list[FanoutResult]:
+        with SessionLocal() as db:
+            order = db.get(Order, order_id)
+            trader = db.get(User, trader_id)
+            if order is None or trader is None:
+                return []
+            results = await fanout_async(db, order, trader)
+            order.fanned_out_to_subscribers = True
+            db.commit()
+            return results
+
+    return asyncio.run_coroutine_threadsafe(_run(), loop).result()
 
 
 def _order_event(event_type: str, order: Order) -> dict[str, Any]:

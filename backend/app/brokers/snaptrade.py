@@ -39,8 +39,8 @@ trades on any of the user's connected brokers via SnapTrade's API.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import date, datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from snaptrade_client import SnapTrade
@@ -90,6 +90,37 @@ _TYPE_OUT = {
     OrderType.STOP:       "Stop",
     OrderType.STOP_LIMIT: "StopLimit",
 }
+
+# Option (multi-leg) order-type strings. NOTE: the mleg endpoint uses the
+# strict upper-case enum (MARKET/LIMIT/…), unlike the stock place_force_order
+# path above which uses "Market"/"Limit".
+_MLEG_TYPE_OUT = {
+    OrderType.MARKET:     "MARKET",
+    OrderType.LIMIT:      "LIMIT",
+    OrderType.STOP:       "STOP_LOSS_MARKET",
+    OrderType.STOP_LIMIT: "STOP_LOSS_LIMIT",
+}
+
+
+def _option_action(side: OrderSide, is_closing: bool) -> str:
+    """(side, open/close) → SnapTrade single-leg option action enum."""
+    if side == OrderSide.BUY:
+        return "BUY_TO_CLOSE" if is_closing else "BUY_TO_OPEN"
+    return "SELL_TO_CLOSE" if is_closing else "SELL_TO_OPEN"
+
+
+def _occ_symbol_21(symbol: str, expiry: date, strike: Decimal, right: OptionRight) -> str:
+    """Strict 21-char OCC option symbol required by SnapTrade's mleg API:
+    6-char root (space-padded) + YYMMDD + C/P + 8-digit strike (price*1000).
+    Example: AAPL 2026-06-19 $200 CALL -> 'AAPL  260619C00200000'.
+
+    SnapTrade rejects the un-padded 19-char form that Alpaca accepts
+    (error code 1012, "Invalid symbol length")."""
+    root = symbol.upper().ljust(6)
+    ymd = expiry.strftime("%y%m%d")
+    cp = "C" if str(getattr(right, "value", right)).upper().startswith("C") else "P"
+    strike_int = int((Decimal(strike) * 1000).to_integral_value(rounding=ROUND_HALF_UP))
+    return f"{root}{ymd}{cp}{strike_int:08d}"
 
 
 def _dec_or_none(v: Any) -> Decimal | None:
@@ -459,22 +490,11 @@ class SnapTradeAdapter(BrokerAdapter):
     # ── orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        if req.instrument_type == InstrumentType.OPTION:
+            return self._place_option_order(req)
         if req.instrument_type != InstrumentType.STOCK:
-            # Stock-orders only on the *placement* path. Detection of
-            # externally-placed option orders (e.g. the trader places an
-            # option on their broker's app, we observe it via the poll
-            # loop) IS supported — see parse_snaptrade_order_symbol in
-            # this module and snaptrade_listener._insert_order_from_
-            # snaptrade. Placing options through SnapTrade requires a
-            # universal_symbol_id lookup against their options
-            # discovery endpoint, which is a meaningfully different
-            # contract-resolution flow than Alpaca's OCC symbols and
-            # needs its own work.
             raise ValueError(
-                "SnapTrade adapter: option order placement not yet supported. "
-                "Externally-placed option orders ARE detected and mirror "
-                "correctly; the placement path needs the SnapTrade options "
-                "discovery flow built out."
+                f"SnapTrade adapter: unsupported instrument_type {req.instrument_type}"
             )
 
         action = _SIDE_OUT[req.side]
@@ -504,6 +524,63 @@ class SnapTradeAdapter(BrokerAdapter):
         if not order_id:
             raise RuntimeError(
                 f"SnapTrade place_force_order returned no brokerage_order_id: {body!r}"
+            )
+        status_str = str(_attr(body, "status", default="SUBMITTED")).upper()
+        return BrokerOrderResult(
+            broker_order_id=str(order_id),
+            status=_STATUS_IN.get(status_str, OrderStatus.SUBMITTED),
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=Decimal(0),
+            filled_avg_price=None,
+        )
+
+    def _place_option_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        """Place a single-leg option order via SnapTrade's multi-leg endpoint.
+
+        SnapTrade identifies the contract by a strict 21-char OCC symbol
+        (resolved server-side — no separate chain-discovery call needed) and
+        requires prices as STRINGS. Only works on SnapTrade brokerages that
+        support option trading (see support.snaptrade.com/brokerages)."""
+        if not (req.option_expiry and req.option_strike and req.option_right):
+            raise ValueError("option order missing expiry/strike/right")
+
+        occ = _occ_symbol_21(
+            req.symbol, req.option_expiry, req.option_strike, req.option_right
+        )
+        leg = {
+            "action":     _option_action(req.side, req.is_closing),
+            "instrument": {"symbol": occ, "instrument_type": "OPTION"},
+            "units":      int(req.quantity),  # options trade in whole contracts
+        }
+        kwargs: dict[str, Any] = {
+            "account_id":    self._account_id,
+            "user_id":       self._user_id,
+            "user_secret":   self._user_secret,
+            "order_type":    _MLEG_TYPE_OUT.get(req.order_type, "LIMIT"),
+            "time_in_force": "Day",
+            "legs":          [leg],
+        }
+        # SnapTrade's mleg endpoint requires prices as strings, not numbers.
+        if req.limit_price is not None:
+            kwargs["limit_price"] = f"{req.limit_price}"
+        if req.stop_price is not None:
+            kwargs["stop_price"] = f"{req.stop_price}"
+
+        try:
+            resp = self._c().trading.place_mleg_order(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"SnapTrade place_mleg_order: {exc}") from exc
+
+        body = getattr(resp, "body", resp)
+        order_id = _attr(body, "brokerage_order_id", "id", "trade_id")
+        if not order_id:
+            inner = _attr(body, "order", "orders")
+            if isinstance(inner, (list, tuple)) and inner:
+                inner = inner[0]
+            order_id = _attr(inner, "brokerage_order_id", "id", "trade_id")
+        if not order_id:
+            raise RuntimeError(
+                f"SnapTrade place_mleg_order returned no order id: {body!r}"
             )
         status_str = str(_attr(body, "status", default="SUBMITTED")).upper()
         return BrokerOrderResult(

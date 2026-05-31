@@ -18,12 +18,13 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user
+from app.api.deps import current_user, require_trader
 from app.api.trades import _place_trader_order
 from app.brokers import adapter_for
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderType
+from app.models.settings import SubscriberSettings
 from app.models.user import User
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import ClosePositionIn, PositionOut
@@ -153,6 +154,94 @@ def close_all_positions(
                     "symbol": pos.symbol,
                     "error": str(exc)[:300],
                 })
+
+    return {"closed": closed, "failed": failed, "closed_count": len(closed), "failed_count": len(failed)}
+
+
+@router.post("/close-all-subscribers")
+def close_all_subscribers_positions(
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Trader-only: flatten every open position across EVERY subscriber
+    following this trader, by placing a market reverse order on each
+    subscriber's OWN account. The trader's own positions are NOT touched.
+    Per-position failures don't abort the rest — we return a result list."""
+    sub_ids = list(db.execute(
+        select(SubscriberSettings.user_id).where(
+            SubscriberSettings.following_trader_id == user.id
+        )
+    ).scalars())
+
+    closed: list[dict] = []
+    failed: list[dict] = []
+    for sub_id in sub_ids:
+        sub_user = db.get(User, sub_id)
+        if sub_user is None:
+            continue
+        accts = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == sub_id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars().all()
+        for acct in accts:
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+                positions = adapter.get_positions()
+            except Exception as exc:  # noqa: BLE001
+                failed.append({
+                    "subscriber_user_id": str(sub_id),
+                    "broker_account_id": str(acct.id),
+                    "symbol": None,
+                    "error": f"could not list positions: {exc}"[:300],
+                })
+                continue
+
+            for pos in positions:
+                if pos.quantity == 0:
+                    continue
+                reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+                qty = abs(pos.quantity)
+                payload = PlaceOrderIn(
+                    instrument_type=pos.instrument_type,
+                    symbol=pos.symbol,
+                    side=reverse_side,
+                    order_type=OrderType.MARKET,
+                    quantity=qty,
+                    limit_price=None,
+                    stop_price=None,
+                    option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
+                    option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
+                    option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
+                )
+                try:
+                    # Place on the SUBSCRIBER's own account. Passing the
+                    # subscriber as the order owner makes _place_trader_order
+                    # skip the trader kill-switch and any fanout (subscribers
+                    # have no downstream), recording the order under them.
+                    order = _place_trader_order(
+                        db, sub_user, payload, acct.id, background, request,
+                        skip_fanout=True,
+                    )
+                    closed.append({
+                        "subscriber_user_id": str(sub_id),
+                        "broker_account_id": str(acct.id),
+                        "symbol": pos.symbol,
+                        "qty": str(qty),
+                        "side": reverse_side.value,
+                        "order_id": str(order.id),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    failed.append({
+                        "subscriber_user_id": str(sub_id),
+                        "broker_account_id": str(acct.id),
+                        "symbol": pos.symbol,
+                        "error": str(exc)[:300],
+                    })
 
     return {"closed": closed, "failed": failed, "closed_count": len(closed), "failed_count": len(failed)}
 

@@ -57,7 +57,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, copy_engine, events, fills_sync, listener_state
+from app.services import audit, broker_filters, copy_engine, events, fills_sync, listener_state
 from app.services.crypto import decrypt_json
 from app.services.listener_state import ListenerState, ListenerStatus
 
@@ -376,6 +376,17 @@ def _persist_and_fanout(
     alpaca_order = update.order
     broker_order_id = str(alpaca_order.id)
 
+    # Gate: master switch + per-status (open vs filled) checkboxes on the
+    # broker account. Re-read each event so the user can flip flags at
+    # runtime and have it apply on the very next WS event. Treat anything
+    # that isn't a final FILLED as "open lifecycle" for filter purposes.
+    raw_status = str(getattr(alpaca_order, "status", "") or "").lower()
+    status_for_gate = OrderStatus.FILLED if raw_status == "filled" else OrderStatus.SUBMITTED
+    with SessionLocal() as gate_db:
+        gate_acct = gate_db.get(BrokerAccount, broker_account_id)
+        if not broker_filters.should_persist_order(gate_acct, status_for_gate):
+            return
+
     with SessionLocal() as db:
         from sqlalchemy import select
         existing = db.execute(
@@ -471,9 +482,15 @@ def _persist_and_fanout(
         # as a fresh trade to mirror. To avoid mirroring twice for the same
         # external order, we set fanned_out_to_subscribers=True and dedupe on
         # subsequent events via the "existing" branch above.
-        copy_engine.fanout(db, order, _load_trader(db, trader_user_id))
-        order.fanned_out_to_subscribers = True
-        db.commit()
+        # Fan out on the main event loop (see copy_engine.fanout_threadsafe)
+        # rather than a throwaway asyncio.run loop, so per-broker semaphores
+        # and the async Redis client stay bound to one stable loop.
+        if _main_loop is not None:
+            copy_engine.fanout_threadsafe(order.id, trader_user_id, _main_loop)
+        else:
+            copy_engine.fanout(db, order, _load_trader(db, trader_user_id))
+            order.fanned_out_to_subscribers = True
+            db.commit()
 
 
 def _apply_event_to_existing(
@@ -666,8 +683,11 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
                 skipped_historical += 1
                 continue
             try:
-                copy_engine.fanout(db, o, trader)
-                o.fanned_out_to_subscribers = True
+                if _main_loop is not None:
+                    copy_engine.fanout_threadsafe(o.id, trader_user_id, _main_loop)
+                else:
+                    copy_engine.fanout(db, o, trader)
+                    o.fanned_out_to_subscribers = True
                 fanned += 1
             except Exception:  # noqa: BLE001
                 log.exception(

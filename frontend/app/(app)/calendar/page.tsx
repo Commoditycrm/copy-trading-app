@@ -15,11 +15,10 @@ function iso(d: Date) {
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
-/** The user's IANA timezone (e.g. "Asia/Calcutta"). Sent to the backend so
- *  fills are bucketed against the same calendar the user is looking at. */
+/** US trading app — bucket daily P&L by US Eastern (America/New_York), the
+ *  market's calendar, regardless of the viewer's local timezone. */
 function browserTz(): string {
-  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; }
-  catch { return "UTC"; }
+  return "America/New_York";
 }
 
 export default function CalendarPage() {

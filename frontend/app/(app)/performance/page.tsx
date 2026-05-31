@@ -22,6 +22,7 @@ interface FanoutChild {
   subscriber_user_id: string;
   subscriber_email: string | null;
   subscriber_name: string | null;
+  broker_name: string | null;
   status: string;
   quantity: string;
   filled_quantity: string;
@@ -39,6 +40,7 @@ interface FanoutChild {
   pick_lag_ms: number | null;
   eligibility_lag_ms: number | null;
   broker_lag_ms: number | null;
+  broker_response_ms: number | null;
   publish_lag_ms: number | null;
 }
 interface FanoutRow {
@@ -89,19 +91,55 @@ function fmtMs(ms: number | null | undefined): string {
   if (ms === null || ms === undefined) return "—";
   if (ms < 0) return "—";
   if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(2)}s`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
+  // ≥ 60s → minutes + seconds, e.g. "1m 05s", "2m 30s".
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
-/** HH:MM:SS.mmm in the user's local timezone — matches the screenshot. */
+/** HH:MM:SS.mmm in US Eastern (America/New_York — auto EST/EDT). */
 function fmtClock(iso: string | null | undefined): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
+  const t = d.toLocaleTimeString("en-US", {
+    timeZone: "America/New_York",
+    hourCycle: "h23",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
   const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return `${hh}:${mm}:${ss}.${ms}`;
+  return `${t}.${ms}`;
+}
+
+/** Quantity without trailing-zero noise: "3.000000" → "3", "3.5" → "3.5". */
+function fmtQty(q: string | number | null | undefined): string {
+  if (q === null || q === undefined || q === "") return "—";
+  const n = Number(q);
+  if (!Number.isFinite(n)) return String(q);
+  return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors.
+ *  Used by the trader-side fanout table to surface the spread of how long
+ *  each subscriber's broker took to accept their copy. Rows with a null
+ *  broker_lag_ms (mirror rejected before reaching the broker, or still in
+ *  flight) are excluded from all three stats. Returns {min, avg, max} as
+ *  ms, or all-null when no child has a usable lag yet. */
+function brokerLagStats(
+  children: FanoutChild[]
+): { min: number | null; avg: number | null; max: number | null } {
+  const vals = children
+    .map(c => c.broker_lag_ms)
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
+  if (vals.length === 0) return { min: null, avg: null, max: null };
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+  return { min, avg, max };
 }
 
 // ── Compact metric card with optional inline sparkline ────────────────
@@ -741,17 +779,17 @@ export default function PerformancePage() {
 
   return (
     <div className="space-y-5">
-      <header>
+      {/* <header>
         <h1 className="text-2xl" style={{ fontWeight: 600 }}>Fanout Performance</h1>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
           Latency breakdown for your most recent trades that fanned out to subscribers.
           Click any row to see per-subscriber timing. Auto-refreshes every 5 seconds and
           on every new trade event.
         </p>
-      </header>
+      </header> */}
 
       {/* ── Compact metric cards with inline sparklines ───────────────── */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
+      {/* <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
         <MetricCard
           label="Fanouts"
           value={String(m?.fanouts_shown ?? 0)}
@@ -777,11 +815,10 @@ export default function PerformancePage() {
           valueColor={colorFor(m?.avg_total_ms ?? null)}
           Icon={IcoTarget}
         />
-      </div>
+      </div> */}
 
       {/* ── Charts row: trend chart (wide) + donut + symbol bars ───────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5">
-        {/* Latency trend */}
+      {/* <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5">
         <div
           className="lg:col-span-7 rounded-lg p-4"
           style={{
@@ -806,7 +843,6 @@ export default function PerformancePage() {
           </div>
           <div className="relative">
             <LatencyAreaChart values={durationSeries} height={120} color="var(--accent)" />
-            {/* Overlay the total series in a different color, same scale */}
             <div className="absolute inset-0 pointer-events-none" style={{ mixBlendMode: "screen" }}>
               <LatencyAreaChart values={totalSeries} height={120} color="var(--good)" />
             </div>
@@ -817,7 +853,6 @@ export default function PerformancePage() {
           </div>
         </div>
 
-        {/* Success donut */}
         <div
           className="lg:col-span-3 rounded-lg p-4 flex flex-col"
           style={{
@@ -837,7 +872,6 @@ export default function PerformancePage() {
           </div>
         </div>
 
-        {/* Per-symbol bars */}
         <div
           className="lg:col-span-2 rounded-lg p-4 flex flex-col"
           style={{
@@ -852,18 +886,28 @@ export default function PerformancePage() {
             <SymbolBars rows={symbolRows} />
           </div>
         </div>
-      </div>
+      </div> */}
 
       {/* ── Table ──────────────────────────────────────────────────────── */}
+      {/* overflow-auto + a viewport-relative max-h enables BOTH horizontal
+          scroll (wide table) and vertical scroll. The max-h subtracts a
+          rough allowance for the AppShell topbar + page header above so the
+          table fills the rest of the screen instead of having an arbitrary
+          70vh cap. The sticky thead below stays pinned to the top of this
+          scroll container so column headers remain visible while scrolling. */}
       <div
-        className="overflow-x-auto rounded-xl"
+        className="overflow-auto rounded-xl"
         style={{
           border: "1px solid var(--border)",
           background: "linear-gradient(180deg, rgba(14,20,17,0.5) 0%, rgba(7,9,10,0.3) 100%)",
+          maxHeight: "calc(100vh - 110px)",
         }}
       >
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
-          <thead>
+          {/* z-10 keeps the header above scrolling cells; the opaque panel
+              background prevents row text from bleeding through behind the
+              sticky header (which would otherwise be transparent). */}
+          <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
             <tr style={{ color: "var(--muted)" }}>
               {([
                 ["Symbol", "Ticker symbol the trader bought or sold."],
@@ -871,16 +915,18 @@ export default function PerformancePage() {
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
-                ["Socket Received At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
+                ["Trader Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
                 ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
                 ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
                 ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
-                ["Socket Lag", "Trader submit → our WebSocket hearing about it. Socket Received At − Trader Submitted At."],
                 ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
                 ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
-                ["Fanout Duration", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
+                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
                 ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
+                ["Lowest Broker Lag", "Fastest subscriber: minimum broker_lag (mirror-submit → broker-accept) across all subscriber children for this trade."],
+                ["Average Broker Lag", "Mean broker_lag across all subscriber children for this trade."],
+                ["Highest Broker Lag", "Slowest subscriber: maximum broker_lag across all subscriber children for this trade."],
                 ["Subscribers", "Total subscribers receiving this trade, with submitted-vs-error counts."],
               ] as [string, string][]).map(([h, tip]) => (
                 <th
@@ -904,7 +950,7 @@ export default function PerformancePage() {
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -914,13 +960,14 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={17} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   No fanouts yet. Place a trade to see latency metrics here.
                 </td>
               </tr>
             )}
             {fanouts.map(f => {
               const isOpen = expanded.has(f.parent_order_id);
+              const blStats = brokerLagStats(f.children);
               return (
                 <Fragment key={f.parent_order_id}>
                   <tr
@@ -950,7 +997,7 @@ export default function PerformancePage() {
                         {f.side.toUpperCase()}
                       </span>
                     </td>
-                    <td className="px-3 py-3 tabular-nums">{f.quantity}</td>
+                    <td className="px-3 py-3 tabular-nums">{fmtQty(f.quantity)}</td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.trader_submitted_at)}
                     </td>
@@ -972,9 +1019,6 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.api_to_broker_lag_ms) }}>
                       {fmtMs(f.api_to_broker_lag_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.socket_lag_ms) }}>
-                      {fmtMs(f.socket_lag_ms)}
-                    </td>
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.publish_lag_ms) }}>
                       {fmtMs(f.publish_lag_ms)}
                     </td>
@@ -987,6 +1031,15 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
                       {fmtMs(f.total_ms)}
                     </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.min) }}>
+                      {fmtMs(blStats.min)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.avg) }}>
+                      {fmtMs(blStats.avg)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.max) }}>
+                      {fmtMs(blStats.max)}
+                    </td>
                     <td className="px-3 py-3">
                       <SubscriberPill counts={f.subscribers} />
                     </td>
@@ -995,7 +1048,7 @@ export default function PerformancePage() {
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={16} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
+                      <td colSpan={18} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
@@ -1014,11 +1067,23 @@ export default function PerformancePage() {
                               No subscribers received this trade.
                             </div>
                           ) : (
+                            // Scroll wrapper so the inner per-subscriber table
+                            // gets the same sticky-header treatment as the
+                            // outer fanout table. max-h caps the drawer's own
+                            // height (already nested inside the page-level
+                            // scrolling container).
+                            <div
+                              className="overflow-auto max-h-[50vh] rounded"
+                              style={{ border: "1px solid var(--border)" }}
+                            >
                             <table
                               className="w-full text-xs"
                               style={{ borderCollapse: "separate", borderSpacing: 0, tableLayout: "auto" }}
                             >
-                              <thead>
+                              {/* Sticky thead pinned to the wrapper. Opaque
+                                  panel background prevents row text from
+                                  bleeding through behind the sticky row. */}
+                              <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
                                 <tr style={{ color: "var(--muted)" }}>
                                   {([
                                     ["Subscriber", "The subscriber whose account this mirror was placed on."],
@@ -1027,17 +1092,17 @@ export default function PerformancePage() {
                                     ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
                                     ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING)."],
                                     ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line."],
-                                    ["Accepted At", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker."],
+                                    ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker."],
                                     ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order."],
-                                    ["Published At", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
-                                    ["Submitted At", "Broker's own timestamp for when it accepted the order. Usually identical to Broker Accepted At; can differ if the broker's clock is skewed."],
+                                    ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
                                     ["Pick Lag 🟢", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
-                                    ["Eligibility Lag 🟢", "Platform-owned. Picked → ready to call broker. Accepted At − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Eligibility Lag 🟢", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
                                     ["Broker Lag 🔵", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
+                                    ["Broker Response 🔵", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
                                     ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
-                                    ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published At − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
+                                    ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
                                     ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
-                                    ["Broker Order ID", "Identifier the subscriber's broker assigned to this mirror. Used by support to look up the order on the broker side."],
                                     ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
                                   ] as [string, string][]).map(([h, tip]) => (
                                     <th
@@ -1102,12 +1167,12 @@ export default function PerformancePage() {
                                           {c.status}
                                         </span>
                                       </td>
-                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{c.quantity}</td>
+                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: Number(c.filled_quantity) > 0 ? "var(--text)" : "var(--muted)" }}
                                       >
-                                        {c.filled_quantity}
+                                        {fmtQty(c.filled_quantity)}
                                       </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
@@ -1141,12 +1206,6 @@ export default function PerformancePage() {
                                       </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.submitted_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: colorFor(c.pick_lag_ms) }}
                                       >
                                         {fmtMs(c.pick_lag_ms)}
@@ -1157,11 +1216,20 @@ export default function PerformancePage() {
                                       >
                                         {fmtMs(c.eligibility_lag_ms)}
                                       </td>
+                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
+                                        {c.broker_name ?? "—"}
+                                      </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: colorFor(c.broker_lag_ms) }}
                                       >
                                         {fmtMs(c.broker_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.broker_response_ms) }}
+                                      >
+                                        {fmtMs(c.broker_response_ms)}
                                       </td>
                                       {/* Split bar — Platform (green) vs Broker (blue) */}
                                       <td className="px-2 py-2 whitespace-nowrap">
@@ -1182,37 +1250,30 @@ export default function PerformancePage() {
                                       >
                                         {fmtMs(c.subscriber_lag_ms)}
                                       </td>
-                                      <td
-                                        className="px-2 py-2 font-mono text-[10px] whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                        title={c.broker_order_id ?? undefined}
-                                      >
-                                        {c.broker_order_id
-                                          ? c.broker_order_id.length > 18
-                                            ? c.broker_order_id.slice(0, 18) + "…"
-                                            : c.broker_order_id
-                                          : "—"}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2"
-                                        style={{
-                                          color: "var(--bad)",
-                                          // Long JSON / error strings wrap; break on any char so
-                                          // a raw response body doesn't blow the column width.
-                                          wordBreak: "break-word",
-                                          whiteSpace: "normal",
-                                          minWidth: 240,
-                                          maxWidth: 480,
-                                          lineHeight: 1.4,
-                                        }}
-                                      >
-                                        {c.reject_reason || ""}
+                                      <td className="px-2 py-2 whitespace-nowrap">
+                                        {c.reject_reason ? (
+                                          <span
+                                            title={c.reject_reason}
+                                            className="text-[11px]"
+                                            style={{
+                                              color: "var(--bad)",
+                                              cursor: "help",
+                                              textDecoration: "underline dotted var(--bad)",
+                                              textUnderlineOffset: 3,
+                                            }}
+                                          >
+                                            Hover to see error
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: "var(--muted)" }}>—</span>
+                                        )}
                                       </td>
                                     </tr>
                                   );
                                 })}
                               </tbody>
                             </table>
+                            </div>
                           )}
                         </div>
                       </td>
@@ -1225,9 +1286,12 @@ export default function PerformancePage() {
         </table>
       </div>
 
-      {/* ── Footnote (matches the screenshot terminology) ──────────────── */}
+      {/* ── Footnote (matches the screenshot terminology) ────────────────
+          Hidden for now per UX request — the column-header tooltips on the
+          table itself cover the same content on hover, so the long inline
+          legend was visual noise. Restore by removing this comment block
+          if we ever want the legend back as a permanent footer.
       <div className="text-xs leading-relaxed space-y-2" style={{ color: "var(--muted)" }}>
-        {/* Platform vs Broker legend */}
         <div className="flex flex-wrap gap-x-5 gap-y-1 pb-1" style={{ borderBottom: "1px solid var(--border)" }}>
           <span className="inline-flex items-center gap-1.5">
             <span style={{ width: 8, height: 8, borderRadius: 2, background: "var(--good)", display: "inline-block" }} />
@@ -1254,13 +1318,14 @@ export default function PerformancePage() {
           New per-step lifecycle stamps (alembic <code>e7a1d2c40f01</code>):{" "}
           <strong style={{ color: "var(--text-2)" }}>Trader Submitted At</strong> = our backend received the trader&apos;s
           submit (or Alpaca&apos;s receive time for externally-placed orders).{" "}
-          <strong style={{ color: "var(--text-2)" }}>Socket Received At</strong> = our Alpaca trade_updates listener
+          <strong style={{ color: "var(--text-2)" }}>Trader Listened At</strong> = our Alpaca trade_updates listener
           heard the event (NULL for in-app orders).{" "}
           <strong style={{ color: "var(--text-2)" }}>Redis Published At</strong> = SSE event broadcast to subscribers.{" "}
           <strong style={{ color: "var(--text-2)" }}>Picked At / Accepted At / Broker Accepted At</strong> (per-child) =
           when copy_engine picked the subscriber, passed eligibility, and their broker accepted, respectively.
         </p>
       </div>
+      */}
     </div>
   );
 }
