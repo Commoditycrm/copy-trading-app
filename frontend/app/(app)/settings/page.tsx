@@ -24,7 +24,6 @@ export default function SettingsPage() {
   const [multBusy, setMultBusy] = useState(false);
   const [limitInput, setLimitInput] = useState("");
   const [limitBusy, setLimitBusy] = useState(false);
-  // Daily-PROFIT-limit input mirrors the loss-limit one — symmetric.
   const [profitInput, setProfitInput] = useState("");
   const [profitBusy, setProfitBusy] = useState(false);
 
@@ -45,7 +44,6 @@ export default function SettingsPage() {
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
 
-  // Auto-pause SSE → refresh sub.
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
@@ -132,8 +130,6 @@ export default function SettingsPage() {
     }
   }
 
-  // Symbol-filter PATCH used by both chip lists. Optimistic update +
-  // revert on error so the chip vanishes/reappears instantly.
   async function saveSymbolFilter(
     which: "symbol_exclusion_list" | "symbol_inclusion_list",
     next: string[],
@@ -176,80 +172,73 @@ export default function SettingsPage() {
   const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
   const headroom = limit !== null ? limit + todaysPnL : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
-  // Profit-limit parallels loss: how far is today's gain from the cap?
   const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
   const profitHeadroom = profitLimit !== null ? profitLimit - Math.max(0, todaysPnL) : null;
   const profitPct = profitLimit !== null && profitLimit > 0
     ? Math.min(100, Math.max(0, (Math.max(0, todaysPnL) / profitLimit) * 100))
     : 0;
 
-  return (
-    <div className="space-y-4 max-w-3xl">
-      <h1 className="text-xl font-semibold">Settings</h1>
+  const followedTrader = sub?.following_trader_id
+    ? traders.find(t => t.id === sub.following_trader_id) ?? null
+    : null;
 
+  return (
+    <div className="space-y-5 max-w-3xl pb-12">
       {user.role === "subscriber" && sub && (
         <>
-          {/* ── Trader + Multiplier (single row, single card) ──────────
-              Following selector grows to take the remaining width; the
-              multiplier control sticks to a fixed slot on the right so
-              the two never wrap awkwardly on common screen widths. On
-              mobile they stack via flex-col. */}
-          <Card title="Following Trader & Multiplier">
-            <div className="flex flex-col md:flex-row md:items-center gap-3">
-              {/* Trader selector — 50% of the row on md+ */}
-              <div className="flex-1 min-w-0 md:basis-1/2">
-                <label className="block text-[10px] uppercase tracking-wider mb-1" style={{color: "var(--muted)"}}>
-                  Following
-                </label>
-                <select
+          {/* ── Trader + Multiplier ─────────────────────────────────── */}
+          <Card
+            icon={<IconUsers />}
+            title="Following trader & multiplier"
+            hint="Pick whose trades to mirror, and scale them by a factor of 0.1× to 10×."
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Field label="Following">
+                <SelectInput
                   value={sub.following_trader_id ?? ""}
-                  onChange={e => follow(e.target.value || null)}
-                  className="w-full px-2 py-1.5 text-sm rounded bg-transparent border"
-                  style={{borderColor: "var(--border)"}}
-                >
-                  <option value="">— not following anyone —</option>
-                  {traders.map(t => (
-                    <option key={t.id} value={t.id}>{t.display_name ?? t.email}</option>
-                  ))}
-                </select>
-              </div>
+                  onChange={v => follow(v || null)}
+                  options={[
+                    { value: "", label: "— not following anyone —" },
+                    ...traders.map(t => ({ value: t.id, label: t.display_name ?? t.email })),
+                  ]}
+                />
+              </Field>
 
-              {/* Multiplier — also 50% of the row on md+ */}
-              <div className="flex-1 min-w-0 md:basis-1/2">
-                <label className="block text-[10px] uppercase tracking-wider mb-1" style={{color: "var(--muted)"}}>
-                  Multiplier <span className="opacity-60">· 0.1–10</span>
-                </label>
+              <Field label={<>Multiplier <span className="opacity-50">· 0.1–10</span></>}>
                 <div className="flex items-center gap-2">
-                  <input
-                    type="number" step="0.1" min="0.1" max="10"
-                    className="w-20 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
-                    style={{borderColor: "var(--border)"}}
+                  <NumberInput
                     value={multInput}
-                    onChange={(e) => setMultInput(e.target.value)}
+                    onChange={setMultInput}
+                    step={0.1} min={0.1} max={10}
+                    className="w-24"
                   />
-                  <span className="text-xs whitespace-nowrap" style={{color: "var(--muted)"}}>
-                    ×{fmtMultiplier(sub.multiplier)}
+                  <span className="text-xs tabular-nums whitespace-nowrap" style={{color: "var(--muted)"}}>
+                    current ×{fmtMultiplier(sub.multiplier)}
                   </span>
-                  <button
+                  <PrimaryButton
+                    busy={multBusy}
                     onClick={saveMultiplier}
                     disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
-                    className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-                    style={{background: "var(--accent)", color: "#06121f"}}
+                    className="ml-auto"
                   >
-                    {multBusy && <Spinner />}
                     Save
-                  </button>
+                  </PrimaryButton>
                 </div>
-              </div>
+              </Field>
             </div>
           </Card>
 
-          {/* ── P&L Limit (loss + profit, both auto-resume next day) ──── */}
+          {/* ── P&L Limit ───────────────────────────────────────────── */}
+          {/* Two-column layout split by a vertical divider — no inner card
+              borders so it reads as one cohesive section instead of cards
+              inside a card. Stacks vertically on mobile with the divider
+              becoming horizontal. */}
           <Card
+            icon={<IconShield />}
             title="P&L Limit"
             hint="Copy turns OFF for the day when either limit is hit, then auto-resumes the next UTC day."
           >
-            <div className="flex flex-col md:flex-row gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_1px_1fr] gap-4 md:gap-5">
               <PnLLimitPanel
                 kind="loss"
                 input={limitInput}
@@ -262,6 +251,17 @@ export default function SettingsPage() {
                 pct={limitPct}
                 headroom={headroom}
                 fmt={fmt}
+              />
+              {/* Vertical divider on md+, horizontal on mobile */}
+              <div
+                aria-hidden
+                className="hidden md:block w-px h-full"
+                style={{background: "var(--border)"}}
+              />
+              <div
+                aria-hidden
+                className="md:hidden h-px w-full"
+                style={{background: "var(--border)"}}
               />
               <PnLLimitPanel
                 kind="profit"
@@ -279,101 +279,83 @@ export default function SettingsPage() {
             </div>
           </Card>
 
-          {/* ── Trade Settings (exclusion + inclusion together) ─────────
-              Both lists live in the same card because they're two sides
-              of the same filter. The flex row collapses to a stack on
-              narrow screens. Counters in each sub-header are at-a-glance
-              "how many symbols am I filtering?" feedback. */}
+          {/* ── Symbol filters ─────────────────────────────────────── */}
           <Card
+            icon={<IconFilter />}
             title="Trade Settings"
-            hint="Control which trades get copied to you by symbol."
+            hint="Filter which trader trades get copied to you. Empty = mirror everything."
           >
-            <div className="flex flex-col gap-3">
-              {/* Exclusion (denylist) — neutral styling, no red tint */}
-              <div
-                className="w-full rounded-md p-2.5 space-y-1.5"
-                style={{
-                  background: "rgba(255,255,255,0.02)",
-                  border: "1px solid var(--border)",
-                }}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold">Exclusion list</span>
-                  <span className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
-                    {sub.symbol_exclusion_list.length} {sub.symbol_exclusion_list.length === 1 ? "symbol" : "symbols"}
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{color: "var(--muted)"}}>
-                  trades on these symbols are <strong>NOT</strong> copied.
-                </p>
-                <ChipInput
-                  symbols={sub.symbol_exclusion_list}
-                  onChange={(next) => saveSymbolFilter("symbol_exclusion_list", next)}
-                  placeholder="e.g. TSLA — Enter or comma to add"
-                  accent="var(--text)"
-                />
-              </div>
-
-              {/* Inclusion (allowlist) — neutral styling, no green tint */}
-              <div
-                className="w-full rounded-md p-2.5 space-y-1.5"
-                style={{
-                  background: "rgba(255,255,255,0.02)",
-                  border: "1px solid var(--border)",
-                }}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold">Inclusion list</span>
-                  <span className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
-                    {sub.symbol_inclusion_list.length === 0
-                      ? "all symbols"
-                      : `${sub.symbol_inclusion_list.length} ${sub.symbol_inclusion_list.length === 1 ? "symbol" : "symbols"} only`}
-                  </span>
-                </div>
-                <p className="text-[11px]" style={{color: "var(--muted)"}}>
-                  when non-empty, <strong>ONLY</strong> these symbols are copied.
-                </p>
-                <ChipInput
-                  symbols={sub.symbol_inclusion_list}
-                  onChange={(next) => saveSymbolFilter("symbol_inclusion_list", next)}
-                  placeholder="e.g. AAPL — Enter or comma to add"
-                  accent="var(--text)"
-                />
-              </div>
+            {/* Two filter panels stacked with a single hairline divider
+                between — no nested boxes. */}
+            <div className="space-y-4">
+              <FilterPanel
+                title="Exclusion list"
+                description={<>Trades on these symbols are <strong>NOT</strong> copied.</>}
+                counter={`${sub.symbol_exclusion_list.length} ${sub.symbol_exclusion_list.length === 1 ? "symbol" : "symbols"}`}
+                symbols={sub.symbol_exclusion_list}
+                onChange={(n) => saveSymbolFilter("symbol_exclusion_list", n)}
+                placeholder="e.g. TSLA — Enter or comma to add"
+              />
+              <FilterPanel
+                title="Inclusion list"
+                description={<>When non-empty, <strong>ONLY</strong> these symbols are copied.</>}
+                counter={sub.symbol_inclusion_list.length === 0
+                  ? "all symbols"
+                  : `${sub.symbol_inclusion_list.length} ${sub.symbol_inclusion_list.length === 1 ? "symbol" : "symbols"} only`}
+                symbols={sub.symbol_inclusion_list}
+                onChange={(n) => saveSymbolFilter("symbol_inclusion_list", n)}
+                placeholder="e.g. AAPL — Enter or comma to add"
+              />
             </div>
           </Card>
 
-            {/* ── Retry policy (2-up, inline) ─────────────────────────── */}
-            <Card title="Retry mirror orders on broker errors" hint="for transient (network/5xx/rate-limit) failures only.">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <RetrySelect
-                label="Opening positions"
-                value={sub.retry_interval_open}
-                onChange={(v) => setRetryInterval("open", v)}
-              />
-              <RetrySelect
-                label="Closing positions"
-                value={sub.retry_interval_close}
-                onChange={(v) => setRetryInterval("close", v)}
-              />
+          {/* ── Retry policy ───────────────────────────────────────── */}
+          <Card
+            icon={<IconRefresh />}
+            title="Retry on broker errors"
+            hint="For transient failures only (network / 5xx / rate-limit). User-fixable errors never retry."
+          >
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Field label="Opening positions">
+                <SelectInput
+                  value={sub.retry_interval_open}
+                  onChange={(v) => setRetryInterval("open", v as RetryInterval)}
+                  options={RETRY_OPTIONS.map(o => ({ value: o.value, label: o.label }))}
+                />
+              </Field>
+              <Field label="Closing positions">
+                <SelectInput
+                  value={sub.retry_interval_close}
+                  onChange={(v) => setRetryInterval("close", v as RetryInterval)}
+                  options={RETRY_OPTIONS.map(o => ({ value: o.value, label: o.label }))}
+                />
+              </Field>
             </div>
           </Card>
         </>
       )}
 
       {user.role === "trader" && trd && (
-        <Card title="Master trading switch"
-              hint="when OFF, the platform refuses to place new orders (yours and any subscriber mirrors).">
-          <div className="flex items-center justify-between">
-            <div className="text-xs" style={{color: "var(--muted)"}}>
-              State: <strong style={{color: trd.trading_enabled ? "var(--good)" : "var(--bad)"}}>
-                {trd.trading_enabled ? "ON" : "OFF"}
-              </strong>
-            </div>
+        <Card
+          icon={<IconPower />}
+          title="Master trading switch"
+          hint="When OFF, the platform refuses to place new orders (yours and any subscriber mirrors)."
+        >
+          <div className="flex items-center justify-between gap-3">
+            <Pill
+              dot={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
+              label="State"
+              value={trd.trading_enabled ? "ON" : "OFF"}
+              valueColor={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
+            />
             <button
               onClick={() => toggleTrading(!trd.trading_enabled)}
-              className="px-3 py-1.5 text-xs rounded font-medium"
-              style={{background: trd.trading_enabled ? "var(--good)" : "var(--border)", color: trd.trading_enabled ? "#06121f" : "var(--text)"}}
+              className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98]"
+              style={{
+                background: trd.trading_enabled ? "var(--bad)" : "var(--good)",
+                color: "#06121f",
+                boxShadow: "0 4px 14px -4px rgba(0,0,0,0.4)",
+              }}
             >
               {trd.trading_enabled ? "Turn OFF" : "Turn ON"}
             </button>
@@ -384,39 +366,180 @@ export default function SettingsPage() {
   );
 }
 
-// ── Compact reusable building blocks ────────────────────────────────────
+// ── Reusable building blocks ────────────────────────────────────────────
 
-function Card({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
+/** Polished card shell: refined border, subtle gradient, icon-anchored
+ *  title row, and an optional hint paragraph below. Uses CSS vars from
+ *  the theme so it picks up dark/light mode automatically. */
+function Card({
+  icon, title, hint, children,
+}: {
+  icon?: React.ReactNode;
+  title: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
   return (
     <section
-      className="p-3 rounded-lg border space-y-2"
-      style={{borderColor: "var(--border)", background: "var(--panel)"}}
+      className="rounded-xl border overflow-hidden"
+      style={{
+        borderColor: "var(--border)",
+        background: "linear-gradient(180deg, var(--panel) 0%, rgba(0,0,0,0.18) 100%)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px -16px rgba(0,0,0,0.5)",
+      }}
     >
-      <header>
-        <h2 className="text-sm font-semibold leading-tight">{title}</h2>
-        {hint && <p className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{hint}</p>}
+      <header
+        className="flex items-start gap-2.5 px-4 py-3 border-b"
+        style={{ borderColor: "var(--border)" }}
+      >
+        {icon && (
+          <span
+            className="grid place-items-center w-7 h-7 rounded-md shrink-0"
+            style={{ background: "rgba(255,255,255,0.04)", color: "var(--accent-2, var(--accent))" }}
+          >
+            {icon}
+          </span>
+        )}
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold leading-tight">{title}</h2>
+          {hint && <p className="text-[11px] mt-1 leading-snug" style={{color: "var(--muted)"}}>{hint}</p>}
+        </div>
       </header>
-      {children}
+      <div className="px-4 py-3">{children}</div>
     </section>
   );
+}
+
+function Field({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{color: "var(--muted)"}}>
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function NumberInput({
+  value, onChange, step, min, max, className = "", placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  step?: number;
+  min?: number;
+  max?: number;
+  className?: string;
+  placeholder?: string;
+}) {
+  return (
+    <input
+      type="number" step={step} min={min} max={max} placeholder={placeholder}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className={`px-3 py-2 text-sm rounded-lg bg-transparent border tabular-nums transition-colors focus:outline-none focus:border-[var(--accent)] ${className}`}
+      style={{borderColor: "var(--border)"}}
+    />
+  );
+}
+
+function SelectInput({
+  value, onChange, options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full px-3 py-2 text-sm rounded-lg bg-transparent border transition-colors focus:outline-none focus:border-[var(--accent)] cursor-pointer"
+      style={{borderColor: "var(--border)"}}
+    >
+      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  );
+}
+
+function PrimaryButton({
+  busy, onClick, disabled, children, className = "",
+}: {
+  busy?: boolean;
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`px-4 py-2 text-xs rounded-lg font-semibold inline-flex items-center gap-1.5 transition-all disabled:opacity-30 disabled:cursor-not-allowed hover:enabled:scale-[1.03] active:enabled:scale-[0.97] ${className}`}
+      style={{
+        background: "var(--accent)",
+        color: "#06121f",
+        boxShadow: disabled ? "none" : "0 4px 14px -6px var(--accent)",
+      }}
+    >
+      {busy && <Spinner />}
+      {children}
+    </button>
+  );
+}
+
+function Pill({ dot, label, value, valueColor }: {
+  dot: string;
+  label: string;
+  value?: string;
+  valueColor?: string;
+}) {
+  return (
+    <span className="inline-flex items-center gap-2 text-xs">
+      <span
+        aria-hidden
+        style={{
+          width: 7, height: 7, borderRadius: "50%", background: dot,
+          boxShadow: `0 0 8px ${dot}`,
+          display: "inline-block",
+        }}
+      />
+      <span style={{color: "var(--muted)"}}>{label}</span>
+      {value !== undefined && (
+        <strong style={{color: valueColor ?? "var(--text)"}}>{value}</strong>
+      )}
+    </span>
+  );
+}
+
+function StatusItem({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-baseline gap-1.5 text-xs">
+      <span className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>
+        {label}
+      </span>
+      <span>{children}</span>
+    </span>
+  );
+}
+
+function Divider() {
+  return <span className="h-3.5 w-px" style={{background: "var(--border)"}} aria-hidden />;
 }
 
 function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
     <div>
-      <div className="text-[9px] uppercase tracking-wider" style={{color: "var(--muted)"}}>{label}</div>
-      <div className="font-medium mt-0.5 tabular-nums" style={{color: color ?? "var(--text)"}}>{value}</div>
+      <div className="text-[9px] uppercase tracking-wider font-medium" style={{color: "var(--muted)"}}>{label}</div>
+      <div className="font-semibold mt-0.5 tabular-nums text-sm" style={{color: color ?? "var(--text)"}}>{value}</div>
     </div>
   );
 }
 
-/** One side of the P&L Limit card — handles both the loss and profit
- *  panels with the same shape. The two only differ by:
- *    - kind (decides label, accent color, headroom verb)
- *    - which save / current / pct / headroom values get plugged in.
- *  Visual: tinted background + border (red for loss, green for profit),
- *  $ + input + Save inline, then a 3-up stat row + a progress bar that
- *  fills up as today's P&L approaches the limit. */
+/** One side of the P&L Limit card. No box around it — the parent card
+ *  + a divider provide the visual grouping. The $-input is one cohesive
+ *  control: a single bordered field with $ inline, focus ring on the
+ *  whole thing (not just the inner input). */
 function PnLLimitPanel({
   kind, input, onInput, onSave, busy, current, todaysPnL, limit, pct, headroom, fmt,
 }: {
@@ -433,47 +556,59 @@ function PnLLimitPanel({
   fmt: (v: string | null | undefined) => string;
 }) {
   const isLoss = kind === "loss";
-  const accent = isLoss ? "var(--bad)" : "var(--good)";
-  const tint = isLoss ? "rgba(239,68,68,0.04)" : "rgba(34,197,94,0.04)";
-  const tintBorder = isLoss ? "rgba(239,68,68,0.18)" : "rgba(34,197,94,0.18)";
   const title = isLoss ? "Daily loss limit" : "Daily profit limit";
-  // Progress bar fills toward the limit. Both go red when ≥100% (limit hit)
-  // because hitting a profit cap is just as much "stop now" as hitting a loss.
-  const barColor = pct >= 100 ? "var(--bad)" : pct >= 75 ? "#f59e0b" : accent;
+  const subtitle = isLoss
+    ? "Pause copy when today's loss reaches this."
+    : "Pause copy when today's profit reaches this.";
+  const barColor = pct >= 100 ? "var(--bad)" : pct >= 75 ? "#f59e0b" : "var(--good)";
   return (
-    <div
-      className="flex-1 min-w-0 rounded-md p-2.5 space-y-2"
-      style={{ background: tint, border: `1px solid ${tintBorder}` }}
-    >
-      <div className="flex items-center gap-2">
-        <span
-          style={{
-            width: 6, height: 6, borderRadius: "50%",
-            background: accent, display: "inline-block",
-          }}
-        />
-        <span className="text-xs font-semibold" style={{color: accent}}>{title}</span>
+    <div className="min-w-0 space-y-3">
+      <div>
+        <div className="text-sm font-semibold">{title}</div>
+        <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{subtitle}</div>
       </div>
+
+      {/* One cohesive $-input: a single bordered field, with USD as a
+          baked-in prefix and input as the body. Focus-within lights the
+          whole shell. The inline style on <input> wipes the global
+          `input[type="number"]` border + background from globals.css —
+          without that override the inner input would render its OWN
+          border inside the shell, creating a box-in-box look. */}
       <div className="flex items-center gap-2">
-        <span className="text-sm" style={{color: "var(--muted)"}}>$</span>
-        <input
-          type="number" step="0.01" min="0" placeholder="no limit"
-          className="w-28 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
-          style={{borderColor: "var(--border)"}}
-          value={input}
-          onChange={(e) => onInput(e.target.value)}
-        />
-        <button
+        <div
+          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
+          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
+        >
+          <span
+            className="px-3 py-2 text-xs font-medium border-r"
+            style={{color: "var(--muted)", borderColor: "var(--border)"}}
+          >
+            USD
+          </span>
+          <input
+            type="number" step="0.01" min="0" placeholder="no limit"
+            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
+            style={{
+              border: "none",
+              background: "transparent",
+              outline: "none",
+              borderRadius: 0,  // overrides globals.css var(--r-sm) inheritance
+              color: "var(--text)",
+            }}
+            value={input}
+            onChange={(e) => onInput(e.target.value)}
+          />
+        </div>
+        <PrimaryButton
+          busy={busy}
           onClick={onSave}
           disabled={busy || input === (current ?? "")}
-          className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-          style={{background: "var(--accent)", color: "#06121f"}}
         >
-          {busy && <Spinner />}
           Save
-        </button>
+        </PrimaryButton>
       </div>
-      <div className="grid grid-cols-3 gap-2 text-xs">
+
+      <div className="grid grid-cols-3 gap-2">
         <Stat label="Today P&L" value={fmt(String(todaysPnL))}
               color={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"} />
         <Stat label="Limit" value={fmt(current)} />
@@ -483,50 +618,76 @@ function PnLLimitPanel({
           color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
         />
       </div>
+
       {limit !== null && (
-        <div className="h-1 rounded overflow-hidden" style={{background: "var(--border)"}}>
-          <div style={{
-            width: `${pct}%`, height: "100%", background: barColor,
-            transition: "width 0.3s ease",
-          }} />
+        <div>
+          <div className="h-1.5 rounded-full overflow-hidden" style={{background: "rgba(255,255,255,0.06)"}}>
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${pct}%`,
+                background: barColor,
+                boxShadow: `0 0 8px -2px ${barColor}`,
+                transition: "width 0.4s ease",
+              }}
+            />
+          </div>
+          <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
+            {Math.round(pct)}% of limit
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function RetrySelect({ label, value, onChange }: {
-  label: string; value: RetryInterval; onChange: (v: RetryInterval) => void;
+/** Single exclusion/inclusion list. No box around it — the parent Card
+ *  + a hairline divider provide visual grouping. */
+function FilterPanel({
+  title, description, counter, symbols, onChange, placeholder,
+}: {
+  title: string;
+  description: React.ReactNode;
+  counter: string;
+  symbols: string[];
+  onChange: (next: string[]) => void;
+  placeholder: string;
 }) {
   return (
-    <div>
-      <label className="block text-[11px] mb-1" style={{color: "var(--muted)"}}>{label}</label>
-      <select
-        className="w-full px-2 py-1.5 text-sm rounded border bg-transparent"
-        style={{borderColor: "var(--border)"}}
-        value={value}
-        onChange={(e) => onChange(e.target.value as RetryInterval)}
-      >
-        {RETRY_OPTIONS.map(opt => (
-          <option key={opt.value} value={opt.value}>{opt.label}</option>
-        ))}
-      </select>
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-semibold">{title}</div>
+          <p className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{description}</p>
+        </div>
+        <span
+          className="text-[10px] px-2 py-0.5 rounded-full tabular-nums whitespace-nowrap"
+          style={{
+            background: "rgba(255,255,255,0.06)",
+            color: "var(--muted)",
+          }}
+        >
+          {counter}
+        </span>
+      </div>
+      <ChipInput
+        symbols={symbols}
+        onChange={onChange}
+        placeholder={placeholder}
+      />
     </div>
   );
 }
 
 /** Chip-style symbol input. Add via Enter or comma. Backspace on empty
- *  input removes the last chip. PATCH-on-every-mutation through the
- *  onChange callback (parent does the API call + revert-on-error). */
-function ChipInput({ symbols, onChange, placeholder, accent }: {
+ *  input removes the last chip. */
+function ChipInput({ symbols, onChange, placeholder }: {
   symbols: string[];
   onChange: (next: string[]) => void;
   placeholder?: string;
-  accent: string;
 }) {
   const [draft, setDraft] = useState("");
 
-  // Dedupe + uppercase on entry so we never persist garbage chips.
   function commit(raw: string) {
     const parts = raw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
     if (parts.length === 0) return;
@@ -545,26 +706,23 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
 
   const empty = useMemo(() => symbols.length === 0, [symbols]);
 
+  // Bordered box explicitly kept here (user request) — the rounded
+  // rectangle signals "this is an editable input field" more clearly
+  // than a bare row of chips with an underline. focus-within lights
+  // the whole border to accent.
   return (
     <div
-      className="rounded border px-1.5 py-1 flex flex-wrap items-center gap-1 min-h-[34px]"
-      style={{borderColor: "var(--border)", background: "rgba(255,255,255,0.02)"}}
+      className="rounded-lg border px-2 py-1.5 flex flex-wrap items-center gap-1.5 min-h-[40px] transition-colors focus-within:border-[var(--accent)]"
+      style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.15)"}}
       onClick={(e) => {
-        // Click anywhere in the box → focus the input.
         const inp = (e.currentTarget.querySelector("input") as HTMLInputElement | null);
         inp?.focus();
       }}
     >
       {symbols.map(sym => (
-        // Flat neutral chip per user-provided mock — dark grey bg, light
-        // text, light × to remove. List identity (excl vs incl) lives on
-        // the container background tint, not on the chips themselves,
-        // which keeps the chip row visually calm even with many entries.
-        // `accent` prop still threaded in case we want to bring back a
-        // subtle hover/border accent later.
         <span
           key={sym}
-          className="inline-flex items-center gap-1.5 px-2 py-0.5 text-xs rounded-md"
+          className="inline-flex items-center gap-1.5 pl-2 pr-1 py-0.5 text-xs rounded-md"
           style={{
             background: "rgba(255,255,255,0.08)",
             color: "var(--text)",
@@ -577,7 +735,7 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
             type="button"
             onClick={(e) => { e.stopPropagation(); remove(sym); }}
             aria-label={`Remove ${sym}`}
-            className="opacity-50 hover:opacity-100 transition-opacity leading-none"
+            className="opacity-50 hover:opacity-100 transition-opacity leading-none w-4 h-4 grid place-items-center rounded hover:bg-white/10"
             style={{color: "var(--text)", fontSize: "14px"}}
           >
             ×
@@ -589,7 +747,6 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
         value={draft}
         onChange={(e) => {
           const v = e.target.value;
-          // Auto-commit when user types a delimiter so chips form as you type.
           if (/[,\s]$/.test(v)) commit(v);
           else setDraft(v);
         }}
@@ -601,9 +758,62 @@ function ChipInput({ symbols, onChange, placeholder, accent }: {
         }}
         onBlur={() => { if (draft.trim()) commit(draft); }}
         placeholder={empty ? placeholder : ""}
-        className="flex-1 min-w-[120px] px-1.5 py-1 text-xs bg-transparent outline-none"
-        style={{color: "var(--text)"}}
+        className="flex-1 min-w-[120px] px-1.5 py-1 text-xs"
+        style={{
+          // Wipe the global input[type="text"] border + background from
+          // globals.css so the inner input sits flush inside the
+          // bordered chip shell instead of rendering its own box.
+          border: "none",
+          background: "transparent",
+          outline: "none",
+          borderRadius: 0,
+          color: "var(--text)",
+        }}
       />
     </div>
+  );
+}
+
+// ── Inline SVG icons (no extra dep) ─────────────────────────────────────
+
+function IconUsers() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+      <circle cx="9" cy="7" r="4"/>
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+      <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+    </svg>
+  );
+}
+function IconShield() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+    </svg>
+  );
+}
+function IconFilter() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+    </svg>
+  );
+}
+function IconRefresh() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 4 23 10 17 10"/>
+      <polyline points="1 20 1 14 7 14"/>
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+    </svg>
+  );
+}
+function IconPower() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+      <line x1="12" y1="2" x2="12" y2="12"/>
+    </svg>
   );
 }
