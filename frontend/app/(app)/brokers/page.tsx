@@ -484,7 +484,7 @@ export default function BrokersPage() {
   const hasConnected = accounts.length > 0;
 
   return (
-    <div className="space-y-6 max-w-[845px]">
+    <div className="space-y-6 max-w-[760px]">
       <div>
         <h1 className="text-2xl font-semibold">Broker connections</h1>
         <p className="text-sm mt-1.5" style={{ color: "var(--muted)" }}>
@@ -578,7 +578,10 @@ export default function BrokersPage() {
           <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: "var(--muted)" }}>
             Choose a broker to connect
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+          {/* 3 columns once the screen is wide enough so the three remaining
+              brokers (Alpaca / SnapTrade / IBKR) fill the row evenly — no
+              empty 4th slot now that direct Webull is gone. */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
             {BROKER_ORDER.map(b => {
               const meta = BROKER_META[b];
               const active = chosenBroker === b;

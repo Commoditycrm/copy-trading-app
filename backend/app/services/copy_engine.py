@@ -175,17 +175,54 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # ── Phase 1: build child orders + skip records ─────────────────────────
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
+    # ── Daily auto-resume sweep ────────────────────────────────────────────
+    # For every subscriber whose copy was previously auto-paused by a P&L
+    # limit, check whether the pause was set on a PRIOR UTC day. If so,
+    # clear the pause + re-enable copy_enabled so today's trades flow.
+    # The pause is keyed off pnl_auto_paused_at (not just copy_enabled=False)
+    # so we don't re-enable users who manually disabled copy.
+    today_utc = datetime.now(timezone.utc).date()
+    resumed_user_ids: list[uuid.UUID] = []
+    for sub in subs:
+        paused_iso = getattr(sub, "pnl_auto_paused_at", None)
+        if not paused_iso:
+            continue
+        try:
+            paused_at = datetime.fromisoformat(paused_iso) if isinstance(paused_iso, str) else paused_iso
+        except ValueError:
+            continue
+        if paused_at.astimezone(timezone.utc).date() < today_utc:
+            db_settings = db.get(SubscriberSettings, sub.user_id)
+            if db_settings is not None:
+                db_settings.copy_enabled = True
+                db_settings.pnl_auto_paused_at = None
+                resumed_user_ids.append(sub.user_id)
+                audit.record(
+                    db,
+                    actor_user_id=sub.user_id,
+                    action="copy.auto_resumed_next_day",
+                    entity_type="subscriber_settings",
+                    entity_id=sub.user_id,
+                    metadata={"paused_at": paused_iso, "resumed_at": today_utc.isoformat()},
+                )
+                events.publish(sub.user_id, {
+                    "type": "copy.auto_resumed",
+                    "reason": "new_day",
+                })
+    if resumed_user_ids:
+        # Re-fetch the active subscriber list AFTER flipping copy_enabled
+        # so the per-sub loop below sees the freshly-resumed users this
+        # very fanout (otherwise they'd need a second trade to fire).
+        cache.invalidate_subscribers_for_trader(trader.id)
+        subs = await cache.get_subscribers_for_trader(db, trader.id)
+
     # PRE-PHASE-1 BATCH: compute today's realized P&L for every subscriber
-    # who has a daily_loss_limit set, in ONE round-trip instead of N. The
-    # old code called today_realized_pnl(db, sub.user_id) once per
-    # subscriber, and each call SELECTed that user's entire fill history
-    # and walked FIFO lot matching from time zero — for 91 subscribers
-    # that single check was the dominant cost in pick_lag (~9s tail). With
-    # this batch we pay it once, in two SELECTs total.
-    #
-    # Subscribers without a limit set don't appear in the result and are
-    # short-circuited inside the per-sub loop below.
-    sub_ids_with_limit = [s.user_id for s in subs if s.daily_loss_limit is not None]
+    # who has EITHER limit set, in ONE round-trip instead of N. Same batch
+    # serves the daily-loss check AND the daily-profit check below.
+    sub_ids_with_limit = [
+        s.user_id for s in subs
+        if s.daily_loss_limit is not None or s.daily_profit_limit is not None
+    ]
     pnl_by_user: dict[uuid.UUID, Decimal] = (
         await asyncio.to_thread(today_realized_pnl_bulk, db, sub_ids_with_limit)
         if sub_ids_with_limit
@@ -203,39 +240,55 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         if not sub_user:
             continue
 
-        # Daily-loss kill switch (check BEFORE placing).
-        if sub.daily_loss_limit is not None:
+        # Daily P&L kill switches (check BEFORE placing). Loss + profit
+        # share the same auto-pause + auto-resume machinery — both stamp
+        # pnl_auto_paused_at so the next-day sweep above re-enables them.
+        if sub.daily_loss_limit is not None or sub.daily_profit_limit is not None:
             todays_pnl = pnl_by_user.get(sub.user_id, Decimal(0))
-            if todays_pnl <= -sub.daily_loss_limit:
-                # Flip the DB row off so future fanouts skip cheap. Also bust
-                # the subscriber cache so other workers see it on next read.
+            hit_loss = (
+                sub.daily_loss_limit is not None
+                and todays_pnl <= -sub.daily_loss_limit
+            )
+            hit_profit = (
+                sub.daily_profit_limit is not None
+                and todays_pnl >= sub.daily_profit_limit
+            )
+            if hit_loss or hit_profit:
+                reason = "daily_loss_limit" if hit_loss else "daily_profit_limit"
+                now_utc = datetime.now(timezone.utc)
+                # Flip the DB row off + stamp pnl_auto_paused_at so the
+                # next-day sweep above re-enables this subscriber on the
+                # next fanout after UTC midnight.
                 db_settings = db.get(SubscriberSettings, sub.user_id)
                 if db_settings is not None:
                     db_settings.copy_enabled = False
+                    db_settings.pnl_auto_paused_at = now_utc
                 cache.invalidate_subscribers_for_trader(trader.id)
                 audit.record(
                     db,
                     actor_user_id=sub.user_id,
-                    action="copy.auto_paused_daily_loss",
+                    action=f"copy.auto_paused_{reason}",
                     entity_type="subscriber_settings",
                     entity_id=sub.user_id,
                     metadata={
-                        "daily_loss_limit": str(sub.daily_loss_limit),
+                        "daily_loss_limit": str(sub.daily_loss_limit) if sub.daily_loss_limit else None,
+                        "daily_profit_limit": str(sub.daily_profit_limit) if sub.daily_profit_limit else None,
                         "todays_realized_pnl": str(todays_pnl),
                         "trigger_order_id": str(trader_order.id),
                     },
                 )
                 events.publish(sub.user_id, {
                     "type": "copy.auto_paused",
-                    "reason": "daily_loss_limit",
-                    "daily_loss_limit": str(sub.daily_loss_limit),
+                    "reason": reason,
+                    "daily_loss_limit": str(sub.daily_loss_limit) if sub.daily_loss_limit else None,
+                    "daily_profit_limit": str(sub.daily_profit_limit) if sub.daily_profit_limit else None,
                     "todays_realized_pnl": str(todays_pnl),
                 })
                 results.append(FanoutResult(
                     subscriber_user_id=sub.user_id,
                     broker_account_id=uuid.UUID(int=0),
                     order_id=None,
-                    status="skipped_daily_loss_limit",
+                    status=f"skipped_{reason}",
                 ))
                 continue
 

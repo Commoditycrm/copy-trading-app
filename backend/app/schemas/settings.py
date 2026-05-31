@@ -11,6 +11,10 @@ class SubscriberSettingsOut(BaseModel):
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    # Symmetric counterpart to daily_loss_limit. Positive amount — e.g. 500
+    # means "auto-pause copy after $500 realized profit today". NULL = no
+    # profit cap.
+    daily_profit_limit: Decimal | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
     # Retry policy for transient broker errors. "never" disables retry.
     # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
@@ -58,6 +62,14 @@ class DailyLossLimitIn(BaseModel):
     """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
 
     daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class DailyProfitLimitIn(BaseModel):
+    """Subscriber-set daily realized-profit auto-pause. Pass null to disable.
+    Symmetric to DailyLossLimitIn — both flip copy_enabled=False when hit,
+    both auto-resume at the next UTC midnight via copy_engine."""
+
+    daily_profit_limit: Decimal | None = Field(default=None, ge=0)
 
 
 class RetryIntervalIn(BaseModel):

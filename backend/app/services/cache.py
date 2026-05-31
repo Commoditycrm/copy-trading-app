@@ -39,6 +39,11 @@ class CachedSubscriber:
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    daily_profit_limit: Decimal | None = None
+    # ISO-8601 string (not datetime) so the JSON round-trip is trivial.
+    # Read as "the subscriber's copy was last auto-paused by a P&L limit
+    # at this UTC moment." None = not currently auto-paused.
+    pnl_auto_paused_at: str | None = None
     # Per-subscriber symbol filters. Empty list = no filter. Stored as
     # tuple here (frozen dataclass needs hashable fields) but serialized
     # back/forth as JSON lists.
@@ -71,12 +76,19 @@ def _k_accts(user_id: uuid.UUID) -> str:
 
 
 def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
+    paused_at = getattr(s, "pnl_auto_paused_at", None)
+    # ORM gives a datetime; CachedSubscriber gives an ISO string already.
+    # Normalize to ISO string for the JSON payload either way.
+    if paused_at is not None and not isinstance(paused_at, str):
+        paused_at = paused_at.isoformat()
     return {
         "user_id": str(s.user_id),
         "following_trader_id": str(s.following_trader_id) if s.following_trader_id else None,
         "copy_enabled": bool(s.copy_enabled),
         "multiplier": str(s.multiplier),
         "daily_loss_limit": str(s.daily_loss_limit) if s.daily_loss_limit is not None else None,
+        "daily_profit_limit": str(s.daily_profit_limit) if getattr(s, "daily_profit_limit", None) is not None else None,
+        "pnl_auto_paused_at": paused_at,
         # JSONB columns come off the ORM as plain lists; CachedSubscriber
         # stores them as tuples for hashability. Either way, serialize as
         # JSON lists.
@@ -92,8 +104,9 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         copy_enabled=d["copy_enabled"],
         multiplier=Decimal(d["multiplier"]),
         daily_loss_limit=Decimal(d["daily_loss_limit"]) if d["daily_loss_limit"] is not None else None,
-        # Tolerate older cached entries that pre-date the symbol-filter
-        # fields by defaulting to empty tuples (= no filter).
+        # Tolerate older cached entries that pre-date these fields.
+        daily_profit_limit=Decimal(d["daily_profit_limit"]) if d.get("daily_profit_limit") is not None else None,
+        pnl_auto_paused_at=d.get("pnl_auto_paused_at"),
         symbol_exclusion_list=tuple(d.get("symbol_exclusion_list") or ()),
         symbol_inclusion_list=tuple(d.get("symbol_inclusion_list") or ()),
     )
@@ -160,6 +173,8 @@ async def get_subscribers_for_trader(
             copy_enabled=row.copy_enabled,
             multiplier=row.multiplier,
             daily_loss_limit=row.daily_loss_limit,
+            daily_profit_limit=row.daily_profit_limit,
+            pnl_auto_paused_at=row.pnl_auto_paused_at.isoformat() if row.pnl_auto_paused_at else None,
             symbol_exclusion_list=tuple(row.symbol_exclusion_list or ()),
             symbol_inclusion_list=tuple(row.symbol_inclusion_list or ()),
         )

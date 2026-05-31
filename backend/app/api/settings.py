@@ -8,6 +8,7 @@ from app.models.settings import RetryInterval, SubscriberSettings, TraderSetting
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
+    DailyProfitLimitIn,
     FollowTraderIn,
     RetryIntervalIn,
     SubscriberSelfMultiplierIn,
@@ -36,6 +37,52 @@ def get_subscriber_settings(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        daily_profit_limit=s.daily_profit_limit,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+        retry_interval_open=s.retry_interval_open.value,
+        retry_interval_close=s.retry_interval_close.value,
+        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
+        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
+    )
+
+
+@router.patch("/subscriber/daily-profit-limit", response_model=SubscriberSettingsOut)
+def set_daily_profit_limit(
+    payload: DailyProfitLimitIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set / clear the daily realized-profit auto-pause. Symmetric to
+    set_daily_loss_limit — same audit + cache-bust + response shape."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_profit_limit
+    s.daily_profit_limit = payload.daily_profit_limit
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_profit_limit_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_profit_limit) if payload.daily_profit_limit is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        daily_profit_limit=s.daily_profit_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
@@ -78,6 +125,7 @@ def set_daily_loss_limit(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        daily_profit_limit=s.daily_profit_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
@@ -137,6 +185,7 @@ def set_retry_interval(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        daily_profit_limit=s.daily_profit_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
@@ -212,6 +261,7 @@ def set_symbol_filter(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        daily_profit_limit=s.daily_profit_limit,
         todays_realized_pnl=today_realized_pnl(db, user.id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,

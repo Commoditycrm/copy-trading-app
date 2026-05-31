@@ -1,8 +1,9 @@
 import enum
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Enum, ForeignKey, Numeric
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -58,6 +59,22 @@ class SubscriberSettings(Base, TimestampMixin):
     # When today's realized P&L falls below -daily_loss_limit, copy_enabled is
     # auto-flipped to false and an audit + SSE event are emitted.
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+
+    # Daily realized-PROFIT kill switch — symmetric counterpart to
+    # daily_loss_limit. Positive amount (e.g. 500 = "stop after $500 profit
+    # today"). NULL disables. When today's realized P&L reaches
+    # +daily_profit_limit, copy_enabled flips to false (same path as loss).
+    daily_profit_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+
+    # Set to the UTC timestamp at which a P&L-limit (loss OR profit) flipped
+    # copy_enabled to False. NULL means "not paused by a limit" — either the
+    # user manually disabled (we leave them alone), or copy is currently
+    # enabled. On every fanout entry, if this timestamp is set AND its UTC
+    # date is < today's UTC date, copy_engine clears it and re-enables
+    # copy_enabled — that's how "auto-resume next day" works.
+    pnl_auto_paused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     # Retry policy for transient broker errors. Two separate intervals so a
     # subscriber can be aggressive about closing positions (late close hurts
