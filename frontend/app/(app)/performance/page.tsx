@@ -91,7 +91,14 @@ function fmtMs(ms: number | null | undefined): string {
   if (ms === null || ms === undefined) return "—";
   if (ms < 0) return "—";
   if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(2)}s`;
+  if (ms < 60_000) {
+    // Floor to centiseconds (not round) so values like 59999ms don't
+    // display as "60.00s" — which made it look like the >60s minutes
+    // switch was broken. Now 59999ms → "59.99s" and only true ≥60s
+    // values cross into the minutes formatter below.
+    const cs = Math.floor(ms / 10);
+    return `${(cs / 100).toFixed(2)}s`;
+  }
   // ≥ 60s → minutes + seconds, e.g. "1m 05s", "2m 30s".
   const totalSec = Math.floor(ms / 1000);
   const m = Math.floor(totalSec / 60);
