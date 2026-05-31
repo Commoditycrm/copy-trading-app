@@ -20,6 +20,15 @@ services:
     # the managed cloud Postgres/Redis), JWT_SECRET, CREDENTIAL_ENCRYPTION_KEY,
     # SNAPTRADE_CLIENT_ID/CONSUMER_KEY, etc. See app/config.py.
     env_file: ./backend/.env
+    # Force IPv4 to the managed Neon Postgres. Neon's hostname resolves to both
+    # AAAA (IPv6) and A (IPv4) records, with IPv6 first; but Lightsail instances
+    # have no IPv6 egress, so the backend's getaddrinfo picks an IPv6 address and
+    # every connect() returns "Network is unreachable", crash-looping the app and
+    # surfacing as a 502 through Caddy. Disabling IPv6 inside the container makes
+    # getaddrinfo return only the (reachable) A records.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     # Bound to localhost; Caddy (in the override) proxies to it over the
     # compose network. Nothing is exposed publicly except via Caddy on 80/443.
     ports:
