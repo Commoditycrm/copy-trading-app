@@ -27,11 +27,13 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
@@ -216,9 +218,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         cache.invalidate_subscribers_for_trader(trader.id)
         subs = await cache.get_subscribers_for_trader(db, trader.id)
 
-    # PRE-PHASE-1 BATCH: compute today's realized P&L for every subscriber
-    # who has EITHER limit set, in ONE round-trip instead of N. Same batch
-    # serves the daily-loss check AND the daily-profit check below.
+    # PRE-PHASE-1 BATCH (1/3): compute today's realized P&L for every
+    # subscriber who has EITHER limit set, in ONE round-trip instead of N.
+    # Same batch serves the daily-loss check AND the daily-profit check below.
     sub_ids_with_limit = [
         s.user_id for s in subs
         if s.daily_loss_limit is not None or s.daily_profit_limit is not None
@@ -229,14 +231,44 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         else {}
     )
 
+    # PRE-PHASE-1 BATCH (2/3): one SELECT for all subscriber Users.
+    # Previously this was a per-iteration ``db.get(User, sub.user_id)`` —
+    # 300 subscribers = 300 round-trips, the dominant component of
+    # pick_lag at scale. Now: one query, in-memory lookup inside the loop.
+    sub_user_ids = [s.user_id for s in subs]
+    users_by_id: dict[uuid.UUID, User] = {}
+    if sub_user_ids:
+        users_by_id = {
+            u.id: u
+            for u in db.execute(
+                select(User).where(User.id.in_(sub_user_ids))
+            ).scalars()
+        }
+
+    # PRE-PHASE-1 BATCH (3/3): one SELECT for every broker account across
+    # all subscribers. Previously this was a per-iteration
+    # ``await cache.get_broker_accounts(...)`` which, even with warm Redis,
+    # still cost a sequential await per subscriber and fell back to a DB
+    # query on cache miss (a likely culprit for the 17s pick_lag observed
+    # on a freshly-seeded 300-subscriber test where the cache was cold).
+    # Grouped by user_id so the per-sub loop is a pure dict lookup.
+    accts_by_user: dict[uuid.UUID, list[BrokerAccount]] = defaultdict(list)
+    if sub_user_ids:
+        for acct in db.execute(
+            select(BrokerAccount).where(BrokerAccount.user_id.in_(sub_user_ids))
+        ).scalars():
+            accts_by_user[acct.user_id].append(acct)
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
         # below. Captured here (not inside the inner per-account loop) so it
-        # reflects the per-subscriber pick, not per-account.
+        # reflects the per-subscriber pick, not per-account. After batching,
+        # all picked_at values are within microseconds — pick_lag is now a
+        # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
 
-        sub_user = db.get(User, sub.user_id)
+        sub_user = users_by_id.get(sub.user_id)
         if not sub_user:
             continue
 
@@ -334,7 +366,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
             continue
 
-        sub_accounts = await cache.get_broker_accounts(db, sub.user_id)
+        # Pre-batched at the top of fanout — pure dict lookup, no IO.
+        sub_accounts = accts_by_user.get(sub.user_id, [])
         if not sub_accounts:
             results.append(FanoutResult(
                 subscriber_user_id=sub.user_id,

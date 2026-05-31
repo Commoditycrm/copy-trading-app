@@ -120,8 +120,36 @@ export default function SubscribersPage() {
     );
   }, [selected]);
 
+  // At-a-glance counts shown in the page header. `active` = copy on,
+  // `paused` = copy off (subscriber-side disable OR daily-loss auto-pause).
+  // The numbers re-derive from `rows` so they're always in sync with the
+  // table below — no risk of a stale count after a remove / refresh.
+  const total = rows.length;
+  const active = rows.filter(r => r.copy_enabled).length;
+  const paused = total - active;
+
   return (
     <div className="space-y-4">
+      {/* ── Page header with subscriber counts ──────────────────────────
+          Plain stat strip — total, active, paused — so the trader can
+          see at a glance how many people are following them and how
+          many currently have copy ON. */}
+      <header className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          {/* <h1 className="text-xl font-semibold tracking-tight">Subscribers</h1> */}
+          <p className="text-xs mt-0.5" style={{color: "var(--muted)"}}>
+            People copying your trades.
+          </p>
+        </div>
+        <div className="inline-flex items-center gap-4">
+          <CountStat label="Total" value={total} loading={loading} />
+          <Divider />
+          <CountStat label="Copy ON" value={active} loading={loading} color="var(--good)" />
+          <Divider />
+          <CountStat label="Paused" value={paused} loading={loading} color={paused > 0 ? "var(--muted)" : "var(--text)"} />
+        </div>
+      </header>
+
       {bulkBar}
 
       <div className="overflow-x-auto rounded border" style={{borderColor: "var(--border)"}}>
@@ -138,7 +166,7 @@ export default function SubscribersPage() {
                   disabled={loading || rows.length === 0}
                 />
               </th>
-              {["Subscriber", "Copy", "Brokers", "30d realized P&L", ""].map(h =>
+              {["Subscriber", "Copy", "Broker", "30d realized P&L", ""].map(h =>
                 <th key={h} className="text-left px-3 py-2 font-medium" style={{color: "var(--muted)"}}>{h}</th>
               )}
             </tr>
@@ -179,7 +207,17 @@ export default function SubscribersPage() {
                       {r.copy_enabled ? "ON" : "OFF"}
                     </span>
                   </td>
-                  <td className="px-3 py-2">{r.broker_count}</td>
+                  <td className="px-3 py-2">
+                    {/* Plain status text — green for connected, muted for not.
+                        broker_count == 0 means fanout will skip this row with
+                        status="skipped_no_broker". */}
+                    <span
+                      className="text-xs"
+                      style={{color: r.broker_count > 0 ? "var(--good)" : "var(--muted)"}}
+                    >
+                      {r.broker_count > 0 ? "Connected" : "Not Connected"}
+                    </span>
+                  </td>
                   <td className="px-3 py-2" style={{color: pnl >= 0 ? "var(--good)" : "var(--bad)"}}>
                     {pnl.toLocaleString(undefined, { style: "currency", currency: "USD" })}
                   </td>
@@ -247,4 +285,36 @@ export default function SubscribersPage() {
       )}
     </div>
   );
+}
+
+// ── Header-strip helpers ──────────────────────────────────────────────
+
+/** One labelled count in the header stat strip. Shows a small dash while
+ *  the initial fetch is in flight so the row doesn't briefly read "0/0/0"
+ *  before real data arrives. */
+function CountStat({
+  label, value, loading, color,
+}: {
+  label: string;
+  value: number;
+  loading: boolean;
+  color?: string;
+}) {
+  return (
+    <span className="inline-flex items-baseline gap-1.5 text-xs">
+      <span className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>
+        {label}
+      </span>
+      <strong
+        className="tabular-nums text-sm"
+        style={{color: color ?? "var(--text)"}}
+      >
+        {loading ? "—" : value}
+      </strong>
+    </span>
+  );
+}
+
+function Divider() {
+  return <span aria-hidden className="h-3.5 w-px" style={{background: "var(--border)"}} />;
 }
