@@ -9,16 +9,20 @@ from app.brokers.base import (
 from app.brokers.fake import FakeBrokerAdapter
 from app.brokers.ibkr import IBKRAdapter
 from app.brokers.snaptrade import SnapTradeAdapter
-from app.brokers.webull import WebullAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
 
 
 def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapter:
-    """Construct an adapter for the broker_account using its decrypted credentials."""
+    """Construct an adapter for the broker_account using its decrypted credentials.
+
+    Note: ``BrokerName.WEBULL`` is intentionally NOT routed here — the direct
+    Webull integration has been removed (users connect Webull via SnapTrade
+    instead, which lands as ``BrokerName.SNAPTRADE`` rows). The enum value is
+    kept around so any historic webull DB rows / audit entries still load,
+    but creating a new direct-webull account is no longer possible.
+    """
     if broker_account.broker == BrokerName.ALPACA:
         return AlpacaAdapter(credentials)
-    if broker_account.broker == BrokerName.WEBULL:
-        return WebullAdapter(credentials)
     if broker_account.broker == BrokerName.SNAPTRADE:
         return SnapTradeAdapter(credentials)
     if broker_account.broker == BrokerName.IBKR:
@@ -42,7 +46,6 @@ __all__ = [
     "FakeBrokerAdapter",
     "IBKRAdapter",
     "SnapTradeAdapter",
-    "WebullAdapter",
     "adapter_for",
     "build_occ_symbol",
 ]

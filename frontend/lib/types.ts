@@ -17,6 +17,10 @@ export interface BrokerAccount {
   is_paper: boolean;
   supports_fractional: boolean;
   broker_account_number: string | null;
+  // Underlying broker for SnapTrade-routed accounts (e.g. "Webull",
+  // "Robinhood", "IBKR"). null for direct-API brokers — `broker` itself
+  // is already the real name in that case.
+  brokerage_name?: string | null;
   connection_status: "pending" | "connected" | "error";
   last_error: string | null;
   created_at: string;
@@ -122,6 +126,12 @@ export interface SubscriberSettings {
   retry_interval_open: RetryInterval;
   /** Retry policy for transient broker errors when *closing* a position. */
   retry_interval_close: RetryInterval;
+  /** Subscriber's symbol denylist — trader trades on these symbols are
+   *  NOT mirrored to this subscriber. Empty = no filter. Uppercase. */
+  symbol_exclusion_list: string[];
+  /** Subscriber's symbol allowlist — when non-empty, only trader trades
+   *  on these symbols ARE mirrored. Empty = no filter (mirror all). */
+  symbol_inclusion_list: string[];
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

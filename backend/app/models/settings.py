@@ -3,7 +3,7 @@ import uuid
 from decimal import Decimal
 
 from sqlalchemy import Boolean, Enum, ForeignKey, Numeric
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -71,6 +71,21 @@ class SubscriberSettings(Base, TimestampMixin):
     retry_interval_close: Mapped[RetryInterval] = mapped_column(
         Enum(RetryInterval, name="retry_interval"),
         default=RetryInterval.NEVER, server_default="never", nullable=False,
+    )
+
+    # Per-subscriber symbol filters. Both stored as JSONB arrays of
+    # uppercase tickers ("AAPL", "TSLA"). copy_engine consults these on
+    # every fanout:
+    #   - exclusion_list non-empty + trader's symbol IN it  → skip mirror
+    #   - inclusion_list non-empty + trader's symbol NOT in → skip mirror
+    #   - empty lists                                       → mirror everything
+    # Defaults are empty so existing subscribers' behaviour is unchanged
+    # after the migration.
+    symbol_exclusion_list: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default="[]", nullable=False,
+    )
+    symbol_inclusion_list: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default="[]", nullable=False,
     )
 
     user = relationship("User", back_populates="subscriber_settings", foreign_keys=[user_id])

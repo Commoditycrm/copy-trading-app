@@ -13,34 +13,7 @@ class AlpacaCredentialsIn(BaseModel):
     paper: bool = True
 
 
-class WebullCredentialsIn(BaseModel):
-    """All five fields are required. ``mfa_code`` is the SMS/email code the
-    user just received after hitting ``/api/brokers/webull/start-mfa``;
-    if it's stale Webull rejects the login and the user has to restart
-    the flow. ``trade_pin`` is the 6-digit PIN they set in Webull's
-    mobile app for trade confirmation — without it we can't place
-    orders, so we collect it up front rather than blocking the first
-    copy."""
-
-    username: str = Field(min_length=3, max_length=200)
-    password: str = Field(min_length=4, max_length=200)
-    mfa_code: str = Field(min_length=3, max_length=20)
-    trade_pin: str = Field(min_length=4, max_length=12)
-    paper: bool = True
-
-
-class StartWebullMfaIn(BaseModel):
-    """Step 1 of the Webull connect flow: trigger Webull to send the MFA
-    code. We don't store anything yet — the user comes back with
-    ``WebullCredentialsIn`` on the second call."""
-
-    username: str = Field(min_length=3, max_length=200)
-    paper: bool = True
-
-
-class StartWebullMfaOut(BaseModel):
-    sent: bool
-    message: str
+# Direct Webull schemas removed — users connect Webull via SnapTrade.
 
 
 class IbkrCredentialsIn(BaseModel):
@@ -90,7 +63,6 @@ class ConnectBrokerIn(BaseModel):
     # SnapTrade has its own two-step flow (start-portal → finish) and
     # doesn't use this generic shape.
     alpaca: AlpacaCredentialsIn | None = None
-    webull: WebullCredentialsIn | None = None
     ibkr:   IbkrCredentialsIn   | None = None
 
 
@@ -101,6 +73,10 @@ class BrokerAccountOut(BaseModel):
     is_paper: bool
     supports_fractional: bool
     broker_account_number: str | None
+    # Underlying broker for aggregator-routed accounts (broker=snaptrade).
+    # NULL for direct-API brokers because `broker` itself is already the
+    # real name.
+    brokerage_name: str | None = None
     connection_status: str
     last_error: str | None
     created_at: datetime

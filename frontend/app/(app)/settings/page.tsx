@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -8,11 +8,11 @@ import { Spinner } from "@/components/Spinner";
 import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
-  { value: "never", label: "Never (REJECT immediately)" },
-  { value: "1m",    label: "Retry after 1 minute" },
-  { value: "2m",    label: "Retry after 2 minutes" },
-  { value: "3m",    label: "Retry after 3 minutes" },
-  { value: "5m",    label: "Retry after 5 minutes" },
+  { value: "never", label: "Never (REJECT)" },
+  { value: "1m",    label: "After 1 min" },
+  { value: "2m",    label: "After 2 min" },
+  { value: "3m",    label: "After 3 min" },
+  { value: "5m",    label: "After 5 min" },
 ];
 
 export default function SettingsPage() {
@@ -41,23 +41,19 @@ export default function SettingsPage() {
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
 
-  // Listen for the auto-pause event from the backend so the UI reacts instantly
-  // when the daily-loss limit fires (no refresh needed).
+  // Auto-pause SSE → refresh sub.
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
     if (e?.type === "copy.auto_paused") {
       notify.error(
         `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily limit ($${e.daily_loss_limit}).`,
-        { autoClose: false }   // sticky — important enough to require dismissal
+        { autoClose: false }
       );
-      // Pull fresh settings so the UI's copy toggle now shows OFF.
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
     }
   });
 
-  // Copy on/off lives in the sidebar now — keep the patch path documented
-  // there only.
   async function follow(traderId: string | null) {
     setSub(await api<SubscriberSettings>("/api/settings/subscriber/follow", {
       method: "PATCH", body: JSON.stringify({ trader_id: traderId })
@@ -72,8 +68,7 @@ export default function SettingsPage() {
       }
       const rounded = (Math.round(n * 10) / 10).toFixed(1);
       const s = await api<SubscriberSettings>("/api/settings/subscriber/multiplier", {
-        method: "PATCH",
-        body: JSON.stringify({ multiplier: rounded }),
+        method: "PATCH", body: JSON.stringify({ multiplier: rounded }),
       });
       setSub(s);
       setMultInput(parseFloat(s.multiplier).toString());
@@ -90,8 +85,7 @@ export default function SettingsPage() {
       const trimmed = limitInput.trim();
       const body = { daily_loss_limit: trimmed === "" ? null : trimmed };
       const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit", {
-        method: "PATCH",
-        body: JSON.stringify(body),
+        method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
       setLimitInput(s.daily_loss_limit ?? "");
@@ -112,14 +106,29 @@ export default function SettingsPage() {
         { method: "PATCH", body: JSON.stringify(body) },
       );
       setSub(s);
-      const verb = direction === "open" ? "opening" : "closing";
-      notify.success(
-        value === "never"
-          ? `Retry for ${verb} positions disabled`
-          : `Retry for ${verb} positions set to ${RETRY_OPTIONS.find(o => o.value === value)?.label}`
-      );
     } catch (e) {
       notify.fromError(e, "Could not update retry interval");
+    }
+  }
+
+  // Symbol-filter PATCH used by both chip lists. Optimistic update +
+  // revert on error so the chip vanishes/reappears instantly.
+  async function saveSymbolFilter(
+    which: "symbol_exclusion_list" | "symbol_inclusion_list",
+    next: string[],
+  ) {
+    if (!sub) return;
+    const prev = sub;
+    setSub({ ...sub, [which]: next });
+    try {
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/symbol-filter",
+        { method: "PATCH", body: JSON.stringify({ [which]: next }) },
+      );
+      setSub(s);
+    } catch (e) {
+      setSub(prev);
+      notify.fromError(e, "Could not update symbol filter");
     }
   }
 
@@ -131,15 +140,12 @@ export default function SettingsPage() {
 
   if (!user) return <p style={{color: "var(--muted)"}}>Loading…</p>;
 
-  // Helper to format a Decimal-like string as USD; "$" sign + 2 dp.
   const fmt = (v: string | null | undefined): string => {
     if (v === null || v === undefined || v === "") return "—";
     const n = Number(v);
     if (!Number.isFinite(n)) return v;
     return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
   };
-
-  // Drop trailing zeros from the backend's "1.300" → "1.3", "1.000" → "1".
   const fmtMultiplier = (v: string): string => {
     const n = parseFloat(v);
     return Number.isFinite(n) ? n.toString() : v;
@@ -147,21 +153,21 @@ export default function SettingsPage() {
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
   const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
-  const headroom = limit !== null ? limit + todaysPnL : null;  // todaysPnL is negative when losing
+  const headroom = limit !== null ? limit + todaysPnL : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
 
   return (
-    <div className="space-y-6 max-w-2xl">
-      <h1 className="text-2xl font-semibold">Settings</h1>
+    <div className="space-y-4 max-w-3xl">
+      <h1 className="text-xl font-semibold">Settings</h1>
 
       {user.role === "subscriber" && sub && (
         <>
-          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
-            <h2 className="font-medium">Following trader</h2>
+          {/* ── Following trader (inline) ─────────────────────────── */}
+          <Card title="Following trader">
             <select
               value={sub.following_trader_id ?? ""}
               onChange={e => follow(e.target.value || null)}
-              className="w-full p-2 rounded bg-transparent border"
+              className="w-full px-2 py-1.5 text-sm rounded bg-transparent border"
               style={{borderColor: "var(--border)"}}
             >
               <option value="">— not following anyone —</option>
@@ -169,190 +175,271 @@ export default function SettingsPage() {
                 <option key={t.id} value={t.id}>{t.display_name ?? t.email}</option>
               ))}
             </select>
-          </section>
+          </Card>
 
-          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
-            <h2 className="font-medium">Trade multiplier</h2>
-            <p className="text-sm" style={{color: "var(--muted)"}}>
-              Each mirrored order will be sized at trader_qty × this multiplier. Default is 1. Max 10.
-            </p>
-            <div className="flex items-center gap-2">
-              <input
-                type="number" step="0.1" min="0.1" max="10"
-                className="w-32 p-2 rounded bg-transparent border" style={{borderColor: "var(--border)"}}
-                value={multInput}
-                onChange={(e) => setMultInput(e.target.value)}
-              />
-              <button
-                onClick={saveMultiplier}
-                disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
-                className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
-                style={{background: "var(--accent)", color: "#06121f"}}
-              >
-                <span>Save</span>
-                {multBusy && <Spinner />}
-              </button>
-              {parseFloat(multInput) !== parseFloat(sub.multiplier) && (
+          {/* ── Multiplier + Daily Loss Limit (2-up) ────────────────── */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Card title="Trade multiplier" hint="trader_qty × this. 0.1–10.">
+              <div className="flex items-center gap-2">
+                <input
+                  type="number" step="0.1" min="0.1" max="10"
+                  className="w-24 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
+                  style={{borderColor: "var(--border)"}}
+                  value={multInput}
+                  onChange={(e) => setMultInput(e.target.value)}
+                />
+                <span className="text-xs" style={{color: "var(--muted)"}}>
+                  current ×{fmtMultiplier(sub.multiplier)}
+                </span>
                 <button
-                  onClick={() => setMultInput(parseFloat(sub.multiplier).toString())}
-                  className="px-3 py-2 text-sm rounded border"
-                  style={{borderColor: "var(--border)", color: "var(--muted)"}}
+                  onClick={saveMultiplier}
+                  disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
+                  className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+                  style={{background: "var(--accent)", color: "#06121f"}}
                 >
-                  Reset
+                  {multBusy && <Spinner />}
+                  Save
                 </button>
-              )}
-              <span className="text-sm ml-2" style={{color: "var(--muted)"}}>
-                current: ×{fmtMultiplier(sub.multiplier)}
-              </span>
-            </div>
-          </section>
-
-          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
-            <h2 className="font-medium">Daily Loss Limit</h2>
-            <p className="text-sm" style={{color: "var(--muted)"}}>
-              When today&rsquo;s realized loss reaches this amount, copy trading turns OFF automatically. Resets daily at UTC midnight. Leave blank to disable.
-            </p>
-
-            {/* today's P&L + headroom display */}
-            <div className="grid grid-cols-3 gap-4 p-3 rounded" style={{background: "rgba(255,255,255,0.02)"}}>
-              <div>
-                <div className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>Today&rsquo;s P&amp;L</div>
-                <div className="text-sm font-medium mt-0.5" style={{color: todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}}>
-                  {fmt(sub.todays_realized_pnl)}
-                </div>
               </div>
-              <div>
-                <div className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>Limit</div>
-                <div className="text-sm font-medium mt-0.5">{fmt(sub.daily_loss_limit)}</div>
-              </div>
-              <div>
-                <div className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>Headroom</div>
-                <div className="text-sm font-medium mt-0.5" style={{color: (headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}}>
-                  {limit === null ? "—" : fmt(String(headroom))}
-                </div>
-              </div>
-            </div>
+            </Card>
 
-            {limit !== null && (
-              <div className="h-1 rounded overflow-hidden" style={{background: "var(--border)"}}>
-                <div
-                  style={{
-                    width: `${limitPct}%`,
-                    height: "100%",
+            <Card title="Daily loss limit" hint="copy turns OFF when hit. blank = disabled.">
+              <div className="flex items-center gap-2">
+                <span className="text-sm" style={{color: "var(--muted)"}}>$</span>
+                <input
+                  type="number" step="0.01" min="0" placeholder="no limit"
+                  className="w-28 px-2 py-1.5 text-sm rounded bg-transparent border tabular-nums"
+                  style={{borderColor: "var(--border)"}}
+                  value={limitInput}
+                  onChange={(e) => setLimitInput(e.target.value)}
+                />
+                <button
+                  onClick={saveLimit}
+                  disabled={limitBusy || limitInput === (sub.daily_loss_limit ?? "")}
+                  className="ml-auto px-3 py-1.5 text-xs rounded font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+                  style={{background: "var(--accent)", color: "#06121f"}}
+                >
+                  {limitBusy && <Spinner />}
+                  Save
+                </button>
+              </div>
+
+              {/* compact metric row: pnl / limit / headroom */}
+              <div className="grid grid-cols-3 gap-2 mt-2 text-xs">
+                <Stat label="Today P&L" value={fmt(sub.todays_realized_pnl)}
+                      color={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"} />
+                <Stat label="Limit" value={fmt(sub.daily_loss_limit)} />
+                <Stat label="Headroom" value={limit === null ? "—" : fmt(String(headroom))}
+                      color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"} />
+              </div>
+              {limit !== null && (
+                <div className="h-1 mt-2 rounded overflow-hidden" style={{background: "var(--border)"}}>
+                  <div style={{
+                    width: `${limitPct}%`, height: "100%",
                     background: limitPct >= 100 ? "var(--bad)" : limitPct >= 75 ? "#f59e0b" : "var(--good)",
                     transition: "width 0.3s ease",
-                  }}
-                />
-              </div>
-            )}
-
-            <div className="flex items-center gap-2">
-              <span style={{color: "var(--muted)"}}>$</span>
-              <input
-                type="number" step="0.01" min="0"
-                placeholder="(no limit)"
-                className="w-40 p-2 rounded bg-transparent border" style={{borderColor: "var(--border)"}}
-                value={limitInput}
-                onChange={(e) => setLimitInput(e.target.value)}
-              />
-              <button
-                onClick={saveLimit}
-                disabled={limitBusy || limitInput === (sub.daily_loss_limit ?? "")}
-                className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
-                style={{background: "var(--accent)", color: "#06121f"}}
-              >
-                <span>Save</span>
-                {limitBusy && <Spinner />}
-              </button>
-              {sub.daily_loss_limit !== null && (
-                <button
-                  onClick={() => { setLimitInput(""); }}
-                  className="px-3 py-2 text-sm rounded border"
-                  style={{borderColor: "var(--border)", color: "var(--muted)"}}
-                  title="Clear the limit (then click Save)"
-                >
-                  Clear
-                </button>
+                  }} />
+                </div>
               )}
-            </div>
-          </section>
+            </Card>
+          </div>
 
-          {/* Retry mirror orders on broker errors — wraps the per-direction
-              policy from anitha-workspace into a single section keyed to
-              main's section styling. */}
-          <section className="p-4 rounded border space-y-4" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
-            <div>
-              <h2 className="font-medium">Retry mirror orders on broker errors</h2>
-              <p className="text-sm" style={{color: "var(--muted)"}}>
-                If your broker is unreachable when a mirror order is placed (network blip,
-                5xx error, rate limit), the platform can wait and try once more. Set &ldquo;Never&rdquo;
-                to keep the old behaviour (immediately reject). User-fixable errors
-                (insufficient buying power, expired option, etc.) never retry regardless &mdash;
-                they&rsquo;d just fail the same way next time.
-              </p>
-              <p className="text-xs mt-2" style={{color: "var(--muted)"}}>
-                If the retry also fails, you&rsquo;ll get a notification in your inbox.
-              </p>
+          {/* ── Retry policy (2-up, inline) ─────────────────────────── */}
+          <Card title="Retry mirror orders on broker errors" hint="for transient (network/5xx/rate-limit) failures only.">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <RetrySelect
+                label="Opening positions"
+                value={sub.retry_interval_open}
+                onChange={(v) => setRetryInterval("open", v)}
+              />
+              <RetrySelect
+                label="Closing positions"
+                value={sub.retry_interval_close}
+                onChange={(v) => setRetryInterval("close", v)}
+              />
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium block">Opening positions</label>
-                <select
-                  className="w-full p-2 rounded border bg-transparent"
-                  style={{borderColor: "var(--border)"}}
-                  value={sub.retry_interval_open}
-                  onChange={(e) => setRetryInterval("open", e.target.value as RetryInterval)}
-                >
-                  {RETRY_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                <p className="text-xs" style={{color: "var(--muted)"}}>
-                  Applies to new positions the trader opens (BUY mirrors).
-                </p>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium block">Closing positions</label>
-                <select
-                  className="w-full p-2 rounded border bg-transparent"
-                  style={{borderColor: "var(--border)"}}
-                  value={sub.retry_interval_close}
-                  onChange={(e) => setRetryInterval("close", e.target.value as RetryInterval)}
-                >
-                  {RETRY_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                <p className="text-xs" style={{color: "var(--muted)"}}>
-                  Applies to exit / close-position orders. Late closes can affect P&amp;L &mdash;
-                  consider a shorter interval here than for opens.
-                </p>
-              </div>
-            </div>
-          </section>
+          </Card>
 
+          {/* ── Symbol filters (the new feature) ────────────────────── */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Card
+              title="Trade exclusion list"
+              hint="trades on these symbols are NOT copied to you."
+            >
+              <ChipInput
+                symbols={sub.symbol_exclusion_list}
+                onChange={(next) => saveSymbolFilter("symbol_exclusion_list", next)}
+                placeholder="e.g. TSLA — Enter or comma to add"
+                accent="var(--bad)"
+              />
+            </Card>
+            <Card
+              title="Trade inclusion list"
+              hint="when non-empty, ONLY these symbols are copied. Empty = copy everything."
+            >
+              <ChipInput
+                symbols={sub.symbol_inclusion_list}
+                onChange={(next) => saveSymbolFilter("symbol_inclusion_list", next)}
+                placeholder="e.g. AAPL — Enter or comma to add"
+                accent="var(--good)"
+              />
+            </Card>
+          </div>
         </>
       )}
 
       {user.role === "trader" && trd && (
-        <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+        <Card title="Master trading switch"
+              hint="when OFF, the platform refuses to place new orders (yours and any subscriber mirrors).">
           <div className="flex items-center justify-between">
-            <div>
-              <h2 className="font-medium">Master trading switch</h2>
-              <p className="text-sm" style={{color: "var(--muted)"}}>
-                When OFF, the platform refuses to place new orders (yours and any subscriber mirrors).
-              </p>
+            <div className="text-xs" style={{color: "var(--muted)"}}>
+              State: <strong style={{color: trd.trading_enabled ? "var(--good)" : "var(--bad)"}}>
+                {trd.trading_enabled ? "ON" : "OFF"}
+              </strong>
             </div>
             <button
               onClick={() => toggleTrading(!trd.trading_enabled)}
-              className="px-4 py-2 rounded font-medium"
+              className="px-3 py-1.5 text-xs rounded font-medium"
               style={{background: trd.trading_enabled ? "var(--good)" : "var(--border)", color: trd.trading_enabled ? "#06121f" : "var(--text)"}}
             >
-              {trd.trading_enabled ? "ON" : "OFF"}
+              {trd.trading_enabled ? "Turn OFF" : "Turn ON"}
             </button>
           </div>
-        </section>
+        </Card>
       )}
+    </div>
+  );
+}
+
+// ── Compact reusable building blocks ────────────────────────────────────
+
+function Card({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <section
+      className="p-3 rounded-lg border space-y-2"
+      style={{borderColor: "var(--border)", background: "var(--panel)"}}
+    >
+      <header>
+        <h2 className="text-sm font-semibold leading-tight">{title}</h2>
+        {hint && <p className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{hint}</p>}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
+  return (
+    <div>
+      <div className="text-[9px] uppercase tracking-wider" style={{color: "var(--muted)"}}>{label}</div>
+      <div className="font-medium mt-0.5 tabular-nums" style={{color: color ?? "var(--text)"}}>{value}</div>
+    </div>
+  );
+}
+
+function RetrySelect({ label, value, onChange }: {
+  label: string; value: RetryInterval; onChange: (v: RetryInterval) => void;
+}) {
+  return (
+    <div>
+      <label className="block text-[11px] mb-1" style={{color: "var(--muted)"}}>{label}</label>
+      <select
+        className="w-full px-2 py-1.5 text-sm rounded border bg-transparent"
+        style={{borderColor: "var(--border)"}}
+        value={value}
+        onChange={(e) => onChange(e.target.value as RetryInterval)}
+      >
+        {RETRY_OPTIONS.map(opt => (
+          <option key={opt.value} value={opt.value}>{opt.label}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+/** Chip-style symbol input. Add via Enter or comma. Backspace on empty
+ *  input removes the last chip. PATCH-on-every-mutation through the
+ *  onChange callback (parent does the API call + revert-on-error). */
+function ChipInput({ symbols, onChange, placeholder, accent }: {
+  symbols: string[];
+  onChange: (next: string[]) => void;
+  placeholder?: string;
+  accent: string;
+}) {
+  const [draft, setDraft] = useState("");
+
+  // Dedupe + uppercase on entry so we never persist garbage chips.
+  function commit(raw: string) {
+    const parts = raw.split(/[,\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+    if (parts.length === 0) return;
+    const set = new Set(symbols);
+    const next = [...symbols];
+    for (const p of parts) {
+      if (!set.has(p)) { set.add(p); next.push(p); }
+    }
+    if (next.length !== symbols.length) onChange(next);
+    setDraft("");
+  }
+
+  function remove(sym: string) {
+    onChange(symbols.filter(s => s !== sym));
+  }
+
+  const empty = useMemo(() => symbols.length === 0, [symbols]);
+
+  return (
+    <div
+      className="rounded border px-1.5 py-1 flex flex-wrap items-center gap-1 min-h-[34px]"
+      style={{borderColor: "var(--border)", background: "rgba(255,255,255,0.02)"}}
+      onClick={(e) => {
+        // Click anywhere in the box → focus the input.
+        const inp = (e.currentTarget.querySelector("input") as HTMLInputElement | null);
+        inp?.focus();
+      }}
+    >
+      {symbols.map(sym => (
+        <span
+          key={sym}
+          className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] rounded"
+          style={{
+            background: "rgba(255,255,255,0.06)",
+            border: `1px solid ${accent}`,
+            color: accent,
+            fontWeight: 600,
+          }}
+        >
+          {sym}
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); remove(sym); }}
+            aria-label={`Remove ${sym}`}
+            className="opacity-70 hover:opacity-100"
+            style={{color: accent}}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+      <input
+        type="text"
+        value={draft}
+        onChange={(e) => {
+          const v = e.target.value;
+          // Auto-commit when user types a delimiter so chips form as you type.
+          if (/[,\s]$/.test(v)) commit(v);
+          else setDraft(v);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(draft); }
+          else if (e.key === "Backspace" && draft === "" && symbols.length > 0) {
+            remove(symbols[symbols.length - 1]);
+          }
+        }}
+        onBlur={() => { if (draft.trim()) commit(draft); }}
+        placeholder={empty ? placeholder : ""}
+        className="flex-1 min-w-[120px] px-1.5 py-1 text-xs bg-transparent outline-none"
+        style={{color: "var(--text)"}}
+      />
     </div>
   );
 }

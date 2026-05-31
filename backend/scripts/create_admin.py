@@ -8,10 +8,10 @@ Usage
     cd backend
 
     # Promote an existing user (most common case):
-    python scripts/create_admin.py --email anitha@agilenautics.com
+    python scripts/create_admin.py --email admin@techarts.us
 
     # Create a brand-new admin user (sets a temporary password):
-    python scripts/create_admin.py --email anitha@agilenautics.com --create
+    python scripts/create_admin.py --email admin@techarts.us --create
 
 IMPORTANT
 ---------
