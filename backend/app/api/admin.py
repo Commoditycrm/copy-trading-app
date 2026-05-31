@@ -420,3 +420,52 @@ def admin_list_fanouts(
         "max_fanout_ms": max(completed_durations) if completed_durations else None,
     }
     return {"fanouts": fanouts, "metrics": metrics}
+
+
+# ── Platform-config: fanout batch threshold ─────────────────────────────────
+#
+# Runtime-tunable knob that copy_engine reads on every fanout to decide
+# between the per-iteration (small N, low floor) and batched (large N, flat
+# scaling) code paths. Env default lives in Settings.fanout_batch_threshold;
+# this endpoint pair sets / clears a Redis override on top of that.
+
+
+class FanoutThresholdOut(BaseModel):
+    """Effective + default + override values for the admin UI to render."""
+
+    default: int
+    override: int | None
+    effective: int
+
+
+class FanoutThresholdIn(BaseModel):
+    """Pass ``threshold=null`` to reset to the env default. Bounded so a
+    misclick can't disable the hybrid entirely (a threshold of 0 would
+    always batch — fine, but extreme; >10000 would never batch — also fine
+    but extreme). 1–10000 covers every realistic deployment."""
+
+    threshold: int | None = Field(default=None, ge=1, le=10000)
+
+
+@router.get("/config/fanout-batch-threshold", response_model=FanoutThresholdOut)
+def get_fanout_threshold(
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import get_fanout_batch_threshold_state
+    return get_fanout_batch_threshold_state()
+
+
+@router.patch("/config/fanout-batch-threshold", response_model=FanoutThresholdOut)
+def set_fanout_threshold(
+    payload: FanoutThresholdIn,
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import (
+        get_fanout_batch_threshold_state,
+        set_fanout_batch_threshold,
+    )
+    try:
+        set_fanout_batch_threshold(payload.threshold)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return get_fanout_batch_threshold_state()

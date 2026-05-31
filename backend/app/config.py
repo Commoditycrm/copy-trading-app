@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300
+    # Fanout-batch threshold. Below this subscriber count, copy_engine
+    # runs the per-iteration code path (one db.get(User) + one
+    # cache.get_broker_accounts per sub) — lower first-sub pick_lag floor
+    # (~30ms) at the cost of linear-in-N total. At/above this count it
+    # switches to the batched code path (three pre-SELECTs up front) —
+    # higher floor (~150-300ms) but flat scaling, so 1000+ subs finish in
+    # the same wall-clock as 100. Admin can override at runtime via Redis
+    # (see services.platform_config); env var sets the default.
+    fanout_batch_threshold: int = 75
 
     @property
     def cors_origins_list(self) -> list[str]:

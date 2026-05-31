@@ -44,6 +44,7 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
+from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
 from app.services.order_retry import classify_error
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
@@ -231,33 +232,38 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         else {}
     )
 
-    # PRE-PHASE-1 BATCH (2/3): one SELECT for all subscriber Users.
-    # Previously this was a per-iteration ``db.get(User, sub.user_id)`` —
-    # 300 subscribers = 300 round-trips, the dominant component of
-    # pick_lag at scale. Now: one query, in-memory lookup inside the loop.
-    sub_user_ids = [s.user_id for s in subs]
-    users_by_id: dict[uuid.UUID, User] = {}
-    if sub_user_ids:
-        users_by_id = {
-            u.id: u
-            for u in db.execute(
-                select(User).where(User.id.in_(sub_user_ids))
-            ).scalars()
-        }
+    # HYBRID MODE — pick a path based on subscriber count:
+    #   - Small N (< threshold): per-iteration db.get(User) + cache lookups
+    #     inside the loop. Cheaper first-sub pick_lag (~30 ms floor) but
+    #     scales linearly — fine until ~75 subs.
+    #   - Large N (>= threshold): one SELECT for users, one for broker
+    #     accounts up front, then the loop is pure dict lookups. Higher
+    #     fixed floor (~150-300 ms) but stays flat as N grows.
+    # Threshold is env-defaulted via Settings.fanout_batch_threshold and
+    # admin-overridable at runtime via Redis. Read once per fanout; ~0.5ms.
+    threshold = await get_fanout_batch_threshold_async()
+    use_batch = len(subs) >= threshold
 
-    # PRE-PHASE-1 BATCH (3/3): one SELECT for every broker account across
-    # all subscribers. Previously this was a per-iteration
-    # ``await cache.get_broker_accounts(...)`` which, even with warm Redis,
-    # still cost a sequential await per subscriber and fell back to a DB
-    # query on cache miss (a likely culprit for the 17s pick_lag observed
-    # on a freshly-seeded 300-subscriber test where the cache was cold).
-    # Grouped by user_id so the per-sub loop is a pure dict lookup.
+    users_by_id: dict[uuid.UUID, User] = {}
     accts_by_user: dict[uuid.UUID, list[BrokerAccount]] = defaultdict(list)
-    if sub_user_ids:
-        for acct in db.execute(
-            select(BrokerAccount).where(BrokerAccount.user_id.in_(sub_user_ids))
-        ).scalars():
-            accts_by_user[acct.user_id].append(acct)
+    if use_batch:
+        # PRE-PHASE-1 BATCH (2/3): one SELECT for all subscriber Users.
+        # Replaces N per-iteration ``db.get(User, sub.user_id)`` calls.
+        sub_user_ids = [s.user_id for s in subs]
+        if sub_user_ids:
+            users_by_id = {
+                u.id: u
+                for u in db.execute(
+                    select(User).where(User.id.in_(sub_user_ids))
+                ).scalars()
+            }
+            # PRE-PHASE-1 BATCH (3/3): one SELECT for every broker account
+            # across all subscribers. Replaces N per-iteration
+            # ``await cache.get_broker_accounts(...)`` calls.
+            for acct in db.execute(
+                select(BrokerAccount).where(BrokerAccount.user_id.in_(sub_user_ids))
+            ).scalars():
+                accts_by_user[acct.user_id].append(acct)
 
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
@@ -268,7 +274,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
 
-        sub_user = users_by_id.get(sub.user_id)
+        # Hybrid: dict lookup when pre-batched, single ``db.get`` otherwise.
+        sub_user = users_by_id.get(sub.user_id) if use_batch else db.get(User, sub.user_id)
         if not sub_user:
             continue
 
@@ -366,8 +373,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
             continue
 
-        # Pre-batched at the top of fanout — pure dict lookup, no IO.
-        sub_accounts = accts_by_user.get(sub.user_id, [])
+        # Hybrid: dict lookup when pre-batched, per-iter cache call otherwise.
+        sub_accounts = (
+            accts_by_user.get(sub.user_id, [])
+            if use_batch
+            else await cache.get_broker_accounts(db, sub.user_id)
+        )
         if not sub_accounts:
             results.append(FanoutResult(
                 subscriber_user_id=sub.user_id,
