@@ -7,6 +7,7 @@ from app.brokers.base import (
     ConnectionInfo,
 )
 from app.brokers.fake import FakeBrokerAdapter
+from app.brokers.ibkr import IBKRAdapter
 from app.brokers.snaptrade import SnapTradeAdapter
 from app.brokers.webull import WebullAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -20,6 +21,8 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
         return WebullAdapter(credentials)
     if broker_account.broker == BrokerName.SNAPTRADE:
         return SnapTradeAdapter(credentials)
+    if broker_account.broker == BrokerName.IBKR:
+        return IBKRAdapter(credentials)
     if broker_account.broker == BrokerName.FAKE:
         # Test-only — see app/brokers/fake.py. The credentials dict is
         # ignored; we keep the same call signature so copy_engine doesn't
@@ -37,6 +40,7 @@ __all__ = [
     "BrokerPosition",
     "ConnectionInfo",
     "FakeBrokerAdapter",
+    "IBKRAdapter",
     "SnapTradeAdapter",
     "WebullAdapter",
     "adapter_for",

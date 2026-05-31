@@ -123,6 +123,25 @@ function fmtQty(q: string | number | null | undefined): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
+/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors.
+ *  Used by the trader-side fanout table to surface the spread of how long
+ *  each subscriber's broker took to accept their copy. Rows with a null
+ *  broker_lag_ms (mirror rejected before reaching the broker, or still in
+ *  flight) are excluded from all three stats. Returns {min, avg, max} as
+ *  ms, or all-null when no child has a usable lag yet. */
+function brokerLagStats(
+  children: FanoutChild[]
+): { min: number | null; avg: number | null; max: number | null } {
+  const vals = children
+    .map(c => c.broker_lag_ms)
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
+  if (vals.length === 0) return { min: null, avg: null, max: null };
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
+  return { min, avg, max };
+}
+
 // ── Compact metric card with optional inline sparkline ────────────────
 
 function MetricCard({
@@ -760,17 +779,17 @@ export default function PerformancePage() {
 
   return (
     <div className="space-y-5">
-      <header>
+      {/* <header>
         <h1 className="text-2xl" style={{ fontWeight: 600 }}>Fanout Performance</h1>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
           Latency breakdown for your most recent trades that fanned out to subscribers.
           Click any row to see per-subscriber timing. Auto-refreshes every 5 seconds and
           on every new trade event.
         </p>
-      </header>
+      </header> */}
 
       {/* ── Compact metric cards with inline sparklines ───────────────── */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
+      {/* <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
         <MetricCard
           label="Fanouts"
           value={String(m?.fanouts_shown ?? 0)}
@@ -796,11 +815,10 @@ export default function PerformancePage() {
           valueColor={colorFor(m?.avg_total_ms ?? null)}
           Icon={IcoTarget}
         />
-      </div>
+      </div> */}
 
       {/* ── Charts row: trend chart (wide) + donut + symbol bars ───────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5">
-        {/* Latency trend */}
+      {/* <div className="grid grid-cols-1 lg:grid-cols-12 gap-2.5">
         <div
           className="lg:col-span-7 rounded-lg p-4"
           style={{
@@ -825,7 +843,6 @@ export default function PerformancePage() {
           </div>
           <div className="relative">
             <LatencyAreaChart values={durationSeries} height={120} color="var(--accent)" />
-            {/* Overlay the total series in a different color, same scale */}
             <div className="absolute inset-0 pointer-events-none" style={{ mixBlendMode: "screen" }}>
               <LatencyAreaChart values={totalSeries} height={120} color="var(--good)" />
             </div>
@@ -836,7 +853,6 @@ export default function PerformancePage() {
           </div>
         </div>
 
-        {/* Success donut */}
         <div
           className="lg:col-span-3 rounded-lg p-4 flex flex-col"
           style={{
@@ -856,7 +872,6 @@ export default function PerformancePage() {
           </div>
         </div>
 
-        {/* Per-symbol bars */}
         <div
           className="lg:col-span-2 rounded-lg p-4 flex flex-col"
           style={{
@@ -871,18 +886,28 @@ export default function PerformancePage() {
             <SymbolBars rows={symbolRows} />
           </div>
         </div>
-      </div>
+      </div> */}
 
       {/* ── Table ──────────────────────────────────────────────────────── */}
+      {/* overflow-auto + a viewport-relative max-h enables BOTH horizontal
+          scroll (wide table) and vertical scroll. The max-h subtracts a
+          rough allowance for the AppShell topbar + page header above so the
+          table fills the rest of the screen instead of having an arbitrary
+          70vh cap. The sticky thead below stays pinned to the top of this
+          scroll container so column headers remain visible while scrolling. */}
       <div
-        className="overflow-x-auto rounded-xl"
+        className="overflow-auto rounded-xl"
         style={{
           border: "1px solid var(--border)",
           background: "linear-gradient(180deg, rgba(14,20,17,0.5) 0%, rgba(7,9,10,0.3) 100%)",
+          maxHeight: "calc(100vh - 110px)",
         }}
       >
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
-          <thead>
+          {/* z-10 keeps the header above scrolling cells; the opaque panel
+              background prevents row text from bleeding through behind the
+              sticky header (which would otherwise be transparent). */}
+          <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
             <tr style={{ color: "var(--muted)" }}>
               {([
                 ["Symbol", "Ticker symbol the trader bought or sold."],
@@ -899,6 +924,9 @@ export default function PerformancePage() {
                 ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
                 ["Platform Lag", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
                 ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
+                ["Lowest Broker Lag", "Fastest subscriber: minimum broker_lag (mirror-submit → broker-accept) across all subscriber children for this trade."],
+                ["Average Broker Lag", "Mean broker_lag across all subscriber children for this trade."],
+                ["Highest Broker Lag", "Slowest subscriber: maximum broker_lag across all subscriber children for this trade."],
                 ["Subscribers", "Total subscribers receiving this trade, with submitted-vs-error counts."],
               ] as [string, string][]).map(([h, tip]) => (
                 <th
@@ -922,7 +950,7 @@ export default function PerformancePage() {
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={15} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -932,13 +960,14 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={15} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   No fanouts yet. Place a trade to see latency metrics here.
                 </td>
               </tr>
             )}
             {fanouts.map(f => {
               const isOpen = expanded.has(f.parent_order_id);
+              const blStats = brokerLagStats(f.children);
               return (
                 <Fragment key={f.parent_order_id}>
                   <tr
@@ -1002,6 +1031,15 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
                       {fmtMs(f.total_ms)}
                     </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.min) }}>
+                      {fmtMs(blStats.min)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.avg) }}>
+                      {fmtMs(blStats.avg)}
+                    </td>
+                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.max) }}>
+                      {fmtMs(blStats.max)}
+                    </td>
                     <td className="px-3 py-3">
                       <SubscriberPill counts={f.subscribers} />
                     </td>
@@ -1010,7 +1048,7 @@ export default function PerformancePage() {
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={15} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
+                      <td colSpan={18} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
@@ -1029,11 +1067,23 @@ export default function PerformancePage() {
                               No subscribers received this trade.
                             </div>
                           ) : (
+                            // Scroll wrapper so the inner per-subscriber table
+                            // gets the same sticky-header treatment as the
+                            // outer fanout table. max-h caps the drawer's own
+                            // height (already nested inside the page-level
+                            // scrolling container).
+                            <div
+                              className="overflow-auto max-h-[50vh] rounded"
+                              style={{ border: "1px solid var(--border)" }}
+                            >
                             <table
                               className="w-full text-xs"
                               style={{ borderCollapse: "separate", borderSpacing: 0, tableLayout: "auto" }}
                             >
-                              <thead>
+                              {/* Sticky thead pinned to the wrapper. Opaque
+                                  panel background prevents row text from
+                                  bleeding through behind the sticky row. */}
+                              <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
                                 <tr style={{ color: "var(--muted)" }}>
                                   {([
                                     ["Subscriber", "The subscriber whose account this mirror was placed on."],
@@ -1223,6 +1273,7 @@ export default function PerformancePage() {
                                 })}
                               </tbody>
                             </table>
+                            </div>
                           )}
                         </div>
                       </td>
@@ -1235,9 +1286,12 @@ export default function PerformancePage() {
         </table>
       </div>
 
-      {/* ── Footnote (matches the screenshot terminology) ──────────────── */}
+      {/* ── Footnote (matches the screenshot terminology) ────────────────
+          Hidden for now per UX request — the column-header tooltips on the
+          table itself cover the same content on hover, so the long inline
+          legend was visual noise. Restore by removing this comment block
+          if we ever want the legend back as a permanent footer.
       <div className="text-xs leading-relaxed space-y-2" style={{ color: "var(--muted)" }}>
-        {/* Platform vs Broker legend */}
         <div className="flex flex-wrap gap-x-5 gap-y-1 pb-1" style={{ borderBottom: "1px solid var(--border)" }}>
           <span className="inline-flex items-center gap-1.5">
             <span style={{ width: 8, height: 8, borderRadius: 2, background: "var(--good)", display: "inline-block" }} />
@@ -1271,6 +1325,7 @@ export default function PerformancePage() {
           when copy_engine picked the subscriber, passed eligibility, and their broker accepted, respectively.
         </p>
       </div>
+      */}
     </div>
   );
 }

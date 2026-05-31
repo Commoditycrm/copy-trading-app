@@ -1,21 +1,18 @@
-"""SnapTrade order-update listener — polling-based.
+"""IBKR order-update listener — polling-based.
 
-Why slower than Webull
-----------------------
-SnapTrade itself polls the upstream broker on roughly a 5–30s cadence
-(varies per broker). Polling on our side faster than that is wasted
-work — we just see the same SnapTrade snapshot multiple times. We poll
-every ``POLL_INTERVAL_S`` (5s default) which is a fair tradeoff between
-freshness and SnapTrade rate-limit headroom.
+Why polling: IBKR's OAuth Web API doesn't expose a hosted WebSocket for
+order updates; that's a CPAPI (gateway) feature and we explicitly avoid
+the gateway to keep the integration SaaS-friendly. So we poll IBKR's
+``/iserver/account/orders`` directly every ``POLL_INTERVAL_S``. Because
+we're talking to IBKR (not an aggregator that itself polls), end-to-end
+mirror latency is typically 2–5s — far better than the SnapTrade path
+(5–60s).
 
-End-to-end latency: 5–60s from the trader's actual fill to subscribers
-seeing the mirror order. That's the architectural cost of going
-through an aggregator — there's no fix for it short of switching that
-trader to a direct broker integration.
-
-Otherwise mirrors the public surface of ``trade_listener.py`` and
-``webull_listener.py`` so the same shared ``listener_state`` powers the
-SSE pill regardless of broker.
+Mirrors the public surface of ``snaptrade_listener.py`` so the shared
+``listener_state`` + SSE pill work the same regardless of broker. Uses
+``copy_engine.fanout_threadsafe`` to dispatch the fanout onto the main
+event loop (avoids the throwaway-loop-per-order cross-loop semaphore
+bug; see copy_engine.fanout_threadsafe docstring).
 """
 from __future__ import annotations
 
@@ -29,7 +26,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.brokers.snaptrade import SnapTradeAdapter, parse_snaptrade_order_symbol
+from app.brokers.ibkr import IBKRAdapter
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import (
@@ -46,33 +43,24 @@ from app.services.crypto import decrypt_json
 log = logging.getLogger(__name__)
 
 
-# Per the module docstring: SnapTrade's own upstream poll cadence sets a
-# floor on useful freshness. 5s is a fine default for the self-poller.
-POLL_INTERVAL_S = 5.0
-# When a webhook secret is configured, SnapTrade's Trade Detection +
-# webhook becomes the primary trigger and our self-poll is only a
-# backstop — so we slow it down to avoid redundant API calls.
-POLL_INTERVAL_BACKSTOP_S = 60.0
+# 3s is a fair default — fast enough to keep mirror latency in the 2–5s
+# range, gentle enough not to blow IBKR's rate budget. Tune via env if
+# someone wants tighter latency at the cost of more calls.
+POLL_INTERVAL_S = 3.0
 
 
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
+# Per-trader (broker_order_id → last status) — dedup so we only persist a
+# status transition once.
 _last_seen: dict[uuid.UUID, dict[str, str]] = {}
-# Per-trader lock so a webhook-triggered immediate poll and the periodic
-# poll can't run _poll_once concurrently for the same trader (which could
-# double-insert a brand-new order — there's no DB unique constraint on
-# broker_order_id, the dedup is a SELECT-then-INSERT inside _poll_once).
+# Per-trader lock so we can't race ourselves on the SELECT-then-INSERT
+# dedup inside _persist_and_fanout.
 _poll_locks: dict[uuid.UUID, threading.Lock] = {}
 _main_loop: asyncio.AbstractEventLoop | None = None
 
 
-def _lock_for(trader_user_id: uuid.UUID) -> "threading.Lock":
+def _lock_for(trader_user_id: uuid.UUID) -> threading.Lock:
     return _poll_locks.setdefault(trader_user_id, threading.Lock())
-
-
-def _poll_interval() -> float:
-    """5s normally; 60s backstop when a webhook drives detection."""
-    from app.config import get_settings
-    return POLL_INTERVAL_BACKSTOP_S if get_settings().snaptrade_webhook_enabled else POLL_INTERVAL_S
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -80,7 +68,6 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     _main_loop = loop
 
 
-# Re-exports — same shape as the other listeners.
 get_status = listener_state.get_status
 _set_state = listener_state.set_state
 
@@ -90,7 +77,7 @@ _set_state = listener_state.set_state
 
 async def start_all_listeners() -> None:
     """On app startup, spawn a poll task for every active TRADER with a
-    connected SnapTrade account."""
+    connected IBKR account."""
     with SessionLocal() as db:
         traders = db.execute(
             select(User).where(User.role == UserRole.TRADER, User.is_active.is_(True))
@@ -99,7 +86,7 @@ async def start_all_listeners() -> None:
             for acct in db.execute(
                 select(BrokerAccount).where(
                     BrokerAccount.user_id == trader.id,
-                    BrokerAccount.broker == BrokerName.SNAPTRADE,
+                    BrokerAccount.broker == BrokerName.IBKR,
                     BrokerAccount.connection_status == "connected",
                 )
             ).scalars():
@@ -109,7 +96,7 @@ async def start_all_listeners() -> None:
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
-        log.info("snaptrade-listener[%s] restart requested", trader_user_id)
+        log.info("ibkr-listener[%s] restart requested", trader_user_id)
         stop_listener(trader_user_id)
 
     try:
@@ -121,7 +108,7 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
 
     if loop is None:
         log.warning(
-            "snaptrade-listener[%s] no main loop bound; start_listener is a no-op",
+            "ibkr-listener[%s] no main loop bound; start_listener is a no-op",
             trader_user_id,
         )
         return
@@ -164,7 +151,7 @@ async def _run_listener(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID
 ) -> None:
     """Outer loop: load creds → verify → inner poll loop → reconnect.
-    Same shape as webull_listener._run_listener."""
+    Same shape as snaptrade_listener._run_listener."""
     backoff = _BACKOFF_INITIAL
     while True:
         try:
@@ -179,11 +166,10 @@ async def _run_listener(
                 backoff = _BACKOFF_INITIAL
                 continue
 
-            adapter = SnapTradeAdapter(creds)
-            # First connect: hit balance to confirm the SnapTrade auth is
-            # still valid. SnapTrade authorizations are revoked when the
-            # underlying broker session ends (e.g. user changed their
-            # Robinhood password) — we surface that as credentials_invalid.
+            adapter = IBKRAdapter(creds)
+            # Verify auth before settling into the inner poll loop —
+            # surface "creds rotated / token expired" cleanly instead of
+            # the whole poll loop spinning on 401s.
             try:
                 await asyncio.to_thread(adapter.verify_connection)
             except Exception as exc:  # noqa: BLE001
@@ -203,60 +189,21 @@ async def _run_listener(
                     raise
                 except Exception as exc:  # noqa: BLE001
                     log.exception(
-                        "snaptrade-listener[%s] poll iteration failed", trader_user_id
+                        "ibkr-listener[%s] poll iteration failed", trader_user_id
                     )
                     _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
                     break
-                await asyncio.sleep(_poll_interval())
+                await asyncio.sleep(POLL_INTERVAL_S)
 
         except asyncio.CancelledError:
-            log.info("snaptrade-listener[%s] cancelled", trader_user_id)
+            log.info("ibkr-listener[%s] cancelled", trader_user_id)
             raise
         except Exception as exc:  # noqa: BLE001
-            log.exception("snaptrade-listener[%s] error: %s", trader_user_id, exc)
+            log.exception("ibkr-listener[%s] error: %s", trader_user_id, exc)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 
         await asyncio.sleep(backoff)
         backoff = min(_BACKOFF_MAX, backoff * 2)
-
-
-# ── Webhook-triggered immediate poll ────────────────────────────────────────
-
-
-async def poll_now_for_trader(trader_user_id: uuid.UUID) -> bool:
-    """Run one poll immediately for this trader, outside the periodic
-    loop. Called by the SnapTrade Trade-Detection webhook so a new order
-    is picked up the instant SnapTrade notifies us, instead of waiting
-    for the next periodic tick.
-
-    Returns True if a poll ran, False if the trader has no connected
-    SnapTrade account or the poll errored. Shares ``_last_seen`` + the
-    per-trader lock with the periodic loop, so it's safe to run
-    concurrently — the lock serialises the SELECT-then-INSERT in
-    _poll_once. Exception-safe because it runs as a fire-and-forget
-    background task from the webhook handler."""
-    try:
-        with SessionLocal() as db:
-            acct = db.execute(
-                select(BrokerAccount).where(
-                    BrokerAccount.user_id == trader_user_id,
-                    BrokerAccount.broker == BrokerName.SNAPTRADE,
-                    BrokerAccount.connection_status == "connected",
-                )
-            ).scalar_one_or_none()
-            if acct is None:
-                return False
-            broker_account_id = acct.id
-
-        creds = _load_creds(trader_user_id, broker_account_id)
-        if creds is None:
-            return False
-        adapter = SnapTradeAdapter(creds)
-        await asyncio.to_thread(_poll_once, trader_user_id, broker_account_id, adapter)
-        return True
-    except Exception:  # noqa: BLE001
-        log.exception("snaptrade poll_now_for_trader failed for %s", trader_user_id)
-        return False
 
 
 # ── Credential helpers ──────────────────────────────────────────────────────
@@ -270,7 +217,7 @@ def _load_creds(
         if (
             acct is None
             or acct.user_id != trader_user_id
-            or acct.broker != BrokerName.SNAPTRADE
+            or acct.broker != BrokerName.IBKR
             or acct.connection_status != "connected"
         ):
             return None
@@ -278,7 +225,7 @@ def _load_creds(
             return decrypt_json(acct.encrypted_credentials)
         except Exception:  # noqa: BLE001
             log.exception(
-                "snaptrade-listener[%s] failed to decrypt credentials", trader_user_id
+                "ibkr-listener[%s] failed to decrypt credentials", trader_user_id
             )
             return None
 
@@ -290,21 +237,29 @@ _BUY = OrderSide.BUY
 _SELL = OrderSide.SELL
 
 
+# IBKR → our OrderType.
+_TYPE_IN = {
+    "MKT":     OrderType.MARKET,
+    "LMT":     OrderType.LIMIT,
+    "STP":     OrderType.STOP,
+    "STP_LMT": OrderType.STOP_LIMIT,
+}
+
+
 def _poll_once(
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
-    adapter: SnapTradeAdapter,
+    adapter: IBKRAdapter,
 ) -> None:
     """Pull recent orders, diff against last-seen, route changes through
     the persist+fanout pipeline. Sync — runs in a thread.
 
-    Guarded by a per-trader lock so the periodic loop and a
-    webhook-triggered poll (poll_now_for_trader) never race on the
-    SELECT-then-INSERT dedup inside _persist_and_fanout."""
+    Guarded by a per-trader lock so future periodic + ad-hoc polls don't
+    race on the SELECT-then-INSERT dedup."""
     with _lock_for(trader_user_id):
         # Gate: master switch off → skip the broker fetch + processing.
-        # Reload each poll so the flag can be flipped at runtime via the
-        # Brokers-page "Auto Pull Orders" checkbox.
+        # Re-read every poll so a runtime flip of "Auto Pull Orders" on
+        # the Brokers page takes effect immediately.
         with SessionLocal() as db:
             acct = db.get(BrokerAccount, broker_account_id)
             if not broker_filters.auto_pull_enabled(acct):
@@ -317,10 +272,10 @@ def _poll_once(
 
         seen = _last_seen.setdefault(trader_user_id, {})
         for o in orders:
-            broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
+            broker_order_id = str(_attr(o, "orderId", "order_id", "id") or "")
             if not broker_order_id:
                 continue
-            status_str = str(_attr(o, "status", default="")).upper()
+            status_str = str(_attr(o, "status", "orderStatus") or "").upper().replace(" ", "_")
             prev = seen.get(broker_order_id)
             if prev == status_str:
                 continue
@@ -331,6 +286,26 @@ def _poll_once(
             )
 
 
+# IBKR order status → our enum (same mapping as the adapter, kept local
+# so the listener doesn't import the adapter's internal dicts).
+_STATUS_IN: dict[str, OrderStatus] = {
+    "PENDINGSUBMIT":    OrderStatus.PENDING,
+    "PENDING_SUBMIT":   OrderStatus.PENDING,
+    "PRESUBMITTED":     OrderStatus.SUBMITTED,
+    "PRE_SUBMITTED":    OrderStatus.SUBMITTED,
+    "SUBMITTED":        OrderStatus.SUBMITTED,
+    "ACCEPTED":         OrderStatus.ACCEPTED,
+    "FILLED":           OrderStatus.FILLED,
+    "PARTIALLYFILLED":  OrderStatus.PARTIALLY_FILLED,
+    "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+    "CANCELLED":        OrderStatus.CANCELED,
+    "CANCELED":         OrderStatus.CANCELED,
+    "REJECTED":         OrderStatus.REJECTED,
+    "INACTIVE":         OrderStatus.REJECTED,
+    "EXPIRED":          OrderStatus.EXPIRED,
+}
+
+
 def _persist_and_fanout(
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
@@ -338,14 +313,9 @@ def _persist_and_fanout(
     status_str: str,
     order_obj: Any,
 ) -> None:
-    from app.brokers.snaptrade import _STATUS_IN as SNAP_STATUS_IN
-
-    status_enum = SNAP_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
+    status_enum = _STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
 
     with SessionLocal() as db:
-        # Per-order gate: respect bring_open_orders / bring_filled_orders
-        # so a flip mid-stream (e.g. user unchecks "Bring Filled orders"
-        # at runtime) takes effect on the very next observed event.
         acct_gate = db.get(BrokerAccount, broker_account_id)
         if not broker_filters.should_persist_order(acct_gate, status_enum):
             return
@@ -356,13 +326,13 @@ def _persist_and_fanout(
         if existing is not None:
             if existing.status != status_enum:
                 existing.status = status_enum
-            fq = _attr(order_obj, "filled_units", "filled_quantity")
+            fq = _attr(order_obj, "filledQuantity", "cumQty")
             if fq is not None:
                 try:
                     existing.filled_quantity = Decimal(str(fq))
                 except Exception:  # noqa: BLE001
                     pass
-            fap = _attr(order_obj, "execution_price", "filled_avg_price")
+            fap = _attr(order_obj, "avgPrice", "lastPrice")
             if fap is not None:
                 try:
                     existing.filled_avg_price = Decimal(str(fap))
@@ -383,7 +353,7 @@ def _persist_and_fanout(
                 copy_engine._order_event("order.placed", existing),  # noqa: SLF001
             )
             if (
-                status_str.upper() in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "FAILED")
+                status_str in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED")
                 and existing.parent_order_id is None
                 and existing.fanned_out_to_subscribers
             ):
@@ -397,14 +367,12 @@ def _persist_and_fanout(
         ):
             return
 
-        order = _insert_order_from_snaptrade(
+        order = _insert_order_from_ibkr(
             db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
         )
-
-        # Lifecycle stamps. `socket_received_at` is reused for poll-time
-        # so the Performance page can report "broker → us" latency in
-        # one column regardless of transport.
-        order.trader_submitted_at = _as_dt(_attr(order_obj, "time_placed", "created_at"))
+        order.trader_submitted_at = _as_dt(
+            _attr(order_obj, "lastExecutionTime", "submittedTime", "time")
+        )
         order.socket_received_at = datetime.now(timezone.utc)
 
         audit.record(
@@ -414,7 +382,7 @@ def _persist_and_fanout(
             entity_type="order",
             entity_id=order.id,
             metadata={
-                "broker": "snaptrade",
+                "broker": "ibkr",
                 "broker_order_id": broker_order_id,
                 "status": status_str,
                 "symbol": order.symbol,
@@ -424,11 +392,9 @@ def _persist_and_fanout(
         )
         order.redis_published_at = datetime.now(timezone.utc)
 
-        # Replay guard: if this order was placed before we started
-        # watching this broker, it's history surfaced by SnapTrade's
-        # recent-orders list — record it but DON'T mirror it to
-        # subscribers. Marking fanned_out_to_subscribers=True means
-        # "fanout resolved" so it's never retried.
+        # Replay guard — orders the trader placed BEFORE we started
+        # watching this IBKR account are history surfaced by /iserver/
+        # account/orders. Record them locally but DON'T mirror.
         acct = db.get(BrokerAccount, broker_account_id)
         if copy_engine.order_predates_connection(acct, order.trader_submitted_at):
             order.fanned_out_to_subscribers = True
@@ -439,24 +405,22 @@ def _persist_and_fanout(
                 copy_engine._order_event("order.placed", order),  # noqa: SLF001
             )
             log.info(
-                "snaptrade-listener[%s] skipping fanout — order %s predates connection",
+                "ibkr-listener[%s] skipping fanout — order %s predates connection",
                 trader_user_id, broker_order_id,
             )
             return
 
         db.commit()
         db.refresh(order)
-
         events.publish(
             trader_user_id,
             copy_engine._order_event("order.placed", order),  # noqa: SLF001
         )
 
-        # Fan out on the main event loop (see copy_engine.fanout_threadsafe)
-        # instead of a throwaway asyncio.run loop, so per-broker semaphores
-        # and the async Redis client stay bound to one stable loop. Without
-        # this, the second detected order hits a cross-loop error and the
-        # mirror silently fails.
+        # Dispatch fanout on the MAIN event loop (see copy_engine.fanout_threadsafe)
+        # — never the throwaway asyncio.run loop that the sync fanout
+        # would create. Keeps per-broker semaphores + the async Redis
+        # client bound to a single stable loop.
         if _main_loop is not None:
             copy_engine.fanout_threadsafe(order.id, trader_user_id, _main_loop)
         else:
@@ -467,7 +431,7 @@ def _persist_and_fanout(
                 db.commit()
 
 
-def _insert_order_from_snaptrade(
+def _insert_order_from_ibkr(
     db: Any,
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
@@ -475,49 +439,49 @@ def _insert_order_from_snaptrade(
     order_obj: Any,
     status_enum: OrderStatus,
 ) -> Order:
-    """Translate a SnapTrade order payload into our Order schema and INSERT.
+    """Translate an IBKR order payload into our Order schema and INSERT.
 
-    Detects whether the order is a stock or an option via the SnapTrade
-    symbol payload — see ``parse_snaptrade_order_symbol`` for the shape.
-    Without this routing, options inserted as stocks won't surface in
-    Option Haven's option views (and would have meaningless symbol +
-    missing expiry/strike/right fields)."""
-    parsed = parse_snaptrade_order_symbol(order_obj)
+    Stocks-only for now (matches the adapter's placement scope). Option
+    detection lives in the contract description; once IBKR option
+    placement is implemented we'll parse expiry/strike/right out here."""
+    side_raw = str(_attr(order_obj, "side") or "").upper()
+    side = _BUY if side_raw == "BUY" else _SELL
 
-    # SnapTrade option actions are BUY_TO_OPEN / BUY_TO_CLOSE /
-    # SELL_TO_OPEN / SELL_TO_CLOSE. We collapse them to our two-value
-    # OrderSide (BUY/SELL) and use the _TO_CLOSE half to set is_closing,
-    # which the Order Haven UI uses to render closing-trade pills.
-    side_raw = str(_attr(order_obj, "action", default="")).upper()
-    side = _BUY if "BUY" in side_raw else _SELL
-    is_closing = "CLOSE" in side_raw
+    type_raw = str(_attr(order_obj, "orderType") or "MKT").upper().replace(" ", "_")
+    order_type = _TYPE_IN.get(type_raw, OrderType.MARKET)
 
-    type_raw = str(_attr(order_obj, "order_type", default="")).capitalize()
-    order_type = {
-        "Market":    OrderType.MARKET,
-        "Limit":     OrderType.LIMIT,
-        "Stop":      OrderType.STOP,
-        "Stoplimit": OrderType.STOP_LIMIT,
-    }.get(type_raw, OrderType.MARKET)
+    sec_type = (_attr(order_obj, "secType") or "").upper()
+    instrument = (
+        InstrumentType.OPTION if sec_type in ("OPT", "FOP") else InstrumentType.STOCK
+    )
+    # contractDesc for options reads like "AAPL 06JUN26 200 C"; first
+    # token is the underlying ticker, which is what our Order.symbol
+    # holds. For stocks it's just the ticker.
+    symbol_raw = str(_attr(order_obj, "ticker", "symbol", "contractDesc") or "")
+    symbol = symbol_raw.split(" ")[0].upper()
 
-    qty = _to_dec(_attr(order_obj, "total_quantity", "units")) or Decimal(0)
-    limit_price = _to_dec(_attr(order_obj, "limit_price", "price"))
-    stop_price = _to_dec(_attr(order_obj, "stop_price", "stop"))
-    filled_q = _to_dec(_attr(order_obj, "filled_units", "filled_quantity")) or Decimal(0)
-    filled_avg = _to_dec(_attr(order_obj, "execution_price", "filled_avg_price"))
+    qty = _to_dec(_attr(order_obj, "totalSize", "quantity")) or Decimal(0)
+    limit_price = _to_dec(_attr(order_obj, "price"))
+    stop_price = _to_dec(_attr(order_obj, "auxPrice", "stopPrice"))
+    filled_q = _to_dec(_attr(order_obj, "filledQuantity", "cumQty")) or Decimal(0)
+    filled_avg = _to_dec(_attr(order_obj, "avgPrice", "lastPrice"))
     submitted_at = (
-        _as_dt(_attr(order_obj, "time_placed", "created_at"))
+        _as_dt(_attr(order_obj, "lastExecutionTime", "submittedTime", "time"))
         or datetime.now(timezone.utc)
     )
 
     order = Order(
         user_id=trader_user_id,
         broker_account_id=broker_account_id,
-        instrument_type=parsed["instrument_type"],
-        symbol=parsed["symbol"],
-        option_expiry=parsed["option_expiry"],
-        option_strike=parsed["option_strike"],
-        option_right=parsed["option_right"],
+        instrument_type=instrument,
+        symbol=symbol,
+        # Option fields stay None for stocks; option placement is a TODO,
+        # but if a trader places an option on IBKR's app directly we'll
+        # detect it as instrument_type=OPTION with the underlying as
+        # symbol — a follow-up will parse expiry/strike/right.
+        option_expiry=None,
+        option_strike=None,
+        option_right=None,
         side=side,
         order_type=order_type,
         quantity=qty,
@@ -528,7 +492,7 @@ def _insert_order_from_snaptrade(
         filled_quantity=filled_q,
         filled_avg_price=filled_avg,
         submitted_at=submitted_at,
-        is_closing=is_closing,
+        is_closing=False,
         closed_at=(
             datetime.now(timezone.utc) if status_enum in (
                 OrderStatus.FILLED, OrderStatus.CANCELED,
@@ -547,7 +511,7 @@ def _cascade_cancel_to_mirrors(parent_order_id: uuid.UUID) -> None:
     try:
         _run_cancel_fanout_in_background(parent_order_id)
     except Exception:  # noqa: BLE001
-        log.exception("snaptrade-listener cancel-cascade failed for %s", parent_order_id)
+        log.exception("ibkr-listener cancel-cascade failed for %s", parent_order_id)
 
 
 # ── Small helpers ───────────────────────────────────────────────────────────
@@ -555,10 +519,7 @@ def _cascade_cancel_to_mirrors(parent_order_id: uuid.UUID) -> None:
 
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
     for n in names:
-        if isinstance(obj, dict):
-            v = obj.get(n)
-        else:
-            v = getattr(obj, n, None)
+        v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
         if v is not None:
             return v
     return default
@@ -574,12 +535,17 @@ def _to_dec(v: Any) -> Decimal | None:
 
 
 def _as_dt(v: Any) -> datetime | None:
-    if v is None:
+    if v is None or v == "":
         return None
     if isinstance(v, datetime):
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
-    s = str(v)
+    if isinstance(v, (int, float)):
+        sec = v / 1000.0 if v > 10**12 else float(v)
+        try:
+            return datetime.fromtimestamp(sec, tz=timezone.utc)
+        except (OSError, ValueError, OverflowError):
+            return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None

@@ -54,6 +54,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import client_ip, current_user
 from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter
+from app.brokers.ibkr import IBKRAdapter
 from app.brokers import snaptrade as snap
 from app.brokers.snaptrade import SnapTradeAdapter
 from app.brokers.webull import WebullAdapter, login_with_mfa, request_mfa
@@ -63,6 +64,7 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.user import User, UserRole
 from app.schemas.broker import (
     BrokerAccountOut,
+    BrokerAccountSettingsIn,
     ConnectBrokerIn,
     FinishSnaptradeIn,
     StartSnaptradeIn,
@@ -121,6 +123,21 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
             except Exception as exc:  # noqa: BLE001
                 log.exception("webull login_with_mfa unexpected failure")
                 raise HTTPException(400, f"webull_error: {exc}") from exc
+        case BrokerName.IBKR:
+            if not payload.ibkr:
+                raise HTTPException(422, "ibkr credentials required")
+            creds = payload.ibkr.model_dump()
+            # Validate via a live OAuth call before we persist. A bad
+            # consumer/token combo would otherwise sit silently and break
+            # every subsequent listener poll + order placement.
+            try:
+                IBKRAdapter(creds).verify_connection()
+            except RuntimeError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001
+                log.exception("ibkr verify_connection unexpected failure")
+                raise HTTPException(400, f"ibkr_error: {exc}") from exc
+            return creds
     raise HTTPException(422, "unknown broker")
 
 
@@ -754,6 +771,48 @@ def refresh_balance(
         entity_type="broker_account", entity_id=acct.id,
         ip_address=client_ip(request),
     )
+    db.commit()
+    db.refresh(acct)
+    return acct
+
+
+@router.patch("/{account_id}/settings", response_model=BrokerAccountOut)
+def update_broker_account_settings(
+    account_id: uuid.UUID,
+    payload: BrokerAccountSettingsIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> BrokerAccount:
+    """Update the listener-gating flags on a broker account.
+
+    Partial: any field left unset on the payload is unchanged. Owner-only
+    (caller must own the account). Used by the Brokers page checkboxes
+    (Auto Pull Orders + Bring open/Filled orders) so each user can decide
+    what their broker's listener actually persists + fans out.
+    """
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "not_found")
+
+    changes: dict[str, bool] = {}
+    if payload.auto_pull_orders is not None and payload.auto_pull_orders != acct.auto_pull_orders:
+        acct.auto_pull_orders = payload.auto_pull_orders
+        changes["auto_pull_orders"] = payload.auto_pull_orders
+    if payload.bring_open_orders is not None and payload.bring_open_orders != acct.bring_open_orders:
+        acct.bring_open_orders = payload.bring_open_orders
+        changes["bring_open_orders"] = payload.bring_open_orders
+    if payload.bring_filled_orders is not None and payload.bring_filled_orders != acct.bring_filled_orders:
+        acct.bring_filled_orders = payload.bring_filled_orders
+        changes["bring_filled_orders"] = payload.bring_filled_orders
+
+    if changes:
+        audit.record(
+            db, actor_user_id=user.id, action="broker.settings_updated",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata=changes, ip_address=client_ip(request),
+        )
+
     db.commit()
     db.refresh(acct)
     return acct

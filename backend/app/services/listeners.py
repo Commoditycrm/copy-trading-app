@@ -17,6 +17,7 @@ import uuid
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.services import (
+    ibkr_listener,
     listener_state,
     snaptrade_listener,
     trade_listener,
@@ -31,6 +32,7 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     trade_listener.bind_loop(loop)
     webull_listener.bind_loop(loop)
     snaptrade_listener.bind_loop(loop)
+    ibkr_listener.bind_loop(loop)
 
 
 async def start_all_listeners() -> None:
@@ -38,6 +40,7 @@ async def start_all_listeners() -> None:
     await trade_listener.start_all_listeners()
     await webull_listener.start_all_listeners()
     await snaptrade_listener.start_all_listeners()
+    await ibkr_listener.start_all_listeners()
 
 
 async def stop_all_listeners() -> None:
@@ -45,6 +48,7 @@ async def stop_all_listeners() -> None:
     await trade_listener.stop_all_listeners()
     await webull_listener.stop_all_listeners()
     await snaptrade_listener.stop_all_listeners()
+    await ibkr_listener.stop_all_listeners()
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
@@ -63,6 +67,8 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         webull_listener.start_listener(trader_user_id, broker_account_id)
     elif acct.broker == BrokerName.SNAPTRADE:
         snaptrade_listener.start_listener(trader_user_id, broker_account_id)
+    elif acct.broker == BrokerName.IBKR:
+        ibkr_listener.start_listener(trader_user_id, broker_account_id)
     else:
         log.info(
             "listeners.start_listener: no listener for broker %s",
@@ -82,6 +88,7 @@ def stop_listener(trader_user_id: uuid.UUID) -> None:
     trade_listener.stop_listener(trader_user_id)
     webull_listener.stop_listener(trader_user_id)
     snaptrade_listener.stop_listener(trader_user_id)
+    ibkr_listener.stop_listener(trader_user_id)
     # Drop the entry entirely so the SSE pill doesn't keep showing a
     # 'disconnected' state for a broker the user no longer has.
     listener_state.clear(trader_user_id)

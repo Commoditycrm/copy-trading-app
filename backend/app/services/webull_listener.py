@@ -39,7 +39,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, copy_engine, events, listener_state
+from app.services import audit, broker_filters, copy_engine, events, listener_state
 from app.services.crypto import decrypt_json, encrypt_json
 
 log = logging.getLogger(__name__)
@@ -286,6 +286,12 @@ def _poll_once(
     """Sync — runs in a thread. Pulls recent orders from Webull, diffs
     against last-seen, and routes new/changed orders through the same
     persist+fanout pipeline as the Alpaca listener."""
+    # Gate: master switch off → skip the broker fetch entirely.
+    with SessionLocal() as db:
+        acct = db.get(BrokerAccount, broker_account_id)
+        if not broker_filters.auto_pull_enabled(acct):
+            listener_state.bump_last_event(trader_user_id)
+            return
     orders = adapter.list_recent_activities()
     if not orders:
         listener_state.bump_last_event(trader_user_id)
@@ -323,6 +329,9 @@ def _persist_and_fanout(
     status_enum = WEBULL_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
 
     with SessionLocal() as db:
+        acct_gate = db.get(BrokerAccount, broker_account_id)
+        if not broker_filters.should_persist_order(acct_gate, status_enum):
+            return
         existing = db.execute(
             select(Order).where(Order.broker_order_id == broker_order_id)
         ).scalar_one_or_none()

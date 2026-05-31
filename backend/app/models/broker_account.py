@@ -24,6 +24,11 @@ class BrokerName(str, enum.Enum):
     # SnapTrade itself polls the upstream broker, so faster polling on our
     # side buys nothing. See app/brokers/snaptrade.py.
     SNAPTRADE = "snaptrade"
+    # Interactive Brokers — direct integration via IBKR's Web API (OAuth 1.0a,
+    # per-user self-service consumer credentials). Order updates are polled
+    # every ~2–5s (faster than SnapTrade because we talk to IBKR directly).
+    # See app/brokers/ibkr.py and app/services/ibkr_listener.py.
+    IBKR = "ibkr"
     # Test-only mock broker — see app/brokers/fake.py. NEVER ROUTE A REAL
     # SUBSCRIBER TO THIS. Calls to place_order() sleep + return synthetic
     # results; no order is sent anywhere. Used by
@@ -66,6 +71,16 @@ class BrokerAccount(Base, TimestampMixin):
     broker_account_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── Listener gating ───────────────────────────────────────────────
+    # Per-account knobs surfaced in the Brokers UI ("Auto Pull Orders"
+    # + "Bring open orders" + "Bring Filled orders"). Govern what the
+    # broker listener persists + fans out. Defaults are all-on so the
+    # historic behaviour (mirror everything) is preserved for existing
+    # rows after the migration.
+    auto_pull_orders: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="true")
+    bring_open_orders: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="true")
+    bring_filled_orders: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="true")
 
     # Cached balance snapshot
     cash: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)

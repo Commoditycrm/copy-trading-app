@@ -57,7 +57,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, copy_engine, events, fills_sync, listener_state
+from app.services import audit, broker_filters, copy_engine, events, fills_sync, listener_state
 from app.services.crypto import decrypt_json
 from app.services.listener_state import ListenerState, ListenerStatus
 
@@ -375,6 +375,17 @@ def _persist_and_fanout(
     event_name = getattr(update.event, "value", str(update.event)).lower()
     alpaca_order = update.order
     broker_order_id = str(alpaca_order.id)
+
+    # Gate: master switch + per-status (open vs filled) checkboxes on the
+    # broker account. Re-read each event so the user can flip flags at
+    # runtime and have it apply on the very next WS event. Treat anything
+    # that isn't a final FILLED as "open lifecycle" for filter purposes.
+    raw_status = str(getattr(alpaca_order, "status", "") or "").lower()
+    status_for_gate = OrderStatus.FILLED if raw_status == "filled" else OrderStatus.SUBMITTED
+    with SessionLocal() as gate_db:
+        gate_acct = gate_db.get(BrokerAccount, broker_account_id)
+        if not broker_filters.should_persist_order(gate_acct, status_for_gate):
+            return
 
     with SessionLocal() as db:
         from sqlalchemy import select
