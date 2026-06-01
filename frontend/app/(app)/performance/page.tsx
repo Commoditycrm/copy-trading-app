@@ -151,6 +151,31 @@ function brokerLagStats(
 
 // ── Compact metric card with optional inline sparkline ────────────────
 
+// ── Sort-direction chevron used by sortable inner-table headers ──────────
+//
+// Shows three states:
+//   - inactive (active=false)        → both arrows dim, signals "clickable to sort"
+//   - active asc (dir="asc")         → upper arrow highlighted
+//   - active desc (dir="desc")       → lower arrow highlighted
+// Pure SVG, no icon-lib dependency. The user-facing column header still
+// owns the click + cursor:pointer; this is just the visual indicator.
+function SortChevron({ dir, active }: { dir: "asc" | "desc" | undefined; active: boolean }) {
+  const upColor = active && dir === "asc" ? "var(--accent)" : "rgba(255,255,255,0.25)";
+  const downColor = active && dir === "desc" ? "var(--accent)" : "rgba(255,255,255,0.25)";
+  return (
+    <svg
+      width="8"
+      height="12"
+      viewBox="0 0 8 12"
+      aria-hidden
+      style={{ flexShrink: 0 }}
+    >
+      <path d="M 4 0 L 8 4 L 0 4 Z" fill={upColor} />
+      <path d="M 0 8 L 8 8 L 4 12 Z" fill={downColor} />
+    </svg>
+  );
+}
+
 function MetricCard({
   label, value, sub, valueColor, spark, Icon,
 }: {
@@ -671,24 +696,16 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
             )}
             {/* Platform */}
             <div className="flex items-center gap-1.5 text-sm">
-              <span
-                aria-hidden
-                style={{ width: 9, height: 9, borderRadius: 2, background: "var(--good)", display: "inline-block", flexShrink: 0 }}
-              />
               <span style={{ color: "var(--muted)" }}>Platform:</span>
-              <span style={{ color: "var(--good)", fontWeight: 600 }}>{fmtMs(medPlatform)}</span>
+              <span style={{ color: colorFor(medPlatform), fontWeight: 600 }}>{fmtMs(medPlatform)}</span>
             </div>
             {/* Broker */}
             <div className="flex items-center gap-1.5 text-sm">
-              <span
-                aria-hidden
-                style={{ width: 9, height: 9, borderRadius: 2, background: "#3b82f6", display: "inline-block", flexShrink: 0 }}
-              />
-              <span style={{ color: "var(--muted)" }}>Broker (Alpaca):</span>
-              <span style={{ color: "#3b82f6", fontWeight: 600 }}>{fmtMs(medBroker)}</span>
+              <span style={{ color: "var(--muted)" }}>Broker:</span>
+              <span style={{ color: colorFor(medBroker), fontWeight: 600 }}>{fmtMs(medBroker)}</span>
             </div>
             {/* Stacked bar */}
-            <PlatformBrokerBar platformMs={medPlatform} brokerMs={medBroker} />
+            {/* <PlatformBrokerBar platformMs={medPlatform} brokerMs={medBroker} /> */}
           </div>
         </div>
       )}
@@ -702,10 +719,27 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
   );
 }
 
+// Per-subscriber inner-table date/time columns the user can sort by.
+// Order here is just for type safety — the actual column order in the UI
+// is determined by the headers array further down.
+type ChildSortField =
+  | "created_at"
+  | "subscriber_picked_at"
+  | "subscriber_accepted_at"
+  | "broker_accepted_at"
+  | "redis_published_at";
+type SortDir = "asc" | "desc";
+interface ChildSort { field: ChildSortField; dir: SortDir; }
+
 export default function PerformancePage() {
   const [data, setData] = useState<FanoutResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Per-fanout sort state for the per-subscriber inner table. Keyed by
+  // parent_order_id so each open expansion remembers its own sort, and
+  // they don't bleed into each other if the user opens multiple at once.
+  // Missing key = chronological (API order, by created_at).
+  const [childSort, setChildSort] = useState<Map<string, ChildSort>>(new Map());
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function load() {
@@ -741,6 +775,46 @@ export default function PerformancePage() {
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
+  }
+
+  // Cycle the sort state for a given fanout's date/time column:
+  //   unsorted → asc → desc → unsorted → ...
+  // 3-state cycle lets the user return to chronological order without
+  // collapsing/re-expanding the row.
+  function cycleChildSort(parentId: string, field: ChildSortField) {
+    setChildSort(prev => {
+      const next = new Map(prev);
+      const cur = next.get(parentId);
+      if (!cur || cur.field !== field) {
+        next.set(parentId, { field, dir: "asc" });
+      } else if (cur.dir === "asc") {
+        next.set(parentId, { field, dir: "desc" });
+      } else {
+        next.delete(parentId);
+      }
+      return next;
+    });
+  }
+
+  // Sort a fanout's children by the active sort field+dir. Null timestamps
+  // sort LAST regardless of direction (e.g. a mirror that never made it
+  // to "Broker Accepted At" shouldn't push real rows around). Returns the
+  // original array if no sort is active.
+  function applyChildSort(parentId: string, children: FanoutChild[]): FanoutChild[] {
+    const sort = childSort.get(parentId);
+    if (!sort) return children;
+    const sorted = [...children];
+    sorted.sort((a, b) => {
+      const av = (a as unknown as Record<ChildSortField, string | null>)[sort.field];
+      const bv = (b as unknown as Record<ChildSortField, string | null>)[sort.field];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      // ISO 8601 timestamps sort correctly as strings — no need to parse.
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sort.dir === "asc" ? cmp : -cmp;
+    });
+    return sorted;
   }
 
   const m = data?.metrics;
@@ -1092,44 +1166,60 @@ export default function PerformancePage() {
                                   bleeding through behind the sticky row. */}
                               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
                                 <tr style={{ color: "var(--muted)" }}>
+                                  {/* Per-column header definitions. The optional third element is the
+                                      sort field — when present, the column renders a clickable sort
+                                      indicator that cycles unsorted → asc → desc → unsorted. */}
                                   {([
                                     ["Subscriber", "The subscriber whose account this mirror was placed on."],
                                     ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
                                     ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
                                     ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
-                                    ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING)."],
-                                    ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line."],
-                                    ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker."],
-                                    ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order."],
-                                    ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
-                                    ["Pick Lag 🟢", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
-                                    ["Eligibility Lag 🟢", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING).", "created_at"],
+                                    ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line.", "subscriber_picked_at"],
+                                    ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
+                                    ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order.", "broker_accepted_at"],
+                                    ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time.", "redis_published_at"],
+                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Eligibility Lag", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
                                     ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
-                                    ["Broker Lag 🔵", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
-                                    ["Broker Response 🔵", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
-                                    ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
+                                    ["Broker Lag", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
+                                    ["Broker Response", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
+                                    // ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
                                     ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
                                     ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
                                     ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
-                                  ] as [string, string][]).map(([h, tip]) => (
-                                    <th
-                                      key={h}
-                                      title={tip}
-                                      className="text-left px-2 py-2 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
-                                      style={{
-                                        borderBottom: "1px solid var(--border)",
-                                        cursor: "help",
-                                        textDecoration: "underline dotted var(--border)",
-                                        textUnderlineOffset: 4,
-                                      }}
-                                    >
-                                      {h}
-                                    </th>
-                                  ))}
+                                  ] as ([string, string] | [string, string, ChildSortField])[]).map((row) => {
+                                    const [h, tip] = row;
+                                    const sortField = row[2] as ChildSortField | undefined;
+                                    const active = sortField && childSort.get(f.parent_order_id)?.field === sortField;
+                                    const dir = active ? childSort.get(f.parent_order_id)?.dir : undefined;
+                                    return (
+                                      <th
+                                        key={h}
+                                        title={tip}
+                                        onClick={sortField ? () => cycleChildSort(f.parent_order_id, sortField) : undefined}
+                                        className="text-left px-2 py-2 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap select-none"
+                                        style={{
+                                          borderBottom: "1px solid var(--border)",
+                                          cursor: sortField ? "pointer" : "help",
+                                          textDecoration: sortField ? "none" : "underline dotted var(--border)",
+                                          textUnderlineOffset: 4,
+                                          color: active ? "var(--accent)" : "var(--muted)",
+                                        }}
+                                      >
+                                        <span className="inline-flex items-center gap-1">
+                                          <span>{h}</span>
+                                          {sortField && (
+                                            <SortChevron dir={dir} active={!!active} />
+                                          )}
+                                        </span>
+                                      </th>
+                                    );
+                                  })}
                                 </tr>
                               </thead>
                               <tbody>
-                                {f.children.map(c => {
+                                {applyChildSort(f.parent_order_id, f.children).map(c => {
                                   const displayName =
                                     c.subscriber_name ||
                                     (c.subscriber_email ? c.subscriber_email.split("@")[0] : null) ||
@@ -1239,12 +1329,12 @@ export default function PerformancePage() {
                                         {fmtMs(c.broker_response_ms)}
                                       </td>
                                       {/* Split bar — Platform (green) vs Broker (blue) */}
-                                      <td className="px-2 py-2 whitespace-nowrap">
+                                      {/* <td className="px-2 py-2 whitespace-nowrap">
                                         <PlatformBrokerBar
                                           platformMs={(c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0)}
                                           brokerMs={c.broker_lag_ms}
                                         />
-                                      </td>
+                                      </td> */}
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
                                         style={{ color: colorFor(c.publish_lag_ms) }}

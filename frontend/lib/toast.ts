@@ -35,7 +35,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   wrong_token_type: "Your session is invalid. Please sign in again.",
   missing_token: "Please sign in to continue.",
   user_inactive: "This account is disabled. Contact support.",
-  trader_already_exists: "A trader account already exists. Only one trader is allowed.",
+  // trader_already_exists removed — multi-trader is now supported.
 
   // role gates
   trader_only: "Only the trader can do this.",

@@ -27,16 +27,11 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="email_taken")
 
-    if payload.role == UserRole.TRADER:
-        # Product rule: only one trader on the platform.
-        trader_exists = db.execute(
-            select(User).where(User.role == UserRole.TRADER)
-        ).scalar_one_or_none()
-        if trader_exists:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, detail="trader_already_exists"
-            )
-
+    # Multi-trader is now supported — anyone can register as TRADER. Each
+    # trader is independent: their own broker_accounts, their own copy
+    # fanout, their own subscribers list. SubscriberSettings.following_trader_id
+    # is a free FK to any user with role=TRADER, so subscribers pick whichever
+    # trader they want from the Following dropdown.
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
