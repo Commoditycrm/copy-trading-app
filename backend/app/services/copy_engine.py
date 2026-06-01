@@ -219,51 +219,64 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         cache.invalidate_subscribers_for_trader(trader.id)
         subs = await cache.get_subscribers_for_trader(db, trader.id)
 
-    # PRE-PHASE-1 BATCH (1/3): compute today's realized P&L for every
-    # subscriber who has EITHER limit set, in ONE round-trip instead of N.
-    # Same batch serves the daily-loss check AND the daily-profit check below.
+    # Decide hybrid path first — we need it to know whether to do the
+    # batched broker_accounts SELECT (we skip it for small-N to keep the
+    # per-iter path's low floor intact).
+    threshold = await get_fanout_batch_threshold_async()
+    use_batch = len(subs) >= threshold
+
+    # PRE-PHASE-1 PARALLEL BATCHES — these two prep steps are independent
+    # and previously ran serially:
+    #   (1) today_realized_pnl_bulk — FIFO lot-walk for every subscriber
+    #       with a P&L limit set. The single most expensive piece of prep
+    #       (often 150-250 ms at scale).
+    #   (2) batched broker_accounts SELECT — only in the batched path.
+    # Wrapping both in asyncio.gather lets them overlap, so the slower of
+    # the two sets the floor instead of (1) + (2) added together.
+    #
+    # NOTE: previous revisions also fetched a `users_by_id` dict just to
+    # do `if not sub_user: continue`. That guard never fires in practice —
+    # get_subscribers_for_trader() returns only subscribers whose
+    # SubscriberSettings row exists, which CASCADEs from users, so a
+    # returned sub.user_id is guaranteed to correspond to a live User.
+    # Dropping that SELECT saves another ~30-50 ms.
     sub_ids_with_limit = [
         s.user_id for s in subs
         if s.daily_loss_limit is not None or s.daily_profit_limit is not None
     ]
-    pnl_by_user: dict[uuid.UUID, Decimal] = (
-        await asyncio.to_thread(today_realized_pnl_bulk, db, sub_ids_with_limit)
-        if sub_ids_with_limit
-        else {}
-    )
+    sub_user_ids = [s.user_id for s in subs] if use_batch else []
 
-    # HYBRID MODE — pick a path based on subscriber count:
-    #   - Small N (< threshold): per-iteration db.get(User) + cache lookups
-    #     inside the loop. Cheaper first-sub pick_lag (~30 ms floor) but
-    #     scales linearly — fine until ~75 subs.
-    #   - Large N (>= threshold): one SELECT for users, one for broker
-    #     accounts up front, then the loop is pure dict lookups. Higher
-    #     fixed floor (~150-300 ms) but stays flat as N grows.
-    # Threshold is env-defaulted via Settings.fanout_batch_threshold and
-    # admin-overridable at runtime via Redis. Read once per fanout; ~0.5ms.
-    threshold = await get_fanout_batch_threshold_async()
-    use_batch = len(subs) >= threshold
+    # Each parallel branch opens its OWN SessionLocal — SQLAlchemy
+    # sessions aren't safe to share across threads, and to_thread can run
+    # both branches concurrently. The caller's `db` keeps the
+    # transactional context for everything after this gather (Phase 1
+    # inserts, Phase 3 commit).
+    def _pnl_sync() -> dict[uuid.UUID, Decimal]:
+        if not sub_ids_with_limit:
+            return {}
+        with SessionLocal() as session:
+            return today_realized_pnl_bulk(session, sub_ids_with_limit)
 
-    users_by_id: dict[uuid.UUID, User] = {}
-    accts_by_user: dict[uuid.UUID, list[BrokerAccount]] = defaultdict(list)
-    if use_batch:
-        # PRE-PHASE-1 BATCH (2/3): one SELECT for all subscriber Users.
-        # Replaces N per-iteration ``db.get(User, sub.user_id)`` calls.
-        sub_user_ids = [s.user_id for s in subs]
-        if sub_user_ids:
-            users_by_id = {
-                u.id: u
-                for u in db.execute(
-                    select(User).where(User.id.in_(sub_user_ids))
-                ).scalars()
-            }
-            # PRE-PHASE-1 BATCH (3/3): one SELECT for every broker account
-            # across all subscribers. Replaces N per-iteration
-            # ``await cache.get_broker_accounts(...)`` calls.
-            for acct in db.execute(
+    def _accts_sync() -> dict[uuid.UUID, list[BrokerAccount]]:
+        d: dict[uuid.UUID, list[BrokerAccount]] = defaultdict(list)
+        if not sub_user_ids:
+            return d
+        with SessionLocal() as session:
+            for acct in session.execute(
                 select(BrokerAccount).where(BrokerAccount.user_id.in_(sub_user_ids))
             ).scalars():
-                accts_by_user[acct.user_id].append(acct)
+                # Detach so the BrokerAccount survives past the session
+                # close — we read attributes (encrypted_credentials,
+                # supports_fractional, broker, id) inside the loop on
+                # the caller's coroutine, after this session exits.
+                session.expunge(acct)
+                d[acct.user_id].append(acct)
+            return d
+
+    pnl_by_user, accts_by_user = await asyncio.gather(
+        asyncio.to_thread(_pnl_sync),
+        asyncio.to_thread(_accts_sync),
+    )
 
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
@@ -273,11 +286,6 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # all picked_at values are within microseconds — pick_lag is now a
         # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
-
-        # Hybrid: dict lookup when pre-batched, single ``db.get`` otherwise.
-        sub_user = users_by_id.get(sub.user_id) if use_batch else db.get(User, sub.user_id)
-        if not sub_user:
-            continue
 
         # Daily P&L kill switches (check BEFORE placing). Loss + profit
         # share the same auto-pause + auto-resume machinery — both stamp
