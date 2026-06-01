@@ -120,13 +120,13 @@ export default function SubscribersPage() {
     );
   }, [selected]);
 
-  // At-a-glance counts shown in the page header. `active` = copy on,
-  // `paused` = copy off (subscriber-side disable OR daily-loss auto-pause).
-  // The numbers re-derive from `rows` so they're always in sync with the
-  // table below — no risk of a stale count after a remove / refresh.
+  // At-a-glance counts shown in the page header. `active` = copy_enabled,
+  // `withBroker` = at least one broker connected (broker_count > 0).
+  // All three derive from `rows` so they're always in sync with the table
+  // below — no stale count after a remove / refresh.
   const total = rows.length;
   const active = rows.filter(r => r.copy_enabled).length;
-  const paused = total - active;
+  const withBroker = rows.filter(r => r.broker_count > 0).length;
 
   return (
     <div className="space-y-4">
@@ -146,15 +146,37 @@ export default function SubscribersPage() {
           <Divider />
           <CountStat label="Copy ON" value={active} loading={loading} color="var(--good)" />
           <Divider />
-          <CountStat label="Paused" value={paused} loading={loading} color={paused > 0 ? "var(--muted)" : "var(--text)"} />
+          {/* Number of subscribers with at least one broker hooked up —
+              anyone with 0 brokers gets skipped by copy_engine with
+              status="skipped_no_broker", so this is "how many can
+              actually receive mirrors." */}
+          <CountStat
+            label="Broker Connected"
+            value={withBroker}
+            loading={loading}
+            color={withBroker === total ? "var(--good)" : "var(--text)"}
+          />
         </div>
       </header>
 
       {bulkBar}
 
-      <div className="overflow-x-auto rounded border" style={{borderColor: "var(--border)"}}>
+      {/* overflow-auto + max-h enables BOTH horizontal scroll (if cols
+          ever exceed width) and vertical scroll once the body is taller
+          than the viewport minus the header chrome. The sticky <thead>
+          below stays pinned to the top of this scroll container so
+          column headers remain visible while the user scrolls rows. */}
+      <div
+        className="overflow-auto rounded border"
+        style={{
+          borderColor: "var(--border)",
+          maxHeight: "calc(100vh - 150px)",
+        }}
+      >
         <table className="w-full text-sm">
-          <thead style={{background: "var(--panel)"}}>
+          {/* sticky top-0 z-10 keeps the header pinned; opaque var(--panel)
+              background prevents row text from bleeding through behind it. */}
+          <thead className="sticky top-0 z-10" style={{background: "var(--panel)"}}>
             <tr>
               <th className="px-3 py-2 w-10">
                 <input
@@ -212,7 +234,6 @@ export default function SubscribersPage() {
                         broker_count == 0 means fanout will skip this row with
                         status="skipped_no_broker". */}
                     <span
-                      className="text-xs"
                       style={{color: r.broker_count > 0 ? "var(--good)" : "var(--muted)"}}
                     >
                       {r.broker_count > 0 ? "Connected" : "Not Connected"}
