@@ -76,6 +76,25 @@ class SubscriberSettings(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True,
     )
 
+    # UI-only ceiling on per-contract dollar size — surfaced in the Settings
+    # panel for the user to track their own risk, NOT enforced server-side.
+    # We persist it so the value survives refresh and round-trips through
+    # PATCH/GET like the other limits.
+    max_per_contract: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+
+    # Percentage of current Alpaca account equity that bounds today's
+    # cumulative filled trade NOTIONAL (capital deployed in mirror orders
+    # today, both buy + sell, options × 100). When notional crosses
+    # ``equity * pct/100``, copy is auto-paused. Stored as the percent
+    # value itself (e.g. 50.00 = 50%). Enforced by pnl_poller every 60s
+    # using fresh equity from Alpaca, so the dollar threshold floats with
+    # account size instead of being a fixed cap. NULL = feature disabled.
+    max_account_pct_per_day: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+
     # Retry policy for transient broker errors. Two separate intervals so a
     # subscriber can be aggressive about closing positions (late close hurts
     # P&L) and conservative about opening (late open is usually fine — skip

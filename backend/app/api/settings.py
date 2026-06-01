@@ -10,6 +10,8 @@ from app.schemas.settings import (
     DailyLossLimitIn,
     DailyProfitLimitIn,
     FollowTraderIn,
+    MaxAccountPctIn,
+    MaxPerContractIn,
     RetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
@@ -24,13 +26,13 @@ from app.services import audit, cache
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
-@router.get("/subscriber", response_model=SubscriberSettingsOut)
-def get_subscriber_settings(
-    db: Session = Depends(get_db), user: User = Depends(require_subscriber)
-) -> SubscriberSettingsOut:
-    s = db.get(SubscriberSettings, user.id)
-    if not s:
-        raise HTTPException(404, "settings_missing")
+def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
+    """Build the response payload from a SubscriberSettings ORM row.
+
+    Centralised so adding a new column doesn't require touching every
+    PATCH endpoint that returns this shape. ``todays_realized_pnl`` is
+    computed from the fills table here — the live tick from pnl_poller
+    pushes the same number via SSE for the panel's live refresh."""
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
@@ -38,12 +40,24 @@ def get_subscriber_settings(
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
+        todays_realized_pnl=today_realized_pnl(db, s.user_id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
         symbol_exclusion_list=list(s.symbol_exclusion_list or []),
         symbol_inclusion_list=list(s.symbol_inclusion_list or []),
+        max_per_contract=s.max_per_contract,
+        max_account_pct_per_day=s.max_account_pct_per_day,
     )
+
+
+@router.get("/subscriber", response_model=SubscriberSettingsOut)
+def get_subscriber_settings(
+    db: Session = Depends(get_db), user: User = Depends(require_subscriber)
+) -> SubscriberSettingsOut:
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    return _to_out(db, s)
 
 
 @router.patch("/subscriber/daily-profit-limit", response_model=SubscriberSettingsOut)
@@ -76,19 +90,7 @@ def set_daily_profit_limit(
     db.refresh(s)
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
-        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
-    )
+    return _to_out(db, s)
 
 
 @router.patch("/subscriber/daily-loss-limit", response_model=SubscriberSettingsOut)
@@ -119,19 +121,73 @@ def set_daily_loss_limit(
     db.refresh(s)
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
-        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/max-per-contract", response_model=SubscriberSettingsOut)
+def set_max_per_contract(
+    payload: MaxPerContractIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """UI-only ceiling — persisted so it survives refresh. NOT enforced
+    server-side; copy_engine doesn't read this column."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.max_per_contract
+    s.max_per_contract = payload.max_per_contract
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.max_per_contract_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.max_per_contract) if payload.max_per_contract is not None else None,
+        },
+        ip_address=client_ip(request),
     )
+    db.commit()
+    db.refresh(s)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/max-account-pct", response_model=SubscriberSettingsOut)
+def set_max_account_pct(
+    payload: MaxAccountPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """% of current Alpaca equity that, if today's P&L breaches as a loss,
+    auto-pauses copy. Enforced by ``services.pnl_poller`` every 60s using
+    fresh equity from Alpaca — the dollar threshold floats with account
+    size instead of being a fixed cap."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.max_account_pct_per_day
+    s.max_account_pct_per_day = payload.max_account_pct_per_day
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.max_account_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.max_account_pct_per_day) if payload.max_account_pct_per_day is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
 
 
 @router.patch("/subscriber/retry-interval", response_model=SubscriberSettingsOut)
@@ -179,19 +235,7 @@ def set_retry_interval(
         )
     db.commit()
     db.refresh(s)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
-        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
-    )
+    return _to_out(db, s)
 
 
 def _normalize_symbols(syms: list[str]) -> list[str]:
@@ -255,19 +299,7 @@ def set_symbol_filter(
     # stale snapshot for a few seconds).
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
-    return SubscriberSettingsOut(
-        user_id=s.user_id,
-        following_trader_id=s.following_trader_id,
-        copy_enabled=s.copy_enabled,
-        multiplier=s.multiplier,
-        daily_loss_limit=s.daily_loss_limit,
-        daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, user.id),
-        retry_interval_open=s.retry_interval_open.value,
-        retry_interval_close=s.retry_interval_close.value,
-        symbol_exclusion_list=list(s.symbol_exclusion_list or []),
-        symbol_inclusion_list=list(s.symbol_inclusion_list or []),
-    )
+    return _to_out(db, s)
 
 
 @router.patch("/subscriber/copy", response_model=SubscriberSettingsOut)
