@@ -349,11 +349,34 @@ def _persist_and_fanout(
         acct_gate = db.get(BrokerAccount, broker_account_id)
         if not broker_filters.should_persist_order(acct_gate, status_enum):
             return
+        # Scope the lookup to *this trader's own* order by (user_id,
+        # broker_order_id) — NOT broker_account_id. Reconnecting a broker
+        # deletes the old broker_account, and the FK (ondelete=SET NULL) then
+        # nulls broker_account_id on all its historical orders. If we scoped by
+        # broker_account_id we'd miss those orphaned rows and re-insert the same
+        # order under the new account on every reconnect (the source of the
+        # duplicate pile-up). Matching by user_id finds the orphaned row so we
+        # update + re-adopt it instead.
+        #
+        # parent_order_id IS NULL excludes subscriber mirror orders (which carry
+        # their own broker_order_id). broker_order_id has no unique constraint,
+        # so use LIMIT 1 + .first() — a dup group can never raise
+        # MultipleResultsFound and crash the poll loop; deterministic order_by
+        # keeps the chosen row stable across polls.
         existing = db.execute(
-            select(Order).where(Order.broker_order_id == broker_order_id)
-        ).scalar_one_or_none()
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .where(Order.user_id == trader_user_id)
+            .where(Order.parent_order_id.is_(None))
+            .order_by(Order.created_at)
+            .limit(1)
+        ).scalars().first()
 
         if existing is not None:
+            # Re-adopt an orphaned row (broker_account_id nulled by a prior
+            # reconnect) back onto the live account so it stays linked.
+            if existing.broker_account_id != broker_account_id:
+                existing.broker_account_id = broker_account_id
             if existing.status != status_enum:
                 existing.status = status_enum
             fq = _attr(order_obj, "filled_units", "filled_quantity")
