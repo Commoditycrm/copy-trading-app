@@ -233,6 +233,71 @@ input[type="number"] {
   appearance: textfield;
 }
 
+/* Dark-themed checkboxes — overrides the browser's default white box
+   (Chrome on macOS especially renders an out-of-place light square on
+   our dark surfaces). We `appearance: none` to drop the OS rendering
+   then re-draw the box + checkmark + indeterminate state in our own
+   palette via pseudo-elements (no SVG needed). The :indeterminate
+   state matters: the "select all" header checkbox on the subscribers
+   page sets it via a React ref when some-but-not-all rows are picked. */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  /* Subtle gray fill — visible on dark panels but not bright enough to
+     pull focus away from row content. Border is a touch lighter than the
+     fill so the shape stays defined without glowing. */
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  transition: background 120ms ease, border-color 120ms ease;
+  vertical-align: middle;
+  flex-shrink: 0;
+  margin: 0;
+}
+input[type="checkbox"]:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+/* Checkmark — angled ::after, no SVG. Ink color matches our accent-on-button text. */
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 4px;
+  width: 5px;
+  height: 9px;
+  border: solid #06121f;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+/* Indeterminate state — flat horizontal bar instead of the check. */
+input[type="checkbox"]:indeterminate::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  width: 10px;
+  height: 2px;
+  background: #06121f;
+}
+input[type="checkbox"]:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* Tables — softer dividers */
 table { border-collapse: separate; border-spacing: 0; }
 thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; font-size: 11px; }
