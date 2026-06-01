@@ -16,6 +16,12 @@ class SubscriberSettingsOut(BaseModel):
     # profit cap.
     daily_profit_limit: Decimal | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
+    # UI-only — persisted but never enforced server-side.
+    max_per_contract: Decimal | None = None
+    # Percent of account equity (0–100). pnl_poller checks every 60s using
+    # today's equity from Alpaca; pauses copy if today's P&L breaches the
+    # derived dollar threshold.
+    max_account_pct_per_day: Decimal | None = None
     # Retry policy for transient broker errors. "never" disables retry.
     # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
     # frontend can render dropdowns without a separate mapping. Validator
@@ -70,6 +76,19 @@ class DailyProfitLimitIn(BaseModel):
     both auto-resume at the next UTC midnight via copy_engine."""
 
     daily_profit_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class MaxPerContractIn(BaseModel):
+    """UI-only dollar ceiling per contract. Persisted but not enforced."""
+
+    max_per_contract: Decimal | None = Field(default=None, ge=0)
+
+
+class MaxAccountPctIn(BaseModel):
+    """% of current Alpaca account equity. When today's P&L falls below
+    -(equity * pct/100), pnl_poller auto-pauses copy. 0 < pct <= 100."""
+
+    max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
 
 
 class RetryIntervalIn(BaseModel):

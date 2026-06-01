@@ -26,6 +26,21 @@ export default function SettingsPage() {
   const [limitBusy, setLimitBusy] = useState(false);
   const [profitInput, setProfitInput] = useState("");
   const [profitBusy, setProfitBusy] = useState(false);
+  // Max-per-contract is UI-only — no Today/Headroom readouts. Persisted
+  // so the value survives refresh.
+  const [maxContractInput, setMaxContractInput] = useState("");
+  const [maxContractBusy, setMaxContractBusy] = useState(false);
+  // Max-account-pct-per-day is enforced server-side by pnl_poller.
+  // `equity` comes in on every pnl.tick event so the panel can render
+  // the dynamic dollar threshold (equity × pct/100). Null until the
+  // first tick lands — typically within 60s of page load.
+  const [maxPctInput, setMaxPctInput] = useState("");
+  const [maxPctBusy, setMaxPctBusy] = useState(false);
+  const [equity, setEquity] = useState<string | null>(null);
+  // Today's filled-trade notional in USD — the metric the pct limit
+  // compares against. Comes in on every pnl.tick event; "—" in the UI
+  // until the first tick lands.
+  const [todaysTradingValue, setTodaysTradingValue] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -37,6 +52,8 @@ export default function SettingsPage() {
         setMultInput(parseFloat(s.multiplier).toString());
         setLimitInput(s.daily_loss_limit ?? "");
         setProfitInput(s.daily_profit_limit ?? "");
+        setMaxContractInput(s.max_per_contract ?? "");
+        setMaxPctInput(s.max_account_pct_per_day ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -53,6 +70,28 @@ export default function SettingsPage() {
         { autoClose: false }
       );
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
+      return;
+    }
+    if (e?.type === "copy.auto_resumed") {
+      notify.success("Copy trading auto-resumed for the new day.");
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
+      return;
+    }
+    // pnl_poller publishes this every 60s with the latest equity-delta
+    // P&L from Alpaca + the current copy_enabled flag. Merge into local
+    // state so the P&L Limit panel updates live without a manual refresh.
+    if (e?.type === "pnl.tick") {
+      if (typeof e.equity === "string") setEquity(e.equity);
+      if (typeof e.todays_trading_value === "string") setTodaysTradingValue(e.todays_trading_value);
+      setSub(prev => prev ? {
+        ...prev,
+        todays_realized_pnl:      e.todays_realized_pnl      ?? prev.todays_realized_pnl,
+        daily_loss_limit:         e.daily_loss_limit         ?? null,
+        daily_profit_limit:       e.daily_profit_limit       ?? null,
+        max_per_contract:         e.max_per_contract         ?? prev.max_per_contract,
+        max_account_pct_per_day:  e.max_account_pct_per_day  ?? prev.max_account_pct_per_day,
+        copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
+      } : prev);
     }
   });
 
@@ -113,6 +152,40 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update daily profit limit");
     } finally {
       setProfitBusy(false);
+    }
+  }
+  async function saveMaxContract() {
+    setMaxContractBusy(true);
+    try {
+      const trimmed = maxContractInput.trim();
+      const body = { max_per_contract: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/max-per-contract", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setMaxContractInput(s.max_per_contract ?? "");
+      notify.success(s.max_per_contract ? `Max per contract set to $${s.max_per_contract}` : "Max per contract cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not update max per contract");
+    } finally {
+      setMaxContractBusy(false);
+    }
+  }
+  async function saveMaxPct() {
+    setMaxPctBusy(true);
+    try {
+      const trimmed = maxPctInput.trim();
+      const body = { max_account_pct_per_day: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/max-account-pct", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setMaxPctInput(s.max_account_pct_per_day ?? "");
+      notify.success(s.max_account_pct_per_day ? `Max ${s.max_account_pct_per_day}% per day set` : "Max % per day cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not update max % per day");
+    } finally {
+      setMaxPctBusy(false);
     }
   }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
@@ -274,6 +347,48 @@ export default function SettingsPage() {
                 limit={profitLimit}
                 pct={profitPct}
                 headroom={profitHeadroom}
+                fmt={fmt}
+              />
+            </div>
+          </Card>
+
+          {/* ── Risk Limits (per-contract + % of equity) ──────────────── */}
+          {/* Same split layout as P&L Limit so the two cards read as a
+              pair. Left side is UI-only ($ display ceiling), right side
+              is the live pct-of-equity kill switch enforced by the
+              pnl_poller every 60s — its dollar threshold is computed
+              from the latest equity that arrives on each pnl.tick. */}
+          <Card
+            icon={<IconShield />}
+            title="Risk Limits"
+            hint="Max position size + % of account equity that, if today's P&L breaches as a loss, turns copy OFF."
+          >
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_1px_1fr] gap-4 md:gap-5">
+              <MaxPerContractPanel
+                input={maxContractInput}
+                onInput={setMaxContractInput}
+                onSave={saveMaxContract}
+                busy={maxContractBusy}
+                current={sub.max_per_contract}
+              />
+              <div
+                aria-hidden
+                className="hidden md:block w-px h-full"
+                style={{background: "var(--border)"}}
+              />
+              <div
+                aria-hidden
+                className="md:hidden h-px w-full"
+                style={{background: "var(--border)"}}
+              />
+              <MaxPctPanel
+                input={maxPctInput}
+                onInput={setMaxPctInput}
+                onSave={saveMaxPct}
+                busy={maxPctBusy}
+                current={sub.max_account_pct_per_day}
+                equity={equity}
+                todaysTradingValue={todaysTradingValue}
                 fmt={fmt}
               />
             </div>
@@ -634,6 +749,172 @@ function PnLLimitPanel({
           </div>
           <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
             {Math.round(pct)}% of limit
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Max-per-contract panel — UI-only ceiling, no live readouts. Persisted
+ *  on the server but never read by copy_engine; surfaces here purely so
+ *  the subscriber can record their own risk policy alongside the live
+ *  kill switches. */
+function MaxPerContractPanel({
+  input, onInput, onSave, busy, current,
+}: {
+  input: string;
+  onInput: (v: string) => void;
+  onSave: () => void;
+  busy: boolean;
+  current: string | null;
+}) {
+  return (
+    <div className="min-w-0 space-y-3">
+      <div>
+        <div className="text-sm font-semibold">Max per contract</div>
+        {/* <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>
+          Self-imposed ceiling — display only, not enforced.
+        </div> */}
+      </div>
+      <div className="flex items-center gap-2">
+        <div
+          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
+          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
+        >
+          <span
+            className="px-3 py-2 text-xs font-medium border-r"
+            style={{color: "var(--muted)", borderColor: "var(--border)"}}
+          >
+            USD
+          </span>
+          <input
+            type="number" step="0.01" min="0" placeholder="no limit"
+            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
+            style={{
+              border: "none", background: "transparent", outline: "none",
+              borderRadius: 0, color: "var(--text)",
+            }}
+            value={input}
+            onChange={(e) => onInput(e.target.value)}
+          />
+        </div>
+        <PrimaryButton
+          busy={busy}
+          onClick={onSave}
+          disabled={busy || input === (current ?? "")}
+        >
+          Save
+        </PrimaryButton>
+      </div>
+      <div className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
+        Current: {current ? `$${current}` : "—"}
+      </div>
+    </div>
+  );
+}
+
+/** Max-%-of-equity panel — enforced server-side every 60s by pnl_poller.
+ *  The metric here is TODAY'S TRADING VALUE in USD (cumulative filled
+ *  notional, both buy + sell, options × 100 multiplier), NOT P&L. When
+ *  trading value crosses equity × pct/100, copy is auto-paused.
+ *
+ *  Both ``equity`` and ``todaysTradingValue`` arrive on every pnl.tick;
+ *  the panel renders "—" for the dollar columns until the first tick
+ *  lands (typically within 60s of page load). */
+function MaxPctPanel({
+  input, onInput, onSave, busy, current, equity, todaysTradingValue, fmt,
+}: {
+  input: string;
+  onInput: (v: string) => void;
+  onSave: () => void;
+  busy: boolean;
+  current: string | null;
+  equity: string | null;
+  todaysTradingValue: string | null;
+  fmt: (v: string | null | undefined) => string;
+}) {
+  const pctNum = current ? parseFloat(current) : null;
+  const equityNum = equity ? parseFloat(equity) : null;
+  const tvNum = todaysTradingValue ? parseFloat(todaysTradingValue) : 0;
+  // Dollar threshold the server uses: equity × pct/100. Null until we
+  // have both inputs so the UI doesn't render a misleading "$0.00".
+  const limitDollars = (pctNum && equityNum && equityNum > 0)
+    ? (equityNum * pctNum / 100)
+    : null;
+  const headroom = limitDollars !== null ? limitDollars - tvNum : null;
+  const pctConsumed = (limitDollars && limitDollars > 0)
+    ? Math.min(100, Math.max(0, (tvNum / limitDollars) * 100))
+    : 0;
+  const barColor = pctConsumed >= 100 ? "var(--bad)" : pctConsumed >= 75 ? "#f59e0b" : "var(--good)";
+  return (
+    <div className="min-w-0 space-y-3">
+      <div>
+        <div className="text-sm font-semibold">Max % of account per day</div>
+        <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>
+          Pause copy when today&apos;s trading value (USD) reaches this % of equity.
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <div
+          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
+          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
+        >
+          <span
+            className="px-3 py-2 text-xs font-medium border-r"
+            style={{color: "var(--muted)", borderColor: "var(--border)"}}
+          >
+            %
+          </span>
+          <input
+            type="number" step="0.5" min="0" max="100" placeholder="no limit"
+            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
+            style={{
+              border: "none", background: "transparent", outline: "none",
+              borderRadius: 0, color: "var(--text)",
+            }}
+            value={input}
+            onChange={(e) => onInput(e.target.value)}
+          />
+        </div>
+        <PrimaryButton
+          busy={busy}
+          onClick={onSave}
+          disabled={busy || input === (current ?? "")}
+        >
+          Save
+        </PrimaryButton>
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        <Stat
+          label="Today's Trading"
+          value={todaysTradingValue !== null ? fmt(todaysTradingValue) : "—"}
+        />
+        <Stat
+          label="Limit"
+          value={limitDollars !== null ? fmt(String(limitDollars)) : "—"}
+        />
+        <Stat
+          label="Headroom"
+          value={headroom !== null ? fmt(String(headroom)) : "—"}
+          color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+        />
+      </div>
+      {limitDollars !== null && (
+        <div>
+          <div className="h-1.5 rounded-full overflow-hidden" style={{background: "rgba(255,255,255,0.06)"}}>
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${pctConsumed}%`,
+                background: barColor,
+                boxShadow: `0 0 8px -2px ${barColor}`,
+                transition: "width 0.4s ease",
+              }}
+            />
+          </div>
+          <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
+            {Math.round(pctConsumed)}% of limit · equity {equity ? `$${parseFloat(equity).toFixed(2)}` : "—"}
           </div>
         </div>
       )}

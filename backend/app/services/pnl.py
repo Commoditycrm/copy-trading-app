@@ -67,6 +67,63 @@ def _tz_or_market(tz_name: str | None) -> "ZoneInfo | timezone":
         return _MARKET_TZ
 
 
+def today_filled_notional(
+    db: Session, user_id: uuid.UUID, tz_name: str | None = None,
+) -> Decimal:
+    """Gross USD value of every fill placed today for ``user_id``.
+
+    Returns ``sum(abs(filled_qty) * filled_avg_price * multiplier)`` across
+    every order that has any filled quantity recorded with a transaction
+    time in today's market-timezone day. Both BUY and SELL count — this is
+    capital deployed, not net P&L. Options pick up the 100x contract
+    multiplier so the dollar amount reflects actual exposure, matching
+    how an Alpaca/SnapTrade dashboard surfaces it.
+
+    Used by the per-day ``max_account_pct_per_day`` kill switch in
+    ``services.pnl_poller``: when today's trading value crosses
+    ``equity * pct/100``, copy is auto-paused.
+    """
+    tz = _tz_or_market(tz_name)
+    today = datetime.now(tz).date()
+
+    orders = list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+    ).scalars())
+    if not orders:
+        return Decimal(0)
+
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    for f in db.execute(
+        select(Fill).where(Fill.order_id.in_(order_ids))
+    ).scalars():
+        fills_by_order[f.order_id].append(f)
+
+    total = Decimal(0)
+    for o in orders:
+        unit = Decimal(100) if o.instrument_type == InstrumentType.OPTION else Decimal(1)
+        fs = fills_by_order.get(o.id)
+        if fs:
+            for f in fs:
+                if f.filled_at.astimezone(tz).date() == today:
+                    total += abs(f.quantity) * f.price * unit
+        else:
+            # No detailed fills synced yet — fall back to the order's
+            # aggregate. Mirrors the same fallback ``realized_pnl_by_day``
+            # uses so the two numbers are consistent with each other.
+            when = o.closed_at or o.submitted_at or o.created_at
+            if when is None:
+                continue
+            if when.astimezone(tz).date() != today:
+                continue
+            total += abs(o.filled_quantity) * o.filled_avg_price * unit
+    return total
+
+
 def today_realized_pnl(db: Session, user_id: uuid.UUID, tz_name: str | None = None) -> Decimal:
     """Realized P&L for "today" in the chosen timezone. Negative = loss."""
     tz = _tz_or_market(tz_name)

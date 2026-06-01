@@ -225,6 +225,26 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     if (evt.type === "notification.created") {
       setUnreadCount(c => c + 1);
       notify.warn(evt.notification.message, { autoClose: 8000 });
+      return;
+    }
+    // The footer toggle binds to subCopy.copy_enabled, which is loaded
+    // ONCE on mount and otherwise only mutated by the toggle handler.
+    // When pnl_poller auto-pauses (loss/profit/pct limit hit) the
+    // toggle stays visually ON until a manual reload — fix by listening
+    // to the same events the Settings page does and keeping subCopy in
+    // sync. eslint-disable: SSE union type doesn't carry these fields.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const e = evt as any;
+    if (e?.type === "copy.auto_paused") {
+      setSubCopy(prev => prev ? { ...prev, copy_enabled: false } : prev);
+      return;
+    }
+    if (e?.type === "copy.auto_resumed") {
+      setSubCopy(prev => prev ? { ...prev, copy_enabled: true } : prev);
+      return;
+    }
+    if (e?.type === "pnl.tick" && typeof e.copy_enabled === "boolean") {
+      setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
     }
   });
 

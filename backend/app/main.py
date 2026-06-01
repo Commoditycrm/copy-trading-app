@@ -22,7 +22,7 @@ from app.api import (
 )
 from app.config import get_settings
 from app.services import events as events_bus
-from app.services import listeners, recovery, retry_scheduler
+from app.services import listeners, pnl_poller, recovery, retry_scheduler
 from app.services.redis_client import close_async_redis
 
 log = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
         # WebSocket listener and the Webull poll listener share this
         # captured loop.
         listeners.bind_loop(loop)
+        pnl_poller.bind_loop(loop)
         # Replace the default ThreadPoolExecutor (capped at min(32, cpu+4)) so
         # asyncio.to_thread() can actually run 200 broker calls in parallel
         # during fanout. Without this, the semaphore is misleading — calls
@@ -106,6 +107,15 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start trade listeners")
 
+        # 60s sweep that pulls today's P&L from Alpaca directly and
+        # auto-pauses copy when loss/profit limits are hit. Covers the
+        # "trader is quiet but subscriber's positions move" gap that
+        # copy_engine's in-fanout check can't see.
+        try:
+            pnl_poller.start()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start pnl_poller")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep
@@ -131,6 +141,10 @@ def create_app() -> FastAPI:
             await listeners.stop_all_listeners()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop trade listeners cleanly")
+        try:
+            await pnl_poller.stop()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop pnl_poller cleanly")
         try:
             await close_async_redis()
         except Exception:  # noqa: BLE001

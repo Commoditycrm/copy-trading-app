@@ -135,6 +135,13 @@ export interface SubscriberSettings {
   /** Subscriber's symbol allowlist — when non-empty, only trader trades
    *  on these symbols ARE mirrored. Empty = no filter (mirror all). */
   symbol_inclusion_list: string[];
+  /** UI-only ceiling on per-contract dollar size. Persisted but NOT
+   *  enforced server-side — the panel surfaces it for the user's own
+   *  risk-tracking. */
+  max_per_contract: string | null;
+  /** Percent of current Alpaca account equity (0–100). When today's P&L
+   *  breaches -(equity * pct/100), pnl_poller auto-pauses copy. */
+  max_account_pct_per_day: string | null;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side
