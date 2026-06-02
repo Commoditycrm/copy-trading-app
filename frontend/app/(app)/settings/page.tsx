@@ -425,7 +425,7 @@ export default function SettingsPage() {
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per contract"
-                subtitle="Self-imposed ceiling — display only, not enforced."
+                subtitle="Max per contract"
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"
