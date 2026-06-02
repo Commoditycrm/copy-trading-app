@@ -1,6 +1,7 @@
 "use client";
 
 import { usePathname, useRouter } from "next/navigation";
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -440,23 +441,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="flex-1 min-h-0 overflow-y-auto px-3 space-y-1">
           {nav.map((item) => {
             const active = pathname?.startsWith(item.href);
-            // Use programmatic router.push instead of <Link>. <Link>'s built-in
-            // navigation can fall back to a hard reload on Vercel when the
-            // RSC payload fetch returns an unexpected shape (auth wall, CDN
-            // weirdness). router.push goes strictly through the client router
-            // — no prefetch, no MPA fallback.
+            // Use Next.js <Link> with prefetch=true (the default) so the
+            // RSC payload for each route is fetched on hover / when the
+            // link scrolls into view. Without this, every navigation
+            // pays the full RSC roundtrip (3-4s on slow links) before
+            // the new page can render. We pair this with the route-
+            // level `loading.tsx` so even a cold prefetch shows the
+            // centered spinner instantly on click.
+            //
+            // (Previously this used router.push + an <a> to dodge an
+            //  RSC auth-wall failure; the route-level loading file
+            //  covers that case now — the user sees the spinner
+            //  immediately rather than a stale page.)
             return (
-              <a
+              <Link
                 key={item.href}
                 href={item.href}
+                prefetch
                 title={collapsed ? item.label : undefined}
-                onClick={(e) => {
-                  // Let modified clicks (cmd/ctrl/middle) open in a new tab
-                  // as usual; intercept only the plain click.
-                  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
-                  e.preventDefault();
-                  if (item.href !== pathname) router.push(item.href);
-                }}
                 className={`flex items-center gap-2.5 ${collapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline`}
                 style={{
                   background: active
@@ -470,7 +472,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               >
                 <item.Icon />
                 {!collapsed && <span>{item.label}</span>}
-              </a>
+              </Link>
             );
           })}
         </nav>

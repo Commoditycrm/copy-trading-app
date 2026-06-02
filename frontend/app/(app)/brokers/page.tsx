@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import type { BrokerAccount, BrokerName } from "@/lib/types";
 
@@ -277,6 +278,12 @@ export default function BrokersPage() {
 
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+  // True until the first /api/brokers fetch settles. Without this gate
+  // the page briefly renders its empty-state picker (because `accounts`
+  // starts as []) and then jumps to show the connected card once the
+  // API responds. Holding back the body during the initial fetch keeps
+  // the layout stable.
+  const [loading, setLoading] = useState(true);
 
   // Disconnect confirmation — holds the account id pending removal (or
   // null when the modal is closed) + a busy flag for the in-flight DELETE.
@@ -287,7 +294,13 @@ export default function BrokersPage() {
   const searchParams = useSearchParams();
 
   async function load() {
-    setAccounts(await api<BrokerAccount[]>("/api/brokers"));
+    // Clear `loading` in a finally so a failed fetch still removes the
+    // skeleton instead of stranding the user on a forever-loading page.
+    try {
+      setAccounts(await api<BrokerAccount[]>("/api/brokers"));
+    } finally {
+      setLoading(false);
+    }
   }
   useEffect(() => { load(); }, []);
 
@@ -482,6 +495,11 @@ export default function BrokersPage() {
   }
 
   const hasConnected = accounts.length > 0;
+
+  // Centered loading view — hides the page until the initial fetch
+  // settles, so we don't render the picker briefly before the connected
+  // card lands.
+  if (loading) return <PageLoading />;
 
   return (
     <div className="space-y-6 max-w-[760px]">
