@@ -1,0 +1,83 @@
+name: Deploy QA to Lightsail
+
+on:
+  push:
+    branches: [qa-branch]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-qa
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build + migrate + restart QA on Lightsail
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Sanity check secrets are configured
+        run: |
+          missing=()
+          [ -z "${{ secrets.DEPLOY_HOST }}" ] && missing+=("DEPLOY_HOST")
+          [ -z "${{ secrets.DEPLOY_USER }}" ] && missing+=("DEPLOY_USER")
+          [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ] && missing+=("DEPLOY_SSH_KEY")
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Missing required secret(s): ${missing[*]}"
+            exit 1
+          fi
+
+          echo "Secrets present."
+
+      - name: Deploy QA over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            PROJECT_DIR="$HOME/copy-trading-app"
+            cd "$PROJECT_DIR"
+
+            echo "── git pull qa-branch ───────────────────────────────────"
+            git fetch --prune origin qa-branch
+            git reset --hard origin/qa-branch
+            git log -1 --oneline
+
+            echo "── docker compose build ─────────────────────────────────"
+            docker compose build backend frontend
+
+            echo "── alembic upgrade head ─────────────────────────────────"
+            docker compose run --rm backend alembic upgrade head
+
+            echo "── docker compose up -d ─────────────────────────────────"
+            docker compose up -d --remove-orphans
+
+            echo "── docker image prune ───────────────────────────────────"
+            docker image prune -f
+
+            echo "── health check ─────────────────────────────────────────"
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 3 http://localhost/api/health > /tmp/qa-health.json; then
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$ok" -ne 1 ]; then
+              echo "QA health check failed after 60s. Last logs:"
+              docker compose logs --tail=80 backend caddy frontend || true
+              exit 1
+            fi
+
+            echo "Healthy:"
+            cat /tmp/qa-health.json
+            echo
+
+            echo "── QA deploy complete ───────────────────────────────────"
