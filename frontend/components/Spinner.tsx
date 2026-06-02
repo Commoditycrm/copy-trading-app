@@ -13,8 +13,8 @@ export function Spinner() {
   return (
     <svg
       className="animate-spin"
-      width="0.85em"
-      height="0.85em"
+      width="0.60em"
+      height="0.60em"
       viewBox="0 0 24 24"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"

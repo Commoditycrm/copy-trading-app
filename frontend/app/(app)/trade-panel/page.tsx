@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PageLoading } from "@/components/PageLoading";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { ExitAllModal, type ExitAction } from "@/components/ExitAllModal";
 import { StrikePicker } from "@/components/StrikePicker";
@@ -138,6 +139,10 @@ function SegBtn({
 
 export default function TradePanelPage() {
   const [accts, setAccts] = useState<BrokerAccount[]>([]);
+  // True until the first /api/brokers fetch completes — gates the page
+  // body so we don't flash an empty broker dropdown before the data
+  // lands.
+  const [acctsLoading, setAcctsLoading] = useState(true);
   const [acctId, setAcctId] = useState<string>("");
   const [instrument, setInstrument] = useState<InstrumentType>("option");
   const [symbol, setSymbol] = useState("");
@@ -189,10 +194,12 @@ export default function TradePanelPage() {
   }, [symbol]);
 
   useEffect(() => {
-    api<BrokerAccount[]>("/api/brokers").then(a => {
-      setAccts(a);
-      if (a.length && !acctId) setAcctId(a[0].id);
-    });
+    api<BrokerAccount[]>("/api/brokers")
+      .then(a => {
+        setAccts(a);
+        if (a.length && !acctId) setAcctId(a[0].id);
+      })
+      .finally(() => setAcctsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -755,6 +762,10 @@ export default function TradePanelPage() {
       )}
     </div>
   );
+
+  // Wait for the broker list before rendering the form — otherwise the
+  // page briefly shows an empty broker dropdown until /api/brokers responds.
+  if (acctsLoading) return <PageLoading />;
 
   return (
     <div className="space-y-5">

@@ -15,6 +15,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
+import { PageLoading } from "@/components/PageLoading";
 
 interface SubscriberCounts { total: number; submitted: number; errors: number; }
 interface FanoutChild {
@@ -858,6 +859,10 @@ export default function PerformancePage() {
     .map(([symbol, e]) => ({ symbol, avg_ms: Math.round(e.sum / e.count), count: e.count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 6);
+
+  // Centered loader for the initial mount. Auto-refresh after that
+  // keeps the table visible while polling silently in the background.
+  if (loading && !data) return <PageLoading />;
 
   return (
     <div className="space-y-5">
