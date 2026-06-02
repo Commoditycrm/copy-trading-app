@@ -99,3 +99,17 @@ class BrokerAdapter(ABC):
     def get_positions(self) -> list[BrokerPosition]:
         """List currently held positions at this broker account."""
         raise NotImplementedError
+
+    def get_pnl_snapshot(self) -> dict[str, Any] | None:
+        """Polled by ``services.pnl_poller`` every 5s to drive the daily
+        P&L tile and the day-start-balance-based pct kill switch.
+
+        Returns ``{"todays_pl", "equity", "beginning_day_balance"}`` —
+        all Decimals — or ``None`` on failure. ``beginning_day_balance``
+        may itself be None for broker integrations that don't surface a
+        day-start figure (some SnapTrade brokers); the poller falls back
+        to no pct enforcement for that subscriber when that's the case.
+
+        Adapters that haven't implemented this default to None — the
+        poller skips them silently."""
+        return None

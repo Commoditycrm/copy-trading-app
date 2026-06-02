@@ -251,6 +251,23 @@ class AlpacaAdapter(BrokerAdapter):
 
     # ── reads — used by sync, balance refresh, options chain ──────────────
 
+    def get_pnl_snapshot(self) -> dict[str, Any] | None:
+        """Alpaca-direct: one ``GET /v2/account`` gives us live equity +
+        last_equity (yesterday's close). Returns None on any failure so
+        the poller skips this tick rather than killing the loop."""
+        try:
+            a = self._c().get_account()
+            equity = Decimal(str(a.equity))
+            last_equity = Decimal(str(a.last_equity))
+        except Exception:  # noqa: BLE001
+            log.warning("alpaca get_pnl_snapshot failed", exc_info=True)
+            return None
+        return {
+            "todays_pl":             equity - last_equity,
+            "equity":                equity,
+            "beginning_day_balance": last_equity,
+        }
+
     def get_balance_snapshot(self) -> dict[str, Any]:
         """Returns normalized balance numbers for the broker_accounts row."""
         a = self._c().get_account()
