@@ -19,9 +19,9 @@ jobs:
       - name: Sanity check secrets are configured
         run: |
           missing=()
-          [ -z "${{ secrets.DEPLOY_HOST }}" ] && missing+=("DEPLOY_HOST")
-          [ -z "${{ secrets.DEPLOY_USER }}" ] && missing+=("DEPLOY_USER")
-          [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ] && missing+=("DEPLOY_SSH_KEY")
+          [ -z "${{ secrets.TEST_DEPLOY_HOST }}" ] && missing+=("TEST_DEPLOY_HOST")
+          [ -z "${{ secrets.TEST_DEPLOY_USER }}" ] && missing+=("TEST_DEPLOY_USER")
+          [ -z "${{ secrets.TEST_DEPLOY_SSH_KEY }}" ] && missing+=("TEST_DEPLOY_SSH_KEY")
 
           if [ ${#missing[@]} -ne 0 ]; then
             echo "Missing required secret(s): ${missing[*]}"
@@ -33,9 +33,9 @@ jobs:
       - name: Deploy QA over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          host: ${{ secrets.TEST_DEPLOY_HOST }}
+          username: ${{ secrets.TEST_DEPLOY_USER }}
+          key: ${{ secrets.TEST_DEPLOY_SSH_KEY }}
           script_stop: true
           script: |
             set -euo pipefail

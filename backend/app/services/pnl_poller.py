@@ -163,6 +163,15 @@ def _enforce_one(acct: BrokerAccount) -> None:
     until the next manual refresh."""
     pending_events: list[dict[str, Any]] = []
 
+    # Fetch the broker P&L snapshot FIRST — with NO DB session/connection held.
+    # SnapTrade rate-limits (429) and this call can block for seconds; doing it
+    # inside `with SessionLocal()` pinned a pool connection in "idle in
+    # transaction" for the whole call. With every connected account polled
+    # concurrently every tick, that exhausted the pool (15/15) and stalled all
+    # DB-backed APIs. _fetch_pnl_snapshot only needs `acct` (no DB), so do it
+    # up front and only open the session for the fast enforcement writes.
+    state = _fetch_pnl_snapshot(acct)
+
     with SessionLocal() as db:
         s = db.get(SubscriberSettings, acct.user_id)
         if s is None:
@@ -193,13 +202,11 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "type": "copy.auto_resumed", "reason": "new_day",
                 })
 
-        # ── Fetch today's P&L + equity + beginning_day_balance ───────────
-        # Broker-agnostic: ``adapter_for`` routes to AlpacaAdapter or
-        # SnapTradeAdapter and both return the same ``get_pnl_snapshot``
-        # shape. ``beginning_day_balance`` may come back None for
-        # SnapTrade brokers that don't surface a day-start figure; the
+        # today's P&L snapshot (todays_pl / equity / beginning_day_balance) was
+        # fetched ABOVE, before this session opened, so we never hold a pool
+        # connection across the slow broker call. beginning_day_balance may be
+        # None for SnapTrade brokers that don't expose a day-start figure; the
         # pct kill switch is silently skipped for those subscribers.
-        state = _fetch_pnl_snapshot(acct)
         if state is None:
             # Broker call failed — commit any auto-resume we did, skip
             # the rest of this tick, try again next time.
