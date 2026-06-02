@@ -139,8 +139,9 @@ export interface SubscriberSettings {
    *  enforced server-side — the panel surfaces it for the user's own
    *  risk-tracking. */
   max_per_contract: string | null;
-  /** Percent of current Alpaca account equity (0–100). When today's P&L
-   *  breaches -(equity * pct/100), pnl_poller auto-pauses copy. */
+  /** Percent of today's beginning-day account balance (0–100). When
+   *  today's filled trade NOTIONAL (USD) crosses
+   *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */
   max_account_pct_per_day: string | null;
 }
 
