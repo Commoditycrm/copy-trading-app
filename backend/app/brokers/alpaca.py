@@ -9,6 +9,7 @@ request types for both — only the symbol shape distinguishes them.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -112,6 +113,9 @@ class AlpacaCredentials:
     api_key: str
     api_secret: str
     paper: bool = True
+
+
+log = logging.getLogger(__name__)
 
 
 class AlpacaAdapter(BrokerAdapter):
