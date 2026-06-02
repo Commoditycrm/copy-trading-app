@@ -651,6 +651,62 @@ class SnapTradeAdapter(BrokerAdapter):
 
     # ── reads — used by listener + balance refresh ─────────────────────────
 
+    def get_pnl_snapshot(self) -> dict[str, Any] | None:
+        """SnapTrade-routed: equity comes from the balance endpoint;
+        the day-start figure (yesterday's close) is broker-dependent
+        inside SnapTrade — we try several common field names on the
+        account-details payload. When the broker doesn't surface a
+        day-start, ``beginning_day_balance`` comes back None and the
+        pct kill switch is effectively disabled for that subscriber
+        (the loss/profit limits still work).
+
+        Returns None on any failure so the poller skips this tick."""
+        try:
+            snap = self.get_balance_snapshot()
+        except Exception:  # noqa: BLE001
+            log.warning("snaptrade get_pnl_snapshot: balance fetch failed",
+                        exc_info=True)
+            return None
+        equity = snap.get("total_equity") or snap.get("cash")
+        if equity is None:
+            return None
+
+        # Best-effort day-start. SnapTrade brokers don't agree on a
+        # field name — we accept the union and treat the first hit as
+        # authoritative. None means "broker didn't tell us".
+        beginning_day_balance: Decimal | None = None
+        try:
+            resp = self._c().account_information.get_user_account_details(
+                user_id=self._user_id,
+                user_secret=self._user_secret,
+                account_id=self._account_id,
+            )
+            body = getattr(resp, "body", resp) or {}
+            bal = _attr(body, "balance", default={}) or {}
+            raw = _attr(
+                bal, "day_start_total", "beginning_of_day",
+                "equity_previous_close", "previous_close",
+            )
+            if isinstance(raw, dict):
+                raw = raw.get("amount")
+            beginning_day_balance = _dec_or_none(raw)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "snaptrade get_user_account_details failed — "
+                "beginning_day_balance will be None this tick",
+                exc_info=True,
+            )
+
+        todays_pl = (
+            equity - beginning_day_balance
+            if beginning_day_balance is not None else Decimal(0)
+        )
+        return {
+            "todays_pl":             todays_pl,
+            "equity":                equity,
+            "beginning_day_balance": beginning_day_balance,
+        }
+
     def get_balance_snapshot(self) -> dict[str, Any]:
         """Pull cash/buying_power/total from SnapTrade.
 

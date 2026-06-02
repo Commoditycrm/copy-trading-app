@@ -36,7 +36,12 @@ export default function SettingsPage() {
   // first tick lands — typically within 60s of page load.
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
-  const [equity, setEquity] = useState<string | null>(null);
+  // Today's starting account balance from Alpaca (`last_equity`, =
+  // equity at yesterday's close). Drives the panel's display tile and
+  // is the base the pct-per-day cap is computed against, so the dollar
+  // threshold stays fixed for the trading day instead of moving with
+  // live equity changes. Null until the first pnl.tick lands.
+  const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(null);
   // Today's filled-trade notional in USD — the metric the pct limit
   // compares against. Comes in on every pnl.tick event; "—" in the UI
   // until the first tick lands.
@@ -81,7 +86,7 @@ export default function SettingsPage() {
     // P&L from Alpaca + the current copy_enabled flag. Merge into local
     // state so the P&L Limit panel updates live without a manual refresh.
     if (e?.type === "pnl.tick") {
-      if (typeof e.equity === "string") setEquity(e.equity);
+      if (typeof e.beginning_day_balance === "string") setBeginningDayBalance(e.beginning_day_balance);
       if (typeof e.todays_trading_value === "string") setTodaysTradingValue(e.todays_trading_value);
       setSub(prev => prev ? {
         ...prev,
@@ -243,10 +248,12 @@ export default function SettingsPage() {
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
   const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
-  const headroom = limit !== null ? limit + todaysPnL : null;
+  // Clamp to 0 once the limit is hit — going past it is the same UX as
+  // "no room left", so the tile shows $0 instead of a negative number.
+  const headroom = limit !== null ? Math.max(0, limit + todaysPnL) : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
   const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
-  const profitHeadroom = profitLimit !== null ? profitLimit - Math.max(0, todaysPnL) : null;
+  const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
   const profitPct = profitLimit !== null && profitLimit > 0
     ? Math.min(100, Math.max(0, (Math.max(0, todaysPnL) / profitLimit) * 100))
     : 0;
@@ -387,7 +394,7 @@ export default function SettingsPage() {
                 onSave={saveMaxPct}
                 busy={maxPctBusy}
                 current={sub.max_account_pct_per_day}
-                equity={equity}
+                beginningDayBalance={beginningDayBalance}
                 todaysTradingValue={todaysTradingValue}
                 fmt={fmt}
               />
@@ -814,33 +821,34 @@ function MaxPerContractPanel({
   );
 }
 
-/** Max-%-of-equity panel — enforced server-side every 60s by pnl_poller.
- *  The metric here is TODAY'S TRADING VALUE in USD (cumulative filled
- *  notional, both buy + sell, options × 100 multiplier), NOT P&L. When
- *  trading value crosses equity × pct/100, copy is auto-paused.
+/** Max-%-of-beginning-day-balance panel — enforced server-side every 60s
+ *  by pnl_poller. The metric is TODAY'S TRADING VALUE in USD (cumulative
+ *  filled notional, both buy + sell, options × 100 multiplier), NOT P&L.
+ *  When trading value crosses ``beginning_day_balance × pct/100``, copy
+ *  is auto-paused.
  *
- *  Both ``equity`` and ``todaysTradingValue`` arrive on every pnl.tick;
- *  the panel renders "—" for the dollar columns until the first tick
- *  lands (typically within 60s of page load). */
+ *  Both ``beginningDayBalance`` and ``todaysTradingValue`` arrive on
+ *  every pnl.tick; the panel renders "—" for the dollar columns until
+ *  the first tick lands (typically within 60s of page load). */
 function MaxPctPanel({
-  input, onInput, onSave, busy, current, equity, todaysTradingValue, fmt,
+  input, onInput, onSave, busy, current, beginningDayBalance, todaysTradingValue, fmt,
 }: {
   input: string;
   onInput: (v: string) => void;
   onSave: () => void;
   busy: boolean;
   current: string | null;
-  equity: string | null;
+  beginningDayBalance: string | null;
   todaysTradingValue: string | null;
   fmt: (v: string | null | undefined) => string;
 }) {
   const pctNum = current ? parseFloat(current) : null;
-  const equityNum = equity ? parseFloat(equity) : null;
+  const baseNum = beginningDayBalance ? parseFloat(beginningDayBalance) : null;
   const tvNum = todaysTradingValue ? parseFloat(todaysTradingValue) : 0;
-  // Dollar threshold the server uses: equity × pct/100. Null until we
-  // have both inputs so the UI doesn't render a misleading "$0.00".
-  const limitDollars = (pctNum && equityNum && equityNum > 0)
-    ? (equityNum * pctNum / 100)
+  // Dollar threshold the server uses: beginning_day_balance × pct/100.
+  // Null until we have both inputs so the UI doesn't show "$0.00".
+  const limitDollars = (pctNum && baseNum && baseNum > 0)
+    ? (baseNum * pctNum / 100)
     : null;
   const headroom = limitDollars !== null ? limitDollars - tvNum : null;
   const pctConsumed = (limitDollars && limitDollars > 0)
@@ -852,7 +860,7 @@ function MaxPctPanel({
       <div>
         <div className="text-sm font-semibold">Max % of account per day</div>
         <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>
-          Pause copy when today&apos;s trading value (USD) reaches this % of equity.
+          Pause copy when today&apos;s trading value (USD) reaches this % of the day&apos;s starting balance.
         </div>
       </div>
       <div className="flex items-center gap-2">
@@ -887,8 +895,8 @@ function MaxPctPanel({
       </div>
       <div className="grid grid-cols-3 gap-2">
         <Stat
-          label="Today's Trading"
-          value={todaysTradingValue !== null ? fmt(todaysTradingValue) : "—"}
+          label="Day-Start Balance"
+          value={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
         />
         <Stat
           label="Limit"
@@ -914,7 +922,7 @@ function MaxPctPanel({
             />
           </div>
           <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
-            {Math.round(pctConsumed)}% of limit · equity {equity ? `$${parseFloat(equity).toFixed(2)}` : "—"}
+            {Math.round(pctConsumed)}% of limit · today&apos;s trading {todaysTradingValue ? `$${parseFloat(todaysTradingValue).toFixed(2)}` : "—"}
           </div>
         </div>
       )}
