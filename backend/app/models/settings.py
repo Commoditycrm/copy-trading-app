@@ -84,13 +84,15 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(20, 2), nullable=True,
     )
 
-    # Percentage of current Alpaca account equity that bounds today's
+    # Percentage of TODAY'S BEGINNING-DAY ACCOUNT BALANCE (Alpaca's
+    # ``last_equity`` — equity at yesterday's close) that bounds today's
     # cumulative filled trade NOTIONAL (capital deployed in mirror orders
     # today, both buy + sell, options × 100). When notional crosses
-    # ``equity * pct/100``, copy is auto-paused. Stored as the percent
-    # value itself (e.g. 50.00 = 50%). Enforced by pnl_poller every 60s
-    # using fresh equity from Alpaca, so the dollar threshold floats with
-    # account size instead of being a fixed cap. NULL = feature disabled.
+    # ``beginning_day_balance * pct/100``, copy is auto-paused. Stored as
+    # the percent value itself (e.g. 50.00 = 50%). Enforced by pnl_poller
+    # every 60s. Using day-start balance (not live equity) keeps the
+    # dollar threshold FIXED for the trading day — it doesn't drift up
+    # on gains or down on losses mid-day. NULL = feature disabled.
     max_account_pct_per_day: Mapped[Decimal | None] = mapped_column(
         Numeric(5, 2), nullable=True,
     )
