@@ -1,13 +1,18 @@
-"""Daily P&L limit poller — broker-agnostic.
+"""Daily P&L limit poller — Alpaca only.
 
-Every 5 seconds, for every subscriber with a connected Alpaca-direct or
-SnapTrade-routed broker account:
+SnapTrade is intentionally NOT polled here. The combined load of the
+order listener (12 req/min/trader, 5s cadence) plus this poller would
+exhaust SnapTrade's 250 req/min platform quota and 429 the connect
+flow. For SnapTrade subscribers the in-fanout check inside
+``copy_engine`` is the kill-switch enforcement path; the live "Today"
+tile shows "—" for those users until we wire a separate cadence
+(e.g. 60s or webhook-driven).
 
-  1. Call ``adapter.get_pnl_snapshot()`` to get today's P&L, current
-     equity, and the day-start account balance. For Alpaca that's one
-     ``GET /v2/account`` (equity - last_equity); for SnapTrade it's
-     balance + account-details (day-start is broker-dependent and may
-     come back None).
+Every 10 seconds, for every subscriber with a connected Alpaca account:
+
+  1. Call ``AlpacaAdapter.get_pnl_snapshot()`` — one ``GET /v2/account``
+     yielding equity, last_equity (today's start-of-day balance), and
+     today's P&L = equity - last_equity.
   2. If the subscriber has a ``daily_loss_limit`` or ``daily_profit_limit``
      set AND today's P&L breaches it, flip ``copy_enabled = False`` and
      stamp ``pnl_auto_paused_at``. Same audit + cache-invalidation + SSE
@@ -25,13 +30,11 @@ SnapTrade-routed broker account:
 
 Cadence
 -------
-5s per tick at the user's request. Per-account work runs concurrently
-via ``asyncio.gather(*to_thread(...))`` so wall-clock per tick is the
-slowest single broker call (~500ms), not the sum. At 5s polling, each
-Alpaca account costs 12 req/min against its own 200/min budget; each
-SnapTrade account costs 24 req/min (balance + details) against the
-shared platform quota — comfortably under SnapTrade's per-endpoint
-limits at any realistic platform size.
+10s per tick. Per-account work runs concurrently via
+``asyncio.gather(*to_thread(...))`` so wall-clock per tick is the
+slowest single broker call (~500ms), not the sum. Each Alpaca account
+costs 6 req/min against its own 200/min budget — comfortably under
+even after broker-side activity.
 
 Why a separate task (not piggyback on copy_engine)
 --------------------------------------------------
@@ -43,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -61,15 +65,32 @@ from app.services.pnl import today_filled_notional
 log = logging.getLogger(__name__)
 
 
-# 5s cadence per user request. The per-account work runs in parallel via
-# ``asyncio.gather`` so the wall-clock per tick is dominated by the
-# slowest single broker call (~500ms typical), not the sum.
-POLL_INTERVAL_S = 5.0
+# Outer-loop tick = Alpaca's cadence (the only broker this poller hits).
+# SnapTrade was previously polled by this loop too but burned through
+# its 250 req/min platform quota when combined with snaptrade_listener;
+# we now rely on copy_engine's in-fanout pause check for SnapTrade
+# subscribers and let the order listener handle order-event detection.
+POLL_INTERVAL_S = 10.0
+
+# Per-broker minimum interval (seconds). Only brokers in this dict are
+# polled. SnapTrade is intentionally absent — re-add a key here (and to
+# ``_SUPPORTED_BROKERS`` below) to enable poller-driven P&L for it.
+_INTERVAL_BY_BROKER: dict[BrokerName, float] = {
+    BrokerName.ALPACA: 10.0,
+}
+
+# Per-account monotonic timestamp of the earliest time the account is
+# allowed to be polled again. The outer loop ticks every POLL_INTERVAL_S
+# and uses this dict to skip accounts that aren't yet due. Entries for
+# deleted accounts hang around but are harmless — just stale keys.
+_next_due_at: dict[uuid.UUID, float] = {}
 
 # Brokers the poller knows how to fetch from. Adding a broker is one of:
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
-# is listed here. Everything else is silently skipped.
-_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE)
+# is listed here, and (c) the broker has an entry in
+# ``_INTERVAL_BY_BROKER``. SnapTrade is intentionally omitted — see the
+# comment on POLL_INTERVAL_S above.
+_SUPPORTED_BROKERS = (BrokerName.ALPACA,)
 
 
 _task: asyncio.Task | None = None
@@ -90,7 +111,12 @@ def start() -> None:
         log.warning("pnl_poller: no main loop bound; start is a no-op")
         return
     _task = _main_loop.create_task(_run())
-    log.info("pnl_poller: started (interval=%.0fs)", POLL_INTERVAL_S)
+    intervals = ", ".join(
+        f"{b.value}={s:.0f}s" for b, s in _INTERVAL_BY_BROKER.items()
+    )
+    log.info(
+        "pnl_poller: started (tick=%.0fs, %s)", POLL_INTERVAL_S, intervals,
+    )
 
 
 async def stop() -> None:
@@ -105,19 +131,33 @@ async def stop() -> None:
 
 
 async def _run() -> None:
-    """Outer loop: every POLL_INTERVAL_S, load the active broker accounts
-    and fan ``_enforce_one`` out over the threadpool concurrently. With
-    the 5s cadence, sequential per-account work would miss ticks once we
-    cross ~10 connected accounts (each broker call is 100-500ms); gather
-    makes per-tick wall-clock the slowest single call, not the sum."""
+    """Outer loop ticks every POLL_INTERVAL_S. On each tick:
+
+      1. Load every connected broker_account (supported brokers only).
+      2. Filter to accounts whose ``_next_due_at`` has elapsed — that's
+         how SnapTrade (60s cadence) is polled less often than Alpaca
+         (10s) without spawning separate tasks per broker.
+      3. Fan ``_enforce_one`` out concurrently over the threadpool
+         (asyncio.gather → wall-clock = slowest single call).
+      4. Stamp the next-due time per account using its broker's interval.
+    """
     while True:
         try:
             accts = await asyncio.to_thread(_load_active_accounts)
-            if accts:
+            now = time.monotonic()
+            due = [a for a in accts if _next_due_at.get(a.id, 0.0) <= now]
+            if due:
                 await asyncio.gather(
-                    *(asyncio.to_thread(_enforce_one_safe, acct) for acct in accts),
+                    *(asyncio.to_thread(_enforce_one_safe, acct) for acct in due),
                     return_exceptions=True,
                 )
+                # Stamp next-due AFTER the work — using a fresh monotonic
+                # read so a slow tick (e.g. SnapTrade throttling) doesn't
+                # immediately re-run the same accounts on the next tick.
+                stamp = time.monotonic()
+                for a in due:
+                    interval = _INTERVAL_BY_BROKER.get(a.broker, POLL_INTERVAL_S)
+                    _next_due_at[a.id] = stamp + interval
         except asyncio.CancelledError:
             log.info("pnl_poller: cancelled")
             raise
