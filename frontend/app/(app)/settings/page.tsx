@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
+import { PageLoading } from "@/components/PageLoading";
 import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -246,7 +247,15 @@ export default function SettingsPage() {
     }));
   }
 
-  if (!user) return <p style={{color: "var(--muted)"}}>Loading…</p>;
+  // Gate the page until BOTH the user identity AND the role-specific
+  // settings row have landed — otherwise the subscriber/trader sections
+  // briefly render empty while the second fetch is in flight.
+  const settingsReady = user && (
+    (user.role === "subscriber" && sub) ||
+    (user.role === "trader" && trd) ||
+    (user.role !== "subscriber" && user.role !== "trader")
+  );
+  if (!settingsReady) return <PageLoading />;
 
   const fmt = (v: string | null | undefined): string => {
     if (v === null || v === undefined || v === "") return "—";

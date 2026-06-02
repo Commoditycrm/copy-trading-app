@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
+import { PageLoading } from "@/components/PageLoading";
 import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
@@ -26,6 +27,10 @@ export default function CalendarPage() {
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
   const [data, setData] = useState<DailyPnL[]>([]);
   const [loading, setLoading] = useState(true);
+  // Tracks whether the FIRST month's P&L fetch has completed. Subsequent
+  // month switches show the small inline loader without remounting the
+  // whole grid; only the initial mount surfaces the centered loading.
+  const [firstLoadDone, setFirstLoadDone] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [subs, setSubs] = useState<SubscriberSummary[]>([]);
   // The "viewing" user — defaults to self. Trader can pick a subscriber.
@@ -41,7 +46,10 @@ export default function CalendarPage() {
     const qs = viewingUserId ? `&user_id=${viewingUserId}` : "";
     api<DailyPnL[]>(`/api/calendar/pnl?from=${range.from}&to=${range.to}&tz=${encodeURIComponent(browserTz())}${qs}`)
       .then(setData)
-      .finally(() => setLoading(false));
+      .finally(() => {
+        setLoading(false);
+        setFirstLoadDone(true);
+      });
   }, [range.from, range.to, viewingUserId]);
 
   // Auto-sync fills on first load, then load P&L.
@@ -97,6 +105,11 @@ export default function CalendarPage() {
     const s = subs.find((s) => s.user_id === viewingUserId);
     return s ? `${s.display_name ?? s.email} · P&L` : "Subscriber P&L";
   }, [viewingUserId, user, subs]);
+
+  // Centered loader for the initial mount — once the first month lands,
+  // subsequent month-switches keep the grid visible and show the small
+  // inline loader at the bottom.
+  if (!firstLoadDone) return <PageLoading />;
 
   return (
     <div className="space-y-4 max-w-5xl">

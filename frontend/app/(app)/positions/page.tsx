@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
+import { PageLoading } from "@/components/PageLoading";
 import type { User } from "@/lib/types";
 
 /** The bulk-exit actions. "My*" act on the caller's own brokers; "subs*" are
@@ -109,6 +110,10 @@ export default function PositionsPage() {
   }
 
   const def = pending ? DEFS[pending] : null;
+
+  // Hold the page until `user` lands — otherwise the trader-only Exit
+  // buttons briefly appear or disappear once role resolves.
+  if (!user) return <PageLoading />;
 
   return (
     <div className="space-y-5">
