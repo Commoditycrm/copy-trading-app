@@ -258,7 +258,12 @@ export default function TradesPage() {
         </div>
       )}
 
-      {(() => {
+      {/* Tab bar is trader-only. Subscribers own a single class of orders
+          (mirrors copied from the trader they follow), so a "My Orders"
+          vs "All Orders" toggle would always show the same rows. Hiding
+          the bar is safe because the default `tab="all"` state is a no-op
+          filter — the body's `if (tab === "mine")` branch never fires. */}
+      {user?.role === "trader" && (() => {
         // Live counts so each tab can show how many orders it'd surface.
         // Keep this in sync with the body-side `visibleOrders` filter.
         const mineCount = orders.filter(
