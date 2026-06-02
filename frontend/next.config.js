@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 module.exports = {
   reactStrictMode: true,
+  eslint: {
+    ignoreDuringBuilds: true, // lint runs as its own CI step; don't block builds
+  },
   async rewrites() {
     return [
       {
