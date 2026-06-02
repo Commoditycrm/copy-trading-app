@@ -85,8 +85,10 @@ class MaxPerContractIn(BaseModel):
 
 
 class MaxAccountPctIn(BaseModel):
-    """% of current Alpaca account equity. When today's P&L falls below
-    -(equity * pct/100), pnl_poller auto-pauses copy. 0 < pct <= 100."""
+    """% of today's beginning-day account balance. When today's
+    cumulative filled trade NOTIONAL (USD) crosses
+    ``beginning_day_balance * pct/100``, pnl_poller auto-pauses copy.
+    0 < pct <= 100."""
 
     max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
 

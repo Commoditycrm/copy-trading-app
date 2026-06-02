@@ -1,35 +1,43 @@
-"""Daily P&L limit poller — Alpaca-direct.
+"""Daily P&L limit poller — broker-agnostic.
 
-Every 60 seconds, for every subscriber with a connected Alpaca account:
+Every 5 seconds, for every subscriber with a connected Alpaca-direct or
+SnapTrade-routed broker account:
 
-  1. Hit Alpaca's ``GET /v2/account`` and compute today's P&L as
-     ``equity - last_equity`` (matches the number Alpaca's own dashboard
-     shows under "Today's P/L"). No FIFO walk over our local fills —
-     this is the broker's own bookkeeping, taken at face value.
-  2. If the subscriber has a ``daily_loss_limit`` or
-     ``daily_profit_limit`` set AND today's P&L breaches it, flip
-     ``copy_enabled = False`` and stamp ``pnl_auto_paused_at = now``.
-     Same audit + cache-invalidation + SSE event shape the in-fanout
-     enforcement uses, so subscribers get one consistent experience.
-  3. Auto-resume any pause whose ``pnl_auto_paused_at`` is from a prior
+  1. Call ``adapter.get_pnl_snapshot()`` to get today's P&L, current
+     equity, and the day-start account balance. For Alpaca that's one
+     ``GET /v2/account`` (equity - last_equity); for SnapTrade it's
+     balance + account-details (day-start is broker-dependent and may
+     come back None).
+  2. If the subscriber has a ``daily_loss_limit`` or ``daily_profit_limit``
+     set AND today's P&L breaches it, flip ``copy_enabled = False`` and
+     stamp ``pnl_auto_paused_at``. Same audit + cache-invalidation + SSE
+     event shape the in-fanout enforcement uses.
+  3. If ``max_account_pct_per_day`` is set AND today's filled trade
+     notional (from our own fills table) crosses
+     ``beginning_day_balance * pct/100``, same pause. Skipped silently
+     when the broker doesn't expose a day-start.
+  4. Auto-resume any pause whose ``pnl_auto_paused_at`` is from a prior
      UTC day. Runs here (not just in copy_engine on fanout) so a
      subscriber paused yesterday comes back online at 00:00 UTC even if
      no trader places an order that day.
-  4. Emit a ``pnl.tick`` SSE event with the latest number so the
-     Settings page's P&L Limit panel updates live.
+  5. Emit a ``pnl.tick`` SSE event so the Settings page's P&L Limit and
+     Risk Limits panels update live.
+
+Cadence
+-------
+5s per tick at the user's request. Per-account work runs concurrently
+via ``asyncio.gather(*to_thread(...))`` so wall-clock per tick is the
+slowest single broker call (~500ms), not the sum. At 5s polling, each
+Alpaca account costs 12 req/min against its own 200/min budget; each
+SnapTrade account costs 24 req/min (balance + details) against the
+shared platform quota — comfortably under SnapTrade's per-endpoint
+limits at any realistic platform size.
 
 Why a separate task (not piggyback on copy_engine)
 --------------------------------------------------
 copy_engine's check only runs when a trader fanouts. If the trader is
 quiet for hours but the subscriber's positions move against them, the
 limit goes un-policed. This poller fills that gap.
-
-Why one global task (not per-account)
--------------------------------------
-The per-account work is one HTTP call to Alpaca; spinning a task per
-account adds bookkeeping without parallelism gains worth caring about
-at the platform's current scale. If we ever cross ~500 active Alpaca
-subscribers, switch to a worker pool.
 """
 from __future__ import annotations
 
@@ -41,9 +49,8 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from app.brokers.alpaca import AlpacaAdapter
+from app.brokers import adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.settings import SubscriberSettings
@@ -54,7 +61,15 @@ from app.services.pnl import today_filled_notional
 log = logging.getLogger(__name__)
 
 
-POLL_INTERVAL_S = 60.0
+# 5s cadence per user request. The per-account work runs in parallel via
+# ``asyncio.gather`` so the wall-clock per tick is dominated by the
+# slowest single broker call (~500ms typical), not the sum.
+POLL_INTERVAL_S = 5.0
+
+# Brokers the poller knows how to fetch from. Adding a broker is one of:
+# (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
+# is listed here. Everything else is silently skipped.
+_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE)
 
 
 _task: asyncio.Task | None = None
@@ -90,9 +105,19 @@ async def stop() -> None:
 
 
 async def _run() -> None:
+    """Outer loop: every POLL_INTERVAL_S, load the active broker accounts
+    and fan ``_enforce_one`` out over the threadpool concurrently. With
+    the 5s cadence, sequential per-account work would miss ticks once we
+    cross ~10 connected accounts (each broker call is 100-500ms); gather
+    makes per-tick wall-clock the slowest single call, not the sum."""
     while True:
         try:
-            await asyncio.to_thread(_tick)
+            accts = await asyncio.to_thread(_load_active_accounts)
+            if accts:
+                await asyncio.gather(
+                    *(asyncio.to_thread(_enforce_one_safe, acct) for acct in accts),
+                    return_exceptions=True,
+                )
         except asyncio.CancelledError:
             log.info("pnl_poller: cancelled")
             raise
@@ -101,30 +126,33 @@ async def _run() -> None:
         await asyncio.sleep(POLL_INTERVAL_S)
 
 
-def _tick() -> None:
-    """One full sweep: every connected Alpaca account → fetch + enforce.
-
-    No top-level commit — ``_enforce_one`` opens its own session per
-    subscriber so each subscriber's mutations are durable BEFORE its SSE
-    events go out. That ordering prevents a UI race where the frontend's
-    refetch (triggered by ``copy.auto_paused``) reads an uncommitted
-    transaction and gets stale ``copy_enabled=true``."""
+def _load_active_accounts() -> list[BrokerAccount]:
+    """Snapshot every connected broker_account whose broker has a
+    ``get_pnl_snapshot`` implementation. Detaches the rows from the
+    session so ``_enforce_one`` can read scalar attributes after the
+    session closes without DetachedInstanceError."""
     with SessionLocal() as db:
         accts = list(db.execute(
             select(BrokerAccount).where(
-                BrokerAccount.broker == BrokerName.ALPACA,
+                BrokerAccount.broker.in_(_SUPPORTED_BROKERS),
                 BrokerAccount.connection_status == "connected",
             )
         ).scalars())
+        for a in accts:
+            db.expunge(a)
+        return accts
 
-    for acct in accts:
-        try:
-            _enforce_one(acct)
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "pnl_poller: enforce failed for account %s (user %s)",
-                acct.id, acct.user_id,
-            )
+
+def _enforce_one_safe(acct: BrokerAccount) -> None:
+    """Crash isolation wrapper — one subscriber's failure (broker 500,
+    DB lock, etc.) must not abort the rest of the tick's gather."""
+    try:
+        _enforce_one(acct)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "pnl_poller: enforce failed for account %s (user %s)",
+            acct.id, acct.user_id,
+        )
 
 
 def _enforce_one(acct: BrokerAccount) -> None:
@@ -165,8 +193,13 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "type": "copy.auto_resumed", "reason": "new_day",
                 })
 
-        # ── Fetch today's P&L + current equity from Alpaca ───────────────
-        state = _fetch_alpaca_state(acct)
+        # ── Fetch today's P&L + equity + beginning_day_balance ───────────
+        # Broker-agnostic: ``adapter_for`` routes to AlpacaAdapter or
+        # SnapTradeAdapter and both return the same ``get_pnl_snapshot``
+        # shape. ``beginning_day_balance`` may come back None for
+        # SnapTrade brokers that don't surface a day-start figure; the
+        # pct kill switch is silently skipped for those subscribers.
+        state = _fetch_pnl_snapshot(acct)
         if state is None:
             # Broker call failed — commit any auto-resume we did, skip
             # the rest of this tick, try again next time.
@@ -176,19 +209,26 @@ def _enforce_one(acct: BrokerAccount) -> None:
             if invalidate_trader_id:
                 _safe_invalidate(invalidate_trader_id)
             return
-        todays_pl, equity = state
+        todays_pl = state["todays_pl"]
+        equity = state["equity"]
+        beginning_day_balance: Decimal | None = state.get("beginning_day_balance")
 
-        # ── Pct-of-equity TRADING-VALUE cap ──────────────────────────────
+        # ── Pct-of-day-start-balance TRADING-VALUE cap ───────────────────
         # Tracks today's cumulative filled trade notional (capital
         # deployed, not P&L). When today's trading USD crosses
-        # equity*pct/100, copy is paused. Computed from our own fills
-        # table (DB-derived), independent of the equity-delta P&L number
-        # used by the loss/profit limits.
+        # beginning_day_balance * pct/100, copy is paused. Using the
+        # day-start balance means the dollar threshold is FIXED for the
+        # trading day; if we used live equity, the threshold would drift
+        # up on gains and down on losses, which would be confusing.
         todays_trading_value = today_filled_notional(db, s.user_id)
 
         pct_limit_dollars: Decimal | None = None
-        if s.max_account_pct_per_day is not None and equity > 0:
-            pct_limit_dollars = equity * s.max_account_pct_per_day / Decimal(100)
+        if (
+            s.max_account_pct_per_day is not None
+            and beginning_day_balance is not None
+            and beginning_day_balance > 0
+        ):
+            pct_limit_dollars = beginning_day_balance * s.max_account_pct_per_day / Decimal(100)
 
         hit_loss = (
             s.daily_loss_limit is not None and todays_pl <= -s.daily_loss_limit
@@ -215,9 +255,11 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 entity_type="subscriber_settings", entity_id=s.user_id,
                 metadata={
                     "source":                  "pnl_poller",
+                    "broker":                  acct.broker.value,
                     "todays_pl":               str(todays_pl),
                     "todays_trading_value":    str(todays_trading_value),
                     "equity":                  str(equity),
+                    "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
                     "daily_loss_limit":        str(s.daily_loss_limit) if s.daily_loss_limit else None,
                     "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
                     "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
@@ -237,6 +279,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
                 "todays_realized_pnl":     str(todays_pl),
                 "todays_trading_value":    str(todays_trading_value),
+                "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
             })
 
         # ── Commit BEFORE any events go out ───────────────────────────────
@@ -249,6 +292,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "todays_realized_pnl":     str(todays_pl),
             "todays_trading_value":    str(todays_trading_value),
             "equity":                  str(equity),
+            "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
             "daily_loss_limit":        str(s.daily_loss_limit) if s.daily_loss_limit else None,
             "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
             "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
@@ -283,30 +327,34 @@ def _flush(user_id: uuid.UUID, pending: list[dict[str, Any]]) -> None:
         events.publish(user_id, evt)
 
 
-def _fetch_alpaca_state(acct: BrokerAccount) -> tuple[Decimal, Decimal] | None:
-    """Pull ``equity`` and ``last_equity`` from Alpaca, return
-    ``(todays_pl, equity)``. Today's P&L is the dashboard-style
-    ``equity - last_equity``; equity itself is needed separately so the
-    pct-of-equity limit can derive a current-dollar threshold each tick.
-    None on any failure — the caller skips this tick rather than killing
-    the loop."""
+def _fetch_pnl_snapshot(acct: BrokerAccount) -> dict[str, Any] | None:
+    """Broker-agnostic fetch. Decrypts creds, builds the right adapter
+    via ``adapter_for``, calls ``get_pnl_snapshot``. Returns the dict
+    shape ``{"todays_pl", "equity", "beginning_day_balance"}`` or None
+    on any failure (caller skips the tick). ``beginning_day_balance``
+    inside the dict may itself be None for SnapTrade brokers that don't
+    expose a day-start — the pct kill switch is skipped in that case
+    while the loss/profit limits and live tile still work."""
     try:
         creds = decrypt_json(acct.encrypted_credentials)
     except Exception:  # noqa: BLE001
         log.exception("pnl_poller: decrypt failed for account %s", acct.id)
         return None
     try:
-        adapter = AlpacaAdapter(creds)
-        a = adapter._c().get_account()  # noqa: SLF001 — single-call shortcut, no need for a public wrapper
-        equity = Decimal(str(a.equity))
-        last_equity = Decimal(str(a.last_equity))
+        adapter = adapter_for(acct, creds)
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "pnl_poller: alpaca get_account failed for %s: %s",
-            acct.id, exc,
+            "pnl_poller: adapter_for failed for account %s: %s", acct.id, exc,
         )
         return None
-    return (equity - last_equity), equity
+    try:
+        return adapter.get_pnl_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "pnl_poller: %s get_pnl_snapshot failed for account %s: %s",
+            adapter.name, acct.id, exc,
+        )
+        return None
 
 
 __all__ = ["bind_loop", "start", "stop", "POLL_INTERVAL_S"]

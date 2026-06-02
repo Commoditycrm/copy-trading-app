@@ -579,6 +579,7 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
     }
   }
 
+  
   const placedCount = lags.length;
   const under1s = lags.filter(l => l <= 1000).length;
   // Median: sort + pick middle. Skip when we have no samples.

@@ -36,7 +36,12 @@ export default function SettingsPage() {
   // first tick lands — typically within 60s of page load.
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
-  const [equity, setEquity] = useState<string | null>(null);
+  // Today's starting account balance from Alpaca (`last_equity`, =
+  // equity at yesterday's close). Drives the panel's display tile and
+  // is the base the pct-per-day cap is computed against, so the dollar
+  // threshold stays fixed for the trading day instead of moving with
+  // live equity changes. Null until the first pnl.tick lands.
+  const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(null);
   // Today's filled-trade notional in USD — the metric the pct limit
   // compares against. Comes in on every pnl.tick event; "—" in the UI
   // until the first tick lands.
@@ -65,10 +70,19 @@ export default function SettingsPage() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
     if (e?.type === "copy.auto_paused") {
-      notify.error(
-        `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily limit ($${e.daily_loss_limit}).`,
-        { autoClose: false }
-      );
+      // The same event fires for loss / profit / pct triggers — branch
+      // on `reason` so the toast doesn't say "today's loss ... ($null)"
+      // when the actual cause was the profit or pct cap.
+      const reason = e.reason as string | undefined;
+      let msg: string;
+      if (reason === "daily_profit_limit") {
+        msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your daily profit limit ($${e.daily_profit_limit}).`;
+      } else if (reason === "max_account_pct_per_day") {
+        msg = `Copy trading auto-paused — today's trading ($${e.todays_trading_value}) hit ${e.max_account_pct_per_day}% of your day-start balance.`;
+      } else {
+        msg = `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily loss limit ($${e.daily_loss_limit}).`;
+      }
+      notify.error(msg, { autoClose: false });
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
       return;
     }
@@ -81,15 +95,19 @@ export default function SettingsPage() {
     // P&L from Alpaca + the current copy_enabled flag. Merge into local
     // state so the P&L Limit panel updates live without a manual refresh.
     if (e?.type === "pnl.tick") {
-      if (typeof e.equity === "string") setEquity(e.equity);
+      if (typeof e.beginning_day_balance === "string") setBeginningDayBalance(e.beginning_day_balance);
       if (typeof e.todays_trading_value === "string") setTodaysTradingValue(e.todays_trading_value);
+      // The tick carries the canonical DB state for every limit field —
+      // overwrite with the tick value (null included) so a freshly-
+      // cleared limit doesn't stay stuck in the UI. Only "today" /
+      // copy_enabled fall back to prev when missing from the payload.
       setSub(prev => prev ? {
         ...prev,
         todays_realized_pnl:      e.todays_realized_pnl      ?? prev.todays_realized_pnl,
         daily_loss_limit:         e.daily_loss_limit         ?? null,
         daily_profit_limit:       e.daily_profit_limit       ?? null,
-        max_per_contract:         e.max_per_contract         ?? prev.max_per_contract,
-        max_account_pct_per_day:  e.max_account_pct_per_day  ?? prev.max_account_pct_per_day,
+        max_per_contract:         e.max_per_contract         ?? null,
+        max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
         copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
       } : prev);
     }
@@ -243,10 +261,27 @@ export default function SettingsPage() {
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
   const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
-  const headroom = limit !== null ? limit + todaysPnL : null;
+  // Only count the LOSS portion against the loss-limit headroom. If
+  // today's P&L is positive (profit), no loss has been absorbed, so
+  // headroom = full limit. Without the max(0, -pnl) clamp we'd report
+  // "$700 headroom on a $500 limit" when the trader is up $200 — which
+  // is the opposite of what the kill switch protects against.
+  const headroom = limit !== null ? Math.max(0, limit - Math.max(0, -todaysPnL)) : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
   const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
-  const profitHeadroom = profitLimit !== null ? profitLimit - Math.max(0, todaysPnL) : null;
+  const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
+  // Max-% derived values — pulled up here so the table row can read
+  // them. balance × pct/100 = the dollar threshold; today's trading
+  // value (from the SSE tick) is the metric compared against it.
+  const maxPctNum = sub?.max_account_pct_per_day ? Number(sub.max_account_pct_per_day) : null;
+  const baseNum = beginningDayBalance ? Number(beginningDayBalance) : null;
+  const tvNum = todaysTradingValue ? Number(todaysTradingValue) : 0;
+  const maxPctLimitDollars = (maxPctNum && baseNum && baseNum > 0)
+    ? (baseNum * maxPctNum / 100) : null;
+  const maxPctHeadroom = maxPctLimitDollars !== null
+    ? Math.max(0, maxPctLimitDollars - tvNum) : null;
+  const maxPctConsumed = (maxPctLimitDollars && maxPctLimitDollars > 0)
+    ? Math.min(100, Math.max(0, (tvNum / maxPctLimitDollars) * 100)) : 0;
   const profitPct = profitLimit !== null && profitLimit > 0
     ? Math.min(100, Math.max(0, (Math.max(0, todaysPnL) / profitLimit) * 100))
     : 0;
@@ -256,7 +291,7 @@ export default function SettingsPage() {
     : null;
 
   return (
-    <div className="space-y-5 max-w-3xl pb-12">
+    <div className="space-y-5 max-w-6xl pb-12">
       {user.role === "subscriber" && sub && (
         <>
           {/* ── Trader + Multiplier ─────────────────────────────────── */}
@@ -301,95 +336,106 @@ export default function SettingsPage() {
             </div>
           </Card>
 
-          {/* ── P&L Limit ───────────────────────────────────────────── */}
-          {/* Two-column layout split by a vertical divider — no inner card
-              borders so it reads as one cohesive section instead of cards
-              inside a card. Stacks vertically on mobile with the divider
-              becoming horizontal. */}
+          {/* ── Risk Controls (all four limits in one table) ──────────── */}
+          {/* One unified surface for every kill-switch on the account.
+              Each row is its own subtle card with a color-coded left
+              accent, live "Today" reading, inline input + Save, and a
+              progress bar across the bottom. The four rows share one
+              header so the eye doesn't have to re-orient between cards. */}
           <Card
             icon={<IconShield />}
-            title="P&L Limit"
-            hint="Copy turns OFF for the day when either limit is hit, then auto-resumes the next UTC day."
+            title="Risk Controls"
+            hint="Loss / profit / size / capital caps. When any live limit is hit, copy turns OFF for the day and auto-resumes the next UTC day."
           >
-            <div className="grid grid-cols-1 md:grid-cols-[1fr_1px_1fr] gap-4 md:gap-5">
-              <PnLLimitPanel
-                kind="loss"
+            {/* Desktop column legend — hidden on mobile where rows stack
+                their own labels. Keeps the grid scannable without
+                cluttering the row content. */}
+            <div
+              className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
+              style={{
+                gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr",
+                color: "var(--muted)",
+              }}
+            >
+              <div>Limit</div>
+              <div>Today</div>
+              <div>Threshold</div>
+              <div>Headroom</div>
+              <div className="text-right">Used</div>
+            </div>
+            <div className="space-y-2.5">
+              <LimitRow
+                accent="#ef4444"
+                icon={<IconTrendDown />}
+                title="Daily loss limit"
+                subtitle="Pause copy when today's loss reaches this."
+                todayLabel="Today P&L"
+                todayValue={fmt(String(todaysPnL))}
+                todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
+                inputPrefix="USD"
                 input={limitInput}
                 onInput={setLimitInput}
-                onSave={saveLimit}
                 busy={limitBusy}
+                onSave={saveLimit}
                 current={sub.daily_loss_limit}
-                todaysPnL={todaysPnL}
-                limit={limit}
-                pct={limitPct}
-                headroom={headroom}
-                fmt={fmt}
+                hasLimit={limit !== null}
+                headroomDisplay={limit === null ? "—" : fmt(String(headroom))}
+                headroomColor={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+                pctConsumed={limitPct}
               />
-              {/* Vertical divider on md+, horizontal on mobile */}
-              <div
-                aria-hidden
-                className="hidden md:block w-px h-full"
-                style={{background: "var(--border)"}}
-              />
-              <div
-                aria-hidden
-                className="md:hidden h-px w-full"
-                style={{background: "var(--border)"}}
-              />
-              <PnLLimitPanel
-                kind="profit"
+              <LimitRow
+                accent="#22c55e"
+                icon={<IconTrendUp />}
+                title="Daily profit limit"
+                subtitle="Pause copy when today's profit reaches this."
+                todayLabel="Today P&L"
+                todayValue={fmt(String(todaysPnL))}
+                todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
+                inputPrefix="USD"
                 input={profitInput}
                 onInput={setProfitInput}
-                onSave={saveProfit}
                 busy={profitBusy}
+                onSave={saveProfit}
                 current={sub.daily_profit_limit}
-                todaysPnL={todaysPnL}
-                limit={profitLimit}
-                pct={profitPct}
-                headroom={profitHeadroom}
-                fmt={fmt}
+                hasLimit={profitLimit !== null}
+                headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
+                headroomColor={(profitHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+                pctConsumed={profitPct}
               />
-            </div>
-          </Card>
-
-          {/* ── Risk Limits (per-contract + % of equity) ──────────────── */}
-          {/* Same split layout as P&L Limit so the two cards read as a
-              pair. Left side is UI-only ($ display ceiling), right side
-              is the live pct-of-equity kill switch enforced by the
-              pnl_poller every 60s — its dollar threshold is computed
-              from the latest equity that arrives on each pnl.tick. */}
-          <Card
-            icon={<IconShield />}
-            title="Risk Limits"
-            hint="Max position size + % of account equity that, if today's P&L breaches as a loss, turns copy OFF."
-          >
-            <div className="grid grid-cols-1 md:grid-cols-[1fr_1px_1fr] gap-4 md:gap-5">
-              <MaxPerContractPanel
-                input={maxContractInput}
-                onInput={setMaxContractInput}
-                onSave={saveMaxContract}
-                busy={maxContractBusy}
-                current={sub.max_per_contract}
-              />
-              <div
-                aria-hidden
-                className="hidden md:block w-px h-full"
-                style={{background: "var(--border)"}}
-              />
-              <div
-                aria-hidden
-                className="md:hidden h-px w-full"
-                style={{background: "var(--border)"}}
-              />
-              <MaxPctPanel
+              <LimitRow
+                accent="#f59e0b"
+                icon={<IconPercent />}
+                title="Max % of account per day"
+                subtitle="Pause when today's trading value reaches this % of the day's starting balance."
+                todayLabel="Day-Start"
+                todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
+                inputPrefix="%"
                 input={maxPctInput}
                 onInput={setMaxPctInput}
-                onSave={saveMaxPct}
                 busy={maxPctBusy}
+                onSave={saveMaxPct}
                 current={sub.max_account_pct_per_day}
-                equity={equity}
-                todaysTradingValue={todaysTradingValue}
-                fmt={fmt}
+                hasLimit={maxPctLimitDollars !== null}
+
+                headroomDisplay={maxPctLimitDollars === null ? "—" : fmt(String(maxPctHeadroom))}
+                headroomColor={(maxPctHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+                pctConsumed={maxPctConsumed}
+              />
+              <LimitRow
+                accent="#3b82f6"
+                icon={<IconLayers />}
+                title="Max per contract"
+                subtitle="Max per contract"
+                todayLabel="—"
+                todayValue="—"
+                inputPrefix="USD"
+                input={maxContractInput}
+                onInput={setMaxContractInput}
+                busy={maxContractBusy}
+                onSave={saveMaxContract}
+                current={sub.max_per_contract}
+                hasLimit={false}
+                headroomDisplay="—"
               />
             </div>
           </Card>
@@ -594,7 +640,6 @@ function PrimaryButton({
       style={{
         background: "var(--accent)",
         color: "#06121f",
-        boxShadow: disabled ? "none" : "0 4px 14px -6px var(--accent)",
       }}
     >
       {busy && <Spinner />}
@@ -651,276 +696,259 @@ function Stat({ label, value, color }: { label: string; value: string; color?: s
   );
 }
 
-/** One side of the P&L Limit card. No box around it — the parent card
- *  + a divider provide the visual grouping. The $-input is one cohesive
- *  control: a single bordered field with $ inline, focus ring on the
- *  whole thing (not just the inner input). */
-function PnLLimitPanel({
-  kind, input, onInput, onSave, busy, current, todaysPnL, limit, pct, headroom, fmt,
-}: {
-  kind: "loss" | "profit";
-  input: string;
-  onInput: (v: string) => void;
-  onSave: () => void;
-  busy: boolean;
-  current: string | null;
-  todaysPnL: number;
-  limit: number | null;
-  pct: number;
-  headroom: number | null;
-  fmt: (v: string | null | undefined) => string;
-}) {
-  const isLoss = kind === "loss";
-  const title = isLoss ? "Daily loss limit" : "Daily profit limit";
-  const subtitle = isLoss
-    ? "Pause copy when today's loss reaches this."
-    : "Pause copy when today's profit reaches this.";
-  const barColor = pct >= 100 ? "var(--bad)" : pct >= 75 ? "#f59e0b" : "var(--good)";
-  return (
-    <div className="min-w-0 space-y-3">
-      <div>
-        <div className="text-sm font-semibold">{title}</div>
-        <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{subtitle}</div>
-      </div>
 
-      {/* One cohesive $-input: a single bordered field, with USD as a
-          baked-in prefix and input as the body. Focus-within lights the
-          whole shell. The inline style on <input> wipes the global
-          `input[type="number"]` border + background from globals.css —
-          without that override the inner input would render its OWN
-          border inside the shell, creating a box-in-box look. */}
-      <div className="flex items-center gap-2">
-        <div
-          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
-          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
-        >
-          <span
-            className="px-3 py-2 text-xs font-medium border-r"
-            style={{color: "var(--muted)", borderColor: "var(--border)"}}
-          >
-            USD
-          </span>
-          <input
-            type="number" step="0.01" min="0" placeholder="no limit"
-            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
-            style={{
-              border: "none",
-              background: "transparent",
-              outline: "none",
-              borderRadius: 0,  // overrides globals.css var(--r-sm) inheritance
-              color: "var(--text)",
-            }}
-            value={input}
-            onChange={(e) => onInput(e.target.value)}
-          />
-        </div>
-        <PrimaryButton
-          busy={busy}
-          onClick={onSave}
-          disabled={busy || input === (current ?? "")}
-        >
-          Save
-        </PrimaryButton>
-      </div>
-
-      <div className="grid grid-cols-3 gap-2">
-        <Stat label="Today P&L" value={fmt(String(todaysPnL))}
-              color={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"} />
-        <Stat label="Limit" value={fmt(current)} />
-        <Stat
-          label="Headroom"
-          value={limit === null ? "—" : fmt(String(headroom))}
-          color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
-        />
-      </div>
-
-      {limit !== null && (
-        <div>
-          <div className="h-1.5 rounded-full overflow-hidden" style={{background: "rgba(255,255,255,0.06)"}}>
-            <div
-              className="h-full rounded-full"
-              style={{
-                width: `${pct}%`,
-                background: barColor,
-                boxShadow: `0 0 8px -2px ${barColor}`,
-                transition: "width 0.4s ease",
-              }}
-            />
-          </div>
-          <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
-            {Math.round(pct)}% of limit
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Max-per-contract panel — UI-only ceiling, no live readouts. Persisted
- *  on the server but never read by copy_engine; surfaces here purely so
- *  the subscriber can record their own risk policy alongside the live
- *  kill switches. */
-function MaxPerContractPanel({
-  input, onInput, onSave, busy, current,
-}: {
-  input: string;
-  onInput: (v: string) => void;
-  onSave: () => void;
-  busy: boolean;
-  current: string | null;
-}) {
-  return (
-    <div className="min-w-0 space-y-3">
-      <div>
-        <div className="text-sm font-semibold">Max per contract</div>
-        {/* <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>
-          Self-imposed ceiling — display only, not enforced.
-        </div> */}
-      </div>
-      <div className="flex items-center gap-2">
-        <div
-          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
-          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
-        >
-          <span
-            className="px-3 py-2 text-xs font-medium border-r"
-            style={{color: "var(--muted)", borderColor: "var(--border)"}}
-          >
-            USD
-          </span>
-          <input
-            type="number" step="0.01" min="0" placeholder="no limit"
-            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
-            style={{
-              border: "none", background: "transparent", outline: "none",
-              borderRadius: 0, color: "var(--text)",
-            }}
-            value={input}
-            onChange={(e) => onInput(e.target.value)}
-          />
-        </div>
-        <PrimaryButton
-          busy={busy}
-          onClick={onSave}
-          disabled={busy || input === (current ?? "")}
-        >
-          Save
-        </PrimaryButton>
-      </div>
-      <div className="text-[10px] tabular-nums" style={{color: "var(--muted)"}}>
-        Current: {current ? `$${current}` : "—"}
-      </div>
-    </div>
-  );
-}
-
-/** Max-%-of-equity panel — enforced server-side every 60s by pnl_poller.
- *  The metric here is TODAY'S TRADING VALUE in USD (cumulative filled
- *  notional, both buy + sell, options × 100 multiplier), NOT P&L. When
- *  trading value crosses equity × pct/100, copy is auto-paused.
+/** One row of the consolidated Risk Controls table.
  *
- *  Both ``equity`` and ``todaysTradingValue`` arrive on every pnl.tick;
- *  the panel renders "—" for the dollar columns until the first tick
- *  lands (typically within 60s of page load). */
-function MaxPctPanel({
-  input, onInput, onSave, busy, current, equity, todaysTradingValue, fmt,
+ *  Visual rhythm:
+ *    - Color-coded left accent rail (per limit type)
+ *    - Icon + title + subtitle at the start
+ *    - Live "Today" value, inline input + Save, headroom, used%
+ *    - Slim animated progress bar across the bottom edge
+ *    - Hover lifts the card 1px for tactility
+ *
+ *  Designed to read as a table at md+ widths (columns align with the
+ *  legend above), and as a stack on mobile (each row's content drops
+ *  into a single column with field labels back inline).
+ *
+ *  `hasLimit` controls whether the headroom / progress bar render — for
+ *  the UI-only Max-per-contract row, both stay "—" / hidden. */
+function LimitRow({
+  accent, icon, title, subtitle,
+  todayLabel, todayValue, todayColor,
+  inputPrefix, input, onInput, busy, onSave, current,
+  hasLimit, thresholdHint,
+  headroomDisplay, headroomColor,
+  pctConsumed,
 }: {
+  accent: string;
+  icon: React.ReactNode;
+  title: string;
+  subtitle: string;
+  todayLabel: string;
+  todayValue: string;
+  todayColor?: string;
+  inputPrefix: string;
   input: string;
   onInput: (v: string) => void;
-  onSave: () => void;
   busy: boolean;
+  onSave: () => void;
   current: string | null;
-  equity: string | null;
-  todaysTradingValue: string | null;
-  fmt: (v: string | null | undefined) => string;
+  hasLimit: boolean;
+  thresholdHint?: string;
+  headroomDisplay: string;
+  headroomColor?: string;
+  pctConsumed?: number;
 }) {
-  const pctNum = current ? parseFloat(current) : null;
-  const equityNum = equity ? parseFloat(equity) : null;
-  const tvNum = todaysTradingValue ? parseFloat(todaysTradingValue) : 0;
-  // Dollar threshold the server uses: equity × pct/100. Null until we
-  // have both inputs so the UI doesn't render a misleading "$0.00".
-  const limitDollars = (pctNum && equityNum && equityNum > 0)
-    ? (equityNum * pctNum / 100)
-    : null;
-  const headroom = limitDollars !== null ? limitDollars - tvNum : null;
-  const pctConsumed = (limitDollars && limitDollars > 0)
-    ? Math.min(100, Math.max(0, (tvNum / limitDollars) * 100))
-    : 0;
-  const barColor = pctConsumed >= 100 ? "var(--bad)" : pctConsumed >= 75 ? "#f59e0b" : "var(--good)";
+  const barPct = Math.max(0, Math.min(100, pctConsumed ?? 0));
+  const barTone =
+    barPct >= 100 ? "var(--bad)"
+    : barPct >= 75 ? "#f59e0b"
+    : accent;
+
   return (
-    <div className="min-w-0 space-y-3">
-      <div>
-        <div className="text-sm font-semibold">Max % of account per day</div>
-        <div className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>
-          Pause copy when today&apos;s trading value (USD) reaches this % of equity.
-        </div>
-      </div>
-      <div className="flex items-center gap-2">
+    <div
+      className="relative rounded-xl border overflow-hidden"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.005) 60%, rgba(0,0,0,0.15) 100%)",
+        borderColor: "var(--border)",
+        boxShadow:
+          "inset 0 1px 0 rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.2)",
+      }}
+    >
+      {/* Left accent rail — fades top→bottom for a softer feel */}
+      <div
+        aria-hidden
+        className="absolute left-0 top-0 bottom-0 w-[3px]"
+        style={{
+          background: `linear-gradient(180deg, ${accent} 0%, ${accent}66 60%, transparent 100%)`,
+          boxShadow: `0 0 12px -2px ${accent}80`,
+        }}
+      />
+
+      {/* Grid: matches the legend above on md+, stacks on mobile */}
+      <div
+        className="grid items-center gap-3 p-4 pl-5"
+        style={{ gridTemplateColumns: "minmax(0,1fr)" }}
+      >
         <div
-          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
-          style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.18)"}}
+          className="md:grid md:items-center md:gap-3"
+          style={{ gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr" }}
         >
-          <span
-            className="px-3 py-2 text-xs font-medium border-r"
-            style={{color: "var(--muted)", borderColor: "var(--border)"}}
-          >
-            %
-          </span>
-          <input
-            type="number" step="0.5" min="0" max="100" placeholder="no limit"
-            className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
-            style={{
-              border: "none", background: "transparent", outline: "none",
-              borderRadius: 0, color: "var(--text)",
-            }}
-            value={input}
-            onChange={(e) => onInput(e.target.value)}
-          />
-        </div>
-        <PrimaryButton
-          busy={busy}
-          onClick={onSave}
-          disabled={busy || input === (current ?? "")}
-        >
-          Save
-        </PrimaryButton>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        <Stat
-          label="Today's Trading"
-          value={todaysTradingValue !== null ? fmt(todaysTradingValue) : "—"}
-        />
-        <Stat
-          label="Limit"
-          value={limitDollars !== null ? fmt(String(limitDollars)) : "—"}
-        />
-        <Stat
-          label="Headroom"
-          value={headroom !== null ? fmt(String(headroom)) : "—"}
-          color={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
-        />
-      </div>
-      {limitDollars !== null && (
-        <div>
-          <div className="h-1.5 rounded-full overflow-hidden" style={{background: "rgba(255,255,255,0.06)"}}>
+          {/* Limit name + subtitle */}
+          <div className="min-w-0 flex items-start gap-2.5">
             <div
-              className="h-full rounded-full"
+              className="shrink-0 mt-0.5 rounded-md p-1.5"
               style={{
-                width: `${pctConsumed}%`,
-                background: barColor,
-                boxShadow: `0 0 8px -2px ${barColor}`,
-                transition: "width 0.4s ease",
+                color: accent,
+                background: `${accent}1a`,
+                border: `1px solid ${accent}33`,
               }}
-            />
+            >
+              {icon}
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-semibold leading-tight">{title}</div>
+              <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+                {subtitle}
+              </div>
+            </div>
           </div>
-          <div className="text-[10px] mt-1 tabular-nums" style={{color: "var(--muted)"}}>
-            {Math.round(pctConsumed)}% of limit · equity {equity ? `$${parseFloat(equity).toFixed(2)}` : "—"}
+
+          {/* Today */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              {todayLabel}
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{ color: todayColor ?? "var(--text)" }}
+            >
+              {todayValue}
+            </div>
           </div>
+
+          {/* Threshold input + Save inline */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              Threshold
+            </div>
+            <div className="flex items-center gap-2">
+              <div
+                className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
+                style={{
+                  borderColor: "var(--border)",
+                  background: "rgba(0,0,0,0.25)",
+                }}
+              >
+                <span
+                  className="px-2.5 py-2 text-[10px] font-semibold border-r tabular-nums self-stretch inline-flex items-center"
+                  style={{ color: "var(--muted)", borderColor: "var(--border)" }}
+                >
+                  {inputPrefix}
+                </span>
+                <input
+                  type="number"
+                  step={inputPrefix === "%" ? 0.5 : 0.01}
+                  min={0}
+                  max={inputPrefix === "%" ? 100 : undefined}
+                  placeholder="no limit"
+                  className="flex-1 w-full px-2 py-2 text-xs tabular-nums"
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    outline: "none",
+                    borderRadius: 0,
+                    color: "var(--text)",
+                  }}
+                  value={input}
+                  onChange={(e) => onInput(e.target.value)}
+                />
+              </div>
+              <PrimaryButton
+                busy={busy}
+                onClick={onSave}
+                disabled={busy || input === (current ?? "")}
+              >
+                Save
+              </PrimaryButton>
+            </div>
+            {thresholdHint && (
+              <div className="text-[10px] mt-1 tabular-nums" style={{ color: "var(--muted)" }}>
+                {thresholdHint}
+              </div>
+            )}
+          </div>
+
+          {/* Headroom */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              Headroom
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{ color: headroomColor ?? "var(--text)" }}
+            >
+              {headroomDisplay}
+            </div>
+          </div>
+
+          {/* Used % */}
+          <div className="mt-3 md:mt-0 md:text-right">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              Used
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{
+                color:
+                  !hasLimit ? "var(--muted)"
+                  : barPct >= 100 ? "var(--bad)"
+                  : barPct >= 75 ? "#f59e0b"
+                  : "var(--text)",
+              }}
+            >
+              {hasLimit ? `${Math.round(barPct)}%` : "—"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom progress bar — gradient + glow tied to limit accent.
+          No track background: when used% is 0, nothing renders, so the
+          last row's bottom edge doesn't show a faint horizontal strip. */}
+      {hasLimit && barPct > 0 && (
+        <div className="h-1 w-full overflow-hidden">
+          <div
+            className="h-full"
+            style={{
+              width: `${barPct}%`,
+              background: `linear-gradient(90deg, ${barTone} 0%, ${barTone}cc 100%)`,
+              boxShadow: `0 0 14px -2px ${barTone}`,
+              transition: "width 0.4s ease, background 0.2s linear",
+            }}
+          />
         </div>
       )}
     </div>
   );
 }
+
+function IconTrendDown() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/>
+      <polyline points="17 18 23 18 23 12"/>
+    </svg>
+  );
+}
+function IconTrendUp() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/>
+      <polyline points="17 6 23 6 23 12"/>
+    </svg>
+  );
+}
+function IconLayers() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+      <polyline points="2 17 12 22 22 17"/>
+      <polyline points="2 12 12 17 22 12"/>
+    </svg>
+  );
+}
+function IconPercent() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="19" y1="5" x2="5" y2="19"/>
+      <circle cx="6.5" cy="6.5" r="2.5"/>
+      <circle cx="17.5" cy="17.5" r="2.5"/>
+    </svg>
+  );
+}
+
 
 /** Single exclusion/inclusion list. No box around it — the parent Card
  *  + a hairline divider provide visual grouping. */
