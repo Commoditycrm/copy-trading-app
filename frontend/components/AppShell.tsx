@@ -244,8 +244,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       setSubCopy(prev => prev ? { ...prev, copy_enabled: true } : prev);
       return;
     }
-    if (e?.type === "pnl.tick" && typeof e.copy_enabled === "boolean") {
-      setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
+    if (e?.type === "pnl.tick") {
+      if (typeof e.copy_enabled === "boolean") {
+        setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
+      }
+      // Keep the Settings page's Risk Controls panel fresh even while
+      // the user is on another page — write the tick fields it cares
+      // about to sessionStorage so its mount-time hydration picks up
+      // the latest values instead of showing "—" until the next tick.
+      try {
+        const raw = window.sessionStorage.getItem("trading-app:pnl-tick-cache");
+        const current = raw ? JSON.parse(raw) : {};
+        const next = {
+          ...current,
+          ...(typeof e.beginning_day_balance === "string" && { beginning_day_balance: e.beginning_day_balance }),
+          ...(typeof e.todays_trading_value  === "string" && { todays_trading_value:  e.todays_trading_value }),
+        };
+        window.sessionStorage.setItem("trading-app:pnl-tick-cache", JSON.stringify(next));
+      } catch { /* sessionStorage disabled / quota — silent */ }
     }
   });
 

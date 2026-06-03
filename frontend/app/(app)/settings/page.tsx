@@ -16,6 +16,61 @@ const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
   { value: "5m",    label: "After 5 min" },
 ];
 
+/** Cross-navigation cache for the pnl.tick payload fields the Risk
+ *  Controls panel renders.
+ *
+ *  Problem this solves: the panel's live numbers come in on a
+ *  ~10-second SSE tick. The numbers were stored as useState on the
+ *  SettingsPage component, so navigating away and back unmounted the
+ *  page and reset everything to null — the user saw "—" / "0" for up
+ *  to 10s every time they re-opened Settings.
+ *
+ *  Now: every tick writes the latest values both to a module-level
+ *  variable (survives client-side navigation since the module stays
+ *  loaded) and to sessionStorage (survives hard refresh of the page,
+ *  but clears when the tab closes — so a stale cache from yesterday
+ *  can't mislead today).
+ *
+ *  Stored fields are the pure transient-display ones; nothing that
+ *  affects business logic (limits etc.) is cached here. */
+const TICK_CACHE_KEY = "trading-app:pnl-tick-cache";
+
+interface TickCache {
+  beginning_day_balance: string | null;
+  todays_trading_value: string | null;
+}
+
+const EMPTY_TICK_CACHE: TickCache = {
+  beginning_day_balance: null,
+  todays_trading_value: null,
+};
+
+function readTickCache(): TickCache {
+  // SSR guard — Next.js renders this module on the server during the
+  // initial RSC pass, where `sessionStorage` doesn't exist.
+  if (typeof window === "undefined") return EMPTY_TICK_CACHE;
+  try {
+    const raw = window.sessionStorage.getItem(TICK_CACHE_KEY);
+    if (!raw) return EMPTY_TICK_CACHE;
+    const parsed = JSON.parse(raw);
+    return {
+      beginning_day_balance: typeof parsed.beginning_day_balance === "string" ? parsed.beginning_day_balance : null,
+      todays_trading_value:  typeof parsed.todays_trading_value  === "string" ? parsed.todays_trading_value  : null,
+    };
+  } catch {
+    return EMPTY_TICK_CACHE;
+  }
+}
+
+function writeTickCache(patch: Partial<TickCache>) {
+  if (typeof window === "undefined") return;
+  try {
+    const current = readTickCache();
+    const next = { ...current, ...patch };
+    window.sessionStorage.setItem(TICK_CACHE_KEY, JSON.stringify(next));
+  } catch { /* quota / disabled storage — silent */ }
+}
+
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
@@ -38,15 +93,16 @@ export default function SettingsPage() {
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
-  // equity at yesterday's close). Drives the panel's display tile and
-  // is the base the pct-per-day cap is computed against, so the dollar
-  // threshold stays fixed for the trading day instead of moving with
-  // live equity changes. Null until the first pnl.tick lands.
-  const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(null);
-  // Today's filled-trade notional in USD — the metric the pct limit
-  // compares against. Comes in on every pnl.tick event; "—" in the UI
-  // until the first tick lands.
-  const [todaysTradingValue, setTodaysTradingValue] = useState<string | null>(null);
+  // equity at yesterday's close). Hydrated from sessionStorage so
+  // navigating away and back keeps the last value visible while the
+  // next pnl.tick is in flight, instead of flashing "—" for 10s.
+  const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(
+    () => readTickCache().beginning_day_balance,
+  );
+  // Today's filled-trade notional in USD — same cross-nav cache.
+  const [todaysTradingValue, setTodaysTradingValue] = useState<string | null>(
+    () => readTickCache().todays_trading_value,
+  );
 
   useEffect(() => {
     (async () => {
@@ -96,8 +152,14 @@ export default function SettingsPage() {
     // P&L from Alpaca + the current copy_enabled flag. Merge into local
     // state so the P&L Limit panel updates live without a manual refresh.
     if (e?.type === "pnl.tick") {
-      if (typeof e.beginning_day_balance === "string") setBeginningDayBalance(e.beginning_day_balance);
-      if (typeof e.todays_trading_value === "string") setTodaysTradingValue(e.todays_trading_value);
+      if (typeof e.beginning_day_balance === "string") {
+        setBeginningDayBalance(e.beginning_day_balance);
+        writeTickCache({ beginning_day_balance: e.beginning_day_balance });
+      }
+      if (typeof e.todays_trading_value === "string") {
+        setTodaysTradingValue(e.todays_trading_value);
+        writeTickCache({ todays_trading_value: e.todays_trading_value });
+      }
       // The tick carries the canonical DB state for every limit field —
       // overwrite with the tick value (null included) so a freshly-
       // cleared limit doesn't stay stuck in the UI. Only "today" /
