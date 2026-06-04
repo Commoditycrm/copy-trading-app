@@ -60,6 +60,7 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.settings import SubscriberSettings
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
+from app.services import pnl
 from app.services.pnl import today_filled_notional
 
 log = logging.getLogger(__name__)
@@ -286,6 +287,90 @@ def _enforce_one(acct: BrokerAccount) -> None:
         hit_pct = (
             pct_limit_dollars is not None and todays_trading_value >= pct_limit_dollars
         )
+        # Auto-liquidation: a take-profit ceiling on UNREALIZED P&L for
+        # the day (today's total mark-to-market gains on still-open
+        # positions). Distinct from daily_profit_limit which is a REALIZED
+        # circuit breaker triggered by closed fills. When tripped we
+        # (1) flip copy_enabled, (2) stamp auto_liquidated_at as an audit
+        # marker, (3) hand off to auto_liquidator to flatten the broker —
+        # which converts the unrealized gain into a realized one.
+        #
+        #   unrealized = todays_total_pl − today_realized_pnl
+        #              = (equity − beginning_day_balance) − fills_today
+        #
+        # Requires beginning_day_balance to be known (some SnapTrade
+        # brokers don't expose it — for those subscribers the take-profit
+        # check is skipped, same as the pct kill switch).
+        todays_realized = pnl.today_realized_pnl(db, s.user_id)
+        unrealized_pl: Decimal | None = None
+        if beginning_day_balance is not None:
+            unrealized_pl = todays_pl - todays_realized
+        hit_liquidation = (
+            s.auto_liquidation_limit is not None
+            and s.auto_liquidation_limit > 0
+            and unrealized_pl is not None
+            and unrealized_pl >= s.auto_liquidation_limit
+        )
+
+        if s.copy_enabled and hit_liquidation:
+            from app.services.auto_liquidator import liquidate_subscriber_account  # noqa: PLC0415
+            s.copy_enabled = False
+            s.auto_liquidated_at = now_utc
+            try:
+                liq_summary = liquidate_subscriber_account(db, s.user_id, acct.id)
+            except Exception:  # noqa: BLE001
+                log.exception("pnl_poller: liquidation crashed for user=%s", s.user_id)
+                liq_summary = {"cancelled": 0, "closed": 0, "failures": [{"error": "crashed"}]}
+            audit.record(
+                db, actor_user_id=s.user_id,
+                action="copy.auto_liquidated_take_profit",
+                entity_type="subscriber_settings", entity_id=s.user_id,
+                metadata={
+                    "source": "pnl_poller",
+                    "broker": acct.broker.value,
+                    "equity": str(equity),
+                    "unrealized_pl": str(unrealized_pl) if unrealized_pl is not None else None,
+                    "todays_realized_pnl": str(todays_realized),
+                    "todays_total_pl": str(todays_pl),
+                    "auto_liquidation_limit": str(s.auto_liquidation_limit),
+                    "cancelled": liq_summary.get("cancelled"),
+                    "closed":    liq_summary.get("closed"),
+                    "failures":  liq_summary.get("failures"),
+                },
+            )
+            if s.following_trader_id:
+                invalidate_trader_id = s.following_trader_id
+            pending_events.append({
+                "type": "copy.auto_liquidated",
+                "reason": "auto_liquidation_take_profit",
+                "auto_liquidation_limit": str(s.auto_liquidation_limit),
+                "unrealized_pl": str(unrealized_pl) if unrealized_pl is not None else None,
+                "equity": str(equity),
+                "cancelled": liq_summary.get("cancelled"),
+                "closed":    liq_summary.get("closed"),
+            })
+            try:
+                from app.services import notifications as notif_svc  # noqa: PLC0415
+                notif_svc.create_notification(
+                    db,
+                    user_id=s.user_id,
+                    type="copy.auto_liquidated",
+                    message=(
+                        f"Unrealized profit hit ${unrealized_pl} "
+                        f"(target ${s.auto_liquidation_limit}). "
+                        f"All positions closed to lock in the gain; "
+                        f"copy trading is OFF until you turn it back on."
+                    ),
+                    metadata={
+                        "equity": str(equity),
+                        "unrealized_pl": str(unrealized_pl) if unrealized_pl is not None else None,
+                        "auto_liquidation_limit": str(s.auto_liquidation_limit),
+                        "cancelled": liq_summary.get("cancelled"),
+                        "closed":    liq_summary.get("closed"),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("pnl_poller: notification failed for user=%s", s.user_id)
 
         if s.copy_enabled and (hit_loss or hit_profit or hit_pct):
             if hit_loss:
@@ -344,6 +429,12 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
             "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
             "max_per_contract":        str(s.max_per_contract) if s.max_per_contract else None,
+            "auto_liquidation_limit":  str(s.auto_liquidation_limit) if s.auto_liquidation_limit else None,
+            # Today's unrealized P&L = total daily P&L − realized fills.
+            # The take-profit auto-liquidation triggers when this crosses
+            # ``auto_liquidation_limit``; surface it on the tick so the
+            # Settings page can render headroom + progress live.
+            "unrealized_pl":           str(unrealized_pl) if unrealized_pl is not None else None,
             "copy_enabled":            s.copy_enabled,
         }
         user_id_snapshot = s.user_id

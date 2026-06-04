@@ -200,6 +200,13 @@ export default function TradePanelPage() {
   const [expiriesErr, setExpiriesErr] = useState<string | null>(null);
   const [expiriesFor, setExpiriesFor] = useState<string>("");
 
+  // Live option quote for the currently-selected contract. Populated by
+  // an effect that fires when (symbol, expiry, strike, right) all hold a
+  // value. `bid`/`ask` are nullable — illiquid contracts or out-of-RTH
+  // sessions can return 0/None and we don't want to lie to the user.
+  const [optionQuote, setOptionQuote] = useState<{ bid: number | null; ask: number | null; mid: number | null } | null>(null);
+  const [quoteFor, setQuoteFor] = useState<string>("");
+
   const [strikes, setStrikes] = useState<number[]>([]);
   const [strikesLoading, setStrikesLoading] = useState(false);
   const [strikesErr, setStrikesErr] = useState<string | null>(null);
@@ -269,19 +276,37 @@ export default function TradePanelPage() {
         );
         setStrikes(res.strikes);
         setStrikesFor(cacheKey);
-        // Pick the strike NEAREST to the underlying's current price (ATM).
-        // The backend ships a `underlying_price` alongside the strikes; we
-        // pick `argmin(|strike - underlying|)`. If the lookup failed (null)
-        // we fall back to the chain median — a coarse ATM approximation,
-        // but better than picking the first strike.
+        // Pick the FIRST OTM (out-of-the-money) strike relative to the
+        // underlying. Matches what most trading apps default to:
+        //   call → smallest strike >= underlying_price (just above)
+        //   put  → largest  strike <= underlying_price (just below)
+        // Example: TSLA at 420.26, calls → 422.50 (not 420, which would
+        // be slightly ITM). Falls back to absolute-nearest if no strike
+        // sits on the OTM side, and to the chain median if there's no
+        // underlying_price at all.
         if (res.strikes.length === 0) {
           setStrike("");
         } else if (res.underlying_price && res.underlying_price > 0) {
           const target = res.underlying_price;
-          const nearest = res.strikes.reduce((best, s) =>
-            Math.abs(s - target) < Math.abs(best - target) ? s : best
-          );
-          setStrike(String(nearest));
+          const sorted = [...res.strikes].sort((a, b) => a - b);
+          let pick: number | undefined;
+          if (right === "call") {
+            pick = sorted.find(s => s >= target);
+          } else {
+            // For puts walk from the top down so we land on the largest
+            // strike that's still <= underlying.
+            for (let i = sorted.length - 1; i >= 0; i--) {
+              if (sorted[i] <= target) { pick = sorted[i]; break; }
+            }
+          }
+          // No OTM strike on this side of the chain — fall back to the
+          // absolute-nearest strike so we still pick something sensible.
+          if (pick === undefined) {
+            pick = sorted.reduce((best, s) =>
+              Math.abs(s - target) < Math.abs(best - target) ? s : best
+            );
+          }
+          setStrike(String(pick));
         } else {
           setStrike(String(res.strikes[Math.floor(res.strikes.length / 2)]));
         }
@@ -297,6 +322,52 @@ export default function TradePanelPage() {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, symbol, acctId, expiry, right]);
+
+  // Fetch the live option quote (bid/ask) when the contract is fully
+  // specified. Debounced 400ms so the user can quickly switch between
+  // strikes without triggering a request for each intermediate state.
+  // On contract change we also seed the Limit price with the MID —
+  // it splits the spread, which is the standard "neutral" default and
+  // tends to fill more often than the ask without crossing the spread.
+  // Falls back to ask, then bid, when the other side is missing
+  // (illiquid contracts can have one-sided quotes).
+  useEffect(() => {
+    if (instrument !== "option") {
+      setOptionQuote(null);
+      setQuoteFor("");
+      return;
+    }
+    const sym = symbol.trim().toUpperCase();
+    if (!sym || !acctId || !expiry || !strike || !right) {
+      setOptionQuote(null);
+      setQuoteFor("");
+      return;
+    }
+    const cacheKey = `${acctId}:${sym}:${expiry}:${strike}:${right}`;
+    if (cacheKey === quoteFor) return;
+    const t = setTimeout(async () => {
+      try {
+        const res = await api<{ bid: number | null; ask: number | null; mid: number | null }>(
+          `/api/options/quote?account_id=${acctId}&symbol=${encodeURIComponent(sym)}&expiry=${expiry}&strike=${strike}&right=${right}`
+        );
+        setOptionQuote({ bid: res.bid, ask: res.ask, mid: res.mid });
+        setQuoteFor(cacheKey);
+        // Default the Limit field to MID (best of {mid, ask, bid}). We
+        // always overwrite because limit pricing is contract-specific —
+        // a stale value carried across a strike or expiry change would
+        // be misleading.
+        const seed = res.mid ?? res.ask ?? res.bid;
+        if (seed && seed > 0) {
+          setLimit(seed.toFixed(2));
+        }
+      } catch {
+        setOptionQuote(null);
+        setQuoteFor(cacheKey);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument, symbol, acctId, expiry, strike, right]);
 
 
   const isOption = instrument === "option";
@@ -682,10 +753,22 @@ export default function TradePanelPage() {
             )}
 
             {/* Price inputs — only render the ones the current order type
-                needs, so the form doesn't grow when MARKET is selected. */}
-            {(orderType === "limit" || orderType === "stop_limit" || orderType === "stop") && (
-              <div className="grid grid-cols-2 gap-2">
-                {(orderType === "limit" || orderType === "stop_limit") && (
+                needs. For LIMIT we split the row 50/50: input on the left,
+                three Bid / Mid / Ask pills on the right. Each pill is a
+                button that seeds the limit with that price; values are
+                plain numbers (no $ or currency code) so they read at a
+                glance and don't crowd the 50% column. */}
+            {(orderType === "limit" || orderType === "stop_limit") && (() => {
+              const hasQuote =
+                isOption && optionQuote &&
+                (optionQuote.bid !== null || optionQuote.ask !== null || optionQuote.mid !== null);
+              const fmtPx = (n: number) => n.toFixed(2);
+              return (
+                <div
+                  className={
+                    hasQuote ? "grid grid-cols-2 gap-2" : "grid grid-cols-1 gap-2"
+                  }
+                >
                   <div>
                     <TinyLabel>Limit price</TinyLabel>
                     <input
@@ -697,20 +780,68 @@ export default function TradePanelPage() {
                       onChange={e => setLimit(e.target.value)}
                     />
                   </div>
-                )}
-                {(orderType === "stop" || orderType === "stop_limit") && (
-                  <div>
-                    <TinyLabel>Stop price</TinyLabel>
-                    <input
-                      type="number" step="0.01" min="0.01"
-                      className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
-                      style={inputStyle}
-                      placeholder="195.00"
-                      value={stop}
-                      onChange={e => setStop(e.target.value)}
-                    />
-                  </div>
-                )}
+
+                  {hasQuote && (
+                    <div>
+                      <TinyLabel>Quote</TinyLabel>
+                      {/* Three pills side-by-side, equal width, height
+                          matches the limit input (34px) so the row reads
+                          as one aligned strip. Each pill is a button —
+                          click seeds the limit with that price. */}
+                      <div className="flex gap-1.5" style={{ height: 34 }}>
+                        {(["bid", "mid", "ask"] as const).map(side => {
+                          const val =
+                            side === "bid" ? optionQuote!.bid :
+                            side === "mid" ? optionQuote!.mid :
+                            optionQuote!.ask;
+                          const color =
+                            side === "bid" ? "var(--bad)" :
+                            side === "mid" ? "var(--text)" :
+                            "var(--good)";
+                          const disabled = val === null;
+                          return (
+                            <button
+                              key={side}
+                              type="button"
+                              disabled={disabled}
+                              onClick={() => !disabled && setLimit(fmtPx(val!))}
+                              className="flex-1 flex flex-col items-center justify-center rounded-md tabular-nums transition-colors hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                              style={inputStyle}
+                              title={disabled ? "no quote" : `Use ${side} as limit`}
+                            >
+                              <span
+                                className="text-[8px] uppercase tracking-[0.15em] leading-none"
+                                style={{ color: "var(--muted)" }}
+                              >
+                                {side}
+                              </span>
+                              <span
+                                className="text-[12px] font-semibold leading-tight mt-0.5"
+                                style={{ color }}
+                              >
+                                {val !== null ? fmtPx(val) : "—"}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {(orderType === "stop" || orderType === "stop_limit") && (
+              <div>
+                <TinyLabel>Stop price</TinyLabel>
+                <input
+                  type="number" step="0.01" min="0.01"
+                  className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
+                  style={inputStyle}
+                  placeholder="195.00"
+                  value={stop}
+                  onChange={e => setStop(e.target.value)}
+                />
               </div>
             )}
 

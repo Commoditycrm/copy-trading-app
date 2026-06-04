@@ -92,6 +92,11 @@ export default function SettingsPage() {
   // first tick lands — typically within 60s of page load.
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
+  // Auto-liquidation floor — when broker-reported equity drops to or
+  // below this dollar value, pnl_poller flattens the account at market
+  // and disables copy until the subscriber manually re-enables.
+  const [autoLiqInput, setAutoLiqInput] = useState("");
+  const [autoLiqBusy, setAutoLiqBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
   // equity at yesterday's close). Hydrated from sessionStorage so
   // navigating away and back keeps the last value visible while the
@@ -99,6 +104,16 @@ export default function SettingsPage() {
   const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(
     () => readTickCache().beginning_day_balance,
   );
+  // Live broker equity, refreshed by every pnl.tick. Used by the
+  // Auto-liquidation (take-profit) row to show how close the unrealized
+  // P&L is to the target. Null until the first tick lands.
+  const [equity, setEquity] = useState<string | null>(null);
+  // Today's UNREALIZED P&L (mark-to-market on still-open positions),
+  // computed server-side as todays_total_pl − today_realized_pnl. The
+  // take-profit auto-liquidation trigger compares this against
+  // `auto_liquidation_limit`. Null when beginning_day_balance isn't
+  // available (some SnapTrade brokers).
+  const [unrealizedPl, setUnrealizedPl] = useState<string | null>(null);
   // Today's filled-trade notional in USD — same cross-nav cache.
   const [todaysTradingValue, setTodaysTradingValue] = useState<string | null>(
     () => readTickCache().todays_trading_value,
@@ -116,6 +131,7 @@ export default function SettingsPage() {
         setProfitInput(s.daily_profit_limit ?? "");
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxPctInput(s.max_account_pct_per_day ?? "");
+        setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -148,6 +164,17 @@ export default function SettingsPage() {
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
       return;
     }
+    if (e?.type === "copy.auto_liquidated") {
+      notify.success(
+        `Take-profit hit — unrealized profit reached $${e.unrealized_pl} ` +
+        `(target $${e.auto_liquidation_limit}). ` +
+        `${e.closed ?? 0} position(s) closed, ${e.cancelled ?? 0} open order(s) cancelled. ` +
+        `Copy trading is OFF until you re-enable it.`,
+        { autoClose: false },
+      );
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
+      return;
+    }
     // pnl_poller publishes this every 60s with the latest equity-delta
     // P&L from Alpaca + the current copy_enabled flag. Merge into local
     // state so the P&L Limit panel updates live without a manual refresh.
@@ -160,6 +187,12 @@ export default function SettingsPage() {
         setTodaysTradingValue(e.todays_trading_value);
         writeTickCache({ todays_trading_value: e.todays_trading_value });
       }
+      if (typeof e.equity === "string") {
+        setEquity(e.equity);
+      }
+      if (typeof e.unrealized_pl === "string" || e.unrealized_pl === null) {
+        setUnrealizedPl(e.unrealized_pl);
+      }
       // The tick carries the canonical DB state for every limit field —
       // overwrite with the tick value (null included) so a freshly-
       // cleared limit doesn't stay stuck in the UI. Only "today" /
@@ -171,6 +204,7 @@ export default function SettingsPage() {
         daily_profit_limit:       e.daily_profit_limit       ?? null,
         max_per_contract:         e.max_per_contract         ?? null,
         max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
+        auto_liquidation_limit:   e.auto_liquidation_limit   ?? null,
         copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
       } : prev);
     }
@@ -267,6 +301,27 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update max % per day");
     } finally {
       setMaxPctBusy(false);
+    }
+  }
+  async function saveAutoLiq() {
+    setAutoLiqBusy(true);
+    try {
+      const trimmed = autoLiqInput.trim();
+      const body = { auto_liquidation_limit: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/auto-liquidation-limit", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setAutoLiqInput(s.auto_liquidation_limit ?? "");
+      notify.success(
+        s.auto_liquidation_limit
+          ? `Auto-liquidation floor set to $${s.auto_liquidation_limit}`
+          : "Auto-liquidation cleared",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update auto-liquidation limit");
+    } finally {
+      setAutoLiqBusy(false);
     }
   }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
@@ -509,6 +564,74 @@ export default function SettingsPage() {
                 headroomDisplay="—"
               />
             </div>
+          </Card>
+
+          {/* ── Auto-liquidation — its own surface ───────────────────────
+              Separated from Risk Controls so the trader sees this as a
+              distinct take-profit instrument, not a fifth daily cap. The
+              semantic is different too: it locks in a winning day by
+              CLOSING positions, where the Risk Controls rows just pause
+              new mirror entries. */}
+          <Card
+            icon={<IconTrendUp />}
+            title="Auto-Liquidation (Take-Profit)"
+            hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
+          >
+            <div
+              className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
+              style={{
+                gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr",
+                color: "var(--muted)",
+              }}
+            >
+              <div>Target</div>
+              <div>Today</div>
+              <div>Set</div>
+              <div>Headroom</div>
+              <div className="text-right">Progress</div>
+            </div>
+            {(() => {
+              const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
+              const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
+              // Headroom = how much MORE unrealized profit you need
+              // before the trigger fires. Negative once you've crossed.
+              const liqHeadroom =
+                unrealizedNum !== null && liqLimitNum !== null
+                  ? liqLimitNum - unrealizedNum
+                  : null;
+              // Progress bar: unrealized / target, clamped 0–100.
+              const liqPctConsumed =
+                unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
+                  ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
+                  : 0;
+              return (
+                <LimitRow
+                  accent="#22c55e"
+                  icon={<IconTrendUp />}
+                  title="Auto-liquidation target"
+                  subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
+                  todayLabel="Unrealized"
+                  todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
+                  todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
+                  inputPrefix="USD"
+                  input={autoLiqInput}
+                  onInput={setAutoLiqInput}
+                  busy={autoLiqBusy}
+                  onSave={saveAutoLiq}
+                  current={sub.auto_liquidation_limit}
+                  hasLimit={liqLimitNum !== null}
+                  headroomDisplay={
+                    liqLimitNum === null
+                      ? "—"
+                      : liqHeadroom !== null
+                        ? fmt(String(liqHeadroom))
+                        : "—"
+                  }
+                  headroomColor={(liqHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
+                  pctConsumed={liqPctConsumed}
+                />
+              );
+            })()}
           </Card>
 
           {/* ── Symbol filters ─────────────────────────────────────── */}

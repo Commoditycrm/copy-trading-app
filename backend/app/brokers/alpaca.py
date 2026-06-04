@@ -419,3 +419,45 @@ class AlpacaAdapter(BrokerAdapter):
 
         log.warning("get_stock_latest_price(%s): no usable price returned", sym)
         return None
+
+    def get_option_latest_quote(self, occ_symbol: str) -> tuple[Decimal | None, Decimal | None]:
+        """Latest bid + ask for an OCC option symbol. Used by the trade
+        panel to surface live pricing alongside the strike picker and to
+        seed the Limit price field with the ask (the conventional buyer
+        default).
+
+        Returns (bid, ask) as Decimals. Either side may be None when the
+        broker returns a zero / missing quote (illiquid contracts late
+        in the trading day are the common case). On any API failure we
+        return (None, None) so the caller can fall back to manual entry
+        rather than 500-ing.
+
+        Options data on Alpaca is OPRA-feed under the hood; paper + free
+        keys are entitled to it, so no explicit feed param needed."""
+        from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+        from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: PLC0415
+
+        client = OptionHistoricalDataClient(
+            api_key=self.credentials["api_key"],
+            secret_key=self.credentials["api_secret"],
+        )
+        try:
+            quotes = client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=occ_symbol)
+            )
+            q = quotes.get(occ_symbol) if isinstance(quotes, dict) else None
+            bid = _dec_or_none(getattr(q, "bid_price", None)) if q else None
+            ask = _dec_or_none(getattr(q, "ask_price", None)) if q else None
+            # Treat 0.00 as "no quote" — Alpaca returns 0 for both sides
+            # outside RTH on illiquid contracts.
+            if bid is not None and bid <= 0:
+                bid = None
+            if ask is not None and ask <= 0:
+                ask = None
+            log.info(
+                "get_option_latest_quote(%s) → bid=%s ask=%s", occ_symbol, bid, ask
+            )
+            return bid, ask
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_option_latest_quote(%s) failed: %s", occ_symbol, exc)
+            return None, None
