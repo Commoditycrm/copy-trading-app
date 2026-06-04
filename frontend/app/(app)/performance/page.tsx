@@ -1319,7 +1319,7 @@ export default function PerformancePage() {
                                       >
                                         {fmtMs(c.eligibility_lag_ms)}
                                       </td>
-                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
+                                      <td className="px-2 py-2 whitespace-nowrap capitalize" style={{ color: "var(--text-2)" }}>
                                         {c.broker_name ?? "—"}
                                       </td>
                                       <td

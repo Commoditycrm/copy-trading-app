@@ -490,6 +490,16 @@ class SnapTradeAdapter(BrokerAdapter):
     # ── orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        # SnapTrade has no native bracket / OCO. Callers (trade endpoint,
+        # copy_engine) now strip the bracket fields from the request for
+        # non-Alpaca brokers — the emulator places the exit legs on fill,
+        # see app/services/bracket_emulator.py. We assert the fields are
+        # absent so a future regression that re-introduces them surfaces
+        # immediately instead of silently dropping the SL/TP.
+        assert req.take_profit_price is None and req.stop_loss_price is None, (
+            "SnapTrade adapter should not receive bracket fields; the trade "
+            "endpoint must strip them and let bracket_emulator handle the exits."
+        )
         if req.instrument_type == InstrumentType.OPTION:
             return self._place_option_order(req)
         if req.instrument_type != InstrumentType.STOCK:

@@ -324,7 +324,11 @@ def _persist_and_fanout(
         ).scalar_one_or_none()
 
         if existing is not None:
-            if existing.status != status_enum:
+            # Track whether *this* poll observed a status transition — the
+            # bracket emulator hooks below only fire on actual transitions
+            # so we don't pay for them on every quiescent poll.
+            status_changed = existing.status != status_enum
+            if status_changed:
                 existing.status = status_enum
             fq = _attr(order_obj, "filledQuantity", "cumQty")
             if fq is not None:
@@ -346,6 +350,22 @@ def _persist_and_fanout(
             if existing.socket_received_at is None:
                 existing.socket_received_at = datetime.now(timezone.utc)
             existing.redis_published_at = datetime.now(timezone.utc)
+            # Bracket emulator hooks — see snaptrade_listener for the same
+            # pattern. Both functions short-circuit on inputs they don't
+            # match, so calling them together is safe.
+            if status_changed and status_enum == OrderStatus.FILLED:
+                try:
+                    from app.services.bracket_emulator import (  # noqa: PLC0415
+                        cancel_sibling_on_fill,
+                        emulate_bracket_exits,
+                    )
+                    emulate_bracket_exits(db, existing)
+                    cancel_sibling_on_fill(db, existing)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "ibkr_listener: bracket emulator failed for order %s",
+                        existing.id,
+                    )
             db.commit()
             db.refresh(existing)
             events.publish(

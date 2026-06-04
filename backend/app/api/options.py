@@ -85,4 +85,22 @@ def list_strikes(
         if getattr(c, "strike_price", None) is not None
         and str(getattr(c, "type", "")).lower().endswith(want_type)
     })
-    return {"symbol": symbol.upper(), "expiry": str(expiry), "right": want_type, "strikes": strikes}
+
+    # Underlying price so the UI can default to the nearest-to-ATM strike
+    # instead of the chain median (which can be very off for skewed chains).
+    # Best-effort: any failure returns None and the UI falls back to median.
+    underlying_price: float | None = None
+    try:
+        px = adapter.get_stock_latest_price(symbol)
+        if px is not None and px > 0:
+            underlying_price = float(px)
+    except Exception:  # noqa: BLE001
+        underlying_price = None
+
+    return {
+        "symbol": symbol.upper(),
+        "expiry": str(expiry),
+        "right": want_type,
+        "strikes": strikes,
+        "underlying_price": underlying_price,
+    }

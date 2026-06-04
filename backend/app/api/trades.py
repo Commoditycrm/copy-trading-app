@@ -228,6 +228,8 @@ def _place_trader_order(
         quantity=payload.quantity,
         limit_price=payload.limit_price,
         stop_price=payload.stop_price,
+        take_profit_price=payload.take_profit_price,
+        stop_loss_price=payload.stop_loss_price,
         status=OrderStatus.PENDING,
         fanned_out_to_subscribers=will_fanout,
         trader_submitted_at=trader_submitted_at,
@@ -236,6 +238,14 @@ def _place_trader_order(
     db.flush()
 
     adapter = adapter_for(acct, creds)
+    # Forward bracket prices to the adapter ONLY when the adapter can
+    # place a native bracket (Alpaca's OrderClass.BRACKET). For other
+    # brokers we keep TP/SL on the Order row but place the entry plain —
+    # the bracket_emulator service then places the exit legs when the
+    # listener detects the entry has filled. See
+    # app/services/bracket_emulator.py.
+    from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+    use_native_bracket = isinstance(adapter, AlpacaAdapter)
     try:
         result = adapter.place_order(
             BrokerOrderRequest(
@@ -246,6 +256,8 @@ def _place_trader_order(
                 quantity=order.quantity,
                 limit_price=order.limit_price,
                 stop_price=order.stop_price,
+                take_profit_price=order.take_profit_price if use_native_bracket else None,
+                stop_loss_price=order.stop_loss_price if use_native_bracket else None,
                 option_expiry=order.option_expiry,
                 option_strike=order.option_strike,
                 option_right=order.option_right,

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { PageLoading } from "@/components/PageLoading";
+import { SearchableSelect } from "@/components/SearchableSelect";
 import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
@@ -124,20 +125,21 @@ export default function CalendarPage() {
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {user?.role === "trader" && (
-            <select
-              value={viewingUserId ?? ""}
-              onChange={(e) => setViewingUserId(e.target.value || null)}
-              className="p-2 rounded bg-transparent border text-sm"
-              style={{ borderColor: "var(--border)" }}
-              title="View P&L for"
-            >
-              <option value="">— My P&amp;L —</option>
-              {subs.map((s) => (
-                <option key={s.user_id} value={s.user_id}>
-                  {s.display_name ?? s.email}
-                </option>
-              ))}
-            </select>
+            <div className="min-w-[220px]">
+              <SearchableSelect
+                value={viewingUserId ?? ""}
+                onChange={(v) => setViewingUserId(v || null)}
+                options={[
+                  { value: "", label: "— My P&L —" },
+                  ...subs.map((s) => ({
+                    value: s.user_id,
+                    label: s.display_name ?? s.email,
+                  })),
+                ]}
+                placeholder="View P&L for"
+                style={{ height: 34 }}
+              />
+            </div>
           )}
           <button
             onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))}
