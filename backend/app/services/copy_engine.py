@@ -442,6 +442,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 quantity=scaled,
                 limit_price=trader_order.limit_price,
                 stop_price=trader_order.stop_price,
+                # Bracket exit legs inherit verbatim — price levels are
+                # scale-invariant, multipliers only scale quantity.
+                take_profit_price=trader_order.take_profit_price,
+                stop_loss_price=trader_order.stop_loss_price,
                 status=OrderStatus.PENDING,
                 subscriber_picked_at=subscriber_picked_at,
                 subscriber_accepted_at=subscriber_accepted_at,
@@ -472,6 +476,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 continue
 
+            # Forward bracket prices to the broker request ONLY when the
+            # subscriber's broker supports native bracket OCO (Alpaca).
+            # Other brokers get the plain entry; bracket_emulator places
+            # the TP / SL exits when the listener detects the mirror has
+            # filled. The bracket prices stay on the child Order row
+            # regardless, so the emulator can find them.
+            sub_native_bracket = acct.broker == BrokerName.ALPACA
             pending.append(_PendingMirror(
                 child_order_id=child.id,
                 subscriber_user_id=sub.user_id,
@@ -486,6 +497,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     quantity=child.quantity,
                     limit_price=child.limit_price,
                     stop_price=child.stop_price,
+                    take_profit_price=child.take_profit_price if sub_native_bracket else None,
+                    stop_loss_price=child.stop_loss_price if sub_native_bracket else None,
                     option_expiry=child.option_expiry,
                     option_strike=child.option_strike,
                     option_right=child.option_right,

@@ -95,6 +95,29 @@ class Order(Base, TimestampMixin):
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
 
+    # Bracket-order legs attached to a parent entry. Both NULL = plain
+    # order; both set = bracket (Alpaca OrderClass.BRACKET on supported
+    # brokers). Mirror children inherit these prices verbatim — multipliers
+    # only scale quantity, not price levels.
+    take_profit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+
+    # Linkage for *emulated* bracket exits on adapters without native OCO
+    # (everything except Alpaca direct). When the entry fills, the
+    # `bracket_emulator` service places TP (LIMIT) + SL (STOP) on the
+    # opposite side; those exit Order rows reference back via
+    # ``bracket_parent_id`` and identify themselves with
+    # ``bracket_leg in {'tp','sl'}``. Both stay NULL on a regular order or
+    # an Alpaca-native bracket entry (Alpaca brackets it server-side and
+    # the exit legs never become rows in our DB).
+    bracket_parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    bracket_leg: Mapped[str | None] = mapped_column(String(4), nullable=True)
+
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status"), default=OrderStatus.PENDING, nullable=False, index=True
     )
@@ -167,7 +190,17 @@ class Order(Base, TimestampMixin):
 
     broker_account = relationship("BrokerAccount", back_populates="orders")
     fills = relationship("Fill", back_populates="order", cascade="all, delete-orphan")
-    parent = relationship("Order", remote_side=[id], backref="children")
+    # `foreign_keys` is required now that there are TWO self-referential
+    # FKs on `orders` (parent_order_id for copy-fanout linkage and
+    # bracket_parent_id for emulated bracket exits). Without this the
+    # mapper can't decide which column to join on and bails with
+    # "multiple foreign key paths" at first query time.
+    parent = relationship(
+        "Order",
+        remote_side=[id],
+        foreign_keys=[parent_order_id],
+        backref="children",
+    )
 
 
 class Fill(Base):

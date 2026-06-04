@@ -72,6 +72,8 @@ export interface Order {
   quantity: string;
   limit_price: string | null;
   stop_price: string | null;
+  take_profit_price: string | null;
+  stop_loss_price: string | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: OptionRight | null;

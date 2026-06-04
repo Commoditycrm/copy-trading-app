@@ -142,6 +142,8 @@ export default function TradesPage() {
         quantity: incoming.quantity,
         limit_price: idx >= 0 ? cur[idx].limit_price : null,
         stop_price: idx >= 0 ? cur[idx].stop_price : null,
+        take_profit_price: idx >= 0 ? cur[idx].take_profit_price : null,
+        stop_loss_price: idx >= 0 ? cur[idx].stop_loss_price : null,
         option_expiry: idx >= 0 ? cur[idx].option_expiry : null,
         option_strike: idx >= 0 ? cur[idx].option_strike : null,
         option_right: idx >= 0 ? cur[idx].option_right : null,

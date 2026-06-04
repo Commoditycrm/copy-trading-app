@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from alpaca.trading.enums import OrderSide as AlpacaSide
 from alpaca.trading.enums import OrderStatus as AlpacaStatus
 from alpaca.trading.enums import TimeInForce
@@ -25,7 +26,9 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
     StopLimitOrderRequest,
+    StopLossRequest,
     StopOrderRequest,
+    TakeProfitRequest,
 )
 
 from app.brokers.base import (
@@ -169,13 +172,34 @@ class AlpacaAdapter(BrokerAdapter):
             qty = float(req.quantity)
 
         side = _SIDE_OUT[req.side]
+        # Bracket entries (take_profit and/or stop_loss attached) require
+        # OrderClass.BRACKET + GTC TIF + at least one of the child legs.
+        # Alpaca enforces both legs in production; we pass whichever the
+        # trader set and let Alpaca's validator surface a precise error
+        # if it insists on both.
+        has_bracket = (
+            req.take_profit_price is not None or req.stop_loss_price is not None
+        )
+        is_bracket = has_bracket and req.order_type in (OrderType.MARKET, OrderType.LIMIT)
         common = {
             "symbol": sym,
             "qty": qty,
             "side": side,
-            "time_in_force": TimeInForce.DAY,
+            # Bracket exit legs may not fire same-day, so they require GTC.
+            # Plain orders keep DAY (cancel at session close).
+            "time_in_force": TimeInForce.GTC if is_bracket else TimeInForce.DAY,
             "client_order_id": req.client_order_id,
         }
+        if is_bracket:
+            common["order_class"] = AlpacaOrderClass.BRACKET
+            if req.take_profit_price is not None:
+                common["take_profit"] = TakeProfitRequest(
+                    limit_price=float(req.take_profit_price)
+                )
+            if req.stop_loss_price is not None:
+                common["stop_loss"] = StopLossRequest(
+                    stop_price=float(req.stop_loss_price)
+                )
         if req.order_type == OrderType.MARKET:
             order_req = MarketOrderRequest(**common)
         elif req.order_type == OrderType.LIMIT:
@@ -325,3 +349,73 @@ class AlpacaAdapter(BrokerAdapter):
         resp = self._c().get_option_contracts(GetOptionContractsRequest(**params))
         # Response is a paginated object with .option_contracts
         return list(getattr(resp, "option_contracts", []) or [])
+
+    def get_stock_latest_price(self, symbol: str) -> Decimal | None:
+        """Latest known price for a stock symbol. Used by the trade panel's
+        strike picker so it can default to the strike nearest the underlying
+        (ATM) — picking the median of the chain is a poor approximation for
+        skewed chains.
+
+        Tries the latest QUOTE first (mid of bid/ask if both present, else
+        whichever side is set); falls back to the latest TRADE if no quote
+        is available (low-liquidity tickers between sessions, etc.).
+
+        Feed selection: defaults to IEX, the only free feed that paper +
+        free-tier API keys are entitled to. SIP returns 403 ``unauthorized``
+        for those accounts, which previously surfaced as a silent None —
+        the strike picker would then fall back to the chain median and
+        the user would see AAPL default to ~$297 instead of ~$312.
+
+        Returns None on any failure so the caller can fall back to its
+        median-based pick rather than 500-ing the whole strikes request.
+        """
+        # Local imports — these data-API clients aren't needed by the
+        # trading hot path, and lazy-importing keeps adapter construction
+        # cheap for endpoints that don't touch quotes.
+        from alpaca.data.enums import DataFeed  # noqa: PLC0415
+        from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
+        from alpaca.data.requests import (  # noqa: PLC0415
+            StockLatestQuoteRequest,
+            StockLatestTradeRequest,
+        )
+
+        client = StockHistoricalDataClient(
+            api_key=self.credentials["api_key"],
+            secret_key=self.credentials["api_secret"],
+        )
+        sym = symbol.upper()
+
+        try:
+            quotes = client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+            )
+            q = quotes.get(sym) if isinstance(quotes, dict) else None
+            bid = _dec_or_none(getattr(q, "bid_price", None)) if q else None
+            ask = _dec_or_none(getattr(q, "ask_price", None)) if q else None
+            if bid and ask and bid > 0 and ask > 0:
+                px = (bid + ask) / Decimal(2)
+                log.info("get_stock_latest_price(%s) → %s (quote mid)", sym, px)
+                return px
+            if ask and ask > 0:
+                log.info("get_stock_latest_price(%s) → %s (ask only)", sym, ask)
+                return ask
+            if bid and bid > 0:
+                log.info("get_stock_latest_price(%s) → %s (bid only)", sym, bid)
+                return bid
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_stock_latest_price(%s): quote lookup failed: %s", sym, exc)
+
+        try:
+            trades = client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+            )
+            t = trades.get(sym) if isinstance(trades, dict) else None
+            px = _dec_or_none(getattr(t, "price", None)) if t else None
+            if px and px > 0:
+                log.info("get_stock_latest_price(%s) → %s (last trade)", sym, px)
+                return px
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_stock_latest_price(%s): trade lookup failed: %s", sym, exc)
+
+        log.warning("get_stock_latest_price(%s): no usable price returned", sym)
+        return None
