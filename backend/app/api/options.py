@@ -1,15 +1,17 @@
 """Options chain lookups — populate the Trade Panel's expiry + strike pickers
-from Alpaca's option-contracts endpoint.
+from Alpaca's option-contracts endpoint, plus a per-contract quote so the
+panel can auto-fill the Limit price with the ask.
 """
 import uuid
 from datetime import date, timedelta
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
 from app.brokers import adapter_for
-from app.brokers.alpaca import AlpacaAdapter
+from app.brokers.alpaca import AlpacaAdapter, build_occ_symbol
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.user import User
@@ -103,4 +105,53 @@ def list_strikes(
         "right": want_type,
         "strikes": strikes,
         "underlying_price": underlying_price,
+    }
+
+
+@router.get("/quote")
+def get_option_quote(
+    account_id: uuid.UUID = Query(..., description="Local BrokerAccount id"),
+    symbol: str = Query(..., min_length=1, max_length=12),
+    expiry: date = Query(..., description="Specific expiry date (YYYY-MM-DD)"),
+    strike: Decimal = Query(..., gt=0, description="Strike price"),
+    right: str = Query("call", pattern="^(call|put)$"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Return the latest bid + ask for a specific option contract.
+
+    Used by the trade panel to surface live pricing under the strike picker
+    and to default the Limit price field to the current ask (the standard
+    "I want to buy at the offer" baseline). Either side may be null when
+    the broker returns no quote (illiquid contracts, after-hours, etc.);
+    in that case the panel just leaves the limit field empty for manual
+    entry."""
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    if not isinstance(adapter, AlpacaAdapter):
+        raise HTTPException(501, "option quote only implemented for alpaca")
+
+    occ = build_occ_symbol(symbol, expiry, strike, right)
+    bid, ask = adapter.get_option_latest_quote(occ)
+
+    # Mid is a convenience for "fair value" displays; only compute when
+    # both sides are present so we don't return a half-mid that the UI
+    # might mistake for a real quote.
+    mid: Decimal | None = None
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / Decimal(2)
+
+    return {
+        "symbol": symbol.upper(),
+        "occ": occ,
+        "expiry": str(expiry),
+        "strike": str(strike),
+        "right": right.lower(),
+        "bid": float(bid) if bid is not None else None,
+        "ask": float(ask) if ask is not None else None,
+        "mid": float(mid) if mid is not None else None,
     }

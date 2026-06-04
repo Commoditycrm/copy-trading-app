@@ -1,5 +1,6 @@
 import enum
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
@@ -22,6 +23,12 @@ class SubscriberSettingsOut(BaseModel):
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
     max_account_pct_per_day: Decimal | None = None
+    # Account-equity floor that triggers full liquidation + copy disable.
+    # When the pnl_poller sees broker equity <= this value, every open
+    # position is closed at market and copy_enabled flips to False until
+    # the subscriber manually re-enables it.
+    auto_liquidation_limit: Decimal | None = None
+    auto_liquidated_at: datetime | None = None
     # Retry policy for transient broker errors. "never" disables retry.
     # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
     # frontend can render dropdowns without a separate mapping. Validator
@@ -91,6 +98,15 @@ class MaxAccountPctIn(BaseModel):
     0 < pct <= 100."""
 
     max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class AutoLiquidationLimitIn(BaseModel):
+    """Subscriber-set hard floor on account equity. Pass null to disable.
+    When broker-reported equity falls to/below this value, pnl_poller
+    runs a full liquidation of the subscriber's open positions and flips
+    copy_enabled=False until they manually re-enable."""
+
+    auto_liquidation_limit: Decimal | None = Field(default=None, gt=0)
 
 
 class RetryIntervalIn(BaseModel):

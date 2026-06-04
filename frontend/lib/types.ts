@@ -145,6 +145,16 @@ export interface SubscriberSettings {
    *  today's filled trade NOTIONAL (USD) crosses
    *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */
   max_account_pct_per_day: string | null;
+  /** Auto-liquidation floor (USD). When broker-reported equity drops
+   *  to/below this value, pnl_poller closes every open position at
+   *  market and flips `copy_enabled` to false until the subscriber
+   *  manually re-enables it. NULL disables the feature. */
+  auto_liquidation_limit: string | null;
+  /** Timestamp of the most recent auto-liquidation trigger (UTC ISO).
+   *  Surfaced on the Settings page as "Auto-liquidated at …". Persists
+   *  even after the subscriber clears the limit — it's an audit marker,
+   *  not state. */
+  auto_liquidated_at: string | null;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side
