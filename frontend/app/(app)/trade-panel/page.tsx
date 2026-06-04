@@ -46,8 +46,9 @@ const ORDER_TYPE_OPTIONS = [
 
 // ── shared visual primitives ─────────────────────────────────────────────────
 
-/** Tinted glass-card surface used by the ticket + watchlist panels.
- *  Subtle vertical gradient + 1px border + soft backdrop blur. */
+/** Dark glass surface used by the Watchlist placeholder (keeps the
+ *  original quiet look — it's a sidekick to the ticket, not the
+ *  primary focus). Use `ticketStyle` for the actual trade form. */
 const cardStyle: React.CSSProperties = {
   background:
     "linear-gradient(180deg, rgba(20,26,32,0.55) 0%, rgba(10,14,18,0.35) 100%)",
@@ -57,10 +58,24 @@ const cardStyle: React.CSSProperties = {
   WebkitBackdropFilter: "blur(10px)",
 };
 
-/** Inset input style — slightly darker than the card surface so they
- *  read as wells the user types into. Smaller radius for a tighter look. */
+/** Trade-ticket surface — slightly brighter than `cardStyle` so the
+ *  primary trade form holds its own contrast against the page bg.
+ *  Aim is "clearly visible without screaming"; the previous 0.92/0.85
+ *  read as washed-out, this 0.78/0.7 sits between the original (too
+ *  dark) and the over-bright revision. */
+const ticketStyle: React.CSSProperties = {
+  background:
+    "linear-gradient(180deg, rgba(26,32,40,0.78) 0%, rgba(16,22,28,0.70) 100%)",
+  border: "1px solid var(--border-strong)",
+  borderRadius: "var(--r)",
+  backdropFilter: "blur(10px)",
+  WebkitBackdropFilter: "blur(10px)",
+};
+
+/** Inset input style — flat page-bg fill (#07090b) so every input and
+ *  dropdown trigger reads at the same pitch. */
 const inputStyle: React.CSSProperties = {
-  background: "rgba(7,10,14,0.7)",
+  background: "#07090b",
   border: "1px solid var(--border)",
   borderRadius: 8,
 };
@@ -70,7 +85,7 @@ const inputStyle: React.CSSProperties = {
 function TinyLabel({ children, hint }: { children: React.ReactNode; hint?: React.ReactNode }) {
   return (
     <div className="flex items-baseline justify-between mb-1">
-      <span className="text-[9px] uppercase tracking-[0.15em] font-semibold" style={{ color: "var(--muted)" }}>
+      <span className="text-[9px] uppercase tracking-[0.15em] font-semibold" style={{ color: "var(--text-2)" }}>
         {children}
       </span>
       {hint && <span className="text-[10px]" style={{ color: "var(--muted)" }}>{hint}</span>}
@@ -434,7 +449,7 @@ export default function TradePanelPage() {
         <form
           onSubmit={submit}
           className="overflow-hidden flex flex-col"
-          style={cardStyle}
+          style={ticketStyle}
         >
           {/* Header — two matching pill toggles. Both use the same
               rounded-full track + identical inner-button geometry so they
