@@ -96,7 +96,7 @@ export default function LoadTestPage() {
       <div>
         <h2 className="text-xl font-bold">Load Test</h2>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Seed fake subscribers with a simulated broker (no real trades, no real money).
+          Seed test subscribers with a simulated broker (no real trades, no real money).
           Used to test the fanout pipeline speed without needing real Alpaca accounts.
         </p>
       </div>
@@ -140,7 +140,7 @@ export default function LoadTestPage() {
         className="rounded-xl p-5 space-y-4"
         style={{ background: "rgba(14,20,17,0.5)", border: "1px solid var(--border)" }}
       >
-        <div className="font-semibold">Seed Fake Subscribers</div>
+        <div className="font-semibold">Seed Test Subscribers</div>
 
         <form onSubmit={handleSeed} className="space-y-4">
           {/* Trader email */}

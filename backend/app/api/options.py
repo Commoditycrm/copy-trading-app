@@ -2,6 +2,7 @@
 from Alpaca's option-contracts endpoint, plus a per-contract quote so the
 panel can auto-fill the Limit price with the ask.
 """
+import logging
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
@@ -16,6 +17,8 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.user import User
 from app.services.crypto import decrypt_json
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/options", tags=["options"])
 
@@ -130,13 +133,32 @@ def get_option_quote(
     if not acct or acct.user_id != user.id:
         raise HTTPException(404, "broker_account_not_found")
 
-    creds = decrypt_json(acct.encrypted_credentials)
-    adapter = adapter_for(acct, creds)
-    if not isinstance(adapter, AlpacaAdapter):
-        raise HTTPException(501, "option quote only implemented for alpaca")
+    occ: str | None = None
+    bid: Decimal | None = None
+    ask: Decimal | None = None
 
-    occ = build_occ_symbol(symbol, expiry, strike, right)
-    bid, ask = adapter.get_option_latest_quote(occ)
+    # The quote pipeline can fail in several ways that aren't really
+    # "server errors" from the trader's perspective: alpaca-py version
+    # mismatch missing the option data module, OPRA/feed entitlement
+    # gaps, decrypt edge cases on legacy credentials rows, etc. Treat
+    # any failure as "no quote available" and return a clean 200 with
+    # null bid/ask. The trade panel already handles null gracefully —
+    # the Bid/Mid/Ask pills hide and the Limit field stays blank for
+    # manual entry. We log the underlying error so it shows up in the
+    # server logs without surfacing to the user as a 500.
+    try:
+        creds = decrypt_json(acct.encrypted_credentials)
+        adapter = adapter_for(acct, creds)
+        if not isinstance(adapter, AlpacaAdapter):
+            # Non-Alpaca brokers don't have an option quote method wired
+            # in — return null instead of 501 so the frontend treats it
+            # as "no quote, type your own limit" instead of erroring.
+            log.info("options/quote: %s broker has no quote method", acct.broker.value)
+        else:
+            occ = build_occ_symbol(symbol, expiry, strike, right)
+            bid, ask = adapter.get_option_latest_quote(occ)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("options/quote: lookup failed for %s/%s: %s", symbol, occ, exc)
 
     # Mid is a convenience for "fair value" displays; only compute when
     # both sides are present so we don't return a half-mid that the UI
