@@ -123,6 +123,12 @@ export interface SubscriberSettings {
   /** Daily realized-profit auto-pause. When today's realized P&L reaches
    *  this amount, copy_enabled flips to false. Auto-resumes next UTC day. */
   daily_profit_limit: string | null;
+  /** Percentage variants of the daily loss / profit limits. Each is
+   *  0 < x <= 100 and applied against `beginning_day_balance` to derive
+   *  the dollar threshold every pnl_poller tick. UI uses these — the
+   *  USD columns above are legacy. */
+  daily_loss_limit_pct: string | null;
+  daily_profit_limit_pct: string | null;
   todays_realized_pnl: string | null;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */

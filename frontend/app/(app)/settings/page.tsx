@@ -127,8 +127,10 @@ export default function SettingsPage() {
         const s = await api<SubscriberSettings>("/api/settings/subscriber");
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
-        setLimitInput(s.daily_loss_limit ?? "");
-        setProfitInput(s.daily_profit_limit ?? "");
+        // The UI now uses the % variants; fall back to legacy USD only
+        // if the user hasn't set a pct yet (smooth transition).
+        setLimitInput(s.daily_loss_limit_pct ?? "");
+        setProfitInput(s.daily_profit_limit_pct ?? "");
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxPctInput(s.max_account_pct_per_day ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
@@ -148,7 +150,11 @@ export default function SettingsPage() {
       // when the actual cause was the profit or pct cap.
       const reason = e.reason as string | undefined;
       let msg: string;
-      if (reason === "daily_profit_limit") {
+      if (reason === "daily_loss_limit_pct") {
+        msg = `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your ${e.daily_loss_limit_pct}% daily loss limit (≈ $${e.loss_pct_dollars} of your day-start balance).`;
+      } else if (reason === "daily_profit_limit_pct") {
+        msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your ${e.daily_profit_limit_pct}% daily profit limit (≈ $${e.profit_pct_dollars} of your day-start balance).`;
+      } else if (reason === "daily_profit_limit") {
         msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your daily profit limit ($${e.daily_profit_limit}).`;
       } else if (reason === "max_account_pct_per_day") {
         msg = `Copy trading auto-paused — today's trading ($${e.todays_trading_value}) hit ${e.max_account_pct_per_day}% of your day-start balance.`;
@@ -202,6 +208,8 @@ export default function SettingsPage() {
         todays_realized_pnl:      e.todays_realized_pnl      ?? prev.todays_realized_pnl,
         daily_loss_limit:         e.daily_loss_limit         ?? null,
         daily_profit_limit:       e.daily_profit_limit       ?? null,
+        daily_loss_limit_pct:     e.daily_loss_limit_pct     ?? null,
+        daily_profit_limit_pct:   e.daily_profit_limit_pct   ?? null,
         max_per_contract:         e.max_per_contract         ?? null,
         max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
         auto_liquidation_limit:   e.auto_liquidation_limit   ?? null,
@@ -239,13 +247,13 @@ export default function SettingsPage() {
     setLimitBusy(true);
     try {
       const trimmed = limitInput.trim();
-      const body = { daily_loss_limit: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit", {
+      const body = { daily_loss_limit_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit-pct", {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setLimitInput(s.daily_loss_limit ?? "");
-      notify.success(s.daily_loss_limit ? `Daily loss limit set to $${s.daily_loss_limit}` : "Daily loss limit cleared");
+      setLimitInput(s.daily_loss_limit_pct ?? "");
+      notify.success(s.daily_loss_limit_pct ? `Daily loss limit set to ${s.daily_loss_limit_pct}%` : "Daily loss limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily loss limit");
     } finally {
@@ -256,13 +264,13 @@ export default function SettingsPage() {
     setProfitBusy(true);
     try {
       const trimmed = profitInput.trim();
-      const body = { daily_profit_limit: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit", {
+      const body = { daily_profit_limit_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit-pct", {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setProfitInput(s.daily_profit_limit ?? "");
-      notify.success(s.daily_profit_limit ? `Daily profit limit set to $${s.daily_profit_limit}` : "Daily profit limit cleared");
+      setProfitInput(s.daily_profit_limit_pct ?? "");
+      notify.success(s.daily_profit_limit_pct ? `Daily profit limit set to ${s.daily_profit_limit_pct}%` : "Daily profit limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily profit limit");
     } finally {
@@ -386,15 +394,29 @@ export default function SettingsPage() {
   };
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
-  const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
-  // Only count the LOSS portion against the loss-limit headroom. If
-  // today's P&L is positive (profit), no loss has been absorbed, so
-  // headroom = full limit. Without the max(0, -pnl) clamp we'd report
-  // "$700 headroom on a $500 limit" when the trader is up $200 — which
-  // is the opposite of what the kill switch protects against.
+  // Daily loss limit is now a PERCENTAGE of the broker's beginning-day
+  // balance. Derive the dollar threshold from baseNum * pct / 100, then
+  // headroom is "dollars of loss capacity left" (max(0, threshold − loss)).
+  const lossPctNum = sub?.daily_loss_limit_pct ? Number(sub.daily_loss_limit_pct) : null;
+  // Only count the LOSS portion against the loss-limit headroom — see
+  // pre-existing comment on max(0,-pnl) clamp.
+  // We need baseNum below — let it hoist via the maxPct block which
+  // defines it; for the loss/profit blocks we re-derive here.
+  const _baseEarly = beginningDayBalance ? Number(beginningDayBalance) : null;
+  const lossPctDollars = (lossPctNum !== null && _baseEarly !== null && _baseEarly > 0)
+    ? (_baseEarly * lossPctNum / 100)
+    : null;
+  // Keep `limit` name so JSX below doesn't have to change everywhere —
+  // it now holds the derived dollar threshold instead of the raw USD value.
+  const limit = lossPctDollars;
   const headroom = limit !== null ? Math.max(0, limit - Math.max(0, -todaysPnL)) : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
-  const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
+  // Profit-limit mirror.
+  const profitPctNum = sub?.daily_profit_limit_pct ? Number(sub.daily_profit_limit_pct) : null;
+  const profitPctDollars = (profitPctNum !== null && _baseEarly !== null && _baseEarly > 0)
+    ? (_baseEarly * profitPctNum / 100)
+    : null;
+  const profitLimit = profitPctDollars;
   const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
   // Max-% derived values — pulled up here so the table row can read
   // them. balance × pct/100 = the dollar threshold; today's trading
@@ -479,13 +501,13 @@ export default function SettingsPage() {
             <div
               className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
               style={{
-                gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr",
+                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
                 color: "var(--muted)",
               }}
             >
               <div>Limit</div>
-              <div>Today</div>
               <div>Threshold</div>
+              <div>Today</div>
               <div>Headroom</div>
               <div className="text-right">Used</div>
             </div>
@@ -494,16 +516,15 @@ export default function SettingsPage() {
                 accent="#ef4444"
                 icon={<IconTrendDown />}
                 title="Daily loss limit"
-                subtitle="Pause copy when today's loss reaches this."
-                todayLabel="Today P&L"
-                todayValue={fmt(String(todaysPnL))}
-                todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="USD"
+                subtitle="Pause copy when today's loss reaches this % of your day-start balance."
+                todayLabel="Day-Start"
+                todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
+                inputPrefix="%"
                 input={limitInput}
                 onInput={setLimitInput}
                 busy={limitBusy}
                 onSave={saveLimit}
-                current={sub.daily_loss_limit}
+                current={sub.daily_loss_limit_pct}
                 hasLimit={limit !== null}
                 headroomDisplay={limit === null ? "—" : fmt(String(headroom))}
                 headroomColor={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
@@ -513,16 +534,15 @@ export default function SettingsPage() {
                 accent="#22c55e"
                 icon={<IconTrendUp />}
                 title="Daily profit limit"
-                subtitle="Pause copy when today's profit reaches this."
-                todayLabel="Today P&L"
-                todayValue={fmt(String(todaysPnL))}
-                todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="USD"
+                subtitle="Pause copy when today's profit reaches this % of your day-start balance."
+                todayLabel="Day-Start"
+                todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
+                inputPrefix="%"
                 input={profitInput}
                 onInput={setProfitInput}
                 busy={profitBusy}
                 onSave={saveProfit}
-                current={sub.daily_profit_limit}
+                current={sub.daily_profit_limit_pct}
                 hasLimit={profitLimit !== null}
                 headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
                 headroomColor={(profitHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
@@ -580,13 +600,13 @@ export default function SettingsPage() {
             <div
               className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
               style={{
-                gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr",
+                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
                 color: "var(--muted)",
               }}
             >
               <div>Target</div>
-              <div>Today</div>
               <div>Set</div>
+              <div>Today</div>
               <div>Headroom</div>
               <div className="text-right">Progress</div>
             </div>
@@ -967,7 +987,7 @@ function LimitRow({
       >
         <div
           className="md:grid md:items-center md:gap-3"
-          style={{ gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr" }}
+          style={{ gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr" }}
         >
           {/* Limit name + subtitle */}
           <div className="min-w-0 flex items-start gap-2.5">
@@ -989,20 +1009,8 @@ function LimitRow({
             </div>
           </div>
 
-          {/* Today */}
-          <div className="mt-3 md:mt-0">
-            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
-              {todayLabel}
-            </div>
-            <div
-              className="text-sm font-semibold tabular-nums"
-              style={{ color: todayColor ?? "var(--text)" }}
-            >
-              {todayValue}
-            </div>
-          </div>
-
-          {/* Threshold input + Save inline */}
+          {/* Threshold input + Save inline — moved BEFORE "Today" so the
+              column the user actively edits sits next to the row title. */}
           <div className="mt-3 md:mt-0">
             <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
               Threshold
@@ -1052,6 +1060,20 @@ function LimitRow({
                 {thresholdHint}
               </div>
             )}
+          </div>
+
+          {/* Today — now sits AFTER the threshold input, matching the new
+              column legend (Limit · Threshold · Today · Headroom · Used). */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              {todayLabel}
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{ color: todayColor ?? "var(--text)" }}
+            >
+              {todayValue}
+            </div>
           </div>
 
           {/* Headroom */}

@@ -278,12 +278,33 @@ def _enforce_one(acct: BrokerAccount) -> None:
         ):
             pct_limit_dollars = beginning_day_balance * s.max_account_pct_per_day / Decimal(100)
 
+        # Legacy USD-based daily kill switches. Stay enforced for accounts
+        # still configured with absolute amounts (predate the % rollout).
         hit_loss = (
             s.daily_loss_limit is not None and todays_pl <= -s.daily_loss_limit
         )
         hit_profit = (
             s.daily_profit_limit is not None and todays_pl >= s.daily_profit_limit
         )
+
+        # New PERCENTAGE-of-day-start daily limits. Derive the dollar
+        # threshold each tick from beginning_day_balance, then trip on
+        # the same realized-P&L breach as the USD variants. Skipped when
+        # beginning_day_balance is unavailable (some SnapTrade brokers).
+        loss_pct_dollars: Decimal | None = None
+        profit_pct_dollars: Decimal | None = None
+        if beginning_day_balance is not None and beginning_day_balance > 0:
+            if s.daily_loss_limit_pct is not None:
+                loss_pct_dollars = beginning_day_balance * s.daily_loss_limit_pct / Decimal(100)
+            if s.daily_profit_limit_pct is not None:
+                profit_pct_dollars = beginning_day_balance * s.daily_profit_limit_pct / Decimal(100)
+        hit_loss_pct = (
+            loss_pct_dollars is not None and todays_pl <= -loss_pct_dollars
+        )
+        hit_profit_pct = (
+            profit_pct_dollars is not None and todays_pl >= profit_pct_dollars
+        )
+
         hit_pct = (
             pct_limit_dollars is not None and todays_trading_value >= pct_limit_dollars
         )
@@ -372,11 +393,15 @@ def _enforce_one(acct: BrokerAccount) -> None:
             except Exception:  # noqa: BLE001
                 log.exception("pnl_poller: notification failed for user=%s", s.user_id)
 
-        if s.copy_enabled and (hit_loss or hit_profit or hit_pct):
+        if s.copy_enabled and (hit_loss or hit_profit or hit_pct or hit_loss_pct or hit_profit_pct):
             if hit_loss:
                 reason = "daily_loss_limit"
             elif hit_profit:
                 reason = "daily_profit_limit"
+            elif hit_loss_pct:
+                reason = "daily_loss_limit_pct"
+            elif hit_profit_pct:
+                reason = "daily_profit_limit_pct"
             else:
                 reason = "max_account_pct_per_day"
             s.copy_enabled = False
@@ -394,6 +419,10 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
                     "daily_loss_limit":        str(s.daily_loss_limit) if s.daily_loss_limit else None,
                     "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
+                    "daily_loss_limit_pct":    str(s.daily_loss_limit_pct) if s.daily_loss_limit_pct else None,
+                    "daily_profit_limit_pct":  str(s.daily_profit_limit_pct) if s.daily_profit_limit_pct else None,
+                    "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
+                    "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
                     "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
                     "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
                 },
@@ -407,6 +436,10 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 "reason": reason,
                 "daily_loss_limit":        str(s.daily_loss_limit) if s.daily_loss_limit else None,
                 "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
+                "daily_loss_limit_pct":    str(s.daily_loss_limit_pct) if s.daily_loss_limit_pct else None,
+                "daily_profit_limit_pct":  str(s.daily_profit_limit_pct) if s.daily_profit_limit_pct else None,
+                "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
+                "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
                 "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
                 "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
                 "todays_realized_pnl":     str(todays_pl),
@@ -427,6 +460,10 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
             "daily_loss_limit":        str(s.daily_loss_limit) if s.daily_loss_limit else None,
             "daily_profit_limit":      str(s.daily_profit_limit) if s.daily_profit_limit else None,
+            "daily_loss_limit_pct":    str(s.daily_loss_limit_pct) if s.daily_loss_limit_pct else None,
+            "daily_profit_limit_pct":  str(s.daily_profit_limit_pct) if s.daily_profit_limit_pct else None,
+            "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
+            "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
             "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
             "max_per_contract":        str(s.max_per_contract) if s.max_per_contract else None,
             "auto_liquidation_limit":  str(s.auto_liquidation_limit) if s.auto_liquidation_limit else None,

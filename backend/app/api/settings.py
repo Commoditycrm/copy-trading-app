@@ -9,7 +9,9 @@ from app.models.user import User, UserRole
 from app.schemas.settings import (
     AutoLiquidationLimitIn,
     DailyLossLimitIn,
+    DailyLossLimitPctIn,
     DailyProfitLimitIn,
+    DailyProfitLimitPctIn,
     FollowTraderIn,
     MaxAccountPctIn,
     MaxPerContractIn,
@@ -50,6 +52,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         max_account_pct_per_day=s.max_account_pct_per_day,
         auto_liquidation_limit=s.auto_liquidation_limit,
         auto_liquidated_at=s.auto_liquidated_at,
+        daily_loss_limit_pct=s.daily_loss_limit_pct,
+        daily_profit_limit_pct=s.daily_profit_limit_pct,
     )
 
 
@@ -117,6 +121,72 @@ def set_daily_loss_limit(
         metadata={
             "old": str(old) if old is not None else None,
             "new": str(payload.daily_loss_limit) if payload.daily_loss_limit is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/daily-loss-limit-pct", response_model=SubscriberSettingsOut)
+def set_daily_loss_limit_pct(
+    payload: DailyLossLimitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Daily realized-loss kill switch as a percent of beginning-day
+    balance. 0 < pct <= 100. Pass null to disable."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_loss_limit_pct
+    s.daily_loss_limit_pct = payload.daily_loss_limit_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_loss_limit_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_loss_limit_pct) if payload.daily_loss_limit_pct is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/daily-profit-limit-pct", response_model=SubscriberSettingsOut)
+def set_daily_profit_limit_pct(
+    payload: DailyProfitLimitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Symmetric to set_daily_loss_limit_pct — profit cap as % of
+    beginning-day balance."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_profit_limit_pct
+    s.daily_profit_limit_pct = payload.daily_profit_limit_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_profit_limit_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_profit_limit_pct) if payload.daily_profit_limit_pct is not None else None,
         },
         ip_address=client_ip(request),
     )
