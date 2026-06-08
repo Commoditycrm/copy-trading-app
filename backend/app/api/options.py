@@ -149,14 +149,19 @@ def get_option_quote(
     try:
         creds = decrypt_json(acct.encrypted_credentials)
         adapter = adapter_for(acct, creds)
-        if not isinstance(adapter, AlpacaAdapter):
-            # Non-Alpaca brokers don't have an option quote method wired
-            # in — return null instead of 501 so the frontend treats it
-            # as "no quote, type your own limit" instead of erroring.
-            log.info("options/quote: %s broker has no quote method", acct.broker.value)
-        else:
-            occ = build_occ_symbol(symbol, expiry, strike, right)
+        occ = build_occ_symbol(symbol, expiry, strike, right)
+        # Duck-typed dispatch: any adapter that exposes
+        # ``get_option_latest_quote(occ)`` participates. Alpaca uses its
+        # OPRA feed; SnapTrade uses the per-account option quotes
+        # endpoint (root padded to 6 chars with spaces). Brokers that
+        # don't implement the method return null silently and the
+        # frontend falls back to manual limit entry.
+        if hasattr(adapter, "get_option_latest_quote"):
             bid, ask = adapter.get_option_latest_quote(occ)
+        else:
+            log.info(
+                "options/quote: %s broker has no quote method", acct.broker.value
+            )
     except Exception as exc:  # noqa: BLE001
         log.exception("options/quote: lookup failed for %s/%s: %s", symbol, occ, exc)
 
