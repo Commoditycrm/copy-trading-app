@@ -118,6 +118,7 @@ def get_option_quote(
     expiry: date = Query(..., description="Specific expiry date (YYYY-MM-DD)"),
     strike: Decimal = Query(..., gt=0, description="Strike price"),
     right: str = Query("call", pattern="^(call|put)$"),
+    debug: int = Query(0, description="When 1, include a _debug field with broker + error trace. For troubleshooting only — do NOT rely on this field in the UI."),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -136,34 +137,40 @@ def get_option_quote(
     occ: str | None = None
     bid: Decimal | None = None
     ask: Decimal | None = None
+    debug_info: dict = {
+        "broker": acct.broker.value,
+        "connection_status": acct.connection_status,
+        "adapter_class": None,
+        "has_quote_method": False,
+        "quote_call_returned": None,
+        "error_type": None,
+        "error_message": None,
+        "error_traceback": None,
+    }
 
-    # The quote pipeline can fail in several ways that aren't really
-    # "server errors" from the trader's perspective: alpaca-py version
-    # mismatch missing the option data module, OPRA/feed entitlement
-    # gaps, decrypt edge cases on legacy credentials rows, etc. Treat
-    # any failure as "no quote available" and return a clean 200 with
-    # null bid/ask. The trade panel already handles null gracefully —
-    # the Bid/Mid/Ask pills hide and the Limit field stays blank for
-    # manual entry. We log the underlying error so it shows up in the
-    # server logs without surfacing to the user as a 500.
     try:
         creds = decrypt_json(acct.encrypted_credentials)
         adapter = adapter_for(acct, creds)
+        debug_info["adapter_class"] = adapter.__class__.__name__
         occ = build_occ_symbol(symbol, expiry, strike, right)
-        # Duck-typed dispatch: any adapter that exposes
-        # ``get_option_latest_quote(occ)`` participates. Alpaca uses its
-        # OPRA feed; SnapTrade uses the per-account option quotes
-        # endpoint (root padded to 6 chars with spaces). Brokers that
-        # don't implement the method return null silently and the
-        # frontend falls back to manual limit entry.
-        if hasattr(adapter, "get_option_latest_quote"):
+        has_method = hasattr(adapter, "get_option_latest_quote")
+        debug_info["has_quote_method"] = has_method
+        if has_method:
             bid, ask = adapter.get_option_latest_quote(occ)
+            debug_info["quote_call_returned"] = {
+                "bid": str(bid) if bid is not None else None,
+                "ask": str(ask) if ask is not None else None,
+            }
         else:
             log.info(
                 "options/quote: %s broker has no quote method", acct.broker.value
             )
     except Exception as exc:  # noqa: BLE001
+        import traceback  # noqa: PLC0415
         log.exception("options/quote: lookup failed for %s/%s: %s", symbol, occ, exc)
+        debug_info["error_type"] = exc.__class__.__name__
+        debug_info["error_message"] = str(exc)[:500]
+        debug_info["error_traceback"] = traceback.format_exc()[-1500:]
 
     # Mid is a convenience for "fair value" displays; only compute when
     # both sides are present so we don't return a half-mid that the UI
@@ -172,7 +179,7 @@ def get_option_quote(
     if bid is not None and ask is not None:
         mid = (bid + ask) / Decimal(2)
 
-    return {
+    out: dict = {
         "symbol": symbol.upper(),
         "occ": occ,
         "expiry": str(expiry),
@@ -182,3 +189,10 @@ def get_option_quote(
         "ask": float(ask) if ask is not None else None,
         "mid": float(mid) if mid is not None else None,
     }
+    # Inspector-mode field. Only attached when the caller passes
+    # ?debug=1 — keeps regular UI responses clean. Useful for
+    # diagnosing why null bid/ask is coming back without needing
+    # access to the server log stream.
+    if debug:
+        out["_debug"] = debug_info
+    return out
