@@ -4,7 +4,7 @@ import type { Metadata } from "next";
 import { ToastContainer } from "react-toastify";
 
 export const metadata: Metadata = {
-  title: "The Option Haven",
+  title: "ARK",
   description: "Stock & options copy trading",
   icons: {
     icon: "/brand-icon.avif",

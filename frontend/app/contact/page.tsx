@@ -113,25 +113,10 @@ export default function ContactPage() {
           className="flex items-center gap-2.5 no-underline"
           style={{ color: "var(--text)" }}
         >
-          {/* Same `/brand-icon.avif` the AppShell sidebar uses, so the
-              public contact page reads as part of the same product. The
-              subtle glow + rounded mask keeps it visually consistent
-              with the rest of the page chrome. */}
-          <img
-            src="/brand-icon.avif"
-            alt="The Option Haven"
-            width={35}
-            height={35}
-            style={{
-              width: 35,
-              height: 35,
-              borderRadius: 9,
-              objectFit: "cover",
-              boxShadow: "0 0 24px -4px var(--accent-glow)",
-            }}
-          />
-          <span className="text-sm font-semibold tracking-tight">
-            The Option Haven
+          {/* Logo image intentionally hidden — wordmark-only branding
+              matches the new sidebar treatment. */}
+          <span className="text-base font-semibold tracking-tight">
+            ARK
           </span>
         </a>
         <a
@@ -350,7 +335,7 @@ export default function ContactPage() {
             }}
           >
             <div>
-              © {new Date().getFullYear()} The Option Haven. All rights reserved.
+              © {new Date().getFullYear()} ARK. All rights reserved.
             </div>
             <div className="flex items-center gap-4">
               <a
