@@ -20,6 +20,10 @@ export default function PositionsPage() {
   // "my-only" set before the trader-targeted ones appear.
   if (!user) return <PageLoading />;
 
+  // Hold the page until `user` lands — otherwise the trader-only Exit
+  // buttons briefly appear or disappear once role resolves.
+  if (!user) return <PageLoading />;
+
   return (
     <div className="space-y-4">
       <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
