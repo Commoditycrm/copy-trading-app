@@ -41,13 +41,13 @@ export default function LoginPage() {
         <div className="flex items-center gap-3">
           <img
             src="/brand-icon.avif"
-            alt="The Option Haven"
+            alt="ARK"
             width={45}
             height={45}
             style={{ width: 45, height: 45, borderRadius: 8, objectFit: "cover" }}
           />
           <div>
-            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>The Option Haven</div>
+            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>ARK</div>
             <div className="text-xs" style={{ color: "var(--muted)" }}>Sign in to your account</div>
           </div>
         </div>
