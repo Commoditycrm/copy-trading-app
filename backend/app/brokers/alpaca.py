@@ -375,6 +375,7 @@ class AlpacaAdapter(BrokerAdapter):
         from alpaca.data.enums import DataFeed  # noqa: PLC0415
         from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
         from alpaca.data.requests import (  # noqa: PLC0415
+            StockLatestBarRequest,
             StockLatestQuoteRequest,
             StockLatestTradeRequest,
         )
@@ -416,6 +417,25 @@ class AlpacaAdapter(BrokerAdapter):
                 return px
         except Exception as exc:  # noqa: BLE001
             log.warning("get_stock_latest_price(%s): trade lookup failed: %s", sym, exc)
+
+        # Bar fallback — bars publish for *every* symbol Alpaca knows
+        # about, regardless of which exchange the stock trades on. AMZN,
+        # GOOG, MSFT, etc. (NASDAQ-listed, light IEX volume) often have
+        # NO IEX quote or trade outside RTH, which previously made the
+        # picker fall back to the chain median and pick a wildly OTM
+        # strike. The latest bar's close price is a reliable "last
+        # known mid" and works for any ticker.
+        try:
+            bars = client.get_stock_latest_bar(
+                StockLatestBarRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+            )
+            b = bars.get(sym) if isinstance(bars, dict) else None
+            close = _dec_or_none(getattr(b, "close", None)) if b else None
+            if close and close > 0:
+                log.info("get_stock_latest_price(%s) → %s (bar close)", sym, close)
+                return close
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_stock_latest_price(%s): bar lookup failed: %s", sym, exc)
 
         log.warning("get_stock_latest_price(%s): no usable price returned", sym)
         return None

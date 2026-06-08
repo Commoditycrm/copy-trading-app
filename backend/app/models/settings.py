@@ -66,6 +66,19 @@ class SubscriberSettings(Base, TimestampMixin):
     # +daily_profit_limit, copy_enabled flips to false (same path as loss).
     daily_profit_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
 
+    # Percentage variants of the loss / profit kill switches — the UI
+    # uses these now and the absolute USD columns above are legacy. Each
+    # is a percent of the broker's beginning-day balance. pnl_poller
+    # computes the dollar threshold each tick as
+    # ``beginning_day_balance * pct / 100`` and trips the kill switch on
+    # the same realized-P&L breach. Bounds: 0 < pct <= 100. NULL = off.
+    daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+    daily_profit_limit_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
     # When the pnl_poller observes broker-reported equity <= this value,
     # everything on the subscriber's broker is closed at market AND

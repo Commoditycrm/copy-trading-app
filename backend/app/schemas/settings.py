@@ -16,6 +16,12 @@ class SubscriberSettingsOut(BaseModel):
     # means "auto-pause copy after $500 realized profit today". NULL = no
     # profit cap.
     daily_profit_limit: Decimal | None = None
+    # Percentage variants — the new UI uses these. Each is a percent
+    # (0 < x <= 100) of the broker's beginning-day balance. pnl_poller
+    # derives the dollar threshold each tick and trips the same kill
+    # switch when today's realized P&L breaches it.
+    daily_loss_limit_pct: Decimal | None = None
+    daily_profit_limit_pct: Decimal | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
     # UI-only — persisted but never enforced server-side.
     max_per_contract: Decimal | None = None
@@ -98,6 +104,21 @@ class MaxAccountPctIn(BaseModel):
     0 < pct <= 100."""
 
     max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class DailyLossLimitPctIn(BaseModel):
+    """Subscriber-set daily realized-loss kill switch — percentage
+    variant. 0 < pct <= 100. pnl_poller derives the dollar threshold
+    each tick from beginning_day_balance. Pass null to disable."""
+
+    daily_loss_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class DailyProfitLimitPctIn(BaseModel):
+    """Symmetric to DailyLossLimitPctIn — daily realized-profit cap as
+    a percentage of beginning-day balance. Pass null to disable."""
+
+    daily_profit_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
 
 
 class AutoLiquidationLimitIn(BaseModel):
