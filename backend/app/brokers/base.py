@@ -38,6 +38,12 @@ class BrokerOrderRequest:
     # Open vs. close intent. Stock adapters (Alpaca) ignore it; SnapTrade's
     # options API needs it to pick BUY_TO_OPEN/SELL_TO_CLOSE etc.
     is_closing: bool = False
+    # Bracket-order exit legs attached to the parent entry. When either is
+    # set on a market/limit entry, adapters that support bracket orders
+    # (Alpaca) route through OrderClass.BRACKET; adapters that don't
+    # support brackets fall through to a plain order and log a warning.
+    take_profit_price: Decimal | None = None
+    stop_loss_price: Decimal | None = None
 
 
 @dataclass(frozen=True)

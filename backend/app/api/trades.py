@@ -148,6 +148,81 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
+async def _run_rejection_notify_in_background(
+    trader_order_id: uuid.UUID, trader_id: uuid.UUID
+) -> None:
+    """Notify subscribers when the TRADER's entry order was rejected at
+    the broker — so they see "the trader tried X and it was rejected"
+    instead of silence.
+
+    Runs after the 502 response is sent. Per-subscriber failure is
+    isolated (one bad row doesn't kill the loop) and the whole thing
+    is best-effort: if Redis / DB hiccup mid-fanout we log and move on
+    rather than retrying — a missed notification is preferable to a
+    duplicated one.
+    """
+    from app.services import notifications as notif_svc  # noqa: PLC0415
+
+    with SessionLocal() as db:
+        order = db.get(Order, trader_order_id)
+        trader = db.get(User, trader_id)
+        if order is None or trader is None:
+            return
+
+        # Pull the subscriber list the same way the regular fanout does —
+        # so a subscriber who has copy paused doesn't get spammed about
+        # rejections they wouldn't have received anyway. The cache helper
+        # filters out paused/disabled rows for us.
+        try:
+            subs = await copy_engine.cache.get_subscribers_for_trader(db, trader.id)
+        except Exception:  # noqa: BLE001
+            log = __import__("logging").getLogger(__name__)
+            log.exception("rejection-notify: subscriber lookup failed")
+            return
+
+        if not subs:
+            return
+
+        trader_label = trader.display_name or trader.email or "Trader"
+        symbol = order.symbol or "—"
+        side = order.side.value.upper() if order.side else "?"
+        qty = str(order.quantity) if order.quantity is not None else "?"
+        reason = (order.reject_reason or "broker rejected").strip()
+        # Keep the message concise — the notifications bell has limited
+        # real estate. Detail goes in metadata for the deep-dive view.
+        message = (
+            f"{trader_label} tried to {side} {qty} {symbol} — rejected by broker"
+        )
+        metadata = {
+            "trader_id": str(trader.id),
+            "trader_order_id": str(order.id),
+            "symbol": symbol,
+            "side": order.side.value if order.side else None,
+            "order_type": order.order_type.value if order.order_type else None,
+            "quantity": qty,
+            "limit_price": str(order.limit_price) if order.limit_price else None,
+            "stop_price": str(order.stop_price) if order.stop_price else None,
+            "reason": reason[:300],
+        }
+
+        for sub in subs:
+            try:
+                notif_svc.create_notification(
+                    db,
+                    user_id=sub.user_id,
+                    type="trader.order_rejected",
+                    message=message,
+                    metadata=metadata,
+                )
+            except Exception:  # noqa: BLE001
+                log = __import__("logging").getLogger(__name__)
+                log.exception(
+                    "rejection-notify: failed for subscriber=%s order=%s",
+                    sub.user_id, order.id,
+                )
+        db.commit()
+
+
 async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.UUID) -> None:
     """Runs after the response is sent. Async so we can fan out 200 broker
     calls concurrently on the same event loop. Opens its own DB session
@@ -228,6 +303,8 @@ def _place_trader_order(
         quantity=payload.quantity,
         limit_price=payload.limit_price,
         stop_price=payload.stop_price,
+        take_profit_price=payload.take_profit_price,
+        stop_loss_price=payload.stop_loss_price,
         status=OrderStatus.PENDING,
         fanned_out_to_subscribers=will_fanout,
         trader_submitted_at=trader_submitted_at,
@@ -236,6 +313,14 @@ def _place_trader_order(
     db.flush()
 
     adapter = adapter_for(acct, creds)
+    # Forward bracket prices to the adapter ONLY when the adapter can
+    # place a native bracket (Alpaca's OrderClass.BRACKET). For other
+    # brokers we keep TP/SL on the Order row but place the entry plain —
+    # the bracket_emulator service then places the exit legs when the
+    # listener detects the entry has filled. See
+    # app/services/bracket_emulator.py.
+    from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+    use_native_bracket = isinstance(adapter, AlpacaAdapter)
     try:
         result = adapter.place_order(
             BrokerOrderRequest(
@@ -246,6 +331,8 @@ def _place_trader_order(
                 quantity=order.quantity,
                 limit_price=order.limit_price,
                 stop_price=order.stop_price,
+                take_profit_price=order.take_profit_price if use_native_bracket else None,
+                stop_loss_price=order.stop_loss_price if use_native_bracket else None,
                 option_expiry=order.option_expiry,
                 option_strike=order.option_strike,
                 option_right=order.option_right,
@@ -262,6 +349,12 @@ def _place_trader_order(
             metadata={"error": str(exc)[:480]}, ip_address=client_ip(request),
         )
         db.commit()
+        # Tell subscribers the trader tried to enter and got rejected — so
+        # the rejection isn't silent on their side. Only when this order
+        # would have fanned out (i.e. trader-originated AND copy not paused
+        # AND `skip_fanout=False`). Runs AFTER the response is sent.
+        if will_fanout:
+            background.add_task(_run_rejection_notify_in_background, order.id, trader.id)
         raise HTTPException(502, f"broker_error: {exc}")
 
     order.broker_order_id = result.broker_order_id

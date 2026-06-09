@@ -66,6 +66,34 @@ class SubscriberSettings(Base, TimestampMixin):
     # +daily_profit_limit, copy_enabled flips to false (same path as loss).
     daily_profit_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
 
+    # Percentage variants of the loss / profit kill switches — the UI
+    # uses these now and the absolute USD columns above are legacy. Each
+    # is a percent of the broker's beginning-day balance. pnl_poller
+    # computes the dollar threshold each tick as
+    # ``beginning_day_balance * pct / 100`` and trips the kill switch on
+    # the same realized-P&L breach. Bounds: 0 < pct <= 100. NULL = off.
+    daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+    daily_profit_limit_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+
+    # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
+    # When the pnl_poller observes broker-reported equity <= this value,
+    # everything on the subscriber's broker is closed at market AND
+    # ``copy_enabled`` flips to False. Unlike the daily limits, copy does
+    # NOT auto-resume next day — the subscriber has to manually re-enable
+    # (that's the contract: "stop until I turn it back on"). NULL = off.
+    # Stamped with ``auto_liquidated_at`` when the trigger fires so the
+    # Settings page can show "Auto-liquidated at HH:MM".
+    auto_liquidation_limit: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+    auto_liquidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     # Set to the UTC timestamp at which a P&L-limit (loss OR profit) flipped
     # copy_enabled to False. NULL means "not paused by a limit" — either the
     # user manually disabled (we leave them alone), or copy is currently

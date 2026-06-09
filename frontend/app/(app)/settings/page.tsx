@@ -92,6 +92,11 @@ export default function SettingsPage() {
   // first tick lands — typically within 60s of page load.
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
+  // Auto-liquidation floor — when broker-reported equity drops to or
+  // below this dollar value, pnl_poller flattens the account at market
+  // and disables copy until the subscriber manually re-enables.
+  const [autoLiqInput, setAutoLiqInput] = useState("");
+  const [autoLiqBusy, setAutoLiqBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
   // equity at yesterday's close). Hydrated from sessionStorage so
   // navigating away and back keeps the last value visible while the
@@ -99,6 +104,16 @@ export default function SettingsPage() {
   const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(
     () => readTickCache().beginning_day_balance,
   );
+  // Live broker equity, refreshed by every pnl.tick. Used by the
+  // Auto-liquidation (take-profit) row to show how close the unrealized
+  // P&L is to the target. Null until the first tick lands.
+  const [equity, setEquity] = useState<string | null>(null);
+  // Today's UNREALIZED P&L (mark-to-market on still-open positions),
+  // computed server-side as todays_total_pl − today_realized_pnl. The
+  // take-profit auto-liquidation trigger compares this against
+  // `auto_liquidation_limit`. Null when beginning_day_balance isn't
+  // available (some SnapTrade brokers).
+  const [unrealizedPl, setUnrealizedPl] = useState<string | null>(null);
   // Today's filled-trade notional in USD — same cross-nav cache.
   const [todaysTradingValue, setTodaysTradingValue] = useState<string | null>(
     () => readTickCache().todays_trading_value,
@@ -112,10 +127,13 @@ export default function SettingsPage() {
         const s = await api<SubscriberSettings>("/api/settings/subscriber");
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
-        setLimitInput(s.daily_loss_limit ?? "");
-        setProfitInput(s.daily_profit_limit ?? "");
+        // The UI now uses the % variants; fall back to legacy USD only
+        // if the user hasn't set a pct yet (smooth transition).
+        setLimitInput(s.daily_loss_limit_pct ?? "");
+        setProfitInput(s.daily_profit_limit_pct ?? "");
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxPctInput(s.max_account_pct_per_day ?? "");
+        setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -132,7 +150,11 @@ export default function SettingsPage() {
       // when the actual cause was the profit or pct cap.
       const reason = e.reason as string | undefined;
       let msg: string;
-      if (reason === "daily_profit_limit") {
+      if (reason === "daily_loss_limit_pct") {
+        msg = `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your ${e.daily_loss_limit_pct}% daily loss limit (≈ $${e.loss_pct_dollars} of your day-start balance).`;
+      } else if (reason === "daily_profit_limit_pct") {
+        msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your ${e.daily_profit_limit_pct}% daily profit limit (≈ $${e.profit_pct_dollars} of your day-start balance).`;
+      } else if (reason === "daily_profit_limit") {
         msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your daily profit limit ($${e.daily_profit_limit}).`;
       } else if (reason === "max_account_pct_per_day") {
         msg = `Copy trading auto-paused — today's trading ($${e.todays_trading_value}) hit ${e.max_account_pct_per_day}% of your day-start balance.`;
@@ -140,12 +162,40 @@ export default function SettingsPage() {
         msg = `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily loss limit ($${e.daily_loss_limit}).`;
       }
       notify.error(msg, { autoClose: false });
-      api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
+      // Pull fresh settings (copy_enabled, pnl_auto_paused_at, etc.) but
+      // PRESERVE `todays_realized_pnl` from the last pnl.tick. The /GET
+      // endpoint sums our local fills table, which lags the broker's
+      // equity-delta value the tick uses — re-fetching naively flashes
+      // the value back to $0 for ~10s until the next tick re-syncs.
+      api<SubscriberSettings>("/api/settings/subscriber").then((fresh) => {
+        setSub((prev) => prev ? { ...fresh, todays_realized_pnl: prev.todays_realized_pnl } : fresh);
+      });
       return;
     }
     if (e?.type === "copy.auto_resumed") {
       notify.success("Copy trading auto-resumed for the new day.");
-      api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
+      api<SubscriberSettings>("/api/settings/subscriber").then((fresh) => {
+        setSub((prev) => prev ? { ...fresh, todays_realized_pnl: prev.todays_realized_pnl } : fresh);
+      });
+      return;
+    }
+    if (e?.type === "copy.auto_liquidated") {
+      notify.success(
+        `Take-profit hit — unrealized profit reached $${e.unrealized_pl} ` +
+        `(target $${e.auto_liquidation_limit}). ` +
+        `${e.closed ?? 0} position(s) closed, ${e.cancelled ?? 0} open order(s) cancelled. ` +
+        `Copy trading is OFF until you re-enable it.`,
+        { autoClose: false },
+      );
+      // CRITICAL: preserve the prior P&L value through this fetch.
+      // Liquidation just placed close orders at the broker; the fills
+      // haven't synced into our local DB yet, so the GET endpoint will
+      // return today_realized_pnl=$0 momentarily and the "Today" cell
+      // would flash to $0 until the next tick (~10s later). Keep the
+      // live value from the last pnl.tick instead.
+      api<SubscriberSettings>("/api/settings/subscriber").then((fresh) => {
+        setSub((prev) => prev ? { ...fresh, todays_realized_pnl: prev.todays_realized_pnl } : fresh);
+      });
       return;
     }
     // pnl_poller publishes this every 60s with the latest equity-delta
@@ -160,6 +210,12 @@ export default function SettingsPage() {
         setTodaysTradingValue(e.todays_trading_value);
         writeTickCache({ todays_trading_value: e.todays_trading_value });
       }
+      if (typeof e.equity === "string") {
+        setEquity(e.equity);
+      }
+      if (typeof e.unrealized_pl === "string" || e.unrealized_pl === null) {
+        setUnrealizedPl(e.unrealized_pl);
+      }
       // The tick carries the canonical DB state for every limit field —
       // overwrite with the tick value (null included) so a freshly-
       // cleared limit doesn't stay stuck in the UI. Only "today" /
@@ -169,8 +225,11 @@ export default function SettingsPage() {
         todays_realized_pnl:      e.todays_realized_pnl      ?? prev.todays_realized_pnl,
         daily_loss_limit:         e.daily_loss_limit         ?? null,
         daily_profit_limit:       e.daily_profit_limit       ?? null,
+        daily_loss_limit_pct:     e.daily_loss_limit_pct     ?? null,
+        daily_profit_limit_pct:   e.daily_profit_limit_pct   ?? null,
         max_per_contract:         e.max_per_contract         ?? null,
         max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
+        auto_liquidation_limit:   e.auto_liquidation_limit   ?? null,
         copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
       } : prev);
     }
@@ -205,13 +264,13 @@ export default function SettingsPage() {
     setLimitBusy(true);
     try {
       const trimmed = limitInput.trim();
-      const body = { daily_loss_limit: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit", {
+      const body = { daily_loss_limit_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit-pct", {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setLimitInput(s.daily_loss_limit ?? "");
-      notify.success(s.daily_loss_limit ? `Daily loss limit set to $${s.daily_loss_limit}` : "Daily loss limit cleared");
+      setLimitInput(s.daily_loss_limit_pct ?? "");
+      notify.success(s.daily_loss_limit_pct ? `Daily loss limit set to ${s.daily_loss_limit_pct}%` : "Daily loss limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily loss limit");
     } finally {
@@ -222,13 +281,13 @@ export default function SettingsPage() {
     setProfitBusy(true);
     try {
       const trimmed = profitInput.trim();
-      const body = { daily_profit_limit: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit", {
+      const body = { daily_profit_limit_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit-pct", {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setProfitInput(s.daily_profit_limit ?? "");
-      notify.success(s.daily_profit_limit ? `Daily profit limit set to $${s.daily_profit_limit}` : "Daily profit limit cleared");
+      setProfitInput(s.daily_profit_limit_pct ?? "");
+      notify.success(s.daily_profit_limit_pct ? `Daily profit limit set to ${s.daily_profit_limit_pct}%` : "Daily profit limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily profit limit");
     } finally {
@@ -267,6 +326,27 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update max % per day");
     } finally {
       setMaxPctBusy(false);
+    }
+  }
+  async function saveAutoLiq() {
+    setAutoLiqBusy(true);
+    try {
+      const trimmed = autoLiqInput.trim();
+      const body = { auto_liquidation_limit: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/auto-liquidation-limit", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setAutoLiqInput(s.auto_liquidation_limit ?? "");
+      notify.success(
+        s.auto_liquidation_limit
+          ? `Auto-liquidation floor set to $${s.auto_liquidation_limit}`
+          : "Auto-liquidation cleared",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update auto-liquidation limit");
+    } finally {
+      setAutoLiqBusy(false);
     }
   }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
@@ -331,15 +411,29 @@ export default function SettingsPage() {
   };
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
-  const limit = sub?.daily_loss_limit ? Number(sub.daily_loss_limit) : null;
-  // Only count the LOSS portion against the loss-limit headroom. If
-  // today's P&L is positive (profit), no loss has been absorbed, so
-  // headroom = full limit. Without the max(0, -pnl) clamp we'd report
-  // "$700 headroom on a $500 limit" when the trader is up $200 — which
-  // is the opposite of what the kill switch protects against.
+  // Daily loss limit is now a PERCENTAGE of the broker's beginning-day
+  // balance. Derive the dollar threshold from baseNum * pct / 100, then
+  // headroom is "dollars of loss capacity left" (max(0, threshold − loss)).
+  const lossPctNum = sub?.daily_loss_limit_pct ? Number(sub.daily_loss_limit_pct) : null;
+  // Only count the LOSS portion against the loss-limit headroom — see
+  // pre-existing comment on max(0,-pnl) clamp.
+  // We need baseNum below — let it hoist via the maxPct block which
+  // defines it; for the loss/profit blocks we re-derive here.
+  const _baseEarly = beginningDayBalance ? Number(beginningDayBalance) : null;
+  const lossPctDollars = (lossPctNum !== null && _baseEarly !== null && _baseEarly > 0)
+    ? (_baseEarly * lossPctNum / 100)
+    : null;
+  // Keep `limit` name so JSX below doesn't have to change everywhere —
+  // it now holds the derived dollar threshold instead of the raw USD value.
+  const limit = lossPctDollars;
   const headroom = limit !== null ? Math.max(0, limit - Math.max(0, -todaysPnL)) : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
-  const profitLimit = sub?.daily_profit_limit ? Number(sub.daily_profit_limit) : null;
+  // Profit-limit mirror.
+  const profitPctNum = sub?.daily_profit_limit_pct ? Number(sub.daily_profit_limit_pct) : null;
+  const profitPctDollars = (profitPctNum !== null && _baseEarly !== null && _baseEarly > 0)
+    ? (_baseEarly * profitPctNum / 100)
+    : null;
+  const profitLimit = profitPctDollars;
   const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
   // Max-% derived values — pulled up here so the table row can read
   // them. balance × pct/100 = the dollar threshold; today's trading
@@ -424,13 +518,13 @@ export default function SettingsPage() {
             <div
               className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
               style={{
-                gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr",
+                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
                 color: "var(--muted)",
               }}
             >
               <div>Limit</div>
-              <div>Today</div>
               <div>Threshold</div>
+              <div>Today</div>
               <div>Headroom</div>
               <div className="text-right">Used</div>
             </div>
@@ -439,16 +533,16 @@ export default function SettingsPage() {
                 accent="#ef4444"
                 icon={<IconTrendDown />}
                 title="Daily loss limit"
-                subtitle="Pause copy when today's loss reaches this."
+                subtitle="Pause copy when today's loss reaches this % of your day-start balance."
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="USD"
+                inputPrefix="%"
                 input={limitInput}
                 onInput={setLimitInput}
                 busy={limitBusy}
                 onSave={saveLimit}
-                current={sub.daily_loss_limit}
+                current={sub.daily_loss_limit_pct}
                 hasLimit={limit !== null}
                 headroomDisplay={limit === null ? "—" : fmt(String(headroom))}
                 headroomColor={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
@@ -458,16 +552,16 @@ export default function SettingsPage() {
                 accent="#22c55e"
                 icon={<IconTrendUp />}
                 title="Daily profit limit"
-                subtitle="Pause copy when today's profit reaches this."
+                subtitle="Pause copy when today's profit reaches this % of your day-start balance."
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="USD"
+                inputPrefix="%"
                 input={profitInput}
                 onInput={setProfitInput}
                 busy={profitBusy}
                 onSave={saveProfit}
-                current={sub.daily_profit_limit}
+                current={sub.daily_profit_limit_pct}
                 hasLimit={profitLimit !== null}
                 headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
                 headroomColor={(profitHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
@@ -509,6 +603,81 @@ export default function SettingsPage() {
                 headroomDisplay="—"
               />
             </div>
+          </Card>
+
+          {/* ── Auto-liquidation — its own surface ───────────────────────
+              Separated from Risk Controls so the trader sees this as a
+              distinct take-profit instrument, not a fifth daily cap. The
+              semantic is different too: it locks in a winning day by
+              CLOSING positions, where the Risk Controls rows just pause
+              new mirror entries. */}
+          <Card
+            icon={<IconTrendUp />}
+            title="Auto-Liquidation (Take-Profit)"
+            hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
+          >
+            <div
+              className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
+              style={{
+                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
+                color: "var(--muted)",
+              }}
+            >
+              <div>Target</div>
+              <div>Set</div>
+              <div>Profit</div>
+              <div>Headroom</div>
+              <div className="text-right">Progress</div>
+            </div>
+            {(() => {
+              const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
+              const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
+              // Headroom = how much MORE profit you need before the
+              // trigger fires. Clamped to 0 so once you've reached the
+              // limit the cell reads "$0.00" instead of a negative.
+              const liqHeadroom =
+                unrealizedNum !== null && liqLimitNum !== null
+                  ? Math.max(0, liqLimitNum - unrealizedNum)
+                  : null;
+              // Progress bar: unrealized / target, clamped 0–100.
+              const liqPctConsumed =
+                unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
+                  ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
+                  : 0;
+              return (
+                <LimitRow
+                  accent="#22c55e"
+                  icon={<IconTrendUp />}
+                  title="Auto-liquidation target"
+                  subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
+                  todayLabel="Profit"
+                  todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
+                  todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
+                  inputPrefix="USD"
+                  input={autoLiqInput}
+                  onInput={setAutoLiqInput}
+                  busy={autoLiqBusy}
+                  onSave={saveAutoLiq}
+                  current={sub.auto_liquidation_limit}
+                  hasLimit={liqLimitNum !== null}
+                  headroomDisplay={
+                    liqLimitNum === null
+                      ? "—"
+                      : liqHeadroom !== null
+                        ? fmt(String(liqHeadroom))
+                        : "—"
+                  }
+                  // Headroom text stays neutral — this is a take-profit,
+                  // not a stop-loss, so hitting $0 headroom is *good*.
+                  headroomColor="var(--text)"
+                  pctConsumed={liqPctConsumed}
+                  // Tell LimitRow to keep the progress bar green even at
+                  // 100% — the default treats max-progress as danger
+                  // (red), which is wrong for a take-profit target.
+                  successProgress
+                />
+              );
+            })()}
           </Card>
 
           {/* ── Symbol filters ─────────────────────────────────────── */}
@@ -790,6 +959,7 @@ function LimitRow({
   hasLimit, thresholdHint,
   headroomDisplay, headroomColor,
   pctConsumed,
+  successProgress,
 }: {
   accent: string;
   icon: React.ReactNode;
@@ -809,12 +979,19 @@ function LimitRow({
   headroomDisplay: string;
   headroomColor?: string;
   pctConsumed?: number;
+  /** When true, the progress bar keeps the accent color all the way to
+   *  100% (no orange-at-75% or red-at-100% transitions). Use this for
+   *  rows where reaching the limit is the *desired* outcome — e.g. the
+   *  take-profit Auto-Liquidation card, where 100% means "you locked in
+   *  your target gain", not "you blew past a stop-loss". */
+  successProgress?: boolean;
 }) {
   const barPct = Math.max(0, Math.min(100, pctConsumed ?? 0));
-  const barTone =
-    barPct >= 100 ? "var(--bad)"
-    : barPct >= 75 ? "#f59e0b"
-    : accent;
+  const barTone = successProgress
+    ? accent
+    : barPct >= 100 ? "var(--bad)"
+      : barPct >= 75 ? "#f59e0b"
+      : accent;
 
   return (
     <div
@@ -844,7 +1021,7 @@ function LimitRow({
       >
         <div
           className="md:grid md:items-center md:gap-3"
-          style={{ gridTemplateColumns: "1.5fr 0.9fr 1.4fr 0.9fr 0.5fr" }}
+          style={{ gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr" }}
         >
           {/* Limit name + subtitle */}
           <div className="min-w-0 flex items-start gap-2.5">
@@ -866,20 +1043,8 @@ function LimitRow({
             </div>
           </div>
 
-          {/* Today */}
-          <div className="mt-3 md:mt-0">
-            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
-              {todayLabel}
-            </div>
-            <div
-              className="text-sm font-semibold tabular-nums"
-              style={{ color: todayColor ?? "var(--text)" }}
-            >
-              {todayValue}
-            </div>
-          </div>
-
-          {/* Threshold input + Save inline */}
+          {/* Threshold input + Save inline — moved BEFORE "Today" so the
+              column the user actively edits sits next to the row title. */}
           <div className="mt-3 md:mt-0">
             <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
               Threshold
@@ -931,6 +1096,20 @@ function LimitRow({
             )}
           </div>
 
+          {/* Today — now sits AFTER the threshold input, matching the new
+              column legend (Limit · Threshold · Today · Headroom · Used). */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              {todayLabel}
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{ color: todayColor ?? "var(--text)" }}
+            >
+              {todayValue}
+            </div>
+          </div>
+
           {/* Headroom */}
           <div className="mt-3 md:mt-0">
             <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
@@ -954,6 +1133,11 @@ function LimitRow({
               style={{
                 color:
                   !hasLimit ? "var(--muted)"
+                  // Take-profit rows treat hitting the limit as a *win*,
+                  // so the percentage text stays in the accent color
+                  // (green) all the way to 100% instead of going
+                  // amber → red like the stop-loss style limits.
+                  : successProgress ? accent
                   : barPct >= 100 ? "var(--bad)"
                   : barPct >= 75 ? "#f59e0b"
                   : "var(--text)",

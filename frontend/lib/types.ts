@@ -72,6 +72,8 @@ export interface Order {
   quantity: string;
   limit_price: string | null;
   stop_price: string | null;
+  take_profit_price: string | null;
+  stop_loss_price: string | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: OptionRight | null;
@@ -121,6 +123,12 @@ export interface SubscriberSettings {
   /** Daily realized-profit auto-pause. When today's realized P&L reaches
    *  this amount, copy_enabled flips to false. Auto-resumes next UTC day. */
   daily_profit_limit: string | null;
+  /** Percentage variants of the daily loss / profit limits. Each is
+   *  0 < x <= 100 and applied against `beginning_day_balance` to derive
+   *  the dollar threshold every pnl_poller tick. UI uses these — the
+   *  USD columns above are legacy. */
+  daily_loss_limit_pct: string | null;
+  daily_profit_limit_pct: string | null;
   todays_realized_pnl: string | null;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
@@ -143,6 +151,16 @@ export interface SubscriberSettings {
    *  today's filled trade NOTIONAL (USD) crosses
    *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */
   max_account_pct_per_day: string | null;
+  /** Auto-liquidation floor (USD). When broker-reported equity drops
+   *  to/below this value, pnl_poller closes every open position at
+   *  market and flips `copy_enabled` to false until the subscriber
+   *  manually re-enables it. NULL disables the feature. */
+  auto_liquidation_limit: string | null;
+  /** Timestamp of the most recent auto-liquidation trigger (UTC ISO).
+   *  Surfaced on the Settings page as "Auto-liquidated at …". Persists
+   *  even after the subscriber clears the limit — it's an audit marker,
+   *  not state. */
+  auto_liquidated_at: string | null;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

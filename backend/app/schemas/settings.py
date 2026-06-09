@@ -1,5 +1,6 @@
 import enum
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
@@ -15,6 +16,12 @@ class SubscriberSettingsOut(BaseModel):
     # means "auto-pause copy after $500 realized profit today". NULL = no
     # profit cap.
     daily_profit_limit: Decimal | None = None
+    # Percentage variants — the new UI uses these. Each is a percent
+    # (0 < x <= 100) of the broker's beginning-day balance. pnl_poller
+    # derives the dollar threshold each tick and trips the same kill
+    # switch when today's realized P&L breaches it.
+    daily_loss_limit_pct: Decimal | None = None
+    daily_profit_limit_pct: Decimal | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
     # UI-only — persisted but never enforced server-side.
     max_per_contract: Decimal | None = None
@@ -22,6 +29,12 @@ class SubscriberSettingsOut(BaseModel):
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
     max_account_pct_per_day: Decimal | None = None
+    # Account-equity floor that triggers full liquidation + copy disable.
+    # When the pnl_poller sees broker equity <= this value, every open
+    # position is closed at market and copy_enabled flips to False until
+    # the subscriber manually re-enables it.
+    auto_liquidation_limit: Decimal | None = None
+    auto_liquidated_at: datetime | None = None
     # Retry policy for transient broker errors. "never" disables retry.
     # Sent as the bare enum string ("never"/"1m"/"2m"/"3m"/"5m") so the
     # frontend can render dropdowns without a separate mapping. Validator
@@ -91,6 +104,30 @@ class MaxAccountPctIn(BaseModel):
     0 < pct <= 100."""
 
     max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class DailyLossLimitPctIn(BaseModel):
+    """Subscriber-set daily realized-loss kill switch — percentage
+    variant. 0 < pct <= 100. pnl_poller derives the dollar threshold
+    each tick from beginning_day_balance. Pass null to disable."""
+
+    daily_loss_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class DailyProfitLimitPctIn(BaseModel):
+    """Symmetric to DailyLossLimitPctIn — daily realized-profit cap as
+    a percentage of beginning-day balance. Pass null to disable."""
+
+    daily_profit_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class AutoLiquidationLimitIn(BaseModel):
+    """Subscriber-set hard floor on account equity. Pass null to disable.
+    When broker-reported equity falls to/below this value, pnl_poller
+    runs a full liquidation of the subscriber's open positions and flips
+    copy_enabled=False until they manually re-enable."""
+
+    auto_liquidation_limit: Decimal | None = Field(default=None, gt=0)
 
 
 class RetryIntervalIn(BaseModel):

@@ -127,7 +127,7 @@ function LogoMark({ size = 40 }: { size?: number }) {
   return (
     <img
       src="/brand-icon.avif"
-      alt="The Option Haven"
+      alt="ARK"
       width={size}
       height={size}
       style={{ width: size, height: size, borderRadius: 8, objectFit: "cover" }}
@@ -443,14 +443,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           backdropFilter: "blur(8px)",
         }}
       >
-        {/* Logo (always visible — wordmark hidden when collapsed) */}
-        <div className={`flex items-center gap-3 ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
-          <LogoMark />
-          {!collapsed && (
-            <div className="leading-tight">
-              <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
+        {/* Wordmark only — the image logo is intentionally hidden per
+            product direction. The "ARK" text is left-aligned when the
+            sidebar is expanded and falls back to a centered "A"
+            initial when collapsed so the chrome still reads as
+            branded at narrow widths. */}
+        <div className={`flex items-center ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
+          <div className="leading-tight">
+            <div
+              style={{
+                fontWeight: 700,
+                fontSize: collapsed ? 20 : 26,
+                letterSpacing: "0.04em",
+              }}
+            >
+              {collapsed ? "A" : "ARK"}
             </div>
-          )}
+          </div>
         </div>
 
         {/* Nav — scrolls within sidebar if it ever overflows */}

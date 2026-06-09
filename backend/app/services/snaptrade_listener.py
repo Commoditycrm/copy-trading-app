@@ -377,7 +377,12 @@ def _persist_and_fanout(
             # reconnect) back onto the live account so it stays linked.
             if existing.broker_account_id != broker_account_id:
                 existing.broker_account_id = broker_account_id
-            if existing.status != status_enum:
+            # Track whether *this* poll observed a status transition — the
+            # bracket emulator hooks below only fire on actual transitions
+            # so we don't pay for them on every quiescent poll of an
+            # already-FILLED order.
+            status_changed = existing.status != status_enum
+            if status_changed:
                 existing.status = status_enum
             fq = _attr(order_obj, "filled_units", "filled_quantity")
             if fq is not None:
@@ -399,6 +404,25 @@ def _persist_and_fanout(
             if existing.socket_received_at is None:
                 existing.socket_received_at = datetime.now(timezone.utc)
             existing.redis_published_at = datetime.now(timezone.utc)
+            # Bracket emulator hooks. We run BOTH on every FILLED
+            # transition; each function short-circuits if the order
+            # doesn't match its case (entry vs exit leg), so calling them
+            # together is safe and saves duplicating the gate logic here.
+            # Failures are caught and logged — we don't want a bracket
+            # bug to corrupt the listener's main status update.
+            if status_changed and status_enum == OrderStatus.FILLED:
+                try:
+                    from app.services.bracket_emulator import (  # noqa: PLC0415
+                        cancel_sibling_on_fill,
+                        emulate_bracket_exits,
+                    )
+                    emulate_bracket_exits(db, existing)
+                    cancel_sibling_on_fill(db, existing)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "snaptrade_listener: bracket emulator failed for order %s",
+                        existing.id,
+                    )
             db.commit()
             db.refresh(existing)
             events.publish(

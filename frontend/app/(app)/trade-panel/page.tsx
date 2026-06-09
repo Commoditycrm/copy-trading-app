@@ -7,31 +7,11 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
-import { ExitAllModal, type ExitAction } from "@/components/ExitAllModal";
-import { StrikePicker } from "@/components/StrikePicker";
+import { BulkExitBar } from "@/components/BulkExitBar";
+import { SearchableSelect } from "@/components/SearchableSelect";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
-function fmtNum(n: string | null | undefined, dp = 2): string {
-  if (n === null || n === undefined || n === "") return "—";
-  const v = Number(n);
-  if (!Number.isFinite(v)) return String(n);
-  return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
-}
-
-function fmtSignedMoney(n: string | null | undefined): { text: string; sign: 1 | -1 | 0 | null } {
-  if (n === null || n === undefined || n === "") return { text: "—", sign: null };
-  const v = Number(n);
-  if (!Number.isFinite(v)) return { text: String(n), sign: null };
-  return {
-    text: v.toLocaleString(undefined, { style: "currency", currency: "USD" }),
-    sign: v === 0 ? 0 : v > 0 ? 1 : -1,
-  };
-}
-
-// ── small helpers ────────────────────────────────────────────────────────────
-
-/** Build the standard OCC option symbol: ROOT + YYMMDD + C/P + strike*1000 (8 digits).
- *  Example: AAPL 2025-07-19 200 CALL → AAPL250719C00200000 */
+/** Build OCC option symbol — ROOT + YYMMDD + C/P + strike*1000 (8 digits). */
 function buildOccSymbol(
   symbol: string, expiryISO: string, strike: string, right: OptionRight
 ): string | null {
@@ -53,81 +33,80 @@ function fmtMoney(n: number | null | undefined): string {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
 }
 
-// Top-10 most-traded US underlyings (by option-volume reputation, not a feed).
-// Used for the quick-pick chip row above the Symbol input.
 const POPULAR_SYMBOLS = [
-  "AAPL", "NVDA", "TSLA", "AMZN", "MSFT",
-  "META", "GOOGL", "AMD",
+  "AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "META", "GOOGL", "AMD",
 ];
 
-// ── shared style helpers ─────────────────────────────────────────────────────
+const ORDER_TYPE_OPTIONS = [
+  { value: "market", label: "Market" },
+  { value: "limit", label: "Limit" },
+  { value: "stop", label: "Stop" },
+  { value: "stop_limit", label: "Stop-limit" },
+];
 
-const sectionStyle: React.CSSProperties = {
-  borderColor: "var(--border)",
-  background: "var(--panel)",
+// ── shared visual primitives ─────────────────────────────────────────────────
+
+/** Dark glass surface used by the Watchlist placeholder (keeps the
+ *  original quiet look — it's a sidekick to the ticket, not the
+ *  primary focus). Use `ticketStyle` for the actual trade form. */
+const cardStyle: React.CSSProperties = {
+  background:
+    "linear-gradient(180deg, rgba(20,26,32,0.55) 0%, rgba(10,14,18,0.35) 100%)",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--r)",
+  backdropFilter: "blur(10px)",
+  WebkitBackdropFilter: "blur(10px)",
 };
 
+/** Trade-ticket surface — slightly brighter than `cardStyle` so the
+ *  primary trade form holds its own contrast against the page bg.
+ *  Aim is "clearly visible without screaming"; the previous 0.92/0.85
+ *  read as washed-out, this 0.78/0.7 sits between the original (too
+ *  dark) and the over-bright revision. */
+const ticketStyle: React.CSSProperties = {
+  background:
+    "linear-gradient(180deg, rgba(26,32,40,0.78) 0%, rgba(16,22,28,0.70) 100%)",
+  border: "1px solid var(--border-strong)",
+  borderRadius: "var(--r)",
+  backdropFilter: "blur(10px)",
+  WebkitBackdropFilter: "blur(10px)",
+};
+
+/** Inset input style — flat page-bg fill (#07090b) so every input and
+ *  dropdown trigger reads at the same pitch. */
 const inputStyle: React.CSSProperties = {
-  borderColor: "var(--border)",
-  background: "var(--bg)",   // darker than the panel they sit on
+  background: "#07090b",
+  border: "1px solid var(--border)",
+  borderRadius: 8,
 };
 
-function ChevronDown() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 20 20" aria-hidden>
-      <path d="M0 0h20v20H0z" fill="none" />
-      <path fill="currentColor" d="M10.103 12.778L16.81 6.08a.69.69 0 0 1 .99.012a.726.726 0 0 1-.012 1.012l-7.203 7.193a.69.69 0 0 1-.985-.006L2.205 6.72a.727.727 0 0 1 0-1.01a.69.69 0 0 1 .99 0z" />
-    </svg>
-  );
-}
+// ── primitive components ─────────────────────────────────────────────────────
 
-function ChevronUp() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 15 15" aria-hidden>
-      <path d="M0 0h15v15H0z" fill="none" />
-      <path fill="none" stroke="currentColor" strokeLinecap="square" d="m1 10l6.5-7l6.5 7" />
-    </svg>
-  );
-}
-
-function Label({ children, hint }: { children: React.ReactNode; hint?: string }) {
+function TinyLabel({ children, hint }: { children: React.ReactNode; hint?: React.ReactNode }) {
   return (
     <div className="flex items-baseline justify-between mb-1">
-      <label className="text-[11px] uppercase tracking-wider font-medium" style={{ color: "var(--muted)" }}>
+      <span className="text-[9px] uppercase tracking-[0.15em] font-semibold" style={{ color: "var(--text-2)" }}>
         {children}
-      </label>
+      </span>
       {hint && <span className="text-[10px]" style={{ color: "var(--muted)" }}>{hint}</span>}
     </div>
   );
 }
 
-function SegBtn({
-  active, onClick, children, color,
-}: {
-  active: boolean; onClick: () => void; children: React.ReactNode;
-  color?: "good" | "bad" | "accent";
-}) {
-  // Active state uses the matching gradient + a subtle inner highlight; inactive
-  // is a quiet outlined chip. Border colour matches the gradient family for
-  // a consistent edge.
-  const grad =
-    color === "bad" ? "var(--grad-bad)" :
-      "var(--grad-accent)";   // good + accent both use lime gradient
-  const edge =
-    color === "bad" ? "rgba(255, 107, 107, 0.35)" :
-      "rgba(10, 115, 168, 0.35)";
+/** Tab-pill toggle — used for Instrument and Right. Inactive is flat
+ *  ghost; active gets a subtle filled background + crisp text. */
+function PillTab({
+  active, onClick, children,
+}: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex-1 px-3 py-2 rounded text-sm font-medium transition-all"
+      className="flex-1 inline-flex items-center justify-center h-full px-2 text-sm font-medium rounded-md transition-all"
       style={{
-        border: `1px solid ${active ? edge : "var(--border)"}`,
-        background: active ? grad : "transparent",
-        color: active ? "var(--accent-ink)" : "var(--text)",
-        boxShadow: active
-          ? "inset 0 1px 0 rgba(255,255,255,0.25), 0 6px 18px -8px " + (color === "bad" ? "rgba(255,107,107,0.35)" : "var(--accent-glow)")
-          : "none",
+        background: active ? "rgba(255,255,255,0.06)" : "transparent",
+        color: active ? "var(--text)" : "var(--muted)",
+        boxShadow: active ? "inset 0 1px 0 rgba(255,255,255,0.06)" : "none",
       }}
     >
       {children}
@@ -135,21 +114,69 @@ function SegBtn({
   );
 }
 
+/** Watchlist placeholder card — reserves the right-side column until
+ *  the live-quotes module ships. Uses the same glass surface as the
+ *  ticket so the two read as a paired layout. */
+function WatchlistPlaceholder() {
+  return (
+    <div
+      className="overflow-hidden flex flex-col h-full"
+      style={cardStyle}
+    >
+      <div
+        className="flex items-center justify-between px-4 py-3"
+        style={{ borderBottom: "1px solid var(--border)" }}
+      >
+        <div className="flex items-center gap-2">
+          <span
+            className="w-1.5 h-1.5 rounded-full"
+            style={{ background: "var(--accent-2)" }}
+          />
+          <span className="text-[10px] uppercase tracking-[0.2em] font-semibold" style={{ color: "var(--text-2)" }}>
+            Watchlist
+          </span>
+        </div>
+        <span className="text-[10px]" style={{ color: "var(--faint)" }}>
+          coming soon
+        </span>
+      </div>
+
+      <div className="flex-1 grid place-items-center p-6">
+        <div className="text-center max-w-[280px]">
+          <div
+            className="mx-auto mb-3 inline-flex items-center justify-center w-12 h-12 rounded-full"
+            style={{
+              background: "linear-gradient(135deg, rgba(10,115,168,0.25), rgba(10,115,168,0.05))",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ color: "var(--accent-2)" }}>
+              <path d="M3 3v18h18" />
+              <path d="M7 14l4-4 4 4 5-5" />
+            </svg>
+          </div>
+          <div className="text-sm font-medium mb-1.5" style={{ color: "var(--text)" }}>
+            Live quotes panel
+          </div>
+          <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+            Pin symbols here for streaming prices, intraday charts, and one-click trade entry.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export default function TradePanelPage() {
   const [accts, setAccts] = useState<BrokerAccount[]>([]);
-  // True until the first /api/brokers fetch completes — gates the page
-  // body so we don't flash an empty broker dropdown before the data
-  // lands.
   const [acctsLoading, setAcctsLoading] = useState(true);
   const [acctId, setAcctId] = useState<string>("");
   const [instrument, setInstrument] = useState<InstrumentType>("option");
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<OrderSide>("buy");
-  // Default to "limit" so the Custom order section opens ready for a limit order
-  // (the express BUY/SELL @ MARKET buttons override this anyway via placeOrder).
-  const [orderType, setOrderType] = useState<OrderType>("limit");
+  const [orderType, setOrderType] = useState<OrderType>("market");
   const [qty, setQty] = useState("1");
   const [limit, setLimit] = useState("");
   const [stop, setStop] = useState("");
@@ -157,39 +184,36 @@ export default function TradePanelPage() {
   const [strike, setStrike] = useState("");
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
-  const [last, setLast] = useState<Order | null>(null);
-  const [summaryOpen, setSummaryOpen] = useState(false);
 
-  // Open positions table — owned by the shared component. We keep a ref so
-  // we can ask it to refresh after a fresh order or exit-all.
+  // Bracket exit legs — entered as PERCENTAGES off the reference price.
+  // Reference is the limit price for limit/stop_limit orders, or a small
+  // user-supplied "ref price" input that appears for market orders. We
+  // convert to absolute prices at submit time so the backend / adapter
+  // contract stays unchanged (Alpaca's bracket wants absolute prices).
+  const [stopLoss, setStopLoss] = useState("");     // percent, e.g. "5" = 5%
+  const [takeProfit, setTakeProfit] = useState(""); // percent, e.g. "10" = 10%
+
   const positionsRef = useRef<OpenPositionsTableHandle>(null);
-  const [exitBusy, setExitBusy] = useState(false);
-  const [exitConfirmOpen, setExitConfirmOpen] = useState(false);
 
-  // Expiries fetched per (symbol, account). Cached client-side
-  // so retyping the same symbol doesn't trigger a re-fetch.
   const [expiries, setExpiries] = useState<string[]>([]);
   const [expiriesLoading, setExpiriesLoading] = useState(false);
   const [expiriesErr, setExpiriesErr] = useState<string | null>(null);
-  const [expiriesFor, setExpiriesFor] = useState<string>("");  // "<acctId>:<SYMBOL>"
+  const [expiriesFor, setExpiriesFor] = useState<string>("");
 
-  // Strikes fetched per (symbol, account, expiry, right). Same caching shape
-  // as expiries — keyed by the full tuple so swapping right or expiry
-  // triggers a fresh fetch but nothing else does.
+  // Live option quote for the currently-selected contract. Populated by
+  // an effect that fires when (symbol, expiry, strike, right) all hold a
+  // value. `bid`/`ask` are nullable — illiquid contracts or out-of-RTH
+  // sessions can return 0/None and we don't want to lie to the user.
+  const [optionQuote, setOptionQuote] = useState<{ bid: number | null; ask: number | null; mid: number | null } | null>(null);
+  const [quoteFor, setQuoteFor] = useState<string>("");
+
   const [strikes, setStrikes] = useState<number[]>([]);
   const [strikesLoading, setStrikesLoading] = useState(false);
   const [strikesErr, setStrikesErr] = useState<string | null>(null);
   const [strikesFor, setStrikesFor] = useState<string>("");
 
-  // When the symbol changes, drop the previous chain's strikes immediately.
-  // Without this the old list lingers until the new expiry resolves and the
-  // strikes effect re-fires — and worse, an intermediate fetch with the
-  // stale (new symbol, old expiry) pair can poison the cache.
   useEffect(() => {
-    setStrikes([]);
-    setStrike("");
-    setStrikesFor("");
-    setStrikesErr(null);
+    setStrikes([]); setStrike(""); setStrikesFor(""); setStrikesErr(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
@@ -203,8 +227,6 @@ export default function TradePanelPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch option expiries from SnapTrade when (symbol, account) change.
-  // Debounced 500ms so typing "AAPL" doesn't fire 4 requests.
   useEffect(() => {
     if (instrument !== "option") return;
     const sym = symbol.trim().toUpperCase();
@@ -213,24 +235,17 @@ export default function TradePanelPage() {
       return;
     }
     const cacheKey = `${acctId}:${sym}`;
-    if (cacheKey === expiriesFor) return;  // already fetched / fetching
-
+    if (cacheKey === expiriesFor) return;
     const t = setTimeout(async () => {
-      setExpiriesLoading(true);
-      setExpiriesErr(null);
+      setExpiriesLoading(true); setExpiriesErr(null);
       try {
         const res = await api<{ symbol: string; expiries: string[] }>(
           `/api/options/expiries?account_id=${acctId}&symbol=${encodeURIComponent(sym)}`
         );
         setExpiries(res.expiries);
         setExpiriesFor(cacheKey);
-        // Auto-pick the soonest expiry: keep the user's existing choice if
-        // it's still valid, otherwise default to the first (closest) date.
-        if (res.expiries.length === 0) {
-          setExpiry("");
-        } else if (!expiry || !res.expiries.includes(expiry)) {
-          setExpiry(res.expiries[0]);
-        }
+        if (res.expiries.length === 0) setExpiry("");
+        else if (!expiry || !res.expiries.includes(expiry)) setExpiry(res.expiries[0]);
       } catch (e) {
         setExpiries([]);
         setExpiriesErr(e instanceof ApiError ? String(e.detail) : "could not load expiries");
@@ -244,9 +259,6 @@ export default function TradePanelPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, symbol, acctId]);
 
-  // Fetch option strikes whenever (symbol, account, expiry, right) changes.
-  // Debounced so back-to-back changes coalesce into one round-trip. Reuses
-  // the same caching/auto-pick pattern as expiries.
   useEffect(() => {
     if (instrument !== "option") return;
     const sym = symbol.trim().toUpperCase();
@@ -256,24 +268,45 @@ export default function TradePanelPage() {
     }
     const cacheKey = `${acctId}:${sym}:${expiry}:${right}`;
     if (cacheKey === strikesFor) return;
-
     const t = setTimeout(async () => {
-      setStrikesLoading(true);
-      setStrikesErr(null);
+      setStrikesLoading(true); setStrikesErr(null);
       try {
-        const res = await api<{ symbol: string; expiry: string; right: string; strikes: number[] }>(
+        const res = await api<{ symbol: string; expiry: string; right: string; strikes: number[]; underlying_price: number | null }>(
           `/api/options/strikes?account_id=${acctId}&symbol=${encodeURIComponent(sym)}&expiry=${expiry}&right=${right}`
         );
         setStrikes(res.strikes);
         setStrikesFor(cacheKey);
-        // Always re-pick the ATM-ish strike on a fresh fetch — Alpaca's
-        // chains are roughly symmetric around the underlying so the median
-        // of the returned list is the nearest-to-ATM. Preserving a previous
-        // strike that "happens to be in the new list" looked broken to the
-        // user (e.g. AAPL 200 carried over to TSLA's chain even though
-        // TSLA is at ~$400).
+        // Pick the FIRST OTM (out-of-the-money) strike relative to the
+        // underlying. Matches what most trading apps default to:
+        //   call → smallest strike >= underlying_price (just above)
+        //   put  → largest  strike <= underlying_price (just below)
+        // Example: TSLA at 420.26, calls → 422.50 (not 420, which would
+        // be slightly ITM). Falls back to absolute-nearest if no strike
+        // sits on the OTM side, and to the chain median if there's no
+        // underlying_price at all.
         if (res.strikes.length === 0) {
           setStrike("");
+        } else if (res.underlying_price && res.underlying_price > 0) {
+          const target = res.underlying_price;
+          const sorted = [...res.strikes].sort((a, b) => a - b);
+          let pick: number | undefined;
+          if (right === "call") {
+            pick = sorted.find(s => s >= target);
+          } else {
+            // For puts walk from the top down so we land on the largest
+            // strike that's still <= underlying.
+            for (let i = sorted.length - 1; i >= 0; i--) {
+              if (sorted[i] <= target) { pick = sorted[i]; break; }
+            }
+          }
+          // No OTM strike on this side of the chain — fall back to the
+          // absolute-nearest strike so we still pick something sensible.
+          if (pick === undefined) {
+            pick = sorted.reduce((best, s) =>
+              Math.abs(s - target) < Math.abs(best - target) ? s : best
+            );
+          }
+          setStrike(String(pick));
         } else {
           setStrike(String(res.strikes[Math.floor(res.strikes.length / 2)]));
         }
@@ -290,106 +323,161 @@ export default function TradePanelPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instrument, symbol, acctId, expiry, right]);
 
-  const selectedAcct = useMemo(() => accts.find(a => a.id === acctId), [accts, acctId]);
-
-  /** Routes to the right backend endpoint depending on the user's
-   *  step-1 choice in ExitAllModal. Trader-only page, so `include
-   *  subscribers` is always meaningful. */
-  async function doExitAll(action: ExitAction, includeSubscribers: boolean) {
-    setExitBusy(true);
-    try {
-      if (action === "orders") {
-        const res = await api<{ cancelled_count: number; failed_count: number; failed: { order_id: string; symbol: string | null; error: string }[] }>(
-          `/api/trades/cancel-all-open?include_subscribers=${includeSubscribers}`,
-          { method: "POST" },
-        );
-        if (res.cancelled_count === 0 && res.failed_count === 0) {
-          notify.info("No open orders to cancel.");
-        } else if (res.failed_count === 0) {
-          notify.success(
-            `Cancelled ${res.cancelled_count} order${res.cancelled_count === 1 ? "" : "s"}` +
-            (includeSubscribers ? " (cascaded to subscriber mirrors)" : "")
-          );
-        } else {
-          notify.warn(`Cancelled ${res.cancelled_count}; ${res.failed_count} failed — check Trades for details`);
-        }
-      } else {
-        const res = await api<{ closed_count: number; failed_count: number; failed: { symbol: string | null; error: string }[] }>(
-          `/api/positions/close-all?include_subscribers=${includeSubscribers}`,
-          { method: "POST" },
-        );
-        if (res.closed_count === 0 && res.failed_count === 0) {
-          notify.info("No open positions to close.");
-        } else if (res.failed_count === 0) {
-          notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market${includeSubscribers ? " (fanned out to subscribers)" : ""}`);
-        } else {
-          notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Trades for details`);
-        }
-      }
-      positionsRef.current?.refresh();
-      setExitConfirmOpen(false);
-    } catch (e) {
-      notify.fromError(e, "Exit all failed");
-    } finally {
-      setExitBusy(false);
+  // Fetch the live option quote (bid/ask) when the contract is fully
+  // specified. Debounced 400ms so the user can quickly switch between
+  // strikes without triggering a request for each intermediate state.
+  // On contract change we also seed the Limit price with the MID —
+  // it splits the spread, which is the standard "neutral" default and
+  // tends to fill more often than the ask without crossing the spread.
+  // Falls back to ask, then bid, when the other side is missing
+  // (illiquid contracts can have one-sided quotes).
+  useEffect(() => {
+    if (instrument !== "option") {
+      setOptionQuote(null);
+      setQuoteFor("");
+      return;
     }
-  }
+    const sym = symbol.trim().toUpperCase();
+    if (!sym || !acctId || !expiry || !strike || !right) {
+      setOptionQuote(null);
+      setQuoteFor("");
+      return;
+    }
+    const cacheKey = `${acctId}:${sym}:${expiry}:${strike}:${right}`;
+    if (cacheKey === quoteFor) return;
+    const t = setTimeout(async () => {
+      try {
+        const res = await api<{ bid: number | null; ask: number | null; mid: number | null }>(
+          `/api/options/quote?account_id=${acctId}&symbol=${encodeURIComponent(sym)}&expiry=${expiry}&strike=${strike}&right=${right}`
+        );
+        setOptionQuote({ bid: res.bid, ask: res.ask, mid: res.mid });
+        setQuoteFor(cacheKey);
+        // Default the Limit field to MID (best of {mid, ask, bid}). We
+        // always overwrite because limit pricing is contract-specific —
+        // a stale value carried across a strike or expiry change would
+        // be misleading.
+        const seed = res.mid ?? res.ask ?? res.bid;
+        if (seed && seed > 0) {
+          setLimit(seed.toFixed(2));
+        }
+      } catch {
+        setOptionQuote(null);
+        setQuoteFor(cacheKey);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument, symbol, acctId, expiry, strike, right]);
 
-  // OCC symbol preview for the right-side summary panel.
+
+  const isOption = instrument === "option";
+  const isBuy = side === "buy";
+
   const occ = useMemo(
-    () => instrument === "option" ? buildOccSymbol(symbol, expiry, strike, right) : null,
-    [instrument, symbol, expiry, strike, right]
+    () => isOption ? buildOccSymbol(symbol, expiry, strike, right) : null,
+    [isOption, symbol, expiry, strike, right]
   );
 
-  // Estimated cost for the summary panel. Options multiplier is 100 shares/contract.
+  const bracketCompatible = orderType === "market" || orderType === "limit";
+
+  // Reference price for converting TP/SL percentages → absolute prices.
+  // We use the order's limit price as the implicit reference. Market
+  // orders have no upfront price → an inline hint asks the trader to
+  // switch to limit if they want %-based SL/TP.
+  const refPrice = useMemo(() => {
+    const n = limit ? Number(limit) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }, [limit]);
+
+  /** Apply a positive percentage to the reference price on the trader's
+   *  side. Buy: TP is above entry, SL is below. Sell: reversed. */
+  function pctToPrice(pct: string, leg: "tp" | "sl"): number | null {
+    if (!refPrice) return null;
+    const p = Number(pct);
+    if (!Number.isFinite(p) || p <= 0) return null;
+    const sign = (isBuy && leg === "tp") || (!isBuy && leg === "sl") ? 1 : -1;
+    return refPrice * (1 + (sign * p) / 100);
+  }
+
+  const tpAbsPrice = useMemo(() => pctToPrice(takeProfit, "tp"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refPrice, takeProfit, isBuy]);
+  const slAbsPrice = useMemo(() => pctToPrice(stopLoss, "sl"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [refPrice, stopLoss, isBuy]);
+
+  const bracketGeometryError = useMemo(() => {
+    if (!bracketCompatible) return null;
+    const sl = stopLoss ? Number(stopLoss) : null;
+    const tp = takeProfit ? Number(takeProfit) : null;
+    if (!sl && !tp) return null;
+    // Percentages must be positive (direction is implied by side).
+    if (sl !== null && sl <= 0) return "Stop loss % must be > 0";
+    if (tp !== null && tp <= 0) return "Take profit % must be > 0";
+    // Sanity: a 100%+ stop loss on a long would push the SL price to ≤0.
+    if (isBuy && sl !== null && sl >= 100) return "Stop loss % must be < 100";
+    if (!isBuy && tp !== null && tp >= 100) return "Take profit % must be < 100";
+    // Need a reference price to actually convert to absolute.
+    if ((sl || tp) && !refPrice) {
+      return "Enter a limit price for % SL/TP";
+    }
+    return null;
+  }, [bracketCompatible, stopLoss, takeProfit, isBuy, refPrice, orderType]);
+
+  // Estimated cost for the live preview footer.
   const estCost = useMemo(() => {
     const q = Number(qty);
     if (!Number.isFinite(q) || q <= 0) return null;
-    if (instrument === "option") {
-      if (orderType === "market") return null;     // unknown until fill
-      const px = Number(limit);
-      if (!Number.isFinite(px) || px <= 0) return null;
-      return q * px * 100;
-    }
     if (orderType === "market") return null;
     const px = Number(limit);
     if (!Number.isFinite(px) || px <= 0) return null;
-    return q * px;
-  }, [instrument, orderType, qty, limit]);
+    return q * px * (isOption ? 100 : 1);
+  }, [orderType, qty, limit, isOption]);
 
-  /**
-   * Single placement path used by:
-   *   - Express "Buy/Sell at Market" buttons (overrideSide + overrideType="market")
-   *   - Custom-order submit (no overrides — uses form state)
-   */
-  async function placeOrder(opts: {
-    overrideSide?: OrderSide;
-    overrideType?: OrderType;
-  } = {}) {
+  /** Build the bracket TP/SL absolute prices for a specific side. Used
+   *  inside placeOrder so the actual prices match the button the user
+   *  clicked, even though the preview state defaults to "buy". Returns
+   *  null for legs that don't have a usable percentage or ref price. */
+  function bracketFor(forSide: OrderSide): { tp: number | null; sl: number | null } {
+    if (!bracketCompatible || !refPrice) return { tp: null, sl: null };
+    const buy = forSide === "buy";
+    const tpPct = Number(takeProfit);
+    const slPct = Number(stopLoss);
+    const tp = takeProfit && Number.isFinite(tpPct) && tpPct > 0
+      ? refPrice * (1 + (buy ? 1 : -1) * tpPct / 100)
+      : null;
+    const sl = stopLoss && Number.isFinite(slPct) && slPct > 0
+      ? refPrice * (1 + (buy ? -1 : 1) * slPct / 100)
+      : null;
+    return { tp, sl };
+  }
+
+  async function placeOrder(forSide: OrderSide) {
     if (!acctId) { notify.warn("Connect a broker first"); return; }
     if (!symbol.trim()) { notify.warn("Enter a symbol"); return; }
     if (!qty || Number(qty) <= 0) { notify.warn("Enter a quantity"); return; }
+    if (bracketGeometryError) { notify.warn(bracketGeometryError); return; }
 
-    const useSide = opts.overrideSide ?? side;
-    const useType = opts.overrideType ?? orderType;
-
+    setSide(forSide);
     setSubmitting(true);
     try {
       const body: Record<string, unknown> = {
         instrument_type: instrument,
         symbol: symbol.toUpperCase(),
-        side: useSide,
-        order_type: useType,
+        side: forSide,
+        order_type: orderType,
         quantity: qty,
       };
-      if (useType === "limit" || useType === "stop_limit") body.limit_price = limit;
-      if (useType === "stop" || useType === "stop_limit") body.stop_price = stop;
-      if (instrument === "option") {
-        if (!expiry || !strike) {
-          notify.warn("Option requires expiry and strike");
-          setSubmitting(false);
-          return;
-        }
+      if (orderType === "limit" || orderType === "stop_limit") body.limit_price = limit;
+      if (orderType === "stop" || orderType === "stop_limit") body.stop_price = stop;
+      // Convert percentage TP/SL → absolute prices for the broker. We
+      // recompute here for the *clicked* side (not the previewed side)
+      // and round to 4 decimals to match the orders.Numeric(18,4) column.
+      const { tp, sl } = bracketFor(forSide);
+      if (tp !== null) body.take_profit_price = tp.toFixed(4);
+      if (sl !== null) body.stop_loss_price = sl.toFixed(4);
+      if (isOption) {
+        if (!expiry || !strike) { notify.warn("Option requires expiry and strike"); setSubmitting(false); return; }
         body.option_expiry = expiry;
         body.option_strike = strike;
         body.option_right = right;
@@ -397,11 +485,8 @@ export default function TradePanelPage() {
       const res = await api<Order>(`/api/trades?broker_account_id=${acctId}`, {
         method: "POST", body: JSON.stringify(body),
       });
-      setLast(res);
-      notify.success(
-        `${useSide.toUpperCase()} ${qty} ${symbol.toUpperCase()} (${useType.replace("_", "-")}) — ${res.status}`
-      );
-      // Refresh the embedded positions table so a new fill appears below.
+      const tag = (tp !== null || sl !== null) ? " · bracket" : "";
+      notify.success(`${forSide.toUpperCase()} ${qty} ${symbol.toUpperCase()} (${orderType.replace("_", "-")})${tag} — ${res.status}`);
       positionsRef.current?.refresh();
     } catch (e) {
       notify.fromError(e, "Order placement failed");
@@ -411,412 +496,500 @@ export default function TradePanelPage() {
   }
 
   function submit(e: FormEvent) {
+    // Enter-key submit defaults to the side currently highlighted in
+    // the preview (initially "buy"). The two CTA buttons override.
     e.preventDefault();
-    placeOrder();   // uses current side + orderType state (custom path)
+    placeOrder(side);
   }
 
-  // The form is the same content in both stock and option mode — only the
-  // wrapper layout changes (single-col vs two-col with summary on the right).
-  const formBody = (
-    <form onSubmit={submit} className="space-y-5 p-5 rounded border" style={sectionStyle}>
-
-      {/* Account */}
-      {/* <div>
-        <Label>Broker account</Label>
-        <select
-          value={acctId} onChange={e => setAcctId(e.target.value)} required
-          className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-        >
-          {accts.length === 0 && <option value="">— connect a broker first —</option>}
-          {accts.map(a => (
-            <option key={a.id} value={a.id}>
-              {a.broker} · {a.label}{a.is_paper ? " (paper)" : ""}
-            </option>
-          ))}
-        </select>
-        {selectedAcct && (
-          <div className="mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
-            Buying power: {fmtMoney(selectedAcct.buying_power ? Number(selectedAcct.buying_power) : null)}
-            {" · "}
-            Cash: {fmtMoney(selectedAcct.cash ? Number(selectedAcct.cash) : null)}
-          </div>
-        )}
-      </div> */}
-
-      {/* Instrument toggle */}
-      <div>
-        <Label>Instrument</Label>
-        <div className="flex gap-2">
-          <SegBtn active={instrument === "option"} onClick={() => setInstrument("option")}>Options</SegBtn>
-          <SegBtn active={instrument === "stock"} onClick={() => setInstrument("stock")}>Stocks</SegBtn>
-        </div>
-      </div>
-
-      {/* Quick-pick: most-traded US underlyings. Click sets the Symbol field. */}
-      <div>
-        <Label>Popular symbols</Label>
-        <div className="flex flex-wrap gap-2">
-          {POPULAR_SYMBOLS.map((tk) => {
-            const selected = symbol.trim().toUpperCase() === tk;
-            return (
-              <button
-                key={tk}
-                type="button"
-                onClick={() => setSymbol(tk)}
-                aria-pressed={selected}
-                className="px-3 py-1 text-xs font-medium rounded-full transition-colors"
-                style={{
-                  border: `1px solid ${selected ? "rgba(10,115,168,0.5)" : "var(--border)"}`,
-                  background: selected ? "var(--accent)" : "transparent",
-                  color: selected ? "var(--accent-ink)" : "var(--text-2)",
-                }}
-              >
-                {tk}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Symbol + Quantity in one row — the two fields you always need */}
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <Label>Symbol</Label>
-          <input
-            className="w-full p-2 rounded bg-transparent border uppercase tracking-wide font-medium" style={inputStyle}
-            placeholder="AAPL" value={symbol}
-            onChange={e => setSymbol(e.target.value)} required
-          />
-        </div>
-        <div>
-          <Label>Quantity</Label>
-          <input
-            type="number" step="1" min="1"
-            className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-            placeholder="1" value={qty} onChange={e => setQty(e.target.value)} required
-          />
-        </div>
-      </div>
-
-      {/* Option contract fields */}
-      {instrument === "option" && (
-        <div className="space-y-3 p-3 rounded" style={{ background: "rgba(10,115,168,0.05)", border: "1px dashed var(--border)" }}>
-          <div className="text-[11px] uppercase tracking-wider font-medium" style={{ color: "var(--muted)" }}>
-            Contract
-          </div>
-          <div className="grid grid-cols-3 gap-3">
-            <div>
-              <Label hint={expiriesLoading ? "loading…" : (expiries.length ? `${expiries.length} available` : undefined)}>
-                Expiry
-              </Label>
-              {expiriesErr ? (
-                <>
-                  <input
-                    type="date" className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                    value={expiry} onChange={e => setExpiry(e.target.value)} required
-                  />
-                  <div className="text-[10px] mt-1" style={{ color: "var(--bad)" }}>
-                    {expiriesErr} — pick a date manually
-                  </div>
-                </>
-              ) : (
-                <select
-                  className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                  value={expiry} onChange={e => setExpiry(e.target.value)}
-                  required disabled={expiriesLoading || expiries.length === 0}
-                >
-                  <option value="">
-                    {expiriesLoading
-                      ? "loading…"
-                      : !symbol
-                        ? "Expiry"
-                        : expiries.length === 0
-                          ? "no expiries"
-                          : "— select —"}
-                  </option>
-                  {expiries.map(e => (
-                    <option key={e} value={e}>{fmtDate(e)}</option>
-                  ))}
-                </select>
-              )}
-            </div>
-            <div>
-              <Label>Strike</Label>
-              {strikesErr ? (
-                <>
-                  <input
-                    type="number" step="0.01" min="0.01"
-                    className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                    placeholder="200" value={strike} onChange={e => setStrike(e.target.value)} required
-                  />
-                  <div className="text-[10px] mt-1" style={{ color: "var(--bad)" }}>
-                    {strikesErr} — enter a strike manually
-                  </div>
-                </>
-              ) : (
-                <StrikePicker
-                  value={strike}
-                  strikes={strikes}
-                  loading={strikesLoading}
-                  disabled={strikesLoading || strikes.length === 0}
-                  placeholder={
-                    !expiry
-                      ? "Strike"
-                      : strikes.length === 0
-                        ? "no strikes"
-                        : "— select —"
-                  }
-                  onChange={setStrike}
-                  style={inputStyle}
-                />
-              )}
-            </div>
-            <div>
-              <Label>Right</Label>
-              <div className="flex gap-2">
-                <SegBtn active={right === "call"} onClick={() => setRight("call")}>Call</SegBtn>
-                <SegBtn active={right === "put"} onClick={() => setRight("put")}>Put</SegBtn>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Express market buttons — primary path: 1 click after Symbol+Qty */}
-      <div className="grid grid-cols-2 gap-3">
-        <button
-          type="button"
-          disabled={submitting || !acctId}
-          onClick={() => placeOrder({ overrideSide: "buy", overrideType: "market" })}
-          className="btn-primary w-full p-2.5 text-sm inline-flex items-center justify-center gap-2"
-        >
-          <span>BUY at MARKET</span>
-          {submitting && <Spinner />}
-        </button>
-        <button
-          type="button"
-          disabled={submitting || !acctId}
-          onClick={() => placeOrder({ overrideSide: "sell", overrideType: "market" })}
-          className="btn-danger w-full p-2.5 text-sm inline-flex items-center justify-center gap-2"
-        >
-          <span>SELL at MARKET</span>
-          {submitting && <Spinner />}
-        </button>
-      </div>
-
-      {/* ── Custom order (limit / stop / stop-limit) ───────────────────── */}
-      <div className="pt-4 border-t" style={{ borderColor: "var(--border)" }}>
-        <div className="text-xs uppercase tracking-wider mb-3" style={{ color: "var(--muted)" }}>
-          Custom order
-        </div>
-
-        <div className="p-4 rounded space-y-4" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <Label>Side</Label>
-              <div className="flex gap-2">
-                <SegBtn color="good" active={side === "buy"} onClick={() => setSide("buy")}>Buy</SegBtn>
-                <SegBtn color="bad" active={side === "sell"} onClick={() => setSide("sell")}>Sell</SegBtn>
-              </div>
-            </div>
-            <div>
-              <Label>Order type</Label>
-              <select
-                value={orderType} onChange={e => setOrderType(e.target.value as OrderType)}
-                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-              >
-                <option value="market">Market</option>
-                <option value="limit">Limit</option>
-                <option value="stop">Stop</option>
-                <option value="stop_limit">Stop-limit</option>
-              </select>
-            </div>
-          </div>
-
-          {(orderType === "limit" || orderType === "stop_limit") && (
-            <div>
-              <Label>Limit price</Label>
-              <input
-                type="number" step="0.01" min="0.01"
-                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                placeholder="200.00" value={limit} onChange={e => setLimit(e.target.value)} required
-              />
-            </div>
-          )}
-          {(orderType === "stop" || orderType === "stop_limit") && (
-            <div>
-              <Label>Stop price</Label>
-              <input
-                type="number" step="0.01" min="0.01"
-                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
-                placeholder="195.00" value={stop} onChange={e => setStop(e.target.value)} required
-              />
-            </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={submitting || !acctId}
-            className={(side === "buy" ? "btn-primary" : "btn-danger") + " w-full p-2.5 text-sm capitalize inline-flex items-center justify-center gap-2"}
-          >
-            <span>{`${side === "buy" ? "Buy" : "Sell"} ${orderType.replace("_", "-")} order`}</span>
-            {submitting && <Spinner />}
-          </button>
-        </div>
-      </div>
-    </form>
-  );
-
-  // ── Order summary — collapsible accordion ────────────────────────────────
-  const isOption = instrument === "option";
-  const summaryHeadline = qty && symbol
-    ? `${side.toUpperCase()} ${qty} ${symbol.toUpperCase()}${isOption ? " (option)" : ""} · ${orderType.replace("_", "-")}`
-    : "Fill in symbol & quantity";
-
-  const summaryCard = (
-    <div className="rounded border sticky top-4 overflow-hidden" style={sectionStyle}>
-      {/* Accordion header — always visible, click to toggle */}
-      <button
-        type="button"
-        onClick={() => setSummaryOpen(v => !v)}
-        className="w-full flex items-center justify-between gap-3 p-4 text-left transition-colors hover:opacity-90"
-      >
-        <div className="min-w-0 flex-1">
-          <div className="font-semibold text-sm">Order summary</div>
-          <div className="text-[11px] mt-0.5 truncate" style={{ color: "var(--muted)" }}>
-            {summaryHeadline}
-          </div>
-        </div>
-        <span className="text-base shrink-0" style={{ color: "var(--muted)" }}>
-          {summaryOpen ? <ChevronUp /> : <ChevronDown />}
-        </span>
-      </button>
-
-      {/* Body */}
-      {summaryOpen && (
-        <div className="px-5 pb-5 pt-1 space-y-4 border-t" style={{ borderColor: "var(--border)" }}>
-          <div className="pt-3">
-            <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-              {isOption ? "OCC symbol" : "Symbol"}
-            </div>
-            <div className="font-mono text-xs break-all p-2 mt-1 rounded" style={{ background: "rgba(255,255,255,0.03)" }}>
-              {isOption
-                ? (occ ?? <span style={{ color: "var(--muted)" }}>fill in expiry, strike & right</span>)
-                : (symbol ? symbol.toUpperCase() : <span style={{ color: "var(--muted)" }}>enter a ticker</span>)
-              }
-            </div>
-          </div>
-
-          {isOption && (
-            <div className="border-t pt-3" style={{ borderColor: "var(--border)" }}>
-              <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: "var(--muted)" }}>Contract</div>
-              <dl className="space-y-1.5 text-sm">
-                <Row label="Underlying" value={symbol ? symbol.toUpperCase() : "—"} />
-                <Row label="Expiry" value={fmtDate(expiry)} />
-                <Row label="Strike" value={strike ? fmtMoney(Number(strike)) : "—"} />
-                <Row label="Type" value={right.toUpperCase()} valueColor={right === "call" ? "var(--good)" : "var(--bad)"} />
-              </dl>
-            </div>
-          )}
-
-          <div className="border-t pt-3" style={{ borderColor: "var(--border)" }}>
-            <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: "var(--muted)" }}>Order</div>
-            <dl className="space-y-1.5 text-sm">
-              <Row label="Side" value={side.toUpperCase()} valueColor={side === "buy" ? "var(--good)" : "var(--bad)"} />
-              <Row
-                label="Quantity"
-                value={qty
-                  ? `${qty} ${isOption ? `Contract${Number(qty) === 1 ? "" : "s"}` : `share${Number(qty) === 1 ? "" : "s"}`}`
-                  : "—"}
-              />
-              <Row label="Order type" value={orderType.replace("_", "-")} />
-              {(orderType === "limit" || orderType === "stop_limit") && (
-                <Row label="Limit" value={limit ? fmtMoney(Number(limit)) : "—"} />
-              )}
-              {(orderType === "stop" || orderType === "stop_limit") && (
-                <Row label="Stop" value={stop ? fmtMoney(Number(stop)) : "—"} />
-              )}
-              <Row label="Time in force" value="Day" />
-            </dl>
-          </div>
-
-          <div className="border-t pt-3" style={{ borderColor: "var(--border)" }}>
-            <div className="text-[11px] uppercase tracking-wider mb-2" style={{ color: "var(--muted)" }}>
-              {side === "buy" ? "Estimated cost" : "Estimated proceeds"}
-            </div>
-            {orderType === "market" ? (
-              <div className="text-sm" style={{ color: "var(--muted)" }}>
-                Computed at fill — depends on market price.
-              </div>
-            ) : (
-              <>
-                <div className="text-2xl font-semibold">{fmtMoney(estCost)}</div>
-                <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
-                  {qty || "—"} × {limit ? fmtMoney(Number(limit)) : "—"}
-                  {isOption ? " × 100 (contract multiplier)" : ""}
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-
-  // Wait for the broker list before rendering the form — otherwise the
-  // page briefly shows an empty broker dropdown until /api/brokers responds.
   if (acctsLoading) return <PageLoading />;
 
+  // Order-type descriptor used inside both CTA button labels so the
+  // trader sees the exact action: "Buy · Market", "Sell · Limit @ $200".
+  const typeLabel = orderType === "market" ? "Market"
+    : orderType === "limit" ? `Limit @ ${limit ? fmtMoney(Number(limit)) : "—"}`
+    : orderType === "stop" ? `Stop @ ${stop ? fmtMoney(Number(stop)) : "—"}`
+    : "Stop-Limit";
+
   return (
-    <div className="space-y-5">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Trade panel</h1>
-          <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            Orders placed here mirror to all subscribers who have copy trading on, scaled by their multiplier.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => setExitConfirmOpen(true)}
-          disabled={exitBusy}
-          title="Close every open position at market across all connected brokers"
-          className="btn-danger-soft shrink-0 px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
+    <div className="space-y-4">
+      {/* ── Top row: ticket + watchlist placeholder, side-by-side ─────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
+
+        {/* ────────────── TRADE TICKET ────────────── */}
+        <form
+          onSubmit={submit}
+          className="overflow-hidden flex flex-col"
+          style={ticketStyle}
         >
-          <span>Exit All</span>
-          {exitBusy && <Spinner />}
-        </button>
+          {/* Header — two matching pill toggles. Both use the same
+              rounded-full track + identical inner-button geometry so they
+              read as a balanced pair. Options/Stocks is the neutral one
+              (subtle white-tint active state); Buy/Sell is the loud one
+              (colored gradient active state). */}
+          <div
+            className="px-4 py-3"
+            style={{ borderBottom: "1px solid var(--border)" }}
+          >
+            {/* Instrument switch — Options / Stocks. Full-width segmented
+                control with `rounded-lg` to match the radius of the Buy /
+                Sell CTA buttons at the footer. Each button flexes equally
+                to fill half the row. */}
+            <div
+              className="flex w-full p-0.5 rounded-lg"
+              style={{ background: "rgba(0,0,0,0.35)", border: "1px solid var(--border)" }}
+            >
+              {(["option", "stock"] as const).map(kind => {
+                const active = instrument === kind;
+                return (
+                  <button
+                    key={kind}
+                    type="button"
+                    onClick={() => setInstrument(kind)}
+                    className="flex-1 px-3.5 py-2 text-[11px] font-bold uppercase tracking-wider rounded-md transition-all"
+                    style={
+                      active
+                        ? {
+                            background: "rgba(255,255,255,0.08)",
+                            color: "var(--text)",
+                            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.12)",
+                          }
+                        : { color: "var(--muted)" }
+                    }
+                  >
+                    {kind === "option" ? "Options" : "Stocks"}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Body — all input rows */}
+          <div className="p-4 space-y-3.5">
+            {/* Symbol — the visual focal point. Large, bold, monospace. */}
+            <div>
+              <TinyLabel>
+                Symbol
+              </TinyLabel>
+              <input
+                className="w-full px-3 text-[17px] font-bold tracking-tight uppercase outline-none transition-colors"
+                style={{
+                  ...inputStyle,
+                  fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace",
+                  height: 42,
+                }}
+                placeholder="AAPL"
+                value={symbol}
+                onChange={e => setSymbol(e.target.value)}
+                required
+              />
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {POPULAR_SYMBOLS.map(tk => {
+                  const selected = symbol.trim().toUpperCase() === tk;
+                  return (
+                    <button
+                      key={tk}
+                      type="button"
+                      onClick={() => setSymbol(tk)}
+                      className="px-[9.2px] py-[2.3px] text-[11.5px] font-medium rounded-md transition-all"
+                      style={{
+                        border: `1px solid ${selected ? "rgba(10,115,168,0.45)" : "var(--border)"}`,
+                        background: selected
+                          ? "linear-gradient(180deg, rgba(10,115,168,0.25), rgba(10,115,168,0.1))"
+                          : "transparent",
+                        color: selected ? "var(--text)" : "var(--muted)",
+                      }}
+                    >
+                      {tk}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Field rows — layout depends on instrument.
+                Options: row A is [Qty | Expiry | Strike] · row B is [Right | Order type].
+                Stocks:  single row [Qty | Order type] (no contract fields).
+                All inputs share the same height (px-2.5 py-1.5 text-sm) so
+                the rows read as a clean grid. The Right toggle's inner pill
+                buttons use the same vertical padding to line up with the
+                neighboring select / input boxes. */}
+            {isOption ? (
+              <>
+                {/* Row A: Qty · Expiry · Strike — grouped inside a tinted
+                    dashed wrapper to visually separate the "contract" inputs
+                    from the rest of the form (same treatment we had before
+                    the layout flatten). Inner inputs still pin at 34px so
+                    the row reads as a single aligned strip. */}
+                <div
+                  className="p-2.5 rounded-lg"
+                  style={{
+                    background: "linear-gradient(180deg, rgba(10,115,168,0.06), rgba(10,115,168,0.02))",
+                    border: "1px dashed rgba(10,115,168,0.25)",
+                  }}
+                >
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <TinyLabel>Qty</TinyLabel>
+                    <input
+                      type="number" step="1" min="1"
+                      className="w-full px-2.5 text-sm tabular-nums outline-none"
+                      style={{ ...inputStyle, height: 34 }}
+                      value={qty}
+                      onChange={e => setQty(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div>
+                    <TinyLabel hint={expiriesLoading ? "…" : (expiries.length ? `${expiries.length}` : undefined)}>
+                      Expiry
+                    </TinyLabel>
+                    {expiriesErr ? (
+                      <input
+                        type="date"
+                        className="w-full px-2.5 text-sm outline-none"
+                        style={{ ...inputStyle, height: 34 }}
+                        value={expiry}
+                        onChange={e => setExpiry(e.target.value)}
+                        required
+                      />
+                    ) : (
+                      <SearchableSelect
+                        value={expiry}
+                        options={expiries.map(e => ({ value: e, label: fmtDate(e) }))}
+                        onChange={setExpiry}
+                        loading={expiriesLoading}
+                        disabled={expiriesLoading || expiries.length === 0}
+                        placeholder={!symbol ? "—" : expiries.length === 0 ? "none" : "Select"}
+                        style={{ height: 34 }}
+                      />
+                    )}
+                  </div>
+                  <div>
+                    <TinyLabel>Strike</TinyLabel>
+                    {strikesErr ? (
+                      <input
+                        type="number" step="0.01" min="0.01"
+                        className="w-full px-2.5 text-sm tabular-nums outline-none"
+                        style={{ ...inputStyle, height: 34 }}
+                        placeholder="200"
+                        value={strike}
+                        onChange={e => setStrike(e.target.value)}
+                        required
+                      />
+                    ) : (
+                      <SearchableSelect
+                        value={strike}
+                        options={strikes.map(s => ({
+                          value: String(s),
+                          label: s.toLocaleString(undefined, { minimumFractionDigits: 2 }),
+                        }))}
+                        onChange={setStrike}
+                        loading={strikesLoading}
+                        disabled={strikesLoading || strikes.length === 0}
+                        placeholder={!expiry ? "—" : strikes.length === 0 ? "none" : "Select"}
+                        style={{ height: 34 }}
+                      />
+                    )}
+                  </div>
+                </div>
+                </div>
+
+                {/* Row B: Right · Order type — same 34px height so the
+                    segmented pill matches the select beside it. */}
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <TinyLabel>Right</TinyLabel>
+                    <div
+                      className="flex p-0.5"
+                      style={{
+                        background: "rgba(0,0,0,0.3)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        height: 34,
+                      }}
+                    >
+                      <PillTab active={right === "call"} onClick={() => setRight("call")}>Call</PillTab>
+                      <PillTab active={right === "put"} onClick={() => setRight("put")}>Put</PillTab>
+                    </div>
+                  </div>
+                  <div>
+                    <TinyLabel>Order type</TinyLabel>
+                    <SearchableSelect
+                      value={orderType}
+                      options={ORDER_TYPE_OPTIONS}
+                      onChange={v => setOrderType(v as OrderType)}
+                      searchable={false}
+                      style={{ height: 34 }}
+                    />
+                  </div>
+                </div>
+              </>
+            ) : (
+              // Stocks: just Qty + Order type. Same 34px row height.
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <TinyLabel>Qty</TinyLabel>
+                  <input
+                    type="number" step="1" min="1"
+                    className="w-full px-2.5 text-sm tabular-nums outline-none"
+                    style={{ ...inputStyle, height: 34 }}
+                    value={qty}
+                    onChange={e => setQty(e.target.value)}
+                    required
+                  />
+                </div>
+                <div>
+                  <TinyLabel>Order type</TinyLabel>
+                  <SearchableSelect
+                    value={orderType}
+                    options={ORDER_TYPE_OPTIONS}
+                    onChange={v => setOrderType(v as OrderType)}
+                    searchable={false}
+                    style={{ height: 34 }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Price inputs — only render the ones the current order type
+                needs. For LIMIT we split the row 50/50: input on the left,
+                three Bid / Mid / Ask pills on the right. Each pill is a
+                button that seeds the limit with that price; values are
+                plain numbers (no $ or currency code) so they read at a
+                glance and don't crowd the 50% column. */}
+            {(orderType === "limit" || orderType === "stop_limit") && (() => {
+              const hasQuote =
+                isOption && optionQuote &&
+                (optionQuote.bid !== null || optionQuote.ask !== null || optionQuote.mid !== null);
+              const fmtPx = (n: number) => n.toFixed(2);
+              return (
+                <div
+                  className={
+                    hasQuote ? "grid grid-cols-2 gap-2" : "grid grid-cols-1 gap-2"
+                  }
+                >
+                  <div>
+                    <TinyLabel>Limit price</TinyLabel>
+                    <input
+                      type="number" step="0.01" min="0.01"
+                      className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
+                      style={inputStyle}
+                      placeholder="200.00"
+                      value={limit}
+                      onChange={e => setLimit(e.target.value)}
+                    />
+                  </div>
+
+                  {hasQuote && (
+                    <div>
+                      <TinyLabel>Quote</TinyLabel>
+                      {/* Three pills side-by-side, equal width, height
+                          matches the limit input (34px) so the row reads
+                          as one aligned strip. Each pill is a button —
+                          click seeds the limit with that price. */}
+                      <div className="flex gap-1.5" style={{ height: 34 }}>
+                        {(["bid", "mid", "ask"] as const).map(side => {
+                          const val =
+                            side === "bid" ? optionQuote!.bid :
+                            side === "mid" ? optionQuote!.mid :
+                            optionQuote!.ask;
+                          const color =
+                            side === "bid" ? "var(--bad)" :
+                            side === "mid" ? "var(--text)" :
+                            "var(--good)";
+                          const disabled = val === null;
+                          return (
+                            <button
+                              key={side}
+                              type="button"
+                              disabled={disabled}
+                              onClick={() => !disabled && setLimit(fmtPx(val!))}
+                              className="flex-1 flex flex-col items-center justify-center rounded-md tabular-nums transition-colors hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                              style={inputStyle}
+                              title={disabled ? "no quote" : `Use ${side} as limit`}
+                            >
+                              <span
+                                className="text-[8px] uppercase tracking-[0.15em] leading-none"
+                                style={{ color: "var(--muted)" }}
+                              >
+                                {side}
+                              </span>
+                              <span
+                                className="text-[12px] font-semibold leading-tight mt-0.5"
+                                style={{ color }}
+                              >
+                                {val !== null ? fmtPx(val) : "—"}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {(orderType === "stop" || orderType === "stop_limit") && (
+              <div>
+                <TinyLabel>Stop price</TinyLabel>
+                <input
+                  type="number" step="0.01" min="0.01"
+                  className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
+                  style={inputStyle}
+                  placeholder="195.00"
+                  value={stop}
+                  onChange={e => setStop(e.target.value)}
+                />
+              </div>
+            )}
+
+            {/* Bracket — PERCENTAGE inputs, side-by-side. The number entered
+                is interpreted as % away from the reference price (limit for
+                limit/stop-limit; the small "Ref price" input below for
+                market orders). Computed absolute price shows under each
+                input so the trader sees what's going to the broker. */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                {!bracketCompatible && (
+                  <span className="text-[10px]" style={{ color: "var(--muted)" }}>
+                    market/limit only
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {/* Take profit % — single flat input. The "%" lives in the
+                    label only; no inline suffix, no wrapper div. */}
+                <div>
+                  <TinyLabel>Take profit %</TinyLabel>
+                  <input
+                    type="number" step="0.01" min="0.01"
+                    disabled={!bracketCompatible}
+                    className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none disabled:opacity-50"
+                    style={{
+                      ...inputStyle,
+                      borderColor: takeProfit && bracketCompatible
+                        ? "rgba(34,197,94,0.45)"
+                        : "var(--border)",
+                    }}
+                    placeholder="10"
+                    value={takeProfit}
+                    onChange={e => setTakeProfit(e.target.value)}
+                  />
+                  {tpAbsPrice !== null && (
+                    <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+                      ≈ <span style={{ color: "var(--good)" }}>{fmtMoney(tpAbsPrice)}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Stop loss % — same shape, red accent when filled. */}
+                <div>
+                  <TinyLabel>Stop loss %</TinyLabel>
+                  <input
+                    type="number" step="0.01" min="0.01"
+                    disabled={!bracketCompatible}
+                    className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none disabled:opacity-50"
+                    style={{
+                      ...inputStyle,
+                      borderColor: stopLoss && bracketCompatible
+                        ? "rgba(239,68,68,0.45)"
+                        : "var(--border)",
+                    }}
+                    placeholder="5"
+                    value={stopLoss}
+                    onChange={e => setStopLoss(e.target.value)}
+                  />
+                  {slAbsPrice !== null && (
+                    <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+                      ≈ <span style={{ color: "var(--bad)" }}>{fmtMoney(slAbsPrice)}</span>
+                    </div>
+                  )}
+                </div>
+
+                {bracketGeometryError && (
+                  <div className="col-span-2 text-[10px]" style={{ color: "var(--warn)" }}>
+                    {bracketGeometryError}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Footer — TWO CTAs (Buy + Sell) side-by-side, no shared toggle.
+              Each button is its own commit point: click Buy → places buy
+              order; click Sell → places sell. The bracket TP/SL prices are
+              recomputed per-side at click time inside placeOrder, so the
+              correct geometry goes to the broker regardless of which side
+              the preview was rendered for. */}
+          <div
+            className="px-4 py-3 space-y-2"
+            style={{ borderTop: "1px solid var(--border)", background: "rgba(0,0,0,0.2)" }}
+          >
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => placeOrder("buy")}
+                disabled={submitting || !acctId}
+                className="w-full px-4 py-3 text-sm font-bold tracking-wide rounded-lg inline-flex items-center justify-center gap-2 transition-all"
+                style={{
+                  background: "linear-gradient(135deg, #2dd66b 0%, #16a34a 50%, #15803d 100%)",
+                  color: "#06210f",
+                  opacity: submitting || !acctId ? 0.6 : 1,
+                  cursor: submitting || !acctId ? "not-allowed" : "pointer",
+                }}
+              >
+                {submitting && side === "buy" && <Spinner />}
+                <span>Buy · {typeLabel}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => placeOrder("sell")}
+                disabled={submitting || !acctId}
+                className="w-full px-4 py-3 text-sm font-bold tracking-wide rounded-lg inline-flex items-center justify-center gap-2 transition-all"
+                style={{
+                  background: "linear-gradient(135deg, #fb7474 0%, #dc2626 50%, #b91c1c 100%)",
+                  color: "#1a0606",
+                  opacity: submitting || !acctId ? 0.6 : 1,
+                  cursor: submitting || !acctId ? "not-allowed" : "pointer",
+                }}
+              >
+                {submitting && side === "sell" && <Spinner />}
+                <span>Sell · {typeLabel}</span>
+              </button>
+            </div>
+
+            {/* Live preview footer — OCC symbol (options) + cost estimate. */}
+            <div
+              className="flex items-center justify-between text-[10px] tabular-nums"
+              style={{ color: "var(--muted)" }}
+            >
+              <div className="truncate">
+                {isOption
+                  ? (occ ? <span className="font-mono">{occ}</span> : <span>fill expiry · strike · right</span>)
+                  : <span>{symbol ? symbol.toUpperCase() : "—"} · stock</span>
+                }
+              </div>
+              <div className="shrink-0">
+                {estCost !== null
+                  ? <span>≈ {fmtMoney(estCost)}</span>
+                  : orderType === "market"
+                    ? <span>market price</span>
+                    : <span>—</span>}
+              </div>
+            </div>
+          </div>
+        </form>
+
+        {/* ────────────── WATCHLIST PLACEHOLDER ────────────── */}
+        <WatchlistPlaceholder />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[640px_304px] gap-5 items-start">
-        <div>{formBody}</div>
-        <div>{summaryCard}</div>
-      </div>
-
-
-      <OpenPositionsTable ref={positionsRef} className="pt-2" />
-      <ExitAllModal
-        open={exitConfirmOpen}
-        busy={exitBusy}
-        onConfirm={(action, includeSubs) => doExitAll(action, includeSubs)}
-        onCancel={() => setExitConfirmOpen(false)}
-      />
-    </div>
-  );
-}
-
-// Small reusable label/value row for the summary card.
-function Row({
-  label, value, valueColor,
-}: {
-  label: string; value: React.ReactNode; valueColor?: string;
-}) {
-  return (
-    <div className="flex justify-between gap-2">
-      <dt style={{ color: "var(--muted)" }}>{label}</dt>
-      <dd className="font-medium text-right capitalize" style={valueColor ? { color: valueColor } : undefined}>
-        {value}
-      </dd>
+      {/* ── Divider, bulk-exit bar, then the open positions table ──────── */}
+      <hr className="my-2" style={{ borderColor: "var(--border)" }} />
+      <BulkExitBar onActionComplete={() => positionsRef.current?.refresh()} />
+      <OpenPositionsTable ref={positionsRef} />
     </div>
   );
 }

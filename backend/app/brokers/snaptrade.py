@@ -487,9 +487,68 @@ class SnapTradeAdapter(BrokerAdapter):
             },
         )
 
+    def get_option_latest_quote(self, occ_symbol: str) -> tuple[Decimal | None, Decimal | None]:
+        """Latest bid + ask for an OCC option symbol via SnapTrade.
+
+        SnapTrade wants the 21-char OCC form **with spaces** padding the
+        root to 6 chars (``AAPL  260608C00305000``). Our internal
+        ``build_occ_symbol`` produces the no-space form Alpaca uses
+        (``AAPL260608C00305000``) — we re-insert the padding here.
+
+        Returns (bid, ask) as Decimals or (None, None) on any failure;
+        the trade panel falls back to manual entry on null. We also
+        treat 0/0 quotes as null (illiquid contracts late session).
+        """
+        if not occ_symbol or len(occ_symbol) < 16:
+            return None, None
+        # Split off the 15-char suffix (YYMMDD + C/P + 8-digit strike)
+        # and pad the root to 6 chars with spaces.
+        suffix = occ_symbol[-15:]
+        root = occ_symbol[:-15]
+        padded = f"{root:<6}{suffix}"
+        try:
+            resp = self._c().trading.get_user_account_option_quotes(
+                user_id=self._user_id,
+                user_secret=self._user_secret,
+                account_id=self._account_id,
+                symbol=padded,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "snaptrade.get_option_latest_quote(%s) failed: %s", occ_symbol, exc,
+            )
+            return None, None
+
+        body = getattr(resp, "body", resp)
+        # The response shape varies a bit by SDK version — try the most
+        # common attribute names and fall through to None if none match.
+        bid = _dec_or_none(
+            _attr(body, "bid_price", "bidPrice", "bid")
+        )
+        ask = _dec_or_none(
+            _attr(body, "ask_price", "askPrice", "ask")
+        )
+        if bid is not None and bid <= 0:
+            bid = None
+        if ask is not None and ask <= 0:
+            ask = None
+        log.info("snaptrade.get_option_latest_quote(%s) → bid=%s ask=%s",
+                 occ_symbol, bid, ask)
+        return bid, ask
+
     # ── orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        # SnapTrade has no native bracket / OCO. Callers (trade endpoint,
+        # copy_engine) now strip the bracket fields from the request for
+        # non-Alpaca brokers — the emulator places the exit legs on fill,
+        # see app/services/bracket_emulator.py. We assert the fields are
+        # absent so a future regression that re-introduces them surfaces
+        # immediately instead of silently dropping the SL/TP.
+        assert req.take_profit_price is None and req.stop_loss_price is None, (
+            "SnapTrade adapter should not receive bracket fields; the trade "
+            "endpoint must strip them and let bracket_emulator handle the exits."
+        )
         if req.instrument_type == InstrumentType.OPTION:
             return self._place_option_order(req)
         if req.instrument_type != InstrumentType.STOCK:
