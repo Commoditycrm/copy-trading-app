@@ -131,23 +131,49 @@ function fmtQty(q: string | number | null | undefined): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
-/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors.
- *  Used by the trader-side fanout table to surface the spread of how long
- *  each subscriber's broker took to accept their copy. Rows with a null
- *  broker_lag_ms (mirror rejected before reaching the broker, or still in
- *  flight) are excluded from all three stats. Returns {min, avg, max} as
- *  ms, or all-null when no child has a usable lag yet. */
+/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors,
+ *  along with the broker name responsible for the min and max so the
+ *  trader can see at a glance which broker is fastest / slowest. Rows
+ *  with a null broker_lag_ms (mirror rejected before reaching the broker,
+ *  or still in flight) are excluded from all three stats. Returns all-
+ *  null when no child has a usable lag yet.
+ *
+ *  For "avg" we don't surface a single broker because it's an aggregate
+ *  across many — but if every contributing row was on the *same* broker
+ *  we surface that name (useful when the whole fanout went to one broker
+ *  type, e.g. a fleet of Alpaca-only subscribers). */
 function brokerLagStats(
   children: FanoutChild[]
-): { min: number | null; avg: number | null; max: number | null } {
-  const vals = children
-    .map(c => c.broker_lag_ms)
-    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
-  if (vals.length === 0) return { min: null, avg: null, max: null };
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
-  const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
-  return { min, avg, max };
+): {
+  min: number | null; minBroker: string | null;
+  avg: number | null; avgBroker: string | null;
+  max: number | null; maxBroker: string | null;
+} {
+  type Row = { ms: number; broker: string | null };
+  const rows: Row[] = children
+    .map(c => ({
+      ms: c.broker_lag_ms as number,
+      broker: c.broker_name ?? null,
+    }))
+    .filter((r): r is Row => typeof r.ms === "number" && Number.isFinite(r.ms) && r.ms >= 0);
+  if (rows.length === 0) {
+    return { min: null, minBroker: null, avg: null, avgBroker: null, max: null, maxBroker: null };
+  }
+  let minRow = rows[0], maxRow = rows[0], sum = 0;
+  for (const r of rows) {
+    if (r.ms < minRow.ms) minRow = r;
+    if (r.ms > maxRow.ms) maxRow = r;
+    sum += r.ms;
+  }
+  const distinctBrokers = new Set(rows.map(r => r.broker).filter(Boolean));
+  return {
+    min: minRow.ms, minBroker: minRow.broker,
+    avg: Math.round(sum / rows.length),
+    // Avg broker: only meaningful when every contributing row shares the
+    // same broker name; otherwise the single label would be misleading.
+    avgBroker: distinctBrokers.size === 1 ? Array.from(distinctBrokers)[0] : null,
+    max: maxRow.ms, maxBroker: maxRow.broker,
+  };
 }
 
 // ── Compact metric card with optional inline sparkline ────────────────
@@ -529,14 +555,17 @@ const IcoTarget = () => (
 
 function SubscriberPill({ counts }: { counts: SubscriberCounts }) {
   // "6 ✓ / 0 ✗ of 6" — green ok, red errors, neutral denominator.
+  // `whitespace-nowrap` keeps the whole pill on a single line even when
+  // the column is narrow; without it the column was breaking each
+  // segment onto its own row (the screenshot fix).
   return (
-    <span className="inline-flex items-center gap-1 text-xs">
-      <span style={{ color: "var(--good)" }}>{counts.submitted} ✓</span>
+    <span className="inline-flex items-center gap-1 text-xs whitespace-nowrap">
+      <span style={{ color: "var(--good)" }}>{counts.submitted}&nbsp;✓</span>
       <span style={{ color: "var(--muted)" }}>/</span>
       <span style={{ color: counts.errors > 0 ? "var(--bad)" : "var(--muted)" }}>
-        {counts.errors} ✗
+        {counts.errors}&nbsp;✗
       </span>
-      <span style={{ color: "var(--muted)" }}>of {counts.total}</span>
+      <span style={{ color: "var(--muted)" }}>of&nbsp;{counts.total}</span>
     </span>
   );
 }
@@ -1118,14 +1147,29 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
                       {fmtMs(f.total_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.min) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.min) }}>
                       {fmtMs(blStats.min)}
+                      {blStats.minBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.minBroker})
+                        </span>
+                      )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.avg) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.avg) }}>
                       {fmtMs(blStats.avg)}
+                      {blStats.avgBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.avgBroker})
+                        </span>
+                      )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.max) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.max) }}>
                       {fmtMs(blStats.max)}
+                      {blStats.maxBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.maxBroker})
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-3">
                       <SubscriberPill counts={f.subscribers} />

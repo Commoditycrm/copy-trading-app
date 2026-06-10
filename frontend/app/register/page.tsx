@@ -43,18 +43,8 @@ export default function RegisterPage() {
   return (
     <main className="min-h-screen grid place-items-center p-6">
       <form onSubmit={submit} className="card w-full max-w-md p-8 space-y-5">
-        <div className="flex items-center gap-3">
-          <img
-            src="/brand-icon.avif"
-            alt="ARK"
-            width={45}
-            height={45}
-            style={{ width: 45, height: 45, borderRadius: 8, objectFit: "cover" }}
-          />
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>ARK</div>
-            <div className="text-xs" style={{ color: "var(--muted)" }}>Create an account</div>
-          </div>
+        <div className="text-center">
+          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>Sign Up</div>
         </div>
 
         <div className="space-y-3">

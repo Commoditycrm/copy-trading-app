@@ -73,7 +73,11 @@ def _serialize_child(
     broker_name = None
     if account is not None:
         if account.broker == BrokerName.SNAPTRADE and account.brokerage_name:
-            broker_name = account.brokerage_name
+            # Suffix " (ST)" so the trader can tell at a glance that this
+            # subscriber's "Alpaca" / "Webull" / "Robinhood" was routed via
+            # SnapTrade, not a direct integration. Direct connections stay
+            # bare ("Alpaca", "Webull") — see the else branch.
+            broker_name = f"{account.brokerage_name} (ST)"
         else:
             broker_name = (account.broker.value if account.broker else None) or account.label
     # New lifecycle stamps — see Order model / alembic e7a1d2c40f01.
