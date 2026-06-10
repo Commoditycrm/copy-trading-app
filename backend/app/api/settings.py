@@ -36,9 +36,19 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
     PATCH endpoint that returns this shape. ``todays_realized_pnl`` is
     computed from the fills table here — the live tick from pnl_poller
     pushes the same number via SSE for the panel's live refresh."""
+    # The followed trader's business_name is surfaced to subscribers so
+    # the AppShell can show the trader's brand instead of the default
+    # "ARK" wordmark. Cheap one-row lookup via PK — no join needed since
+    # we already have the FK.
+    trader_business_name: str | None = None
+    if s.following_trader_id:
+        trader = db.get(User, s.following_trader_id)
+        if trader is not None:
+            trader_business_name = trader.business_name
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
+        following_trader_business_name=trader_business_name,
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
@@ -544,4 +554,12 @@ def toggle_trading(
 def list_available_traders(db: Session = Depends(get_db), _: User = Depends(current_user)) -> list[dict]:
     """Subscribers use this to find the trader to follow."""
     rows = db.execute(select(User).where(User.role == UserRole.TRADER, User.is_active.is_(True))).scalars()
-    return [{"id": str(t.id), "display_name": t.display_name, "email": t.email} for t in rows]
+    return [
+        {
+            "id": str(t.id),
+            "display_name": t.display_name,
+            "email": t.email,
+            "business_name": t.business_name,
+        }
+        for t in rows
+    ]

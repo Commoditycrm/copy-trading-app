@@ -37,6 +37,9 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
         password_hash=hash_password(payload.password),
         role=payload.role,
         display_name=payload.display_name,
+        # business_name is required for traders (enforced by RegisterIn) and
+        # forced to None for everyone else, so this is safe to pass through.
+        business_name=payload.business_name,
     )
     db.add(user)
     db.flush()

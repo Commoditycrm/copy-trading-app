@@ -9,6 +9,10 @@ from pydantic import BaseModel, Field, field_validator
 class SubscriberSettingsOut(BaseModel):
     user_id: uuid.UUID
     following_trader_id: uuid.UUID | None
+    # Brand of the trader being followed — surfaced in the shell so the
+    # subscriber sees the trader's app name (not "ARK"). None when not
+    # following anyone, or for legacy traders that pre-date business_name.
+    following_trader_business_name: str | None = None
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
