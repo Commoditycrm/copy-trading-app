@@ -1003,14 +1003,14 @@ export default function PerformancePage() {
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
                 ["Trader Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
-                ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
-                ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
-                ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
+                ["DB SAVED AT", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
+                ["PUBLISHED FOR SUBS AT", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
+                ["ALL SUBS COMPLETED AT", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
-                ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
-                ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
-                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
-                ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
+                ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. PUBLISHED FOR SUBS AT − DB SAVED AT. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
+                ["Detection Lag", "Broker accept → our DB row created. DB SAVED AT − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
+                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. ALL SUBS COMPLETED AT − DB SAVED AT."],
+                ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. ALL SUBS COMPLETED AT − Broker Accepted At."],
                 ["Lowest Broker Lag", "Fastest subscriber: minimum broker_lag (mirror-submit → broker-accept) across all subscriber children for this trade."],
                 ["Average Broker Lag", "Mean broker_lag across all subscriber children for this trade."],
                 ["Highest Broker Lag", "Slowest subscriber: maximum broker_lag across all subscriber children for this trade."],
@@ -1185,14 +1185,14 @@ export default function PerformancePage() {
                                     ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
                                     ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order.", "broker_accepted_at"],
                                     ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time.", "redis_published_at"],
-                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent DB SAVED AT. Grows with the number of subscribers ahead of this one in the fanout queue."],
                                     ["Eligibility Lag", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
                                     ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
                                     ["Broker Lag", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
                                     ["Broker Response", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
                                     // ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
                                     ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
-                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
+                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent DB SAVED AT."],
                                     ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
                                   ] as ([string, string] | [string, string, ChildSortField])[]).map((row) => {
                                     const [h, tip] = row;
@@ -1423,7 +1423,7 @@ export default function PerformancePage() {
           submit (or Alpaca&apos;s receive time for externally-placed orders).{" "}
           <strong style={{ color: "var(--text-2)" }}>Trader Listened At</strong> = our Alpaca trade_updates listener
           heard the event (NULL for in-app orders).{" "}
-          <strong style={{ color: "var(--text-2)" }}>Redis Published At</strong> = SSE event broadcast to subscribers.{" "}
+          <strong style={{ color: "var(--text-2)" }}>PUBLISHED FOR SUBS AT</strong> = SSE event broadcast to subscribers.{" "}
           <strong style={{ color: "var(--text-2)" }}>Picked At / Accepted At / Broker Accepted At</strong> (per-child) =
           when copy_engine picked the subscriber, passed eligibility, and their broker accepted, respectively.
         </p>

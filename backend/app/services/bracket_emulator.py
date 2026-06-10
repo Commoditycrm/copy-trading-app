@@ -53,10 +53,18 @@ _ALIVE_STATUSES = (
 )
 
 
-def _uses_native_bracket(broker: BrokerName) -> bool:
-    """Brokers that handle bracket OCO server-side — skip emulation for
-    these. (Alpaca's ``OrderClass.BRACKET`` is the only one today.)"""
-    return broker == BrokerName.ALPACA
+def _uses_native_bracket(broker: BrokerName, instrument_type: "InstrumentType | None" = None) -> bool:
+    """True only when the (broker, instrument) pair supports server-side
+    bracket / OCO orders. Currently that's Alpaca **stocks** only:
+    Alpaca's options API explicitly rejects complex orders (error
+    42210000 — "complex orders not supported for options trading"), so
+    options on Alpaca must use the emulator like SnapTrade does."""
+    from app.models.order import InstrumentType  # noqa: PLC0415
+    if broker != BrokerName.ALPACA:
+        return False
+    if instrument_type == InstrumentType.OPTION:
+        return False
+    return True
 
 
 def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
@@ -89,9 +97,11 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
     acct = db.get(BrokerAccount, entry.broker_account_id)
     if acct is None:
         return []
-    if _uses_native_bracket(acct.broker):
+    if _uses_native_bracket(acct.broker, entry.instrument_type):
         # Alpaca's OrderClass.BRACKET already attached these legs on the
-        # broker side — nothing for us to do.
+        # broker side — nothing for us to do. (Options on Alpaca are
+        # NOT native — see _uses_native_bracket; those fall through to
+        # the emulator path below.)
         return []
 
     # Idempotency: don't place exits twice. Re-deliveries of the same
