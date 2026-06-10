@@ -24,6 +24,10 @@ class User(Base, TimestampMixin):
         Enum(UserRole, name="user_role"), nullable=False, index=True
     )
     display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Trader-only: shown as the app name across the shell for the trader and
+    # for any subscriber who follows them. Required at registration for
+    # role=trader, nullable here so existing rows + subscriber rows are valid.
+    business_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
 
     broker_accounts = relationship(

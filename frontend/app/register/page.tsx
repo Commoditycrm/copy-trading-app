@@ -15,15 +15,28 @@ export default function RegisterPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<Role>("subscriber");
   const [displayName, setDisplayName] = useState("");
+  // Business name is REQUIRED when role=trader (enforced server-side too).
+  // For subscribers we just don't send it.
+  const [businessName, setBusinessName] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
+    if (role === "trader" && !businessName.trim()) {
+      notify.error("Business name is required for traders");
+      return;
+    }
     setLoading(true);
     try {
       await api("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify({ email, password, role, display_name: displayName || null }),
+        body: JSON.stringify({
+          email,
+          password,
+          role,
+          display_name: displayName || null,
+          business_name: role === "trader" ? businessName.trim() : null,
+        }),
         auth: false,
       });
       const tok = await api<{ access_token: string; refresh_token: string }>(
@@ -86,6 +99,29 @@ export default function RegisterPage() {
               >Trader</button>
             </div>
           </div>
+          {/* Trader-only: business / brand name. Required server-side too
+              (RegisterIn validator) — this is the mandatory app name that
+              gets shown to the trader and to every subscriber following
+              them, replacing the default "ARK" wordmark. */}
+          {role === "trader" && (
+            <div>
+              <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+                Business name <span style={{ color: "var(--bad)" }}>*</span>
+              </label>
+              <input
+                className="w-full p-2.5"
+                type="text"
+                autoComplete="organization"
+                value={businessName}
+                onChange={(e) => setBusinessName(e.target.value)}
+                required
+                maxLength={120}
+              />
+              <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+                Shown as your app name to you and every subscriber who follows you.
+              </div>
+            </div>
+          )}
         </div>
 
         <button disabled={loading} className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center gap-2">
