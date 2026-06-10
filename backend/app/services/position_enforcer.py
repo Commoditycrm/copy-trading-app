@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -70,7 +70,13 @@ def _position_pct(pos: BrokerPosition) -> Decimal | None:
     basis = abs(pos.cost_basis)
     if basis == 0:
         return None
-    return (pos.unrealized_pnl / basis) * Decimal(100)
+    # Decimal division produces many trailing digits (e.g.
+    # -13.54838709677419354838...%) which then leaks into the SSE
+    # event, the toast, the in-app notification, and the audit row.
+    # Round to 2 decimal places — same precision the user enters
+    # their TP/SL at, and what they'd expect to see in a report.
+    raw = (pos.unrealized_pnl / basis) * Decimal(100)
+    return raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def enforce_position_tp_sl(

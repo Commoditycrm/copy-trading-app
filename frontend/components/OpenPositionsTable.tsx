@@ -101,21 +101,49 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     // Real-time: any order event for this user (own placement, mirror from a
     // followed trader, cancellation, etc.) is a reason to re-check positions.
-    // Debounce so a burst of fanout events fires one network round-trip, and
-    // give the broker a moment to actually fill before we ask for the
-    // post-fill state.
-    const ssEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    //
+    // We fire multiple staggered refreshes per event burst, not just one,
+    // because subscribers DON'T have their own broker listener running
+    // (backend listeners are TRADER-only — see snaptrade_listener.start_all_listeners
+    // and trade_listener.start_all_listeners). That means the only SSE
+    // they ever receive for a mirror order is `order.copy_submitted`,
+    // emitted the instant we hand the order to the broker — BEFORE it
+    // fills. A single 1.5s refresh almost always misses the fill, so
+    // the user has to manually reload the page to see the new position.
+    //
+    // Staggered schedule (1.5s, 6s, 18s, 35s) catches:
+    //   - immediate-fill paper accounts (1.5s)
+    //   - typical live-broker fill latency (6s)
+    //   - laggy SnapTrade / multi-leg fills (18-35s)
+    //
+    // Burst-debounce: any new event clears the prior schedule so a flurry
+    // of fanout events fires ONE schedule, not N. The cleanup on unmount
+    // clears every pending timer.
+    const SCHEDULE_MS = [1_500, 6_000, 18_000, 35_000] as const;
+    const ssTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+    const clearTimers = useCallback(() => {
+      for (const t of ssTimers.current) clearTimeout(t);
+      ssTimers.current = [];
+    }, []);
     useEventStream((evt) => {
       if (
         evt.type !== "order.placed" &&
         evt.type !== "order.copy_submitted" &&
         evt.type !== "order.copy_failed" &&
-        evt.type !== "order.cancelled"
+        evt.type !== "order.cancelled" &&
+        // pnl_poller fires this when the per-position TP/SL enforcer
+        // closes a position at the broker. Without listening for it,
+        // the closed position lingers in the table until the user
+        // manually refreshes — even though the broker close has
+        // already been placed.
+        evt.type !== "position.auto_closed"
       ) return;
-      if (ssEventTimer.current) clearTimeout(ssEventTimer.current);
-      ssEventTimer.current = setTimeout(() => { refresh(); }, 1500);
+      clearTimers();
+      for (const ms of SCHEDULE_MS) {
+        ssTimers.current.push(setTimeout(() => { refresh(); }, ms));
+      }
     });
-    useEffect(() => () => { if (ssEventTimer.current) clearTimeout(ssEventTimer.current); }, []);
+    useEffect(() => () => { clearTimers(); }, [clearTimers]);
 
     async function closePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
