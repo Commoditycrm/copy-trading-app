@@ -29,6 +29,12 @@ class SubscriberSettingsOut(BaseModel):
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
     # UI-only — persisted but never enforced server-side.
     max_per_contract: Decimal | None = None
+    # Per-position TP/SL percentages applied to every open position.
+    # pnl_poller closes the offending position at market when the
+    # unrealized P&L breaches the configured threshold. Independent of
+    # the daily kill switches and of auto_liquidation_limit.
+    position_tp_pct: Decimal | None = None
+    position_sl_pct: Decimal | None = None
     # Percent of account equity (0–100). pnl_poller checks every 60s using
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
@@ -123,6 +129,28 @@ class DailyProfitLimitPctIn(BaseModel):
     a percentage of beginning-day balance. Pass null to disable."""
 
     daily_profit_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class PositionTpPctIn(BaseModel):
+    """Per-position take-profit % applied to EVERY open position.
+    When `unrealized_pnl / abs(cost_basis) * 100 >= position_tp_pct`,
+    pnl_poller closes that position at market. Pass null to disable.
+
+    Ceiling is intentionally high (1000%) — options can multi-bag.
+    Min is >0; a TP of 0% would close every position immediately."""
+
+    position_tp_pct: Decimal | None = Field(default=None, gt=0, le=1000)
+
+
+class PositionSlPctIn(BaseModel):
+    """Per-position stop-loss % applied to EVERY open position.
+    When `unrealized_pnl / abs(cost_basis) * 100 <= -position_sl_pct`,
+    pnl_poller closes that position at market. Pass null to disable.
+
+    Ceiling is 100% — you can't lose more than the cost basis.
+    Min is >0; an SL of 0% would close every position immediately."""
+
+    position_sl_pct: Decimal | None = Field(default=None, gt=0, le=100)
 
 
 class AutoLiquidationLimitIn(BaseModel):

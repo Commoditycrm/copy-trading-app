@@ -152,10 +152,24 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
             stop_price=price if otype == OrderType.STOP else None,
             status=OrderStatus.PENDING,
             is_closing=True,
-            # Mirror the entry's fanout flag — if subscribers mirrored
-            # the entry they'll also mirror the exits (when their own
-            # listener fires the emulator for their copy of the entry).
-            fanned_out_to_subscribers=False,
+            # CRITICAL: bracket exits are TRADER-ONLY. By policy
+            # (see copy_engine.fanout_async) subscribers never receive
+            # TP/SL — their mirrored entries are constructed with
+            # take_profit_price=NULL / stop_loss_price=NULL, so when
+            # the subscriber's own listener fires this emulator on
+            # their mirrored entry's fill, the "if not tp_price and
+            # not sl_price: return []" guard at the top short-circuits.
+            # We must ALSO make sure the trader's exits themselves
+            # never get broadcast — even though emulate_bracket_exits
+            # doesn't call fanout, the backfill sweep in
+            # trade_listener.py picks up any row matching
+            # `fanned_out_to_subscribers=False AND parent_order_id IS
+            # NULL AND status IN (...)`, which would otherwise match
+            # these exits. Flagging them as fanned-out at creation
+            # tells that sweep "fanout resolved" and keeps them off
+            # the wire. Belt-and-braces: fanout_async has a
+            # bracket_parent_id guard too.
+            fanned_out_to_subscribers=True,
         )
         db.add(exit_order)
         db.flush()

@@ -502,6 +502,12 @@ def _apply_event_to_existing(
         new_status = _STATUS_IN.get(alpaca_order.status, order.status)
     except Exception:  # noqa: BLE001
         new_status = order.status
+    # Track whether THIS event flipped the status to FILLED — the
+    # bracket-emulator hook below only fires on the transition, not on
+    # every subsequent quiescent event for an already-FILLED order.
+    status_changed_to_filled = (
+        new_status == OrderStatus.FILLED and order.status != OrderStatus.FILLED
+    )
     if new_status != order.status:
         order.status = new_status
     fq = getattr(alpaca_order, "filled_qty", None)
@@ -518,6 +524,31 @@ def _apply_event_to_existing(
             pass
     if event_name in ("fill", "canceled", "expired", "rejected") and order.closed_at is None:
         order.closed_at = datetime.now(timezone.utc)
+
+    # Bracket emulator hooks — mirror what snaptrade_listener / ibkr_listener
+    # do on FILLED. Native bracket (Alpaca stocks) doesn't need this:
+    # Alpaca itself attaches the TP/SL legs at submit and handles OCO
+    # server-side, so emulate_bracket_exits short-circuits via
+    # _uses_native_bracket(). The reason we still call it: Alpaca
+    # OPTIONS reject complex orders (error 42210000), so api/trades.py
+    # places those entries plain and the emulator is the only thing
+    # that materialises the TP/SL exits when an option entry fills.
+    # cancel_sibling_on_fill is the OCO half — when one emulator-placed
+    # leg fills, cancel the surviving sibling. Both functions are no-ops
+    # when the order doesn't match their case, so calling them together
+    # is safe and saves duplicating the gate logic here.
+    if status_changed_to_filled:
+        try:
+            from app.services.bracket_emulator import (  # noqa: PLC0415
+                cancel_sibling_on_fill,
+                emulate_bracket_exits,
+            )
+            emulate_bracket_exits(db, order)
+            cancel_sibling_on_fill(db, order)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "alpaca_listener: bracket emulator failed for order %s", order.id
+            )
 
 
 def _insert_order_from_alpaca(
