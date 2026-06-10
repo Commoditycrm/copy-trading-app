@@ -40,7 +40,7 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Order, OrderStatus
+from app.models.order import InstrumentType, Order, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
@@ -477,12 +477,18 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 continue
 
             # Forward bracket prices to the broker request ONLY when the
-            # subscriber's broker supports native bracket OCO (Alpaca).
-            # Other brokers get the plain entry; bracket_emulator places
+            # subscriber's broker supports native bracket OCO. Today that's
+            # Alpaca **stocks** only — Alpaca's options API rejects
+            # complex orders (error 42210000) so options on Alpaca route
+            # through the emulator just like SnapTrade does. Other
+            # brokers also get the plain entry; bracket_emulator places
             # the TP / SL exits when the listener detects the mirror has
             # filled. The bracket prices stay on the child Order row
             # regardless, so the emulator can find them.
-            sub_native_bracket = acct.broker == BrokerName.ALPACA
+            sub_native_bracket = (
+                acct.broker == BrokerName.ALPACA
+                and child.instrument_type != InstrumentType.OPTION
+            )
             pending.append(_PendingMirror(
                 child_order_id=child.id,
                 subscriber_user_id=sub.user_id,
