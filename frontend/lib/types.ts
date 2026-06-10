@@ -171,6 +171,16 @@ export interface SubscriberSettings {
    *  even after the subscriber clears the limit — it's an audit marker,
    *  not state. */
   auto_liquidated_at: string | null;
+  /** Per-position take-profit % applied to every open position. When a
+   *  position's unrealized P&L hits this %, the position is closed at
+   *  market. Per-position only — does NOT affect copy_enabled. Null
+   *  disables. */
+  position_tp_pct: string | null;
+  /** Per-position stop-loss % applied to every open position. When a
+   *  position's unrealized P&L drops below -this%, the position is
+   *  closed at market. Per-position only — does NOT affect copy_enabled.
+   *  Null disables. */
+  position_sl_pct: string | null;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

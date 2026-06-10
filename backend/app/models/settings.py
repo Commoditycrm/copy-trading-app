@@ -112,6 +112,24 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(20, 2), nullable=True,
     )
 
+    # Per-position TAKE-PROFIT / STOP-LOSS percentages, applied to every
+    # open position the subscriber holds. Independent of any TP/SL on
+    # the trader's mirrored entry (which subscribers no longer receive —
+    # see copy_engine.fanout_async). pnl_poller checks each tick: for
+    # every open position, computes `unrealized_pnl / abs(cost_basis) *
+    # 100`. If >= position_tp_pct → close that position at market. If
+    # <= -position_sl_pct → same. Per-position only — does NOT flip
+    # copy_enabled (other positions and new mirrors keep flowing).
+    # Numeric(7,2) so a position_tp_pct of 999.99 is representable
+    # (1000%+ moonshots happen on options); SL is bounded 0 < pct <= 100
+    # by the API layer since you can't lose more than 100% of cost.
+    position_tp_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(7, 2), nullable=True,
+    )
+    position_sl_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+
     # Percentage of TODAY'S BEGINNING-DAY ACCOUNT BALANCE (Alpaca's
     # ``last_equity`` — equity at yesterday's close) that bounds today's
     # cumulative filled trade NOTIONAL (capital deployed in mirror orders
