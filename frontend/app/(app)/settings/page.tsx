@@ -653,6 +653,7 @@ export default function SettingsPage() {
                 headroomColor={(maxPctHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
                 pctConsumed={maxPctConsumed}
               />
+              
               <LimitRow
                 accent="#3b82f6"
                 icon={<IconLayers />}
