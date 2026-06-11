@@ -1,38 +1,64 @@
-# App services only. Postgres and Redis are MANAGED CLOUD services now —
-# configure them via DATABASE_URL and REDIS_URL in backend/.env. They are
-# deliberately NOT run as containers here.
+# App services. Postgres and Redis run as local containers via the server's
+# docker-compose.override.yml (localhost-bound, password-protected). Caddy
+# (TLS/reverse-proxy) also lives in the override and routes to `backend:8000`
+# and `frontend:3000`.
 #
-# Why the datastores moved off the box: running an on-instance Redis was the
-# original attack vector behind the May 2026 AWS abuse cases (an exposed Redis
-# on 6379 was used to drop a port-scanner). Using managed cloud datastores —
-# with authentication, TLS, and an IP allowlist limited to this instance —
-# removes that surface entirely.
-#
-# Reverse proxy / TLS (Caddy) lives in the server's docker-compose.override.yml;
-# Caddy reaches these over the compose network via the service names
-# `backend:8000` and `frontend:3000`.
+# Web/worker split
+# ----------------
+# `backend` (WEB) serves HTTP and runs the request-path fanout, with
+# RUN_BACKGROUND_WORKERS=false — so it can run uvicorn --workers N without each
+# worker spawning its own listeners/poller. `worker` (BACKGROUND) is the single
+# process that runs the broker listeners, P&L poller, retry scheduler and
+# crash-recovery sweep (RUN_BACKGROUND_WORKERS=true). Never scale `worker` >1.
 
 services:
   backend:
     build: ./backend
     restart: unless-stopped
-    # All secrets live here, never in git: DATABASE_URL + REDIS_URL (pointing at
-    # the managed cloud Postgres/Redis), JWT_SECRET, CREDENTIAL_ENCRYPTION_KEY,
-    # SNAPTRADE_CLIENT_ID/CONSUMER_KEY, etc. See app/config.py.
     env_file: ./backend/.env
-    # Force IPv4 to the managed Neon Postgres. Neon's hostname resolves to both
-    # AAAA (IPv6) and A (IPv4) records, with IPv6 first; but Lightsail instances
-    # have no IPv6 egress, so the backend's getaddrinfo picks an IPv6 address and
-    # every connect() returns "Network is unreachable", crash-looping the app and
-    # surfacing as a 502 through Caddy. Disabling IPv6 inside the container makes
-    # getaddrinfo return only the (reachable) A records.
+    # WEB tier: HTTP + fanout. Background singletons disabled here so multiple
+    # uvicorn workers don't duplicate them. UVICORN_WORKERS defaults to 1
+    # (bump once the instance has RAM headroom for more event loops).
+    environment:
+      RUN_BACKGROUND_WORKERS: "false"
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1} --proxy-headers --forwarded-allow-ips=*
+    # Force IPv4 to outbound services (broker APIs); Lightsail has no IPv6 egress.
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
       - net.ipv6.conf.default.disable_ipv6=1
-    # Bound to localhost; Caddy (in the override) proxies to it over the
-    # compose network. Nothing is exposed publicly except via Caddy on 80/443.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     ports:
       - "127.0.0.1:8000:8000"
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    # BACKGROUND tier: the ONE process that runs broker listeners, the P&L
+    # poller, the retry scheduler and the crash-recovery sweep. No HTTP traffic
+    # is routed here (Caddy talks to `backend`); it only needs the app startup
+    # hook to fire with the background flag on. Migrations are owned by the web
+    # container, so this one waits for it to be healthy and does NOT run alembic.
+    environment:
+      RUN_BACKGROUND_WORKERS: "true"
+    command:
+      - sh
+      - -c
+      - exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    depends_on:
+      backend:
+        condition: service_healthy
 
   frontend:
     build: ./frontend
