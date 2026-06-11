@@ -131,23 +131,49 @@ function fmtQty(q: string | number | null | undefined): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
-/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors.
- *  Used by the trader-side fanout table to surface the spread of how long
- *  each subscriber's broker took to accept their copy. Rows with a null
- *  broker_lag_ms (mirror rejected before reaching the broker, or still in
- *  flight) are excluded from all three stats. Returns {min, avg, max} as
- *  ms, or all-null when no child has a usable lag yet. */
+/** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors,
+ *  along with the broker name responsible for the min and max so the
+ *  trader can see at a glance which broker is fastest / slowest. Rows
+ *  with a null broker_lag_ms (mirror rejected before reaching the broker,
+ *  or still in flight) are excluded from all three stats. Returns all-
+ *  null when no child has a usable lag yet.
+ *
+ *  For "avg" we don't surface a single broker because it's an aggregate
+ *  across many — but if every contributing row was on the *same* broker
+ *  we surface that name (useful when the whole fanout went to one broker
+ *  type, e.g. a fleet of Alpaca-only subscribers). */
 function brokerLagStats(
   children: FanoutChild[]
-): { min: number | null; avg: number | null; max: number | null } {
-  const vals = children
-    .map(c => c.broker_lag_ms)
-    .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0);
-  if (vals.length === 0) return { min: null, avg: null, max: null };
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
-  const avg = Math.round(vals.reduce((a, b) => a + b, 0) / vals.length);
-  return { min, avg, max };
+): {
+  min: number | null; minBroker: string | null;
+  avg: number | null; avgBroker: string | null;
+  max: number | null; maxBroker: string | null;
+} {
+  type Row = { ms: number; broker: string | null };
+  const rows: Row[] = children
+    .map(c => ({
+      ms: c.broker_lag_ms as number,
+      broker: c.broker_name ?? null,
+    }))
+    .filter((r): r is Row => typeof r.ms === "number" && Number.isFinite(r.ms) && r.ms >= 0);
+  if (rows.length === 0) {
+    return { min: null, minBroker: null, avg: null, avgBroker: null, max: null, maxBroker: null };
+  }
+  let minRow = rows[0], maxRow = rows[0], sum = 0;
+  for (const r of rows) {
+    if (r.ms < minRow.ms) minRow = r;
+    if (r.ms > maxRow.ms) maxRow = r;
+    sum += r.ms;
+  }
+  const distinctBrokers = new Set(rows.map(r => r.broker).filter(Boolean));
+  return {
+    min: minRow.ms, minBroker: minRow.broker,
+    avg: Math.round(sum / rows.length),
+    // Avg broker: only meaningful when every contributing row shares the
+    // same broker name; otherwise the single label would be misleading.
+    avgBroker: distinctBrokers.size === 1 ? Array.from(distinctBrokers)[0] : null,
+    max: maxRow.ms, maxBroker: maxRow.broker,
+  };
 }
 
 // ── Compact metric card with optional inline sparkline ────────────────
@@ -529,14 +555,17 @@ const IcoTarget = () => (
 
 function SubscriberPill({ counts }: { counts: SubscriberCounts }) {
   // "6 ✓ / 0 ✗ of 6" — green ok, red errors, neutral denominator.
+  // `whitespace-nowrap` keeps the whole pill on a single line even when
+  // the column is narrow; without it the column was breaking each
+  // segment onto its own row (the screenshot fix).
   return (
-    <span className="inline-flex items-center gap-1 text-xs">
-      <span style={{ color: "var(--good)" }}>{counts.submitted} ✓</span>
+    <span className="inline-flex items-center gap-1 text-xs whitespace-nowrap">
+      <span style={{ color: "var(--good)" }}>{counts.submitted}&nbsp;✓</span>
       <span style={{ color: "var(--muted)" }}>/</span>
       <span style={{ color: counts.errors > 0 ? "var(--bad)" : "var(--muted)" }}>
-        {counts.errors} ✗
+        {counts.errors}&nbsp;✗
       </span>
-      <span style={{ color: "var(--muted)" }}>of {counts.total}</span>
+      <span style={{ color: "var(--muted)" }}>of&nbsp;{counts.total}</span>
     </span>
   );
 }
@@ -1003,14 +1032,14 @@ export default function PerformancePage() {
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
                 ["Trader Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
-                ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
-                ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
-                ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
+                ["DB SAVED AT", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
+                ["PUBLISHED FOR SUBS AT", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
+                ["ALL SUBS COMPLETED AT", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
-                ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
-                ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
-                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
-                ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
+                ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. PUBLISHED FOR SUBS AT − DB SAVED AT. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
+                ["Detection Lag", "Broker accept → our DB row created. DB SAVED AT − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
+                ["Platform Lag", "End-to-end time spent fanning out to every subscriber. ALL SUBS COMPLETED AT − DB SAVED AT."],
+                ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. ALL SUBS COMPLETED AT − Broker Accepted At."],
                 ["Lowest Broker Lag", "Fastest subscriber: minimum broker_lag (mirror-submit → broker-accept) across all subscriber children for this trade."],
                 ["Average Broker Lag", "Mean broker_lag across all subscriber children for this trade."],
                 ["Highest Broker Lag", "Slowest subscriber: maximum broker_lag across all subscriber children for this trade."],
@@ -1118,14 +1147,29 @@ export default function PerformancePage() {
                     <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
                       {fmtMs(f.total_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.min) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.min) }}>
                       {fmtMs(blStats.min)}
+                      {blStats.minBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.minBroker})
+                        </span>
+                      )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.avg) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.avg) }}>
                       {fmtMs(blStats.avg)}
+                      {blStats.avgBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.avgBroker})
+                        </span>
+                      )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(blStats.max) }}>
+                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.max) }}>
                       {fmtMs(blStats.max)}
+                      {blStats.maxBroker && (
+                        <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
+                          ({blStats.maxBroker})
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-3">
                       <SubscriberPill counts={f.subscribers} />
@@ -1185,14 +1229,14 @@ export default function PerformancePage() {
                                     ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
                                     ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order.", "broker_accepted_at"],
                                     ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time.", "redis_published_at"],
-                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent DB SAVED AT. Grows with the number of subscribers ahead of this one in the fanout queue."],
                                     ["Eligibility Lag", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
                                     ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
                                     ["Broker Lag", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
                                     ["Broker Response", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
                                     // ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
                                     ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
-                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
+                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent DB SAVED AT."],
                                     ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
                                   ] as ([string, string] | [string, string, ChildSortField])[]).map((row) => {
                                     const [h, tip] = row;
@@ -1423,7 +1467,7 @@ export default function PerformancePage() {
           submit (or Alpaca&apos;s receive time for externally-placed orders).{" "}
           <strong style={{ color: "var(--text-2)" }}>Trader Listened At</strong> = our Alpaca trade_updates listener
           heard the event (NULL for in-app orders).{" "}
-          <strong style={{ color: "var(--text-2)" }}>Redis Published At</strong> = SSE event broadcast to subscribers.{" "}
+          <strong style={{ color: "var(--text-2)" }}>PUBLISHED FOR SUBS AT</strong> = SSE event broadcast to subscribers.{" "}
           <strong style={{ color: "var(--text-2)" }}>Picked At / Accepted At / Broker Accepted At</strong> (per-child) =
           when copy_engine picked the subscriber, passed eligibility, and their broker accepted, respectively.
         </p>

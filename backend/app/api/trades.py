@@ -1,3 +1,4 @@
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
@@ -290,6 +291,46 @@ def _place_trader_order(
     # trader_submitted_at).
     trader_submitted_at = datetime.now(timezone.utc)
 
+    # Server-side duplicate suppression. A short window (3 seconds) catches
+    # accidental double-POSTs from any source — React StrictMode dev re-fires,
+    # browser request retries, click + Enter races, the api() helper's 401
+    # retry, etc. — without rejecting legitimate "trader just placed the same
+    # trade twice on purpose" cases (no human re-clicks the same exact order
+    # in 3s). We match on the full identity of the order (broker, symbol,
+    # side, qty, type, prices, option params) so two different orders at the
+    # same moment don't collide.
+    from datetime import timedelta  # noqa: PLC0415
+    DEDUP_WINDOW = timedelta(seconds=3)
+    cutoff = trader_submitted_at - DEDUP_WINDOW
+    existing = db.execute(
+        select(Order).where(
+            Order.user_id == trader.id,
+            Order.broker_account_id == acct.id,
+            Order.parent_order_id.is_(None),                # not a subscriber mirror
+            Order.bracket_parent_id.is_(None),              # not an emulator-placed exit
+            Order.instrument_type == payload.instrument_type,
+            Order.symbol == payload.symbol.upper(),
+            Order.side == payload.side,
+            Order.order_type == payload.order_type,
+            Order.quantity == payload.quantity,
+            Order.limit_price == payload.limit_price,
+            Order.stop_price == payload.stop_price,
+            Order.option_expiry == payload.option_expiry,
+            Order.option_strike == payload.option_strike,
+            Order.option_right == payload.option_right,
+            Order.created_at >= cutoff,
+        ).order_by(Order.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).warning(
+            "trades: duplicate suppressed for user=%s symbol=%s side=%s qty=%s "
+            "within %ss window (returning existing order %s)",
+            trader.id, payload.symbol, payload.side.value, payload.quantity,
+            DEDUP_WINDOW.total_seconds(), existing.id,
+        )
+        return existing
+
     order = Order(
         user_id=trader.id,
         broker_account_id=acct.id,
@@ -313,14 +354,22 @@ def _place_trader_order(
     db.flush()
 
     adapter = adapter_for(acct, creds)
-    # Forward bracket prices to the adapter ONLY when the adapter can
-    # place a native bracket (Alpaca's OrderClass.BRACKET). For other
-    # brokers we keep TP/SL on the Order row but place the entry plain —
-    # the bracket_emulator service then places the exit legs when the
-    # listener detects the entry has filled. See
+    # Forward bracket prices to the adapter ONLY when the (adapter,
+    # instrument) pair supports native bracket / OCO. Today that's
+    # Alpaca STOCKS only — Alpaca's options API explicitly rejects
+    # complex orders (error 42210000 "complex orders not supported for
+    # options trading"). For everything else (SnapTrade, Webull, IBKR,
+    # AND Alpaca options) we keep TP/SL on the Order row but place the
+    # entry plain — the bracket_emulator service then places the exit
+    # legs when the listener detects the entry has filled. See
     # app/services/bracket_emulator.py.
     from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
-    use_native_bracket = isinstance(adapter, AlpacaAdapter)
+    from app.models.order import InstrumentType  # noqa: PLC0415
+    use_native_bracket = (
+        isinstance(adapter, AlpacaAdapter)
+        and order.instrument_type != InstrumentType.OPTION
+    )
+    _broker_t0 = time.perf_counter()
     try:
         result = adapter.place_order(
             BrokerOrderRequest(
@@ -340,6 +389,7 @@ def _place_trader_order(
             )
         )
     except Exception as exc:  # noqa: BLE001
+        order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
         order.status = OrderStatus.REJECTED
         order.reject_reason = str(exc)[:480]
         order.closed_at = datetime.now(timezone.utc)
@@ -357,6 +407,12 @@ def _place_trader_order(
             background.add_task(_run_rejection_notify_in_background, order.id, trader.id)
         raise HTTPException(502, f"broker_error: {exc}")
 
+    # Perf instrumentation: broker place-order round-trip (request->response)
+    # and when the broker accepted. broker_call_ms was previously never
+    # populated, so the Performance page's broker-latency column was always
+    # blank — now it reflects the real broker call time.
+    order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
+    order.broker_accepted_at = datetime.now(timezone.utc)
     order.broker_order_id = result.broker_order_id
     order.status = result.status
     order.submitted_at = result.submitted_at

@@ -381,6 +381,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   const nav = user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER;
   const displayName = user.display_name || user.email.split("@")[0];
+  // App wordmark: trader sees their own business_name; subscriber sees
+  // the business_name of the trader they follow (loaded via /api/settings/subscriber
+  // into subCopy). Falls back to "ARK" when the value isn't available —
+  // e.g. legacy traders that pre-date business_name, or a subscriber who
+  // hasn't picked a trader yet.
+  const brandName =
+    (user.role === "trader"
+      ? user.business_name
+      : subCopy?.following_trader_business_name) || "ARK";
+  // Collapsed sidebar shows just the first letter so the chrome still
+  // reads as branded at narrow widths.
+  const brandShort = brandName.trim().charAt(0).toUpperCase() || "A";
   const SIDEBAR_W = collapsed ? 72 : 244;
 
   return (
@@ -444,20 +456,25 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         }}
       >
         {/* Wordmark only — the image logo is intentionally hidden per
-            product direction. The "ARK" text is left-aligned when the
-            sidebar is expanded and falls back to a centered "A"
-            initial when collapsed so the chrome still reads as
-            branded at narrow widths. */}
+            product direction. The brand text is derived per role:
+            traders see their own business_name; subscribers see the
+            business_name of the trader they follow. Left-aligned when
+            expanded; first-letter fallback when collapsed so the
+            chrome still reads as branded at narrow widths. */}
         <div className={`flex items-center ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
-          <div className="leading-tight">
+          <div className="leading-tight min-w-0">
             <div
+              title={collapsed ? brandName : undefined}
               style={{
                 fontWeight: 700,
-                fontSize: collapsed ? 20 : 26,
+                fontSize: collapsed ? 17 : 22,
                 letterSpacing: "0.04em",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
               }}
             >
-              {collapsed ? "A" : "ARK"}
+              {collapsed ? brandShort : brandName}
             </div>
           </div>
         </div>

@@ -447,6 +447,66 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
             })
 
+        # ── Per-position TP/SL enforcement ────────────────────────────────
+        # Independent of the daily kill switches above — fires whenever
+        # any open position's unrealized P&L percent breaches the
+        # subscriber's per-position TP or SL. Per-position only: a
+        # triggered close does NOT pause copy_enabled, and other
+        # positions continue to be managed normally.
+        if s.position_tp_pct is not None or s.position_sl_pct is not None:
+            try:
+                from app.services.position_enforcer import (  # noqa: PLC0415
+                    enforce_position_tp_sl,
+                )
+                closures = enforce_position_tp_sl(db, s.user_id, acct.id)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "pnl_poller: position_enforcer crashed for user=%s", s.user_id
+                )
+                closures = []
+            for c in closures:
+                pending_events.append({
+                    "type": "position.auto_closed",
+                    "leg": c["leg"],
+                    "symbol": c["symbol"],
+                    "qty": c["qty"],
+                    "pct": c["pct"],
+                    "position_tp_pct":
+                        str(s.position_tp_pct) if s.position_tp_pct is not None else None,
+                    "position_sl_pct":
+                        str(s.position_sl_pct) if s.position_sl_pct is not None else None,
+                    "broker": acct.broker.value,
+                })
+                try:
+                    from app.services import notifications as notif_svc  # noqa: PLC0415
+                    leg_label = "take-profit" if c["leg"] == "tp" else "stop-loss"
+                    threshold = (
+                        s.position_tp_pct if c["leg"] == "tp" else s.position_sl_pct
+                    )
+                    notif_svc.create_notification(
+                        db,
+                        user_id=s.user_id,
+                        type=f"position.auto_closed_{c['leg']}",
+                        message=(
+                            f"{c['symbol']} closed automatically at {c['pct']}% "
+                            f"({leg_label} threshold {threshold}%). "
+                            f"Other positions and copy trading are unaffected."
+                        ),
+                        metadata={
+                            "symbol": c["symbol"],
+                            "leg": c["leg"],
+                            "pct": c["pct"],
+                            "qty": c["qty"],
+                            "broker": acct.broker.value,
+                            "broker_order_id": c["broker_order_id"],
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "pnl_poller: position TP/SL notification failed for user=%s",
+                        s.user_id,
+                    )
+
         # ── Commit BEFORE any events go out ───────────────────────────────
         # Commit only when there were actual mutations — pnl.tick alone
         # is a pure read and shouldn't bump audit timestamps. We snapshot
@@ -467,6 +527,8 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
             "max_per_contract":        str(s.max_per_contract) if s.max_per_contract else None,
             "auto_liquidation_limit":  str(s.auto_liquidation_limit) if s.auto_liquidation_limit else None,
+            "position_tp_pct":         str(s.position_tp_pct) if s.position_tp_pct is not None else None,
+            "position_sl_pct":         str(s.position_sl_pct) if s.position_sl_pct is not None else None,
             # Today's unrealized P&L = total daily P&L − realized fills.
             # The take-profit auto-liquidation triggers when this crosses
             # ``auto_liquidation_limit``; surface it on the tick so the
@@ -475,7 +537,13 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "copy_enabled":            s.copy_enabled,
         }
         user_id_snapshot = s.user_id
-        if pending_events:
+        # Commit when there's anything to persist. pending_events is the
+        # usual signal (kill-switch trips, position closures), but the
+        # enforcer can also write REJECTED Order rows + audit records
+        # when the broker rejects a close — those need to be persisted
+        # even when closures came back empty so we have an audit trail
+        # of the failed attempt. db.dirty / db.new pick that up.
+        if pending_events or db.new or db.dirty:
             db.commit()
 
     # ── Outside the session: publish events + invalidate caches ──────────

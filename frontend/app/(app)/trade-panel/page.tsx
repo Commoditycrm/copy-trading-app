@@ -184,6 +184,13 @@ export default function TradePanelPage() {
   const [strike, setStrike] = useState("");
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
+  // Synchronous in-flight mutex. We can't rely on the `submitting` state
+  // alone because state updates only take effect after the next render
+  // — if two clicks land in the same render cycle (rapid double-tap,
+  // bubbling event, browser quirk), both pass the `disabled={submitting}`
+  // gate and the API gets hit twice. A ref updates immediately, so the
+  // second invocation bails out before sending a request.
+  const submittingRef = useRef(false);
 
   // Bracket exit legs — entered as PERCENTAGES off the reference price.
   // Reference is the limit price for limit/stop_limit orders, or a small
@@ -378,7 +385,11 @@ export default function TradePanelPage() {
     [isOption, symbol, expiry, strike, right]
   );
 
-  const bracketCompatible = orderType === "market" || orderType === "limit";
+  // %-based TP/SL needs a reference price to convert "10%" into "$X.XX".
+  // We use the order's limit price as that reference. Only LIMIT and
+  // STOP-LIMIT have a limit, so SL/TP only renders for those types.
+  // Market and Stop orders hide the TP/SL section entirely.
+  const bracketCompatible = orderType === "limit" || orderType === "stop_limit";
 
   // Reference price for converting TP/SL percentages → absolute prices.
   // We use the order's limit price as the implicit reference. Market
@@ -453,10 +464,16 @@ export default function TradePanelPage() {
   }
 
   async function placeOrder(forSide: OrderSide) {
-    if (!acctId) { notify.warn("Connect a broker first"); return; }
-    if (!symbol.trim()) { notify.warn("Enter a symbol"); return; }
-    if (!qty || Number(qty) <= 0) { notify.warn("Enter a quantity"); return; }
-    if (bracketGeometryError) { notify.warn(bracketGeometryError); return; }
+    // Synchronous in-flight guard. Fires BEFORE the state-based
+    // disabled prop on the button can save us — protects against
+    // rapid double-clicks, form-submit-plus-button races, and any
+    // browser event quirk that could call this twice in the same tick.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    if (!acctId) { notify.warn("Connect a broker first"); submittingRef.current = false; return; }
+    if (!symbol.trim()) { notify.warn("Enter a symbol"); submittingRef.current = false; return; }
+    if (!qty || Number(qty) <= 0) { notify.warn("Enter a quantity"); submittingRef.current = false; return; }
+    if (bracketGeometryError) { notify.warn(bracketGeometryError); submittingRef.current = false; return; }
 
     setSide(forSide);
     setSubmitting(true);
@@ -477,7 +494,7 @@ export default function TradePanelPage() {
       if (tp !== null) body.take_profit_price = tp.toFixed(4);
       if (sl !== null) body.stop_loss_price = sl.toFixed(4);
       if (isOption) {
-        if (!expiry || !strike) { notify.warn("Option requires expiry and strike"); setSubmitting(false); return; }
+        if (!expiry || !strike) { notify.warn("Option requires expiry and strike"); setSubmitting(false); submittingRef.current = false; return; }
         body.option_expiry = expiry;
         body.option_strike = strike;
         body.option_right = right;
@@ -492,6 +509,7 @@ export default function TradePanelPage() {
       notify.fromError(e, "Order placement failed");
     } finally {
       setSubmitting(false);
+      submittingRef.current = false;
     }
   }
 
@@ -845,76 +863,68 @@ export default function TradePanelPage() {
               </div>
             )}
 
-            {/* Bracket — PERCENTAGE inputs, side-by-side. The number entered
-                is interpreted as % away from the reference price (limit for
-                limit/stop-limit; the small "Ref price" input below for
-                market orders). Computed absolute price shows under each
-                input so the trader sees what's going to the broker. */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                {!bracketCompatible && (
-                  <span className="text-[10px]" style={{ color: "var(--muted)" }}>
-                    market/limit only
-                  </span>
-                )}
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                {/* Take profit % — single flat input. The "%" lives in the
-                    label only; no inline suffix, no wrapper div. */}
-                <div>
-                  <TinyLabel>Take profit %</TinyLabel>
-                  <input
-                    type="number" step="0.01" min="0.01"
-                    disabled={!bracketCompatible}
-                    className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none disabled:opacity-50"
-                    style={{
-                      ...inputStyle,
-                      borderColor: takeProfit && bracketCompatible
-                        ? "rgba(34,197,94,0.45)"
-                        : "var(--border)",
-                    }}
-                    placeholder="10"
-                    value={takeProfit}
-                    onChange={e => setTakeProfit(e.target.value)}
-                  />
-                  {tpAbsPrice !== null && (
-                    <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
-                      ≈ <span style={{ color: "var(--good)" }}>{fmtMoney(tpAbsPrice)}</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Stop loss % — same shape, red accent when filled. */}
-                <div>
-                  <TinyLabel>Stop loss %</TinyLabel>
-                  <input
-                    type="number" step="0.01" min="0.01"
-                    disabled={!bracketCompatible}
-                    className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none disabled:opacity-50"
-                    style={{
-                      ...inputStyle,
-                      borderColor: stopLoss && bracketCompatible
-                        ? "rgba(239,68,68,0.45)"
-                        : "var(--border)",
-                    }}
-                    placeholder="5"
-                    value={stopLoss}
-                    onChange={e => setStopLoss(e.target.value)}
-                  />
-                  {slAbsPrice !== null && (
-                    <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
-                      ≈ <span style={{ color: "var(--bad)" }}>{fmtMoney(slAbsPrice)}</span>
-                    </div>
-                  )}
-                </div>
-
-                {bracketGeometryError && (
-                  <div className="col-span-2 text-[10px]" style={{ color: "var(--warn)" }}>
-                    {bracketGeometryError}
+            {/* Bracket — PERCENTAGE inputs, side-by-side. Only rendered
+                when the order type has a usable reference price (LIMIT or
+                STOP-LIMIT). Market / Stop hide this block entirely since
+                there'd be no anchor to convert the percentage against. */}
+            {bracketCompatible && (
+              <div>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Take profit % — single flat input. The "%" lives in the
+                      label only; no inline suffix, no wrapper div. */}
+                  <div>
+                    <TinyLabel>Take profit %</TinyLabel>
+                    <input
+                      type="number" step="0.01" min="0.01"
+                      className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
+                      style={{
+                        ...inputStyle,
+                        borderColor: takeProfit
+                          ? "rgba(34,197,94,0.45)"
+                          : "var(--border)",
+                      }}
+                      placeholder="10"
+                      value={takeProfit}
+                      onChange={e => setTakeProfit(e.target.value)}
+                    />
+                    {tpAbsPrice !== null && (
+                      <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+                        ≈ <span style={{ color: "var(--good)" }}>{fmtMoney(tpAbsPrice)}</span>
+                      </div>
+                    )}
                   </div>
-                )}
+
+                  {/* Stop loss % — same shape, red accent when filled. */}
+                  <div>
+                    <TinyLabel>Stop loss %</TinyLabel>
+                    <input
+                      type="number" step="0.01" min="0.01"
+                      className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
+                      style={{
+                        ...inputStyle,
+                        borderColor: stopLoss
+                          ? "rgba(239,68,68,0.45)"
+                          : "var(--border)",
+                      }}
+                      placeholder="5"
+                      value={stopLoss}
+                      onChange={e => setStopLoss(e.target.value)}
+                    />
+                    {slAbsPrice !== null && (
+                      <div className="mt-1 text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+                        ≈ <span style={{ color: "var(--bad)" }}>{fmtMoney(slAbsPrice)}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {bracketGeometryError && (
+                    <div className="col-span-2 text-[10px]" style={{ color: "var(--warn)" }}>
+                      {bracketGeometryError}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* Footer — TWO CTAs (Buy + Sell) side-by-side, no shared toggle.

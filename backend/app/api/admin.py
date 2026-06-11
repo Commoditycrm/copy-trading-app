@@ -63,6 +63,9 @@ class UserOut(BaseModel):
     email: str
     role: str
     display_name: Optional[str]
+    # Trader brand surfaced in the AppShell. Null for subscribers / admins.
+    # The admin users page renders + edits this via PATCH .../business-name.
+    business_name: Optional[str] = None
     is_active: bool
     created_at: datetime
 
@@ -71,6 +74,18 @@ class UserOut(BaseModel):
 
 class RoleChangeIn(BaseModel):
     role: str = Field(pattern="^(trader|subscriber|admin)$")
+
+
+class BusinessNameIn(BaseModel):
+    """Trader brand / app name. 1–120 chars, whitespace stripped.
+
+    Empty / whitespace-only is rejected — the field is mandatory for any
+    trader (matches the RegisterIn validator). No null path: clearing
+    isn't a supported admin action since the AppShell would silently
+    revert to the "ARK" fallback for every follower, which is rarely
+    what an admin actually wants."""
+
+    business_name: str = Field(min_length=1, max_length=120)
 
 
 class SeedIn(BaseModel):
@@ -179,6 +194,46 @@ def change_role(
     db.commit()
     log.info("admin changed role of %s to %s", user.email, payload.role)
     return {"ok": True, "user_id": str(user_id), "role": payload.role}
+
+
+@router.patch("/users/{user_id}/business-name")
+def change_business_name(
+    user_id: uuid.UUID,
+    payload: BusinessNameIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """Rename a trader's business / brand. Trader-only — for subscribers
+    and admins business_name is meaningless (it's only ever surfaced as
+    the AppShell wordmark, and the shell pulls it from the trader the
+    subscriber follows). Bust the followed-by cache so every subscriber's
+    next SubscriberSettings fetch sees the new brand without waiting for
+    a 5-minute Redis TTL.
+    """
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+    if user.role != UserRole.TRADER:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="business_name only applies to traders",
+        )
+    new_name = payload.business_name.strip()
+    if not new_name:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="business_name_blank")
+    old = user.business_name
+    user.business_name = new_name
+    db.commit()
+    log.info("admin set business_name for %s: %r -> %r", user.email, old, new_name)
+    # Subscribers see the followed trader's business_name via SubscriberSettings;
+    # the row is cached per-trader in Redis. Invalidate so the rename is
+    # reflected on the next fetch. Best-effort — a cache miss is harmless.
+    try:
+        from app.services import cache as cache_svc  # noqa: PLC0415
+        cache_svc.invalidate_subscribers_for_trader(user.id)
+    except Exception:  # noqa: BLE001
+        log.warning("could not invalidate subscriber cache after rename")
+    return {"ok": True, "user_id": str(user_id), "business_name": new_name}
 
 
 # ─── Load-test subscriber management ─────────────────────────────────────────

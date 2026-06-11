@@ -9,6 +9,10 @@ interface AdminUser {
   email: string;
   role: string;
   display_name: string | null;
+  /** Trader brand / app name. Surfaced in the shell for the trader
+   *  themselves and every subscriber who follows them. Editable only
+   *  for role=trader. Null for subscribers / admins. */
+  business_name: string | null;
   is_active: boolean;
   created_at: string;
 }
@@ -37,6 +41,11 @@ export default function AdminUsersPage() {
   const [filter, setFilter]   = useState<"all" | "trader" | "subscriber" | "admin">("all");
   const [search, setSearch]   = useState("");
   const [busy, setBusy]       = useState<string | null>(null); // user id being actioned
+  // Inline edit for trader business name. Holds {userId, draft} while
+  // a row is being edited; null means no edit in progress. Centralised
+  // so only one row can be edited at a time — clicking a different row
+  // resets the previous draft.
+  const [editingBiz, setEditingBiz] = useState<{ id: string; draft: string } | null>(null);
 
   async function load() {
     setLoading(true);
@@ -63,6 +72,34 @@ export default function AdminUsersPage() {
       );
     } catch (e) {
       notify.fromError(e, "Could not update user");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveBusinessName(user: AdminUser) {
+    if (!editingBiz || editingBiz.id !== user.id) return;
+    const next = editingBiz.draft.trim();
+    if (!next) {
+      notify.error("Business name cannot be empty");
+      return;
+    }
+    if (next === (user.business_name ?? "")) {
+      // No-op: just close the editor without a network call.
+      setEditingBiz(null);
+      return;
+    }
+    setBusy(user.id);
+    try {
+      const res = await api<{ ok: boolean; business_name: string }>(
+        `/api/admin/users/${user.id}/business-name`,
+        { method: "PATCH", body: JSON.stringify({ business_name: next }) },
+      );
+      notify.success(`Business name set to "${res.business_name}"`);
+      setUsers(us => us.map(u => u.id === user.id ? { ...u, business_name: res.business_name } : u));
+      setEditingBiz(null);
+    } catch (e) {
+      notify.fromError(e, "Could not update business name");
     } finally {
       setBusy(null);
     }
@@ -177,6 +214,7 @@ export default function AdminUsersPage() {
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>User</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Role</th>
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Business Name</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Status</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Joined</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Actions</th>
@@ -185,7 +223,7 @@ export default function AdminUsersPage() {
             <tbody>
               {realUsers.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={6} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
                     No users match this filter.
                   </td>
                 </tr>
@@ -229,6 +267,86 @@ export default function AdminUsersPage() {
                         <option value="subscriber">subscriber</option>
                         <option value="admin">admin</option>
                       </select>
+                    </td>
+
+                    {/* Business Name — editable inline for traders only.
+                        For subscribers/admins we show "—" since the field
+                        doesn't apply to those roles (server rejects PATCH
+                        with 400 anyway). Click the value or pencil to
+                        open the editor; Enter saves, Escape cancels. */}
+                    <td className="px-4 py-3">
+                      {u.role !== "trader" ? (
+                        <span style={{ color: "var(--muted)" }}>—</span>
+                      ) : editingBiz?.id === u.id ? (
+                        <div className="flex items-center gap-1">
+                          <input
+                            autoFocus
+                            type="text"
+                            value={editingBiz.draft}
+                            maxLength={120}
+                            onChange={e => setEditingBiz({ id: u.id, draft: e.target.value })}
+                            onKeyDown={e => {
+                              if (e.key === "Enter") { e.preventDefault(); saveBusinessName(u); }
+                              if (e.key === "Escape") { e.preventDefault(); setEditingBiz(null); }
+                            }}
+                            disabled={busy === u.id}
+                            className="text-xs px-2 py-1 rounded-lg"
+                            style={{
+                              background: "rgba(255,255,255,0.04)",
+                              border: "1px solid var(--border)",
+                              color: "var(--text)",
+                              outline: "none",
+                              minWidth: 160,
+                            }}
+                          />
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => saveBusinessName(u)}
+                            className="text-xs px-2 py-1 rounded-lg"
+                            style={{
+                              background: "rgba(34,197,94,0.10)",
+                              color: "#22c55e",
+                              border: "1px solid rgba(34,197,94,0.25)",
+                              cursor: busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Save
+                          </button>
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => setEditingBiz(null)}
+                            className="text-xs px-2 py-1 rounded-lg"
+                            style={{
+                              background: "rgba(255,255,255,0.05)",
+                              color: "var(--text-2)",
+                              border: "1px solid var(--border)",
+                              cursor: busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setEditingBiz({ id: u.id, draft: u.business_name ?? "" })}
+                          title="Click to edit business name"
+                          className="text-sm text-left"
+                          style={{
+                            background: "transparent",
+                            border: "1px dashed transparent",
+                            borderRadius: 6,
+                            padding: "2px 6px",
+                            color: u.business_name ? "var(--text)" : "var(--muted)",
+                            fontStyle: u.business_name ? "normal" : "italic",
+                            cursor: "pointer",
+                          }}
+                          onMouseEnter={e => (e.currentTarget.style.borderColor = "var(--border)")}
+                          onMouseLeave={e => (e.currentTarget.style.borderColor = "transparent")}
+                        >
+                          {u.business_name || "Set business name…"}
+                        </button>
+                      )}
                     </td>
 
                     {/* Status */}

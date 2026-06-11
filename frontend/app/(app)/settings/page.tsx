@@ -97,6 +97,13 @@ export default function SettingsPage() {
   // and disables copy until the subscriber manually re-enables.
   const [autoLiqInput, setAutoLiqInput] = useState("");
   const [autoLiqBusy, setAutoLiqBusy] = useState(false);
+  // Per-position TP/SL — when any open position's unrealized P&L %
+  // breaches one of these thresholds, that position is closed at
+  // market by pnl_poller. Per-position only: does NOT pause copy.
+  const [posTpInput, setPosTpInput] = useState("");
+  const [posTpBusy, setPosTpBusy] = useState(false);
+  const [posSlInput, setPosSlInput] = useState("");
+  const [posSlBusy, setPosSlBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
   // equity at yesterday's close). Hydrated from sessionStorage so
   // navigating away and back keeps the last value visible while the
@@ -134,6 +141,8 @@ export default function SettingsPage() {
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxPctInput(s.max_account_pct_per_day ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
+        setPosTpInput(s.position_tp_pct ?? "");
+        setPosSlInput(s.position_sl_pct ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -230,8 +239,24 @@ export default function SettingsPage() {
         max_per_contract:         e.max_per_contract         ?? null,
         max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
         auto_liquidation_limit:   e.auto_liquidation_limit   ?? null,
+        position_tp_pct:          e.position_tp_pct          ?? null,
+        position_sl_pct:          e.position_sl_pct          ?? null,
         copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
       } : prev);
+    }
+    // Per-position TP/SL — pnl_poller fires this whenever it
+    // auto-closes a position. Surface a non-modal toast and refetch
+    // the row so the panel reflects any state changes immediately.
+    if (e?.type === "position.auto_closed") {
+      const legLabel = e.leg === "tp" ? "take-profit" : "stop-loss";
+      const threshold = e.leg === "tp" ? e.position_tp_pct : e.position_sl_pct;
+      notify.warn(
+        `${e.symbol} closed automatically at ${e.pct}% ` +
+        `(${legLabel} threshold ${threshold}%). ` +
+        `Other positions and copy trading are unaffected.`,
+        { autoClose: 10000 },
+      );
+      return;
     }
   });
 
@@ -347,6 +372,48 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update auto-liquidation limit");
     } finally {
       setAutoLiqBusy(false);
+    }
+  }
+  async function savePosTp() {
+    setPosTpBusy(true);
+    try {
+      const trimmed = posTpInput.trim();
+      const body = { position_tp_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/position-tp-pct", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setPosTpInput(s.position_tp_pct ?? "");
+      notify.success(
+        s.position_tp_pct
+          ? `Position take-profit set to ${s.position_tp_pct}%`
+          : "Position take-profit cleared",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update position take-profit");
+    } finally {
+      setPosTpBusy(false);
+    }
+  }
+  async function savePosSl() {
+    setPosSlBusy(true);
+    try {
+      const trimmed = posSlInput.trim();
+      const body = { position_sl_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/position-sl-pct", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setPosSlInput(s.position_sl_pct ?? "");
+      notify.success(
+        s.position_sl_pct
+          ? `Position stop-loss set to ${s.position_sl_pct}%`
+          : "Position stop-loss cleared",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update position stop-loss");
+    } finally {
+      setPosSlBusy(false);
     }
   }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
@@ -590,7 +657,7 @@ export default function SettingsPage() {
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per contract"
-                subtitle="Max per contract"
+                subtitle="This feature is not available yet."
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"
@@ -601,6 +668,23 @@ export default function SettingsPage() {
                 current={sub.max_per_contract}
                 hasLimit={false}
                 headroomDisplay="—"
+              />
+              {/* Per-position TP/SL — one row, two inputs (TP + SL),
+                  no Today/Headroom/Used columns since these limits are
+                  per-position and don't apply to a single account-wide
+                  number. Independent of the daily caps: a triggered
+                  close does NOT pause copy or affect other positions. */}
+              <PositionTpSlRow
+                tpInput={posTpInput}
+                onTpInput={setPosTpInput}
+                tpBusy={posTpBusy}
+                onTpSave={savePosTp}
+                tpCurrent={sub.position_tp_pct}
+                slInput={posSlInput}
+                onSlInput={setPosSlInput}
+                slBusy={posSlBusy}
+                onSlSave={savePosSl}
+                slCurrent={sub.position_sl_pct}
               />
             </div>
           </Card>
@@ -1165,6 +1249,175 @@ function LimitRow({
           />
         </div>
       )}
+    </div>
+  );
+}
+
+/** Compact two-input row for per-position TP/SL.
+ *
+ *  Different from LimitRow because the per-position thresholds don't
+ *  have a single "Today / Headroom / Used" reading — they apply to
+ *  every open position individually. So we drop those columns entirely
+ *  and just expose two percent inputs (TP + SL) on one row, each with
+ *  its own Save button. Matches LimitRow's visual rhythm (left accent
+ *  rail, rounded card, inset shadow) so the row sits naturally inside
+ *  the Risk Controls table. */
+function PositionTpSlRow({
+  tpInput, onTpInput, tpBusy, onTpSave, tpCurrent,
+  slInput, onSlInput, slBusy, onSlSave, slCurrent,
+}: {
+  tpInput: string;
+  onTpInput: (v: string) => void;
+  tpBusy: boolean;
+  onTpSave: () => void;
+  tpCurrent: string | null;
+  slInput: string;
+  onSlInput: (v: string) => void;
+  slBusy: boolean;
+  onSlSave: () => void;
+  slCurrent: string | null;
+}) {
+  // Split-accent rail: green on top (TP), red on bottom (SL). Both
+  // colors match the saved-row tones used elsewhere in the panel.
+  const TP_ACCENT = "#10b981";
+  const SL_ACCENT = "#dc2626";
+  return (
+    <div
+      className="relative rounded-xl border overflow-hidden"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.005) 60%, rgba(0,0,0,0.15) 100%)",
+        borderColor: "var(--border)",
+        boxShadow:
+          "inset 0 1px 0 rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.2)",
+      }}
+    >
+      {/* Left accent rail — top half green (TP), bottom half red (SL).
+          Visually signals "two limits live in this row." */}
+      <div
+        aria-hidden
+        className="absolute left-0 top-0 bottom-0 w-[3px]"
+        style={{
+          background:
+            `linear-gradient(180deg, ${TP_ACCENT} 0%, ${TP_ACCENT}66 45%, ${SL_ACCENT}66 55%, ${SL_ACCENT} 100%)`,
+          boxShadow: `0 0 12px -2px ${TP_ACCENT}80`,
+        }}
+      />
+
+      <div className="p-4 pl-5">
+        {/* Title + subtitle */}
+        <div className="flex items-start gap-2.5 mb-3">
+          <div
+            className="shrink-0 mt-0.5 rounded-md p-1.5"
+            style={{
+              color: TP_ACCENT,
+              background: `${TP_ACCENT}1a`,
+              border: `1px solid ${TP_ACCENT}33`,
+            }}
+          >
+            <IconTrendUp />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold leading-tight">
+              Position TP / SL
+            </div>
+            <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+              Auto-close any open position whose unrealized P&L hits the take-profit % or drops below the stop-loss %. Per-position — does not pause copy.
+            </div>
+          </div>
+        </div>
+
+        {/* Two inputs side-by-side. Each shows accent-colored prefix
+            (TP / SL), the percent value, and its own Save button. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <PercentInputCell
+            accent={TP_ACCENT}
+            label="Take-profit"
+            prefix="TP %"
+            input={tpInput}
+            onInput={onTpInput}
+            busy={tpBusy}
+            onSave={onTpSave}
+            current={tpCurrent}
+          />
+          <PercentInputCell
+            accent={SL_ACCENT}
+            label="Stop-loss"
+            prefix="SL %"
+            input={slInput}
+            onInput={onSlInput}
+            busy={slBusy}
+            onSave={onSlSave}
+            current={slCurrent}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** One percent-input cell — accent-colored prefix, numeric input,
+ *  inline Save. Save is disabled when the input matches the persisted
+ *  value (no-op edit). Used twice inside PositionTpSlRow. */
+function PercentInputCell({
+  accent, label, prefix, input, onInput, busy, onSave, current,
+}: {
+  accent: string;
+  label: string;
+  prefix: string;
+  input: string;
+  onInput: (v: string) => void;
+  busy: boolean;
+  onSave: () => void;
+  current: string | null;
+}) {
+  return (
+    <div>
+      <div
+        className="text-[10px] uppercase tracking-widest mb-1"
+        style={{ color: accent }}
+      >
+        {label}
+      </div>
+      <div className="flex items-center gap-2">
+        <div
+          className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
+          style={{
+            borderColor: "var(--border)",
+            background: "rgba(0,0,0,0.25)",
+          }}
+        >
+          <span
+            className="px-2.5 py-2 text-[10px] font-semibold border-r tabular-nums self-stretch inline-flex items-center"
+            style={{ color: accent, borderColor: "var(--border)" }}
+          >
+            {prefix}
+          </span>
+          <input
+            type="number"
+            step={0.5}
+            min={0}
+            placeholder="no limit"
+            className="flex-1 w-full px-2 py-2 text-xs tabular-nums"
+            style={{
+              border: "none",
+              background: "transparent",
+              outline: "none",
+              borderRadius: 0,
+              color: "var(--text)",
+            }}
+            value={input}
+            onChange={(e) => onInput(e.target.value)}
+          />
+        </div>
+        <PrimaryButton
+          busy={busy}
+          onClick={onSave}
+          disabled={busy || input === (current ?? "")}
+        >
+          Save
+        </PrimaryButton>
+      </div>
     </div>
   );
 }

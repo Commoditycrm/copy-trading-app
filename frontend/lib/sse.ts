@@ -10,7 +10,22 @@ export type AppEvent =
   | { type: "order.copy_retry_scheduled"; order: OrderEventPayload }
   | { type: "order.cancelled"; order: OrderEventPayload }
   | { type: "listener.state_changed"; trader_id: string; status: ListenerStatus }
-  | { type: "notification.created"; notification: NotificationEventPayload };
+  | { type: "notification.created"; notification: NotificationEventPayload }
+  /** Fired by pnl_poller when the per-position TP/SL enforcer closes
+   *  one of the subscriber's open positions at market. `pct` is the
+   *  unrealized P&L percent at trigger (already rounded to 2 decimals
+   *  by the backend); `leg` is "tp" or "sl"; `position_tp_pct` /
+   *  `position_sl_pct` are the configured thresholds. */
+  | {
+      type: "position.auto_closed";
+      leg: "tp" | "sl";
+      symbol: string;
+      qty: string;
+      pct: string;
+      position_tp_pct: string | null;
+      position_sl_pct: string | null;
+      broker: string;
+    };
 
 export interface NotificationEventPayload {
   id: string;

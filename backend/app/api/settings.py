@@ -15,6 +15,8 @@ from app.schemas.settings import (
     FollowTraderIn,
     MaxAccountPctIn,
     MaxPerContractIn,
+    PositionSlPctIn,
+    PositionTpPctIn,
     RetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
@@ -36,9 +38,19 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
     PATCH endpoint that returns this shape. ``todays_realized_pnl`` is
     computed from the fills table here — the live tick from pnl_poller
     pushes the same number via SSE for the panel's live refresh."""
+    # The followed trader's business_name is surfaced to subscribers so
+    # the AppShell can show the trader's brand instead of the default
+    # "ARK" wordmark. Cheap one-row lookup via PK — no join needed since
+    # we already have the FK.
+    trader_business_name: str | None = None
+    if s.following_trader_id:
+        trader = db.get(User, s.following_trader_id)
+        if trader is not None:
+            trader_business_name = trader.business_name
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
+        following_trader_business_name=trader_business_name,
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
@@ -54,6 +66,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         auto_liquidated_at=s.auto_liquidated_at,
         daily_loss_limit_pct=s.daily_loss_limit_pct,
         daily_profit_limit_pct=s.daily_profit_limit_pct,
+        position_tp_pct=s.position_tp_pct,
+        position_sl_pct=s.position_sl_pct,
     )
 
 
@@ -304,6 +318,80 @@ def set_auto_liquidation_limit(
     return _to_out(db, s)
 
 
+@router.patch("/subscriber/position-tp-pct", response_model=SubscriberSettingsOut)
+def set_position_tp_pct(
+    payload: PositionTpPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Per-position take-profit % applied to every open position.
+    Pass null to disable. Enforced by pnl_poller — see
+    app.services.position_enforcer for the close mechanics.
+
+    Per-position only: a triggered close does NOT pause copy_enabled
+    (other positions and new mirrors keep flowing). For account-wide
+    pauses, use the daily kill switches; for full-account liquidation,
+    use auto_liquidation_limit.
+    """
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.position_tp_pct
+    s.position_tp_pct = payload.position_tp_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.position_tp_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.position_tp_pct) if payload.position_tp_pct is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/position-sl-pct", response_model=SubscriberSettingsOut)
+def set_position_sl_pct(
+    payload: PositionSlPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Per-position stop-loss % applied to every open position. Pass
+    null to disable. Symmetric to set_position_tp_pct — same audit +
+    cache-bust + response shape."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.position_sl_pct
+    s.position_sl_pct = payload.position_sl_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.position_sl_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.position_sl_pct) if payload.position_sl_pct is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
 @router.patch("/subscriber/retry-interval", response_model=SubscriberSettingsOut)
 def set_retry_interval(
     payload: RetryIntervalIn,
@@ -544,4 +632,12 @@ def toggle_trading(
 def list_available_traders(db: Session = Depends(get_db), _: User = Depends(current_user)) -> list[dict]:
     """Subscribers use this to find the trader to follow."""
     rows = db.execute(select(User).where(User.role == UserRole.TRADER, User.is_active.is_(True))).scalars()
-    return [{"id": str(t.id), "display_name": t.display_name, "email": t.email} for t in rows]
+    return [
+        {
+            "id": str(t.id),
+            "display_name": t.display_name,
+            "email": t.email,
+            "business_name": t.business_name,
+        }
+        for t in rows
+    ]

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -36,11 +36,51 @@ from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter
 from app.brokers.base import BrokerOrderRequest
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Order, OrderSide, OrderStatus, OrderType
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.services import audit
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
+
+
+# US-listed-options minimum-tick rules enforced by Alpaca (and SnapTrade
+# when routing to Alpaca). Sending a price off-tick gets you a 422 with
+# either "limit price must be limited to 2 decimal places" or, for
+# >= $3 options, an off-grid rejection. Stocks are always penny-tick.
+_PENNY = Decimal("0.01")
+_NICKEL = Decimal("0.05")
+_OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+
+
+def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) -> Decimal:
+    """Round `price` to the smallest tick the broker will accept.
+
+    Rounding direction is leg-aware so we never push the exit *into* a
+    losing region:
+      * TP (sell-limit for a long, buy-limit for a short) → round
+        DOWN so we still take profit even if we shave a penny. A
+        ROUND_UP here would push the limit further from the market
+        and reduce fill probability.
+      * SL (stop) → round UP toward the threshold side that *triggers
+        earlier*, so we don't accidentally widen the stop. For longs
+        the stop trips on price drop, so rounding up keeps the trigger
+        at or slightly tighter than the user asked for.
+
+    Stocks always tick at $0.01; options tick at $0.01 below $3 and
+    $0.05 at $3 and above."""
+    if leg == "tp":
+        mode = ROUND_DOWN
+    elif leg == "sl":
+        mode = ROUND_UP
+    else:
+        mode = ROUND_HALF_UP
+
+    if instrument_type == InstrumentType.OPTION and price >= _OPTION_NICKEL_THRESHOLD:
+        tick = _NICKEL
+    else:
+        tick = _PENNY
+    # Quantize to the tick: divide → round → multiply.
+    return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
 # OrderStatuses we still consider "alive" — used to decide whether the
 # sibling exit can be cancelled. PENDING covers the brief window between
@@ -53,10 +93,18 @@ _ALIVE_STATUSES = (
 )
 
 
-def _uses_native_bracket(broker: BrokerName) -> bool:
-    """Brokers that handle bracket OCO server-side — skip emulation for
-    these. (Alpaca's ``OrderClass.BRACKET`` is the only one today.)"""
-    return broker == BrokerName.ALPACA
+def _uses_native_bracket(broker: BrokerName, instrument_type: "InstrumentType | None" = None) -> bool:
+    """True only when the (broker, instrument) pair supports server-side
+    bracket / OCO orders. Currently that's Alpaca **stocks** only:
+    Alpaca's options API explicitly rejects complex orders (error
+    42210000 — "complex orders not supported for options trading"), so
+    options on Alpaca must use the emulator like SnapTrade does."""
+    from app.models.order import InstrumentType  # noqa: PLC0415
+    if broker != BrokerName.ALPACA:
+        return False
+    if instrument_type == InstrumentType.OPTION:
+        return False
+    return True
 
 
 def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
@@ -89,9 +137,11 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
     acct = db.get(BrokerAccount, entry.broker_account_id)
     if acct is None:
         return []
-    if _uses_native_bracket(acct.broker):
+    if _uses_native_bracket(acct.broker, entry.instrument_type):
         # Alpaca's OrderClass.BRACKET already attached these legs on the
-        # broker side — nothing for us to do.
+        # broker side — nothing for us to do. (Options on Alpaca are
+        # NOT native — see _uses_native_bracket; those fall through to
+        # the emulator path below.)
         return []
 
     # Idempotency: don't place exits twice. Re-deliveries of the same
@@ -119,9 +169,13 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
 
     legs: list[tuple[str, OrderType, Decimal]] = []
     if tp_price:
-        legs.append(("tp", OrderType.LIMIT, tp_price))
+        # Round to the smallest tick the broker accepts. Without this,
+        # a TP/SL computed as a percentage of entry price (e.g.
+        # 2.51 × 1.02 = 2.5602) is rejected by Alpaca's options API
+        # with "limit price must be limited to 2 decimal places".
+        legs.append(("tp", OrderType.LIMIT, _round_to_tick(tp_price, entry.instrument_type, "tp")))
     if sl_price:
-        legs.append(("sl", OrderType.STOP, sl_price))
+        legs.append(("sl", OrderType.STOP, _round_to_tick(sl_price, entry.instrument_type, "sl")))
 
     created: list[Order] = []
     for leg, otype, price in legs:
@@ -142,10 +196,24 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
             stop_price=price if otype == OrderType.STOP else None,
             status=OrderStatus.PENDING,
             is_closing=True,
-            # Mirror the entry's fanout flag — if subscribers mirrored
-            # the entry they'll also mirror the exits (when their own
-            # listener fires the emulator for their copy of the entry).
-            fanned_out_to_subscribers=False,
+            # CRITICAL: bracket exits are TRADER-ONLY. By policy
+            # (see copy_engine.fanout_async) subscribers never receive
+            # TP/SL — their mirrored entries are constructed with
+            # take_profit_price=NULL / stop_loss_price=NULL, so when
+            # the subscriber's own listener fires this emulator on
+            # their mirrored entry's fill, the "if not tp_price and
+            # not sl_price: return []" guard at the top short-circuits.
+            # We must ALSO make sure the trader's exits themselves
+            # never get broadcast — even though emulate_bracket_exits
+            # doesn't call fanout, the backfill sweep in
+            # trade_listener.py picks up any row matching
+            # `fanned_out_to_subscribers=False AND parent_order_id IS
+            # NULL AND status IN (...)`, which would otherwise match
+            # these exits. Flagging them as fanned-out at creation
+            # tells that sweep "fanout resolved" and keeps them off
+            # the wire. Belt-and-braces: fanout_async has a
+            # bracket_parent_id guard too.
+            fanned_out_to_subscribers=True,
         )
         db.add(exit_order)
         db.flush()

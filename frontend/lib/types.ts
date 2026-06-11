@@ -5,6 +5,11 @@ export interface User {
   email: string;
   role: Role;
   display_name: string | null;
+  /** Trader-only brand / app name. Required at registration for traders;
+   *  null for subscribers and admins. Shown as the app wordmark in the
+   *  shell for the trader themselves and for any subscriber who follows
+   *  them (see `SubscriberSettings.following_trader_business_name`). */
+  business_name: string | null;
   is_active: boolean;
 }
 
@@ -117,6 +122,11 @@ export interface DailyPnL {
 export interface SubscriberSettings {
   user_id: string;
   following_trader_id: string | null;
+  /** Brand of the trader being followed — surfaced as the app wordmark
+   *  in the AppShell so the subscriber sees the trader's app name. Null
+   *  when not following anyone, or when following a legacy trader who
+   *  pre-dates the business_name field. */
+  following_trader_business_name?: string | null;
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;
@@ -161,6 +171,16 @@ export interface SubscriberSettings {
    *  even after the subscriber clears the limit — it's an audit marker,
    *  not state. */
   auto_liquidated_at: string | null;
+  /** Per-position take-profit % applied to every open position. When a
+   *  position's unrealized P&L hits this %, the position is closed at
+   *  market. Per-position only — does NOT affect copy_enabled. Null
+   *  disables. */
+  position_tp_pct: string | null;
+  /** Per-position stop-loss % applied to every open position. When a
+   *  position's unrealized P&L drops below -this%, the position is
+   *  closed at market. Per-position only — does NOT affect copy_enabled.
+   *  Null disables. */
+  position_sl_pct: string | null;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

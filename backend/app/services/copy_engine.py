@@ -170,6 +170,17 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     results: list[FanoutResult] = []
     pending: list[_PendingMirror] = []
 
+    # Bracket-leg guard. Emulator-spawned TP/SL exits (bracket_parent_id
+    # set) are trader-only by design — each subscriber's own listener
+    # runs the bracket emulator on their own mirrored entry and
+    # generates their own exits at the right size. Broadcasting the
+    # trader's exits would double-close and use the trader's quantity
+    # instead of each subscriber's scaled fill. The emulator already
+    # marks these fanned_out=True at creation; this is defence-in-depth
+    # in case anything else (a backfill, a manual replay) hands us one.
+    if trader_order.bracket_parent_id is not None:
+        return results
+
     # Trader master pause — skip all fanout when set.
     ts = db.get(TraderSettings, trader.id)
     if ts is not None and ts.copy_paused:
@@ -442,10 +453,23 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 quantity=scaled,
                 limit_price=trader_order.limit_price,
                 stop_price=trader_order.stop_price,
-                # Bracket exit legs inherit verbatim — price levels are
-                # scale-invariant, multipliers only scale quantity.
-                take_profit_price=trader_order.take_profit_price,
-                stop_loss_price=trader_order.stop_loss_price,
+                # TP/SL are TRADER-ONLY. We deliberately do NOT propagate
+                # the trader's take_profit_price / stop_loss_price onto
+                # the subscriber's mirrored entry. Two reasons we leave
+                # these NULL:
+                #   1. The subscriber's broker should never place a
+                #      native bracket for them — see the
+                #      BrokerOrderRequest below which now hard-codes
+                #      None for both.
+                #   2. The subscriber's listener calls
+                #      bracket_emulator.emulate_bracket_exits when this
+                #      child fills. That function short-circuits when
+                #      BOTH prices are NULL ("if not tp_price and not
+                #      sl_price: return []"), so no exits are spawned.
+                # Net result: subscribers mirror entries only; the
+                # trader manages exits on their own account.
+                take_profit_price=None,
+                stop_loss_price=None,
                 status=OrderStatus.PENDING,
                 subscriber_picked_at=subscriber_picked_at,
                 subscriber_accepted_at=subscriber_accepted_at,
@@ -476,13 +500,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 continue
 
-            # Forward bracket prices to the broker request ONLY when the
-            # subscriber's broker supports native bracket OCO (Alpaca).
-            # Other brokers get the plain entry; bracket_emulator places
-            # the TP / SL exits when the listener detects the mirror has
-            # filled. The bracket prices stay on the child Order row
-            # regardless, so the emulator can find them.
-            sub_native_bracket = acct.broker == BrokerName.ALPACA
+            # TP/SL are TRADER-ONLY (see the child Order construction
+            # above). Hard-code None on the broker request so the
+            # subscriber's broker never opens a native bracket either —
+            # not even on Alpaca stocks. Subscribers receive plain
+            # entries; the trader manages their own exits.
             pending.append(_PendingMirror(
                 child_order_id=child.id,
                 subscriber_user_id=sub.user_id,
@@ -497,8 +519,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     quantity=child.quantity,
                     limit_price=child.limit_price,
                     stop_price=child.stop_price,
-                    take_profit_price=child.take_profit_price if sub_native_bracket else None,
-                    stop_loss_price=child.stop_loss_price if sub_native_bracket else None,
+                    take_profit_price=None,
+                    stop_loss_price=None,
                     option_expiry=child.option_expiry,
                     option_strike=child.option_strike,
                     option_right=child.option_right,
