@@ -1,3 +1,4 @@
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
@@ -368,6 +369,7 @@ def _place_trader_order(
         isinstance(adapter, AlpacaAdapter)
         and order.instrument_type != InstrumentType.OPTION
     )
+    _broker_t0 = time.perf_counter()
     try:
         result = adapter.place_order(
             BrokerOrderRequest(
@@ -387,6 +389,7 @@ def _place_trader_order(
             )
         )
     except Exception as exc:  # noqa: BLE001
+        order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
         order.status = OrderStatus.REJECTED
         order.reject_reason = str(exc)[:480]
         order.closed_at = datetime.now(timezone.utc)
@@ -404,6 +407,12 @@ def _place_trader_order(
             background.add_task(_run_rejection_notify_in_background, order.id, trader.id)
         raise HTTPException(502, f"broker_error: {exc}")
 
+    # Perf instrumentation: broker place-order round-trip (request->response)
+    # and when the broker accepted. broker_call_ms was previously never
+    # populated, so the Performance page's broker-latency column was always
+    # blank — now it reflects the real broker call time.
+    order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
+    order.broker_accepted_at = datetime.now(timezone.utc)
     order.broker_order_id = result.broker_order_id
     order.status = result.status
     order.submitted_at = result.submitted_at
