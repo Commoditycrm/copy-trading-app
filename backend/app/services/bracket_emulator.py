@@ -283,11 +283,20 @@ def cancel_sibling_on_fill(db: Session, filled_exit: Order) -> bool:
 
     Safe to call on any order; it short-circuits if the order isn't a
     bracket-exit leg or hasn't actually filled.
+
+    Side effect: emits a trader-facing notification (persistent + SSE
+    push) the FIRST time we observe a bracket leg fill for an entry —
+    this is the only point in the lifecycle where we can guarantee the
+    trader sees their TP/SL trigger. Done before cancelling the sibling
+    so a sibling-cancel failure doesn't suppress the user-visible
+    notification.
     """
     if not filled_exit.bracket_parent_id or not filled_exit.bracket_leg:
         return False
     if filled_exit.status != OrderStatus.FILLED:
         return False
+
+    _notify_trader_of_bracket_fill(db, filled_exit)
 
     sibling = db.execute(
         select(Order).where(
@@ -349,6 +358,92 @@ def cancel_sibling_on_fill(db: Session, filled_exit: Order) -> bool:
         },
     )
     return True
+
+
+def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
+    """Persist + push an in-app notification for the trader the moment
+    one of their bracket legs fills.
+
+    Idempotent: we only notify the FIRST time a leg fills for a given
+    entry. The listener may re-deliver the same FILLED status across
+    polls (snaptrade_listener short-circuits via ``status_changed``
+    upstream, but trade_listener for Alpaca can re-call us on every
+    websocket update for the same order). We check whether an audit
+    row already exists for this exit before sending.
+
+    Best-effort: any failure is swallowed and logged so the OCO cancel
+    path that follows isn't blocked by a notification hiccup."""
+    try:
+        from app.services import notifications as notif_svc  # noqa: PLC0415
+
+        # Dedup gate. We use a marker audit row keyed on (order id +
+        # action) — present means we already notified for this fill.
+        # Cheap PK-equivalent lookup.
+        from app.models.audit_log import AuditLog  # noqa: PLC0415
+        already = db.execute(
+            select(AuditLog.id).where(
+                AuditLog.action == "bracket.trader_notified",
+                AuditLog.entity_id == str(filled_exit.id),
+            ).limit(1)
+        ).scalar_one_or_none()
+        if already is not None:
+            return
+
+        leg_label = "take-profit" if filled_exit.bracket_leg == "tp" else "stop-loss"
+        # Price the leg was set at. Fall back to the actual fill price
+        # if the trigger price wasn't recorded on the row for some reason.
+        trigger_price = (
+            filled_exit.limit_price
+            if filled_exit.bracket_leg == "tp"
+            else filled_exit.stop_price
+        )
+        fill_price = filled_exit.filled_avg_price
+        qty = filled_exit.filled_quantity or filled_exit.quantity
+        symbol = filled_exit.symbol or "position"
+
+        # Trader-readable message. Includes BOTH the trigger and the
+        # actual fill so they can spot slippage at a glance.
+        msg_parts = [f"{symbol} {leg_label} hit"]
+        if trigger_price is not None:
+            msg_parts.append(f"at ${trigger_price}")
+        if fill_price is not None and fill_price != trigger_price:
+            msg_parts.append(f"(filled ${fill_price})")
+        msg_parts.append(f"— {qty} closed.")
+        message = " ".join(msg_parts)
+
+        notif_svc.create_notification(
+            db,
+            user_id=filled_exit.user_id,
+            type=f"bracket.{filled_exit.bracket_leg}_filled",
+            message=message,
+            metadata={
+                "entry_order_id": str(filled_exit.bracket_parent_id),
+                "exit_order_id": str(filled_exit.id),
+                "leg": filled_exit.bracket_leg,
+                "symbol": symbol,
+                "qty": str(qty) if qty is not None else None,
+                "trigger_price": str(trigger_price) if trigger_price is not None else None,
+                "fill_price": str(fill_price) if fill_price is not None else None,
+                "broker_order_id": filled_exit.broker_order_id,
+            },
+        )
+
+        # Stamp the dedup marker so re-deliveries don't double-notify.
+        audit.record(
+            db, actor_user_id=filled_exit.user_id,
+            action="bracket.trader_notified",
+            entity_type="order", entity_id=filled_exit.id,
+            metadata={
+                "leg": filled_exit.bracket_leg,
+                "symbol": symbol,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "bracket: trader notification failed for exit %s — "
+            "OCO cancel will still run",
+            filled_exit.id,
+        )
 
 
 # Re-export the public surface so listeners can `from app.services.bracket_emulator
