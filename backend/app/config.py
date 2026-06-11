@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     # min(32, cpu+4) — way too small for 200 concurrent broker calls). We
     # bump this at startup so all 200 actually run in parallel.
     fanout_threadpool_size: int = 256
+    # Web/worker split. Background singletons (broker listeners, P&L poller,
+    # retry scheduler, crash-recovery sweep) must run in EXACTLY ONE process.
+    # The dedicated `worker` container sets this true; the web container runs
+    # uvicorn --workers N with it FALSE so those services aren't duplicated
+    # per worker (which would double broker API calls + double-process fills).
+    # Defaults true so a single-process deployment keeps working unchanged.
+    run_background_workers: bool = True
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300

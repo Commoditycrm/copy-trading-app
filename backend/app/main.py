@@ -91,6 +91,24 @@ def create_app() -> FastAPI:
                 thread_name_prefix="fanout",
             )
         )
+
+        # ── Web/worker split ──────────────────────────────────────────────
+        # Background singletons (broker listeners, P&L poller, retry
+        # scheduler, crash-recovery sweep) must run in EXACTLY ONE process.
+        # Under uvicorn --workers N every web worker runs this startup hook,
+        # so the web container sets run_background_workers=false and returns
+        # here; only the dedicated `worker` container (flag true) starts them.
+        # Otherwise each worker would spawn its own listeners/poller →
+        # duplicated broker API calls and double-processed fills. The
+        # threadpool above stays in web workers because fanout (request-path)
+        # still runs there.
+        if not s.run_background_workers:
+            log.info(
+                "web mode (run_background_workers=false): skipping "
+                "listeners / pnl_poller / retry-scheduler in this process"
+            )
+            return
+
         # Replay any PENDING child orders stranded by a previous crash before
         # we start serving traffic. Failures here are logged, never fatal.
         try:

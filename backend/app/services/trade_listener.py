@@ -389,11 +389,25 @@ def _persist_and_fanout(
 
     with SessionLocal() as db:
         from sqlalchemy import select
+        # Scope by (user_id, broker_order_id) + LIMIT 1 — NOT scalar_one_or_none.
+        # broker_order_id has no unique constraint, so duplicate rows (e.g. from
+        # a prior reconnect that orphaned the account) made scalar_one_or_none
+        # raise MultipleResultsFound, which DROPPED the fill event — leaving the
+        # order stuck at ACCEPTED in our UI while the broker showed it FILLED.
         existing = db.execute(
-            select(Order).where(Order.broker_order_id == broker_order_id)
-        ).scalar_one_or_none()
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .where(Order.user_id == trader_user_id)
+            .where(Order.parent_order_id.is_(None))
+            .order_by(Order.created_at)
+            .limit(1)
+        ).scalars().first()
 
         if existing is not None:
+            # Re-adopt an orphaned row (broker_account_id nulled by a prior
+            # reconnect) back onto the live account so the link is restored.
+            if existing.broker_account_id != broker_account_id:
+                existing.broker_account_id = broker_account_id
             # We already know about this order (Trade Panel placement, or an
             # earlier event for the same order). Just update status / fills.
             _apply_event_to_existing(db, existing, alpaca_order, update, event_name)
