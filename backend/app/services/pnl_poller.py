@@ -87,19 +87,47 @@ from app.services.pnl import today_filled_notional
 log = logging.getLogger(__name__)
 
 
-# Outer loop tick. Set to the smallest broker interval so we don't oversleep
-# accounts whose interval is shorter — per-account due-times in
-# ``_next_due_at`` handle longer-cadence brokers (e.g. SnapTrade @ 60s).
-POLL_INTERVAL_S = 10.0
+# Outer loop tick. This is the FLOOR cadence — actual per-account
+# intervals can be longer (see ``_interval_for_broker``) but never
+# shorter than this. Set to the minimum admin-allowed Alpaca interval
+# (1s) so a runtime override down to 1s actually fires every second
+# instead of being clipped to the old floor. The loop only does real
+# work for accounts whose timer has elapsed; on idle wakes it's a
+# single SELECT + dict comparison, sub-millisecond.
+POLL_INTERVAL_S = 1.0
 
-# Per-broker minimum interval (seconds). Each connected account is polled
-# at most once per its broker's interval. SnapTrade gets 60s because its
-# 250 req/min platform quota is shared with the order listener — see the
-# rate-limit math in the module docstring.
+# Per-broker minimum interval (seconds). Kept as a static fallback for
+# brokers without a runtime knob. SnapTrade gets 60s because its 250
+# req/min platform quota is shared with the order listener — see the
+# rate-limit math in the module docstring. The ALPACA entry is the
+# fallback used when Redis is unreachable; the live value comes from
+# ``platform_config.get_alpaca_pnl_poll_interval_sync()``.
 _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     BrokerName.ALPACA: 10.0,
     BrokerName.SNAPTRADE: 60.0,
 }
+
+
+def _interval_for_broker(broker: BrokerName) -> float:
+    """Return the current per-tick interval for ``broker``, reading any
+    runtime override every call. For Alpaca this checks Redis (~0.5ms);
+    for everything else it uses the static map above.
+
+    Called on the hot path (stamping the next-due time after each tick)
+    so an admin change lands on the very next tick without restart."""
+    if broker == BrokerName.ALPACA:
+        try:
+            from app.services.platform_config import (  # noqa: PLC0415
+                get_alpaca_pnl_poll_interval_sync,
+            )
+            return float(get_alpaca_pnl_poll_interval_sync())
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "pnl_poller: alpaca interval lookup failed; using fallback %ss",
+                _INTERVAL_BY_BROKER[BrokerName.ALPACA],
+            )
+            return _INTERVAL_BY_BROKER[BrokerName.ALPACA]
+    return _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
 
 # Per-account monotonic timestamp of the earliest time the account is
 # allowed to be polled again. The outer loop ticks every POLL_INTERVAL_S
@@ -141,11 +169,14 @@ def start() -> None:
         log.warning("pnl_poller: no main loop bound; start is a no-op")
         return
     _task = _main_loop.create_task(_run())
-    intervals = ", ".join(
-        f"{b.value}={s:.0f}s" for b, s in _INTERVAL_BY_BROKER.items()
-    )
+    # Log the live effective intervals so the startup line reflects any
+    # current admin override. Alpaca goes through the runtime lookup;
+    # other brokers come from the static map.
+    parts = []
+    for broker in _SUPPORTED_BROKERS:
+        parts.append(f"{broker.value}={_interval_for_broker(broker):.0f}s")
     log.info(
-        "pnl_poller: started (tick=%.0fs, %s)", POLL_INTERVAL_S, intervals,
+        "pnl_poller: started (tick=%.0fs, %s)", POLL_INTERVAL_S, ", ".join(parts),
     )
 
 
@@ -184,9 +215,12 @@ async def _run() -> None:
                 # Stamp next-due AFTER the work — using a fresh monotonic
                 # read so a slow tick (e.g. SnapTrade throttling) doesn't
                 # immediately re-run the same accounts on the next tick.
+                # ``_interval_for_broker`` reads the live Redis override
+                # each call so an admin change picks up on the very next
+                # account that gets stamped.
                 stamp = time.monotonic()
                 for a in due:
-                    interval = _INTERVAL_BY_BROKER.get(a.broker, POLL_INTERVAL_S)
+                    interval = _interval_for_broker(a.broker)
                     _next_due_at[a.id] = stamp + interval
         except asyncio.CancelledError:
             log.info("pnl_poller: cancelled")

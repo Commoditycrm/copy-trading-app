@@ -524,3 +524,61 @@ def set_fanout_threshold(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     return get_fanout_batch_threshold_state()
+
+
+# ── Platform-config: Alpaca P&L poll interval ──────────────────────────
+#
+# pnl_poller hits Alpaca's GET /v2/account once per connected account
+# per tick. The interval is runtime-tunable so an admin can throttle
+# down to save the 200/min/account budget on a heavy-fanout day, or
+# crank up to lower kill-switch latency. Stored as a Redis override
+# on top of the env default (Settings.alpaca_pnl_poll_interval_s).
+
+
+class AlpacaPollIntervalOut(BaseModel):
+    """Effective + default + override + bound values for the admin UI."""
+
+    default: int
+    override: int | None
+    effective: int
+    # Min/max the setter accepts. Surfaced so the UI input can bound
+    # itself client-side and the user never sends a value that comes
+    # back 422.
+    min: int
+    max: int
+
+
+class AlpacaPollIntervalIn(BaseModel):
+    """Pass ``interval_s=null`` to reset to the env default. Range
+    bounded by the same min/max returned in the GET payload — see the
+    setter for the underlying rationale."""
+
+    interval_s: int | None = Field(default=None, ge=1, le=300)
+
+
+@router.get("/config/alpaca-pnl-poll-interval", response_model=AlpacaPollIntervalOut)
+def get_alpaca_poll_interval(
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import get_alpaca_pnl_poll_interval_state
+    return get_alpaca_pnl_poll_interval_state()
+
+
+@router.patch("/config/alpaca-pnl-poll-interval", response_model=AlpacaPollIntervalOut)
+def set_alpaca_poll_interval(
+    payload: AlpacaPollIntervalIn,
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import (
+        get_alpaca_pnl_poll_interval_state,
+        set_alpaca_pnl_poll_interval,
+    )
+    try:
+        set_alpaca_pnl_poll_interval(payload.interval_s)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    log.info(
+        "admin set alpaca pnl_poll_interval_s override = %s",
+        payload.interval_s,
+    )
+    return get_alpaca_pnl_poll_interval_state()
