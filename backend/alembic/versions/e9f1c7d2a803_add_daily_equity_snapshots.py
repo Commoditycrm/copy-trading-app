@@ -25,41 +25,57 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "daily_equity_snapshots",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column(
-            "broker_account_id",
-            sa.dialects.postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("broker_accounts.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("utc_date", sa.Date(), nullable=False),
-        sa.Column("equity", sa.Numeric(20, 2), nullable=False),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.UniqueConstraint(
-            "broker_account_id", "utc_date",
-            name="uq_daily_equity_account_date",
-        ),
+    # Idempotent — if a previous deploy created the table but didn't
+    # update alembic_version (partial migration, schema dump restore,
+    # manual intervention, etc.) we'd hit DuplicateTable on retry.
+    # ``has_table`` short-circuits the CREATE in that case. Indexes
+    # use PG's "CREATE INDEX IF NOT EXISTS" so they're independently
+    # safe to re-run too.
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
+    if not inspector.has_table("daily_equity_snapshots"):
+        op.create_table(
+            "daily_equity_snapshots",
+            sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column(
+                "broker_account_id",
+                sa.dialects.postgresql.UUID(as_uuid=True),
+                sa.ForeignKey("broker_accounts.id", ondelete="CASCADE"),
+                nullable=False,
+            ),
+            sa.Column("utc_date", sa.Date(), nullable=False),
+            sa.Column("equity", sa.Numeric(20, 2), nullable=False),
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            sa.UniqueConstraint(
+                "broker_account_id", "utc_date",
+                name="uq_daily_equity_account_date",
+            ),
+        )
+
+    # CREATE INDEX IF NOT EXISTS lets us re-run safely without first
+    # introspecting the catalog for index names.
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_daily_equity_snapshots_broker_account_id "
+        "ON daily_equity_snapshots (broker_account_id)"
     )
-    op.create_index(
-        "ix_daily_equity_snapshots_broker_account_id",
-        "daily_equity_snapshots",
-        ["broker_account_id"],
-    )
-    op.create_index(
-        "ix_daily_equity_snapshots_utc_date",
-        "daily_equity_snapshots",
-        ["utc_date"],
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_daily_equity_snapshots_utc_date "
+        "ON daily_equity_snapshots (utc_date)"
     )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_daily_equity_snapshots_utc_date", table_name="daily_equity_snapshots")
-    op.drop_index("ix_daily_equity_snapshots_broker_account_id", table_name="daily_equity_snapshots")
-    op.drop_table("daily_equity_snapshots")
+    # Mirror the upgrade — drop only if present, in case the table was
+    # already dropped manually before downgrade ran.
+    op.execute("DROP INDEX IF EXISTS ix_daily_equity_snapshots_utc_date")
+    op.execute("DROP INDEX IF EXISTS ix_daily_equity_snapshots_broker_account_id")
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if inspector.has_table("daily_equity_snapshots"):
+        op.drop_table("daily_equity_snapshots")
