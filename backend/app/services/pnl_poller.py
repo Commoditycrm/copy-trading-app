@@ -1,40 +1,60 @@
-"""Daily P&L limit poller — Alpaca only.
+"""Daily P&L limit poller — Alpaca + SnapTrade.
 
-SnapTrade is intentionally NOT polled here. The combined load of the
-order listener (12 req/min/trader, 5s cadence) plus this poller would
-exhaust SnapTrade's 250 req/min platform quota and 429 the connect
-flow. For SnapTrade subscribers the in-fanout check inside
-``copy_engine`` is the kill-switch enforcement path; the live "Today"
-tile shows "—" for those users until we wire a separate cadence
-(e.g. 60s or webhook-driven).
+Polls each subscriber's connected broker account on a cadence that's
+broker-specific:
 
-Every 10 seconds, for every subscriber with a connected Alpaca account:
+  * **Alpaca**: 10s per tick. Each account costs ~6 req/min against
+    Alpaca's own 200/min budget — comfortable.
+  * **SnapTrade**: 60s per tick (and rate-controlled — see below).
+    SnapTrade has a 250 req/min PLATFORM quota that's shared with the
+    order listener, so we can't hit it as hard.
 
-  1. Call ``AlpacaAdapter.get_pnl_snapshot()`` — one ``GET /v2/account``
-     yielding equity, last_equity (today's start-of-day balance), and
-     today's P&L = equity - last_equity.
-  2. If the subscriber has a ``daily_loss_limit`` or ``daily_profit_limit``
+Every tick, for every subscriber with a connected supported broker:
+
+  1. Skip-idle gate. If the subscriber has NO active policy (no
+     kill-switch, no auto-liquidation, no position TP/SL), don't make
+     the broker call at all. This is the single biggest rate-limit
+     saver — typical deployments have a long tail of subscribers with
+     nothing enforced.
+  2. Call ``adapter.get_pnl_snapshot()`` — equity, last_equity (today's
+     start-of-day balance), and today's P&L = equity - last_equity.
+  3. If the subscriber has a ``daily_loss_limit`` or ``daily_profit_limit``
      set AND today's P&L breaches it, flip ``copy_enabled = False`` and
      stamp ``pnl_auto_paused_at``. Same audit + cache-invalidation + SSE
      event shape the in-fanout enforcement uses.
-  3. If ``max_account_pct_per_day`` is set AND today's filled trade
+  4. If ``max_account_pct_per_day`` is set AND today's filled trade
      notional (from our own fills table) crosses
      ``beginning_day_balance * pct/100``, same pause. Skipped silently
      when the broker doesn't expose a day-start.
-  4. Auto-resume any pause whose ``pnl_auto_paused_at`` is from a prior
-     UTC day. Runs here (not just in copy_engine on fanout) so a
-     subscriber paused yesterday comes back online at 00:00 UTC even if
-     no trader places an order that day.
-  5. Emit a ``pnl.tick`` SSE event so the Settings page's P&L Limit and
+  5. If ``position_tp_pct`` / ``position_sl_pct`` is set, run the
+     per-position enforcer (one additional ``adapter.get_positions()``
+     call). Closes any position whose unrealized P&L percent has
+     breached either threshold.
+  6. Auto-resume any pause whose ``pnl_auto_paused_at`` is from a prior
+     UTC day.
+  7. Emit a ``pnl.tick`` SSE event so the Settings page's P&L Limit and
      Risk Limits panels update live.
 
-Cadence
--------
-10s per tick. Per-account work runs concurrently via
-``asyncio.gather(*to_thread(...))`` so wall-clock per tick is the
-slowest single broker call (~500ms), not the sum. Each Alpaca account
-costs 6 req/min against its own 200/min budget — comfortably under
-even after broker-side activity.
+SnapTrade rate-limit math
+-------------------------
+Quota: 250 req/min platform-wide. Typical workload:
+
+  * ``snaptrade_listener`` (per active trader, 5s cadence) ~12 req/min
+  * Adapter's ``get_pnl_snapshot`` makes 2 SnapTrade calls internally
+    (balance + account details) — so each polled subscriber costs 2
+    req per 60s tick = 2 req/min.
+  * ``adapter.get_positions`` (only for subs with position TP/SL set):
+    1 req per 60s tick = 1 req/min/sub.
+
+Worked example (38 SnapTrade subscribers):
+  * Listener: ~12-24 req/min (1-2 traders)
+  * Skip-idle reduces actively-polled subs to ~50% → 19 subs × 2 req/min = 38
+  * Position-TP/SL on ~25% of subs → 10 × 1 req/min = 10
+  * Total: ~60-72 req/min ✓ well under 250
+
+Concurrency is gated by ``_SNAPTRADE_SEM`` so that even if every subscriber
+is due on the same tick, only N at a time hit SnapTrade. Prevents the
+burst-of-38-HTTP-requests problem.
 
 Why a separate task (not piggyback on copy_engine)
 --------------------------------------------------
@@ -46,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -66,18 +87,18 @@ from app.services.pnl import today_filled_notional
 log = logging.getLogger(__name__)
 
 
-# Outer-loop tick = Alpaca's cadence (the only broker this poller hits).
-# SnapTrade was previously polled by this loop too but burned through
-# its 250 req/min platform quota when combined with snaptrade_listener;
-# we now rely on copy_engine's in-fanout pause check for SnapTrade
-# subscribers and let the order listener handle order-event detection.
+# Outer loop tick. Set to the smallest broker interval so we don't oversleep
+# accounts whose interval is shorter — per-account due-times in
+# ``_next_due_at`` handle longer-cadence brokers (e.g. SnapTrade @ 60s).
 POLL_INTERVAL_S = 10.0
 
-# Per-broker minimum interval (seconds). Only brokers in this dict are
-# polled. SnapTrade is intentionally absent — re-add a key here (and to
-# ``_SUPPORTED_BROKERS`` below) to enable poller-driven P&L for it.
+# Per-broker minimum interval (seconds). Each connected account is polled
+# at most once per its broker's interval. SnapTrade gets 60s because its
+# 250 req/min platform quota is shared with the order listener — see the
+# rate-limit math in the module docstring.
 _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     BrokerName.ALPACA: 10.0,
+    BrokerName.SNAPTRADE: 60.0,
 }
 
 # Per-account monotonic timestamp of the earliest time the account is
@@ -86,12 +107,20 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
 # deleted accounts hang around but are harmless — just stale keys.
 _next_due_at: dict[uuid.UUID, float] = {}
 
-# Brokers the poller knows how to fetch from. Adding a broker is one of:
+# Brokers the poller knows how to fetch from. Adding a broker is:
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
 # is listed here, and (c) the broker has an entry in
-# ``_INTERVAL_BY_BROKER``. SnapTrade is intentionally omitted — see the
-# comment on POLL_INTERVAL_S above.
-_SUPPORTED_BROKERS = (BrokerName.ALPACA,)
+# ``_INTERVAL_BY_BROKER``.
+_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE)
+
+# Concurrency gate for SnapTrade. Even with skip-idle and 60s cadence,
+# if 30+ subscribers all become due in the same tick they would burst
+# fire HTTP requests concurrently and trip SnapTrade's instantaneous
+# rate-limiter (separate from the 250/min platform quota). The
+# semaphore caps simultaneous in-flight calls so the burst spreads out
+# over the tick. Sized small (4) because each ``_enforce_one`` makes
+# 2-3 SnapTrade calls; a higher cap risks 429.
+_SNAPTRADE_SEM = threading.Semaphore(4)
 
 
 _task: asyncio.Task | None = None
@@ -184,9 +213,61 @@ def _load_active_accounts() -> list[BrokerAccount]:
         return accts
 
 
+def _has_active_policies(s: SubscriberSettings) -> bool:
+    """Return True if the subscriber has at least one enforcement policy
+    configured. When False, the poller can skip the broker call entirely
+    — there's nothing to enforce, and the pnl.tick event would only be
+    consumed by the Settings page to show progress against limits that
+    don't exist. The biggest single rate-limit saver on SnapTrade."""
+    return any((
+        s.daily_loss_limit is not None,
+        s.daily_profit_limit is not None,
+        s.daily_loss_limit_pct is not None,
+        s.daily_profit_limit_pct is not None,
+        s.max_account_pct_per_day is not None,
+        s.auto_liquidation_limit is not None,
+        s.position_tp_pct is not None,
+        s.position_sl_pct is not None,
+    ))
+
+
+def _subscriber_has_active_policies(user_id: uuid.UUID) -> bool:
+    """Short read-only DB session that returns the skip-idle gate
+    answer in one PK lookup. Used by ``_enforce_one_safe`` BEFORE the
+    broker call so we don't burn a SnapTrade request on a subscriber
+    who has nothing configured."""
+    with SessionLocal() as db:
+        s = db.get(SubscriberSettings, user_id)
+        if s is None:
+            return False  # Trader / admin — not our concern
+        return _has_active_policies(s)
+
+
 def _enforce_one_safe(acct: BrokerAccount) -> None:
     """Crash isolation wrapper — one subscriber's failure (broker 500,
-    DB lock, etc.) must not abort the rest of the tick's gather."""
+    DB lock, etc.) must not abort the rest of the tick's gather.
+
+    Two layers of rate-limit protection for SnapTrade:
+      1. Skip-idle: skip the entire tick if the subscriber has no
+         active policy. Saves a 2-3 call burst per idle subscriber.
+      2. Concurrency semaphore: cap simultaneous in-flight SnapTrade
+         calls. Prevents the burst-of-N-HTTP-requests problem when
+         many subscribers become due in the same tick.
+    """
+    # (1) Skip-idle check. Cheap DB read, no broker call yet.
+    if not _subscriber_has_active_policies(acct.user_id):
+        return
+
+    # (2) Concurrency gate per broker. Alpaca is generous; SnapTrade is
+    # the rate-limited one and gets the explicit semaphore.
+    if acct.broker == BrokerName.SNAPTRADE:
+        with _SNAPTRADE_SEM:
+            _enforce_one_inner(acct)
+        return
+    _enforce_one_inner(acct)
+
+
+def _enforce_one_inner(acct: BrokerAccount) -> None:
     try:
         _enforce_one(acct)
     except Exception:  # noqa: BLE001
@@ -260,6 +341,35 @@ def _enforce_one(acct: BrokerAccount) -> None:
         todays_pl = state["todays_pl"]
         equity = state["equity"]
         beginning_day_balance: Decimal | None = state.get("beginning_day_balance")
+
+        # ── Broker-agnostic day-start fallback ────────────────────────────
+        # Direct Alpaca returns `last_equity` (yesterday's market close)
+        # so beginning_day_balance is populated and we trust it.
+        # SnapTrade-routed Alpaca paper (and some other SnapTrade
+        # brokerages) don't expose a day-start field — beginning_day_balance
+        # comes back None. Without it, todays_pl can't be computed (the
+        # adapter falls back to 0) and every pct-based kill switch
+        # silently disables.
+        #
+        # We close that gap with our own snapshot: the first poll of
+        # each UTC day per account records `equity` as the day-start;
+        # subsequent polls that day read it back. Idempotent against
+        # racing pollers via the (broker_account_id, utc_date) unique
+        # constraint.
+        if beginning_day_balance is None and equity is not None:
+            try:
+                from app.services.day_start_equity import get_or_record  # noqa: PLC0415
+                beginning_day_balance = get_or_record(db, acct.id, equity)
+                # Recompute todays_pl using our recorded baseline.
+                todays_pl = equity - beginning_day_balance
+            except Exception:  # noqa: BLE001
+                # Snapshot table failure must not block the rest of the
+                # tick — kill-switch math will silently skip pct rules
+                # this tick, same as before this fallback existed.
+                log.exception(
+                    "pnl_poller: day-start snapshot failed for account %s",
+                    acct.id,
+                )
 
         # ── Pct-of-day-start-balance TRADING-VALUE cap ───────────────────
         # Tracks today's cumulative filled trade notional (capital
