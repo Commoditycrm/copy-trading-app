@@ -377,7 +377,18 @@ def _persist_and_fanout(
                 and existing.parent_order_id is None
                 and existing.fanned_out_to_subscribers
             ):
-                _cascade_cancel_to_mirrors(existing.id)
+                # Honor the trader's "Cancel My Orders" intent. See
+                # cancel_intent.py + the matching guard in trade_listener /
+                # snaptrade_listener for the full rationale.
+                from app.services.cancel_intent import consume_no_cascade  # noqa: PLC0415
+                if consume_no_cascade(existing.id):
+                    log.info(
+                        "ibkr-listener[%s] suppressing cascade for order %s "
+                        "— trader requested cancel-without-subscribers",
+                        trader_user_id, existing.id,
+                    )
+                else:
+                    _cascade_cancel_to_mirrors(existing.id)
             return
 
         # Brand-new order — only act on working/terminal-success states.

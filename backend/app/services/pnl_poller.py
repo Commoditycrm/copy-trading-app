@@ -265,50 +265,155 @@ def _has_active_policies(s: SubscriberSettings) -> bool:
     ))
 
 
-def _subscriber_has_active_policies(user_id: uuid.UUID) -> bool:
-    """Short read-only DB session that returns the skip-idle gate
-    answer in one PK lookup. Used by ``_enforce_one_safe`` BEFORE the
-    broker call so we don't burn a SnapTrade request on a subscriber
-    who has nothing configured."""
+def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
+    """Return (role, should_run) for the user that owns this account.
+
+    ``role`` is one of "subscriber" | "trader" | "other". ``should_run``
+    is the skip-idle gate:
+      * subscriber → True iff at least one enforcement policy is set
+      * trader     → True iff there's at least one open option-entry
+                     row with stop_loss_price set (trader option SL
+                     monitor is the only trader-side work here)
+      * other      → False (admin accounts have nothing to enforce)
+
+    One short read-only DB session — kept off the hot path so the
+    broker call only happens when there's actually work to do.
+    """
+    from app.models.user import User, UserRole  # noqa: PLC0415
+    from app.models.order import (  # noqa: PLC0415
+        InstrumentType, Order, OrderStatus,
+    )
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
     with SessionLocal() as db:
-        s = db.get(SubscriberSettings, user_id)
-        if s is None:
-            return False  # Trader / admin — not our concern
-        return _has_active_policies(s)
+        u = db.get(User, user_id)
+        if u is None:
+            return ("other", False)
+        if u.role == UserRole.SUBSCRIBER:
+            s = db.get(SubscriberSettings, user_id)
+            if s is None:
+                return ("subscriber", False)
+            return ("subscriber", _has_active_policies(s))
+        if u.role == UserRole.TRADER:
+            # Skip-idle for the trader monitor: only worth a broker
+            # call if there's at least one filled option entry with
+            # an SL price still possibly open. The monitor itself
+            # double-checks per-position; this gate just avoids the
+            # broker call for traders with no option SL setups at all.
+            has_setup = db.execute(
+                _select(Order.id).where(
+                    Order.user_id == user_id,
+                    Order.instrument_type == InstrumentType.OPTION,
+                    Order.status == OrderStatus.FILLED,
+                    Order.is_closing.is_(False),
+                    Order.parent_order_id.is_(None),
+                    Order.bracket_parent_id.is_(None),
+                    Order.stop_loss_price.isnot(None),
+                ).limit(1)
+            ).scalar_one_or_none() is not None
+            return ("trader", has_setup)
+        return ("other", False)
 
 
 def _enforce_one_safe(acct: BrokerAccount) -> None:
-    """Crash isolation wrapper — one subscriber's failure (broker 500,
-    DB lock, etc.) must not abort the rest of the tick's gather.
+    """Crash isolation wrapper. Routes to subscriber kill-switches +
+    position-TP/SL enforcement for subscribers, and to the option-SL
+    price-monitor for traders. Both run inside the same SnapTrade
+    semaphore so total in-flight calls stay bounded.
 
-    Two layers of rate-limit protection for SnapTrade:
-      1. Skip-idle: skip the entire tick if the subscriber has no
-         active policy. Saves a 2-3 call burst per idle subscriber.
-      2. Concurrency semaphore: cap simultaneous in-flight SnapTrade
-         calls. Prevents the burst-of-N-HTTP-requests problem when
-         many subscribers become due in the same tick.
+    Layered rate-limit protection:
+      1. Skip-idle: no work this tick if there's nothing to enforce.
+         Avoids a 2-3 call burst per idle account.
+      2. Concurrency semaphore: caps simultaneous SnapTrade calls.
     """
-    # (1) Skip-idle check. Cheap DB read, no broker call yet.
-    if not _subscriber_has_active_policies(acct.user_id):
+    role, should_run = _account_role(acct.user_id)
+    if not should_run:
         return
 
-    # (2) Concurrency gate per broker. Alpaca is generous; SnapTrade is
-    # the rate-limited one and gets the explicit semaphore.
     if acct.broker == BrokerName.SNAPTRADE:
         with _SNAPTRADE_SEM:
-            _enforce_one_inner(acct)
+            _enforce_one_inner(acct, role)
         return
-    _enforce_one_inner(acct)
+    _enforce_one_inner(acct, role)
 
 
-def _enforce_one_inner(acct: BrokerAccount) -> None:
+def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
     try:
-        _enforce_one(acct)
+        if role == "trader":
+            _enforce_one_trader(acct)
+        else:
+            _enforce_one(acct)
     except Exception:  # noqa: BLE001
         log.exception(
-            "pnl_poller: enforce failed for account %s (user %s)",
-            acct.id, acct.user_id,
+            "pnl_poller: enforce failed for account %s (user %s, role=%s)",
+            acct.id, acct.user_id, role,
         )
+
+
+def _enforce_one_trader(acct: BrokerAccount) -> None:
+    """Trader-side tick: run the option SL price monitor and publish
+    any triggered closes. Lightweight wrapper because the monitor
+    already commits + audits per-close — we just translate its
+    return value into SSE + persistent notifications so the trader
+    sees the SL fire in real time.
+    """
+    from app.services import events as _events  # noqa: PLC0415
+    from app.services.trader_bracket_monitor import (  # noqa: PLC0415
+        enforce_trader_option_sl,
+    )
+
+    pending_events: list[dict[str, Any]] = []
+    notifications_to_send: list[dict[str, Any]] = []
+
+    with SessionLocal() as db:
+        closures = enforce_trader_option_sl(db, acct.user_id, acct.id)
+        if not closures:
+            return
+        for c in closures:
+            pending_events.append({
+                "type": "trader.bracket_sl_triggered",
+                "symbol": c["symbol"],
+                "qty": c["qty"],
+                "sl_price": c["sl_price"],
+                "mark": c["mark"],
+                "limit": c["limit"],
+                "broker_order_id": c["broker_order_id"],
+                "entry_order_id": c["entry_order_id"],
+            })
+            notifications_to_send.append({
+                "type": "bracket.sl_triggered",
+                "message": (
+                    f"{c['symbol']} option SL hit at ${c['mark']} "
+                    f"(threshold ${c['sl_price']}). "
+                    f"Close placed at ${c['limit']} — {c['qty']} contracts."
+                ),
+                "metadata": c,
+            })
+        db.commit()
+
+    # Persist notifications + publish SSE in their own session so
+    # commit ordering is clean (state durable before events go out).
+    if notifications_to_send:
+        with SessionLocal() as db:
+            from app.services import notifications as notif_svc  # noqa: PLC0415
+            for n in notifications_to_send:
+                try:
+                    notif_svc.create_notification(
+                        db,
+                        user_id=acct.user_id,
+                        type=n["type"],
+                        message=n["message"],
+                        metadata=n["metadata"],
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "trader_bracket_monitor: notification failed for user=%s",
+                        acct.user_id,
+                    )
+            db.commit()
+
+    for evt in pending_events:
+        _events.publish(acct.user_id, evt)
 
 
 def _enforce_one(acct: BrokerAccount) -> None:

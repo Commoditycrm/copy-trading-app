@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -56,6 +56,37 @@ _CANCELLABLE = (
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
 )
+
+# US-listed options tick rules — same as bracket_emulator's _round_to_tick.
+# Stocks always penny; options $0.01 under $3, $0.05 at/above $3.
+_PENNY = Decimal("0.01")
+_NICKEL = Decimal("0.05")
+_OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+
+
+def _round_limit_for_close(
+    price: Decimal, instrument_type: InstrumentType, side: OrderSide,
+) -> Decimal:
+    """Round ``price`` to the broker's tick for use as a close limit.
+
+    Rounding direction is fill-friendly: when SELLING (closing a long)
+    we round DOWN so the limit sits slightly below current and is
+    likely to fill; when BUYING (closing a short) we round UP so the
+    limit sits slightly above. A "perfectly aligned" current_price
+    isn't enough — sub-penny option marks always need quantization
+    before the broker will accept them."""
+    if side == OrderSide.SELL:
+        mode = ROUND_DOWN
+    elif side == OrderSide.BUY:
+        mode = ROUND_UP
+    else:
+        mode = ROUND_HALF_UP
+
+    if instrument_type == InstrumentType.OPTION and price >= _OPTION_NICKEL_THRESHOLD:
+        tick = _NICKEL
+    else:
+        tick = _PENNY
+    return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
 
 def _position_pct(pos: BrokerPosition) -> Decimal | None:
@@ -238,6 +269,51 @@ def _close_one(
     # 2. Place the close. Side is opposite of position direction.
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
     qty = abs(pos.quantity)
+
+    # Order type and limit price are instrument-aware:
+    #   * STOCKS: MARKET — Alpaca accepts these any time, executes at
+    #     the inside; this is the simplest, most reliable close.
+    #   * OPTIONS: LIMIT priced at pos.current_price (tick-rounded).
+    #     Alpaca's options API rejects market orders when there's no
+    #     live quote (code 40310000, "please reenter with a limit") —
+    #     after-hours, low-liquidity strikes, every illiquid contract.
+    #     A limit at the current mark is the broker-recommended fix
+    #     and works in every market state.
+    if pos.instrument_type == InstrumentType.OPTION:
+        if pos.current_price is None or pos.current_price <= 0:
+            # Without a valid mark we have no defensible limit price.
+            # Don't fire a blind close — log it, audit it, retry next
+            # tick (where we may have a fresh price). The in-flight
+            # guard upstream means we won't keep spamming the broker
+            # since we never placed an order this round.
+            log.info(
+                "position_enforcer: skipping %s close — no current_price "
+                "(broker may be after-hours or SnapTrade-cached at $0); "
+                "will retry next tick",
+                pos.symbol,
+            )
+            audit.record(
+                db, actor_user_id=subscriber_user_id,
+                action=f"subscriber.position_{leg}_close_deferred",
+                entity_type="broker_account", entity_id=acct.id,
+                metadata={
+                    "symbol": pos.symbol,
+                    "reason": "no_current_price",
+                    "current_price": str(pos.current_price)
+                        if pos.current_price is not None else None,
+                    "leg": leg,
+                    "pct": str(pct),
+                },
+            )
+            return None
+        limit_price: Decimal | None = _round_limit_for_close(
+            pos.current_price, pos.instrument_type, reverse_side,
+        )
+        order_type = OrderType.LIMIT
+    else:
+        limit_price = None
+        order_type = OrderType.MARKET
+
     local = Order(
         user_id=subscriber_user_id,
         broker_account_id=acct.id,
@@ -247,8 +323,9 @@ def _close_one(
         option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
         side=reverse_side,
-        order_type=OrderType.MARKET,
+        order_type=order_type,
         quantity=qty,
+        limit_price=limit_price,
         status=OrderStatus.PENDING,
         is_closing=True,
         # This is a subscriber-initiated close (auto-triggered, but
@@ -269,6 +346,7 @@ def _close_one(
                 side=local.side,
                 order_type=local.order_type,
                 quantity=local.quantity,
+                limit_price=local.limit_price,
                 option_expiry=local.option_expiry,
                 option_strike=local.option_strike,
                 option_right=local.option_right,
