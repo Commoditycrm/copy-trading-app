@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # the same wall-clock as 100. Admin can override at runtime via Redis
     # (see services.platform_config); env var sets the default.
     fanout_batch_threshold: int = 75
+    # Alpaca pnl_poller per-account interval (seconds). Pnl_poller hits
+    # one Alpaca GET /v2/account per subscriber per tick — at the
+    # default 10s that's 6 req/min/account against Alpaca's 200/min
+    # budget. Admin can override at runtime via Redis (see
+    # services.platform_config); env var sets the default. Bounds
+    # enforced in the setter: 5-300s.
+    alpaca_pnl_poll_interval_s: int = 10
 
     @property
     def cors_origins_list(self) -> list[str]:
