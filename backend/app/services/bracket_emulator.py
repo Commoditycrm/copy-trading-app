@@ -179,6 +179,54 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
 
     created: list[Order] = []
     for leg, otype, price in legs:
+        # Skip-guard: Alpaca's options API does NOT support STOP /
+        # STOP_LIMIT order types at all (only MARKET + LIMIT). Sending
+        # a STOP for an option always returns code 40310000
+        # ("account not eligible to trade uncovered option contracts"
+        # — Alpaca's misleading framing of "this order type isn't
+        # allowed on options"). Same restriction applies to SnapTrade
+        # routing to Alpaca + most other SnapTrade-routed brokerages.
+        #
+        # Without a STOP, we can't natively place an SL leg for an
+        # option at the broker. The clean fix is a price-monitor that
+        # places a MARKET close when the option mark crosses sl_price
+        # — left as a separate task. For now: skip placement, audit
+        # the skip with a clear reason, notify the trader so they
+        # know SL is unmonitored, leave the row in a CANCELED state
+        # (not REJECTED — that implies the broker rejected, which
+        # didn't happen because we never called the broker).
+        if (
+            entry.instrument_type == InstrumentType.OPTION
+            and otype == OrderType.STOP
+        ):
+            # Alpaca options + SnapTrade-routed Alpaca options don't
+            # accept STOP/STOP_LIMIT — only MARKET + LIMIT (see
+            # https://alpaca.markets/docs/trading/orders/). Don't bother
+            # the broker with a guaranteed rejection. The SL is still
+            # enforced — `trader_bracket_monitor` runs in pnl_poller
+            # and triggers a LIMIT close when the option mark crosses
+            # `entry.stop_loss_price`. The audit row below is purely
+            # diagnostic; no user-facing notification (the monitor
+            # publishes its own when the SL actually fires).
+            log.debug(
+                "bracket: deferring option SL leg for entry %s to "
+                "trader_bracket_monitor (broker=%s)",
+                entry.id, acct.broker.value,
+            )
+            audit.record(
+                db, actor_user_id=entry.user_id,
+                action="bracket.sl_deferred_to_monitor",
+                entity_type="order", entity_id=entry.id,
+                metadata={
+                    "entry_order_id": str(entry.id),
+                    "leg": leg,
+                    "sl_price": str(price),
+                    "symbol": entry.symbol,
+                    "broker": acct.broker.value,
+                },
+            )
+            continue
+
         exit_order = Order(
             user_id=entry.user_id,
             broker_account_id=acct.id,

@@ -614,6 +614,18 @@ def cancel_all_open_orders(
             cancelled = db.get(Order, oid)
             if cancelled is not None and cancelled.parent_order_id is None:
                 background.add_task(_run_cancel_fanout_in_background, oid)
+    elif user.role == UserRole.TRADER and not include_subscribers:
+        # The trader explicitly said "just my orders". Drop a Redis marker
+        # for each cancelled root order so the broker listener — which
+        # receives the canceled WebSocket/poll event AFTER our cancel —
+        # knows to skip ITS cascade too. Without this, the listener sees
+        # `fanned_out_to_subscribers=True` and runs the same mirror-cancel
+        # cascade we just deliberately avoided, defeating the toggle.
+        from app.services.cancel_intent import mark_no_cascade  # noqa: PLC0415
+        for oid in cancelled_ids:
+            cancelled = db.get(Order, oid)
+            if cancelled is not None and cancelled.parent_order_id is None:
+                mark_no_cascade(oid)
 
     return {
         "cancelled_count": len(cancelled_ids),
@@ -623,75 +635,260 @@ def cancel_all_open_orders(
 
 
 @router.post("/trades/cancel-all-subscribers-open")
-def cancel_all_subscribers_open_orders(
+async def cancel_all_subscribers_open_orders(
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
 ) -> dict:
-    """Trader-only: cancel every open order across EVERY subscriber following
-    this trader. The trader's OWN orders are not touched. Mirrors the shape of
-    cancel-all-open; per-order broker failures are recorded and skipped."""
+    """Trader-only: cancel every open order across EVERY subscriber
+    following this trader. The trader's OWN orders are not touched.
+
+    Returns IMMEDIATELY with the queued count — the actual broker
+    cancellations run in the background. This matters because a trader
+    can easily have hundreds or thousands of open subscriber orders
+    accumulated over a session (one observed 1,980), and a synchronous
+    sweep at SnapTrade's rate limit would exceed the request timeout
+    long before completing.
+
+    Each completed cancel publishes an ``order.cancelled`` SSE event
+    so the Order History page updates live. Failures (broker rejects,
+    timeouts) audit but never crash the background task — the rest
+    keep flowing.
+    """
+    import asyncio  # noqa: PLC0415
+
     sub_ids = list(db.execute(
         select(SubscriberSettings.user_id).where(
             SubscriberSettings.following_trader_id == user.id
         )
     ).scalars())
     if not sub_ids:
-        return {"cancelled_count": 0, "failed_count": 0, "failed": []}
+        return {"queued_count": 0, "message": "No subscribers."}
 
-    orders = list(db.execute(
-        select(Order)
-        .options(selectinload(Order.fills))
-        .where(Order.user_id.in_(sub_ids), Order.status.in_(_CANCELLABLE_STATUSES))
-    ).scalars())
-
-    cancelled_ids: list[uuid.UUID] = []
-    failed: list[dict] = []
-    for order in orders:
-        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
-        try:
-            if acct is not None and order.broker_order_id:
-                creds = decrypt_json(acct.encrypted_credentials)
-                adapter_for(acct, creds).cancel_order(order.broker_order_id)
-        except Exception as exc:  # noqa: BLE001
-            audit.record(
-                db, actor_user_id=user.id, action="order.cancel_failed",
-                entity_type="order", entity_id=order.id,
-                metadata={"error": str(exc)[:480], "via": "cancel-all-subscribers-open",
-                          "subscriber_user_id": str(order.user_id)},
-                ip_address=client_ip(request),
-            )
-            failed.append({
-                "order_id": str(order.id),
-                "symbol":   order.symbol,
-                "error":    str(exc)[:300],
-            })
-            continue
-
-        order.status = OrderStatus.CANCELED
-        order.closed_at = datetime.now(timezone.utc)
-        audit.record(
-            db, actor_user_id=user.id, action="order.cancelled",
-            entity_type="order", entity_id=order.id,
-            metadata={"via": "cancel-all-subscribers-open",
-                      "subscriber_user_id": str(order.user_id),
-                      "broker_order_id": order.broker_order_id},
-            ip_address=client_ip(request),
+    # Snapshot the orders + every field the workers need. We can't
+    # share the request DB session across the background task because
+    # FastAPI closes it the moment we return.
+    rows = db.execute(
+        select(
+            Order.id, Order.broker_account_id, Order.broker_order_id,
+            Order.symbol, Order.user_id,
+        ).where(
+            Order.user_id.in_(sub_ids), Order.status.in_(_CANCELLABLE_STATUSES),
         )
-        cancelled_ids.append(order.id)
+    ).all()
+    if not rows:
+        return {"queued_count": 0, "message": "No subscriber orders to cancel."}
 
-    db.commit()
+    targets = [
+        {
+            "order_id": r.id, "acct_id": r.broker_account_id,
+            "broker_order_id": r.broker_order_id, "symbol": r.symbol,
+            "user_id": r.user_id,
+        }
+        for r in rows
+    ]
+    trader_id = user.id
+    client_ip_str = client_ip(request)
 
-    for oid in cancelled_ids:
-        cancelled = db.get(Order, oid)
-        if cancelled is not None:
-            events.publish(cancelled.user_id, copy_engine._order_event("order.cancelled", cancelled))  # noqa: SLF001
+    # Spawn the actual work on the running event loop. asyncio.create_task
+    # is fire-and-forget — the response goes out immediately while the
+    # task runs in parallel. We don't await it.
+    asyncio.create_task(
+        _bulk_cancel_subscriber_orders_background(
+            targets, trader_id, client_ip_str,
+        )
+    )
 
     return {
-        "cancelled_count": len(cancelled_ids),
-        "failed_count":    len(failed),
-        "failed":          failed,
+        "queued_count": len(targets),
+        "message": (
+            f"Queued {len(targets)} subscriber order(s) for cancellation. "
+            "Order History will update live as each completes."
+        ),
     }
+
+
+# Timeout + concurrency for bulk-exit operations.
+#
+# Concurrency = 4: SnapTrade's 250 req/min platform quota means we can
+# sustain ~4 req/sec across all our SnapTrade traffic. The order
+# listener is already burning ~12-24 req/min for traders; leaving 4
+# concurrent cancels gives us room to do bulk work without 429-ing.
+# Alpaca tolerates much more concurrency but this code path is shared
+# and SnapTrade is the bottleneck.
+#
+# Timeout = 60s: covers SnapTrade slow paths during throttling. A
+# timeout doesn't mean the cancel failed — the broker may have
+# processed it; the listener will reconcile on its next poll.
+_BULK_EXIT_BROKER_TIMEOUT_S = 60.0
+_BULK_EXIT_CONCURRENCY = 4
+
+
+async def _bulk_cancel_subscriber_orders_background(
+    targets: list[dict],
+    trader_id: uuid.UUID,
+    client_ip_str: str | None,
+) -> None:
+    """Background coroutine for bulk-cancel-subscribers-open.
+
+    Runs on the main event loop after the API response is already out.
+    Concurrency = ``_BULK_EXIT_CONCURRENCY``; each cancel call wrapped
+    in ``_BULK_EXIT_BROKER_TIMEOUT_S``. Per-order outcomes commit
+    individually + publish SSE so the UI can update incrementally —
+    waiting to commit the whole batch at the end would make the
+    Order History page sit stale for the duration of the run.
+    """
+    import asyncio  # noqa: PLC0415
+    import logging  # noqa: PLC0415
+    log = logging.getLogger(__name__)
+    log.info(
+        "bulk-cancel-subscribers: starting background sweep of %d order(s) "
+        "for trader=%s (concurrency=%d, per-call timeout=%.0fs)",
+        len(targets), trader_id, _BULK_EXIT_CONCURRENCY, _BULK_EXIT_BROKER_TIMEOUT_S,
+    )
+    started = datetime.now(timezone.utc)
+    sem = asyncio.Semaphore(_BULK_EXIT_CONCURRENCY)
+    cancelled = 0
+    failed = 0
+
+    async def _process(target: dict) -> None:
+        nonlocal cancelled, failed
+        async with sem:
+            err = await _try_cancel_then_persist(target, trader_id, client_ip_str)
+        if err is None:
+            cancelled += 1
+        else:
+            failed += 1
+
+    await asyncio.gather(*(_process(t) for t in targets), return_exceptions=True)
+
+    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+    log.info(
+        "bulk-cancel-subscribers: done — cancelled=%d failed=%d total=%d "
+        "elapsed=%.1fs for trader=%s",
+        cancelled, failed, len(targets), elapsed, trader_id,
+    )
+
+
+async def _try_cancel_then_persist(
+    target: dict, trader_id: uuid.UUID, client_ip_str: str | None,
+) -> str | None:
+    """One order: cancel at broker (with timeout) → commit local
+    status + audit → publish SSE. Returns error message or None.
+    Runs in the background coroutine; opens its own DB session so it
+    doesn't depend on anything from the original request."""
+    import asyncio  # noqa: PLC0415
+    import logging  # noqa: PLC0415
+    log = logging.getLogger(__name__)
+
+    loop = asyncio.get_running_loop()
+    order_id: uuid.UUID = target["order_id"]
+    acct_id: uuid.UUID | None = target["acct_id"]
+    broker_order_id: str | None = target["broker_order_id"]
+    symbol: str | None = target["symbol"]
+
+    # Broker call (in threadpool, with timeout).
+    try:
+        err = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, _cancel_one_sync, order_id, acct_id, broker_order_id,
+            ),
+            timeout=_BULK_EXIT_BROKER_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "bulk-cancel-subscribers: timeout cancelling order=%s "
+            "(broker_id=%s) after %.0fs — listener will reconcile",
+            order_id, broker_order_id, _BULK_EXIT_BROKER_TIMEOUT_S,
+        )
+        err = (
+            f"broker cancel exceeded {_BULK_EXIT_BROKER_TIMEOUT_S:.0f}s timeout "
+            "— may have succeeded; will reconcile on next listener tick"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception(
+            "bulk-cancel-subscribers: worker crashed for order=%s", order_id,
+        )
+        err = str(exc)[:300]
+    else:
+        # err is the second value of the (order_id, err_msg) tuple. Unpack.
+        if isinstance(err, tuple):
+            err = err[1]
+
+    # DB write + SSE. Own session — request session is long gone.
+    try:
+        with SessionLocal() as db_local:
+            order_row = db_local.get(Order, order_id)
+            if order_row is None:
+                return err
+            if err is None:
+                order_row.status = OrderStatus.CANCELED
+                order_row.closed_at = datetime.now(timezone.utc)
+                audit.record(
+                    db_local, actor_user_id=trader_id, action="order.cancelled",
+                    entity_type="order", entity_id=order_id,
+                    metadata={"via": "cancel-all-subscribers-open",
+                              "subscriber_user_id": str(order_row.user_id),
+                              "broker_order_id": broker_order_id},
+                    ip_address=client_ip_str,
+                )
+            else:
+                audit.record(
+                    db_local, actor_user_id=trader_id, action="order.cancel_failed",
+                    entity_type="order", entity_id=order_id,
+                    metadata={"error": err[:480],
+                              "via": "cancel-all-subscribers-open",
+                              "subscriber_user_id": str(order_row.user_id),
+                              "symbol": symbol},
+                    ip_address=client_ip_str,
+                )
+            db_local.commit()
+            # Publish SSE AFTER commit so subscribers reading on receipt
+            # see the cancelled state.
+            if err is None:
+                db_local.refresh(order_row)
+                events.publish(
+                    order_row.user_id,
+                    copy_engine._order_event("order.cancelled", order_row),  # noqa: SLF001
+                )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "bulk-cancel-subscribers: db/SSE persist failed for order=%s",
+            order_id,
+        )
+
+    return err
+
+
+def _cancel_one_sync(
+    order_id: uuid.UUID,
+    acct_id: uuid.UUID | None,
+    broker_order_id: str | None,
+) -> tuple[uuid.UUID, str | None]:
+    """Synchronous worker for one broker cancel call.
+
+    Opens its own DB session for the broker-account lookup. Returns
+    (order_id, error_msg) — caller unwraps. Returning a tuple keeps
+    the legacy signature for the close-positions code path which still
+    uses this directly.
+    """
+    # No broker_order_id → nothing to cancel at the broker; the caller
+    # will still mark it CANCELED locally. Same for no account.
+    if not broker_order_id or not acct_id:
+        return order_id, None
+
+    try:
+        with SessionLocal() as db_local:
+            acct = db_local.get(BrokerAccount, acct_id)
+            if acct is None:
+                # Broker disconnected — let the local cancel proceed
+                # (treated as success for the row's lifecycle).
+                return order_id, None
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter_for(acct, creds).cancel_order(broker_order_id)
+        return order_id, None
+    except Exception as exc:  # noqa: BLE001
+        return order_id, str(exc)
 
 
 @router.post("/trades/{order_id}/close", response_model=OrderOut, status_code=status.HTTP_201_CREATED)

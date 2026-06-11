@@ -434,7 +434,21 @@ def _persist_and_fanout(
                 and existing.parent_order_id is None
                 and existing.fanned_out_to_subscribers
             ):
-                _cascade_cancel_to_mirrors(existing.id)
+                # When the trader cancelled via "Cancel My Orders" (the
+                # cancel endpoint with include_subscribers=false), it set
+                # a Redis no-cascade marker for this order. Consume +
+                # honor it here so the SnapTrade poller doesn't run the
+                # cascade we just deliberately avoided in the API path.
+                # Same logic as the Alpaca listener — see cancel_intent.py.
+                from app.services.cancel_intent import consume_no_cascade  # noqa: PLC0415
+                if consume_no_cascade(existing.id):
+                    log.info(
+                        "snaptrade-listener[%s] suppressing cascade for "
+                        "order %s — trader requested cancel-without-subscribers",
+                        trader_user_id, existing.id,
+                    )
+                else:
+                    _cascade_cancel_to_mirrors(existing.id)
             return
 
         # Brand-new order — only act on working/terminal-success states.

@@ -208,7 +208,13 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
     cancelled) with exponential backoff; on each connection runs a backfill
     pass and then hands off to TradingStream.run_forever-equivalent."""
     backoff = _BACKOFF_INITIAL
+    # Increment-only counters for the trader-level diagnostic — gives us
+    # "events seen" + "reconnect attempts" without having to grep across
+    # all logs. Survives any number of inner-loop iterations.
+    connect_attempts = 0
+    handler_calls = 0
     while True:
+        connect_attempts += 1
         try:
             # Re-read creds + broker on every connect attempt — they may have
             # been rotated or the account marked disconnected since last try.
@@ -216,10 +222,19 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             if creds is None:
                 _set_state(trader_user_id, "credentials_invalid",
                            error="broker disconnected or credentials missing")
+                log.warning(
+                    "listener[%s] no creds (attempt #%d) — sleeping 30s",
+                    trader_user_id, connect_attempts,
+                )
                 # Sleep before checking again — the trader may reconnect via UI.
                 await asyncio.sleep(30)
                 backoff = _BACKOFF_INITIAL
                 continue
+
+            log.info(
+                "listener[%s] connecting (attempt #%d, paper=%s)",
+                trader_user_id, connect_attempts, is_paper,
+            )
 
             stream = TradingStream(
                 creds["api_key"],
@@ -235,6 +250,25 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             _streams[trader_user_id] = stream
 
             async def handler(update: Any) -> None:  # bound to this trader
+                nonlocal handler_calls
+                handler_calls += 1
+                # DEBUG level so prod stays quiet but turning on
+                # ``logging.getLogger('app.services.trade_listener').setLevel(logging.DEBUG)``
+                # surfaces every event. Includes the event-name +
+                # broker_order_id so you can correlate with what Alpaca
+                # actually delivered.
+                try:
+                    evt_name = getattr(update.event, "value", str(update.event))
+                    boid = getattr(getattr(update, "order", None), "id", "?")
+                    log.info(
+                        "listener[%s] handler call #%d event=%s broker_order=%s",
+                        trader_user_id, handler_calls, evt_name, boid,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.info(
+                        "listener[%s] handler call #%d (couldn't unpack update)",
+                        trader_user_id, handler_calls,
+                    )
                 await _handle_trade_update(trader_user_id, broker_account_id, update)
 
             stream.subscribe_trade_updates(handler)
@@ -249,6 +283,10 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             # so it can run in parallel with the WebSocket consumer.
             _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
+            log.info(
+                "listener[%s] connected; handler_calls so far: %d",
+                trader_user_id, handler_calls,
+            )
 
             # Backfill anything we missed while disconnected. Cheap and safe;
             # idempotent because fills_sync dedupes by activity id. Runs in
@@ -260,8 +298,38 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 _background_backfill(trader_user_id, broker_account_id)
             )
 
-            # Blocks until disconnected / cancelled.
-            await stream._run_forever()  # noqa: SLF001 — public run() is sync
+            # Heartbeat task — every 60s, log that the listener is still
+            # alive. Distinguishes "WS open and quiet" (heartbeats keep
+            # firing) from "WS dead and stuck" (heartbeats stop). Tied to
+            # this iteration's stream so it dies with the connection.
+            hb_stop = asyncio.Event()
+            hb_task = asyncio.create_task(
+                _listener_heartbeat(trader_user_id, hb_stop, lambda: handler_calls)
+            )
+
+            # Blocks until disconnected / cancelled. THIS IS THE LINE
+            # THAT WAS RETURNING SILENTLY — we now log distinctly when
+            # it returns vs when it raises.
+            try:
+                await stream._run_forever()  # noqa: SLF001 — public run() is sync
+            finally:
+                hb_stop.set()
+                # Best effort — heartbeat exits within a second.
+                try:
+                    await asyncio.wait_for(hb_task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
+            # If we got here, _run_forever() RETURNED instead of raising.
+            # That's almost always the WS closing cleanly. The outer
+            # while loop will reconnect after the backoff sleep.
+            log.warning(
+                "listener[%s] _run_forever returned normally — WS closed cleanly. "
+                "Will reconnect (attempt #%d). handler_calls=%d",
+                trader_user_id, connect_attempts + 1, handler_calls,
+            )
+            _set_state(trader_user_id, "reconnecting",
+                       error="websocket closed without exception")
 
         except asyncio.CancelledError:
             log.info("listener[%s] cancelled", trader_user_id)
@@ -271,8 +339,37 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 
         # Reconnect with exponential backoff capped at 60s.
+        log.info(
+            "listener[%s] sleeping %.1fs before reconnect attempt #%d",
+            trader_user_id, backoff, connect_attempts + 1,
+        )
         await asyncio.sleep(backoff)
         backoff = min(_BACKOFF_MAX, backoff * 2)
+
+
+async def _listener_heartbeat(
+    trader_user_id: uuid.UUID,
+    stop: asyncio.Event,
+    handler_count: "callable[[], int]",
+) -> None:
+    """Emit a periodic INFO line so we can tell from logs alone whether
+    the listener task is still alive. ``handler_count`` is a closure so
+    each heartbeat captures the latest count without us having to plumb
+    state in/out."""
+    last_seen = handler_count()
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60.0)
+            return  # stop set — clean exit
+        except asyncio.TimeoutError:
+            pass
+        now = handler_count()
+        delta = now - last_seen
+        log.info(
+            "listener[%s] heartbeat — events in last 60s: %d (total: %d)",
+            trader_user_id, delta, now,
+        )
+        last_seen = now
 
 
 # Hard ceiling for how long a backfill task is allowed to run before we
@@ -425,12 +522,25 @@ def _persist_and_fanout(
             # For an external trader cancel/close to propagate to subscribers,
             # we need to handle CANCEL via the same cascade as our internal
             # cancel endpoint when the original was a trader-originated order.
+            # EXCEPT when the trader explicitly cancelled "just my orders"
+            # via the API — in that case the cancel endpoint set a Redis
+            # marker (cancel_intent.mark_no_cascade) so we skip and consume
+            # it here. Without this guard, "Cancel My Orders" would still
+            # cascade to subscribers via this listener path.
             if (
                 event_name in ("canceled", "expired", "rejected")
                 and existing.parent_order_id is None
                 and existing.fanned_out_to_subscribers
             ):
-                _cascade_cancel_to_mirrors(existing.id)
+                from app.services.cancel_intent import consume_no_cascade  # noqa: PLC0415
+                if consume_no_cascade(existing.id):
+                    log.info(
+                        "listener[%s] suppressing cascade for order %s — "
+                        "trader requested cancel-without-subscribers",
+                        trader_user_id, existing.id,
+                    )
+                else:
+                    _cascade_cancel_to_mirrors(existing.id)
             return
 
         # Brand-new order: trader placed it on Alpaca directly, outside our app.

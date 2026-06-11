@@ -117,21 +117,25 @@ export function BulkExitBar({ onActionComplete }: Props) {
       else if (res.failed_count === 0) notify.success(`Cancelled ${res.cancelled_count} order${res.cancelled_count === 1 ? "" : "s"} — yours.`);
       else notify.warn(`Cancelled ${res.cancelled_count}; ${res.failed_count} failed — check Order History.`);
     } else if (key === "subs_positions") {
-      const res = await api<{ closed_count: number; failed_count: number }>(
+      // Async/background: API returns immediately with a queued count;
+      // closes stream in over the next ~30-120s and update the UI via
+      // SSE order.placed events.
+      const res = await api<{ queued_pairs: number; message: string }>(
         "/api/positions/close-all-subscribers",
         { method: "POST" },
       );
-      if (res.closed_count === 0 && res.failed_count === 0) notify.info("No open positions to close (subscribers).");
-      else if (res.failed_count === 0) notify.success(`Exited ${res.closed_count} subscriber position${res.closed_count === 1 ? "" : "s"} at market.`);
-      else notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed (subscribers) — check Order History.`);
+      if (res.queued_pairs === 0) notify.info(res.message ?? "No subscriber positions to close.");
+      else notify.success(res.message ?? `Queued close-positions sweep across ${res.queued_pairs} accounts.`);
     } else if (key === "subs_orders") {
-      const res = await api<{ cancelled_count: number; failed_count: number }>(
+      // Same background pattern. With 1,000+ open subscriber orders the
+      // sweep can take several minutes; the UI listens for per-order
+      // SSE order.cancelled events so Order History updates live.
+      const res = await api<{ queued_count: number; message: string }>(
         "/api/trades/cancel-all-subscribers-open",
         { method: "POST" },
       );
-      if (res.cancelled_count === 0 && res.failed_count === 0) notify.info("No open orders to cancel (subscribers).");
-      else if (res.failed_count === 0) notify.success(`Cancelled ${res.cancelled_count} subscriber order${res.cancelled_count === 1 ? "" : "s"}.`);
-      else notify.warn(`Cancelled ${res.cancelled_count}; ${res.failed_count} failed (subscribers) — check Order History.`);
+      if (res.queued_count === 0) notify.info(res.message ?? "No subscriber orders to cancel.");
+      else notify.success(res.message ?? `Queued ${res.queued_count} cancellations — see Order History.`);
     }
   }
 
