@@ -678,6 +678,26 @@ class SnapTradeAdapter(BrokerAdapter):
     # ── positions ─────────────────────────────────────────────────────────
 
     def get_positions(self) -> list[BrokerPosition]:
+        """Return every open position on the account — stocks AND options.
+
+        SnapTrade splits these across two endpoints:
+          * ``account_information.get_user_account_positions`` → stocks /
+            ETFs / crypto (no option positions even when the brokerage
+            holds them).
+          * ``options.list_option_holdings``                  → options.
+
+        Both are called per tick; an empty list from either is fine.
+        Failures on one don't suppress the other — we still surface
+        whichever side returned data so the subscriber's positions UI
+        and the per-position TP/SL enforcer have at least the partial
+        view rather than nothing.
+        """
+        out: list[BrokerPosition] = []
+        out.extend(self._get_stock_positions())
+        out.extend(self._get_option_positions())
+        return out
+
+    def _get_stock_positions(self) -> list[BrokerPosition]:
         try:
             resp = self._c().account_information.get_user_account_positions(
                 user_id=self._user_id,
@@ -685,7 +705,7 @@ class SnapTradeAdapter(BrokerAdapter):
                 account_id=self._account_id,
             )
         except Exception:  # noqa: BLE001
-            log.exception("snaptrade get_positions failed")
+            log.exception("snaptrade get_user_account_positions failed")
             return []
         body = getattr(resp, "body", resp) or []
         out: list[BrokerPosition] = []
@@ -708,6 +728,114 @@ class SnapTradeAdapter(BrokerAdapter):
             ))
         return out
 
+    def _get_option_positions(self) -> list[BrokerPosition]:
+        """Parse ``options.list_option_holdings`` into BrokerPosition rows.
+
+        Response shape (from snaptrade_client.model.options_position):
+          [
+            {
+              symbol: {
+                option_symbol: {
+                  ticker:           "AAPL  240621C00150000",  # OCC
+                  option_type:      "CALL" | "PUT",
+                  strike_price:     150.0,
+                  expiration_date:  "2024-06-21",
+                  underlying_symbol: { symbol: "AAPL", ... },
+                },
+                description: "AAPL Jun 21 2024 $150 Call",
+              },
+              price:                  4.25,   # contract price now
+              units:                  5,      # contracts (NOT shares)
+              average_purchase_price: 3.80,   # contract avg cost
+              currency: { ... },
+            },
+            ...
+          ]
+
+        SnapTrade does NOT return market_value / unrealized_pnl / cost_basis
+        on option holdings — we derive them from
+        ``price * units * 100`` (and the cost equivalent), matching the
+        OCC contract multiplier. The position TP/SL enforcer relies on
+        these three fields, so computing them here is required (not just
+        cosmetic).
+        """
+        try:
+            resp = self._c().options.list_option_holdings(
+                user_id=self._user_id,
+                user_secret=self._user_secret,
+                account_id=self._account_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("snaptrade list_option_holdings failed")
+            return []
+        body = getattr(resp, "body", resp) or []
+        out: list[BrokerPosition] = []
+        for p in body:
+            sym_obj = _attr(p, "symbol", default={}) or {}
+            opt_sym = _attr(sym_obj, "option_symbol", default={}) or {}
+            occ = str(_attr(opt_sym, "ticker", default="")).strip()
+            underlying = _attr(opt_sym, "underlying_symbol", default={}) or {}
+            ticker = str(_attr(underlying, "symbol", "raw_symbol", default="")).upper()
+            if not ticker and occ:
+                # Fallback: ticker prefix of the OCC string (first non-digit chars).
+                ticker = "".join(c for c in occ.split()[0] if c.isalpha()).upper()
+
+            qty = _dec_or_none(_attr(p, "units", "quantity")) or Decimal(0)
+            if qty == 0:
+                continue
+
+            current_price = _dec_or_none(_attr(p, "price", "last_price"))
+            avg_entry = _dec_or_none(_attr(p, "average_purchase_price", "avgPrice"))
+            strike = _dec_or_none(_attr(opt_sym, "strike_price"))
+            expiry_raw = _attr(opt_sym, "expiration_date")
+            try:
+                from datetime import date as _date  # noqa: PLC0415
+                if isinstance(expiry_raw, _date):
+                    expiry = expiry_raw
+                elif expiry_raw is not None:
+                    expiry = _date.fromisoformat(str(expiry_raw)[:10])
+                else:
+                    expiry = None
+            except ValueError:
+                expiry = None
+            right_raw = str(_attr(opt_sym, "option_type", default="")).upper()
+            if right_raw.startswith("C"):
+                right = OptionRight.CALL
+            elif right_raw.startswith("P"):
+                right = OptionRight.PUT
+            else:
+                right = None
+
+            # OCC contract multiplier = 100 shares per contract. SnapTrade
+            # returns price/avg as per-contract premium, not per-share,
+            # so the multiplier turns these into the dollar amounts the
+            # position TP/SL enforcer expects (it computes pct as
+            # unrealized_pnl / |cost_basis|).
+            mult = Decimal(100)
+            market_value = current_price * qty * mult if current_price is not None else None
+            cost_basis = avg_entry * qty * mult if avg_entry is not None else None
+            unrealized_pnl = (
+                market_value - cost_basis
+                if market_value is not None and cost_basis is not None
+                else None
+            )
+
+            out.append(BrokerPosition(
+                broker_symbol=occ or ticker,
+                symbol=ticker,
+                instrument_type=InstrumentType.OPTION,
+                quantity=qty,
+                avg_entry_price=avg_entry,
+                current_price=current_price,
+                market_value=market_value,
+                unrealized_pnl=unrealized_pnl,
+                cost_basis=cost_basis,
+                option_expiry=expiry,
+                option_strike=strike,
+                option_right=right,
+            ))
+        return out
+
     # ── reads — used by listener + balance refresh ─────────────────────────
 
     def get_pnl_snapshot(self) -> dict[str, Any] | None:
@@ -726,13 +854,18 @@ class SnapTradeAdapter(BrokerAdapter):
             log.warning("snaptrade get_pnl_snapshot: balance fetch failed",
                         exc_info=True)
             return None
-        equity = snap.get("total_equity") or snap.get("cash")
-        if equity is None:
-            return None
-
-        # Best-effort day-start. SnapTrade brokers don't agree on a
-        # field name — we accept the union and treat the first hit as
-        # authoritative. None means "broker didn't tell us".
+        cash = snap.get("cash")
+        # Pull the account-details payload up front. Two things live here:
+        # (a) ``balance.total.amount`` — the broker's authoritative view
+        #     of the account's total value INCLUDING marked-to-market
+        #     positions, when the brokerage supports it. This is far more
+        #     accurate than using ``cash`` alone, which doesn't reflect
+        #     open positions.
+        # (b) day-start fields if the broker exposes them.
+        # We make this one extra call regardless of whether (a) or (b)
+        # are populated; failures here only degrade (a) to a cash-only
+        # equity and (b) to None — the poller still runs.
+        total_amount: Decimal | None = None
         beginning_day_balance: Decimal | None = None
         try:
             resp = self._c().account_information.get_user_account_details(
@@ -742,6 +875,19 @@ class SnapTradeAdapter(BrokerAdapter):
             )
             body = getattr(resp, "body", resp) or {}
             bal = _attr(body, "balance", default={}) or {}
+
+            # (a) Broker-reported total. For Alpaca-paper-via-SnapTrade
+            # this equals cash because paper accounts aren't being
+            # mark-to-market by the broker. For live brokers it includes
+            # position values and is what we want as equity.
+            total_obj = _attr(bal, "total", default=None)
+            if isinstance(total_obj, dict):
+                total_amount = _dec_or_none(total_obj.get("amount"))
+            else:
+                total_amount = _dec_or_none(total_obj)
+
+            # (b) Day-start, if exposed. SnapTrade brokers don't agree
+            # on a field name — accept the union; first hit wins.
             raw = _attr(
                 bal, "day_start_total", "beginning_of_day",
                 "equity_previous_close", "previous_close",
@@ -752,9 +898,20 @@ class SnapTradeAdapter(BrokerAdapter):
         except Exception:  # noqa: BLE001
             log.warning(
                 "snaptrade get_user_account_details failed — "
-                "beginning_day_balance will be None this tick",
+                "total_amount and beginning_day_balance will be None this tick",
                 exc_info=True,
             )
+
+        # Equity preference:
+        #   1. balance.total.amount (broker's mark-to-market total)
+        #   2. balance.total_equity from get_user_account_balance
+        #      (some SDK versions surface it here)
+        #   3. cash (last-resort fallback — paper accounts often have
+        #      no other signal, and todays_pl will track only realized
+        #      cash movement)
+        equity = total_amount or snap.get("total_equity") or cash
+        if equity is None:
+            return None
 
         todays_pl = (
             equity - beginning_day_balance
