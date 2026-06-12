@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from sqlalchemy import desc, select
@@ -81,6 +81,13 @@ _ALIVE_STATUSES = (
 _PENNY = Decimal("0.01")
 _NICKEL = Decimal("0.05")
 _OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+
+# Post-fill cooldown — matches position_enforcer. Wide option spreads
+# show -spread% unrealized P&L the moment you fill; the price-side
+# signal can also misfire on the first marketing-data observation
+# after the fill (broker reports the bid as current_price before the
+# spread normalizes). 30s lets the spread settle.
+_SL_COOLDOWN_SECONDS = 30
 
 
 def _round_close_limit(price: Decimal, side: OrderSide) -> Decimal:
@@ -193,6 +200,22 @@ def enforce_trader_option_sl(
         is_long = pos.quantity > 0
         if not _sl_breached(pos, entry, is_long):
             continue
+
+        # Post-fill cooldown — see position_enforcer for the rationale.
+        # Wide option spreads make EITHER SL signal (price or
+        # unrealized-pnl) fire spuriously right after a fill.
+        if entry.closed_at is not None:
+            closed_at = entry.closed_at
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - closed_at
+            if age < timedelta(seconds=_SL_COOLDOWN_SECONDS):
+                log.debug(
+                    "trader_bracket_monitor: skipping SL for %s — within "
+                    "%ss post-fill cooldown",
+                    pos.symbol, _SL_COOLDOWN_SECONDS,
+                )
+                continue
 
         # In-flight guard. If a prior tick already placed a close (or
         # the original TP leg has been swapped for a market exit by
