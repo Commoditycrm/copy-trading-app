@@ -10,10 +10,10 @@ import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
   { value: "never", label: "Never (REJECT)" },
-  { value: "1m",    label: "After 1 min" },
-  { value: "2m",    label: "After 2 min" },
-  { value: "3m",    label: "After 3 min" },
-  { value: "5m",    label: "After 5 min" },
+  { value: "1m", label: "After 1 min" },
+  { value: "2m", label: "After 2 min" },
+  { value: "3m", label: "After 3 min" },
+  { value: "5m", label: "After 5 min" },
 ];
 
 /** Cross-navigation cache for the pnl.tick payload fields the Risk
@@ -55,7 +55,7 @@ function readTickCache(): TickCache {
     const parsed = JSON.parse(raw);
     return {
       beginning_day_balance: typeof parsed.beginning_day_balance === "string" ? parsed.beginning_day_balance : null,
-      todays_trading_value:  typeof parsed.todays_trading_value  === "string" ? parsed.todays_trading_value  : null,
+      todays_trading_value: typeof parsed.todays_trading_value === "string" ? parsed.todays_trading_value : null,
     };
   } catch {
     return EMPTY_TICK_CACHE;
@@ -231,17 +231,17 @@ export default function SettingsPage() {
       // copy_enabled fall back to prev when missing from the payload.
       setSub(prev => prev ? {
         ...prev,
-        todays_realized_pnl:      e.todays_realized_pnl      ?? prev.todays_realized_pnl,
-        daily_loss_limit:         e.daily_loss_limit         ?? null,
-        daily_profit_limit:       e.daily_profit_limit       ?? null,
-        daily_loss_limit_pct:     e.daily_loss_limit_pct     ?? null,
-        daily_profit_limit_pct:   e.daily_profit_limit_pct   ?? null,
-        max_per_contract:         e.max_per_contract         ?? null,
-        max_account_pct_per_day:  e.max_account_pct_per_day  ?? null,
-        auto_liquidation_limit:   e.auto_liquidation_limit   ?? null,
-        position_tp_pct:          e.position_tp_pct          ?? null,
-        position_sl_pct:          e.position_sl_pct          ?? null,
-        copy_enabled:             e.copy_enabled             ?? prev.copy_enabled,
+        todays_realized_pnl: e.todays_realized_pnl ?? prev.todays_realized_pnl,
+        daily_loss_limit: e.daily_loss_limit ?? null,
+        daily_profit_limit: e.daily_profit_limit ?? null,
+        daily_loss_limit_pct: e.daily_loss_limit_pct ?? null,
+        daily_profit_limit_pct: e.daily_profit_limit_pct ?? null,
+        max_per_contract: e.max_per_contract ?? null,
+        max_account_pct_per_day: e.max_account_pct_per_day ?? null,
+        auto_liquidation_limit: e.auto_liquidation_limit ?? null,
+        position_tp_pct: e.position_tp_pct ?? null,
+        position_sl_pct: e.position_sl_pct ?? null,
+        copy_enabled: e.copy_enabled ?? prev.copy_enabled,
       } : prev);
     }
     // Per-position TP/SL — pnl_poller fires this whenever it
@@ -552,7 +552,7 @@ export default function SettingsPage() {
                     step={0.1} min={0.1} max={10}
                     className="w-24"
                   />
-                  <span className="text-xs tabular-nums whitespace-nowrap" style={{color: "var(--muted)"}}>
+                  <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
                     current ×{fmtMultiplier(sub.multiplier)}
                   </span>
                   <PrimaryButton
@@ -579,23 +579,48 @@ export default function SettingsPage() {
             title="Risk Controls"
             hint="Loss / profit / size / capital caps. When any live limit is hit, copy turns OFF for the day and auto-resumes the next UTC day."
           >
-            {/* Desktop column legend — hidden on mobile where rows stack
-                their own labels. Keeps the grid scannable without
-                cluttering the row content. */}
-            <div
-              className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
-              style={{
-                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
-                color: "var(--muted)",
-              }}
-            >
-              <div>Limit</div>
-              <div>Threshold</div>
-              <div>Today</div>
-              <div>Headroom</div>
-              <div className="text-right">Used</div>
-            </div>
             <div className="space-y-2.5">
+              {/* Individual Position (TP/SL) — surfaced FIRST so the
+                  most-used per-position control sits at the top of the
+                  Risk Controls table. Doesn't share the Limit /
+                  Threshold / Today / Headroom / Used column layout
+                  (it has two inputs, no live readouts), so the column
+                  legend renders BELOW this row, right above the
+                  LimitRow grid where those columns actually apply. */}
+              <PositionTpSlRow
+                tpInput={posTpInput}
+                onTpInput={setPosTpInput}
+                tpBusy={posTpBusy}
+                onTpSave={savePosTp}
+                tpCurrent={sub.position_tp_pct}
+                slInput={posSlInput}
+                onSlInput={setPosSlInput}
+                slBusy={posSlBusy}
+                onSlSave={savePosSl}
+                slCurrent={sub.position_sl_pct}
+              />
+
+              {/* Desktop column legend for the LimitRow grid below.
+                  Hidden on mobile where rows stack their own labels.
+                  Lives here (not at the top of the card) because the
+                  Individual Position row above doesn't share these
+                  columns. USD column added between Today and Headroom
+                  to surface the actual dollar trigger derived from
+                  the % the trader typed. */}
+              <div
+                className="hidden md:grid items-center gap-3 px-4 pt-1 pb-1 text-[9px] uppercase tracking-widest"
+                style={{
+                  gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
+                  color: "var(--muted)",
+                }}
+              >
+                <div>Limit</div>
+                <div>Threshold</div>
+                <div>Today</div>
+                <div>USD</div>
+                <div>Headroom</div>
+                <div className="text-right">Used</div>
+              </div>
               <LimitRow
                 accent="#ef4444"
                 icon={<IconTrendDown />}
@@ -611,6 +636,7 @@ export default function SettingsPage() {
                 onSave={saveLimit}
                 current={sub.daily_loss_limit_pct}
                 hasLimit={limit !== null}
+                thresholdUsdDisplay={limit === null ? "—" : fmt(String(limit))}
                 headroomDisplay={limit === null ? "—" : fmt(String(headroom))}
                 headroomColor={(headroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
                 pctConsumed={limitPct}
@@ -630,6 +656,7 @@ export default function SettingsPage() {
                 onSave={saveProfit}
                 current={sub.daily_profit_limit_pct}
                 hasLimit={profitLimit !== null}
+                thresholdUsdDisplay={profitLimit === null ? "—" : fmt(String(profitLimit))}
                 headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
                 headroomColor={(profitHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
                 pctConsumed={profitPct}
@@ -648,12 +675,12 @@ export default function SettingsPage() {
                 onSave={saveMaxPct}
                 current={sub.max_account_pct_per_day}
                 hasLimit={maxPctLimitDollars !== null}
-
+                thresholdUsdDisplay={maxPctLimitDollars === null ? "—" : fmt(String(maxPctLimitDollars))}
                 headroomDisplay={maxPctLimitDollars === null ? "—" : fmt(String(maxPctHeadroom))}
                 headroomColor={(maxPctHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
                 pctConsumed={maxPctConsumed}
               />
-              
+
               <LimitRow
                 accent="#3b82f6"
                 icon={<IconLayers />}
@@ -668,24 +695,8 @@ export default function SettingsPage() {
                 onSave={saveMaxContract}
                 current={sub.max_per_contract}
                 hasLimit={false}
+                thresholdUsdDisplay="—"
                 headroomDisplay="—"
-              />
-              {/* Per-position TP/SL — one row, two inputs (TP + SL),
-                  no Today/Headroom/Used columns since these limits are
-                  per-position and don't apply to a single account-wide
-                  number. Independent of the daily caps: a triggered
-                  close does NOT pause copy or affect other positions. */}
-              <PositionTpSlRow
-                tpInput={posTpInput}
-                onTpInput={setPosTpInput}
-                tpBusy={posTpBusy}
-                onTpSave={savePosTp}
-                tpCurrent={sub.position_tp_pct}
-                slInput={posSlInput}
-                onSlInput={setPosSlInput}
-                slBusy={posSlBusy}
-                onSlSave={savePosSl}
-                slCurrent={sub.position_sl_pct}
               />
             </div>
           </Card>
@@ -704,13 +715,14 @@ export default function SettingsPage() {
             <div
               className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
               style={{
-                gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr",
+                gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
                 color: "var(--muted)",
               }}
             >
               <div>Target</div>
               <div>Set</div>
               <div>Profit</div>
+              <div>USD</div>
               <div>Headroom</div>
               <div className="text-right">Progress</div>
             </div>
@@ -745,6 +757,7 @@ export default function SettingsPage() {
                   onSave={saveAutoLiq}
                   current={sub.auto_liquidation_limit}
                   hasLimit={liqLimitNum !== null}
+                  thresholdUsdDisplay="—"
                   headroomDisplay={
                     liqLimitNum === null
                       ? "—"
@@ -888,7 +901,7 @@ function Card({
         )}
         <div className="min-w-0">
           <h2 className="text-sm font-semibold leading-tight">{title}</h2>
-          {hint && <p className="text-[11px] mt-1 leading-snug" style={{color: "var(--muted)"}}>{hint}</p>}
+          {hint && <p className="text-[11px] mt-1 leading-snug" style={{ color: "var(--muted)" }}>{hint}</p>}
         </div>
       </header>
       <div className="px-4 py-3">{children}</div>
@@ -899,7 +912,7 @@ function Card({
 function Field({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
   return (
     <div>
-      <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{color: "var(--muted)"}}>
+      <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: "var(--muted)" }}>
         {label}
       </label>
       {children}
@@ -924,7 +937,7 @@ function NumberInput({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className={`px-3 py-2 text-sm rounded-lg bg-transparent border tabular-nums transition-colors focus:outline-none focus:border-[var(--accent)] ${className}`}
-      style={{borderColor: "var(--border)"}}
+      style={{ borderColor: "var(--border)" }}
     />
   );
 }
@@ -941,7 +954,7 @@ function SelectInput({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className="w-full px-3 py-2 text-sm rounded-lg bg-transparent border transition-colors focus:outline-none focus:border-[var(--accent)] cursor-pointer"
-      style={{borderColor: "var(--border)"}}
+      style={{ borderColor: "var(--border)" }}
     >
       {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
@@ -989,9 +1002,9 @@ function Pill({ dot, label, value, valueColor }: {
           display: "inline-block",
         }}
       />
-      <span style={{color: "var(--muted)"}}>{label}</span>
+      <span style={{ color: "var(--muted)" }}>{label}</span>
       {value !== undefined && (
-        <strong style={{color: valueColor ?? "var(--text)"}}>{value}</strong>
+        <strong style={{ color: valueColor ?? "var(--text)" }}>{value}</strong>
       )}
     </span>
   );
@@ -1000,7 +1013,7 @@ function Pill({ dot, label, value, valueColor }: {
 function StatusItem({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <span className="inline-flex items-baseline gap-1.5 text-xs">
-      <span className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>
+      <span className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>
         {label}
       </span>
       <span>{children}</span>
@@ -1009,14 +1022,14 @@ function StatusItem({ label, children }: { label: string; children: React.ReactN
 }
 
 function Divider() {
-  return <span className="h-3.5 w-px" style={{background: "var(--border)"}} aria-hidden />;
+  return <span className="h-3.5 w-px" style={{ background: "var(--border)" }} aria-hidden />;
 }
 
 function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
     <div>
-      <div className="text-[9px] uppercase tracking-wider font-medium" style={{color: "var(--muted)"}}>{label}</div>
-      <div className="font-semibold mt-0.5 tabular-nums text-sm" style={{color: color ?? "var(--text)"}}>{value}</div>
+      <div className="text-[9px] uppercase tracking-wider font-medium" style={{ color: "var(--muted)" }}>{label}</div>
+      <div className="font-semibold mt-0.5 tabular-nums text-sm" style={{ color: color ?? "var(--text)" }}>{value}</div>
     </div>
   );
 }
@@ -1042,6 +1055,7 @@ function LimitRow({
   todayLabel, todayValue, todayColor,
   inputPrefix, input, onInput, busy, onSave, current,
   hasLimit, thresholdHint,
+  thresholdUsdDisplay,
   headroomDisplay, headroomColor,
   pctConsumed,
   successProgress,
@@ -1061,6 +1075,14 @@ function LimitRow({
   current: string | null;
   hasLimit: boolean;
   thresholdHint?: string;
+  /** The threshold expressed in USD. For pct-based rows this is
+   *  ``balance × pct / 100`` (the absolute dollar amount the limit
+   *  trips at). Renders in its own column between "Today" and
+   *  "Headroom" so the trader sees both the % they typed AND the
+   *  actual dollar trigger. Pass "—" (or omit) when the row doesn't
+   *  have a meaningful USD value (e.g. Max-per-contract, which IS
+   *  USD already). */
+  thresholdUsdDisplay?: string;
   headroomDisplay: string;
   headroomColor?: string;
   pctConsumed?: number;
@@ -1076,7 +1098,7 @@ function LimitRow({
     ? accent
     : barPct >= 100 ? "var(--bad)"
       : barPct >= 75 ? "#f59e0b"
-      : accent;
+        : accent;
 
   return (
     <div
@@ -1106,7 +1128,7 @@ function LimitRow({
       >
         <div
           className="md:grid md:items-center md:gap-3"
-          style={{ gridTemplateColumns: "1.5fr 1.4fr 0.9fr 0.9fr 0.5fr" }}
+          style={{ gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr" }}
         >
           {/* Limit name + subtitle */}
           <div className="min-w-0 flex items-start gap-2.5">
@@ -1182,7 +1204,7 @@ function LimitRow({
           </div>
 
           {/* Today — now sits AFTER the threshold input, matching the new
-              column legend (Limit · Threshold · Today · Headroom · Used). */}
+              column legend (Limit · Threshold · Today · USD · Headroom · Used). */}
           <div className="mt-3 md:mt-0">
             <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
               {todayLabel}
@@ -1192,6 +1214,22 @@ function LimitRow({
               style={{ color: todayColor ?? "var(--text)" }}
             >
               {todayValue}
+            </div>
+          </div>
+
+          {/* USD — absolute dollar value the threshold trips at.
+              For pct-based rows this is balance × pct / 100, computed
+              by the caller (we need today's balance which isn't local
+              to this component). Passed in via thresholdUsdDisplay. */}
+          <div className="mt-3 md:mt-0">
+            <div className="md:hidden text-[9px] uppercase tracking-widest mb-0.5" style={{ color: "var(--muted)" }}>
+              USD
+            </div>
+            <div
+              className="text-sm font-semibold tabular-nums"
+              style={{ color: thresholdUsdDisplay && thresholdUsdDisplay !== "—" ? "var(--text)" : "var(--muted)" }}
+            >
+              {thresholdUsdDisplay ?? "—"}
             </div>
           </div>
 
@@ -1218,14 +1256,14 @@ function LimitRow({
               style={{
                 color:
                   !hasLimit ? "var(--muted)"
-                  // Take-profit rows treat hitting the limit as a *win*,
-                  // so the percentage text stays in the accent color
-                  // (green) all the way to 100% instead of going
-                  // amber → red like the stop-loss style limits.
-                  : successProgress ? accent
-                  : barPct >= 100 ? "var(--bad)"
-                  : barPct >= 75 ? "#f59e0b"
-                  : "var(--text)",
+                    // Take-profit rows treat hitting the limit as a *win*,
+                    // so the percentage text stays in the accent color
+                    // (green) all the way to 100% instead of going
+                    // amber → red like the stop-loss style limits.
+                    : successProgress ? accent
+                      : barPct >= 100 ? "var(--bad)"
+                        : barPct >= 75 ? "#f59e0b"
+                          : "var(--text)",
               }}
             >
               {hasLimit ? `${Math.round(barPct)}%` : "—"}
@@ -1320,7 +1358,7 @@ function PositionTpSlRow({
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold leading-tight">
-              Position TP / SL
+              Individual Position (TP/SL)
             </div>
             <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
               Auto-close any open position whose unrealized P&L hits the take-profit % or drops below the stop-loss %. Per-position — does not pause copy.
@@ -1426,34 +1464,34 @@ function PercentInputCell({
 function IconTrendDown() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/>
-      <polyline points="17 18 23 18 23 12"/>
+      <polyline points="23 18 13.5 8.5 8.5 13.5 1 6" />
+      <polyline points="17 18 23 18 23 12" />
     </svg>
   );
 }
 function IconTrendUp() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/>
-      <polyline points="17 6 23 6 23 12"/>
+      <polyline points="23 6 13.5 15.5 8.5 10.5 1 18" />
+      <polyline points="17 6 23 6 23 12" />
     </svg>
   );
 }
 function IconLayers() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polygon points="12 2 2 7 12 12 22 7 12 2"/>
-      <polyline points="2 17 12 22 22 17"/>
-      <polyline points="2 12 12 17 22 12"/>
+      <polygon points="12 2 2 7 12 12 22 7 12 2" />
+      <polyline points="2 17 12 22 22 17" />
+      <polyline points="2 12 12 17 22 12" />
     </svg>
   );
 }
 function IconPercent() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <line x1="19" y1="5" x2="5" y2="19"/>
-      <circle cx="6.5" cy="6.5" r="2.5"/>
-      <circle cx="17.5" cy="17.5" r="2.5"/>
+      <line x1="19" y1="5" x2="5" y2="19" />
+      <circle cx="6.5" cy="6.5" r="2.5" />
+      <circle cx="17.5" cy="17.5" r="2.5" />
     </svg>
   );
 }
@@ -1476,7 +1514,7 @@ function FilterPanel({
       <div className="flex items-center justify-between gap-2">
         <div>
           <div className="text-sm font-semibold">{title}</div>
-          <p className="text-[11px] mt-0.5" style={{color: "var(--muted)"}}>{description}</p>
+          <p className="text-[11px] mt-0.5" style={{ color: "var(--muted)" }}>{description}</p>
         </div>
         <span
           className="text-[10px] px-2 py-0.5 rounded-full tabular-nums whitespace-nowrap"
@@ -1531,7 +1569,7 @@ function ChipInput({ symbols, onChange, placeholder }: {
   return (
     <div
       className="rounded-lg border px-2 py-1.5 flex flex-wrap items-center gap-1.5 min-h-[40px] transition-colors focus-within:border-[var(--accent)]"
-      style={{borderColor: "var(--border)", background: "rgba(0,0,0,0.15)"}}
+      style={{ borderColor: "var(--border)", background: "rgba(0,0,0,0.15)" }}
       onClick={(e) => {
         const inp = (e.currentTarget.querySelector("input") as HTMLInputElement | null);
         inp?.focus();
@@ -1554,7 +1592,7 @@ function ChipInput({ symbols, onChange, placeholder }: {
             onClick={(e) => { e.stopPropagation(); remove(sym); }}
             aria-label={`Remove ${sym}`}
             className="opacity-50 hover:opacity-100 transition-opacity leading-none w-4 h-4 grid place-items-center rounded hover:bg-white/10"
-            style={{color: "var(--text)", fontSize: "14px"}}
+            style={{ color: "var(--text)", fontSize: "14px" }}
           >
             ×
           </button>
@@ -1597,41 +1635,41 @@ function ChipInput({ symbols, onChange, placeholder }: {
 function IconUsers() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-      <circle cx="9" cy="7" r="4"/>
-      <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-      <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
     </svg>
   );
 }
 function IconShield() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
     </svg>
   );
 }
 function IconFilter() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
     </svg>
   );
 }
 function IconRefresh() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="23 4 23 10 17 10"/>
-      <polyline points="1 20 1 14 7 14"/>
-      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
     </svg>
   );
 }
 function IconPower() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-      <line x1="12" y1="2" x2="12" y2="12"/>
+      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+      <line x1="12" y1="2" x2="12" y2="12" />
     </svg>
   );
 }
