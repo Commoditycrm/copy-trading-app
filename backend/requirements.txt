@@ -12,7 +12,12 @@ python-multipart==0.0.12
 cryptography==43.0.3
 httpx==0.27.2
 redis==5.2.0
-alpaca-py==0.33.0
+alpaca-py==0.43.4  # bumped from 0.33.0 — 0.33 can't parse multi-leg (mleg)
+# option orders from the Alpaca trade_updates WS (OrderClass.MLEG + empty
+# asset_class raised pydantic ValidationError inside the SDK's _cast, so the
+# message was dropped before trade_listener saw it → broker-placed spreads
+# never pulled into history / never mirrored). Multi-leg support landed in
+# alpaca-py 0.37.0; 0.38.0 fixed mleg position_intent. Pinning latest stable.
 # REMOVED 2026-05-31 (security + architecture): webull==0.6.1 — unofficial
 # reverse-engineered SDK, root cause of the May 2026 prod supply-chain
 # compromise (outbound port-scan / Kinsing signature). The package executed
