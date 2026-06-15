@@ -120,6 +120,20 @@ class MessageOut(BaseModel):
     detail: str
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    # Same constraints as registration so a reset can't set a weaker password.
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class MessageOut(BaseModel):
+    detail: str
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
