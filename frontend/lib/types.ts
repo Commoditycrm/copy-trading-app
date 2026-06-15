@@ -11,6 +11,9 @@ export interface User {
    *  them (see `SubscriberSettings.following_trader_business_name`). */
   business_name: string | null;
   is_active: boolean;
+  /** Whether the user has confirmed their email. Soft-enforced: unverified
+   *  users can still use the app, but see a "verify your email" banner. */
+  email_verified: boolean;
 }
 
 export type BrokerName = "alpaca" | "webull" | "snaptrade" | "ibkr";

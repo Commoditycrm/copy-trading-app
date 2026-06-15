@@ -56,7 +56,7 @@ export default function RegisterPage() {
         { method: "POST", body: JSON.stringify({ email: normalizedEmail, password }), auth: false }
       );
       setTokens(tok.access_token, tok.refresh_token);
-      notify.success("Account created");
+      notify.success("Account created — check your email to verify it");
       router.replace("/");
     } catch (e) {
       notify.fromError(e, "registration failed");

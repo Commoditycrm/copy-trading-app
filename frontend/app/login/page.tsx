@@ -83,6 +83,11 @@ export default function LoginPage() {
               autoComplete="current-password" placeholder="••••••••"
               value={password} onChange={(e) => setPassword(e.target.value)} required
             />
+            <div className="text-right mt-1.5">
+              <Link href="/forgot-password" className="text-xs underline" style={{ color: "var(--muted)" }}>
+                Forgot password?
+              </Link>
+            </div>
           </div>
         </div>
 

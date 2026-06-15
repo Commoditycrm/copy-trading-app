@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -58,6 +59,34 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # ── Password reset / transactional email (SendGrid) ───────────────────
+    # SendGrid Web API v3 key. Blank by default so dev/QA work without it —
+    # the email service then logs the reset link instead of sending (see
+    # services/email.py). Get a key at https://app.sendgrid.com/settings/api_keys.
+    sendgrid_api_key: str = ""
+    # The From address + display name on outgoing mail. The from address MUST
+    # be a verified sender / authenticated domain in SendGrid or sends are
+    # rejected (403). Accepts either EMAIL_FROM or SENDGRID_FROM_EMAIL as the
+    # env var name (the SendGrid-style name is what the dashboard guides toward).
+    email_from: str = Field(
+        default="noreply@kopyya.com",
+        validation_alias=AliasChoices("email_from", "sendgrid_from_email"),
+    )
+    email_from_name: str = "Kopyya"
+    # If set, password-reset emails are sent via this SendGrid Dynamic Template
+    # (designed in the SendGrid UI) instead of the built-in inline HTML. The
+    # template is passed this dynamic data (handlebars): {{reset_link}},
+    # {{name}}, {{app_name}}, {{expiry_minutes}}. Leave blank to use inline HTML.
+    sendgrid_password_reset_template_id: str = ""
+    # Password-reset link lifetime. Short by design — long enough to act on the
+    # email, short enough to limit exposure if the inbox is later compromised.
+    password_reset_token_minutes: int = 30
+    # Email-verification link lifetime. Longer than a reset (24h) — verification
+    # emails often sit in an inbox a while before the user clicks.
+    email_verification_token_minutes: int = 1440
+    # Optional SendGrid Dynamic Template for the verification email. Receives
+    # {{verify_link}}, {{name}}, {{app_name}}. Blank → built-in inline HTML.
+    sendgrid_verification_template_id: str = ""
 
     @property
     def cors_origins_list(self) -> list[str]:
