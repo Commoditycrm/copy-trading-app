@@ -3,7 +3,7 @@
 import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
+import { api, ApiError, clearTokens, getAccessToken, resendVerification } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
@@ -210,6 +210,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // notification.created, and refreshed on a 30s poll as a backstop
   // for SSE drops we didn't fully recover from.
   const [unreadCount, setUnreadCount] = useState<number>(0);
+  // Email-verification banner state (soft enforcement — nag, don't block).
+  const [resendBusy, setResendBusy] = useState(false);
+  const [resendDone, setResendDone] = useState(false);
+
+  async function resendVerify() {
+    if (!user) return;
+    setResendBusy(true);
+    try {
+      await resendVerification(user.email);
+      setResendDone(true);
+      notify.success("Verification email sent — check your inbox.");
+    } catch (e) {
+      notify.fromError(e, "Could not resend verification email");
+    } finally {
+      setResendBusy(false);
+    }
+  }
 
   async function refreshUnreadCount() {
     try {
@@ -763,6 +780,29 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </header>
+
+        {!user.email_verified && (
+          <div
+            className="flex items-center justify-between gap-3 mx-4 mt-3 px-4 py-2.5 rounded-xl text-sm"
+            style={{
+              background: "rgba(250,204,21,0.10)",
+              border: "1px solid rgba(250,204,21,0.35)",
+              color: "#facc15",
+            }}
+          >
+            <span className="min-w-0">
+              📧 Please verify your email <strong>{user.email}</strong> to secure your account.
+            </span>
+            <button
+              type="button"
+              onClick={resendVerify}
+              disabled={resendBusy || resendDone}
+              className="btn-ghost px-3 py-1 text-xs whitespace-nowrap shrink-0"
+            >
+              {resendDone ? "Sent ✓" : resendBusy ? "Sending…" : "Resend email"}
+            </button>
+          </div>
+        )}
 
         <main className="flex-1 min-w-0 overflow-y-auto p-3 md:p-5">{children}</main>
       </div>

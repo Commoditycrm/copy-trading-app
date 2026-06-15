@@ -98,6 +98,28 @@ class RefreshIn(BaseModel):
     refresh_token: str = Field(min_length=1)
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    # Same constraints as registration so a reset can't set a weaker password.
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class VerifyEmailIn(BaseModel):
+    token: str
+
+
+class ResendVerificationIn(BaseModel):
+    email: EmailStr
+
+
+class MessageOut(BaseModel):
+    detail: str
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
@@ -111,5 +133,6 @@ class UserOut(BaseModel):
     display_name: str | None
     business_name: str | None = None
     is_active: bool
+    email_verified: bool = True
 
     model_config = {"from_attributes": True}
