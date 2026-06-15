@@ -43,12 +43,8 @@ async function tryRefresh(): Promise<boolean> {
   refreshInFlight = (async () => {
     try {
       const r = await fetch(
-        `/api/auth/refresh`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh_token: refresh }),
-        }
+        `/api/auth/refresh?refresh_token=${encodeURIComponent(refresh)}`,
+        { method: "POST" }
       );
       if (!r.ok) { clearTokens(); return false; }
       const data = await r.json() as { access_token: string; refresh_token: string };
@@ -109,26 +105,6 @@ export async function resetPassword(
   return api("/api/auth/reset-password", {
     method: "POST",
     body: JSON.stringify({ token, new_password: newPassword }),
-    auth: false,
-  });
-}
-
-// ── Email verification ──────────────────────────────────────────────────────
-
-/** Confirm an email address using the token from the verification link. */
-export async function verifyEmail(token: string): Promise<{ detail: string }> {
-  return api("/api/auth/verify-email", {
-    method: "POST",
-    body: JSON.stringify({ token }),
-    auth: false,
-  });
-}
-
-/** Re-send the verification email. Always resolves (no account enumeration). */
-export async function resendVerification(email: string): Promise<{ detail: string }> {
-  return api("/api/auth/resend-verification", {
-    method: "POST",
-    body: JSON.stringify({ email }),
     auth: false,
   });
 }
