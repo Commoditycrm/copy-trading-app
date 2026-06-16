@@ -19,6 +19,16 @@ function IconBell() {
   );
 }
 
+function IconMenu() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+  );
+}
+
 interface BulkCopyState { total: number; enabled: number; paused: boolean; }
 
 const USER_CACHE_KEY = "trading-app:user";
@@ -122,19 +132,6 @@ const NAV_SUBSCRIBER = [
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 
-/** Brand mark — uses the uploaded icon from /public. */
-function LogoMark({ size = 40 }: { size?: number }) {
-  return (
-    <img
-      src="/brand-icon.avif"
-      alt="ARK"
-      width={size}
-      height={size}
-      style={{ width: size, height: size, borderRadius: 8, objectFit: "cover" }}
-    />
-  );
-}
-
 /** Small pill mirroring ListenerPill's visual language, but for the SSE
  *  connection itself rather than the broker stream. Hidden while
  *  everything's healthy so the header stays quiet during normal
@@ -192,6 +189,68 @@ function initials(s: string | null | undefined, fallback: string) {
   if (!t) return "·";
   const parts = t.split(/[\s@.]+/).filter(Boolean);
   return (parts[0]?.[0] ?? "?").concat(parts[1]?.[0] ?? "").toUpperCase();
+}
+
+/** Copy-trading on/off toggle used in the sidebar footer (trader master +
+ *  subscriber personal share the same visual). Logic is unchanged — this is
+ *  just the presentational switch. */
+function CopySwitch({
+  on,
+  busy,
+  collapsed,
+  onToggle,
+  title,
+}: {
+  on: boolean;
+  busy: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
+  title: string;
+}) {
+  return (
+    <div
+      className={`w-full flex items-center gap-2 rounded-token border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
+      style={{ borderColor: "var(--border)", background: "rgba(255,255,255,0.02)" }}
+    >
+      {!collapsed && (
+        <div className="flex items-center gap-2 min-w-0">
+          <span
+            className={on ? "pulse-dot" : ""}
+            style={{ width: 7, height: 7, borderRadius: 9999, background: on ? "var(--good)" : "var(--muted)", color: "var(--good)", display: "inline-block", flexShrink: 0 }}
+            aria-hidden
+          />
+          <span className="text-sm font-medium truncate">Copy trading</span>
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={busy}
+        role="switch"
+        aria-checked={on}
+        aria-label={title}
+        title={title}
+        className="relative shrink-0 rounded-full transition-colors focus-ring"
+        style={{
+          width: 32, height: 18,
+          background: on ? "var(--good)" : "var(--border)",
+          opacity: busy ? 0.5 : 1,
+          cursor: busy ? "not-allowed" : "pointer",
+        }}
+      >
+        <span
+          className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
+          style={{ width: 14, height: 14, left: on ? 16 : 2, background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,0.3)" }}
+        >
+          {busy && (
+            <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
+              <Spinner />
+            </span>
+          )}
+        </span>
+      </button>
+    </div>
+  );
 }
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
@@ -387,10 +446,25 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     } catch { /* ignore */ }
   }, [collapsed]);
 
+  // Mobile drawer: below lg the sidebar slides in over an overlay. Default
+  // false (matches SSR). Track desktop so the collapse feature only applies
+  // on large screens; the mobile drawer always shows the full sidebar.
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(true);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const update = () => setIsDesktop(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  // Close the drawer on navigation.
+  useEffect(() => { setMobileOpen(false); }, [pathname]);
+
   if (loading) {
     return (
       <div className="min-h-screen grid place-items-center" style={{ color: "var(--muted)" }}>
-        Loading…
+        <Spinner />
       </div>
     );
   }
@@ -407,34 +481,37 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     (user.role === "trader"
       ? user.business_name
       : subCopy?.following_trader_business_name) || "ARK";
-  // Collapsed sidebar shows just the first letter so the chrome still
-  // reads as branded at narrow widths.
+  // The collapse feature is desktop-only; the mobile drawer always shows the
+  // expanded sidebar (labels visible).
+  const navCollapsed = isDesktop && collapsed;
   const brandShort = brandName.trim().charAt(0).toUpperCase() || "A";
-  const SIDEBAR_W = collapsed ? 72 : 244;
+  const SIDEBAR_W = navCollapsed ? 72 : 244;
 
   return (
     // Row: full-height sidebar on the left, then a column (navbar + main)
     // on the right. h-screen + overflow-hidden locks the outer frame; only
     // <main> scrolls internally.
     <div className="h-screen flex overflow-hidden relative">
-      {/* Edge toggle — anchored to the seam between sidebar and main, rendered
-          last in the outer container so it stacks above both. Vertically
-          centered with the navbar strip. */}
+      {/* Mobile overlay — tap to close the drawer. Desktop never shows it. */}
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 z-40 lg:hidden animate-fade-in"
+          style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(2px)" }}
+          onClick={() => setMobileOpen(false)}
+          aria-hidden
+        />
+      )}
+
+      {/* Desktop collapse hinge — sits on the sidebar's right edge. Hidden on
+          mobile (the drawer + hamburger handle navigation there). */}
       <button
         type="button"
         onClick={() => setCollapsed(c => !c)}
         title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="absolute grid place-items-center transition-[left] duration-200"
+        className="absolute hidden lg:grid place-items-center transition-[left] duration-200 focus-ring"
         style={{
-          // Floating navbar starts at mt-3 (12px) with py-3 padding. A 28px
-          // square button centered on the navbar's vertical midline:
-          // 12 (offset) + (56-28)/2 = 26.
           top: 26,
-          // Centered on the sidebar's right border — half the button sits
-          // inside the sidebar, half outside, so it reads as a hinge.
-          // Width trimmed another ~10% (24 → 22); height stays 28 so the
-          // chevron icon doesn't crowd the button.
           left: SIDEBAR_W - 11,
           width: 22,
           height: 28,
@@ -447,52 +524,53 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         }}
       >
         <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden
+          width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden
           style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
         >
           <polyline points="15 18 9 12 15 6" />
         </svg>
       </button>
 
-      {/* ── Sidebar (full viewport height) ──────────────────────────────── */}
+      {/* ── Sidebar — static column on desktop, slide-in drawer on mobile ── */}
       <aside
-        className="flex flex-col h-full shrink-0 transition-[width] duration-200 relative"
+        className={`flex flex-col h-full shrink-0 z-50 fixed inset-y-0 left-0 lg:static transition-[transform,width] duration-200 ${mobileOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}
         style={{
           width: SIDEBAR_W,
-          background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
+          background: "linear-gradient(180deg, rgba(14,20,17,0.92) 0%, rgba(7,9,10,0.88) 100%)",
           borderRight: "1px solid var(--border)",
           backdropFilter: "blur(8px)",
         }}
       >
-        {/* Wordmark only — the image logo is intentionally hidden per
-            product direction. The brand text is derived per role:
-            traders see their own business_name; subscribers see the
-            business_name of the trader they follow. Left-aligned when
-            expanded; first-letter fallback when collapsed so the
-            chrome still reads as branded at narrow widths. */}
-        <div className={`flex items-center ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
-          <div className="leading-tight min-w-0">
+        {/* Wordmark — derived per role (trader's own business_name, or the
+            followed trader's for subscribers). First-letter fallback when
+            collapsed so the chrome still reads as branded at narrow widths. */}
+        <div className={`flex items-center ${navCollapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
+          <div className="flex items-center gap-2.5 min-w-0">
             <div
-              title={collapsed ? brandName : undefined}
+              className="grid place-items-center shrink-0 rounded-token"
               style={{
-                fontWeight: 700,
-                fontSize: collapsed ? 17 : 22,
-                letterSpacing: "0.04em",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
+                width: 30, height: 30,
+                background: "var(--grad-accent)",
+                color: "var(--accent-ink)",
+                fontWeight: 800, fontSize: 15,
+                boxShadow: "0 6px 16px -8px var(--accent-glow)",
               }}
+              aria-hidden
             >
-              {collapsed ? brandShort : brandName}
+              {brandShort}
             </div>
+            {!navCollapsed && (
+              <div
+                title={brandName}
+                style={{
+                  fontWeight: 700, fontSize: 19, letterSpacing: "0.03em",
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}
+              >
+                {brandName}
+              </div>
+            )}
           </div>
         </div>
 
@@ -500,25 +578,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="flex-1 min-h-0 overflow-y-auto px-3 space-y-1">
           {nav.map((item) => {
             const active = pathname?.startsWith(item.href);
-            // Use Next.js <Link> with prefetch=true (the default) so the
-            // RSC payload for each route is fetched on hover / when the
-            // link scrolls into view. Without this, every navigation
-            // pays the full RSC roundtrip (3-4s on slow links) before
-            // the new page can render. We pair this with the route-
-            // level `loading.tsx` so even a cold prefetch shows the
-            // centered spinner instantly on click.
-            //
-            // (Previously this used router.push + an <a> to dodge an
-            //  RSC auth-wall failure; the route-level loading file
-            //  covers that case now — the user sees the spinner
-            //  immediately rather than a stale page.)
             return (
               <Link
                 key={item.href}
                 href={item.href}
                 prefetch
-                title={collapsed ? item.label : undefined}
-                className={`flex items-center gap-2.5 ${collapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline`}
+                onClick={() => setMobileOpen(false)}
+                title={navCollapsed ? item.label : undefined}
+                aria-current={active ? "page" : undefined}
+                className={`flex items-center gap-2.5 ${navCollapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline focus-ring`}
                 style={{
                   background: active
                     ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
@@ -530,7 +598,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 }}
               >
                 <item.Icon />
-                {!collapsed && <span>{item.label}</span>}
+                {!navCollapsed && <span>{item.label}</span>}
               </Link>
             );
           })}
@@ -538,116 +606,39 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
         {/* Footer — copy-trading switch (trader: master; subscriber: own) + Sign out */}
         <div className="p-3 space-y-2">
-          {user.role === "subscriber" && subCopy && (() => {
-            const isOn = subCopy.copy_enabled;
-            const disabled = subCopyBusy;
-            return (
-              <div
-                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
-                style={{
-                  borderColor: "var(--border)",
-                  background: "rgba(255,255,255,0.02)",
-                }}
-              >
-                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
-                <button
-                  type="button"
-                  onClick={toggleSubscriberCopy}
-                  disabled={disabled}
-                  role="switch"
-                  aria-checked={isOn}
-                  title={isOn ? "Turn copy off" : "Turn copy on"}
-                  className="relative shrink-0 rounded-full transition-colors"
-                  style={{
-                    width: 32, height: 18,
-                    background: isOn ? "var(--good)" : "var(--border)",
-                    opacity: disabled ? 0.5 : 1,
-                    cursor: disabled ? "not-allowed" : "pointer",
-                  }}
-                >
-                  <span
-                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
-                    style={{
-                      width: 14, height: 14,
-                      left: isOn ? 16 : 2,
-                      background: "#fff",
-                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                    }}
-                  >
-                    {subCopyBusy && (
-                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
-                        <Spinner />
-                      </span>
-                    )}
-                  </span>
-                </button>
-              </div>
-            );
-          })()}
-          {user.role === "trader" && bulkCopy && (() => {
-            // The toggle reflects the trader-side master fanout gate, not
-            // subscribers' individual flags. ON = fanout active, OFF = paused.
-            const isOn = !bulkCopy.paused;
-            const disabled = bulkBusy;
-            return (
-              <div
-                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
-                style={{
-                  borderColor: "var(--border)",
-                  background: "rgba(255,255,255,0.02)",
-                }}
-              >
-                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
-                <button
-                  type="button"
-                  onClick={toggleBulkCopy}
-                  disabled={disabled}
-                  role="switch"
-                  aria-checked={isOn}
-                  title={isOn ? "Pause copy trading" : "Resume copy trading"}
-                  className="relative shrink-0 rounded-full transition-colors"
-                  style={{
-                    width: 32, height: 18,
-                    background: isOn ? "var(--good)" : "var(--border)",
-                    opacity: disabled ? 0.5 : 1,
-                    cursor: disabled ? "not-allowed" : "pointer",
-                  }}
-                >
-                  <span
-                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
-                    style={{
-                      width: 14, height: 14,
-                      left: isOn ? 16 : 2,
-                      background: "#fff",
-                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                    }}
-                  >
-                    {bulkBusy && (
-                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
-                        <Spinner />
-                      </span>
-                    )}
-                  </span>
-                </button>
-              </div>
-            );
-          })()}
+          {user.role === "subscriber" && subCopy && (
+            <CopySwitch
+              on={subCopy.copy_enabled}
+              busy={subCopyBusy}
+              collapsed={navCollapsed}
+              onToggle={toggleSubscriberCopy}
+              title={subCopy.copy_enabled ? "Turn copy off" : "Turn copy on"}
+            />
+          )}
+          {user.role === "trader" && bulkCopy && (
+            <CopySwitch
+              on={!bulkCopy.paused}
+              busy={bulkBusy}
+              collapsed={navCollapsed}
+              onToggle={toggleBulkCopy}
+              title={!bulkCopy.paused ? "Pause copy trading" : "Resume copy trading"}
+            />
+          )}
           <button
             onClick={() => {
               clearTokens();
               try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
               router.replace("/login");
             }}
-            title={collapsed ? "Sign out" : undefined}
-            className={`btn-ghost w-full ${collapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2`}
+            title={navCollapsed ? "Sign out" : undefined}
+            className={`btn-ghost w-full ${navCollapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2 focus-ring`}
           >
-            {/* Door-arrow icon — always visible; label hidden in collapsed mode. */}
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
               <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
               <polyline points="16 17 21 12 16 7" />
               <line x1="21" y1="12" x2="9" y2="12" />
             </svg>
-            {!collapsed && <span>Sign out</span>}
+            {!navCollapsed && <span>Sign out</span>}
           </button>
         </div>
       </aside>
@@ -655,7 +646,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* ── Right column: navbar on top, scrollable main below ──────────── */}
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <header
-          className="flex items-center justify-between px-5 py-3 shrink-0 mx-4 mt-3 rounded-xl"
+          className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 shrink-0 mx-3 sm:mx-4 mt-3 rounded-xl"
           style={{
             background: "linear-gradient(180deg, rgba(14,20,17,0.75) 0%, rgba(7,9,10,0.5) 100%)",
             border: "1px solid var(--border)",
@@ -663,21 +654,30 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
           }}
         >
-          {/* Left: listener health pill + SSE connection-status pill.
-              Margin-left clears the sidebar collapse tab so the pill
-              doesn't sit underneath it. */}
-          <div className="flex items-center gap-2">
+          {/* Left: hamburger (mobile only) + listener/SSE status pills. */}
+          <div className="flex items-center gap-2 min-w-0">
+            <button
+              type="button"
+              onClick={() => setMobileOpen(true)}
+              aria-label="Open navigation menu"
+              className="lg:hidden grid place-items-center rounded-token shrink-0 focus-ring"
+              style={{ width: 36, height: 36, border: "1px solid var(--border)", background: "rgba(255,255,255,0.02)", color: "var(--text-2)" }}
+            >
+              <IconMenu />
+            </button>
             <ListenerPill role={user.role as "trader" | "subscriber"} />
-            <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
+            <div className="hidden sm:block">
+              <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
+            </div>
           </div>
           {/* Right: bell + who's signed in + role chip. */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             <button
               type="button"
               onClick={() => router.push("/notifications")}
               title={unreadCount > 0 ? `${unreadCount} unread notification(s)` : "Notifications"}
-              aria-label="Notifications"
-              className="relative grid place-items-center rounded-full transition-colors"
+              aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
+              className="relative grid place-items-center rounded-full transition-colors focus-ring"
               style={{
                 width: 32, height: 32,
                 background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
@@ -690,15 +690,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 <span
                   className="absolute text-[10px] font-bold rounded-full grid place-items-center"
                   style={{
-                    top: -4,
-                    right: -4,
-                    minWidth: 16,
-                    height: 16,
-                    padding: "0 4px",
-                    background: "var(--bad)",
-                    color: "#fff",
-                    border: "1px solid var(--panel)",
-                    lineHeight: 1,
+                    top: -4, right: -4, minWidth: 16, height: 16, padding: "0 4px",
+                    background: "var(--bad)", color: "#fff",
+                    border: "1px solid var(--panel)", lineHeight: 1,
                   }}
                 >
                   {unreadCount > 99 ? "99+" : unreadCount}
@@ -706,18 +700,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               )}
             </button>
             <div
-              className="grid place-items-center rounded-full"
+              className="grid place-items-center rounded-full shrink-0"
               style={{
                 width: 32, height: 32,
                 background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
                 border: "1px solid var(--border)",
-                color: "var(--accent)",
-                fontWeight: 700, fontSize: 14,
+                color: "var(--accent)", fontWeight: 700, fontSize: 14,
               }}
             >
               {initials(user.display_name, user.email)}
             </div>
-            <div className="leading-tight text-right">
+            <div className="leading-tight text-right hidden sm:block">
               <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
               <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
                 {user.role}
@@ -728,7 +721,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
         {!user.email_verified && (
           <div
-            className="flex items-center justify-between gap-3 mx-4 mt-3 px-4 py-2.5 rounded-xl text-sm"
+            className="flex items-center justify-between gap-3 mx-3 sm:mx-4 mt-3 px-4 py-2.5 rounded-xl text-sm animate-fade-in"
             style={{
               background: "rgba(250,204,21,0.10)",
               border: "1px solid rgba(250,204,21,0.35)",
@@ -742,14 +735,14 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               type="button"
               onClick={resendVerify}
               disabled={resendBusy || resendDone}
-              className="btn-ghost px-3 py-1 text-xs whitespace-nowrap shrink-0"
+              className="btn-ghost px-3 py-1 text-xs whitespace-nowrap shrink-0 focus-ring"
             >
               {resendDone ? "Sent ✓" : resendBusy ? "Sending…" : "Resend email"}
             </button>
           </div>
         )}
 
-        <main className="flex-1 min-w-0 overflow-y-auto p-5">{children}</main>
+        <main className="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5">{children}</main>
       </div>
     </div>
   );
