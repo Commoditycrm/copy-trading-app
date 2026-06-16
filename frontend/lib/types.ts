@@ -79,6 +79,11 @@ export interface Order {
   stop_price: string | null;
   take_profit_price: string | null;
   stop_loss_price: string | null;
+  /** Set on bracket-exit rows (TP / SL closes); null on entry orders.
+   *  Lets the frontend filter exit legs out of entry-finding lookups. */
+  bracket_parent_id?: string | null;
+  /** "tp" or "sl" on bracket-exit rows; null on entry orders. */
+  bracket_leg?: "tp" | "sl" | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: OptionRight | null;

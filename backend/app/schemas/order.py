@@ -92,6 +92,12 @@ class OrderOut(BaseModel):
     stop_price: Decimal | None
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
+    # Bracket-exit linkage — entry rows have these null; the TP / SL exit
+    # rows placed by bracket_emulator point back at their parent and tag
+    # themselves with 'tp' or 'sl'. The frontend uses these to filter
+    # exit legs out of the "find entry for position" lookup.
+    bracket_parent_id: uuid.UUID | None = None
+    bracket_leg: str | None = None
     option_expiry: date | None
     option_strike: Decimal | None
     option_right: OptionRight | None
@@ -129,4 +135,47 @@ class CloseOrderIn(BaseModel):
             raise ValueError("limit_price required for limit close")
         if self.order_type not in (OrderType.MARKET, OrderType.LIMIT):
             raise ValueError("close only supports market or limit")
+        return self
+
+
+class BracketUpdateIn(BaseModel):
+    """Modify the TP/SL legs of an entry order's bracket.
+
+    Either field may be:
+      * a positive Decimal → set or replace that leg at this price
+      * explicit ``None`` → clear that leg (cancel any live exit on
+        that side; subsequent fills won't have a bracket on that leg)
+      * field omitted entirely → leave that leg unchanged
+
+    Pydantic can't distinguish "omitted" from "set to null" out of the
+    box. We use ``Field(default=...)`` with a sentinel default and a
+    ``model_validator`` that reads the raw input dict — that lets the
+    endpoint tell the three cases apart.
+    """
+
+    take_profit_price: Decimal | None = Field(default=None)
+    stop_loss_price: Decimal | None = Field(default=None)
+
+    # Set by the validator: which keys were present in the request body
+    # (regardless of value). Endpoint reads this to know what to act on.
+    tp_present: bool = Field(default=False, exclude=True)
+    sl_present: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _track_presence(cls, data):  # noqa: ANN001 — pydantic before-validator
+        if isinstance(data, dict):
+            data = dict(data)  # shallow copy so we don't mutate the caller's payload
+            data["tp_present"] = "take_profit_price" in data
+            data["sl_present"] = "stop_loss_price" in data
+        return data
+
+    @model_validator(mode="after")
+    def _check(self) -> "BracketUpdateIn":
+        if not self.tp_present and not self.sl_present:
+            raise ValueError("at least one of take_profit_price / stop_loss_price required")
+        if self.take_profit_price is not None and self.take_profit_price <= 0:
+            raise ValueError("take_profit_price must be > 0")
+        if self.stop_loss_price is not None and self.stop_loss_price <= 0:
+            raise ValueError("stop_loss_price must be > 0")
         return self

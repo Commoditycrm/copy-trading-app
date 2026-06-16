@@ -82,11 +82,10 @@ class SubscriberSettings(Base, TimestampMixin):
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
     # When the pnl_poller observes broker-reported equity <= this value,
     # everything on the subscriber's broker is closed at market AND
-    # ``copy_enabled`` flips to False. Unlike the daily limits, copy does
-    # NOT auto-resume next day — the subscriber has to manually re-enable
-    # (that's the contract: "stop until I turn it back on"). NULL = off.
-    # Stamped with ``auto_liquidated_at`` when the trigger fires so the
-    # Settings page can show "Auto-liquidated at HH:MM".
+    # ``copy_enabled`` flips to False. NULL = off. Re-enable is manual
+    # only — the contract is "stop until I turn it back on", same as
+    # every other limit. Stamped with ``auto_liquidated_at`` when the
+    # trigger fires so the Settings page can show "Auto-liquidated at HH:MM".
     auto_liquidation_limit: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )
@@ -97,9 +96,9 @@ class SubscriberSettings(Base, TimestampMixin):
     # Set to the UTC timestamp at which a P&L-limit (loss OR profit) flipped
     # copy_enabled to False. NULL means "not paused by a limit" — either the
     # user manually disabled (we leave them alone), or copy is currently
-    # enabled. On every fanout entry, if this timestamp is set AND its UTC
-    # date is < today's UTC date, copy_engine clears it and re-enables
-    # copy_enabled — that's how "auto-resume next day" works.
+    # enabled. Audit marker only — re-enable is MANUAL ONLY (the subscriber
+    # has to flip copy_enabled back on from the Settings UI). There is no
+    # auto-resume sweep anywhere.
     pnl_auto_paused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )

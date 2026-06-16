@@ -8,6 +8,7 @@ import { fmtDate, fmtDateTime, fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, OrderStatus, Position, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
@@ -144,6 +145,8 @@ export default function TradesPage() {
         stop_price: idx >= 0 ? cur[idx].stop_price : null,
         take_profit_price: idx >= 0 ? cur[idx].take_profit_price : null,
         stop_loss_price: idx >= 0 ? cur[idx].stop_loss_price : null,
+        bracket_parent_id: idx >= 0 ? cur[idx].bracket_parent_id : null,
+        bracket_leg: idx >= 0 ? cur[idx].bracket_leg : null,
         option_expiry: idx >= 0 ? cur[idx].option_expiry : null,
         option_strike: idx >= 0 ? cur[idx].option_strike : null,
         option_right: idx >= 0 ? cur[idx].option_right : null,
@@ -314,7 +317,7 @@ export default function TradesPage() {
             style={{ background: "var(--panel)" }}
           >
             <tr>
-              {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
+              {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "TP", "SL", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                 <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
@@ -322,7 +325,7 @@ export default function TradesPage() {
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={14} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={16} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading orders…</span>
@@ -331,7 +334,7 @@ export default function TradesPage() {
               </tr>
             )}
             {!loading && orders.length === 0 && (
-              <tr><td colSpan={14} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
+              <tr><td colSpan={16} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
             {(() => {
               // Only filled orders whose underlying position is still open
@@ -509,6 +512,43 @@ export default function TradesPage() {
                     <td className="px-5 py-3 num">{fmt(expectedPrice(o), 2)}</td>
                     {/* Filled price — actual avg execution price */}
                     <td className="px-5 py-3 num">{fmt(o.filled_avg_price, 2)}</td>
+                    {/* TP / SL — show the bracket prices the trader set. Editable
+                        only on entry rows whose status is still open (pre-fill);
+                        filled orders that survive here are ones whose position
+                        already closed, so brackets are immutable. Bracket-exit
+                        legs (TP/SL closes themselves) never expose an editor. */}
+                    {(() => {
+                      const isEntry = !o.bracket_parent_id;
+                      const editable = isEntry && OPEN_STATUSES.includes(o.status);
+                      const onUpdated = (updated: Order) =>
+                        setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
+                      return (
+                        <>
+                          <td className="px-5 py-3 num">
+                            {isEntry ? (
+                              <InlineBracketCell
+                                orderId={o.id}
+                                leg="tp"
+                                value={o.take_profit_price}
+                                canEdit={editable}
+                                onUpdated={onUpdated}
+                              />
+                            ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                          </td>
+                          <td className="px-5 py-3 num">
+                            {isEntry ? (
+                              <InlineBracketCell
+                                orderId={o.id}
+                                leg="sl"
+                                value={o.stop_loss_price}
+                                canEdit={editable}
+                                onUpdated={onUpdated}
+                              />
+                            ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                          </td>
+                        </>
+                      );
+                    })()}
                     {/* Notional — qty × price (× 100 for options) */}
                     <td className="px-5 py-3 num">
                       {notionalFor(o)

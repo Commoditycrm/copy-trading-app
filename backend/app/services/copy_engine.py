@@ -189,46 +189,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # ── Phase 1: build child orders + skip records ─────────────────────────
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
-    # ── Daily auto-resume sweep ────────────────────────────────────────────
-    # For every subscriber whose copy was previously auto-paused by a P&L
-    # limit, check whether the pause was set on a PRIOR UTC day. If so,
-    # clear the pause + re-enable copy_enabled so today's trades flow.
-    # The pause is keyed off pnl_auto_paused_at (not just copy_enabled=False)
-    # so we don't re-enable users who manually disabled copy.
-    today_utc = datetime.now(timezone.utc).date()
-    resumed_user_ids: list[uuid.UUID] = []
-    for sub in subs:
-        paused_iso = getattr(sub, "pnl_auto_paused_at", None)
-        if not paused_iso:
-            continue
-        try:
-            paused_at = datetime.fromisoformat(paused_iso) if isinstance(paused_iso, str) else paused_iso
-        except ValueError:
-            continue
-        if paused_at.astimezone(timezone.utc).date() < today_utc:
-            db_settings = db.get(SubscriberSettings, sub.user_id)
-            if db_settings is not None:
-                db_settings.copy_enabled = True
-                db_settings.pnl_auto_paused_at = None
-                resumed_user_ids.append(sub.user_id)
-                audit.record(
-                    db,
-                    actor_user_id=sub.user_id,
-                    action="copy.auto_resumed_next_day",
-                    entity_type="subscriber_settings",
-                    entity_id=sub.user_id,
-                    metadata={"paused_at": paused_iso, "resumed_at": today_utc.isoformat()},
-                )
-                events.publish(sub.user_id, {
-                    "type": "copy.auto_resumed",
-                    "reason": "new_day",
-                })
-    if resumed_user_ids:
-        # Re-fetch the active subscriber list AFTER flipping copy_enabled
-        # so the per-sub loop below sees the freshly-resumed users this
-        # very fanout (otherwise they'd need a second trade to fire).
-        cache.invalidate_subscribers_for_trader(trader.id)
-        subs = await cache.get_subscribers_for_trader(db, trader.id)
+    # NOTE: there is no auto-resume sweep here. Once a subscriber is paused
+    # by any limit (daily P&L, account-pct, or auto-liquidation), copy
+    # stays OFF until they manually re-enable it from Settings.
 
     # Decide hybrid path first — we need it to know whether to do the
     # batched broker_accounts SELECT (we skip it for small-N to keep the
@@ -299,8 +262,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         subscriber_picked_at = datetime.now(timezone.utc)
 
         # Daily P&L kill switches (check BEFORE placing). Loss + profit
-        # share the same auto-pause + auto-resume machinery — both stamp
-        # pnl_auto_paused_at so the next-day sweep above re-enables them.
+        # share the same auto-pause path — both stamp pnl_auto_paused_at
+        # as an audit marker. Re-enable is MANUAL ONLY (Settings UI).
         if sub.daily_loss_limit is not None or sub.daily_profit_limit is not None:
             todays_pnl = pnl_by_user.get(sub.user_id, Decimal(0))
             hit_loss = (
@@ -314,9 +277,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if hit_loss or hit_profit:
                 reason = "daily_loss_limit" if hit_loss else "daily_profit_limit"
                 now_utc = datetime.now(timezone.utc)
-                # Flip the DB row off + stamp pnl_auto_paused_at so the
-                # next-day sweep above re-enables this subscriber on the
-                # next fanout after UTC midnight.
+                # Flip the DB row off + stamp pnl_auto_paused_at as the
+                # audit marker for "auto-paused at this time". The
+                # subscriber re-enables manually from the Settings UI.
                 db_settings = db.get(SubscriberSettings, sub.user_id)
                 if db_settings is not None:
                     db_settings.copy_enabled = False

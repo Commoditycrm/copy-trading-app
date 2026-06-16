@@ -30,10 +30,12 @@ Every tick, for every subscriber with a connected supported broker:
      per-position enforcer (one additional ``adapter.get_positions()``
      call). Closes any position whose unrealized P&L percent has
      breached either threshold.
-  6. Auto-resume any pause whose ``pnl_auto_paused_at`` is from a prior
-     UTC day.
-  7. Emit a ``pnl.tick`` SSE event so the Settings page's P&L Limit and
+  6. Emit a ``pnl.tick`` SSE event so the Settings page's P&L Limit and
      Risk Limits panels update live.
+
+Once a subscriber is auto-paused by any limit (daily P&L, account-pct,
+or auto-liquidation), copy stays OFF until they manually re-enable it
+from Settings — there is no auto-resume.
 
 SnapTrade rate-limit math
 -------------------------
@@ -443,39 +445,13 @@ def _enforce_one(acct: BrokerAccount) -> None:
         now_utc = datetime.now(timezone.utc)
         invalidate_trader_id: uuid.UUID | None = None
 
-        # ── Auto-resume next-UTC-day ──────────────────────────────────────
-        paused_at = s.pnl_auto_paused_at
-        if paused_at is not None:
-            if paused_at.tzinfo is None:
-                paused_at = paused_at.replace(tzinfo=timezone.utc)
-            if paused_at.astimezone(timezone.utc).date() < now_utc.date():
-                s.copy_enabled = True
-                s.pnl_auto_paused_at = None
-                audit.record(
-                    db, actor_user_id=s.user_id,
-                    action="copy.auto_resumed_next_day",
-                    entity_type="subscriber_settings", entity_id=s.user_id,
-                    metadata={"source": "pnl_poller"},
-                )
-                if s.following_trader_id:
-                    invalidate_trader_id = s.following_trader_id
-                pending_events.append({
-                    "type": "copy.auto_resumed", "reason": "new_day",
-                })
-
         # today's P&L snapshot (todays_pl / equity / beginning_day_balance) was
         # fetched ABOVE, before this session opened, so we never hold a pool
         # connection across the slow broker call. beginning_day_balance may be
         # None for SnapTrade brokers that don't expose a day-start figure; the
         # pct kill switch is silently skipped for those subscribers.
         if state is None:
-            # Broker call failed — commit any auto-resume we did, skip
-            # the rest of this tick, try again next time.
-            if pending_events:
-                db.commit()
-            _flush(s.user_id, pending_events)
-            if invalidate_trader_id:
-                _safe_invalidate(invalidate_trader_id)
+            # Broker call failed — nothing to commit; try again next tick.
             return
         todays_pl = state["todays_pl"]
         equity = state["equity"]

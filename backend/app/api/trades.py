@@ -14,7 +14,7 @@ from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
-from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
+from app.schemas.order import BracketUpdateIn, CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.pnl import realized_pnl_by_day
@@ -956,6 +956,200 @@ def close_trade(
     )
     db.commit()
     return new_order
+
+
+@router.patch("/trades/{order_id}/bracket", response_model=OrderOut)
+def update_bracket(
+    order_id: uuid.UUID,
+    payload: BracketUpdateIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> Order:
+    """Modify the TP / SL legs on an entry order's bracket.
+
+    Behaviour by state:
+      * Entry not yet filled (pending / submitted / accepted / partially_filled)
+        → just update parent.take_profit_price / stop_loss_price. The
+        bracket_emulator places exit legs at the new prices when the
+        entry eventually fills.
+      * Entry filled, exit legs handled by emulator (i.e. NOT Alpaca-native
+        stocks bracket) → cancel any alive exit leg the caller is replacing,
+        update parent prices, then call emulate_bracket_exits to place fresh
+        legs. emulate_bracket_exits' relaxed idempotency check only blocks
+        on alive/filled siblings, so a canceled leg won't stop a re-place.
+      * Entry filled, Alpaca-native bracket (stocks on AlpacaAdapter direct)
+        → 501. We don't have Alpaca's child-leg broker_order_ids stored,
+        and the project's broker layer is SnapTrade (memory:
+        snaptrade_decision); routing live-Alpaca-bracket modify through
+        Alpaca's PATCH /v2/orders/{id} can be a follow-up if needed.
+      * Entry terminal (canceled / rejected) → 409.
+      * Any exit leg already FILLED (position partially closed via TP/SL)
+        → 409. Modifying around a partial exit is a confusing edge case
+        for v1; trader can place a fresh bracketed order if needed.
+
+    The caller may pass either field, both, or null to clear that leg.
+    Pre-fill clearing just nulls the parent column; post-fill clearing
+    cancels the corresponding live exit leg without re-placing.
+    """
+    entry = db.execute(
+        select(Order).where(Order.id == order_id)
+    ).scalar_one_or_none()
+    if not entry or entry.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if entry.bracket_leg is not None:
+        raise HTTPException(409, "cannot_modify_bracket_leg: pick the entry order, not the exit leg")
+    if entry.broker_account_id is None:
+        raise HTTPException(409, "broker_disconnected: reconnect the broker first")
+
+    # Lock entry row so two concurrent PATCHes can't race on cancel/re-place.
+    db.execute(select(Order).where(Order.id == entry.id).with_for_update())
+
+    # ── Reference price for geometry checks ──────────────────────────────
+    # Pre-fill: the limit_price (None for market entries — geometry checks
+    # are skipped if there's nothing to anchor against).
+    # Post-fill: filled_avg_price (the actual entry price).
+    is_filled = entry.status == OrderStatus.FILLED
+    ref_price = entry.filled_avg_price if is_filled else entry.limit_price
+
+    # Effective values after applying the patch. For fields the caller
+    # omitted, keep the current value. For explicit-null, clear. For a
+    # number, use it.
+    new_tp = payload.take_profit_price if payload.tp_present else entry.take_profit_price
+    new_sl = payload.stop_loss_price if payload.sl_present else entry.stop_loss_price
+
+    # Directional geometry: buy → sl < ref < tp; sell → tp < ref < sl.
+    # Only enforced when ref_price is known AND both legs are set (one-leg
+    # brackets have no directional constraint to check beyond ref-side).
+    if ref_price is not None:
+        if new_tp is not None:
+            if entry.side == OrderSide.BUY and new_tp <= ref_price:
+                raise HTTPException(422, "buy_tp_must_be_above_entry")
+            if entry.side == OrderSide.SELL and new_tp >= ref_price:
+                raise HTTPException(422, "sell_tp_must_be_below_entry")
+        if new_sl is not None:
+            if entry.side == OrderSide.BUY and new_sl >= ref_price:
+                raise HTTPException(422, "buy_sl_must_be_below_entry")
+            if entry.side == OrderSide.SELL and new_sl <= ref_price:
+                raise HTTPException(422, "sell_sl_must_be_above_entry")
+
+    old_tp = entry.take_profit_price
+    old_sl = entry.stop_loss_price
+
+    # ── Pre-fill path: DB-only update ────────────────────────────────────
+    if not is_filled:
+        ALIVE_FOR_MODIFY = (
+            OrderStatus.PENDING, OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+        )
+        if entry.status not in ALIVE_FOR_MODIFY:
+            raise HTTPException(409, f"not_modifiable: entry status is {entry.status.value}")
+        if payload.tp_present:
+            entry.take_profit_price = payload.take_profit_price
+        if payload.sl_present:
+            entry.stop_loss_price = payload.stop_loss_price
+        audit.record(
+            db, actor_user_id=user.id, action="bracket.updated_pre_fill",
+            entity_type="order", entity_id=entry.id,
+            metadata={
+                "old_tp": str(old_tp) if old_tp is not None else None,
+                "new_tp": str(entry.take_profit_price) if entry.take_profit_price is not None else None,
+                "old_sl": str(old_sl) if old_sl is not None else None,
+                "new_sl": str(entry.stop_loss_price) if entry.stop_loss_price is not None else None,
+            },
+            ip_address=client_ip(request),
+        )
+        db.commit()
+        db.refresh(entry)
+        return entry
+
+    # ── Post-fill path: cancel live exit legs + re-place ─────────────────
+    from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+    from app.services.bracket_emulator import emulate_bracket_exits  # noqa: PLC0415
+    from app.models.broker_account import BrokerName  # noqa: PLC0415
+    from app.models.order import InstrumentType  # noqa: PLC0415
+
+    # Alpaca-native bracket = Alpaca-direct stocks. We don't track those
+    # children locally, so a modify needs Alpaca's PATCH /v2/orders/{id}
+    # against the child legs — out of scope for v1.
+    acct = db.get(BrokerAccount, entry.broker_account_id)
+    uses_native = (
+        acct is not None
+        and acct.broker == BrokerName.ALPACA
+        and entry.instrument_type != InstrumentType.OPTION
+    )
+    if uses_native:
+        raise HTTPException(501, "alpaca_native_bracket_modify_not_supported")
+
+    # Inspect the current exit legs. We block modify if any have ALREADY
+    # FILLED — partial exit is a confusing state to modify around.
+    legs = db.execute(
+        select(Order).where(Order.bracket_parent_id == entry.id)
+    ).scalars().all()
+    if any(leg.status == OrderStatus.FILLED for leg in legs):
+        raise HTTPException(409, "position_partially_closed: a bracket leg already filled")
+
+    ALIVE = (
+        OrderStatus.PENDING, OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+    )
+    alive_legs = [leg for leg in legs if leg.status in ALIVE]
+
+    # Cancel each alive leg whose price is changing (or being cleared).
+    # If a side wasn't touched in this patch, leave that leg alone.
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    for leg in alive_legs:
+        if leg.bracket_leg == "tp" and not payload.tp_present:
+            continue
+        if leg.bracket_leg == "sl" and not payload.sl_present:
+            continue
+        if leg.broker_order_id:
+            try:
+                adapter.cancel_order(leg.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                # Broker may have already terminalized it between our last
+                # poll and this call; we still mark it locally and proceed.
+                audit.record(
+                    db, actor_user_id=user.id, action="bracket.leg_cancel_failed",
+                    entity_type="order", entity_id=leg.id,
+                    metadata={
+                        "entry_order_id": str(entry.id),
+                        "leg": leg.bracket_leg,
+                        "broker_order_id": leg.broker_order_id,
+                        "error": str(exc)[:300],
+                    },
+                )
+        leg.status = OrderStatus.CANCELED
+        leg.closed_at = datetime.now(timezone.utc)
+
+    # Apply the new prices to the parent.
+    if payload.tp_present:
+        entry.take_profit_price = payload.take_profit_price
+    if payload.sl_present:
+        entry.stop_loss_price = payload.stop_loss_price
+
+    # Flush so emulate_bracket_exits sees the canceled-leg statuses
+    # (its idempotency guard ignores canceled/rejected legs).
+    db.flush()
+    placed = emulate_bracket_exits(db, entry)
+
+    audit.record(
+        db, actor_user_id=user.id, action="bracket.updated_post_fill",
+        entity_type="order", entity_id=entry.id,
+        metadata={
+            "old_tp": str(old_tp) if old_tp is not None else None,
+            "new_tp": str(entry.take_profit_price) if entry.take_profit_price is not None else None,
+            "old_sl": str(old_sl) if old_sl is not None else None,
+            "new_sl": str(entry.stop_loss_price) if entry.stop_loss_price is not None else None,
+            "legs_cancelled": [str(leg.id) for leg in alive_legs],
+            "legs_placed": [str(leg.id) for leg in placed],
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(entry)
+    return entry
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
