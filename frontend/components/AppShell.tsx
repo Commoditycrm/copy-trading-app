@@ -240,10 +240,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       setSubCopy(prev => prev ? { ...prev, copy_enabled: false } : prev);
       return;
     }
-    if (e?.type === "copy.auto_resumed") {
-      setSubCopy(prev => prev ? { ...prev, copy_enabled: true } : prev);
-      return;
-    }
     if (e?.type === "pnl.tick") {
       if (typeof e.copy_enabled === "boolean") {
         setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);

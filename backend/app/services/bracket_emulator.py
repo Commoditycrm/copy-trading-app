@@ -144,14 +144,29 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
         # the emulator path below.)
         return []
 
-    # Idempotency: don't place exits twice. Re-deliveries of the same
-    # FILLED event are common when both the listener poll and the
+    # Idempotency: don't place the SAME leg twice. Re-deliveries of the
+    # same FILLED event are common when both the listener poll and the
     # fills_sync pass land on the same transition.
-    already = db.execute(
-        select(Order).where(Order.bracket_parent_id == entry.id)
+    #
+    # We dedup PER LEG, not as an all-or-nothing block. That serves two
+    # cases at once:
+    #   (a) Re-delivery — both TP and SL siblings are already alive/
+    #       filled, so both are skipped and we return []. Same behaviour
+    #       as the original short-circuit.
+    #   (b) Bracket-modify of only one leg — the modify endpoint cancels
+    #       just the changing leg, leaves the untouched one alive, and
+    #       calls us. We see the surviving alive leg and DON'T re-place
+    #       it, but we DO place a fresh leg on the other side using the
+    #       parent's updated price.
+    # Canceled / rejected children don't block anything — they're gone.
+    BLOCKING = (*_ALIVE_STATUSES, OrderStatus.FILLED)
+    already_rows = db.execute(
+        select(Order).where(
+            Order.bracket_parent_id == entry.id,
+            Order.status.in_(BLOCKING),
+        )
     ).scalars().all()
-    if already:
-        return []
+    already_legs = {a.bracket_leg for a in already_rows if a.bracket_leg}
 
     qty = entry.filled_quantity or entry.quantity
     if not qty or qty <= 0:
@@ -168,14 +183,17 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
         return []
 
     legs: list[tuple[str, OrderType, Decimal]] = []
-    if tp_price:
+    if tp_price and "tp" not in already_legs:
         # Round to the smallest tick the broker accepts. Without this,
         # a TP/SL computed as a percentage of entry price (e.g.
         # 2.51 × 1.02 = 2.5602) is rejected by Alpaca's options API
         # with "limit price must be limited to 2 decimal places".
         legs.append(("tp", OrderType.LIMIT, _round_to_tick(tp_price, entry.instrument_type, "tp")))
-    if sl_price:
+    if sl_price and "sl" not in already_legs:
         legs.append(("sl", OrderType.STOP, _round_to_tick(sl_price, entry.instrument_type, "sl")))
+    if not legs:
+        # Both sides are either already placed or were never requested.
+        return []
 
     created: list[Order] = []
     for leg, otype, price in legs:
