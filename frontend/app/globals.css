@@ -342,3 +342,71 @@ thead th { font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; 
 .Toastify__progress-bar--warning { background: var(--warn) !important; }
 .Toastify__close-button { color: var(--muted); opacity: 0.8; }
 .Toastify__close-button:hover { color: var(--text); opacity: 1; }
+
+/* ── Motion + skeletons (subtle, professional — it's a trading app) ─────── */
+
+/* Respect users who ask for reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Card hover lift — used on interactive cards (broker cards, stat cards). */
+.hover-lift {
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 34px -16px rgba(0, 0, 0, 0.7);
+  border-color: var(--border-strong);
+}
+
+/* Accessible focus ring helper — strong, consistent, keyboard-only. */
+.focus-ring:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* Skeleton loader — shimmer sweep over a panel-colored block. */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--panel-2);
+  border-radius: var(--r-sm);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.06),
+    transparent
+  );
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  100% { transform: translateX(100%); }
+}
+
+/* Live "pulse dot" for real-time / connected indicators. */
+.pulse-dot { position: relative; }
+.pulse-dot::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 9999px;
+  border: 1px solid currentColor;
+  opacity: 0.6;
+  animation: pulse-ring 1.8s ease-out infinite;
+}
+@keyframes pulse-ring {
+  0%   { transform: scale(0.8); opacity: 0.6; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
