@@ -24,7 +24,18 @@ engine = create_engine(
     pool_recycle=1800,
     future=True,
 )
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+# expire_on_commit=False: don't expire ORM objects after commit. By default
+# SQLAlchemy marks every attribute "expired" on commit, so the NEXT attribute
+# access (e.g. serializing the response model) issues a fresh SELECT to reload
+# it — an extra DB round-trip per request, which is costly on a remote DB.
+# With this off, the in-memory state is kept (Postgres INSERT…RETURNING already
+# loaded server defaults at flush), so handlers that commit-then-return the
+# object serialize without a reload. Handlers that need fresh DB state after a
+# commit must call db.refresh(obj) explicitly.
+SessionLocal = sessionmaker(
+    bind=engine, autocommit=False, autoflush=False, future=True,
+    expire_on_commit=False,
+)
 
 
 def get_db() -> Generator[Session, None, None]:

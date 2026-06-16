@@ -15,7 +15,7 @@ from app.models.order import Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
-from app.services import audit, copy_engine, events, fills_sync
+from app.services import audit, cache, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.pnl import realized_pnl_by_day
 
@@ -267,6 +267,12 @@ def _place_trader_order(
     Returns the persisted Order. Caller commits nothing — this function
     commits before returning.
     """
+    # Perf: total wall-clock of the synchronous placement pipeline, so we can
+    # break the request down into pre-broker DB work / broker call / post-broker
+    # DB work in the logs. The single biggest cost on a remote DB is the number
+    # of round-trips before/after the broker call.
+    _t_start = time.perf_counter()
+
     is_trader = trader.role == UserRole.TRADER
     # Trader kill switch only applies to traders. Subscribers can always
     # manage (close/cancel) their own broker accounts.
@@ -278,7 +284,10 @@ def _place_trader_order(
         raise HTTPException(404, "broker_account_not_found")
     if acct.connection_status != "connected":
         raise HTTPException(409, "broker_not_connected")
-    creds = decrypt_json(acct.encrypted_credentials)
+    # Cached Fernet decrypt — keyed on (account_id, encrypted_blob), so a
+    # credential rotation naturally misses the cache. Avoids re-running the
+    # KDF/decrypt on every order placement (copy_engine already uses this).
+    creds = cache.decrypt_creds_cached(acct.id, acct.encrypted_credentials)
 
     # Will this order be broadcast to subscribers? Pre-compute so we can
     # stamp the flag on the row at creation time (immutable record of intent).
@@ -369,6 +378,9 @@ def _place_trader_order(
         isinstance(adapter, AlpacaAdapter)
         and order.instrument_type != InstrumentType.OPTION
     )
+    # Pre-broker pipeline (auth, account, dedup SELECT, INSERT+flush) is done;
+    # everything up to here is DB/CPU work that runs *before* we touch Alpaca.
+    _pre_broker_ms = int((time.perf_counter() - _t_start) * 1000)
     _broker_t0 = time.perf_counter()
     try:
         result = adapter.place_order(
@@ -433,7 +445,24 @@ def _place_trader_order(
     # carries the timestamp the very first time it surfaces in the API.
     order.redis_published_at = datetime.now(timezone.utc)
     db.commit()
-    db.refresh(order)
+    # NOTE: no db.refresh(order) here. With expire_on_commit=False (see
+    # database.py) the ORM keeps the in-memory attributes after commit, and
+    # Postgres INSERT…RETURNING already populated server defaults (created_at)
+    # at flush time — so the response can serialize without an extra SELECT
+    # round-trip to the DB.
+
+    # Perf breakdown: pre-broker DB work / broker round-trip / post-broker
+    # DB work (audit insert + commit). Lets us see exactly where the wall-clock
+    # goes vs. the raw broker call (order.broker_call_ms).
+    _total_ms = int((time.perf_counter() - _t_start) * 1000)
+    _post_broker_ms = max(0, _total_ms - _pre_broker_ms - (order.broker_call_ms or 0))
+    import logging as _logging  # noqa: PLC0415
+    _logging.getLogger(__name__).info(
+        "place_order timing | total=%dms pre_broker=%dms broker=%dms post_broker=%dms "
+        "(symbol=%s type=%s)",
+        _total_ms, _pre_broker_ms, order.broker_call_ms or 0, _post_broker_ms,
+        order.symbol, order.order_type.value,
+    )
 
     events.publish(trader.id, copy_engine._order_event("order.placed", order))
     # Only trader-originated orders fan out to subscribers. Subscribers placing
