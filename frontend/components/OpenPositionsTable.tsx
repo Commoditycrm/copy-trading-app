@@ -208,6 +208,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         submitted_at: string | null;
         filled_at: string | null;
         filled_avg_price: string | null;
+        // limit_price is the SAME anchor the Trade Panel used when it
+        // converted "TP 10% / SL 5%" → absolute prices. Reversing the
+        // % display against filled_avg_price (which can differ due to
+        // slippage) would show 8.11% instead of 10%. Always prefer
+        // limit_price; filled_avg_price stays as a fallback for orders
+        // that had no limit (market entries that somehow carry a bracket).
+        limit_price: string | null;
         take_profit_price: string | null;
         stop_loss_price: string | null;
       }>();
@@ -235,6 +242,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             submitted_at: o.submitted_at ?? o.created_at,
             filled_at: lastFillAt,
             filled_avg_price: o.filled_avg_price,
+            limit_price: o.limit_price,
             take_profit_price: o.take_profit_price,
             stop_loss_price: o.stop_loss_price,
           });
@@ -441,7 +449,15 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                                 orderId={orderId}
                                 leg="tp"
                                 value={t?.take_profit_price ?? null}
-                                entryPrice={t?.filled_avg_price ?? null}
+                                /* Prefer limit_price as the % anchor — it's
+                                   the same number the Trade Panel used to
+                                   convert "TP 10%" into an absolute price,
+                                   so reversing against it round-trips
+                                   exactly to 10%. filled_avg_price is the
+                                   fallback for orders without a limit
+                                   (e.g. market entries that carry a
+                                   bracket — rare but possible). */
+                                entryPrice={t?.limit_price ?? t?.filled_avg_price ?? null}
                                 side={t?.side ?? (isLong ? "buy" : "sell")}
                                 canEdit={!!orderId}
                                 onUpdated={onUpdated}
@@ -452,7 +468,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                                 orderId={orderId}
                                 leg="sl"
                                 value={t?.stop_loss_price ?? null}
-                                entryPrice={t?.filled_avg_price ?? null}
+                                entryPrice={t?.limit_price ?? t?.filled_avg_price ?? null}
                                 side={t?.side ?? (isLong ? "buy" : "sell")}
                                 canEdit={!!orderId}
                                 onUpdated={onUpdated}

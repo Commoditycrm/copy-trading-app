@@ -527,7 +527,14 @@ export default function TradesPage() {
                     {(() => {
                       const isEntry = !o.bracket_parent_id;
                       const editable = isEntry && OPEN_STATUSES.includes(o.status);
-                      const entryPrice = o.filled_avg_price ?? o.limit_price;
+                      // Prefer limit_price as the % anchor — that's the
+                      // exact number the Trade Panel used to convert
+                      // "TP 10%" into an absolute price, so reversing
+                      // against it shows exactly 10% rather than drifting
+                      // with fill slippage. filled_avg_price is the
+                      // fallback for orders that have no limit (e.g.
+                      // market entries that somehow carry a bracket).
+                      const entryPrice = o.limit_price ?? o.filled_avg_price;
                       const onUpdated = (updated: Order) =>
                         setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
                       return (
