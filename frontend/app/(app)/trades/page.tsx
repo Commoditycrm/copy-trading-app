@@ -250,9 +250,13 @@ export default function TradesPage() {
     }
   }
 
-  // Held-position keys + tab/date filter — hoisted to a memo so the summary
-  // strip and the table body share one source of truth (logic unchanged).
-  const visibleOrders = useMemo(() => {
+  // Position-key helpers + held-set, hoisted out of `visibleOrders` so the
+  // row renderer can also consult it for the stale-Cancel guard (see
+  // `positionLive` below). Without hoisting, the heldKeys Set was scoped
+  // inside the memo and the render couldn't tell whether a still-"open"
+  // order's contract was actually held — which is the case that produces
+  // a misleading Cancel button on an already-filled row.
+  const { posKey, heldKeys } = useMemo(() => {
     const normStrike = (s: string | null) => {
       if (s == null) return "";
       const n = Number(s);
@@ -266,13 +270,17 @@ export default function TradesPage() {
       instrument === "option"
         ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
         : `${acctId}:STK:${symbol.toUpperCase()}`;
-
     const heldKeys = new Set(
       positions
         .filter(p => Number(p.quantity) !== 0)
         .map(p => posKey(p.broker_account_id, p.instrument_type, p.symbol, p.option_expiry, p.option_strike, p.option_right))
     );
+    return { posKey, heldKeys };
+  }, [positions]);
 
+  // Held-position keys + tab/date filter — hoisted to a memo so the summary
+  // strip and the table body share one source of truth (logic unchanged).
+  const visibleOrders = useMemo(() => {
     return orders.filter(o => {
       if (tab === "mine") {
         if (o.parent_order_id) return false;
@@ -285,7 +293,7 @@ export default function TradesPage() {
         o.option_expiry, o.option_strike, o.option_right,
       ));
     });
-  }, [orders, positions, tab, fromParam, toParam]);
+  }, [orders, tab, fromParam, toParam, posKey, heldKeys]);
 
   // search → sort (presentational)
   const rows = useMemo(() => {
@@ -468,7 +476,25 @@ export default function TradesPage() {
               )}
               {!loading && rows.map(o => {
                 const isOpen = OPEN_STATUSES.includes(o.status);
-                const canCancel = isOpen;
+                // Position-existence is authoritative: if a position for
+                // this contract is live, the order MUST have filled at the
+                // broker (no other way to acquire the position). When our
+                // DB still shows the order as "submitted/accepted" here,
+                // it's because fills_sync hasn't caught up yet (broker
+                // just filled it seconds ago). Treat the order as
+                // effectively filled — hide the Cancel button so the
+                // trader can't fire a doomed cancel against an
+                // already-filled order. The actual status text will
+                // update on the next sync-fills tick.
+                const positionLive = heldKeys.has(posKey(
+                  o.broker_account_id ?? "",
+                  o.instrument_type,
+                  o.symbol,
+                  o.option_expiry,
+                  o.option_strike,
+                  o.option_right,
+                ));
+                const canCancel = isOpen && !positionLive;
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;
