@@ -1,9 +1,9 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { api, setTokens } from "@/lib/api";
+import { api, getAccessToken, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
@@ -19,6 +19,12 @@ export default function RegisterPage() {
   // For subscribers we just don't send it.
   const [businessName, setBusinessName] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Already signed in? Skip the form and bounce to the root, which
+  // role-routes to the right landing page.
+  useEffect(() => {
+    if (getAccessToken()) router.replace("/");
+  }, [router]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
