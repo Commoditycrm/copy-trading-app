@@ -191,6 +191,49 @@ export default function TradesPage() {
     return () => { if (reconcileTimer.current) clearTimeout(reconcileTimer.current); };
   }, []);
 
+  // Stale-status auto-reconcile. Symptom: place an order, broker fills it
+  // fast, we land on Order History before our DB caught up (or before SSE
+  // delivered the FILLED transition). The order row says "submitted" but
+  // a position for the same contract already exists in /api/positions.
+  // Fix: when we detect that pairing, schedule one sync-fills + refetch
+  // a couple of seconds out so the row catches up automatically. The
+  // effect's dependencies are positions and orders, so once the status
+  // updates to "filled" the matching `o.status !== "filled"` predicate
+  // stops firing and we don't re-trigger forever.
+  useEffect(() => {
+    if (loading) return;
+    if (positions.length === 0 || orders.length === 0) return;
+    const normStrike = (s: string | null) => {
+      if (s == null) return "";
+      const n = Number(s);
+      return Number.isFinite(n) ? String(n) : s;
+    };
+    const normExpiry = (s: string | null) => (s ?? "").slice(0, 10);
+    const heldKeys = new Set(
+      positions
+        .filter(p => Number(p.quantity) !== 0)
+        .map(p => p.instrument_type === "option"
+          ? `${p.broker_account_id}:OPT:${p.symbol.toUpperCase()}:${normExpiry(p.option_expiry)}:${normStrike(p.option_strike)}:${p.option_right ?? ""}`
+          : `${p.broker_account_id}:STK:${p.symbol.toUpperCase()}`),
+    );
+    const hasStale = orders.some(o => {
+      if (o.status === "filled" || o.status === "canceled" || o.status === "rejected") return false;
+      const k = o.instrument_type === "option"
+        ? `${o.broker_account_id ?? ""}:OPT:${o.symbol.toUpperCase()}:${normExpiry(o.option_expiry)}:${normStrike(o.option_strike)}:${o.option_right ?? ""}`
+        : `${o.broker_account_id ?? ""}:STK:${o.symbol.toUpperCase()}`;
+      return heldKeys.has(k);
+    });
+    if (!hasStale) return;
+    const t = setTimeout(async () => {
+      try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* ignore */ }
+      try {
+        const fresh = await api<Order[]>("/api/trades");
+        setOrders(fresh);
+      } catch { /* ignore */ }
+    }, 2000);
+    return () => clearTimeout(t);
+  }, [loading, orders, positions]);
+
   async function cancelOrder(id: string) {
     setActingFor({ id, kind: "cancel" });
     try {
@@ -418,7 +461,25 @@ export default function TradesPage() {
               const isOpen = OPEN_STATUSES.includes(o.status);
               const isFilled = o.status === "filled";
               const isMine = !o.parent_order_id;     // own order (not a mirror)
-              const canCancel = isOpen;
+              // Position-existence is authoritative: if a position for
+              // this contract is live, the order MUST have filled at
+              // the broker (no other way to acquire the position). When
+              // our DB still shows the order as "submitted/accepted"
+              // here, it's because fills_sync hasn't caught up yet
+              // (broker just filled it seconds ago). Treat the order
+              // as effectively filled for action purposes — hide the
+              // Cancel button so the trader can't fire a doomed cancel
+              // against an already-filled order. The actual status text
+              // will update on the next sync-fills tick.
+              const positionLive = heldKeys.has(posKey(
+                o.broker_account_id ?? "",
+                o.instrument_type,
+                o.symbol,
+                o.option_expiry,
+                o.option_strike,
+                o.option_right,
+              ));
+              const canCancel = isOpen && !positionLive;
               // No more Close buttons in Order History — close lives on the
               // Trade Panel's Open Positions table now.
               const canClose = false;
