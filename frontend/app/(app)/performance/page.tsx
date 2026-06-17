@@ -1048,7 +1048,7 @@ export default function PerformancePage() {
                 <th
                   key={h}
                   title={tip}
-                  className="text-left px-3 py-3 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
+                  className="text-left px-2 md:px-3 py-2 md:py-3 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
                   style={{
                     borderBottom: "1px solid var(--border)",
                     // Dotted underline + help cursor signals "hover me for an
@@ -1091,7 +1091,7 @@ export default function PerformancePage() {
                     className="cursor-pointer transition-colors hover:bg-white/5"
                     style={{ borderTop: "1px solid var(--border)" }}
                   >
-                    <td className="px-3 py-3 font-medium whitespace-nowrap">
+                    <td className="px-2 md:px-3 py-2 md:py-3 font-medium whitespace-nowrap">
                       <span className="inline-flex items-center gap-2">
                         <span
                           aria-hidden
@@ -1108,46 +1108,46 @@ export default function PerformancePage() {
                         {f.symbol}
                       </span>
                     </td>
-                    <td className="px-3 py-3">
+                    <td className="px-2 md:px-3 py-2 md:py-3">
                       <span style={{ color: f.side === "buy" ? "var(--good)" : "var(--bad)", fontWeight: 600 }}>
                         {f.side.toUpperCase()}
                       </span>
                     </td>
-                    <td className="px-3 py-3 tabular-nums">{fmtQty(f.quantity)}</td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtQty(f.quantity)}</td>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.trader_submitted_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.broker_accepted_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.socket_received_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.detected_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.redis_published_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: "var(--muted)" }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.fanout_completed_at)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.api_to_broker_lag_ms) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: colorFor(f.api_to_broker_lag_ms) }}>
                       {fmtMs(f.api_to_broker_lag_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.publish_lag_ms) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: colorFor(f.publish_lag_ms) }}>
                       {fmtMs(f.publish_lag_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.detection_lag_ms) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: colorFor(f.detection_lag_ms) }}>
                       {fmtMs(f.detection_lag_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.fanout_duration_ms) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: colorFor(f.fanout_duration_ms) }}>
                       {fmtMs(f.fanout_duration_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: colorFor(f.total_ms) }}>
                       {fmtMs(f.total_ms)}
                     </td>
-                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.min) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.min) }}>
                       {fmtMs(blStats.min)}
                       {blStats.minBroker && (
                         <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
@@ -1155,7 +1155,7 @@ export default function PerformancePage() {
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.avg) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.avg) }}>
                       {fmtMs(blStats.avg)}
                       {blStats.avgBroker && (
                         <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
@@ -1163,7 +1163,7 @@ export default function PerformancePage() {
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.max) }}>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: colorFor(blStats.max) }}>
                       {fmtMs(blStats.max)}
                       {blStats.maxBroker && (
                         <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>
@@ -1171,7 +1171,7 @@ export default function PerformancePage() {
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-3">
+                    <td className="px-2 md:px-3 py-2 md:py-3">
                       <SubscriberPill counts={f.subscribers} />
                     </td>
                   </tr>

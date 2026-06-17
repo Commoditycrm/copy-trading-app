@@ -18,9 +18,15 @@ export default function LoginPage() {
     e.preventDefault();
     setLoading(true);
     try {
+      // Emails are treated as case-insensitive identifiers — normalize
+      // here so "User@Example.com" matches the stored "user@example.com".
+      // toLowerCase is also applied on every keystroke below, so this
+      // is a belt-and-braces safety net (and the trim catches stray
+      // whitespace from paste).
+      const normalizedEmail = email.trim().toLowerCase();
       const res = await api<{ access_token: string; refresh_token: string }>(
         "/api/auth/login",
-        { method: "POST", body: JSON.stringify({ email, password }), auth: false }
+        { method: "POST", body: JSON.stringify({ email: normalizedEmail, password }), auth: false }
       );
       setTokens(res.access_token, res.refresh_token);
       // Root page handles role-aware landing (trader → /trade-panel, subscriber → /trades).
@@ -50,7 +56,15 @@ export default function LoginPage() {
             <input
               className="w-full p-2.5"
               type="email" autoComplete="email" placeholder="you@example.com"
-              value={email} onChange={(e) => setEmail(e.target.value)} required
+              // Emails are case-insensitive — store and display the
+              // lowercase form so what the user sees is what we send,
+              // and they can't end up with a "User@" stored on the
+              // server that won't match a "user@" sign-in.
+              value={email} onChange={(e) => setEmail(e.target.value.toLowerCase())} required
+              inputMode="email"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
             />
           </div>
           <div>

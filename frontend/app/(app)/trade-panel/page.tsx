@@ -527,8 +527,10 @@ export default function TradePanelPage() {
 
   return (
     <div className="space-y-4">
-      {/* ── Top row: ticket + watchlist placeholder, side-by-side ─────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
+      {/* ── Top row: ticket + watchlist placeholder. Side-by-side on
+          lg+; stacks (ticket first) on phones / tablets where 50% of
+          the row would crush the form. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 lg:gap-5 items-stretch">
 
         {/* ────────────── TRADE TICKET ────────────── */}
         <form

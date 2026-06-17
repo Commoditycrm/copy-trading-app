@@ -504,8 +504,8 @@ export default function BrokersPage() {
   return (
     <div className="space-y-6 max-w-[760px]">
       <div>
-        <h1 className="text-2xl font-semibold">Broker connections</h1>
-        <p className="text-sm mt-1.5" style={{ color: "var(--muted)" }}>
+        <h1 className="text-xl md:text-2xl font-semibold">Broker connections</h1>
+        <p className="text-xs md:text-sm mt-1.5" style={{ color: "var(--muted)" }}>
           One broker per account — connecting a new one replaces the previous.
           Keys and passwords are encrypted at rest with Fernet (AES-128) and
           never leave the server.
@@ -555,8 +555,10 @@ export default function BrokersPage() {
               </button>
             </div>
 
-            {/* Balance row */}
-            <div className="mt-5 pt-4 hairline grid grid-cols-3 gap-4">
+            {/* Balance row — 3-up on tablet/desktop; stacks (or wraps to
+                2-up via flex-wrap) on phones so $X,XXX.XX values don't
+                get cramped at 80px column width. */}
+            <div className="mt-5 pt-4 hairline grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4">
               <Stat label="Cash" value={fmtMoney(a.cash, a.currency)} />
               <Stat label="Buying power" value={fmtMoney(a.buying_power, a.currency)} />
               <Stat label="Total equity" value={fmtMoney(a.total_equity, a.currency)} />

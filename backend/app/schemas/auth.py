@@ -1,8 +1,20 @@
 import uuid
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.models.user import UserRole
+
+
+def _normalize_email(v: object) -> object:
+    """Strip whitespace and lowercase the email so user identity is
+    case-insensitive end-to-end. Runs in pydantic's ``before`` phase so
+    EmailStr's format validation sees the already-normalized form, and
+    the User.email lookup in app/api/auth.py (case-sensitive equality)
+    matches what we stored at registration regardless of how the user
+    typed their email at sign-in time."""
+    if isinstance(v, str):
+        return v.strip().lower()
+    return v
 
 
 class RegisterIn(BaseModel):
@@ -14,6 +26,8 @@ class RegisterIn(BaseModel):
     # the trader and every subscriber who follows them. Ignored for
     # subscribers (they inherit the brand from the trader they follow).
     business_name: str | None = Field(default=None, max_length=120)
+
+    _norm_email = field_validator("email", mode="before")(_normalize_email)
 
     @model_validator(mode="after")
     def _require_business_name_for_trader(self) -> "RegisterIn":
@@ -31,6 +45,8 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+
+    _norm_email = field_validator("email", mode="before")(_normalize_email)
 
 
 class TokenPair(BaseModel):

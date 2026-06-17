@@ -318,7 +318,7 @@ export default function TradesPage() {
           >
             <tr>
               {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Actions", "Expected price", "Filled price", "TP", "SL", "Notional", "Status", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
-                <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
+                <th key={h} className="text-left px-3 md:px-5 py-2 md:py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
               ))}
             </tr>
           </thead>
@@ -432,20 +432,20 @@ export default function TradesPage() {
                     }}
                   >
                     {/* Symbol — ticker only */}
-                    <td className="px-5 py-3 font-medium">{o.symbol}</td>
+                    <td className="px-3 md:px-5 py-2 md:py-3 font-medium">{o.symbol}</td>
                     {/* Expiry Date — absolute date for options, "—" for stocks. */}
-                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: o.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
+                    <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: o.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
                       {o.option_expiry ? fmtDate(o.option_expiry) : "—"}
                     </td>
 
-                    <td className="px-5 py-3 capitalize">{o.instrument_type}</td>
-                    <td className="px-5 py-3 uppercase font-medium" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
-                    <td className="px-5 py-3 num">{fmt(o.quantity, 0)}</td>
+                    <td className="px-3 md:px-5 py-2 md:py-3 capitalize">{o.instrument_type}</td>
+                    <td className="px-3 md:px-5 py-2 md:py-3 uppercase font-medium" style={{ color: o.side === "buy" ? "var(--good)" : "var(--bad)" }}>{o.side}</td>
+                    <td className="px-3 md:px-5 py-2 md:py-3 num">{fmt(o.quantity, 0)}</td>
 
                     {/* Actions — inline, no expand step.
                         Open orders → [Cancel].
                         Filled own orders (trader) → [Close at Market] [limit input] [Close at Limit]. */}
-                    <td className="px-5 py-3">
+                    <td className="px-3 md:px-5 py-2 md:py-3">
                       <div className="flex gap-2 items-center whitespace-nowrap">
                         {canCancel && (
                           <button
@@ -509,38 +509,50 @@ export default function TradesPage() {
                     </td>
 
                     {/* Expected price — what the user asked for (limit/stop) */}
-                    <td className="px-5 py-3 num">{fmt(expectedPrice(o), 2)}</td>
+                    <td className="px-3 md:px-5 py-2 md:py-3 num">{fmt(expectedPrice(o), 2)}</td>
                     {/* Filled price — actual avg execution price */}
-                    <td className="px-5 py-3 num">{fmt(o.filled_avg_price, 2)}</td>
-                    {/* TP / SL — show the bracket prices the trader set. Editable
-                        only on entry rows whose status is still open (pre-fill);
-                        filled orders that survive here are ones whose position
-                        already closed, so brackets are immutable. Bracket-exit
-                        legs (TP/SL closes themselves) never expose an editor. */}
+                    <td className="px-3 md:px-5 py-2 md:py-3 num">{fmt(o.filled_avg_price, 2)}</td>
+                    {/* TP / SL — shown as a percent of the entry-side price.
+                        Editable only on entry rows whose status is still open
+                        (pre-fill); filled orders that survive here belong to
+                        positions that already closed, so brackets are immutable.
+                        Bracket-exit legs (TP/SL closes themselves) never expose
+                        an editor.
+
+                        Reference price for the % display: prefer the filled
+                        average (the real entry), fall back to limit_price for
+                        open-but-unfilled limit orders. A market order with no
+                        fill yet has no anchor — the cell quietly drops to
+                        absolute-price display in that case. */}
                     {(() => {
                       const isEntry = !o.bracket_parent_id;
                       const editable = isEntry && OPEN_STATUSES.includes(o.status);
+                      const entryPrice = o.filled_avg_price ?? o.limit_price;
                       const onUpdated = (updated: Order) =>
                         setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
                       return (
                         <>
-                          <td className="px-5 py-3 num">
+                          <td className="px-3 md:px-5 py-2 md:py-3 num">
                             {isEntry ? (
                               <InlineBracketCell
                                 orderId={o.id}
                                 leg="tp"
                                 value={o.take_profit_price}
+                                entryPrice={entryPrice}
+                                side={o.side}
                                 canEdit={editable}
                                 onUpdated={onUpdated}
                               />
                             ) : <span style={{ color: "var(--faint)" }}>—</span>}
                           </td>
-                          <td className="px-5 py-3 num">
+                          <td className="px-3 md:px-5 py-2 md:py-3 num">
                             {isEntry ? (
                               <InlineBracketCell
                                 orderId={o.id}
                                 leg="sl"
                                 value={o.stop_loss_price}
+                                entryPrice={entryPrice}
+                                side={o.side}
                                 canEdit={editable}
                                 onUpdated={onUpdated}
                               />
@@ -550,13 +562,13 @@ export default function TradesPage() {
                       );
                     })()}
                     {/* Notional — qty × price (× 100 for options) */}
-                    <td className="px-5 py-3 num">
+                    <td className="px-3 md:px-5 py-2 md:py-3 num">
                       {notionalFor(o)
                         ? fmt(String(notionalFor(o)))
                         : <span style={{ color: "var(--faint)" }}>—</span>}
                     </td>
                     {/* Status — color-coded pill */}
-                    <td className="px-5 py-3">
+                    <td className="px-3 md:px-5 py-2 md:py-3">
                       <span
                         className="text-[11px] uppercase tracking-wider px-2 py-[4px] rounded whitespace-nowrap font-medium"
                         style={{
@@ -579,7 +591,7 @@ export default function TradesPage() {
                     </td>
                     {/* Submitted at — fallback to created_at for orders that
                         never reached the broker (rejected pre-submit) */}
-                    <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                    <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                       {fmtDateTimeMs(o.submitted_at ?? o.created_at, "America/New_York")}
                     </td>
                     {/* Filled at — latest fill timestamp, or closed_at as fallback
@@ -592,10 +604,10 @@ export default function TradesPage() {
                       const submittedTs = o.submitted_at ?? o.created_at;
                       return (
                         <>
-                          <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                          <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                             {fillTs ? fmtDateTimeMs(fillTs, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                           </td>
-                          <td className="px-5 py-3 whitespace-nowrap num" style={{ color: fillTs ? "var(--text-2)" : "var(--faint)" }}>
+                          <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap num" style={{ color: fillTs ? "var(--text-2)" : "var(--faint)" }}>
                             {fillTs ? fmtDuration(submittedTs, fillTs) : "—"}
                           </td>
                         </>
@@ -606,7 +618,7 @@ export default function TradesPage() {
                     {(() => {
                       const exp = o.instrument_type === "option" ? fmtExpiresIn(o.option_expiry) : null;
                       return (
-                        <td className="px-5 py-3 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
+                        <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
                           {exp ? exp.text : "—"}
                         </td>
                       );
