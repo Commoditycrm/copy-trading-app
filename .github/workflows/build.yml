@@ -1,0 +1,96 @@
+name: Build
+
+# Build/validation pipeline — runs on EVERY branch push and on PRs into the
+# deploy branches. Unlike deploy.yml (main) and deploy-testing.yml (qa-branch),
+# this does NOT deploy: it just proves the backend and frontend build, so any
+# branch (e.g. security-updates) gets a green/red check on its commits before
+# it's ever merged into a deploy branch.
+
+on:
+  push:
+    # Build every branch EXCEPT the deploy branches — main and qa-branch
+    # already build as part of their own deploy workflows, so building them
+    # here too would be redundant.
+    branches-ignore: [main, qa-branch]
+  # Still validate PRs targeting the deploy branches: this builds the PR's
+  # changes before they reach main/qa-branch, without building those
+  # branches themselves on push.
+  pull_request:
+    branches: [main, qa-branch]
+
+# Cancel an in-progress run when new commits land on the same ref.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (install + compile + import)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    # Dummy values so `import app.main` (which builds Settings at module load)
+    # succeeds. Nothing connects to a DB/Redis at import time, so placeholders
+    # are enough — no real secrets needed for a build check.
+    env:
+      DATABASE_URL: postgresql+psycopg://ci:ci@localhost:5432/ci
+      JWT_SECRET: ci-dummy-jwt-secret
+      CREDENTIAL_ENCRYPTION_KEY: ci-dummy-fernet-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # matches backend/Dockerfile (python:3.11-slim)
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile-check all sources
+        run: python -m compileall -q app
+
+      - name: Import smoke test (FastAPI app loads)
+        run: python -c "import app.main; print('app imported OK')"
+
+      - name: Alembic single-head check
+        run: |
+          heads="$(python -m alembic heads 2>/dev/null | grep -c '(head)')"
+          echo "alembic heads: $heads"
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::Expected exactly 1 alembic head, found $heads — 'alembic upgrade head' will fail at deploy."
+            python -m alembic heads
+            exit 1
+          fi
+
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
