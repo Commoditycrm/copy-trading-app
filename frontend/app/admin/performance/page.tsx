@@ -219,7 +219,7 @@ export default function AdminPerformancePage() {
             { label: "Avg fanout time",  value: data.metrics.avg_fanout_ms != null ? `${data.metrics.avg_fanout_ms.toLocaleString()}ms` : "—" },
             { label: "Slowest fanout",   value: data.metrics.max_fanout_ms != null ? `${data.metrics.max_fanout_ms.toLocaleString()}ms` : "—" },
           ].map(({ label, value }) => (
-            <div key={label} className="rounded-xl p-4" style={{ background: "rgba(14,20,17,0.6)", border: "1px solid var(--border)" }}>
+            <div key={label} className="rounded-xl p-4" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
               <div className="text-xs uppercase tracking-widest mb-1" style={{ color: "var(--muted)" }}>{label}</div>
               <div className="text-2xl font-bold">{value}</div>
             </div>
@@ -231,7 +231,7 @@ export default function AdminPerformancePage() {
       {loading ? (
         <div style={{ color: "var(--muted)" }}>Loading performance data…</div>
       ) : !data || data.fanouts.length === 0 ? (
-        <div className="rounded-xl p-8 text-center" style={{ background: "rgba(14,20,17,0.5)", border: "1px solid var(--border)", color: "var(--muted)" }}>
+        <div className="rounded-xl p-8 text-center" style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--muted)" }}>
           No fanout data yet. A trade must be placed and fanned out to subscribers first.
         </div>
       ) : (

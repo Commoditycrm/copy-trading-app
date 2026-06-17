@@ -146,7 +146,7 @@ export default function AdminApiPage() {
             className="flex-1 inline-flex items-center rounded-lg border overflow-hidden transition-colors focus-within:border-[var(--accent)]"
             style={{
               borderColor: "var(--border)",
-              background: "rgba(0,0,0,0.25)",
+              background: "var(--bg-tint)",
             }}
           >
             <span
@@ -175,7 +175,7 @@ export default function AdminApiPage() {
             disabled={saving || !changed}
             onClick={() => save(inputNum)}
             className="px-4 py-2 text-xs rounded-lg font-semibold transition-all disabled:opacity-30 disabled:cursor-not-allowed hover:enabled:scale-[1.03] active:enabled:scale-[0.97]"
-            style={{ background: "var(--accent)", color: "#06121f" }}
+            style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
           >
             Save
           </button>
@@ -184,7 +184,7 @@ export default function AdminApiPage() {
             onClick={() => save(null)}
             className="px-4 py-2 text-xs rounded-lg font-semibold transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             style={{
-              background: "rgba(255,255,255,0.05)",
+              background: "var(--panel-2)",
               color: "var(--text-2)",
               border: "1px solid var(--border)",
             }}
@@ -227,7 +227,7 @@ function Stat({ label, value, color }: { label: string; value: string; color?: s
   return (
     <div
       className="rounded-lg px-3 py-2.5"
-      style={{ background: "rgba(0,0,0,0.2)", border: "1px solid var(--border)" }}
+      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
     >
       <div className="text-[9px] uppercase tracking-widest font-medium" style={{ color: "var(--muted)" }}>
         {label}

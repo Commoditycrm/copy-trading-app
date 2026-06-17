@@ -5,6 +5,7 @@ import Link from "next/link";
 import { forgotPassword } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { AuthCard } from "@/components/auth/AuthCard";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
@@ -27,66 +28,55 @@ export default function ForgotPasswordPage() {
   }
 
   return (
-    <main className="min-h-screen grid place-items-center p-6">
-      <div className="card w-full max-w-md p-8 space-y-5">
-        <div className="text-center">
-          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>
-            Reset password
-          </div>
+    <AuthCard
+      title="Reset password"
+      subtitle={sent ? undefined : "We'll email you a link to choose a new password"}
+    >
+      {sent ? (
+        <div className="space-y-5">
+          <p className="text-sm text-center" style={{ color: "var(--muted)" }}>
+            If an account exists for <strong>{email}</strong>, we&rsquo;ve sent a
+            reset link. Check your inbox (and spam) and follow the link to choose
+            a new password.
+          </p>
+          <Link
+            href="/login"
+            className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center"
+          >
+            Back to sign in
+          </Link>
         </div>
-
-        {sent ? (
-          <div className="space-y-5">
-            <p className="text-sm text-center" style={{ color: "var(--muted)" }}>
-              If an account exists for <strong>{email}</strong>, we&rsquo;ve sent a
-              reset link. Check your inbox (and spam) and follow the link to choose
-              a new password.
-            </p>
-            <Link
-              href="/login"
-              className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center"
-            >
-              Back to sign in
+      ) : (
+        <form onSubmit={submit} className="space-y-5">
+          <div>
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+              Email
+            </label>
+            <input
+              className="w-full p-2.5"
+              type="email"
+              autoComplete="email"
+              placeholder="you@example.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+            />
+          </div>
+          <button
+            disabled={loading}
+            className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center gap-2"
+          >
+            <span>Send reset link</span>
+            {loading && <Spinner />}
+          </button>
+          <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
+            Remembered it?{" "}
+            <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
+              Sign in
             </Link>
           </div>
-        ) : (
-          <form onSubmit={submit} className="space-y-5">
-            <p className="text-sm text-center" style={{ color: "var(--muted)" }}>
-              Enter your email and we&rsquo;ll send you a link to reset your password.
-            </p>
-            <div>
-              <label
-                className="text-[11px] uppercase tracking-wider mb-1 block"
-                style={{ color: "var(--muted)" }}
-              >
-                Email
-              </label>
-              <input
-                className="w-full p-2.5"
-                type="email"
-                autoComplete="email"
-                placeholder="you@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-              />
-            </div>
-            <button
-              disabled={loading}
-              className="btn-primary w-full py-2.5 text-sm inline-flex items-center justify-center gap-2"
-            >
-              <span>Send reset link</span>
-              {loading && <Spinner />}
-            </button>
-            <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
-              Remembered it?{" "}
-              <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
-                Sign in
-              </Link>
-            </div>
-          </form>
-        )}
-      </div>
-    </main>
+        </form>
+      )}
+    </AuthCard>
   );
 }

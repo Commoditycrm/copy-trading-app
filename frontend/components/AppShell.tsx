@@ -9,6 +9,19 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { ChevronsLeft, ChevronsRight } from "lucide-react";
+
+function IconGrid() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  );
+}
 
 function IconBell() {
   return (
@@ -116,6 +129,7 @@ function IconSettings() {
 }
 
 const NAV_TRADER = [
+  { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
@@ -125,6 +139,7 @@ const NAV_TRADER = [
   { href: "/brokers", label: "Broker", Icon: IconLink },
 ];
 const NAV_SUBSCRIBER = [
+  { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
@@ -496,40 +511,36 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {mobileOpen && (
         <div
           className="fixed inset-0 z-40 lg:hidden animate-fade-in"
-          style={{ background: "rgba(0,0,0,0.55)", backdropFilter: "blur(2px)" }}
+          style={{ background: "var(--overlay)", backdropFilter: "blur(2px)" }}
           onClick={() => setMobileOpen(false)}
           aria-hidden
         />
       )}
 
-      {/* Desktop collapse hinge — sits on the sidebar's right edge. Hidden on
-          mobile (the drawer + hamburger handle navigation there). */}
+      {/* Desktop collapse hinge — floats on the sidebar's right edge near the
+          top (half over the bar). Hidden on mobile (drawer + hamburger). */}
       <button
         type="button"
         onClick={() => setCollapsed(c => !c)}
         title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="absolute hidden lg:grid place-items-center transition-[left] duration-200 focus-ring"
+        className="absolute hidden lg:grid place-items-center transition-[left,transform] duration-200 focus-ring hover:scale-110"
         style={{
-          top: 26,
-          left: SIDEBAR_W - 11,
-          width: 22,
+          top: 24,
+          left: SIDEBAR_W - 14,
+          width: 28,
           height: 28,
-          zIndex: 50,
-          borderRadius: 6,
-          border: "1px solid var(--border)",
+          zIndex: 60,
+          borderRadius: 9999,
+          border: "1px solid var(--border-strong)",
           background: "var(--accent)",
           color: "var(--accent-ink)",
-          boxShadow: "0 4px 12px -4px rgba(0,0,0,0.4)",
+          boxShadow: "var(--shadow-card)",
         }}
       >
-        <svg
-          width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-          strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden
-          style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
-        >
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
+        {collapsed
+          ? <ChevronsRight size={16} strokeWidth={2.5} />
+          : <ChevronsLeft size={16} strokeWidth={2.5} />}
       </button>
 
       {/* ── Sidebar — static column on desktop, slide-in drawer on mobile ── */}
@@ -537,7 +548,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         className={`flex flex-col h-full shrink-0 z-50 fixed inset-y-0 left-0 lg:static transition-[transform,width] duration-200 ${mobileOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}
         style={{
           width: SIDEBAR_W,
-          background: "linear-gradient(180deg, rgba(14,20,17,0.92) 0%, rgba(7,9,10,0.88) 100%)",
+          background: "var(--sidebar-bg)",
           borderRight: "1px solid var(--border)",
           backdropFilter: "blur(8px)",
         }}
@@ -588,9 +599,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 aria-current={active ? "page" : undefined}
                 className={`flex items-center gap-2.5 ${navCollapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline focus-ring`}
                 style={{
-                  background: active
-                    ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
-                    : "transparent",
+                  background: active ? "var(--nav-active-bg)" : "transparent",
                   color: active ? "var(--accent)" : "var(--text-2)",
                   fontWeight: active ? 600 : 500,
                   border: active ? "1px solid rgba(10,115,168,0.30)" : "1px solid transparent",
@@ -648,10 +657,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <header
           className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 shrink-0 mx-3 sm:mx-4 mt-3 rounded-xl"
           style={{
-            background: "linear-gradient(180deg, rgba(14,20,17,0.75) 0%, rgba(7,9,10,0.5) 100%)",
+            background: "var(--header-bg)",
             border: "1px solid var(--border)",
             backdropFilter: "blur(10px)",
-            boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
+            boxShadow: "var(--shadow-card)",
           }}
         >
           {/* Left: hamburger (mobile only) + listener/SSE status pills. */}
@@ -670,8 +679,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
             </div>
           </div>
-          {/* Right: bell + who's signed in + role chip. */}
+          {/* Right: theme toggle + bell + who's signed in + role chip. */}
           <div className="flex items-center gap-2 sm:gap-3">
+            <ThemeToggle />
             <button
               type="button"
               onClick={() => router.push("/notifications")}
@@ -680,7 +690,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               className="relative grid place-items-center rounded-full transition-colors focus-ring"
               style={{
                 width: 32, height: 32,
-                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
+                background: "var(--chip-bg)",
                 border: "1px solid var(--border)",
                 color: unreadCount > 0 ? "var(--accent)" : "var(--text-2)",
               }}
@@ -703,7 +713,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               className="grid place-items-center rounded-full shrink-0"
               style={{
                 width: 32, height: 32,
-                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
+                background: "var(--chip-bg)",
                 border: "1px solid var(--border)",
                 color: "var(--accent)", fontWeight: 700, fontSize: 14,
               }}

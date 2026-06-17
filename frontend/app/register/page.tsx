@@ -7,6 +7,7 @@ import { api, getAccessToken, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
+import { AuthCard } from "@/components/auth/AuthCard";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -65,13 +66,39 @@ export default function RegisterPage() {
     }
   }
 
-  return (
-    <main className="min-h-screen grid place-items-center p-6">
-      <form onSubmit={submit} className="card w-full max-w-md p-8 space-y-5">
-        <div className="text-center">
-          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>Sign Up</div>
-        </div>
+  const roleBtn = (value: Role, label: string) => {
+    const active = role === value;
+    return (
+      <button
+        type="button"
+        onClick={() => setRole(value)}
+        className="p-2.5 rounded-full text-sm transition-colors focus-ring"
+        style={{
+          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+          background: active ? "var(--nav-active-bg)" : "transparent",
+          color: active ? "var(--accent)" : "var(--text-2)",
+          fontWeight: active ? 600 : 500,
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
 
+  return (
+    <AuthCard
+      title="Create your account"
+      subtitle="Start copying or sharing trades in minutes"
+      footer={
+        <>
+          Have an account?{" "}
+          <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={submit} className="space-y-5">
         <div className="space-y-3">
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email</label>
@@ -97,24 +124,8 @@ export default function RegisterPage() {
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-2 block" style={{ color: "var(--muted)" }}>I am a</label>
             <div className="grid grid-cols-2 gap-2">
-              <button type="button" onClick={() => setRole("subscriber")}
-                className="p-2.5 rounded-full text-sm transition-colors"
-                style={{
-                  border: `1px solid ${role === "subscriber" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "subscriber" ? "rgba(10,115,168,0.12)" : "transparent",
-                  color: role === "subscriber" ? "var(--accent)" : "var(--text-2)",
-                  fontWeight: role === "subscriber" ? 600 : 500,
-                }}
-              >Subscriber</button>
-              <button type="button" onClick={() => setRole("trader")}
-                className="p-2.5 rounded-full text-sm transition-colors"
-                style={{
-                  border: `1px solid ${role === "trader" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "trader" ? "rgba(10,115,168,0.12)" : "transparent",
-                  color: role === "trader" ? "var(--accent)" : "var(--text-2)",
-                  fontWeight: role === "trader" ? 600 : 500,
-                }}
-              >Trader</button>
+              {roleBtn("subscriber", "Subscriber")}
+              {roleBtn("trader", "Trader")}
             </div>
           </div>
           {/* Trader-only: business / brand name. Required server-side too
@@ -146,11 +157,7 @@ export default function RegisterPage() {
           <span>Create account</span>
           {loading && <Spinner />}
         </button>
-
-        <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
-          Have an account? <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>Sign in</Link>
-        </div>
       </form>
-    </main>
+    </AuthCard>
   );
 }
