@@ -7,16 +7,13 @@ name: Build
 # it's ever merged into a deploy branch.
 
 on:
+  # Build every branch EXCEPT the deploy branches — main and qa-branch
+  # already build as part of their own deploy workflows, so building them
+  # here too would be redundant. The push check also surfaces on any PR
+  # opened from these branches (GitHub shows the head commit's checks),
+  # so a separate pull_request trigger would only duplicate the run.
   push:
-    # Build every branch EXCEPT the deploy branches — main and qa-branch
-    # already build as part of their own deploy workflows, so building them
-    # here too would be redundant.
     branches-ignore: [main, qa-branch]
-  # Still validate PRs targeting the deploy branches: this builds the PR's
-  # changes before they reach main/qa-branch, without building those
-  # branches themselves on push.
-  pull_request:
-    branches: [main, qa-branch]
 
 # Cancel an in-progress run when new commits land on the same ref.
 concurrency:
