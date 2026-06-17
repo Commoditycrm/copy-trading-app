@@ -1,9 +1,9 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { api, setTokens } from "@/lib/api";
+import { api, getAccessToken, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
@@ -13,6 +13,13 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Already signed in? Don't show the form — bounce to the root, which
+  // role-routes to the right landing page. Guards against an authenticated
+  // user landing back on /login via the URL, back button, or a stale link.
+  useEffect(() => {
+    if (getAccessToken()) router.replace("/");
+  }, [router]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();

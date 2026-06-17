@@ -43,8 +43,12 @@ async function tryRefresh(): Promise<boolean> {
   refreshInFlight = (async () => {
     try {
       const r = await fetch(
-        `/api/auth/refresh?refresh_token=${encodeURIComponent(refresh)}`,
-        { method: "POST" }
+        `/api/auth/refresh`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: refresh }),
+        }
       );
       if (!r.ok) { clearTokens(); return false; }
       const data = await r.json() as { access_token: string; refresh_token: string };
