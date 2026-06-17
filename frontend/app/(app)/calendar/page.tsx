@@ -112,12 +112,26 @@ export default function CalendarPage() {
   // inline loader at the bottom.
   if (!firstLoadDone) return <PageLoading />;
 
+  // Short month label for the mobile header — "Jun '26" instead of
+  // "June 2026" so the row fits inside a 320-360px phone.
+  const monthLabelShort = `${cursor.toLocaleString(undefined, { month: "short" })} '${String(cursor.getFullYear()).slice(-2)}`;
+  const monthLabelLong = cursor.toLocaleString(undefined, { month: "long", year: "numeric" });
+  // Compact dollar formatter for cells on phones (40-50px wide). We
+  // round to the dollar and use $1.2K / $-235 style so 5+ digit P&Ls
+  // don't overflow the cell. Desktop keeps full currency formatting.
+  const fmtCompact = (n: number) => {
+    const abs = Math.abs(n);
+    const sign = n < 0 ? "-" : "";
+    if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(1)}K`;
+    return `${sign}$${Math.round(abs)}`;
+  };
+
   return (
-    <div className="space-y-4 max-w-5xl">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold">{viewingLabel}</h1>
-          <p className="text-sm" style={{ color: "var(--muted)" }}>
+    <div className="space-y-3 md:space-y-4 max-w-5xl">
+      <div className="flex items-start md:items-center justify-between flex-wrap gap-2 md:gap-3">
+        <div className="min-w-0">
+          <h1 className="text-lg md:text-2xl font-semibold truncate">{viewingLabel}</h1>
+          <p className="text-xs md:text-sm" style={{ color: "var(--muted)" }}>
             Realized P&amp;L from broker fills.
             {syncing && <span className="ml-2">Syncing…</span>}
             {syncMsg && <span className="ml-2" style={{ color: "var(--accent)" }}>{syncMsg}</span>}
@@ -125,7 +139,7 @@ export default function CalendarPage() {
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {user?.role === "trader" && (
-            <div className="min-w-[220px]">
+            <div className="w-full sm:w-auto sm:min-w-[220px]">
               <SearchableSelect
                 value={viewingUserId ?? ""}
                 onChange={(v) => setViewingUserId(v || null)}
@@ -147,8 +161,9 @@ export default function CalendarPage() {
           >
             ‹
           </button>
-          <div className="min-w-[10rem] text-center font-medium">
-            {cursor.toLocaleString(undefined, { month: "long", year: "numeric" })}
+          <div className="text-center font-medium px-1 min-w-[5rem] md:min-w-[10rem]">
+            <span className="md:hidden">{monthLabelShort}</span>
+            <span className="hidden md:inline">{monthLabelLong}</span>
           </div>
           <button
             onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))}
@@ -159,19 +174,34 @@ export default function CalendarPage() {
         </div>
       </div>
 
-      <div className="text-sm">
+      <div className="text-xs md:text-sm">
         <span style={{ color: "var(--muted)" }}>Month total: </span>
         <span style={{ color: monthTotal >= 0 ? "var(--good)" : "var(--bad)" }}>
           {monthTotal.toLocaleString(undefined, { style: "currency", currency: "USD" })}
         </span>
       </div>
 
-      <div className="grid grid-cols-7 gap-1 text-xs" style={{ color: "var(--muted)" }}>
-        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => <div key={d} className="px-2 py-1">{d}</div>)}
+      {/* Day-of-week headers — single letter on mobile so the row doesn't
+          overflow the 320-360px phone width. Full names on tablet+. */}
+      <div className="grid grid-cols-7 gap-1 text-[10px] md:text-xs" style={{ color: "var(--muted)" }}>
+        {[
+          { full: "Sun", short: "S" },
+          { full: "Mon", short: "M" },
+          { full: "Tue", short: "T" },
+          { full: "Wed", short: "W" },
+          { full: "Thu", short: "T" },
+          { full: "Fri", short: "F" },
+          { full: "Sat", short: "S" },
+        ].map(d => (
+          <div key={d.full} className="px-1 md:px-2 py-1 text-center md:text-left">
+            <span className="md:hidden">{d.short}</span>
+            <span className="hidden md:inline">{d.full}</span>
+          </div>
+        ))}
       </div>
       <div className="grid grid-cols-7 gap-1">
         {cells.map((d, i) => {
-          if (!d) return <div key={i} className="h-24" />;
+          if (!d) return <div key={i} className="h-16 md:h-24" />;
           const key = iso(d);
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
@@ -188,20 +218,32 @@ export default function CalendarPage() {
               onClick={onClick}
               disabled={!has}
               title={has ? `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}` : undefined}
-              className="h-24 p-2 rounded border flex flex-col text-left transition-colors"
+              className="h-16 md:h-24 p-1 md:p-2 rounded border flex flex-col text-left transition-colors"
               style={{
                 borderColor: "var(--border)",
                 background: has ? (pnl >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)") : "var(--panel)",
                 cursor: has ? "pointer" : "default",
               }}
             >
-              <div className="text-xs" style={{ color: "var(--muted)" }}>{d.getDate()}</div>
+              <div className="text-[10px] md:text-xs" style={{ color: "var(--muted)" }}>{d.getDate()}</div>
               {has && (
                 <>
-                  <div className="mt-auto font-medium" style={{ color: pnl >= 0 ? "var(--good)" : "var(--bad)" }}>
-                    {pnl.toLocaleString(undefined, { style: "currency", currency: "USD" })}
+                  <div
+                    className="mt-auto font-medium tabular-nums leading-tight text-[10px] md:text-sm"
+                    style={{ color: pnl >= 0 ? "var(--good)" : "var(--bad)" }}
+                  >
+                    {/* Compact dollar on phones (cell is ~45px wide);
+                        full currency on tablet+. */}
+                    <span className="md:hidden">{fmtCompact(pnl)}</span>
+                    <span className="hidden md:inline">
+                      {pnl.toLocaleString(undefined, { style: "currency", currency: "USD" })}
+                    </span>
                   </div>
-                  <div className="text-xs" style={{ color: "var(--muted)" }}>{day.trade_count} trade{day.trade_count === 1 ? "" : "s"}</div>
+                  {/* Trade count is informative but optional — drop it on
+                      phones so the cell stays uncluttered. */}
+                  <div className="hidden md:block text-xs" style={{ color: "var(--muted)" }}>
+                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
+                  </div>
                 </>
               )}
             </button>

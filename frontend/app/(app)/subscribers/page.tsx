@@ -94,13 +94,13 @@ export default function SubscribersPage() {
     if (selected.size === 0) return null;
     return (
       <div
-        className="flex items-center justify-between px-3 py-2 rounded border"
+        className="flex items-center justify-between px-3 py-2 rounded border flex-wrap gap-2"
         style={{ borderColor: "var(--border)", background: "var(--panel)" }}
       >
         <div className="text-sm">
           <strong>{selected.size}</strong> selected
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           <button
             onClick={() => setSelected(new Set())}
             className="px-3 py-1 text-sm rounded border"
@@ -141,7 +141,7 @@ export default function SubscribersPage() {
             People copying your trades.
           </p>
         </div>
-        <div className="inline-flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-4 flex-wrap">
           <CountStat label="Total" value={total} loading={loading} />
           <Divider />
           <CountStat label="Copy ON" value={active} loading={loading} color="var(--good)" />

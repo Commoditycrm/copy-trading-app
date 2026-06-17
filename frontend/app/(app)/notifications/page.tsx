@@ -89,10 +89,10 @@ export default function NotificationsPage() {
 
   return (
     <div className="flex flex-col h-full max-w-4xl space-y-4">
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Notifications</h1>
-          <p className="text-sm" style={{ color: "var(--muted)" }}>
+      <div className="flex items-start justify-between gap-2 flex-wrap">
+        <div className="min-w-0">
+          <h1 className="text-lg md:text-2xl font-semibold">Notifications</h1>
+          <p className="text-xs md:text-sm" style={{ color: "var(--muted)" }}>
             {unreadCount > 0
               ? `${unreadCount} unread`
               : "All caught up."}
@@ -103,7 +103,7 @@ export default function NotificationsPage() {
           <button
             onClick={markAllRead}
             disabled={markingAll}
-            className="px-3 py-2 text-sm rounded border inline-flex items-center gap-2"
+            className="px-3 py-2 text-xs md:text-sm rounded border inline-flex items-center gap-2 shrink-0"
             style={{ borderColor: "var(--border)", color: "var(--text-2)" }}
           >
             <span>Mark all read</span>
@@ -137,7 +137,7 @@ export default function NotificationsPage() {
           return (
             <div
               key={n.id}
-              className="p-4 rounded border flex items-start gap-4"
+              className="p-3 md:p-4 rounded border flex items-start gap-3 md:gap-4 flex-wrap"
               style={{
                 borderColor: unread ? "rgba(220, 38, 38, 0.4)" : "var(--border)",
                 background: unread ? "rgba(220, 38, 38, 0.04)" : "var(--panel)",

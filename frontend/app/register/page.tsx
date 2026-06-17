@@ -28,10 +28,16 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
+      // Emails are treated case-insensitively — normalize once and use
+      // the same value for both /register and the immediate /login that
+      // follows so they can't drift apart. toLowerCase is also applied
+      // on every keystroke in the input below; this is a belt-and-braces
+      // safety net plus a trim for paste-from-clipboard whitespace.
+      const normalizedEmail = email.trim().toLowerCase();
       await api("/api/auth/register", {
         method: "POST",
         body: JSON.stringify({
-          email,
+          email: normalizedEmail,
           password,
           role,
           display_name: displayName || null,
@@ -41,7 +47,7 @@ export default function RegisterPage() {
       });
       const tok = await api<{ access_token: string; refresh_token: string }>(
         "/api/auth/login",
-        { method: "POST", body: JSON.stringify({ email, password }), auth: false }
+        { method: "POST", body: JSON.stringify({ email: normalizedEmail, password }), auth: false }
       );
       setTokens(tok.access_token, tok.refresh_token);
       notify.success("Account created");
@@ -64,7 +70,13 @@ export default function RegisterPage() {
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email</label>
             <input className="w-full p-2.5" type="email" autoComplete="email" placeholder="you@example.com"
-              value={email} onChange={(e) => setEmail(e.target.value)} required />
+              // Emails are case-insensitive — lowercase on every
+              // keystroke so what the user sees is what we send.
+              // inputMode/autoCapitalize/autoCorrect off prevent
+              // mobile keyboards from inserting capitals or
+              // suggesting corrections.
+              value={email} onChange={(e) => setEmail(e.target.value.toLowerCase())} required
+              inputMode="email" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>

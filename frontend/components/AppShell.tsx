@@ -366,6 +366,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     } catch { /* ignore */ }
   }, [collapsed]);
 
+  // Mobile drawer state — distinct from desktop collapse. On < md the
+  // sidebar is hidden off-canvas and slides in when the header hamburger
+  // is tapped. We auto-close on route change so a nav tap doesn't leave
+  // the drawer open over the new page.
+  const [mobileOpen, setMobileOpen] = useState(false);
+  useEffect(() => { setMobileOpen(false); }, [pathname]);
+
   if (loading) {
     return (
       <div className="min-h-screen grid place-items-center" style={{ color: "var(--muted)" }}>
@@ -404,7 +411,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         onClick={() => setCollapsed(c => !c)}
         title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="absolute grid place-items-center transition-[left] duration-200"
+        // Hide on mobile — the hamburger in the header drives the mobile
+        // drawer instead, so this hinge would have nothing to act on.
+        className="absolute hidden md:grid place-items-center transition-[left] duration-200"
         style={{
           // Floating navbar starts at mt-3 (12px) with py-3 padding. A 28px
           // square button centered on the navbar's vertical midline:
@@ -441,14 +450,35 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </svg>
       </button>
 
-      {/* ── Sidebar (full viewport height) ──────────────────────────────── */}
+      {/* Mobile drawer backdrop — taps anywhere outside the sidebar to
+          close. Only rendered on < md AND when open. z-30 sits under the
+          aside (z-40) but above main content. */}
+      {mobileOpen && (
+        <button
+          type="button"
+          aria-label="Close menu"
+          onClick={() => setMobileOpen(false)}
+          className="fixed inset-0 md:hidden"
+          style={{ background: "rgba(0,0,0,0.55)", zIndex: 30 }}
+        />
+      )}
+
+      {/* ── Sidebar (full viewport height on desktop; off-canvas drawer
+          on mobile) ────────────────────────────────────────────────── */}
       <aside
-        className="flex flex-col h-full shrink-0 transition-[width] duration-200 relative"
+        className={
+          "flex flex-col h-full shrink-0 transition-transform duration-200 " +
+          // On < md: position fixed off-canvas; slide in via translate-x.
+          // On md+: revert to in-flow positioning so the row layout works.
+          "fixed inset-y-0 left-0 md:static md:translate-x-0 " +
+          (mobileOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0")
+        }
         style={{
           width: SIDEBAR_W,
           background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
           borderRight: "1px solid var(--border)",
           backdropFilter: "blur(8px)",
+          zIndex: 40,
         }}
       >
         {/* Wordmark only — the image logo is intentionally hidden per
@@ -634,7 +664,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* ── Right column: navbar on top, scrollable main below ──────────── */}
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <header
-          className="flex items-center justify-between px-5 py-3 shrink-0 mx-4 mt-3 rounded-xl"
+          className="flex items-center justify-between px-3 md:px-5 py-2.5 md:py-3 shrink-0 mx-2 md:mx-4 mt-2 md:mt-3 rounded-xl gap-2"
           style={{
             background: "linear-gradient(180deg, rgba(14,20,17,0.75) 0%, rgba(7,9,10,0.5) 100%)",
             border: "1px solid var(--border)",
@@ -642,10 +672,37 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
           }}
         >
-          {/* Left: listener health pill + SSE connection-status pill.
-              Margin-left clears the sidebar collapse tab so the pill
-              doesn't sit underneath it. */}
-          <div className="flex items-center gap-2">
+          {/* Left: hamburger (mobile only) + listener health pill +
+              SSE connection-status pill. */}
+          <div className="flex items-center gap-2 min-w-0">
+            <button
+              type="button"
+              onClick={() => setMobileOpen(o => !o)}
+              aria-label={mobileOpen ? "Close menu" : "Open menu"}
+              title={mobileOpen ? "Close menu" : "Open menu"}
+              className="md:hidden grid place-items-center rounded-lg shrink-0"
+              style={{
+                width: 36, height: 36,
+                background: "rgba(255,255,255,0.04)",
+                border: "1px solid var(--border)",
+                color: "var(--text)",
+              }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                {mobileOpen ? (
+                  <>
+                    <line x1="18" y1="6" x2="6" y2="18" />
+                    <line x1="6" y1="6" x2="18" y2="18" />
+                  </>
+                ) : (
+                  <>
+                    <line x1="3" y1="6" x2="21" y2="6" />
+                    <line x1="3" y1="12" x2="21" y2="12" />
+                    <line x1="3" y1="18" x2="21" y2="18" />
+                  </>
+                )}
+              </svg>
+            </button>
             <ListenerPill role={user.role as "trader" | "subscriber"} />
             <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
           </div>
@@ -696,7 +753,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             >
               {initials(user.display_name, user.email)}
             </div>
-            <div className="leading-tight text-right">
+            {/* Hide name + role chip on small screens — the avatar still
+                conveys identity, and the row stays under control. */}
+            <div className="leading-tight text-right hidden sm:block">
               <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
               <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
                 {user.role}
@@ -705,7 +764,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="flex-1 min-w-0 overflow-y-auto p-5">{children}</main>
+        <main className="flex-1 min-w-0 overflow-y-auto p-3 md:p-5">{children}</main>
       </div>
     </div>
   );

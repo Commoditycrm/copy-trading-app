@@ -204,6 +204,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
       const byKey = new Map<string, {
         order_id: string;                          // entry-order id (for bracket modify)
+        side: Order["side"];                       // entry-order side (drives TP/SL % direction)
         submitted_at: string | null;
         filled_at: string | null;
         filled_avg_price: string | null;
@@ -230,6 +231,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         if (!prev || (lastFillAt ?? "") > (prev.filled_at ?? "")) {
           byKey.set(k, {
             order_id: o.id,
+            side: o.side,
             submitted_at: o.submitted_at ?? o.created_at,
             filled_at: lastFillAt,
             filled_avg_price: o.filled_avg_price,
@@ -291,7 +293,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
                 {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "TP", "SL", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
-                  <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
+                  <th key={h} className="text-left px-3 md:px-5 py-2 md:py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
             </thead>
@@ -325,23 +327,23 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                 return (
                   <Fragment key={key}>
                     <tr className="border-t" style={{ borderColor: "var(--border)" }}>
-                      <td className="px-5 py-3 font-medium">{p.symbol}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 font-medium">{p.symbol}</td>
                       {/* Expiry Date — absolute date for options, "—" for stocks. */}
-                      <td className="px-5 py-3 whitespace-nowrap" style={{ color: p.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
+                      <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: p.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
                         {p.option_expiry ? fmtDate(p.option_expiry) : "—"}
                       </td>
-                      <td className="px-5 py-3 capitalize">{p.instrument_type}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 capitalize">{p.instrument_type}</td>
                       <td
-                        className="px-5 py-3 uppercase font-medium"
+                        className="px-3 md:px-5 py-2 md:py-3 uppercase font-medium"
                         style={{ color: isLong ? "var(--good)" : "var(--bad)" }}
                       >
                         {isLong ? "long" : "short"}
                       </td>
-                      <td className="px-5 py-3 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
                       {/* Close % — pick a fraction of the position to close.
                           Pills that would round to zero (e.g. 25% of one
                           contract) are disabled. */}
-                      <td className="px-5 py-3">
+                      <td className="px-3 md:px-5 py-2 md:py-3">
                         <div className="flex gap-1">
                           {[25, 50, 75, 100].map(pct => {
                             const computedQty = quantityForPercent(p, pct);
@@ -369,7 +371,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           })}
                         </div>
                       </td>
-                      <td className="px-5 py-3">
+                      <td className="px-3 md:px-5 py-2 md:py-3">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           <button
                             disabled={inFlight}
@@ -413,8 +415,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           </div>
                         </div>
                       </td>
-                      <td className="px-5 py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                      <td className="px-5 py-3 num">{fmtNum(p.current_price, 2)}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 num">{fmtNum(p.current_price, 2)}</td>
                       {(() => {
                         const t = orderTimestamps.byKey.get(orderTimestamps.key(
                           p.broker_account_id, p.instrument_type, p.symbol,
@@ -431,23 +433,27 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         };
                         return (
                           <>
-                            <td className="px-5 py-3 num">
+                            <td className="px-3 md:px-5 py-2 md:py-3 num">
                               {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
                             </td>
-                            <td className="px-5 py-3 num">
+                            <td className="px-3 md:px-5 py-2 md:py-3 num">
                               <InlineBracketCell
                                 orderId={orderId}
                                 leg="tp"
                                 value={t?.take_profit_price ?? null}
+                                entryPrice={t?.filled_avg_price ?? null}
+                                side={t?.side ?? (isLong ? "buy" : "sell")}
                                 canEdit={!!orderId}
                                 onUpdated={onUpdated}
                               />
                             </td>
-                            <td className="px-5 py-3 num">
+                            <td className="px-3 md:px-5 py-2 md:py-3 num">
                               <InlineBracketCell
                                 orderId={orderId}
                                 leg="sl"
                                 value={t?.stop_loss_price ?? null}
+                                entryPrice={t?.filled_avg_price ?? null}
+                                side={t?.side ?? (isLong ? "buy" : "sell")}
                                 canEdit={!!orderId}
                                 onUpdated={onUpdated}
                               />
@@ -455,9 +461,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           </>
                         );
                       })()}
-                      <td className="px-5 py-3 num">{fmtNum(p.market_value, 2)}</td>
+                      <td className="px-3 md:px-5 py-2 md:py-3 num">{fmtNum(p.market_value, 2)}</td>
                       <td
-                        className="px-5 py-3 num"
+                        className="px-3 md:px-5 py-2 md:py-3 num"
                         style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}
                       >
                         {pnl.text}
@@ -471,13 +477,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         const fill = t?.filled_at ?? null;
                         return (
                           <>
-                            <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                            <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                               {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                             </td>
-                            <td className="px-5 py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                            <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                               {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                             </td>
-                            <td className="px-5 py-3 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
+                            <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
                               {sub && fill ? fmtDuration(sub, fill) : "—"}
                             </td>
                           </>
@@ -486,7 +492,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       {(() => {
                         const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
                         return (
-                          <td className="px-5 py-3 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
+                          <td className="px-3 md:px-5 py-2 md:py-3 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
                             {exp ? exp.text : "—"}
                           </td>
                         );
