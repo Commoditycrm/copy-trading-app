@@ -49,7 +49,7 @@ interface Props {
 }
 
 const triggerBaseStyle: React.CSSProperties = {
-  background: "#07090b",
+  background: "var(--bg-tint)",
   border: "1px solid var(--border)",
   borderRadius: 8,
 };
@@ -224,10 +224,10 @@ export function SearchableSelect({
           ref={listRef}
           className="absolute left-0 right-0 z-20 mt-1 rounded-lg overflow-y-auto py-1"
           style={{
-            background: "#07090b",
+            background: "var(--panel)",
             border: "1px solid var(--border)",
             maxHeight: 220,
-            boxShadow: "0 12px 30px -8px rgba(0,0,0,0.55)",
+            boxShadow: "var(--shadow-pop)",
           }}
         >
           {filtered.length === 0 ? (

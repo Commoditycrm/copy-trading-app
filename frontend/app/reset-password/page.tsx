@@ -7,6 +7,7 @@ import { resetPassword } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
+import { AuthCard } from "@/components/auth/AuthCard";
 
 const MIN_LEN = 8;
 
@@ -59,14 +60,8 @@ function ResetPasswordForm() {
 
   return (
     <form onSubmit={submit} className="space-y-5">
-      <p className="text-sm text-center" style={{ color: "var(--muted)" }}>
-        Choose a new password for your account.
-      </p>
       <div>
-        <label
-          className="text-[11px] uppercase tracking-wider mb-1 block"
-          style={{ color: "var(--muted)" }}
-        >
+        <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
           New password
         </label>
         <PasswordInput
@@ -80,10 +75,7 @@ function ResetPasswordForm() {
         />
       </div>
       <div>
-        <label
-          className="text-[11px] uppercase tracking-wider mb-1 block"
-          style={{ color: "var(--muted)" }}
-        >
+        <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
           Confirm new password
         </label>
         <PasswordInput
@@ -114,17 +106,10 @@ function ResetPasswordForm() {
 
 export default function ResetPasswordPage() {
   return (
-    <main className="min-h-screen grid place-items-center p-6">
-      <div className="card w-full max-w-md p-8 space-y-5">
-        <div className="text-center">
-          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>
-            Set a new password
-          </div>
-        </div>
-        <Suspense fallback={<div className="text-center"><Spinner /></div>}>
-          <ResetPasswordForm />
-        </Suspense>
-      </div>
-    </main>
+    <AuthCard title="Set a new password">
+      <Suspense fallback={<div className="text-center"><Spinner /></div>}>
+        <ResetPasswordForm />
+      </Suspense>
+    </AuthCard>
   );
 }

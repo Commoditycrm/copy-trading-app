@@ -24,7 +24,7 @@ const ROLE_COLORS: Record<string, { bg: string; color: string }> = {
 };
 
 function RoleBadge({ role }: { role: string }) {
-  const c = ROLE_COLORS[role] ?? { bg: "rgba(255,255,255,0.08)", color: "var(--text-2)" };
+  const c = ROLE_COLORS[role] ?? { bg: "var(--panel-2)", color: "var(--text-2)" };
   return (
     <span
       className="text-xs font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider"
@@ -159,7 +159,7 @@ export default function AdminUsersPage() {
         <button
           onClick={load}
           className="text-sm px-3 py-1.5 rounded-lg"
-          style={{ background: "rgba(255,255,255,0.06)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+          style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
         >
           Refresh
         </button>
@@ -190,7 +190,7 @@ export default function AdminUsersPage() {
               onClick={() => setFilter(r)}
               className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
               style={{
-                background: filter === r ? "var(--accent)" : "rgba(255,255,255,0.05)",
+                background: filter === r ? "var(--accent)" : "var(--panel-2)",
                 color:      filter === r ? "var(--accent-ink)" : "var(--text-2)",
                 border:     "1px solid " + (filter === r ? "var(--accent)" : "var(--border)"),
               }}
@@ -256,7 +256,7 @@ export default function AdminUsersPage() {
                         onChange={e => changeRole(u, e.target.value)}
                         className="text-xs rounded-lg px-2 py-1 font-semibold"
                         style={{
-                          background: ROLE_COLORS[u.role]?.bg ?? "rgba(255,255,255,0.08)",
+                          background: ROLE_COLORS[u.role]?.bg ?? "var(--panel-2)",
                           color:      ROLE_COLORS[u.role]?.color ?? "var(--text-2)",
                           border:     "1px solid transparent",
                           cursor:     u.role === "admin" ? "default" : "pointer",
@@ -317,7 +317,7 @@ export default function AdminUsersPage() {
                             onClick={() => setEditingBiz(null)}
                             className="text-xs px-2 py-1 rounded-lg"
                             style={{
-                              background: "rgba(255,255,255,0.05)",
+                              background: "var(--panel-2)",
                               color: "var(--text-2)",
                               border: "1px solid var(--border)",
                               cursor: busy === u.id ? "not-allowed" : "pointer",

@@ -107,7 +107,7 @@ export default function LoadTestPage() {
         style={{
           background: hasSeeded
             ? "linear-gradient(135deg,rgba(250,204,21,0.08),rgba(250,204,21,0.02))"
-            : "linear-gradient(135deg,rgba(14,20,17,0.7),rgba(7,9,10,0.5))",
+            : "var(--panel)",
           border: "1px solid " + (hasSeeded ? "rgba(250,204,21,0.25)" : "var(--border)"),
         }}
       >
@@ -127,7 +127,7 @@ export default function LoadTestPage() {
             <button
               onClick={loadCount}
               className="text-xs px-3 py-1.5 rounded-lg"
-              style={{ background: "rgba(255,255,255,0.06)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
             >
               Refresh
             </button>
@@ -138,7 +138,7 @@ export default function LoadTestPage() {
       {/* Seed form */}
       <div
         className="rounded-xl p-5 space-y-4"
-        style={{ background: "rgba(14,20,17,0.5)", border: "1px solid var(--border)" }}
+        style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
       >
         <div className="font-semibold">Seed Test Subscribers</div>
 

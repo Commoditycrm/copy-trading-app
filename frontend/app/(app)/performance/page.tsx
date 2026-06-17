@@ -12,6 +12,7 @@
  */
 
 import { Fragment, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
@@ -895,14 +896,19 @@ export default function PerformancePage() {
 
   return (
     <div className="space-y-5">
-      {/* <header>
-        <h1 className="text-2xl" style={{ fontWeight: 600 }}>Fanout Performance</h1>
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+      >
+        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
+          Fanout Performance
+        </h1>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
           Latency breakdown for your most recent trades that fanned out to subscribers.
-          Click any row to see per-subscriber timing. Auto-refreshes every 5 seconds and
-          on every new trade event.
+          Click any row to see per-subscriber timing. Auto-refreshes every 5 seconds.
         </p>
-      </header> */}
+      </motion.div>
 
       {/* ── Compact metric cards with inline sparklines ───────────────── */}
       {/* <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
@@ -1015,8 +1021,8 @@ export default function PerformancePage() {
         className="overflow-auto rounded-xl"
         style={{
           border: "1px solid var(--border)",
-          background: "linear-gradient(180deg, rgba(14,20,17,0.5) 0%, rgba(7,9,10,0.3) 100%)",
-          maxHeight: "calc(100vh - 110px)",
+          background: "var(--panel)",
+          maxHeight: "calc(100vh - 180px)",
         }}
       >
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
@@ -1088,7 +1094,7 @@ export default function PerformancePage() {
                 <Fragment key={f.parent_order_id}>
                   <tr
                     onClick={() => toggleExpand(f.parent_order_id)}
-                    className="cursor-pointer transition-colors hover:bg-white/5"
+                    className="cursor-pointer transition-colors hover:bg-[var(--panel-2)]"
                     style={{ borderTop: "1px solid var(--border)" }}
                   >
                     <td className="px-2 md:px-3 py-2 md:py-3 font-medium whitespace-nowrap">
@@ -1179,7 +1185,7 @@ export default function PerformancePage() {
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={18} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
+                      <td colSpan={18} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
