@@ -9,6 +9,7 @@ import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
+import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, Position } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
@@ -225,9 +226,20 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           : `${acctId}:STK:${symbol.toUpperCase()}`;
 
       const byKey = new Map<string, {
+        order_id: string;                          // entry-order id (for bracket modify)
+        side: Order["side"];                       // entry-order side (drives TP/SL % direction)
         submitted_at: string | null;
         filled_at: string | null;
         filled_avg_price: string | null;
+        // limit_price is the SAME anchor the Trade Panel used when it
+        // converted "TP 10% / SL 5%" → absolute prices. Reversing the
+        // % display against filled_avg_price (which can differ due to
+        // slippage) would show 8.11% instead of 10%. Always prefer
+        // limit_price; filled_avg_price stays as a fallback for orders
+        // that had no limit (market entries that somehow carry a bracket).
+        limit_price: string | null;
+        take_profit_price: string | null;
+        stop_loss_price: string | null;
       }>();
       for (const o of orders) {
         if (o.status !== "filled" && o.status !== "partially_filled") continue;
@@ -235,6 +247,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         // was disconnected after the trade) — they can't match any current
         // position. Including them with a "" key would corrupt dedup keys.
         if (!o.broker_account_id) continue;
+        // Bracket-exit legs (TP/SL closes) are NOT the entry — they'd
+        // overwrite the real entry's id with their own and break the
+        // bracket-modify UI. Skip them; their parent is already in the loop.
+        if (o.bracket_parent_id) continue;
         const k = key(o.broker_account_id, o.instrument_type, o.symbol, o.option_expiry, o.option_strike, o.option_right);
         const lastFillAt = o.fills?.length
           ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
@@ -243,9 +259,14 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         // Keep the latest record per contract (by fill time).
         if (!prev || (lastFillAt ?? "") > (prev.filled_at ?? "")) {
           byKey.set(k, {
+            order_id: o.id,
+            side: o.side,
             submitted_at: o.submitted_at ?? o.created_at,
             filled_at: lastFillAt,
             filled_avg_price: o.filled_avg_price,
+            limit_price: o.limit_price,
+            take_profit_price: o.take_profit_price,
+            stop_loss_price: o.stop_loss_price,
           });
         }
       }
@@ -336,7 +357,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       );
     };
 
-    const COLSPAN = 16;
+    const COLSPAN = 18;
 
     return (
       <div className={className}>
@@ -396,6 +417,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
                   <Th label="Filled price" />
+                  <Th label="TP" />
+                  <Th label="SL" />
                   <Th label="Market value" sortKey="market_value" />
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="Submitted at" />
@@ -542,10 +565,49 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             p.broker_account_id, p.instrument_type, p.symbol,
                             p.option_expiry, p.option_strike, p.option_right,
                           ));
+                          // Bracket modify is allowed while the underlying
+                          // position is still alive — exactly when this row
+                          // exists. Without an entry-order match (e.g. broker
+                          // connected after the trade) we can't target a
+                          // parent → render the cells read-only.
+                          const orderId = t?.order_id ?? null;
+                          // Prefer limit_price as the % anchor — it's the same
+                          // number the Trade Panel used to convert "TP 10%" into
+                          // an absolute price, so reversing it round-trips to
+                          // 10% exactly; filled_avg_price is the fallback.
+                          const entryPrice = t?.limit_price ?? t?.filled_avg_price ?? null;
+                          const side = t?.side ?? (isLong ? "buy" : "sell");
+                          const onUpdated = (updated: Order) => {
+                            setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
+                          };
                           return (
-                            <td className="px-5 py-3.5 num">
-                              {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
-                            </td>
+                            <>
+                              <td className="px-5 py-3.5 num">
+                                {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
+                              </td>
+                              <td className="px-5 py-3.5 num">
+                                <InlineBracketCell
+                                  orderId={orderId}
+                                  leg="tp"
+                                  value={t?.take_profit_price ?? null}
+                                  entryPrice={entryPrice}
+                                  side={side}
+                                  canEdit={!!orderId}
+                                  onUpdated={onUpdated}
+                                />
+                              </td>
+                              <td className="px-5 py-3.5 num">
+                                <InlineBracketCell
+                                  orderId={orderId}
+                                  leg="sl"
+                                  value={t?.stop_loss_price ?? null}
+                                  entryPrice={entryPrice}
+                                  side={side}
+                                  canEdit={!!orderId}
+                                  onUpdated={onUpdated}
+                                />
+                              </td>
+                            </>
                           );
                         })()}
                         <td className="px-5 py-3.5 num">{fmtNum(p.market_value, 2)}</td>

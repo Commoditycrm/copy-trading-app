@@ -11,6 +11,7 @@ import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
+import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, OrderStatus, Position, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
@@ -338,7 +339,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 14;
+  const COLSPAN = 16;
 
   return (
     <div className="max-w-[1400px] mx-auto">
@@ -437,6 +438,8 @@ export default function TradesPage() {
                 <Th label="Actions" />
                 <Th label="Expected price" />
                 <Th label="Filled price" />
+                <Th label="TP" />
+                <Th label="SL" />
                 <Th label="Notional" sortKey="notional" />
                 <Th label="Status" sortKey="status" />
                 <Th label="Submitted at" sortKey="submitted" />
@@ -553,6 +556,51 @@ export default function TradesPage() {
                       </td>
                       <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>
+                      {/* TP / SL — shown as a percent of the entry-side price.
+                          Editable only on entry rows that are still open
+                          (pre-fill); filled orders that survive here belong to
+                          positions that already closed, so brackets are
+                          immutable. Bracket-exit legs (TP/SL closes) never
+                          expose an editor. Anchor the % off limit_price (the
+                          exact number the Trade Panel used to set the bracket),
+                          falling back to filled_avg_price for market entries. */}
+                      {(() => {
+                        const isEntry = !o.bracket_parent_id;
+                        const editable = isEntry && isOpen;
+                        const entryPrice = o.limit_price ?? o.filled_avg_price;
+                        const onUpdated = (updated: Order) =>
+                          setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
+                        return (
+                          <>
+                            <td className="px-5 py-3.5 num">
+                              {isEntry ? (
+                                <InlineBracketCell
+                                  orderId={o.id}
+                                  leg="tp"
+                                  value={o.take_profit_price}
+                                  entryPrice={entryPrice}
+                                  side={o.side}
+                                  canEdit={editable}
+                                  onUpdated={onUpdated}
+                                />
+                              ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                            </td>
+                            <td className="px-5 py-3.5 num">
+                              {isEntry ? (
+                                <InlineBracketCell
+                                  orderId={o.id}
+                                  leg="sl"
+                                  value={o.stop_loss_price}
+                                  entryPrice={entryPrice}
+                                  side={o.side}
+                                  canEdit={editable}
+                                  onUpdated={onUpdated}
+                                />
+                              ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                            </td>
+                          </>
+                        );
+                      })()}
                       <td className="px-5 py-3.5 num">
                         {notionalFor(o) ? fmt(String(notionalFor(o))) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
