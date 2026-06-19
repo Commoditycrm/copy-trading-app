@@ -93,12 +93,23 @@ class SubscriberSettings(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True,
     )
 
-    # Set to the UTC timestamp at which a P&L-limit (loss OR profit) flipped
-    # copy_enabled to False. NULL means "not paused by a limit" — either the
-    # user manually disabled (we leave them alone), or copy is currently
-    # enabled. Audit marker only — re-enable is MANUAL ONLY (the subscriber
-    # has to flip copy_enabled back on from the Settings UI). There is no
-    # auto-resume sweep anywhere.
+    # Set to the UTC timestamp at which a DAILY limit (loss, profit, or
+    # max_account_pct_per_day, plus their _pct variants) flipped
+    # copy_enabled to False. NULL means "not paused by a daily limit" —
+    # either the user manually disabled (we leave them alone), or copy is
+    # currently enabled, or the pause already auto-resumed.
+    #
+    # Auto-resume: on every fanout entry (copy_engine) AND every pnl_poller
+    # tick, if this timestamp is set AND its UTC date is < today's UTC
+    # date, we flip copy_enabled back to True and clear this stamp. That's
+    # how "auto-resume next UTC day" works for daily limits.
+    #
+    # Auto-liquidation (`auto_liquidation_limit`) deliberately uses a
+    # DIFFERENT column (`auto_liquidated_at`) and is NEVER touched by the
+    # auto-resume sweep — equity-floor liquidation stays sticky until the
+    # subscriber manually re-enables copy. That's the intentional split:
+    # daily limits forgive on the next day, hard-equity liquidation does
+    # not.
     pnl_auto_paused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )

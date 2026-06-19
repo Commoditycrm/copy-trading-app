@@ -118,39 +118,7 @@ export default function CalendarPage() {
   if (!firstLoadDone) return <PageLoading />;
 
   return (
-    <div className="max-w-5xl mx-auto">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-        className="flex items-end justify-between flex-wrap gap-3 mb-5"
-      >
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-            {viewingLabel}
-          </h1>
-          <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            Realized P&amp;L from broker fills.
-            {syncing && <span className="ml-2">Syncing…</span>}
-            {syncMsg && <span className="ml-2" style={{ color: "var(--accent)" }}>{syncMsg}</span>}
-          </p>
-        </div>
-        {user?.role === "trader" && (
-          <div className="min-w-[220px]">
-            <SearchableSelect
-              value={viewingUserId ?? ""}
-              onChange={(v) => setViewingUserId(v || null)}
-              options={[
-                { value: "", label: "— My P&L —" },
-                ...subs.map((s) => ({ value: s.user_id, label: s.display_name ?? s.email })),
-              ]}
-              placeholder="View P&L for"
-              style={{ height: 34 }}
-            />
-          </div>
-        )}
-      </motion.div>
-
+    <div className="max-w-5xl">
       {/* Month bar: total + nav */}
       <div className="card p-4 mb-4 flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-5">

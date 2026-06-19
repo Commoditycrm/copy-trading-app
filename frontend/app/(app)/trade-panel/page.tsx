@@ -530,19 +530,6 @@ export default function TradePanelPage() {
 
   return (
     <div className="space-y-4 max-w-[1400px] mx-auto">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      >
-        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-          Trade Panel
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Place an equity or option order — it mirrors to every active subscriber.
-        </p>
-      </motion.div>
-
       {/* ── Top row: ticket + watchlist placeholder, side-by-side ─────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
 

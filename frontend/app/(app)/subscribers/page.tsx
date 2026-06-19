@@ -108,21 +108,7 @@ export default function SubscribersPage() {
   const withBroker = rows.filter(r => r.broker_count > 0).length;
 
   return (
-    <div className="max-w-[1100px] mx-auto">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-        className="mb-5"
-      >
-        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-          Subscribers
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          People copying your trades.
-        </p>
-      </motion.div>
-
+    <div className="max-w-[1100px]">
       {/* Summary tiles */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <SummaryTile label="Total" node={<AnimatedNumber value={total} format={(n) => String(Math.round(n))} className="num num-lg" />} />

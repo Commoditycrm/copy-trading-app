@@ -181,6 +181,18 @@ export default function SettingsPage() {
       });
       return;
     }
+    if (e?.type === "copy.auto_resumed") {
+      // Fires when a daily-limit pause expires at UTC midnight. The
+      // subscriber's copy_enabled has just flipped back to true on the
+      // server; refresh local state so the toggle in the sidebar +
+      // Settings header tracks. Same PRESERVE-pnl pattern as the pause
+      // handler above so the P&L tile doesn't flash to 0 mid-tick.
+      notify.success("Copy trading auto-resumed for the new day.");
+      api<SubscriberSettings>("/api/settings/subscriber").then((fresh) => {
+        setSub((prev) => prev ? { ...fresh, todays_realized_pnl: prev.todays_realized_pnl } : fresh);
+      });
+      return;
+    }
     if (e?.type === "copy.auto_liquidated") {
       notify.success(
         `Take-profit hit — unrealized profit reached $${e.unrealized_pl} ` +

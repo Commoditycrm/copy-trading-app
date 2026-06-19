@@ -23,20 +23,6 @@ export default function PositionsPage() {
 
   return (
     <div className="max-w-[1400px] mx-auto">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-        className="mb-5"
-      >
-        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-          Positions
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Open positions across your connected brokers, updated in real time.
-        </p>
-      </motion.div>
-
       <div className="space-y-4">
         <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
         <OpenPositionsTable ref={tableRef} />
