@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import { api, ApiError } from "@/lib/api";
 import { fmtDate } from "@/lib/format";
 import { notify } from "@/lib/toast";
@@ -43,8 +44,7 @@ const POPULAR_SYMBOLS = [
  *  original quiet look — it's a sidekick to the ticket, not the
  *  primary focus). Use `ticketStyle` for the actual trade form. */
 const cardStyle: React.CSSProperties = {
-  background:
-    "linear-gradient(180deg, rgba(20,26,32,0.55) 0%, rgba(10,14,18,0.35) 100%)",
+  background: "var(--panel)",
   border: "1px solid var(--border)",
   borderRadius: "var(--r)",
   backdropFilter: "blur(10px)",
@@ -57,8 +57,7 @@ const cardStyle: React.CSSProperties = {
  *  read as washed-out, this 0.78/0.7 sits between the original (too
  *  dark) and the over-bright revision. */
 const ticketStyle: React.CSSProperties = {
-  background:
-    "linear-gradient(180deg, rgba(26,32,40,0.78) 0%, rgba(16,22,28,0.70) 100%)",
+  background: "var(--panel)",
   border: "1px solid var(--border-strong)",
   borderRadius: "var(--r)",
   backdropFilter: "blur(10px)",
@@ -68,7 +67,7 @@ const ticketStyle: React.CSSProperties = {
 /** Inset input style — flat page-bg fill (#07090b) so every input and
  *  dropdown trigger reads at the same pitch. */
 const inputStyle: React.CSSProperties = {
-  background: "#07090b",
+  background: "var(--bg-tint)",
   border: "1px solid var(--border)",
   borderRadius: 8,
 };
@@ -97,9 +96,9 @@ function PillTab({
       onClick={onClick}
       className="flex-1 inline-flex items-center justify-center h-full px-2 text-sm font-medium rounded-md transition-all"
       style={{
-        background: active ? "rgba(255,255,255,0.06)" : "transparent",
+        background: active ? "var(--panel-2)" : "transparent",
         color: active ? "var(--text)" : "var(--muted)",
-        boxShadow: active ? "inset 0 1px 0 rgba(255,255,255,0.06)" : "none",
+        boxShadow: "none",
       }}
     >
       {children}
@@ -414,10 +413,13 @@ export default function TradePanelPage() {
     const sl = stopLoss ? Number(stopLoss) : null;
     const tp = takeProfit ? Number(takeProfit) : null;
     if (!sl && !tp) return null;
+    // Percentages must be positive (direction is implied by side).
     if (sl !== null && sl <= 0) return "Stop loss % must be > 0";
     if (tp !== null && tp <= 0) return "Take profit % must be > 0";
+    // Sanity: a 100%+ stop loss on a long would push the SL price to ≤0.
     if (isBuy && sl !== null && sl >= 100) return "Stop loss % must be < 100";
     if (!isBuy && tp !== null && tp >= 100) return "Take profit % must be < 100";
+    // Need a reference price to actually convert to absolute.
     if ((sl || tp) && !refPrice) {
       return "Enter a limit price for % SL/TP";
     }
@@ -485,8 +487,9 @@ export default function TradePanelPage() {
       };
       if (forType === "limit") body.limit_price = limit;
       // Convert percentage TP/SL → absolute prices for the broker. Only
-      // attached for limit clicks (market has no reference anchor). Round
-      // to 4 decimals to match the orders.Numeric(18,4) column.
+      // attached for limit clicks (market has no reference anchor). We
+      // recompute here for the *clicked* side (not the previewed side)
+      // and round to 4 decimals to match the orders.Numeric(18,4) column.
       if (forType === "limit") {
         const { tp, sl } = bracketFor(forSide);
         if (tp !== null) body.take_profit_price = tp.toFixed(4);
@@ -526,11 +529,22 @@ export default function TradePanelPage() {
   if (acctsLoading) return <PageLoading />;
 
   return (
-    <div className="space-y-4">
-      {/* ── Top row: ticket + watchlist placeholder. Side-by-side on
-          lg+; stacks (ticket first) on phones / tablets where 50% of
-          the row would crush the form. */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 lg:gap-5 items-stretch">
+    <div className="space-y-4 max-w-[1400px] mx-auto">
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+      >
+        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
+          Trade Panel
+        </h1>
+        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+          Place an equity or option order — it mirrors to every active subscriber.
+        </p>
+      </motion.div>
+
+      {/* ── Top row: ticket + watchlist placeholder, side-by-side ─────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-stretch">
 
         {/* ────────────── TRADE TICKET ────────────── */}
         <form
@@ -553,7 +567,7 @@ export default function TradePanelPage() {
                 to fill half the row. */}
             <div
               className="flex w-full p-0.5 rounded-lg"
-              style={{ background: "rgba(0,0,0,0.35)", border: "1px solid var(--border)" }}
+              style={{ background: "var(--bg-tint)", border: "1px solid var(--border)" }}
             >
               {(["option", "stock"] as const).map(kind => {
                 const active = instrument === kind;
@@ -566,9 +580,8 @@ export default function TradePanelPage() {
                     style={
                       active
                         ? {
-                            background: "rgba(255,255,255,0.08)",
+                            background: "var(--panel-2)",
                             color: "var(--text)",
-                            boxShadow: "inset 0 1px 0 rgba(255,255,255,0.12)",
                           }
                         : { color: "var(--muted)" }
                     }
@@ -713,13 +726,13 @@ export default function TradePanelPage() {
 
                 {/* Row B: Right toggle — full-width segmented pill now
                     that the Order-type select is gone (the 4 CTA buttons
-                    encode order type instead). */}
+                    encode order type instead). Same 34px height. */}
                 <div>
                   <TinyLabel>Right</TinyLabel>
                   <div
                     className="flex p-0.5"
                     style={{
-                      background: "rgba(0,0,0,0.3)",
+                      background: "var(--bg-tint)",
                       border: "1px solid var(--border)",
                       borderRadius: 8,
                       height: 34,
@@ -731,7 +744,7 @@ export default function TradePanelPage() {
                 </div>
               </>
             ) : (
-              // Stocks: just Qty (Order type is gone — CTAs encode it).
+              // Stocks: just Qty (Order type is gone — the CTAs encode it).
               <div>
                 <TinyLabel>Qty</TinyLabel>
                 <input
@@ -746,10 +759,12 @@ export default function TradePanelPage() {
             )}
 
             {/* Limit price — always visible. Used only when the user clicks
-                a "Buy LMT" / "Sell LMT" CTA; ignored on Market clicks. The
-                Bid/Mid/Ask pills (options only) seed it from the live quote.
-                Split 50/50 with the quote pills when a quote exists; full
-                width otherwise. */}
+                a "Buy LMT" / "Sell LMT" CTA; ignored on Market clicks. We
+                split the row 50/50: input on the left, three Bid / Mid / Ask
+                pills on the right (options only). Each pill is a button that
+                seeds the limit with that price; values are plain numbers
+                (no $ or currency code) so they read at a glance and don't
+                crowd the 50% column. Full width when no quote exists. */}
             {(() => {
               const hasQuote =
                 isOption && optionQuote &&
@@ -797,7 +812,7 @@ export default function TradePanelPage() {
                               type="button"
                               disabled={disabled}
                               onClick={() => !disabled && setLimit(fmtPx(val!))}
-                              className="flex-1 flex flex-col items-center justify-center rounded-md tabular-nums transition-colors hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                              className="flex-1 flex flex-col items-center justify-center rounded-md tabular-nums transition-colors hover:bg-[var(--panel-2)] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
                               style={inputStyle}
                               title={disabled ? "no quote" : `Use ${side} as limit`}
                             >
@@ -824,11 +839,11 @@ export default function TradePanelPage() {
             })()}
 
             {/* Bracket — PERCENTAGE inputs, side-by-side. Anchored on the
-                Limit price (so they're only applied to "Buy LMT" / "Sell LMT"
-                clicks). Filling them with no limit price triggers the
-                geometry error below at submit time. */}
+                Limit price, so they're only applied to "Buy LMT" / "Sell LMT"
+                clicks. Filling them with no limit price triggers the geometry
+                error below at submit time. */}
             <div>
-              <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-2 gap-2">
                   {/* Take profit % — single flat input. The "%" lives in the
                       label only; no inline suffix, no wrapper div. */}
                   <div>
@@ -876,31 +891,38 @@ export default function TradePanelPage() {
                     )}
                   </div>
 
-                {bracketGeometryError && (
-                  <div className="col-span-2 text-[10px]" style={{ color: "var(--warn)" }}>
-                    {bracketGeometryError}
-                  </div>
-                )}
+                  {bracketGeometryError && (
+                    <div className="col-span-2 text-[10px]" style={{ color: "var(--warn)" }}>
+                      {bracketGeometryError}
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
           </div>
 
           {/* Footer — FOUR CTAs in a single row. Each button picks both
               side AND order type at the moment of click, so the trader
               never has to touch an Order-type dropdown first. Layout is
-              [Buy MKT | Buy LMT | Sell MKT | Sell LMT]; greens on the
-              left half, reds on the right. Spinner only spins on the
-              specific button that's mid-flight. */}
+              [Buy MKT | Sell MKT | Buy LMT | Sell LMT]; the Market pair is
+              outlined (secondary look — fires instantly, no price needed),
+              the Limit pair is filled gradient (primary — uses the Limit
+              price + bracket TP/SL). The bracket TP/SL prices are recomputed
+              per-side at click time inside placeOrder, so the correct
+              geometry goes to the broker regardless of which side the
+              preview was rendered for. Spinner only spins on the specific
+              button that's mid-flight. */}
           <div
             className="px-4 py-3 space-y-2"
-            style={{ borderTop: "1px solid var(--border)", background: "rgba(0,0,0,0.2)" }}
+            style={{ borderTop: "1px solid var(--border)", background: "var(--panel-2)" }}
           >
             <div className="grid grid-cols-4 gap-2">
               {([
                 // Order: Market pair on the left, Limit pair on the right.
-                // Within each pair: Buy then Sell.
-                // Market = outlined (secondary look) — fires instantly, no price input needed.
-                // Limit  = filled gradient (primary look) — uses the Limit price + bracket TP/SL.
+                // Within each pair: Buy then Sell. Greens for buy, reds for
+                // sell — same hues as qa's old single Buy / Sell CTAs.
+                // Market = outlined (secondary look) — fires instantly.
+                // Limit  = filled gradient (primary look) — uses the Limit
+                // price + bracket TP/SL.
                 { side: "buy",  type: "market", primary: "Buy",  sub: "Market",
                   variant: "outline",
                   border: "rgba(34,197,94,0.55)",
@@ -954,7 +976,6 @@ export default function TradePanelPage() {
                 );
               })}
             </div>
-
             {/* Live preview footer — OCC symbol (options) + cost estimate. */}
             <div
               className="flex items-center justify-between text-[10px] tabular-nums"
