@@ -382,12 +382,20 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
                 "broker_order_id": c["broker_order_id"],
                 "entry_order_id": c["entry_order_id"],
             })
+            # Append realised-P&L % so the trader knows the impact at a
+            # glance — "Closed for -7.3%" is more actionable than just
+            # "Closed at $0.85". Signed (negative for SL hits as
+            # expected); the helper that computed it already chose the
+            # right sign per long/short.
+            pnl_pct = c.get("pnl_pct")
+            pnl_phrase = f" Realised P&L: {pnl_pct}%." if pnl_pct is not None else ""
             notifications_to_send.append({
                 "type": "bracket.sl_triggered",
                 "message": (
                     f"{c['symbol']} option SL hit at ${c['mark']} "
                     f"(threshold ${c['sl_price']}). "
                     f"Close placed at ${c['limit']} — {c['qty']} contracts."
+                    f"{pnl_phrase}"
                 ),
                 "metadata": c,
             })

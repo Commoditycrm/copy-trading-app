@@ -182,13 +182,6 @@ export default function SettingsPage() {
       });
       return;
     }
-    if (e?.type === "copy.auto_resumed") {
-      notify.success("Copy trading auto-resumed for the new day.");
-      api<SubscriberSettings>("/api/settings/subscriber").then((fresh) => {
-        setSub((prev) => prev ? { ...fresh, todays_realized_pnl: prev.todays_realized_pnl } : fresh);
-      });
-      return;
-    }
     if (e?.type === "copy.auto_liquidated") {
       notify.success(
         `Take-profit hit — unrealized profit reached $${e.unrealized_pl} ` +
