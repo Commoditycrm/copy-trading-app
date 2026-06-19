@@ -896,20 +896,6 @@ export default function PerformancePage() {
 
   return (
     <div className="space-y-5">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      >
-        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-          Fanout Performance
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Latency breakdown for your most recent trades that fanned out to subscribers.
-          Click any row to see per-subscriber timing. Auto-refreshes every 5 seconds.
-        </p>
-      </motion.div>
-
       {/* ── Compact metric cards with inline sparklines ───────────────── */}
       {/* <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
         <MetricCard
@@ -1022,7 +1008,7 @@ export default function PerformancePage() {
         style={{
           border: "1px solid var(--border)",
           background: "var(--panel)",
-          maxHeight: "calc(100vh - 180px)",
+          maxHeight: "calc(100vh - 120px)",
         }}
       >
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>

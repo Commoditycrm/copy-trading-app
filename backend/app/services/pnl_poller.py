@@ -453,13 +453,52 @@ def _enforce_one(acct: BrokerAccount) -> None:
         now_utc = datetime.now(timezone.utc)
         invalidate_trader_id: uuid.UUID | None = None
 
+        # ── Auto-resume next-UTC-day for daily-limit pauses ──────────────
+        # The three daily kill switches (daily_loss_limit,
+        # daily_profit_limit, max_account_pct_per_day, plus their _pct
+        # variants) stamp `pnl_auto_paused_at` when they trip. This block
+        # checks whether that stamp is from a prior UTC day and, if so,
+        # flips copy_enabled back on and clears the stamp. Auto-liquidation
+        # (auto_liquidation_limit) uses a DIFFERENT column
+        # (`auto_liquidated_at`) and is intentionally not affected here —
+        # liquidation stays sticky until the subscriber manually re-enables
+        # copy from Settings. That separation lets us bring back daily
+        # auto-resume without re-introducing it for the liquidation case.
+        paused_at = s.pnl_auto_paused_at
+        if paused_at is not None:
+            if paused_at.tzinfo is None:
+                paused_at = paused_at.replace(tzinfo=timezone.utc)
+            if paused_at.astimezone(timezone.utc).date() < now_utc.date():
+                s.copy_enabled = True
+                s.pnl_auto_paused_at = None
+                audit.record(
+                    db, actor_user_id=s.user_id,
+                    action="copy.auto_resumed_next_day",
+                    entity_type="subscriber_settings", entity_id=s.user_id,
+                    metadata={"source": "pnl_poller"},
+                )
+                if s.following_trader_id:
+                    invalidate_trader_id = s.following_trader_id
+                pending_events.append({
+                    "type": "copy.auto_resumed", "reason": "new_day",
+                })
+
         # today's P&L snapshot (todays_pl / equity / beginning_day_balance) was
         # fetched ABOVE, before this session opened, so we never hold a pool
         # connection across the slow broker call. beginning_day_balance may be
         # None for SnapTrade brokers that don't expose a day-start figure; the
         # pct kill switch is silently skipped for those subscribers.
         if state is None:
-            # Broker call failed — nothing to commit; try again next tick.
+            # Broker call failed — commit any auto-resume we did above (so
+            # the subscriber's copy_enabled flip + pnl_auto_paused_at=None
+            # don't get lost just because the broker hiccuped on this
+            # tick), then bail. The kill-switch + auto-liquidation logic
+            # below needs the snapshot, so it skips this round.
+            if pending_events:
+                db.commit()
+                _flush(s.user_id, pending_events)
+                if invalidate_trader_id:
+                    _safe_invalidate(invalidate_trader_id)
             return
         todays_pl = state["todays_pl"]
         equity = state["equity"]

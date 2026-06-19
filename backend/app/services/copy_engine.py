@@ -189,9 +189,60 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # ── Phase 1: build child orders + skip records ─────────────────────────
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
-    # NOTE: there is no auto-resume sweep here. Once a subscriber is paused
-    # by any limit (daily P&L, account-pct, or auto-liquidation), copy
-    # stays OFF until they manually re-enable it from Settings.
+    # ── Daily auto-resume sweep ────────────────────────────────────────────
+    # For every subscriber whose copy was paused by a DAILY limit
+    # (daily_loss_limit / daily_profit_limit / max_account_pct_per_day,
+    # plus their _pct variants — all stamp `pnl_auto_paused_at`), check
+    # whether the pause was set on a PRIOR UTC day. If so, clear the
+    # pause + re-enable copy_enabled so today's trades flow. Keying off
+    # `pnl_auto_paused_at` (not just `copy_enabled=False`) means a
+    # subscriber who manually paused their own copy won't be re-enabled
+    # — only auto-pauses come back.
+    #
+    # Auto-liquidation (`auto_liquidation_limit`) uses a DIFFERENT column
+    # (`auto_liquidated_at`) and is not affected by this sweep —
+    # liquidation stays sticky until the subscriber manually re-enables
+    # copy. That's the intentional split: daily limits forgive on the
+    # next day, hard-equity liquidation does not.
+    #
+    # We also run the matching sweep in pnl_poller so an idle subscriber
+    # (one whose trader hasn't placed any orders today) still auto-resumes
+    # on schedule. Both sweeps clear `pnl_auto_paused_at` on success so
+    # they're idempotent against each other.
+    today_utc = datetime.now(timezone.utc).date()
+    resumed_user_ids: list[uuid.UUID] = []
+    for sub in subs:
+        paused_iso = getattr(sub, "pnl_auto_paused_at", None)
+        if not paused_iso:
+            continue
+        try:
+            paused_at = datetime.fromisoformat(paused_iso) if isinstance(paused_iso, str) else paused_iso
+        except ValueError:
+            continue
+        if paused_at.astimezone(timezone.utc).date() < today_utc:
+            db_settings = db.get(SubscriberSettings, sub.user_id)
+            if db_settings is not None:
+                db_settings.copy_enabled = True
+                db_settings.pnl_auto_paused_at = None
+                resumed_user_ids.append(sub.user_id)
+                audit.record(
+                    db,
+                    actor_user_id=sub.user_id,
+                    action="copy.auto_resumed_next_day",
+                    entity_type="subscriber_settings",
+                    entity_id=sub.user_id,
+                    metadata={"paused_at": str(paused_iso), "resumed_at": today_utc.isoformat()},
+                )
+                events.publish(sub.user_id, {
+                    "type": "copy.auto_resumed",
+                    "reason": "new_day",
+                })
+    if resumed_user_ids:
+        # Re-fetch the active subscriber list AFTER flipping copy_enabled
+        # so the per-sub loop below sees the freshly-resumed users this
+        # very fanout (otherwise they'd need a second trade to fire).
+        cache.invalidate_subscribers_for_trader(trader.id)
+        subs = await cache.get_subscribers_for_trader(db, trader.id)
 
     # Decide hybrid path first — we need it to know whether to do the
     # batched broker_accounts SELECT (we skip it for small-N to keep the

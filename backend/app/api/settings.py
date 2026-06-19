@@ -515,6 +515,24 @@ def toggle_copy(
     if not s:
         raise HTTPException(404, "settings_missing")
     s.copy_enabled = payload.copy_enabled
+    # Manual re-enable (going True) acknowledges and clears any in-flight
+    # auto-pause markers. Two reasons:
+    #   1. Avoids a spurious "Copy trading auto-resumed for the new day"
+    #      toast at the next UTC midnight, when the auto-resume sweep
+    #      would otherwise see a stale `pnl_auto_paused_at` and emit
+    #      `copy.auto_resumed` even though the user already re-enabled.
+    #   2. Prevents the auto-resume sweep from overriding a SUBSEQUENT
+    #      auto_liquidation_limit hit. Without this, the timeline
+    #      "hit daily-loss → manually re-enable → hit auto-liquidation"
+    #      would leave both `pnl_auto_paused_at` (yesterday) and
+    #      `auto_liquidated_at` (today) set, and the sweep would
+    #      incorrectly resume copy off the stale daily-limit stamp,
+    #      undoing the sticky liquidation state.
+    # Going False (manual pause) leaves the markers alone — they're
+    # already null in that case, or already accurate.
+    if payload.copy_enabled:
+        s.pnl_auto_paused_at = None
+        s.auto_liquidated_at = None
     audit.record(
         db,
         actor_user_id=user.id,

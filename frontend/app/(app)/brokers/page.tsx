@@ -504,7 +504,7 @@ export default function BrokersPage() {
   if (loading) return <PageLoading />;
 
   return (
-    <div className="space-y-5 max-w-[820px] mx-auto">
+    <div className="space-y-5 max-w-[820px]">
       <motion.div
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
