@@ -431,23 +431,6 @@ def _trigger_close(
             "broker_order_id": result.broker_order_id,
         },
     )
-    # Signed realised-P&L percent at the close limit. Anchored on the
-    # parent's limit_price first (same anchor the trader saw when they
-    # set the bracket "5% / 10%"), falling back to filled_avg_price for
-    # market entries. Sign convention: positive == gain, negative ==
-    # loss, regardless of long/short — so an SL fill on either side
-    # reads as the negative number the trader expects.
-    entry_price = entry.limit_price or entry.filled_avg_price
-    pnl_pct: str | None = None
-    if entry_price and entry_price > 0:
-        # `side` here is the CLOSE side, not the entry side. The entry
-        # side is the opposite: a SELL close means we were long; a BUY
-        # close means we were short.
-        was_long = side == OrderSide.SELL
-        direction = Decimal("1") if was_long else Decimal("-1")
-        pct = ((limit_price - entry_price) / entry_price) * Decimal("100") * direction
-        pnl_pct = f"{pct.quantize(Decimal('0.01'))}"
-
     return {
         "symbol": pos.symbol,
         "qty": str(qty),
@@ -455,8 +438,6 @@ def _trigger_close(
         "sl_price": str(entry.stop_loss_price),
         "mark": str(pos.current_price),
         "limit": str(limit_price),
-        "entry_price": str(entry_price) if entry_price is not None else None,
-        "pnl_pct": pnl_pct,
         "broker_order_id": result.broker_order_id,
         "entry_order_id": str(entry.id),
     }

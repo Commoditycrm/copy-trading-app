@@ -1006,19 +1006,11 @@ def update_bracket(
     db.execute(select(Order).where(Order.id == entry.id).with_for_update())
 
     # ── Reference price for geometry checks ──────────────────────────────
-    # Use the SAME anchor the order was originally bracketed against —
-    # ``limit_price`` for any order that had one (which is what
-    # PlaceOrderIn's bracket validator uses too) and the actual fill
-    # price as the fallback for market entries that carry a bracket.
-    # The frontend uses the same precedence to display the percentage,
-    # so what the user types as "2%" round-trips to the exact price the
-    # backend then validates against. Using filled_avg_price here while
-    # the frontend used limit_price as its display anchor caused the
-    # "buy_sl_must_be_below_entry" rejections on edits — the two ends
-    # were anchoring on different numbers and could disagree by the
-    # fill-slippage amount.
+    # Pre-fill: the limit_price (None for market entries — geometry checks
+    # are skipped if there's nothing to anchor against).
+    # Post-fill: filled_avg_price (the actual entry price).
     is_filled = entry.status == OrderStatus.FILLED
-    ref_price = entry.limit_price or entry.filled_avg_price
+    ref_price = entry.filled_avg_price if is_filled else entry.limit_price
 
     # Effective values after applying the patch. For fields the caller
     # omitted, keep the current value. For explicit-null, clear. For a
