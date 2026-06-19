@@ -467,35 +467,14 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
         qty = filled_exit.filled_quantity or filled_exit.quantity
         symbol = filled_exit.symbol or "position"
 
-        # Realised-P&L %, anchored on the entry's limit_price (same
-        # anchor the trader saw when they set the bracket "5% / 10%"),
-        # falling back to filled_avg_price for market entries. Signed:
-        # positive on TP fills, negative on SL fills, regardless of
-        # whether the entry was long or short.
-        pnl_pct_str: str | None = None
-        parent: "Order | None" = None
-        if filled_exit.bracket_parent_id is not None:
-            parent = db.get(Order, filled_exit.bracket_parent_id)
-        if parent is not None and fill_price is not None:
-            entry_price = parent.limit_price or parent.filled_avg_price
-            if entry_price and entry_price > 0:
-                was_long = parent.side == OrderSide.BUY
-                direction = Decimal("1") if was_long else Decimal("-1")
-                pct = ((fill_price - entry_price) / entry_price) * Decimal("100") * direction
-                pnl_pct_str = f"{pct.quantize(Decimal('0.01'))}"
-
         # Trader-readable message. Includes BOTH the trigger and the
-        # actual fill so they can spot slippage at a glance. The
-        # realised P&L tagline anchors the "what does this mean for
-        # me" answer right in the notification.
+        # actual fill so they can spot slippage at a glance.
         msg_parts = [f"{symbol} {leg_label} hit"]
         if trigger_price is not None:
             msg_parts.append(f"at ${trigger_price}")
         if fill_price is not None and fill_price != trigger_price:
             msg_parts.append(f"(filled ${fill_price})")
         msg_parts.append(f"— {qty} closed.")
-        if pnl_pct_str is not None:
-            msg_parts.append(f"Realised P&L: {pnl_pct_str}%.")
         message = " ".join(msg_parts)
 
         notif_svc.create_notification(
@@ -511,7 +490,6 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
                 "qty": str(qty) if qty is not None else None,
                 "trigger_price": str(trigger_price) if trigger_price is not None else None,
                 "fill_price": str(fill_price) if fill_price is not None else None,
-                "pnl_pct": pnl_pct_str,
                 "broker_order_id": filled_exit.broker_order_id,
             },
         )
