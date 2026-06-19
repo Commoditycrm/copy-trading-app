@@ -8,8 +8,8 @@ import type { User } from "@/lib/types";
 /**
  * Root landing route. Decides where to send the user based on auth + role:
  *   - not logged in → /login
- *   - trader       → /trade-panel  (their primary action surface)
- *   - subscriber   → /positions    (their primary view surface)
+ *   - admin         → /admin      (their own panel)
+ *   - everyone else → /dashboard  (role-aware overview)
  */
 export default function Home() {
   const router = useRouter();
@@ -20,7 +20,7 @@ export default function Home() {
     }
     api<User>("/api/auth/me")
       .then((u) => {
-        router.replace(u.role === "trader" ? "/trade-panel" : "/positions");
+        router.replace(u.role === "admin" ? "/admin" : "/dashboard");
       })
       .catch((e) => {
         // Stale/invalid token — clear and bounce to login.

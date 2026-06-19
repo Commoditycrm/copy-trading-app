@@ -1,7 +1,8 @@
 import enum
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Enum, String
+from sqlalchemy import Boolean, DateTime, Enum, String, false
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +30,15 @@ class User(Base, TimestampMixin):
     # role=trader, nullable here so existing rows + subscriber rows are valid.
     business_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Email verification (soft-enforced): unverified users can still log in,
+    # but the app nags them with a banner until they confirm. Existing rows
+    # were grandfathered to True by the migration.
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     broker_accounts = relationship(
         "BrokerAccount", back_populates="user", cascade="all, delete-orphan"

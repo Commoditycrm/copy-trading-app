@@ -1,18 +1,26 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { api, setTokens } from "@/lib/api";
+import { api, getAccessToken, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
+import { AuthCard } from "@/components/auth/AuthCard";
 
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Already signed in? Don't show the form — bounce to the root, which
+  // role-routes to the right landing page. Guards against an authenticated
+  // user landing back on /login via the URL, back button, or a stale link.
+  useEffect(() => {
+    if (getAccessToken()) router.replace("/");
+  }, [router]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -39,15 +47,19 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="min-h-screen grid place-items-center p-6">
-      <form
-        onSubmit={submit}
-        className="card w-full max-w-md p-8 space-y-5"
-      >
-        <div className="text-center">
-          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>Sign In</div>
-        </div>
-
+    <AuthCard
+      title="Welcome back"
+      subtitle="Sign in to your account"
+      footer={
+        <>
+          New here?{" "}
+          <Link href="/register" className="underline" style={{ color: "var(--accent)" }}>
+            Create an account
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={submit} className="space-y-5">
         <div className="space-y-3">
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
@@ -76,6 +88,11 @@ export default function LoginPage() {
               autoComplete="current-password" placeholder="••••••••"
               value={password} onChange={(e) => setPassword(e.target.value)} required
             />
+            <div className="text-right mt-1.5">
+              <Link href="/forgot-password" className="text-xs underline" style={{ color: "var(--muted)" }}>
+                Forgot password?
+              </Link>
+            </div>
           </div>
         </div>
 
@@ -86,11 +103,7 @@ export default function LoginPage() {
           <span>Sign in</span>
           {loading && <Spinner />}
         </button>
-
-        <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
-          New here? <Link href="/register" className="underline" style={{ color: "var(--accent)" }}>Create an account</Link>
-        </div>
       </form>
-    </main>
+    </AuthCard>
   );
 }

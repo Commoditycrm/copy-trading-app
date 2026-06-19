@@ -101,6 +101,15 @@ export function ListenerPill({ role }: Props) {
     return `${prefix} ${label.toLowerCase()} · ${last}`;
   })();
 
+  // Visible text — avoid prepending the "broker" prefix to states whose label
+  // already stands alone (otherwise: "Trader's broker no trader followed" and
+  // "Trader's broker broker disconnected").
+  const display = (() => {
+    if (s === "no_trader") return "No trader followed";
+    if (s === "credentials_invalid") return `${prefix} disconnected`;
+    return `${prefix} ${label.toLowerCase()}`;
+  })();
+
   return (
     <div
       title={tooltip}
@@ -120,7 +129,7 @@ export function ListenerPill({ role }: Props) {
           boxShadow: s === "connected" ? `0 0 6px ${color}` : "none",
         }}
       />
-      <span className="whitespace-nowrap">{prefix} {label.toLowerCase()}</span>
+      <span className="whitespace-nowrap">{display}</span>
     </div>
   );
 }
