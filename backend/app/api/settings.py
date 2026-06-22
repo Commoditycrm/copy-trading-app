@@ -58,6 +58,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         todays_realized_pnl=today_realized_pnl(db, s.user_id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
+        retry_max_attempts=s.retry_max_attempts,
         symbol_exclusion_list=list(s.symbol_exclusion_list or []),
         symbol_inclusion_list=list(s.symbol_inclusion_list or []),
         max_per_contract=s.max_per_contract,
@@ -413,7 +414,7 @@ def set_retry_interval(
         except ValueError:
             raise HTTPException(422, f"invalid retry_interval: {value!r}")
 
-    changes: dict[str, str] = {}
+    changes: dict[str, object] = {}
     if payload.retry_interval_open is not None:
         new_open = _parse(payload.retry_interval_open)
         if new_open != s.retry_interval_open:
@@ -424,6 +425,10 @@ def set_retry_interval(
         if new_close != s.retry_interval_close:
             changes["retry_interval_close"] = new_close.value
             s.retry_interval_close = new_close
+    if payload.retry_max_attempts is not None:
+        if payload.retry_max_attempts != s.retry_max_attempts:
+            changes["retry_max_attempts"] = payload.retry_max_attempts
+            s.retry_max_attempts = payload.retry_max_attempts
 
     if changes:
         audit.record(

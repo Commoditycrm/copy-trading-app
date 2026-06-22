@@ -16,6 +16,11 @@ const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
   { value: "5m", label: "After 5 min" },
 ];
 
+const RETRY_COUNT_OPTIONS = [1, 2, 3, 4, 5].map(n => ({
+  value: String(n),
+  label: n === 1 ? "1 retry" : `${n} retries`,
+}));
+
 /** Cross-navigation cache for the pnl.tick payload fields the Risk
  *  Controls panel renders.
  *
@@ -436,6 +441,18 @@ export default function SettingsPage() {
     }
   }
 
+  async function setRetryMaxAttempts(value: number) {
+    try {
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/retry-interval",
+        { method: "PATCH", body: JSON.stringify({ retry_max_attempts: value }) },
+      );
+      setSub(s);
+    } catch (e) {
+      notify.fromError(e, "Could not update retry count");
+    }
+  }
+
   async function saveSymbolFilter(
     which: "symbol_exclusion_list" | "symbol_inclusion_list",
     next: string[],
@@ -819,7 +836,7 @@ export default function SettingsPage() {
             title="Retry on broker errors"
             hint="For transient failures only (network / 5xx / rate-limit). User-fixable errors never retry."
           >
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <Field label="Opening positions">
                 <SelectInput
                   value={sub.retry_interval_open}
@@ -832,6 +849,13 @@ export default function SettingsPage() {
                   value={sub.retry_interval_close}
                   onChange={(v) => setRetryInterval("close", v as RetryInterval)}
                   options={RETRY_OPTIONS.map(o => ({ value: o.value, label: o.label }))}
+                />
+              </Field>
+              <Field label="Max retries">
+                <SelectInput
+                  value={String(sub.retry_max_attempts ?? 1)}
+                  onChange={(v) => setRetryMaxAttempts(Number(v))}
+                  options={RETRY_COUNT_OPTIONS}
                 />
               </Field>
             </div>
