@@ -2,6 +2,7 @@ from app.models.audit_log import AuditLog
 from app.models.base import Base
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_equity_snapshot import DailyEquitySnapshot
+from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.notification import Notification
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
@@ -15,6 +16,7 @@ __all__ = [
     "DailyEquitySnapshot",
     "Fill",
     "InstrumentType",
+    "LoadTestRun",
     "Notification",
     "Order",
     "OrderSide",
@@ -22,6 +24,7 @@ __all__ = [
     "OrderType",
     "RetryInterval",
     "SubscriberSettings",
+    "TestResult",
     "TraderSettings",
     "User",
     "UserRole",
