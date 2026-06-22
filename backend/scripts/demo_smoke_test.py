@@ -525,7 +525,33 @@ def run_model_smoke_tests() -> None:
 
 # ── Main ------------------------------------------------------------------
 
+def _record_results(passed: int, failed: int, duration_ms: int) -> None:
+    """Best-effort: persist this run to the ``test_results`` table so the admin
+    dashboard's Testing panel can show it. Opt-in via ``--record`` or
+    SMOKE_RECORD=1 (so ad-hoc local runs don't spam rows). Never fails the run.
+    """
+    try:
+        from app.database import SessionLocal
+        from app.models.dashboard_metrics import TestResult
+        with SessionLocal() as db:
+            db.add(TestResult(
+                suite="smoke",
+                passed=passed,
+                failed=failed,
+                skipped=0,
+                duration_ms=duration_ms,
+                source="smoke",
+                commit_sha=(os.getenv("GIT_COMMIT") or os.getenv("GITHUB_SHA") or None),
+            ))
+            db.commit()
+        print("  ↳ recorded run to test_results (dashboard Testing panel)")
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort
+        print(f"  ↳ could not record results: {exc}")
+
+
 def main() -> int:
+    import time
+    started = time.monotonic()
     print("\n══════════════════════════════════════════════════════════════")
     print("  DEMO SMOKE TEST")
     print(f"  {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
@@ -546,9 +572,14 @@ def main() -> int:
 
     passed = sum(1 for _, ok, _ in _results if ok)
     failed = sum(1 for _, ok, _ in _results if not ok)
+    duration_ms = int((time.monotonic() - started) * 1000)
     print(f"\n══════════════════════════════════════════════════════════════")
     print(f"  RESULT: {passed} passed · {failed} failed · {len(_results)} total")
     print("══════════════════════════════════════════════════════════════")
+
+    if "--record" in sys.argv or os.getenv("SMOKE_RECORD") == "1":
+        _record_results(passed, failed, duration_ms)
+
     if failed:
         print("\nFailed tests:")
         for name, ok, reason in _results:
