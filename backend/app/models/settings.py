@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -165,6 +165,12 @@ class SubscriberSettings(Base, TimestampMixin):
     retry_interval_close: Mapped[RetryInterval] = mapped_column(
         Enum(RetryInterval, name="retry_interval"),
         default=RetryInterval.NEVER, server_default="never", nullable=False,
+    )
+    # How many additional attempts to make after the original failure.
+    # 1 = current behaviour (one retry), max 5. Only consulted when
+    # retry_interval_open/close is not "never".
+    retry_max_attempts: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False,
     )
 
     # Per-subscriber symbol filters. Both stored as JSONB arrays of

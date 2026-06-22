@@ -166,15 +166,17 @@ class Order(Base, TimestampMixin):
     # ── Retry policy (transient broker errors) ──────────────────────────
     # Set on a child order whose broker call returned a transient error
     # (5xx, 429, timeout, connection reset). The retry_scheduler picks
-    # rows up where retry_at <= now() AND retry_attempted=false and tries
-    # the broker call once more. is_closing distinguishes opening vs
-    # closing intent so the subscriber's open/close retry interval can
-    # be applied. See alembic migration b3c1d4e2a51f for details.
+    # rows up where retry_at <= now() and tries again, up to
+    # subscriber_settings.retry_max_attempts times. is_closing
+    # distinguishes opening vs closing intent so the subscriber's
+    # open/close retry interval can be applied.
     retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    retry_attempted: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False
+    # Counts how many retry attempts have been made so far (0 = none yet).
+    # Replaces the old boolean retry_attempted; supports 1-5 retries.
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
     )
     is_closing: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False

@@ -664,7 +664,28 @@ class SnapTradeAdapter(BrokerAdapter):
         )
 
     def cancel_order(self, broker_order_id: str) -> None:
-        """SnapTrade's cancel endpoint takes brokerage_order_id."""
+        """SnapTrade's cancel endpoint takes brokerage_order_id.
+
+        Idempotent against terminal-state orders. When the underlying
+        broker has already cancelled / filled / expired the order before
+        SnapTrade's cancel call reaches it, SnapTrade returns 400 with
+        ``code: '1070'`` and ``detail: "Failed to cancel order with
+        provided brokerage_order_id"``. From the caller's perspective the
+        desired end state ("order is no longer working") is already
+        achieved, so we swallow that specific error and return cleanly
+        instead of bubbling it up to the user as a hard broker error.
+
+        Typical trigger: trader cancels the order in Webull's own app,
+        then a few seconds later clicks Cancel on our Order History
+        (because our DB hadn't synced the terminal status yet). Without
+        this swallow they get a confusing "broker rejected" toast even
+        though the actual broker state matches what they wanted.
+
+        After this returns, the endpoint flips local status to
+        CANCELED. If the broker had actually FILLED (not cancelled) the
+        order, our DB row says CANCELED for the brief window until
+        fills_sync's next tick corrects it.
+        """
         try:
             self._c().trading.cancel_user_account_order(
                 account_id=self._account_id,
@@ -673,6 +694,19 @@ class SnapTradeAdapter(BrokerAdapter):
                 brokerage_order_id=broker_order_id,
             )
         except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            # SnapTrade's error envelope varies slightly across SDK
+            # versions (quote style on the parsed body, presence of
+            # the ``code`` key). Check both the numeric code and the
+            # English detail to be robust.
+            if "'code': '1070'" in err or '"code": "1070"' in err \
+               or "Failed to cancel order with provided brokerage_order_id" in err:
+                log.info(
+                    "snaptrade cancel_order: broker_order_id=%s already in "
+                    "terminal state (code 1070) — treating as success",
+                    broker_order_id,
+                )
+                return
             raise RuntimeError(f"SnapTrade cancel_order: {exc}") from exc
 
     # ── positions ─────────────────────────────────────────────────────────

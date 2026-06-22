@@ -155,6 +155,8 @@ export interface SubscriberSettings {
   retry_interval_open: RetryInterval;
   /** Retry policy for transient broker errors when *closing* a position. */
   retry_interval_close: RetryInterval;
+  /** How many additional retries after the original failure (1–5, default 1). */
+  retry_max_attempts: number;
   /** Subscriber's symbol denylist — trader trades on these symbols are
    *  NOT mirrored to this subscriber. Empty = no filter. Uppercase. */
   symbol_exclusion_list: string[];
