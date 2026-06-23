@@ -19,6 +19,7 @@ loads the page.
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -47,6 +48,49 @@ class ListenerStatus:
 # before serialising.
 _status: dict[uuid.UUID, ListenerStatus] = {}
 
+# Cross-process mirror — listeners run in the worker process, but the admin
+# dashboard (web tier) needs to read every listener's state. So each update is
+# also written to Redis (best-effort); the in-process map stays the fast path
+# for the per-trader reads on the same process.
+_REDIS_PREFIX = "listener:state:"
+
+
+def _status_to_dict(s: ListenerStatus) -> dict:
+    return {
+        "state": s.state,
+        "last_event_at": s.last_event_at.isoformat() if s.last_event_at else None,
+        "state_changed_at": s.state_changed_at.isoformat(),
+        "last_error": s.last_error,
+    }
+
+
+def _mirror_to_redis(trader_user_id: uuid.UUID, status: ListenerStatus) -> None:
+    """Best-effort persist to Redis so the web tier can read live state. Never
+    raises — a Redis hiccup must not disturb a listener."""
+    try:
+        from app.services.redis_client import get_sync_redis
+        get_sync_redis().set(_REDIS_PREFIX + str(trader_user_id), json.dumps(_status_to_dict(status)))
+    except Exception:  # noqa: BLE001
+        log.debug("listener_state redis mirror failed", exc_info=True)
+
+
+def get_all_statuses() -> dict[str, dict]:
+    """Every listener's status (cross-process, from the Redis mirror), keyed by
+    trader_id string. Falls back to this process's in-memory map on Redis error."""
+    try:
+        from app.services.redis_client import get_sync_redis
+        r = get_sync_redis()
+        out: dict[str, dict] = {}
+        for key in r.scan_iter(match=_REDIS_PREFIX + "*"):
+            kstr = key.decode() if isinstance(key, bytes) else key
+            raw = r.get(kstr)
+            if raw:
+                out[kstr[len(_REDIS_PREFIX):]] = json.loads(raw)
+        return out
+    except Exception:  # noqa: BLE001
+        log.warning("listener_state get_all_statuses redis failed; using local map")
+        return {str(tid): _status_to_dict(s) for tid, s in _status.items()}
+
 
 def get_status(trader_user_id: uuid.UUID) -> ListenerStatus | None:
     return _status.get(trader_user_id)
@@ -70,6 +114,7 @@ def set_state(
         last_error=error,
     )
     _status[trader_user_id] = new
+    _mirror_to_redis(trader_user_id, new)
     if not prev or prev.state != state:
         log.info("listener[%s] %s", trader_user_id, state)
         _broadcast_state_changed(trader_user_id, new)
@@ -81,12 +126,18 @@ def bump_last_event(trader_user_id: uuid.UUID) -> None:
         s = ListenerStatus(state="connected")
         _status[trader_user_id] = s
     s.last_event_at = datetime.now(timezone.utc)
+    _mirror_to_redis(trader_user_id, s)
 
 
 def clear(trader_user_id: uuid.UUID) -> None:
     """Drop the entry entirely (used on broker disconnect so the pill
     doesn't show a stale 'disconnected' for a deleted broker)."""
     _status.pop(trader_user_id, None)
+    try:
+        from app.services.redis_client import get_sync_redis
+        get_sync_redis().delete(_REDIS_PREFIX + str(trader_user_id))
+    except Exception:  # noqa: BLE001
+        log.debug("listener_state redis clear failed", exc_info=True)
 
 
 def _broadcast_state_changed(trader_user_id: uuid.UUID, status: ListenerStatus) -> None:
