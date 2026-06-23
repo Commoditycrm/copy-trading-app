@@ -746,6 +746,112 @@ def admin_record_load_test_run(
     return _loadrun_out(r)
 
 
+# ─── Broker-connection health ─────────────────────────────────────────────────
+#
+# DB-backed (broker_accounts), so it's readable from the web tier. Surfaces
+# accounts whose mirrors WON'T fire — disconnected / errored connections,
+# auto-pull turned off, or a stale last-sync.
+
+
+@router.get("/broker-health")
+def admin_broker_health(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    only_problems: bool = False,
+) -> dict:
+    """Every connected broker account with its connection health. An account is
+    'healthy' only if connection_status == 'connected' AND auto_pull_orders is
+    on — otherwise its owner's mirrors won't fire."""
+    rows = list(db.execute(select(BrokerAccount)).scalars())
+    user_ids = {a.user_id for a in rows}
+    users = {u.id: u for u in db.execute(
+        select(User).where(User.id.in_(user_ids))
+    ).scalars()} if user_ids else {}
+
+    def _label(a: BrokerAccount) -> str:
+        if a.broker == BrokerName.SNAPTRADE and a.brokerage_name:
+            return f"{a.brokerage_name} (ST)"
+        return (a.broker.value if a.broker else None) or a.label
+
+    accounts = []
+    for a in rows:
+        u = users.get(a.user_id)
+        healthy = a.connection_status == "connected" and a.auto_pull_orders
+        accounts.append({
+            "user_email": u.email if u else None,
+            "user_name": u.display_name if u else None,
+            "broker": _label(a),
+            "is_paper": a.is_paper,
+            "connection_status": a.connection_status,
+            "last_error": a.last_error,
+            "auto_pull_orders": a.auto_pull_orders,
+            "last_activity_sync_at": a.last_activity_sync_at.isoformat() if a.last_activity_sync_at else None,
+            "balance_updated_at": a.balance_updated_at.isoformat() if a.balance_updated_at else None,
+            "healthy": healthy,
+        })
+    if only_problems:
+        accounts = [x for x in accounts if not x["healthy"]]
+    # Problems first, then by broker.
+    accounts.sort(key=lambda x: (x["healthy"], x["broker"] or ""))
+
+    summary = {
+        "total": len(rows),
+        "connected": sum(1 for a in rows if a.connection_status == "connected"),
+        "problems": sum(1 for a in rows if a.connection_status != "connected"),
+        "auto_pull_off": sum(1 for a in rows if not a.auto_pull_orders),
+    }
+    return {"summary": summary, "accounts": accounts}
+
+
+# ─── Listener health ──────────────────────────────────────────────────────────
+#
+# Listener state lives in the worker process (in-memory) and is mirrored to
+# Redis by listener_state, so the web tier can read every trader's current
+# detection-listener state here. A down listener = that trader's trades aren't
+# detected and nothing mirrors.
+
+
+@router.get("/listener-health")
+def admin_listener_health(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services import listener_state  # noqa: PLC0415
+
+    statuses = listener_state.get_all_statuses()  # {trader_id_str: status_dict}
+    trader_ids = []
+    for t in statuses:
+        try:
+            trader_ids.append(uuid.UUID(t))
+        except ValueError:
+            continue
+    traders = {str(u.id): u for u in db.execute(
+        select(User).where(User.id.in_(trader_ids))
+    ).scalars()} if trader_ids else {}
+
+    listeners = []
+    for tid, st in statuses.items():
+        u = traders.get(tid)
+        listeners.append({
+            "trader_id": tid,
+            "trader_email": u.email if u else None,
+            "trader_name": u.display_name if u else None,
+            "state": st.get("state"),
+            "last_event_at": st.get("last_event_at"),
+            "state_changed_at": st.get("state_changed_at"),
+            "last_error": st.get("last_error"),
+        })
+    # Down/degraded first, then by trader.
+    listeners.sort(key=lambda x: (x["state"] == "connected", x["trader_email"] or ""))
+
+    summary = {
+        "total": len(listeners),
+        "connected": sum(1 for x in listeners if x["state"] == "connected"),
+        "down": sum(1 for x in listeners if x["state"] != "connected"),
+    }
+    return {"summary": summary, "listeners": listeners}
+
+
 # ── Platform-config: fanout batch threshold ─────────────────────────────────
 #
 # Runtime-tunable knob that copy_engine reads on every fanout to decide

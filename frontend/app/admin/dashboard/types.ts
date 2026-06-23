@@ -179,3 +179,36 @@ export function lagColor(v: number | null | undefined): string {
   if (v === null || v === undefined) return "var(--muted)";
   return v <= 1500 ? "var(--good)" : v <= 4000 ? "#facc15" : "var(--bad)";
 }
+
+// Broker-connection health from GET /api/admin/broker-health.
+export interface BrokerHealthAccount {
+  user_email: string | null;
+  user_name: string | null;
+  broker: string;
+  is_paper: boolean;
+  connection_status: string;
+  last_error: string | null;
+  auto_pull_orders: boolean;
+  last_activity_sync_at: string | null;
+  balance_updated_at: string | null;
+  healthy: boolean;
+}
+export interface BrokerHealth {
+  summary: { total: number; connected: number; problems: number; auto_pull_off: number };
+  accounts: BrokerHealthAccount[];
+}
+
+// Per-trader detection-listener state from GET /api/admin/listener-health.
+export interface ListenerHealthRow {
+  trader_id: string;
+  trader_email: string | null;
+  trader_name: string | null;
+  state: string; // connecting | connected | reconnecting | disconnected | credentials_invalid | mfa_required
+  last_event_at: string | null;
+  state_changed_at: string | null;
+  last_error: string | null;
+}
+export interface ListenerHealth {
+  summary: { total: number; connected: number; down: number };
+  listeners: ListenerHealthRow[];
+}

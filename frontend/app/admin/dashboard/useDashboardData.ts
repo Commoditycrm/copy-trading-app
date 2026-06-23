@@ -5,8 +5,10 @@ import type { DependencyList } from "react";
 import { api } from "@/lib/api";
 import {
   buildQuery,
+  type BrokerHealth,
   type BrokerStat,
   type Filters,
+  type ListenerHealth,
   type LoadTestRun,
   type PerfData,
   type TestSuiteResult,
@@ -44,6 +46,8 @@ export interface DashboardData {
   byBroker: Resource<BrokerStat[]>;
   tests: Resource<TestSuiteResult[]>;
   loadTests: Resource<LoadTestRun[]>;
+  brokerHealth: Resource<BrokerHealth>;
+  listenerHealth: Resource<ListenerHealth>;
   refresh: () => void;
 }
 
@@ -68,7 +72,11 @@ export function useDashboardData(filters: Filters): DashboardData {
   const tests = useResource<TestSuiteResult[]>(() => "/api/admin/tests/latest", [refreshKey]);
   const loadTests = useResource<LoadTestRun[]>(() => "/api/admin/load-test/history?limit=20", [refreshKey]);
 
+  // System health — also global; refetch on refresh / SSE.
+  const brokerHealth = useResource<BrokerHealth>(() => "/api/admin/broker-health", [refreshKey]);
+  const listenerHealth = useResource<ListenerHealth>(() => "/api/admin/listener-health", [refreshKey]);
+
   // Keep a ref so SSE handlers (M5) can trigger a refresh without re-subscribing.
   const refreshRef = useRef(() => setRefreshKey((k) => k + 1));
-  return { perf, byBroker, tests, loadTests, refresh: refreshRef.current };
+  return { perf, byBroker, tests, loadTests, brokerHealth, listenerHealth, refresh: refreshRef.current };
 }

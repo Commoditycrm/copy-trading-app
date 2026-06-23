@@ -10,6 +10,8 @@ import { PlatformBrokerSplit } from "./PlatformBrokerSplit";
 import { BrokerLeaderboard } from "./BrokerLeaderboard";
 import { TestPanel } from "./TestPanel";
 import { LoadTestHistory } from "./LoadTestHistory";
+import { BrokerHealthPanel } from "./BrokerHealthPanel";
+import { ListenerHealthPanel } from "./ListenerHealthPanel";
 import { useDashboardData } from "./useDashboardData";
 import { DEFAULT_FILTERS, type Filters, type RangeKey } from "./types";
 
@@ -82,7 +84,7 @@ export default function AdminDashboardPage() {
     });
   }, []);
 
-  const { perf, byBroker, tests, loadTests, refresh } = useDashboardData(filters);
+  const { perf, byBroker, tests, loadTests, brokerHealth, listenerHealth, refresh } = useDashboardData(filters);
 
   // Live updates: any order.* event debounce-refetches all panels (one fanout
   // emits ~N child events, so debounce collapses them into a single refresh).
@@ -150,6 +152,16 @@ export default function AdminDashboardPage() {
         </div>
         <Section title="Platform vs broker" subtitle="Who owns the time.">
           <PlatformBrokerSplit metrics={perf.data?.metrics ?? null} loading={perf.loading} />
+        </Section>
+      </div>
+
+      {/* System health — is copy-trading actually working right now? */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Section title="Listener health" subtitle="Detection listeners — a down listener means that trader's trades aren't detected.">
+          <ListenerHealthPanel data={listenerHealth.data} loading={listenerHealth.loading} />
+        </Section>
+        <Section title="Broker-connection health" subtitle="Accounts whose mirrors won't fire — disconnected, auto-pull off, or stale.">
+          <BrokerHealthPanel data={brokerHealth.data} loading={brokerHealth.loading} />
         </Section>
       </div>
 
