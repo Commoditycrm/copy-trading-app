@@ -477,7 +477,7 @@ def run_user_business_name_tests() -> None:
     def _():
         try:
             RegisterIn(
-                email="t@example.com", password="x" * 8,
+                email="t@example.com", password="Abcdef1!",
                 role="trader", display_name=None, business_name=None,
             )
             raise AssertionError("expected ValidationError for missing business_name")
@@ -487,7 +487,7 @@ def run_user_business_name_tests() -> None:
     @test("RegisterIn forces business_name=None for subscriber")
     def _():
         r = RegisterIn(
-            email="s@example.com", password="x" * 8,
+            email="s@example.com", password="Abcdef1!",
             role="subscriber", business_name="should be discarded",
         )
         assert r.business_name is None

@@ -109,6 +109,7 @@ export default function SettingsPage() {
   const [posTpBusy, setPosTpBusy] = useState(false);
   const [posSlInput, setPosSlInput] = useState("");
   const [posSlBusy, setPosSlBusy] = useState(false);
+  const [copyBracketBusy, setCopyBracketBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
   // equity at yesterday's close). Hydrated from sessionStorage so
   // navigating away and back keeps the last value visible while the
@@ -426,6 +427,25 @@ export default function SettingsPage() {
       setPosSlBusy(false);
     }
   }
+  async function setCopyTraderBracket(next: boolean) {
+    setCopyBracketBusy(true);
+    try {
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/copy-trader-bracket",
+        { method: "PATCH", body: JSON.stringify({ copy_trader_bracket: next }) },
+      );
+      setSub(s);
+      notify.success(
+        next
+          ? "Now copying the trader's SL/TP on each trade"
+          : "Using your own per-position TP/SL",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update SL/TP source");
+    } finally {
+      setCopyBracketBusy(false);
+    }
+  }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
     try {
       const body = direction === "open"
@@ -602,25 +622,46 @@ export default function SettingsPage() {
             hint="Loss / profit / size / capital caps. When any live limit is hit, copy turns OFF for the day and auto-resumes the next UTC day."
           >
             <div className="space-y-2.5">
+              {/* SL/TP source toggle — choose between copying the trader's
+                  per-trade SL/TP (re-anchored onto your own fill) and using
+                  your own per-position TP/SL below. Mutually exclusive: when
+                  ON, the Individual Position row below is ignored. */}
+              <CopyTraderBracketRow
+                enabled={sub.copy_trader_bracket}
+                busy={copyBracketBusy}
+                onToggle={() => setCopyTraderBracket(!sub.copy_trader_bracket)}
+              />
+
               {/* Individual Position (TP/SL) — surfaced FIRST so the
                   most-used per-position control sits at the top of the
                   Risk Controls table. Doesn't share the Limit /
                   Threshold / Today / Headroom / Used column layout
                   (it has two inputs, no live readouts), so the column
                   legend renders BELOW this row, right above the
-                  LimitRow grid where those columns actually apply. */}
-              <PositionTpSlRow
-                tpInput={posTpInput}
-                onTpInput={setPosTpInput}
-                tpBusy={posTpBusy}
-                onTpSave={savePosTp}
-                tpCurrent={sub.position_tp_pct}
-                slInput={posSlInput}
-                onSlInput={setPosSlInput}
-                slBusy={posSlBusy}
-                onSlSave={savePosSl}
-                slCurrent={sub.position_sl_pct}
-              />
+                  LimitRow grid where those columns actually apply.
+                  Dimmed + labelled "overridden" while the subscriber is
+                  copying the trader's bracket — those exits take over. */}
+              <div
+                className={sub.copy_trader_bracket ? "opacity-40" : ""}
+                title={
+                  sub.copy_trader_bracket
+                    ? "Ignored while 'Copy trader's SL/TP' is on"
+                    : undefined
+                }
+              >
+                <PositionTpSlRow
+                  tpInput={posTpInput}
+                  onTpInput={setPosTpInput}
+                  tpBusy={posTpBusy}
+                  onTpSave={savePosTp}
+                  tpCurrent={sub.position_tp_pct}
+                  slInput={posSlInput}
+                  onSlInput={setPosSlInput}
+                  slBusy={posSlBusy}
+                  onSlSave={savePosSl}
+                  slCurrent={sub.position_sl_pct}
+                />
+              </div>
 
               {/* Desktop column legend for the LimitRow grid below.
                   Hidden on mobile where rows stack their own labels.
@@ -1330,6 +1371,76 @@ function LimitRow({
  *  its own Save button. Matches LimitRow's visual rhythm (left accent
  *  rail, rounded card, inset shadow) so the row sits naturally inside
  *  the Risk Controls table. */
+/** Toggle row: copy the trader's per-trade SL/TP (re-anchored onto the
+ *  subscriber's own fill) vs use the subscriber's own per-position TP/SL.
+ *  Mutually exclusive — when ON, position_enforcer skips this subscriber
+ *  and the trader's bracket manages every exit. Visual rhythm matches the
+ *  other Risk Controls rows (accent rail, rounded card, inset shadow). */
+function CopyTraderBracketRow({
+  enabled, busy, onToggle,
+}: {
+  enabled: boolean;
+  busy: boolean;
+  onToggle: () => void;
+}) {
+  const ACCENT = "#6366f1";
+  return (
+    <div
+      className="relative rounded-xl border overflow-hidden flex items-center gap-3 p-3 pl-4"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.005) 60%, rgba(0,0,0,0.15) 100%)",
+        borderColor: enabled ? `${ACCENT}66` : "var(--border)",
+        boxShadow:
+          "inset 0 1px 0 rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.2)",
+      }}
+    >
+      <div
+        aria-hidden
+        className="absolute left-0 top-0 bottom-0 w-1"
+        style={{ background: enabled ? ACCENT : "var(--border)" }}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold leading-tight">
+          Copy trader&apos;s SL/TP
+        </div>
+        <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+          {enabled
+            ? "Each trade mirrors the trader's stop-loss / take-profit, re-anchored to your own fill. Your per-position TP/SL below is ignored."
+            : "Off — you use your own per-position TP/SL below. Turn on to copy the trader's SL/TP on every trade instead."}
+        </div>
+      </div>
+      {/* Switch */}
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        disabled={busy}
+        onClick={onToggle}
+        className="relative shrink-0 rounded-full transition-colors"
+        style={{
+          width: 44,
+          height: 24,
+          background: enabled ? ACCENT : "var(--border)",
+          opacity: busy ? 0.6 : 1,
+          cursor: busy ? "default" : "pointer",
+        }}
+        title={enabled ? "Switch to your own per-position TP/SL" : "Copy the trader's SL/TP"}
+      >
+        <span
+          className="absolute top-0.5 rounded-full bg-white transition-all"
+          style={{
+            width: 20,
+            height: 20,
+            left: enabled ? 22 : 2,
+            boxShadow: "0 1px 2px rgba(0,0,0,0.35)",
+          }}
+        />
+      </button>
+    </div>
+  );
+}
+
 function PositionTpSlRow({
   tpInput, onTpInput, tpBusy, onTpSave, tpCurrent,
   slInput, onSlInput, slBusy, onSlSave, slCurrent,

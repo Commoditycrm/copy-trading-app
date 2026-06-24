@@ -49,6 +49,9 @@ class CachedSubscriber:
     # back/forth as JSON lists.
     symbol_exclusion_list: tuple[str, ...] = ()
     symbol_inclusion_list: tuple[str, ...] = ()
+    # When True the subscriber copies the trader's per-trade SL/TP. Read in
+    # fanout to decide whether to stamp the percent bracket onto the child.
+    copy_trader_bracket: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,7 @@ def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
         # JSON lists.
         "symbol_exclusion_list": list(s.symbol_exclusion_list or []),
         "symbol_inclusion_list": list(s.symbol_inclusion_list or []),
+        "copy_trader_bracket": bool(getattr(s, "copy_trader_bracket", False)),
     }
 
 
@@ -109,6 +113,7 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         pnl_auto_paused_at=d.get("pnl_auto_paused_at"),
         symbol_exclusion_list=tuple(d.get("symbol_exclusion_list") or ()),
         symbol_inclusion_list=tuple(d.get("symbol_inclusion_list") or ()),
+        copy_trader_bracket=bool(d.get("copy_trader_bracket", False)),
     )
 
 
@@ -177,6 +182,7 @@ async def get_subscribers_for_trader(
             pnl_auto_paused_at=row.pnl_auto_paused_at.isoformat() if row.pnl_auto_paused_at else None,
             symbol_exclusion_list=tuple(row.symbol_exclusion_list or ()),
             symbol_inclusion_list=tuple(row.symbol_inclusion_list or ()),
+            copy_trader_bracket=bool(row.copy_trader_bracket),
         )
         for row in rows
     ]

@@ -10,6 +10,7 @@ import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { NotificationBell } from "@/components/NotificationBell";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
 
 function IconGrid() {
@@ -19,15 +20,6 @@ function IconGrid() {
       <rect x="14" y="3" width="7" height="7" rx="1.5" />
       <rect x="14" y="14" width="7" height="7" rx="1.5" />
       <rect x="3" y="14" width="7" height="7" rx="1.5" />
-    </svg>
-  );
-}
-
-function IconBell() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
     </svg>
   );
 }
@@ -229,11 +221,6 @@ function CopySwitch({
     >
       {!collapsed && (
         <div className="flex items-center gap-2 min-w-0">
-          <span
-            className={on ? "pulse-dot" : ""}
-            style={{ width: 7, height: 7, borderRadius: 9999, background: on ? "var(--good)" : "var(--muted)", color: "var(--good)", display: "inline-block", flexShrink: 0 }}
-            aria-hidden
-          />
           <span className="text-sm font-medium truncate">Copy trading</span>
         </div>
       )}
@@ -661,6 +648,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             border: "1px solid var(--border)",
             backdropFilter: "blur(10px)",
             boxShadow: "var(--shadow-card)",
+            // Lift the whole header (and the notification dropdown that
+            // renders inside it) above the scrollable <main> content. The
+            // backdrop-filter above already makes the header its own
+            // stacking context, so without an explicit z-index the cards in
+            // <main> (later in the DOM) paint on top of the open dropdown.
+            position: "relative",
+            zIndex: 50,
           }}
         >
           {/* Left: hamburger (mobile only) + listener/SSE status pills. */}
@@ -682,33 +676,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           {/* Right: theme toggle + bell + who's signed in + role chip. */}
           <div className="flex items-center gap-2 sm:gap-3">
             <ThemeToggle />
-            <button
-              type="button"
-              onClick={() => router.push("/notifications")}
-              title={unreadCount > 0 ? `${unreadCount} unread notification(s)` : "Notifications"}
-              aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
-              className="relative grid place-items-center rounded-full transition-colors focus-ring"
-              style={{
-                width: 32, height: 32,
-                background: "var(--chip-bg)",
-                border: "1px solid var(--border)",
-                color: unreadCount > 0 ? "var(--accent)" : "var(--text-2)",
-              }}
-            >
-              <IconBell />
-              {unreadCount > 0 && (
-                <span
-                  className="absolute text-[10px] font-bold rounded-full grid place-items-center"
-                  style={{
-                    top: -4, right: -4, minWidth: 16, height: 16, padding: "0 4px",
-                    background: "var(--bad)", color: "#fff",
-                    border: "1px solid var(--panel)", lineHeight: 1,
-                  }}
-                >
-                  {unreadCount > 99 ? "99+" : unreadCount}
-                </span>
-              )}
-            </button>
+            <NotificationBell unreadCount={unreadCount} onChanged={refreshUnreadCount} />
             <div
               className="grid place-items-center rounded-full shrink-0"
               style={{

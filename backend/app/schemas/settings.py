@@ -35,6 +35,10 @@ class SubscriberSettingsOut(BaseModel):
     # the daily kill switches and of auto_liquidation_limit.
     position_tp_pct: Decimal | None = None
     position_sl_pct: Decimal | None = None
+    # When True the subscriber copies the trader's per-trade SL/TP
+    # (re-anchored onto their own fill) instead of using the per-position
+    # TP/SL above. The two are mutually exclusive — see position_enforcer.
+    copy_trader_bracket: bool = False
     # Percent of account equity (0–100). pnl_poller checks every 60s using
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
@@ -163,6 +167,14 @@ class AutoLiquidationLimitIn(BaseModel):
     copy_enabled=False until they manually re-enable."""
 
     auto_liquidation_limit: Decimal | None = Field(default=None, gt=0)
+
+
+class CopyTraderBracketIn(BaseModel):
+    """Toggle whether the subscriber copies the trader's per-trade SL/TP
+    (re-anchored onto their own fill) instead of their own per-position
+    TP/SL %. The two are mutually exclusive."""
+
+    copy_trader_bracket: bool
 
 
 class RetryIntervalIn(BaseModel):

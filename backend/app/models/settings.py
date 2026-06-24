@@ -140,6 +140,19 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(5, 2), nullable=True,
     )
 
+    # When True, this subscriber COPIES the trader's per-trade SL/TP instead
+    # of using their own position_tp_pct / position_sl_pct. copy_engine
+    # records the trader's bracket as a percent distance on each mirrored
+    # entry (Order.take_profit_pct / stop_loss_pct), and the bracket
+    # emulator re-anchors it onto the subscriber's own fill when the entry
+    # fills. While True, position_enforcer SKIPS this subscriber's own
+    # per-position TP/SL so the two mechanisms can't double-close a
+    # position. Default False preserves the prior behaviour (own per-
+    # position TP/SL; trader's bracket stripped from mirrors).
+    copy_trader_bracket: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # Percentage of TODAY'S BEGINNING-DAY ACCOUNT BALANCE (Alpaca's
     # ``last_equity`` — equity at yesterday's close) that bounds today's
     # cumulative filled trade NOTIONAL (capital deployed in mirror orders

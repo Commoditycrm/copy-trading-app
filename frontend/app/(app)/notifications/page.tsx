@@ -90,34 +90,7 @@ export default function NotificationsPage() {
   const unreadCount = items.filter(n => n.read_at === null).length;
 
   return (
-    <div className="max-w-3xl mx-auto">
-      <motion.div
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-        className="flex items-start justify-between gap-3 mb-5"
-      >
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-            Notifications
-          </h1>
-          <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            {unreadCount > 0 ? `${unreadCount} unread` : "All caught up."}
-            {" · "}Auto-deleted after 30 days.
-          </p>
-        </div>
-        {unreadCount > 0 && (
-          <button
-            onClick={markAllRead}
-            disabled={markingAll}
-            className="btn-ghost px-3 py-2 text-sm inline-flex items-center gap-2 shrink-0"
-          >
-            <Check size={14} />
-            <span>Mark all read</span>
-            {markingAll && <Spinner />}
-          </button>
-        )}
-      </motion.div>
+    <div className="max-w-3xl">
 
       {loading && (
         <div className="space-y-2">
