@@ -1009,9 +1009,16 @@ export default function PerformancePage() {
           border: "1px solid var(--border)",
           background: "var(--panel)",
           maxHeight: "calc(100vh - 120px)",
+          // When there are no rows, give the container a definite height so
+          // the empty state can sit in the vertical middle of the table area
+          // rather than bunched under the header.
+          ...(!loading && fanouts.length === 0 ? { height: "calc(100vh - 120px)" } : {}),
         }}
       >
-        <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
+        <table
+          className={`w-full text-sm ${!loading && fanouts.length === 0 ? "h-full" : ""}`}
+          style={{ borderCollapse: "separate", borderSpacing: 0 }}
+        >
           {/* z-10 keeps the header above scrolling cells; the opaque panel
               background prevents row text from bleeding through behind the
               sticky header (which would otherwise be transparent). */}
@@ -1068,8 +1075,10 @@ export default function PerformancePage() {
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
-                  No fanouts yet. Place a trade to see latency metrics here.
+                <td colSpan={18} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
+                  <div className="flex items-center justify-center min-h-[240px]">
+                    No fanouts yet. Place a trade to see latency metrics here.
+                  </div>
                 </td>
               </tr>
             )}

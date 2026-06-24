@@ -108,7 +108,7 @@ export default function SubscribersPage() {
   const withBroker = rows.filter(r => r.broker_count > 0).length;
 
   return (
-    <div className="max-w-[1100px]">
+    <div className="max-w-[1100px] flex flex-col h-full min-h-0">
       {/* Summary tiles */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <SummaryTile label="Total" node={<AnimatedNumber value={total} format={(n) => String(Math.round(n))} className="num num-lg" />} />
@@ -152,9 +152,9 @@ export default function SubscribersPage() {
         </div>
       </div>
 
-      <div className="card overflow-hidden">
-        <div className="overflow-auto" style={{ maxHeight: "calc(100vh - 280px)" }}>
-          <table className="w-full text-sm">
+      <div className="card overflow-hidden flex flex-col flex-1 min-h-0">
+        <div className="overflow-auto flex-1 min-h-0">
+          <table className={`w-full text-sm ${!loading && filtered.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
                 <th className="px-4 py-3 w-10">
@@ -182,8 +182,8 @@ export default function SubscribersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-3 py-14">
-                    <div className="flex flex-col items-center justify-center text-center gap-2" style={{ color: "var(--muted)" }}>
+                  <td colSpan={6} className="px-3 align-middle text-center">
+                    <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
                       <Users size={28} />
                       <div className="text-sm" style={{ color: "var(--text)" }}>
                         {rows.length === 0 ? "No subscribers yet" : `No subscribers match “${search}”`}

@@ -79,7 +79,7 @@ const cardStyle: React.CSSProperties = {
   background:
     "linear-gradient(180deg, rgba(20,26,32,0.55) 0%, rgba(10,14,18,0.35) 100%)",
   border: "1px solid var(--border)",
-  borderRadius: "var(--r)",
+  borderRadius: 10,
   backdropFilter: "blur(10px)",
   WebkitBackdropFilter: "blur(10px)",
 };

@@ -162,17 +162,24 @@ export default function TradesPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // Fetch the user FIRST (fast) so the All/My tabs render immediately
+      // while the slower sync-fills + order fetch run behind the table
+      // skeleton. Previously this was bundled into the Promise.all below,
+      // so the tabs only appeared once the (slow) order load finished.
+      try {
+        const u = await api<User>("/api/auth/me");
+        if (!cancelled) setUser(u);
+      } catch { /* tolerate — tabs are trader-only, fall back to none */ }
+
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
-      const [o, u, p] = await Promise.all([
+      const [o, p] = await Promise.all([
         api<Order[]>(tradesEndpoint()),
-        api<User>("/api/auth/me"),
         api<Position[]>("/api/positions").catch(() => [] as Position[]),
         loadStats(),
       ]);
       if (!cancelled) {
         setOrders(o);
-        setUser(u);
         setPositions(p);
         setLoading(false);
       }
@@ -395,7 +402,7 @@ export default function TradesPage() {
   const COLSPAN = 16;
 
   return (
-    <div className="max-w-[1400px] mx-auto">
+    <div className="max-w-[1400px] mx-auto flex flex-col h-full min-h-0">
       {(fromParam || toParam) && (
         <div
           className="flex items-center justify-between gap-3 px-4 py-2.5 rounded-token mb-4 text-sm"
@@ -412,11 +419,11 @@ export default function TradesPage() {
       )}
 
       {/* Summary strip */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-        <SummaryTile label="Total orders" node={<AnimatedNumber value={view.total} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Filled" tone="good" node={<AnimatedNumber value={view.filled} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Working" tone="accent" node={<AnimatedNumber value={view.working} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Filled notional" node={<AnimatedNumber value={view.notional} format={fmtUsd} className="num num-lg" />} />
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 mb-4">
+        <SummaryTile label="Total orders" node={<AnimatedNumber value={view.total} format={(n) => String(Math.round(n))} className="num" />} />
+        <SummaryTile label="Filled" tone="good" node={<AnimatedNumber value={view.filled} format={(n) => String(Math.round(n))} className="num" />} />
+        <SummaryTile label="Working" tone="accent" node={<AnimatedNumber value={view.working} format={(n) => String(Math.round(n))} className="num" />} />
+        <SummaryTile label="Filled notional" node={<AnimatedNumber value={view.notional} format={fmtUsd} className="num" />} />
       </div>
 
       {/* Toolbar: tabs (trader) + symbol search */}
@@ -425,9 +432,11 @@ export default function TradesPage() {
           {user?.role === "trader" && (() => {
             // Prefer DB totals so the badges reflect every order, not just
             // the fetched window. Fall back to local counts pre-load.
-            const mineCount = stats ? stats.mine.total : orders.filter(o => !o.fanned_out_to_subscribers).length;
-            const allCount = stats ? stats.all.total : orders.length;
-            const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number }) => {
+            // Counts come from the DB stats; null until they load so we
+            // show the tab without a misleading "(0)" during the fetch.
+            const mineCount = stats ? stats.mine.total : null;
+            const allCount = stats ? stats.all.total : null;
+            const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number | null }) => {
               const active = tab === k;
               return (
                 <button
@@ -441,7 +450,10 @@ export default function TradesPage() {
                     color: active ? "var(--accent)" : "var(--text-2)",
                   }}
                 >
-                  {label} <span style={{ color: active ? "var(--accent)" : "var(--muted)" }}>({count})</span>
+                  {label}
+                  {count != null && (
+                    <span style={{ color: active ? "var(--accent)" : "var(--muted)" }}> ({count})</span>
+                  )}
                 </button>
               );
             };
@@ -466,9 +478,9 @@ export default function TradesPage() {
         </div>
       </div>
 
-      <div className="card overflow-hidden">
-        <div className="overflow-auto">
-          <table className="min-w-full text-sm">
+      <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
+        <div className="overflow-auto flex-1 min-h-0">
+          <table className={`min-w-full text-sm ${!loading && rows.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
                 <Th label="Symbol" sortKey="symbol" />
@@ -499,8 +511,8 @@ export default function TradesPage() {
               ))}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={COLSPAN} className="px-3 py-14">
-                    <div className="flex flex-col items-center justify-center text-center gap-2" style={{ color: "var(--muted)" }}>
+                  <td colSpan={COLSPAN} className="px-3 align-middle text-center">
+                    <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
                       <Inbox size={28} />
                       <div className="text-sm" style={{ color: "var(--text)" }}>
                         {orders.length === 0 ? "No trades yet" : search ? `No orders match “${search}”` : "No orders in this view"}
@@ -689,13 +701,14 @@ function SummaryTile({
   const color = tone === "good" ? "var(--good)" : tone === "accent" ? "var(--accent)" : "var(--text)";
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-      className="card p-4"
+      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+      className="card px-3.5 py-2.5 flex flex-col gap-4"
+      style={{ borderRadius: 10 }}
     >
-      <div className="text-[11px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</div>
-      <div className="mt-1.5" style={{ color }}>{node}</div>
+      <span className="text-[10px] font-medium uppercase tracking-wider truncate" style={{ color: "var(--muted)" }}>{label}</span>
+      <div className="text-[19px] font-semibold leading-none tabular-nums" style={{ color }}>{node}</div>
     </motion.div>
   );
 }
