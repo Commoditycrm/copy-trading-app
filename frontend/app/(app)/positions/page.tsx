@@ -22,7 +22,7 @@ export default function PositionsPage() {
   if (!user) return <PageLoading />;
 
   return (
-    <div className="max-w-[1400px] mx-auto flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0">
       <div className="flex flex-col gap-4 flex-1 min-h-0">
         <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
         <OpenPositionsTable ref={tableRef} fillHeight className="flex-1 min-h-0" />

@@ -110,13 +110,13 @@ export default function SubscribersPage() {
   return (
     <div className="max-w-[1100px] flex flex-col h-full min-h-0">
       {/* Summary tiles */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <SummaryTile label="Total" node={<AnimatedNumber value={total} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Copy ON" tone="good" node={<AnimatedNumber value={active} format={(n) => String(Math.round(n))} className="num num-lg" />} />
+      <div className="grid grid-cols-3 gap-2.5 mb-4">
+        <SummaryTile label="Total" node={<AnimatedNumber value={total} format={(n) => String(Math.round(n))} className="num" />} />
+        <SummaryTile label="Copy ON" tone="good" node={<AnimatedNumber value={active} format={(n) => String(Math.round(n))} className="num" />} />
         <SummaryTile
           label="Broker connected"
           tone={withBroker === total && total > 0 ? "good" : "neutral"}
-          node={<AnimatedNumber value={withBroker} format={(n) => String(Math.round(n))} className="num num-lg" />}
+          node={<AnimatedNumber value={withBroker} format={(n) => String(Math.round(n))} className="num" />}
         />
       </div>
 
@@ -152,12 +152,12 @@ export default function SubscribersPage() {
         </div>
       </div>
 
-      <div className="card overflow-hidden flex flex-col flex-1 min-h-0">
+      <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
         <div className="overflow-auto flex-1 min-h-0">
           <table className={`w-full text-sm ${!loading && filtered.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
-                <th className="px-4 py-3 w-10">
+                <th className="px-5 py-3 w-10">
                   <input
                     type="checkbox"
                     aria-label="Select all subscribers"
@@ -168,7 +168,7 @@ export default function SubscribersPage() {
                   />
                 </th>
                 {["Subscriber", "Copy", "Broker", "30d realized P&L", ""].map(h =>
-                  <th key={h} className="text-left px-4 py-3 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
+                  <th key={h} className="text-left px-5 py-3 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
                 )}
               </tr>
             </thead>
@@ -176,7 +176,7 @@ export default function SubscribersPage() {
               {loading && Array.from({ length: 5 }).map((_, i) => (
                 <tr key={`sk-${i}`} className="border-t" style={{ borderColor: "var(--border)" }}>
                   {Array.from({ length: 6 }).map((__, j) => (
-                    <td key={j} className="px-4 py-3.5"><div className="skeleton h-4 w-full" style={{ minWidth: 40 }} /></td>
+                    <td key={j} className="px-5 py-3.5"><div className="skeleton h-4 w-full" style={{ minWidth: 40 }} /></td>
                   ))}
                 </tr>
               ))}
@@ -197,7 +197,7 @@ export default function SubscribersPage() {
                 const isSelected = selected.has(r.user_id);
                 return (
                   <tr key={r.user_id} className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                    <td className="px-4 py-3.5">
+                    <td className="px-5 py-3.5">
                       <input
                         type="checkbox"
                         aria-label={`Select ${r.email}`}
@@ -205,11 +205,11 @@ export default function SubscribersPage() {
                         onChange={() => toggleOne(r.user_id)}
                       />
                     </td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-5 py-3.5">
                       <div className="font-medium" style={{ color: "var(--text)" }}>{r.display_name ?? r.email}</div>
                       <div className="text-xs" style={{ color: "var(--muted)" }}>{r.email}</div>
                     </td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-5 py-3.5">
                       <span
                         className="chip uppercase font-semibold"
                         style={{
@@ -221,7 +221,7 @@ export default function SubscribersPage() {
                         {r.copy_enabled ? "On" : "Off"}
                       </span>
                     </td>
-                    <td className="px-4 py-3.5">
+                    <td className="px-5 py-3.5">
                       <span
                         className="chip"
                         style={{
@@ -233,10 +233,10 @@ export default function SubscribersPage() {
                         {r.broker_count > 0 ? "Connected" : "Not connected"}
                       </span>
                     </td>
-                    <td className="px-4 py-3.5 num font-medium" style={{ color: Number(r.realized_pnl_30d) >= 0 ? "var(--good)" : "var(--bad)" }}>
+                    <td className="px-5 py-3.5 num font-medium" style={{ color: Number(r.realized_pnl_30d) >= 0 ? "var(--good)" : "var(--bad)" }}>
                       {fmtSignedUsd(r.realized_pnl_30d)}
                     </td>
-                    <td className="px-4 py-3.5 text-right">
+                    <td className="px-5 py-3.5 text-right">
                       <button
                         onClick={() => requestRemove([r.user_id])}
                         aria-label={`Remove ${r.email}`}
@@ -287,13 +287,14 @@ function SummaryTile({
   const color = tone === "good" ? "var(--good)" : "var(--text)";
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-      className="card p-4"
+      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+      className="card px-3.5 py-2.5 flex flex-col gap-4"
+      style={{ borderRadius: 10 }}
     >
-      <div className="text-[11px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</div>
-      <div className="mt-1.5" style={{ color }}>{node}</div>
+      <span className="text-[10px] font-medium uppercase tracking-wider truncate" style={{ color: "var(--muted)" }}>{label}</span>
+      <div className="text-[19px] font-semibold leading-none tabular-nums" style={{ color }}>{node}</div>
     </motion.div>
   );
 }
