@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -188,7 +188,13 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
     #       it, but we DO place a fresh leg on the other side using the
     #       parent's updated price.
     # Canceled / rejected children don't block anything — they're gone.
-    BLOCKING = (*_ALIVE_STATUSES, OrderStatus.FILLED)
+    # Include REJECTED so a leg the broker refused (e.g. an option SELL that
+    # comes back "uncovered" because the position is already gone) is treated
+    # as "already attempted" and NOT re-placed. Without this, a poller-driven
+    # reconcile retries the rejected leg every tick, spamming the broker.
+    # CANCELED is deliberately NOT here — the bracket-modify flow cancels a
+    # leg then re-places it, which must still work.
+    BLOCKING = (*_ALIVE_STATUSES, OrderStatus.FILLED, OrderStatus.REJECTED)
     already_rows = db.execute(
         select(Order).where(
             Order.bracket_parent_id == entry.id,
@@ -563,7 +569,78 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
         )
 
 
+def reconcile_copy_brackets(db: Session, broker_account_id: "uuid.UUID") -> int:
+    """Reconcile copy-bracket exits for a subscriber's account.
+
+    Subscribers have no real-time fill listener (those are trader-only), so
+    a mirror entry that carries a copied bracket (take_profit_pct /
+    stop_loss_pct, or absolute prices) never triggers the bracket emulator
+    on its own. The pnl_poller calls this every tick for opted-in
+    subscribers to close that gap:
+
+      1. For every FILLED mirror entry that has a bracket but no exit legs
+         yet → place the TP/SL exits (re-anchored onto the subscriber's
+         fill via emulate_bracket_exits).
+      2. For every FILLED bracket exit leg → run the OCO sibling-cancel.
+
+    Idempotent: emulate_bracket_exits skips entries that already have their
+    legs, so calling this repeatedly is safe. Returns the number of entries
+    for which exits were placed this call.
+    """
+    placed = 0
+    # Entry ids that already have AT LEAST ONE exit-leg row (any status,
+    # including rejected) — those have already had their bracket attempted,
+    # so we never reconcile them again. This is what keeps the poller from
+    # re-attempting (and re-auditing) a bracket every tick.
+    have_exits: set = set(db.execute(
+        select(Order.bracket_parent_id).where(
+            Order.broker_account_id == broker_account_id,
+            Order.bracket_parent_id.isnot(None),
+        )
+    ).scalars())
+
+    entries = db.execute(
+        select(Order).where(
+            Order.broker_account_id == broker_account_id,
+            Order.parent_order_id.isnot(None),     # subscriber mirror, not a root order
+            Order.status == OrderStatus.FILLED,
+            Order.bracket_leg.is_(None),            # the entry, not an exit leg
+            or_(
+                Order.take_profit_pct.isnot(None),
+                Order.stop_loss_pct.isnot(None),
+                Order.take_profit_price.isnot(None),
+                Order.stop_loss_price.isnot(None),
+            ),
+        )
+    ).scalars().all()
+    for entry in entries:
+        if entry.id in have_exits:
+            continue  # bracket already attempted — don't retry
+        try:
+            if emulate_bracket_exits(db, entry):
+                placed += 1
+        except Exception:  # noqa: BLE001
+            log.exception("reconcile_copy_brackets: place failed for entry %s", entry.id)
+
+    # OCO: any exit leg that has filled should cancel its surviving sibling.
+    filled_legs = db.execute(
+        select(Order).where(
+            Order.broker_account_id == broker_account_id,
+            Order.bracket_leg.isnot(None),
+            Order.status == OrderStatus.FILLED,
+        )
+    ).scalars().all()
+    for leg in filled_legs:
+        try:
+            cancel_sibling_on_fill(db, leg)
+        except Exception:  # noqa: BLE001
+            log.exception("reconcile_copy_brackets: OCO failed for leg %s", leg.id)
+
+    db.commit()
+    return placed
+
+
 # Re-export the public surface so listeners can `from app.services.bracket_emulator
 # import emulate_bracket_exits, cancel_sibling_on_fill` without touching the
 # private helpers above.
-__all__ = ["emulate_bracket_exits", "cancel_sibling_on_fill"]
+__all__ = ["emulate_bracket_exits", "cancel_sibling_on_fill", "reconcile_copy_brackets"]

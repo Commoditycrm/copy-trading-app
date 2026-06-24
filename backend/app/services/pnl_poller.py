@@ -264,6 +264,9 @@ def _has_active_policies(s: SubscriberSettings) -> bool:
         s.auto_liquidation_limit is not None,
         s.position_tp_pct is not None,
         s.position_sl_pct is not None,
+        # Opted into copying the trader's SL/TP — the poller reconciles
+        # their mirror fills into bracket exits (they have no fill listener).
+        getattr(s, "copy_trader_bracket", False),
     ))
 
 
@@ -345,11 +348,41 @@ def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
             _enforce_one_trader(acct)
         else:
             _enforce_one(acct)
+            _reconcile_brackets_for_subscriber(acct)
     except Exception:  # noqa: BLE001
         log.exception(
             "pnl_poller: enforce failed for account %s (user %s, role=%s)",
             acct.id, acct.user_id, role,
         )
+
+
+def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
+    """For subscribers who opted into copying the trader's SL/TP: refresh
+    their mirror fill statuses from the broker, then place any pending
+    bracket exits (and run OCO). Subscribers have no real-time fill
+    listener, so without this their copied TP/SL would never get placed.
+
+    Runs in its OWN session so it never interferes with the P&L
+    enforcement transaction. No-op unless copy_trader_bracket is on."""
+    from app.services import fills_sync as _fills_sync  # noqa: PLC0415
+    from app.services.bracket_emulator import reconcile_copy_brackets  # noqa: PLC0415
+
+    with SessionLocal() as db:
+        s = db.get(SubscriberSettings, acct.user_id)
+        if s is None or not getattr(s, "copy_trader_bracket", False):
+            return
+        # Refresh mirror + exit-leg statuses (Alpaca; no-op for other brokers)
+        # so the reconcile below sees FILLED entries.
+        try:
+            _fills_sync.sync_account_fills(db, acct)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            log.exception("pnl_poller: fills_sync (copy-bracket) failed for %s", acct.id)
+        try:
+            reconcile_copy_brackets(db, acct.id)
+        except Exception:  # noqa: BLE001
+            log.exception("pnl_poller: copy-bracket reconcile failed for %s", acct.id)
 
 
 def _enforce_one_trader(acct: BrokerAccount) -> None:

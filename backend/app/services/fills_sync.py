@@ -12,13 +12,14 @@ Caller commits the session.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -26,6 +27,8 @@ from app.brokers.alpaca import AlpacaAdapter
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.services.crypto import decrypt_json
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -91,6 +94,11 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
     ).scalars())
 
     refreshed = 0
+    # Bracket exit legs that flip to FILLED here closed a position. Subscribers
+    # have no real-time fill listener, so this poll-driven sync is the only
+    # place we learn a copied TP/SL hit — surface it as an SSE so the positions
+    # table can refresh live instead of only on manual reload.
+    newly_closed: list[Order] = []
     for order in open_orders:
         try:
             res = adapter.get_order(order.broker_order_id)
@@ -98,6 +106,7 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
             # Order may have been cancelled at the broker side or the id is
             # stale — don't fail the whole sync over one bad lookup.
             continue
+        prev_status = order.status
         changed = False
         if res.status != order.status:
             order.status = res.status
@@ -111,8 +120,29 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
         if res.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED) and order.closed_at is None:
             order.closed_at = datetime.now(timezone.utc)
             changed = True
+        if (
+            res.status == OrderStatus.FILLED
+            and prev_status != OrderStatus.FILLED
+            and order.bracket_leg is not None
+        ):
+            newly_closed.append(order)
         if changed:
             refreshed += 1
+
+    for order in newly_closed:
+        try:
+            from app.services import events as _events  # noqa: PLC0415
+            _events.publish(order.user_id, {
+                "type": "position.auto_closed",
+                "leg": order.bracket_leg,
+                "symbol": order.symbol,
+                "qty": str(order.filled_quantity) if order.filled_quantity is not None else None,
+                "broker": acct.broker.value,
+            })
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "fills_sync: position.auto_closed publish failed for order=%s", order.id
+            )
     return refreshed
 
 
@@ -258,16 +288,29 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             db.flush()
             orders_added += 1
         else:
-            # Accumulate qty + recompute volume-weighted avg fill price across
-            # all fills we've seen on this order so far.
-            prev_qty = _dec(order.filled_quantity)
-            prev_avg = _dec(order.filled_avg_price)
-            new_qty = prev_qty + units
-            order.filled_quantity = new_qty
-            order.filled_avg_price = (
-                (prev_qty * prev_avg + units * price) / new_qty
-                if new_qty > 0 else price
-            )
+            # Recompute filled qty + volume-weighted avg from the AUTHORITATIVE
+            # Fill rows (deduped by broker_fill_id), rather than ACCUMULATING
+            # onto order.filled_quantity. Accumulating double-counted any order
+            # whose place response / listener had already set filled_quantity:
+            # e.g. an Alpaca market order that fills instantly is created with
+            # filled_quantity=1, then this fill activity added another 1 → 2.
+            # Summing the existing Fill rows (which exclude the one we're about
+            # to add) plus `units` gives the true cumulative fill.
+            prior_qty, prior_notional = db.execute(
+                select(
+                    func.coalesce(func.sum(Fill.quantity), 0),
+                    func.coalesce(func.sum(Fill.quantity * Fill.price), 0),
+                ).where(Fill.order_id == order.id)
+            ).one()
+            prior_qty = _dec(prior_qty)
+            prior_notional = _dec(prior_notional)
+            new_qty = prior_qty + units
+            new_notional = prior_notional + units * price
+            # Clamp to the order quantity — you can never fill MORE than you
+            # ordered. Guards against any residual duplicate fill activities.
+            order_qty = _dec(order.quantity)
+            order.filled_quantity = min(new_qty, order_qty) if order_qty > 0 else new_qty
+            order.filled_avg_price = (new_notional / new_qty) if new_qty > 0 else price
             # Mark filled if this completes the order quantity; otherwise
             # partial-fill. Float-tolerant compare (Decimal).
             if new_qty >= _dec(order.quantity):
