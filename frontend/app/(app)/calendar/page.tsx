@@ -120,7 +120,7 @@ export default function CalendarPage() {
   return (
     <div className="max-w-5xl">
       {/* Month bar: total + nav */}
-      <div className="card p-4 mb-4 flex items-center justify-between gap-3 flex-wrap">
+      <div className="card p-4 mb-4 flex items-center justify-between gap-3 flex-wrap" style={{ borderRadius: 10 }}>
         <div className="flex items-center gap-5">
           <div>
             <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Month total</div>
@@ -181,8 +181,9 @@ export default function CalendarPage() {
               title={has ? `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}` : undefined}
               whileHover={has ? { y: -2 } : undefined}
               transition={{ duration: 0.15 }}
-              className="h-24 p-2 rounded-token border flex flex-col text-left"
+              className="h-24 p-2 border flex flex-col text-left"
               style={{
+                borderRadius: 10,
                 borderColor: isToday ? "var(--accent)" : "var(--border)",
                 boxShadow: isToday ? "0 0 0 1px var(--accent)" : "none",
                 background: bg,

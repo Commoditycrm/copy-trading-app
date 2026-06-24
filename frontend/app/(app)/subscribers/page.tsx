@@ -1,12 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { motion } from "framer-motion";
 import { Search, Trash2, Users, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
-import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { fmtSignedUsd } from "@/lib/format";
 import type { SubscriberSummary } from "@/lib/types";
 
@@ -108,20 +106,11 @@ export default function SubscribersPage() {
   const withBroker = rows.filter(r => r.broker_count > 0).length;
 
   return (
-    <div className="max-w-[1100px] flex flex-col h-full min-h-0">
-      {/* Summary tiles */}
-      <div className="grid grid-cols-3 gap-2.5 mb-4">
-        <SummaryTile label="Total" node={<AnimatedNumber value={total} format={(n) => String(Math.round(n))} className="num" />} />
-        <SummaryTile label="Copy ON" tone="good" node={<AnimatedNumber value={active} format={(n) => String(Math.round(n))} className="num" />} />
-        <SummaryTile
-          label="Broker connected"
-          tone={withBroker === total && total > 0 ? "good" : "neutral"}
-          node={<AnimatedNumber value={withBroker} format={(n) => String(Math.round(n))} className="num" />}
-        />
-      </div>
-
-      {/* Toolbar: bulk actions OR search */}
+    <div className="flex flex-col h-full min-h-0">
+      {/* Toolbar: live counts on the LEFT, search on the RIGHT. While
+          rows are selected, the bulk-action controls replace the counts. */}
       <div className="flex items-center justify-between mb-3 gap-3 flex-wrap min-h-[34px]">
+        {/* Left: bulk actions while selecting, else the live counts */}
         {selected.size > 0 ? (
           <div className="flex items-center gap-3">
             <span className="text-sm"><strong>{selected.size}</strong> selected</span>
@@ -133,7 +122,15 @@ export default function SubscribersPage() {
               <Trash2 size={13} /> Remove selected ({selected.size})
             </button>
           </div>
-        ) : <span />}
+        ) : (
+          <div className="flex items-center gap-2 self-end pb-0.5">
+            <Stat label="Total" value={total} />
+            <Stat label="Copy ON" value={active} tone="good" />
+            <Stat label="Broker connected" value={withBroker} tone={withBroker === total && total > 0 ? "good" : "neutral"} />
+          </div>
+        )}
+
+        {/* Right: search */}
         <div className="relative ml-auto">
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
           <input
@@ -174,9 +171,9 @@ export default function SubscribersPage() {
             </thead>
             <tbody>
               {loading && Array.from({ length: 5 }).map((_, i) => (
-                <tr key={`sk-${i}`} className="border-t" style={{ borderColor: "var(--border)" }}>
+                <tr key={`sk-${i}`} className="border-t" style={{ height: 54, borderColor: "var(--border)" }}>
                   {Array.from({ length: 6 }).map((__, j) => (
-                    <td key={j} className="px-5 py-3.5"><div className="skeleton h-4 w-full" style={{ minWidth: 40 }} /></td>
+                    <td key={j} className="px-5 py-2"><div className="skeleton h-4 w-full" style={{ minWidth: 40 }} /></td>
                   ))}
                 </tr>
               ))}
@@ -196,8 +193,8 @@ export default function SubscribersPage() {
               {!loading && filtered.map(r => {
                 const isSelected = selected.has(r.user_id);
                 return (
-                  <tr key={r.user_id} className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                    <td className="px-5 py-3.5">
+                  <tr key={r.user_id} className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ height: 54, borderColor: "var(--border)" }}>
+                    <td className="px-5 py-2">
                       <input
                         type="checkbox"
                         aria-label={`Select ${r.email}`}
@@ -205,15 +202,14 @@ export default function SubscribersPage() {
                         onChange={() => toggleOne(r.user_id)}
                       />
                     </td>
-                    <td className="px-5 py-3.5">
+                    <td className="px-5 py-2">
                       <div className="font-medium" style={{ color: "var(--text)" }}>{r.display_name ?? r.email}</div>
                       <div className="text-xs" style={{ color: "var(--muted)" }}>{r.email}</div>
                     </td>
-                    <td className="px-5 py-3.5">
+                    <td className="px-5 py-2">
                       <span
-                        className="chip uppercase font-semibold"
+                        className="uppercase font-semibold"
                         style={{
-                          background: r.copy_enabled ? "var(--good-soft)" : "var(--panel-2)",
                           color: r.copy_enabled ? "var(--good)" : "var(--muted)",
                           borderColor: "transparent",
                         }}
@@ -221,22 +217,20 @@ export default function SubscribersPage() {
                         {r.copy_enabled ? "On" : "Off"}
                       </span>
                     </td>
-                    <td className="px-5 py-3.5">
+                    <td className="px-5 py-2">
                       <span
-                        className="chip"
                         style={{
-                          background: r.broker_count > 0 ? "var(--good-soft)" : "var(--panel-2)",
                           color: r.broker_count > 0 ? "var(--good)" : "var(--muted)",
                           borderColor: "transparent",
                         }}
                       >
-                        {r.broker_count > 0 ? "Connected" : "Not connected"}
+                        {r.broker_count > 0 ? "Connected" : "Disconnected"}
                       </span>
                     </td>
-                    <td className="px-5 py-3.5 num font-medium" style={{ color: Number(r.realized_pnl_30d) >= 0 ? "var(--good)" : "var(--bad)" }}>
+                    <td className="px-5 py-2 num font-medium" style={{ color: Number(r.realized_pnl_30d) >= 0 ? "var(--good)" : "var(--bad)" }}>
                       {fmtSignedUsd(r.realized_pnl_30d)}
                     </td>
-                    <td className="px-5 py-3.5 text-right">
+                    <td className="px-5 py-2 text-right">
                       <button
                         onClick={() => requestRemove([r.user_id])}
                         aria-label={`Remove ${r.email}`}
@@ -275,26 +269,21 @@ export default function SubscribersPage() {
   );
 }
 
-function SummaryTile({
+/** Label + count rendered as a chip, shown beside the search bar. */
+function Stat({
   label,
-  node,
+  value,
   tone = "neutral",
 }: {
   label: string;
-  node: React.ReactNode;
+  value: number;
   tone?: "neutral" | "good";
 }) {
   const color = tone === "good" ? "var(--good)" : "var(--text)";
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-      className="card px-3.5 py-2.5 flex flex-col gap-4"
-      style={{ borderRadius: 10 }}
-    >
-      <span className="text-[10px] font-medium uppercase tracking-wider truncate" style={{ color: "var(--muted)" }}>{label}</span>
-      <div className="text-[19px] font-semibold leading-none tabular-nums" style={{ color }}>{node}</div>
-    </motion.div>
+    <span className="chip whitespace-nowrap" style={{ padding: "6px 12px", borderRadius: 10 }}>
+      <span className="uppercase tracking-wider">{label}</span>
+      <span className="num font-semibold" style={{ color }}>{value}</span>
+    </span>
   );
 }
