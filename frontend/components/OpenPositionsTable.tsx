@@ -77,8 +77,8 @@ export interface OpenPositionsTableHandle {
   refresh: () => Promise<void>;
 }
 
-export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string }>(
-  function OpenPositionsTable({ className }, ref) {
+export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string; fillHeight?: boolean }>(
+  function OpenPositionsTable({ className, fillHeight }, ref) {
     const [positions, setPositions] = useState<Position[]>([]);
     const [orders, setOrders] = useState<Order[]>([]);
     const [loading, setLoading] = useState(true);
@@ -360,20 +360,20 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const COLSPAN = 18;
 
     return (
-      <div className={className}>
+      <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
         {/* Summary strip */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 mb-4">
           <SummaryTile label="Positions" tone="neutral"
-            node={<AnimatedNumber value={summary.count} format={(n) => String(Math.round(n))} className="num num-lg" />}
+            node={<AnimatedNumber value={summary.count} format={(n) => String(Math.round(n))} className="num" />}
             sub={`${summary.longs} long · ${summary.shorts} short`} />
           <SummaryTile label="Market value" tone="neutral"
-            node={<AnimatedNumber value={summary.mv} format={fmtUsd} className="num num-lg" />}
+            node={<AnimatedNumber value={summary.mv} format={fmtUsd} className="num" />}
             sub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
           <SummaryTile label="Unrealized P&L" tone={summary.pnl > 0 ? "good" : summary.pnl < 0 ? "bad" : "neutral"}
-            node={<AnimatedNumber value={summary.pnl} format={fmtSignedUsd} className="num num-lg" />}
+            node={<AnimatedNumber value={summary.pnl} format={fmtSignedUsd} className="num" />}
             sub="On open positions" />
           <SummaryTile label="Long / Short" tone="neutral"
-            node={<span className="num num-lg">{summary.longs} / {summary.shorts}</span>}
+            node={<span className="num">{summary.longs} / {summary.shorts}</span>}
             sub="Direction split" />
         </div>
 
@@ -402,9 +402,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           </div>
         </div>
 
-        <div className="card overflow-hidden">
-          <div className="overflow-auto">
-            <table className="min-w-full text-sm">
+        <div className={`card overflow-hidden ${fillHeight ? "flex flex-col flex-1 min-h-0" : ""}`.trim()} style={{ borderRadius: 10 }}>
+          <div className={`overflow-auto ${fillHeight ? "flex-1 min-h-0" : ""}`.trim()}>
+            <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
                   <Th label="Symbol" sortKey="symbol" />
@@ -437,8 +437,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                 ))}
                 {!loading && visible.length === 0 && (
                   <tr>
-                    <td colSpan={COLSPAN} className="px-3 py-14">
-                      <div className="flex flex-col items-center justify-center text-center gap-2" style={{ color: "var(--muted)" }}>
+                    <td colSpan={COLSPAN} className="px-3 align-middle text-center">
+                      <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
                         <Layers size={28} />
                         <div className="text-sm" style={{ color: "var(--text)" }}>
                           {positions.length === 0
@@ -672,16 +672,17 @@ function SummaryTile({
   tone: "neutral" | "good" | "bad";
 }) {
   const color = tone === "good" ? "var(--good)" : tone === "bad" ? "var(--bad)" : "var(--text)";
+  void sub; // subtitle dropped — cards match the Order History summary size
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-      className="card p-4"
+      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+      className="card px-3.5 py-2.5 flex flex-col gap-4"
+      style={{ borderRadius: 10 }}
     >
-      <div className="text-[11px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</div>
-      <div className="mt-1.5" style={{ color }}>{node}</div>
-      {sub && <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>{sub}</div>}
+      <span className="text-[10px] font-medium uppercase tracking-wider truncate" style={{ color: "var(--muted)" }}>{label}</span>
+      <div className="text-[19px] font-semibold leading-none tabular-nums" style={{ color }}>{node}</div>
     </motion.div>
   );
 }
