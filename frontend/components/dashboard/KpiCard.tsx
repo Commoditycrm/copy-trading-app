@@ -18,6 +18,8 @@ export interface KpiCardProps {
   delta?: { text: string; tone: "good" | "bad" | "flat" } | null;
   /** Stagger index for the entrance animation. */
   index?: number;
+  /** Tighter padding + smaller value/icon for a slimmer card. */
+  compact?: boolean;
 }
 
 const toneColor: Record<KpiTone, string> = {
@@ -45,13 +47,14 @@ export function KpiCard({
   sub,
   delta,
   index = 0,
+  compact = false,
 }: KpiCardProps) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, delay: index * 0.06, ease: [0.16, 1, 0.3, 1] }}
-      className="card hover-lift p-5 relative overflow-hidden"
+      className={`card hover-lift relative overflow-hidden ${compact ? "p-3.5" : "p-5"}`}
     >
       {/* faint accent wash in the corner */}
       <div
@@ -69,23 +72,22 @@ export function KpiCard({
         <span
           className="grid place-items-center rounded-token shrink-0"
           style={{
-            width: 34,
-            height: 34,
+            width: compact ? 28 : 34,
+            height: compact ? 28 : 34,
             background: iconBg[tone],
             border: "1px solid var(--border)",
             color: toneColor[tone],
           }}
         >
-          <Icon size={17} />
+          <Icon size={compact ? 15 : 17} />
         </span>
       </div>
 
-      <div className="mt-3 flex items-end gap-2">
+      <div className={`${compact ? "mt-2" : "mt-3"} flex items-end gap-2`}>
         <AnimatedNumber
           value={value}
           format={format}
-          className="num num-lg"
-          // a touch larger feel; num-lg is 24px
+          className={compact ? "num text-[19px] font-semibold leading-none" : "num num-lg"}
         />
         {delta && (
           <span

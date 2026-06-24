@@ -47,7 +47,7 @@ function CardHeader({ title, value, tone }: { title: string; value?: string; ton
 
 function SectionSkeleton() {
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 dashboard-cards">
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {Array.from({ length: 4 }).map((_, i) => (
           <div key={i} className="skeleton h-[116px] rounded-card" />
@@ -166,7 +166,7 @@ export default function DashboardPage() {
   ];
 
   return (
-    <div className="max-w-[1400px] mx-auto">
+    <div className="max-w-[1400px] mx-auto dashboard-cards">
       {/* Greeting */}
       <motion.div
         initial={{ opacity: 0, y: 8 }}
@@ -185,7 +185,7 @@ export default function DashboardPage() {
       {/* KPI row */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {kpis.map((k, i) => (
-          <KpiCard key={k.label} {...k} index={i} />
+          <KpiCard key={k.label} {...k} index={i} compact />
         ))}
       </div>
 

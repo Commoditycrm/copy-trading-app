@@ -145,6 +145,12 @@ body {
     0 0 0 1px rgba(0, 0, 0, 0.2);
 }
 
+/* Dashboard cards use a tighter 10px radius (scoped to the dashboard root). */
+.dashboard-cards .card,
+.dashboard-cards .rounded-card {
+  border-radius: 10px;
+}
+
 /* Subtle inset divider line */
 .hairline {
   border-top: 1px solid var(--border);
