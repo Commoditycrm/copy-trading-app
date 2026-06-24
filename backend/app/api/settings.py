@@ -8,6 +8,7 @@ from app.models.settings import RetryInterval, SubscriberSettings, TraderSetting
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     AutoLiquidationLimitIn,
+    CopyTraderBracketIn,
     DailyLossLimitIn,
     DailyLossLimitPctIn,
     DailyProfitLimitIn,
@@ -69,6 +70,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         daily_profit_limit_pct=s.daily_profit_limit_pct,
         position_tp_pct=s.position_tp_pct,
         position_sl_pct=s.position_sl_pct,
+        copy_trader_bracket=s.copy_trader_bracket,
     )
 
 
@@ -384,6 +386,37 @@ def set_position_sl_pct(
             "old": str(old) if old is not None else None,
             "new": str(payload.position_sl_pct) if payload.position_sl_pct is not None else None,
         },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/copy-trader-bracket", response_model=SubscriberSettingsOut)
+def set_copy_trader_bracket(
+    payload: CopyTraderBracketIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Toggle whether this subscriber copies the trader's per-trade SL/TP
+    (re-anchored onto their own fill) instead of their own per-position
+    TP/SL %. Cache-busts so the fanout path sees the new flag immediately."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.copy_trader_bracket
+    s.copy_trader_bracket = payload.copy_trader_bracket
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.copy_trader_bracket_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={"old": bool(old), "new": bool(payload.copy_trader_bracket)},
         ip_address=client_ip(request),
     )
     db.commit()

@@ -93,6 +93,15 @@ _ALIVE_STATUSES = (
 )
 
 
+def _leg_direction(side: OrderSide, leg: str) -> Decimal:
+    """+1 when a correctly-placed leg sits ABOVE entry, -1 when BELOW.
+    Mirrors copy_engine._leg_direction and the frontend InlineBracketCell:
+      buy+tp / sell+sl → +1 ; buy+sl / sell+tp → -1."""
+    buy = side == OrderSide.BUY
+    positive = (buy and leg == "tp") or (not buy and leg == "sl")
+    return Decimal("1") if positive else Decimal("-1")
+
+
 def _uses_native_bracket(broker: BrokerName, instrument_type: "InstrumentType | None" = None) -> bool:
     """True only when the (broker, instrument) pair supports server-side
     bracket / OCO orders. Currently that's Alpaca **stocks** only:
@@ -128,6 +137,20 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
         return []
     tp_price = entry.take_profit_price
     sl_price = entry.stop_loss_price
+
+    # Copied percent bracket (subscriber with copy_trader_bracket on):
+    # re-anchor the trader's percent distance onto THIS account's own
+    # fill so the exit sits the same % from entry as the trader's,
+    # regardless of the subscriber's fill price or multiplier. limit_price
+    # first (same anchor the trader's bracket uses), else filled_avg_price.
+    if entry.take_profit_pct is not None or entry.stop_loss_pct is not None:
+        anchor = entry.limit_price or entry.filled_avg_price
+        if anchor and anchor > 0:
+            if entry.take_profit_pct is not None:
+                tp_price = anchor * (1 + _leg_direction(entry.side, "tp") * entry.take_profit_pct / 100)
+            if entry.stop_loss_pct is not None:
+                sl_price = anchor * (1 + _leg_direction(entry.side, "sl") * entry.stop_loss_pct / 100)
+
     if not tp_price and not sl_price:
         return []
     if entry.broker_account_id is None:
@@ -137,7 +160,13 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
     acct = db.get(BrokerAccount, entry.broker_account_id)
     if acct is None:
         return []
-    if _uses_native_bracket(acct.broker, entry.instrument_type):
+    # Native-bracket short-circuit applies ONLY to the trader's own entries.
+    # Subscriber mirror entries (parent_order_id set) NEVER get a native
+    # broker bracket — copy_engine always sends None for TP/SL on the broker
+    # request — so a copied bracket on Alpaca stocks must be emulated here,
+    # not skipped as "already handled natively".
+    is_copied_mirror = entry.parent_order_id is not None
+    if not is_copied_mirror and _uses_native_bracket(acct.broker, entry.instrument_type):
         # Alpaca's OrderClass.BRACKET already attached these legs on the
         # broker side — nothing for us to do. (Options on Alpaca are
         # NOT native — see _uses_native_bracket; those fall through to

@@ -191,6 +191,11 @@ export interface SubscriberSettings {
    *  closed at market. Per-position only — does NOT affect copy_enabled.
    *  Null disables. */
   position_sl_pct: string | null;
+  /** When true, this subscriber copies the trader's per-trade SL/TP
+   *  (re-anchored onto their own fill) instead of using the per-position
+   *  TP/SL above. Mutually exclusive with position_tp_pct / position_sl_pct
+   *  enforcement — see backend position_enforcer. */
+  copy_trader_bracket: boolean;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

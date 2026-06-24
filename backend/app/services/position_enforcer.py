@@ -184,6 +184,12 @@ def enforce_position_tp_sl(
     s = db.get(SubscriberSettings, subscriber_user_id)
     if s is None:
         return []
+    # When the subscriber copies the trader's per-trade SL/TP, the bracket
+    # emulator manages their exits (re-anchored onto each fill). Skip the
+    # OWN per-position enforcement entirely so the two mechanisms can't
+    # double-close a position — it's a strict either/or toggle.
+    if s.copy_trader_bracket:
+        return []
     tp = s.position_tp_pct
     sl = s.position_sl_pct
     if tp is None and sl is None:
