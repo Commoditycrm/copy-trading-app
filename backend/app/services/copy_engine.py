@@ -833,7 +833,15 @@ def fanout_threadsafe(
             if order is None or trader is None:
                 return []
             results = await fanout_async(db, order, trader)
-            order.fanned_out_to_subscribers = True
+            # Only flag as broadcast if copy was actually ACTIVE. When the
+            # trader's master copy is paused, fanout_async no-ops (returns
+            # early) and nothing was sent to subscribers — so leave the flag
+            # False. Otherwise an order placed (or observed) while copy was
+            # OFF would wrongly land in the trader's "All Orders" tab
+            # (copy-on) instead of "My Orders" (copy-off).
+            ts = db.get(TraderSettings, trader_id)
+            if not (ts is not None and ts.copy_paused):
+                order.fanned_out_to_subscribers = True
             db.commit()
             return results
 
