@@ -210,18 +210,30 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
         trade_at = _as_dt(_attr(entry, "transaction_time")) or datetime.now(timezone.utc)
 
         # If the activity references a broker order_id that matches an Order
-        # we already placed, update THAT order in place. Otherwise (external
+        # we already have, update THAT order in place. Otherwise (external
         # trades placed in Alpaca's UI directly, or pre-existing fills) create
         # a synthetic order so the activity still surfaces in the UI.
+        #
+        # Match by (user_id, broker_order_id) — NOT broker_account_id. When a
+        # broker is deleted and reconnected, the old rows survive with
+        # broker_account_id=NULL (ON DELETE SET NULL) under a NEW account id.
+        # Scoping the match to the current account would miss them and
+        # re-import the whole history as duplicates on every reconnect.
+        # Matching by broker_order_id (globally unique per broker) finds the
+        # existing row and we re-adopt it onto the reconnected account.
         broker_oid = str(_attr(entry, "order_id") or "") or None
         order: Order | None = None
         if broker_oid:
             order = db.execute(
                 select(Order).where(
-                    Order.broker_account_id == acct.id,
+                    Order.user_id == acct.user_id,
                     Order.broker_order_id == broker_oid,
-                )
+                ).order_by(Order.created_at.asc()).limit(1)
             ).scalar_one_or_none()
+            # Re-adopt an orphaned (or differently-accounted) match onto the
+            # account we're syncing now, so the row reconnects cleanly.
+            if order is not None and order.broker_account_id != acct.id:
+                order.broker_account_id = acct.id
 
         if order is None:
             order = Order(

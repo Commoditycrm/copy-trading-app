@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
@@ -12,7 +12,7 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { Order, OrderStatus, Position, User } from "@/lib/types";
+import type { Order, OrderStatus, Position, TradeStats, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
 
@@ -93,6 +93,13 @@ function sortValue(o: Order, key: SortKey): number | string {
   }
 }
 
+// How many orders to load into the Order History window. Matches the
+// backend's hard cap (GET /api/trades — limit le=1000), so the tab count
+// stays accurate up to 1000 orders instead of pinning at the old default
+// of 200 (which made a freshly-placed order briefly show 201 then snap
+// back to 200 once the reconcile refetch trimmed the window).
+const PAGE_LIMIT = 1000;
+
 export default function TradesPage() {
   const searchParams = useSearchParams();
   // Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filter (used by Calendar drill-in).
@@ -101,6 +108,10 @@ export default function TradesPage() {
 
   const [orders, setOrders] = useState<Order[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
+  // DB-computed order totals (GET /api/trades/stats) — drives the summary
+  // tiles + tab badges so they reflect EVERY matching order, not just the
+  // fetched window. null until first load (we fall back to local counts).
+  const [stats, setStats] = useState<TradeStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -114,26 +125,50 @@ export default function TradesPage() {
   const [closePrices, setClosePrices] = useState<Record<string, string>>({});
   const reconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Single source of truth for the trades URL — used by both the initial
+  // load and the post-event reconcile so they fetch the SAME window
+  // (limit + any date filter). Previously the reconcile hit a bare
+  // "/api/trades", which both capped at 200 and dropped the from/to filter.
+  const tradesEndpoint = useCallback(() => {
+    const q = new URLSearchParams();
+    q.set("limit", String(PAGE_LIMIT));
+    if (fromParam) q.set("from", fromParam);
+    if (toParam) {
+      const t = new Date(toParam + "T00:00:00Z");
+      t.setUTCDate(t.getUTCDate() + 1);
+      q.set("to", t.toISOString().slice(0, 10));
+    }
+    return `/api/trades?${q.toString()}`;
+  }, [fromParam, toParam]);
+
+  // DB-aggregate totals, same date filter as the list. Fetched alongside
+  // the rows and refreshed whenever orders change (SSE / reconcile) so the
+  // summary stays live without being bound to the fetched page size.
+  const loadStats = useCallback(async () => {
+    const q = new URLSearchParams();
+    if (fromParam) q.set("from", fromParam);
+    if (toParam) {
+      const t = new Date(toParam + "T00:00:00Z");
+      t.setUTCDate(t.getUTCDate() + 1);
+      q.set("to", t.toISOString().slice(0, 10));
+    }
+    const suffix = q.toString();
+    try {
+      const s = await api<TradeStats>(`/api/trades/stats${suffix ? `?${suffix}` : ""}`);
+      setStats(s);
+    } catch { /* tolerate — summary falls back to local counts */ }
+  }, [fromParam, toParam]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
-      let tradesUrl = "/api/trades";
-      if (fromParam || toParam) {
-        const q = new URLSearchParams();
-        if (fromParam) q.set("from", fromParam);
-        if (toParam) {
-          const t = new Date(toParam + "T00:00:00Z");
-          t.setUTCDate(t.getUTCDate() + 1);
-          q.set("to", t.toISOString().slice(0, 10));
-        }
-        tradesUrl = `/api/trades?${q.toString()}`;
-      }
       const [o, u, p] = await Promise.all([
-        api<Order[]>(tradesUrl),
+        api<Order[]>(tradesEndpoint()),
         api<User>("/api/auth/me"),
         api<Position[]>("/api/positions").catch(() => [] as Position[]),
+        loadStats(),
       ]);
       if (!cancelled) {
         setOrders(o);
@@ -187,11 +222,18 @@ export default function TradesPage() {
       };
       const next = idx >= 0
         ? [...cur.slice(0, idx), merged, ...cur.slice(idx + 1)]
-        : [merged, ...cur];
+        // Brand-new order: prepend, but keep the list within the same
+        // window the reconcile refetch will settle on, so the count
+        // doesn't briefly overshoot (e.g. 200 → 201 → 200).
+        : [merged, ...cur].slice(0, PAGE_LIMIT);
       return next;
     });
     setFlashId(incoming.id);
     setTimeout(() => setFlashId((f) => (f === incoming.id ? null : f)), 2000);
+
+    // Counts changed (new order, or a status transition) — refresh the
+    // DB totals. Fire-and-forget; cheap aggregate query.
+    loadStats();
 
     const terminal = incoming.status === "filled" || incoming.status === "canceled" || incoming.status === "rejected";
     if (!terminal) {
@@ -199,8 +241,9 @@ export default function TradesPage() {
       reconcileTimer.current = setTimeout(async () => {
         try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* ignore */ }
         try {
-          const fresh = await api<Order[]>("/api/trades");
+          const fresh = await api<Order[]>(tradesEndpoint());
           setOrders(fresh);
+          loadStats();
         } catch { /* ignore */ }
       }, 1500);
     }
@@ -274,11 +317,11 @@ export default function TradesPage() {
         .map(p => posKey(p.broker_account_id, p.instrument_type, p.symbol, p.option_expiry, p.option_strike, p.option_right))
     );
 
+    // "All Orders" = every order (no filter — a superset). "My Orders"
+    // (trader only) = the subset placed while copy was OFF. So a copy-off
+    // order appears under BOTH tabs; a copy-on order only under All.
     return orders.filter(o => {
-      if (tab === "mine") {
-        if (o.parent_order_id) return false;
-        if (o.fanned_out_to_subscribers) return false;
-      }
+      if (user?.role === "trader" && tab === "mine" && o.fanned_out_to_subscribers) return false;
       if (fromParam || toParam) return true;
       if (o.status !== "filled") return true;
       return !heldKeys.has(posKey(
@@ -286,7 +329,7 @@ export default function TradesPage() {
         o.option_expiry, o.option_strike, o.option_right,
       ));
     });
-  }, [orders, positions, tab, fromParam, toParam]);
+  }, [orders, positions, tab, fromParam, toParam, user]);
 
   // search → sort (presentational)
   const rows = useMemo(() => {
@@ -312,6 +355,16 @@ export default function TradesPage() {
     }
     return { total: visibleOrders.length, filled, working, notional };
   }, [visibleOrders]);
+
+  // Prefer DB-computed totals (every matching order); fall back to the
+  // local page-derived counts only until the first stats response lands.
+  const scopeStats = stats ? (tab === "mine" ? stats.mine : stats.all) : null;
+  const view = {
+    total: scopeStats ? scopeStats.total : summary.total,
+    filled: scopeStats ? scopeStats.filled : summary.filled,
+    working: scopeStats ? scopeStats.working : summary.working,
+    notional: scopeStats ? Number(scopeStats.notional) : summary.notional,
+  };
 
   function toggleSort(key: SortKey) {
     setSort(prev => {
@@ -360,18 +413,20 @@ export default function TradesPage() {
 
       {/* Summary strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-        <SummaryTile label="Orders shown" node={<AnimatedNumber value={summary.total} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Filled" tone="good" node={<AnimatedNumber value={summary.filled} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Working" tone="accent" node={<AnimatedNumber value={summary.working} format={(n) => String(Math.round(n))} className="num num-lg" />} />
-        <SummaryTile label="Filled notional" node={<AnimatedNumber value={summary.notional} format={fmtUsd} className="num num-lg" />} />
+        <SummaryTile label="Total orders" node={<AnimatedNumber value={view.total} format={(n) => String(Math.round(n))} className="num num-lg" />} />
+        <SummaryTile label="Filled" tone="good" node={<AnimatedNumber value={view.filled} format={(n) => String(Math.round(n))} className="num num-lg" />} />
+        <SummaryTile label="Working" tone="accent" node={<AnimatedNumber value={view.working} format={(n) => String(Math.round(n))} className="num num-lg" />} />
+        <SummaryTile label="Filled notional" node={<AnimatedNumber value={view.notional} format={fmtUsd} className="num num-lg" />} />
       </div>
 
       {/* Toolbar: tabs (trader) + symbol search */}
       <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
         <div className="flex gap-2 items-center">
           {user?.role === "trader" && (() => {
-            const mineCount = orders.filter(o => !o.parent_order_id && !o.fanned_out_to_subscribers).length;
-            const allCount = orders.length;
+            // Prefer DB totals so the badges reflect every order, not just
+            // the fetched window. Fall back to local counts pre-load.
+            const mineCount = stats ? stats.mine.total : orders.filter(o => !o.fanned_out_to_subscribers).length;
+            const allCount = stats ? stats.all.total : orders.length;
             const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number }) => {
               const active = tab === k;
               return (

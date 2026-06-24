@@ -121,6 +121,27 @@ class DailyPnL(BaseModel):
     trade_count: int
 
 
+class TradeScopeStats(BaseModel):
+    """Aggregate order counts for one scope, computed in the DB (not from
+    the fetched page). ``working`` = pending/submitted/accepted/partially_
+    filled; ``notional`` = sum of filled_qty × filled_avg_price (×100 for
+    options)."""
+
+    total: int
+    filled: int
+    working: int
+    notional: Decimal
+
+
+class TradeStatsOut(BaseModel):
+    """Order-history summary. ``all`` = every order the user owns; ``mine``
+    = the trader's own non-fanned-out orders (the "My Orders" tab). Both
+    respect the same optional from/to date filter as GET /api/trades."""
+
+    all: TradeScopeStats
+    mine: TradeScopeStats
+
+
 class CloseOrderIn(BaseModel):
     """Close (reverse) a filled order. Quantity defaults to the original
     filled_quantity, but the trader can specify less for partial close."""

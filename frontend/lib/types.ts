@@ -127,6 +127,22 @@ export interface DailyPnL {
   trade_count: number;
 }
 
+/** One scope's order-history totals, computed in the DB (GET
+ *  /api/trades/stats) — independent of how many rows the page fetched. */
+export interface TradeScopeStats {
+  total: number;
+  filled: number;
+  working: number;
+  notional: string;   // Decimal as string
+}
+
+export interface TradeStats {
+  /** Every order the user owns. */
+  all: TradeScopeStats;
+  /** Trader's own non-fanned-out orders (the "My Orders" tab). */
+  mine: TradeScopeStats;
+}
+
 export interface SubscriberSettings {
   user_id: string;
   following_trader_id: string | null;

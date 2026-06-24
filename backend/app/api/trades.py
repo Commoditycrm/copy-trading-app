@@ -4,17 +4,25 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, select, true
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
-from app.models.order import Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
-from app.schemas.order import BracketUpdateIn, CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
+from app.schemas.order import (
+    BracketUpdateIn,
+    CloseOrderIn,
+    DailyPnL,
+    OrderOut,
+    PlaceOrderIn,
+    TradeScopeStats,
+    TradeStatsOut,
+)
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.pnl import realized_pnl_by_day
@@ -34,7 +42,12 @@ def list_trades(
         select(Order)
         .options(selectinload(Order.fills))
         .where(Order.user_id == user.id)
-        .order_by(Order.created_at.desc())
+        # Order by the ACTUAL trade time, not our DB-insert time. Orders
+        # imported by a fills re-sync (e.g. after reconnecting a broker)
+        # all get created_at = now, which would bunch historical trades at
+        # the top. submitted_at carries the broker's real timestamp; fall
+        # back to created_at for rows that never reached the broker.
+        .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
         .limit(limit)
     )
     if from_:
@@ -42,6 +55,94 @@ def list_trades(
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
     return list(db.execute(q).scalars())
+
+
+# Statuses the UI counts as "working" — must mirror the frontend's
+# OPEN_STATUSES (trades/page.tsx). Deliberately excludes RETRY_PENDING.
+_WORKING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
+@router.get("/trades/stats", response_model=TradeStatsOut)
+def trades_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+) -> TradeStatsOut:
+    """Order-history summary counts computed in the DATABASE via aggregate
+    query — so the totals reflect every matching order, not just the
+    page the client fetched. Returns both the ``all`` scope and the
+    trader's ``mine`` scope in one round-trip (the tab badges need both).
+
+    Computed live (no denormalised counters) so it can never drift out of
+    sync with the orders table; respects the same optional from/to filter
+    as ``list_trades``.
+    """
+    # "All Orders" = every order the user placed (copy ON and OFF) — a
+    # superset. "My Orders" (trader only) = the subset placed while copy
+    # was OFF (fanned_out=False). So a copy-off order shows under BOTH; a
+    # copy-on order shows only under All. Non-traders have no tabs → both
+    # scopes are all their orders.
+    is_trader = user.role == UserRole.TRADER
+    all_cond = true()
+    mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
+    filled_cond = Order.status == OrderStatus.FILLED
+    working_cond = Order.status.in_(_WORKING_STATUSES)
+
+    # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
+    # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
+    mult = case((Order.instrument_type == InstrumentType.OPTION, 100), else_=1)
+    notional_expr = (
+        func.coalesce(Order.filled_quantity, 0)
+        * func.coalesce(Order.filled_avg_price, 0)
+        * mult
+    )
+
+    row = db.execute(
+        select(
+            func.count().filter(all_cond).label("all_total"),
+            func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
+            func.count().filter(and_(all_cond, working_cond)).label("all_working"),
+            func.coalesce(
+                func.sum(case((all_cond, notional_expr), else_=0)), 0
+            ).label("all_notional"),
+            func.count().filter(mine_cond).label("mine_total"),
+            func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
+            func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
+            func.coalesce(
+                func.sum(case((mine_cond, notional_expr), else_=0)), 0
+            ).label("mine_notional"),
+        )
+        .where(Order.user_id == user.id)
+        .where(
+            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+            if from_ else True
+        )
+        .where(
+            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+            if to else True
+        )
+    ).one()
+
+    return TradeStatsOut(
+        all=TradeScopeStats(
+            total=row.all_total,
+            filled=row.all_filled,
+            working=row.all_working,
+            notional=row.all_notional,
+        ),
+        mine=TradeScopeStats(
+            total=row.mine_total,
+            filled=row.mine_filled,
+            working=row.mine_working,
+            notional=row.mine_notional,
+        ),
+    )
 
 
 @router.get("/trades/{order_id}", response_model=OrderOut)
@@ -479,13 +580,19 @@ def cancel_trade(
     ):
         raise HTTPException(409, f"not_cancellable: status is {order.status.value}")
 
-    acct = db.get(BrokerAccount, order.broker_account_id)
-    if acct is None:
-        raise HTTPException(404, "broker_account_missing")
+    # Resolve which broker account to cancel through. An order placed on a
+    # PREVIOUS connection becomes "orphaned" once that broker is deleted /
+    # reconnected: ON DELETE SET NULL clears broker_account_id. Rather than
+    # stranding it as un-cancellable, route the cancel through the user's
+    # currently-connected account(s) and re-adopt the order onto whichever
+    # one the broker accepts the cancel from.
+    acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+    reattached = False
 
-    # Best-effort broker call. If the broker rejects (e.g. order already filled),
-    # surface the error but DON'T mutate local state — DB stays accurate.
-    if order.broker_order_id:
+    if order.broker_order_id and acct is not None:
+        # Normal path — cancel at the broker on the order's own account.
+        # If the broker rejects (e.g. already filled), surface the error
+        # but DON'T mutate local state — DB stays accurate.
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter_for(acct, creds).cancel_order(order.broker_order_id)
@@ -498,12 +605,53 @@ def cancel_trade(
             db.commit()
             raise HTTPException(502, f"broker_error: {exc}")
 
+    elif order.broker_order_id and acct is None:
+        # Orphaned: try the user's connected accounts. cancel_order with a
+        # broker_order_id the account doesn't own fails cleanly (id not
+        # found there), so trying each is safe.
+        candidates = list(db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars())
+        last_err: Exception | None = None
+        for cand in candidates:
+            try:
+                creds = decrypt_json(cand.encrypted_credentials)
+                adapter_for(cand, creds).cancel_order(order.broker_order_id)
+                acct = cand
+                order.broker_account_id = cand.id   # re-adopt onto the live account
+                reattached = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+        if acct is None and candidates:
+            # A broker is connected but none could cancel it (wrong broker,
+            # or already terminal upstream). Surface the broker error.
+            audit.record(
+                db, actor_user_id=user.id, action="order.cancel_failed",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(last_err)[:480], "orphaned": True},
+                ip_address=client_ip(request),
+            )
+            db.commit()
+            raise HTTPException(502, f"broker_error: {last_err}")
+        # No connected broker at all → unreachable; fall through to a local
+        # cancel so the order doesn't linger forever as a ghost open order.
+
+    # else: order never reached a broker (no broker_order_id) → local cancel.
+
     order.status = OrderStatus.CANCELED
     order.closed_at = datetime.now(timezone.utc)
     audit.record(
         db, actor_user_id=user.id, action="order.cancelled",
         entity_type="order", entity_id=order.id,
-        metadata={"broker_order_id": order.broker_order_id},
+        metadata={
+            "broker_order_id": order.broker_order_id,
+            "reattached_account": str(acct.id) if reattached else None,
+            "local_only": acct is None,
+        },
         ip_address=client_ip(request),
     )
     db.commit()
