@@ -92,7 +92,34 @@ def get_all_statuses() -> dict[str, dict]:
         return {str(tid): _status_to_dict(s) for tid, s in _status.items()}
 
 
+def _dict_to_status(d: dict) -> ListenerStatus:
+    return ListenerStatus(
+        state=d["state"],
+        last_event_at=datetime.fromisoformat(d["last_event_at"]) if d.get("last_event_at") else None,
+        state_changed_at=(
+            datetime.fromisoformat(d["state_changed_at"])
+            if d.get("state_changed_at") else datetime.now(timezone.utc)
+        ),
+        last_error=d.get("last_error"),
+    )
+
+
 def get_status(trader_user_id: uuid.UUID) -> ListenerStatus | None:
+    """Read a single trader's listener status.
+
+    Prefer the cross-process Redis mirror so the WEB tier — which does NOT run
+    the listener in the web/worker split — sees the WORKER's live state. Without
+    this, the web process's empty in-memory map made /api/listener/status return
+    None (rendered as "Offline") ~30s after connect, even though the listener
+    was healthy in the worker. Falls back to the local in-memory map on a Redis
+    miss or error (so single-process / dev still works)."""
+    try:
+        from app.services.redis_client import get_sync_redis
+        raw = get_sync_redis().get(_REDIS_PREFIX + str(trader_user_id))
+        if raw:
+            return _dict_to_status(json.loads(raw))
+    except Exception:  # noqa: BLE001
+        log.debug("listener_state get_status redis read failed; using local", exc_info=True)
     return _status.get(trader_user_id)
 
 
