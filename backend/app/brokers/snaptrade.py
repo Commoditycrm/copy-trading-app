@@ -459,7 +459,58 @@ class SnapTradeAdapter(BrokerAdapter):
     def _account_id(self) -> str:
         return self.credentials["account_id"]
 
+    @property
+    def _authorization_id(self) -> str | None:
+        return self.credentials.get("authorization_id")
+
     # ── connection ────────────────────────────────────────────────────────
+
+    def force_resync(self) -> str:
+        """Ask SnapTrade to re-pull this connection's data from the brokerage
+        NOW, rather than waiting for its own background sync cadence.
+
+        SnapTrade caches brokerage data and refreshes on its own schedule, so
+        an order cancelled or filled DIRECTLY at the broker (e.g. on the Webull
+        app, outside our app) can lag before it shows up in
+        ``get_user_account_orders`` — which is what the listener polls. The
+        refresh is asynchronous on SnapTrade's side, so the fresh data lands on
+        a later poll, not this one.
+
+        Returns one of:
+          * ``"ok"``        — refresh accepted; fresh data lands on a later poll.
+          * ``"forbidden"`` — this SnapTrade plan does NOT allow manual refresh
+            (real-time plans serve live data already → 403, code 1141), OR no
+            authorization id. The caller should STOP calling — retrying just
+            burns 403s. The residual lag is upstream broker→SnapTrade and isn't
+            fixable from our side on this plan.
+          * ``"error"``     — transient failure (rate-limit/throttle/network);
+            worth a retry on a later eligible tick.
+
+        The CALLER MUST THROTTLE — never call this on every poll."""
+        auth_id = self._authorization_id
+        if not auth_id:
+            return "forbidden"
+        try:
+            self._c().connections.refresh_brokerage_authorization(
+                authorization_id=auth_id,
+                user_id=self._user_id,
+                user_secret=self._user_secret,
+            )
+            return "ok"
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status", None)
+            if status == 403 or "1141" in str(getattr(exc, "body", "")):
+                # Plan doesn't permit manual refresh (data is already
+                # real-time). Permanent for this connection — tell the caller
+                # to stop trying.
+                log.info(
+                    "snaptrade force_resync not permitted on this plan "
+                    "(data already real-time): %s", exc
+                )
+                return "forbidden"
+            # Rate-limited / transient — fine, the next eligible tick retries.
+            log.info("snaptrade force_resync transient failure: %s", exc)
+            return "error"
 
     def verify_connection(self) -> ConnectionInfo:
         """Hit SnapTrade's balance endpoint as a cheap auth + alive check.
