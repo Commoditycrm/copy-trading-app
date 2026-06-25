@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from sqlalchemy import desc, select
@@ -81,6 +81,13 @@ _ALIVE_STATUSES = (
 _PENNY = Decimal("0.01")
 _NICKEL = Decimal("0.05")
 _OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+
+# Post-fill cooldown — matches position_enforcer. Wide option spreads
+# show -spread% unrealized P&L the moment you fill; the price-side
+# signal can also misfire on the first marketing-data observation
+# after the fill (broker reports the bid as current_price before the
+# spread normalizes). 30s lets the spread settle.
+_SL_COOLDOWN_SECONDS = 30
 
 
 def _round_close_limit(price: Decimal, side: OrderSide) -> Decimal:
@@ -194,6 +201,22 @@ def enforce_trader_option_sl(
         if not _sl_breached(pos, entry, is_long):
             continue
 
+        # Post-fill cooldown — see position_enforcer for the rationale.
+        # Wide option spreads make EITHER SL signal (price or
+        # unrealized-pnl) fire spuriously right after a fill.
+        if entry.closed_at is not None:
+            closed_at = entry.closed_at
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - closed_at
+            if age < timedelta(seconds=_SL_COOLDOWN_SECONDS):
+                log.debug(
+                    "trader_bracket_monitor: skipping SL for %s — within "
+                    "%ss post-fill cooldown",
+                    pos.symbol, _SL_COOLDOWN_SECONDS,
+                )
+                continue
+
         # In-flight guard. If a prior tick already placed a close (or
         # the original TP leg has been swapped for a market exit by
         # the user), don't fire again.
@@ -223,7 +246,15 @@ def _find_entry_with_sl(
     """Most-recent FILLED entry on this exact option contract with a
     stop_loss_price set. Filters by symbol + expiry + strike + right
     so we don't accidentally pair a position with an entry for a
-    different contract on the same underlying."""
+    different contract on the same underlying.
+
+    Deliberately does NOT filter on parent_order_id: this monitor serves
+    both the trader's own entries (parent_order_id NULL) AND subscriber
+    mirror entries (parent_order_id set). A mirror's copied option SL
+    can't rest at the broker either, so the subscriber needs the same
+    price-monitor enforcement. `user_id == account owner` already scopes
+    the match to the right person, so dropping the parent filter can't
+    pull in someone else's order."""
     q = (
         select(Order)
         .where(
@@ -233,7 +264,6 @@ def _find_entry_with_sl(
             Order.symbol == pos.symbol,
             Order.status == OrderStatus.FILLED,
             Order.is_closing.is_(False),
-            Order.parent_order_id.is_(None),
             Order.bracket_parent_id.is_(None),
             Order.stop_loss_price.isnot(None),
         )
@@ -408,6 +438,23 @@ def _trigger_close(
             "broker_order_id": result.broker_order_id,
         },
     )
+    # Signed realised-P&L percent at the close limit. Anchored on the
+    # parent's limit_price first (same anchor the trader saw when they
+    # set the bracket "5% / 10%"), falling back to filled_avg_price for
+    # market entries. Sign convention: positive == gain, negative ==
+    # loss, regardless of long/short — so an SL fill on either side
+    # reads as the negative number the trader expects.
+    entry_price = entry.limit_price or entry.filled_avg_price
+    pnl_pct: str | None = None
+    if entry_price and entry_price > 0:
+        # `side` here is the CLOSE side, not the entry side. The entry
+        # side is the opposite: a SELL close means we were long; a BUY
+        # close means we were short.
+        was_long = side == OrderSide.SELL
+        direction = Decimal("1") if was_long else Decimal("-1")
+        pct = ((limit_price - entry_price) / entry_price) * Decimal("100") * direction
+        pnl_pct = f"{pct.quantize(Decimal('0.01'))}"
+
     return {
         "symbol": pos.symbol,
         "qty": str(qty),
@@ -415,9 +462,17 @@ def _trigger_close(
         "sl_price": str(entry.stop_loss_price),
         "mark": str(pos.current_price),
         "limit": str(limit_price),
+        "entry_price": str(entry_price) if entry_price is not None else None,
+        "pnl_pct": pnl_pct,
         "broker_order_id": result.broker_order_id,
         "entry_order_id": str(entry.id),
     }
 
 
-__all__ = ["enforce_trader_option_sl"]
+# The monitor is role-agnostic (see _find_entry_with_sl): it enforces the
+# deferred option SL for whoever owns the account — trader entry or subscriber
+# mirror. `enforce_option_sl` is the role-neutral name; the original is kept as
+# an alias so existing trader-side imports keep working.
+enforce_option_sl = enforce_trader_option_sl
+
+__all__ = ["enforce_trader_option_sl", "enforce_option_sl"]

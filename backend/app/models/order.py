@@ -102,6 +102,22 @@ class Order(Base, TimestampMixin):
     take_profit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
 
+    # Percent-distance bracket — used for COPIED subscriber brackets only.
+    # When a subscriber opts into "copy trader's SL/TP"
+    # (SubscriberSettings.copy_trader_bracket), copy_engine records the
+    # trader's TP/SL as a positive percent distance from the trader's entry
+    # here (NOT the absolute price — the subscriber may fill at a different
+    # price). The bracket emulator re-anchors these onto the subscriber's
+    # OWN fill (limit_price first, else filled_avg_price) when the entry
+    # fills, so every subscriber gets the same risk/reward % regardless of
+    # their fill or multiplier. Sign convention matches the frontend's
+    # InlineBracketCell: the stored value is the positive distance, and the
+    # emulator applies the leg/side direction. NULL on the trader's own
+    # orders and on subscriber orders when the toggle is off (those use the
+    # absolute *_price columns above, or no bracket at all).
+    take_profit_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+    stop_loss_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+
     # Linkage for *emulated* bracket exits on adapters without native OCO
     # (everything except Alpaca direct). When the entry fills, the
     # `bracket_emulator` service places TP (LIMIT) + SL (STOP) on the
@@ -166,15 +182,17 @@ class Order(Base, TimestampMixin):
     # ── Retry policy (transient broker errors) ──────────────────────────
     # Set on a child order whose broker call returned a transient error
     # (5xx, 429, timeout, connection reset). The retry_scheduler picks
-    # rows up where retry_at <= now() AND retry_attempted=false and tries
-    # the broker call once more. is_closing distinguishes opening vs
-    # closing intent so the subscriber's open/close retry interval can
-    # be applied. See alembic migration b3c1d4e2a51f for details.
+    # rows up where retry_at <= now() and tries again, up to
+    # subscriber_settings.retry_max_attempts times. is_closing
+    # distinguishes opening vs closing intent so the subscriber's
+    # open/close retry interval can be applied.
     retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    retry_attempted: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False
+    # Counts how many retry attempts have been made so far (0 = none yet).
+    # Replaces the old boolean retry_attempted; supports 1-5 retries.
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
     )
     is_closing: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False

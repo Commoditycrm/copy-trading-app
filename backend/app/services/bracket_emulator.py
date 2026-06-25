@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -82,6 +82,34 @@ def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) ->
     # Quantize to the tick: divide → round → multiply.
     return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
+
+def _reanchor_exit_price(
+    anchor: Decimal, pct: Decimal, side: OrderSide, leg: str,
+    instrument_type: InstrumentType,
+) -> Decimal:
+    """Re-anchor a percent bracket onto `anchor` and tick-round it, then
+    guarantee the result sits at least ONE tick on the correct side of the
+    anchor.
+
+    The guard matters for low-priced options: 5% of a $0.19 option is
+    $0.0095 — less than the $0.01 tick — so the leg-aware rounding (TP down,
+    SL up) collapses the exit onto the entry and it would fire at break-even.
+    Nudging it one tick out keeps the bracket meaningful (TP 0.20 / SL 0.18
+    instead of 0.19 / 0.19)."""
+    direction = _leg_direction(side, leg)
+    raw = anchor * (1 + direction * pct / 100)
+    rounded = _round_to_tick(raw, instrument_type, leg)
+    tick = (
+        _NICKEL
+        if instrument_type == InstrumentType.OPTION and anchor >= _OPTION_NICKEL_THRESHOLD
+        else _PENNY
+    )
+    if direction > 0 and rounded <= anchor:
+        rounded = anchor + tick
+    elif direction < 0 and rounded >= anchor:
+        rounded = anchor - tick
+    return rounded
+
 # OrderStatuses we still consider "alive" — used to decide whether the
 # sibling exit can be cancelled. PENDING covers the brief window between
 # our DB INSERT and the broker accepting.
@@ -91,6 +119,15 @@ _ALIVE_STATUSES = (
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
 )
+
+
+def _leg_direction(side: OrderSide, leg: str) -> Decimal:
+    """+1 when a correctly-placed leg sits ABOVE entry, -1 when BELOW.
+    Mirrors copy_engine._leg_direction and the frontend InlineBracketCell:
+      buy+tp / sell+sl → +1 ; buy+sl / sell+tp → -1."""
+    buy = side == OrderSide.BUY
+    positive = (buy and leg == "tp") or (not buy and leg == "sl")
+    return Decimal("1") if positive else Decimal("-1")
 
 
 def _uses_native_bracket(broker: BrokerName, instrument_type: "InstrumentType | None" = None) -> bool:
@@ -128,6 +165,46 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
         return []
     tp_price = entry.take_profit_price
     sl_price = entry.stop_loss_price
+
+    # Copied percent bracket (subscriber with copy_trader_bracket on):
+    # re-anchor the trader's percent distance onto THIS account's own
+    # entry so the exit sits the same % from entry as the trader's,
+    # regardless of the subscriber's fill price or multiplier.
+    #
+    # Anchor on the subscriber's actual FILL price first, not the mirror's
+    # limit. The whole point of percent re-anchoring is risk parity: the
+    # subscriber should risk/target the same % off what THEY actually paid.
+    # When a limit mirror fills better than its limit (e.g. limit 0.21,
+    # fill 0.19), anchoring on the limit would place a "+5%" TP at 0.22 —
+    # which is +15.8% off the real 0.19 entry, so it never triggers while
+    # the trader's did. filled_avg_price is the true entry; fall back to
+    # limit_price only when the fill price isn't written back yet.
+    if entry.take_profit_pct is not None or entry.stop_loss_pct is not None:
+        anchor = entry.filled_avg_price or entry.limit_price
+        if anchor and anchor > 0:
+            if entry.take_profit_pct is not None:
+                tp_price = _reanchor_exit_price(
+                    anchor, entry.take_profit_pct, entry.side, "tp", entry.instrument_type
+                )
+            if entry.stop_loss_pct is not None:
+                sl_price = _reanchor_exit_price(
+                    anchor, entry.stop_loss_pct, entry.side, "sl", entry.instrument_type
+                )
+            # Persist the re-anchored absolute prices back onto the entry.
+            # Two reasons:
+            #   1. An OPTION SL leg can't rest at the broker (Alpaca rejects
+            #      STOP on options), so it's enforced by the price monitor —
+            #      which reads `entry.stop_loss_price`. A copied option bracket
+            #      only ever carries stop_loss_PCT, so without this the monitor
+            #      would have no concrete trigger and the SL would never fire.
+            #   2. The order-history / positions UI renders the TP/SL columns
+            #      from these absolute prices; a mirror would otherwise show a
+            #      blank bracket. Already tick-rounded by _reanchor_exit_price.
+            if tp_price:
+                entry.take_profit_price = tp_price
+            if sl_price:
+                entry.stop_loss_price = sl_price
+
     if not tp_price and not sl_price:
         return []
     if entry.broker_account_id is None:
@@ -137,21 +214,48 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
     acct = db.get(BrokerAccount, entry.broker_account_id)
     if acct is None:
         return []
-    if _uses_native_bracket(acct.broker, entry.instrument_type):
+    # Native-bracket short-circuit applies ONLY to the trader's own entries.
+    # Subscriber mirror entries (parent_order_id set) NEVER get a native
+    # broker bracket — copy_engine always sends None for TP/SL on the broker
+    # request — so a copied bracket on Alpaca stocks must be emulated here,
+    # not skipped as "already handled natively".
+    is_copied_mirror = entry.parent_order_id is not None
+    if not is_copied_mirror and _uses_native_bracket(acct.broker, entry.instrument_type):
         # Alpaca's OrderClass.BRACKET already attached these legs on the
         # broker side — nothing for us to do. (Options on Alpaca are
         # NOT native — see _uses_native_bracket; those fall through to
         # the emulator path below.)
         return []
 
-    # Idempotency: don't place exits twice. Re-deliveries of the same
-    # FILLED event are common when both the listener poll and the
+    # Idempotency: don't place the SAME leg twice. Re-deliveries of the
+    # same FILLED event are common when both the listener poll and the
     # fills_sync pass land on the same transition.
-    already = db.execute(
-        select(Order).where(Order.bracket_parent_id == entry.id)
+    #
+    # We dedup PER LEG, not as an all-or-nothing block. That serves two
+    # cases at once:
+    #   (a) Re-delivery — both TP and SL siblings are already alive/
+    #       filled, so both are skipped and we return []. Same behaviour
+    #       as the original short-circuit.
+    #   (b) Bracket-modify of only one leg — the modify endpoint cancels
+    #       just the changing leg, leaves the untouched one alive, and
+    #       calls us. We see the surviving alive leg and DON'T re-place
+    #       it, but we DO place a fresh leg on the other side using the
+    #       parent's updated price.
+    # Canceled / rejected children don't block anything — they're gone.
+    # Include REJECTED so a leg the broker refused (e.g. an option SELL that
+    # comes back "uncovered" because the position is already gone) is treated
+    # as "already attempted" and NOT re-placed. Without this, a poller-driven
+    # reconcile retries the rejected leg every tick, spamming the broker.
+    # CANCELED is deliberately NOT here — the bracket-modify flow cancels a
+    # leg then re-places it, which must still work.
+    BLOCKING = (*_ALIVE_STATUSES, OrderStatus.FILLED, OrderStatus.REJECTED)
+    already_rows = db.execute(
+        select(Order).where(
+            Order.bracket_parent_id == entry.id,
+            Order.status.in_(BLOCKING),
+        )
     ).scalars().all()
-    if already:
-        return []
+    already_legs = {a.bracket_leg for a in already_rows if a.bracket_leg}
 
     qty = entry.filled_quantity or entry.quantity
     if not qty or qty <= 0:
@@ -168,14 +272,17 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
         return []
 
     legs: list[tuple[str, OrderType, Decimal]] = []
-    if tp_price:
+    if tp_price and "tp" not in already_legs:
         # Round to the smallest tick the broker accepts. Without this,
         # a TP/SL computed as a percentage of entry price (e.g.
         # 2.51 × 1.02 = 2.5602) is rejected by Alpaca's options API
         # with "limit price must be limited to 2 decimal places".
         legs.append(("tp", OrderType.LIMIT, _round_to_tick(tp_price, entry.instrument_type, "tp")))
-    if sl_price:
+    if sl_price and "sl" not in already_legs:
         legs.append(("sl", OrderType.STOP, _round_to_tick(sl_price, entry.instrument_type, "sl")))
+    if not legs:
+        # Both sides are either already placed or were never requested.
+        return []
 
     created: list[Order] = []
     for leg, otype, price in legs:
@@ -449,14 +556,35 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
         qty = filled_exit.filled_quantity or filled_exit.quantity
         symbol = filled_exit.symbol or "position"
 
+        # Realised-P&L %, anchored on the entry's limit_price (same
+        # anchor the trader saw when they set the bracket "5% / 10%"),
+        # falling back to filled_avg_price for market entries. Signed:
+        # positive on TP fills, negative on SL fills, regardless of
+        # whether the entry was long or short.
+        pnl_pct_str: str | None = None
+        parent: "Order | None" = None
+        if filled_exit.bracket_parent_id is not None:
+            parent = db.get(Order, filled_exit.bracket_parent_id)
+        if parent is not None and fill_price is not None:
+            entry_price = parent.limit_price or parent.filled_avg_price
+            if entry_price and entry_price > 0:
+                was_long = parent.side == OrderSide.BUY
+                direction = Decimal("1") if was_long else Decimal("-1")
+                pct = ((fill_price - entry_price) / entry_price) * Decimal("100") * direction
+                pnl_pct_str = f"{pct.quantize(Decimal('0.01'))}"
+
         # Trader-readable message. Includes BOTH the trigger and the
-        # actual fill so they can spot slippage at a glance.
+        # actual fill so they can spot slippage at a glance. The
+        # realised P&L tagline anchors the "what does this mean for
+        # me" answer right in the notification.
         msg_parts = [f"{symbol} {leg_label} hit"]
         if trigger_price is not None:
             msg_parts.append(f"at ${trigger_price}")
         if fill_price is not None and fill_price != trigger_price:
             msg_parts.append(f"(filled ${fill_price})")
         msg_parts.append(f"— {qty} closed.")
+        if pnl_pct_str is not None:
+            msg_parts.append(f"Realised P&L: {pnl_pct_str}%.")
         message = " ".join(msg_parts)
 
         notif_svc.create_notification(
@@ -472,6 +600,7 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
                 "qty": str(qty) if qty is not None else None,
                 "trigger_price": str(trigger_price) if trigger_price is not None else None,
                 "fill_price": str(fill_price) if fill_price is not None else None,
+                "pnl_pct": pnl_pct_str,
                 "broker_order_id": filled_exit.broker_order_id,
             },
         )
@@ -494,7 +623,78 @@ def _notify_trader_of_bracket_fill(db: Session, filled_exit: Order) -> None:
         )
 
 
+def reconcile_copy_brackets(db: Session, broker_account_id: "uuid.UUID") -> int:
+    """Reconcile copy-bracket exits for a subscriber's account.
+
+    Subscribers have no real-time fill listener (those are trader-only), so
+    a mirror entry that carries a copied bracket (take_profit_pct /
+    stop_loss_pct, or absolute prices) never triggers the bracket emulator
+    on its own. The pnl_poller calls this every tick for opted-in
+    subscribers to close that gap:
+
+      1. For every FILLED mirror entry that has a bracket but no exit legs
+         yet → place the TP/SL exits (re-anchored onto the subscriber's
+         fill via emulate_bracket_exits).
+      2. For every FILLED bracket exit leg → run the OCO sibling-cancel.
+
+    Idempotent: emulate_bracket_exits skips entries that already have their
+    legs, so calling this repeatedly is safe. Returns the number of entries
+    for which exits were placed this call.
+    """
+    placed = 0
+    # Entry ids that already have AT LEAST ONE exit-leg row (any status,
+    # including rejected) — those have already had their bracket attempted,
+    # so we never reconcile them again. This is what keeps the poller from
+    # re-attempting (and re-auditing) a bracket every tick.
+    have_exits: set = set(db.execute(
+        select(Order.bracket_parent_id).where(
+            Order.broker_account_id == broker_account_id,
+            Order.bracket_parent_id.isnot(None),
+        )
+    ).scalars())
+
+    entries = db.execute(
+        select(Order).where(
+            Order.broker_account_id == broker_account_id,
+            Order.parent_order_id.isnot(None),     # subscriber mirror, not a root order
+            Order.status == OrderStatus.FILLED,
+            Order.bracket_leg.is_(None),            # the entry, not an exit leg
+            or_(
+                Order.take_profit_pct.isnot(None),
+                Order.stop_loss_pct.isnot(None),
+                Order.take_profit_price.isnot(None),
+                Order.stop_loss_price.isnot(None),
+            ),
+        )
+    ).scalars().all()
+    for entry in entries:
+        if entry.id in have_exits:
+            continue  # bracket already attempted — don't retry
+        try:
+            if emulate_bracket_exits(db, entry):
+                placed += 1
+        except Exception:  # noqa: BLE001
+            log.exception("reconcile_copy_brackets: place failed for entry %s", entry.id)
+
+    # OCO: any exit leg that has filled should cancel its surviving sibling.
+    filled_legs = db.execute(
+        select(Order).where(
+            Order.broker_account_id == broker_account_id,
+            Order.bracket_leg.isnot(None),
+            Order.status == OrderStatus.FILLED,
+        )
+    ).scalars().all()
+    for leg in filled_legs:
+        try:
+            cancel_sibling_on_fill(db, leg)
+        except Exception:  # noqa: BLE001
+            log.exception("reconcile_copy_brackets: OCO failed for leg %s", leg.id)
+
+    db.commit()
+    return placed
+
+
 # Re-export the public surface so listeners can `from app.services.bracket_emulator
 # import emulate_bracket_exits, cancel_sibling_on_fill` without touching the
 # private helpers above.
-__all__ = ["emulate_bracket_exits", "cancel_sibling_on_fill"]
+__all__ = ["emulate_bracket_exits", "cancel_sibling_on_fill", "reconcile_copy_brackets"]

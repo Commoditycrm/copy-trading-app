@@ -36,8 +36,9 @@ function StatCard({
     <div
       className="rounded-xl p-5"
       style={{
-        background: "linear-gradient(135deg,rgba(14,20,17,0.7) 0%,rgba(7,9,10,0.5) 100%)",
+        background: "var(--panel)",
         border: "1px solid var(--border)",
+        boxShadow: "var(--shadow-card)",
       }}
     >
       <div className="text-xs uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
@@ -116,7 +117,7 @@ export default function AdminDashboard() {
       {/* Quick links */}
       <div
         className="rounded-xl p-5"
-        style={{ background: "rgba(14,20,17,0.5)", border: "1px solid var(--border)" }}
+        style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
       >
         <div className="text-sm font-semibold mb-3">Quick Actions</div>
         <div className="flex flex-wrap gap-3">
@@ -211,7 +212,7 @@ function FanoutThresholdCard() {
   return (
     <div
       className="rounded-xl p-5"
-      style={{ background: "rgba(14,20,17,0.5)", border: "1px solid var(--border)" }}
+      style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
     >
       <div className="flex items-start justify-between gap-4 mb-3 flex-wrap">
         <div>
@@ -263,7 +264,7 @@ function FanoutThresholdCard() {
           onClick={save}
           disabled={busy || loading || (state ? input === String(state.effective) : true)}
           className="px-3 py-1.5 text-xs rounded-lg font-semibold inline-flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed"
-          style={{ background: "var(--accent)", color: "#06121f" }}
+          style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
         >
           {busy && <Spinner />}
           Save

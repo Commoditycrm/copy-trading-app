@@ -35,6 +35,10 @@ class SubscriberSettingsOut(BaseModel):
     # the daily kill switches and of auto_liquidation_limit.
     position_tp_pct: Decimal | None = None
     position_sl_pct: Decimal | None = None
+    # When True the subscriber copies the trader's per-trade SL/TP
+    # (re-anchored onto their own fill) instead of using the per-position
+    # TP/SL above. The two are mutually exclusive — see position_enforcer.
+    copy_trader_bracket: bool = False
     # Percent of account equity (0–100). pnl_poller checks every 60s using
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
@@ -53,6 +57,9 @@ class SubscriberSettingsOut(BaseModel):
     # ORM row) doesn't end up with "RetryInterval.NEVER".
     retry_interval_open: str = "never"
     retry_interval_close: str = "never"
+    # How many additional retry attempts after the original failure (1–5).
+    # Consulted only when retry_interval_open/close != "never".
+    retry_max_attempts: int = 1
     # Per-subscriber symbol filters. Both default to empty lists, which
     # means "no filter applied" (mirror every trade). See SubscriberSettings
     # model for the precedence rules.
@@ -162,13 +169,22 @@ class AutoLiquidationLimitIn(BaseModel):
     auto_liquidation_limit: Decimal | None = Field(default=None, gt=0)
 
 
+class CopyTraderBracketIn(BaseModel):
+    """Toggle whether the subscriber copies the trader's per-trade SL/TP
+    (re-anchored onto their own fill) instead of their own per-position
+    TP/SL %. The two are mutually exclusive."""
+
+    copy_trader_bracket: bool
+
+
 class RetryIntervalIn(BaseModel):
-    """Subscriber-set retry policy. Either or both fields may be present —
-    only the supplied ones are updated, the rest stay as-is. Valid values:
-    "never", "1m", "2m", "3m", "5m"."""
+    """Subscriber-set retry policy. Any field may be omitted — only the
+    supplied ones are updated. Valid interval values: "never", "1m",
+    "2m", "3m", "5m". retry_max_attempts must be 1–5."""
 
     retry_interval_open: str | None = None
     retry_interval_close: str | None = None
+    retry_max_attempts: int | None = Field(default=None, ge=1, le=5)
 
 
 class SymbolFilterIn(BaseModel):

@@ -8,6 +8,7 @@ from app.models.settings import RetryInterval, SubscriberSettings, TraderSetting
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     AutoLiquidationLimitIn,
+    CopyTraderBracketIn,
     DailyLossLimitIn,
     DailyLossLimitPctIn,
     DailyProfitLimitIn,
@@ -58,6 +59,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         todays_realized_pnl=today_realized_pnl(db, s.user_id),
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
+        retry_max_attempts=s.retry_max_attempts,
         symbol_exclusion_list=list(s.symbol_exclusion_list or []),
         symbol_inclusion_list=list(s.symbol_inclusion_list or []),
         max_per_contract=s.max_per_contract,
@@ -68,6 +70,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         daily_profit_limit_pct=s.daily_profit_limit_pct,
         position_tp_pct=s.position_tp_pct,
         position_sl_pct=s.position_sl_pct,
+        copy_trader_bracket=s.copy_trader_bracket,
     )
 
 
@@ -392,6 +395,37 @@ def set_position_sl_pct(
     return _to_out(db, s)
 
 
+@router.patch("/subscriber/copy-trader-bracket", response_model=SubscriberSettingsOut)
+def set_copy_trader_bracket(
+    payload: CopyTraderBracketIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Toggle whether this subscriber copies the trader's per-trade SL/TP
+    (re-anchored onto their own fill) instead of their own per-position
+    TP/SL %. Cache-busts so the fanout path sees the new flag immediately."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.copy_trader_bracket
+    s.copy_trader_bracket = payload.copy_trader_bracket
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.copy_trader_bracket_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={"old": bool(old), "new": bool(payload.copy_trader_bracket)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
 @router.patch("/subscriber/retry-interval", response_model=SubscriberSettingsOut)
 def set_retry_interval(
     payload: RetryIntervalIn,
@@ -413,7 +447,7 @@ def set_retry_interval(
         except ValueError:
             raise HTTPException(422, f"invalid retry_interval: {value!r}")
 
-    changes: dict[str, str] = {}
+    changes: dict[str, object] = {}
     if payload.retry_interval_open is not None:
         new_open = _parse(payload.retry_interval_open)
         if new_open != s.retry_interval_open:
@@ -424,6 +458,10 @@ def set_retry_interval(
         if new_close != s.retry_interval_close:
             changes["retry_interval_close"] = new_close.value
             s.retry_interval_close = new_close
+    if payload.retry_max_attempts is not None:
+        if payload.retry_max_attempts != s.retry_max_attempts:
+            changes["retry_max_attempts"] = payload.retry_max_attempts
+            s.retry_max_attempts = payload.retry_max_attempts
 
     if changes:
         audit.record(
@@ -515,6 +553,24 @@ def toggle_copy(
     if not s:
         raise HTTPException(404, "settings_missing")
     s.copy_enabled = payload.copy_enabled
+    # Manual re-enable (going True) acknowledges and clears any in-flight
+    # auto-pause markers. Two reasons:
+    #   1. Avoids a spurious "Copy trading auto-resumed for the new day"
+    #      toast at the next UTC midnight, when the auto-resume sweep
+    #      would otherwise see a stale `pnl_auto_paused_at` and emit
+    #      `copy.auto_resumed` even though the user already re-enabled.
+    #   2. Prevents the auto-resume sweep from overriding a SUBSEQUENT
+    #      auto_liquidation_limit hit. Without this, the timeline
+    #      "hit daily-loss → manually re-enable → hit auto-liquidation"
+    #      would leave both `pnl_auto_paused_at` (yesterday) and
+    #      `auto_liquidated_at` (today) set, and the sweep would
+    #      incorrectly resume copy off the stale daily-limit stamp,
+    #      undoing the sticky liquidation state.
+    # Going False (manual pause) leaves the markers alone — they're
+    # already null in that case, or already accurate.
+    if payload.copy_enabled:
+        s.pnl_auto_paused_at = None
+        s.auto_liquidated_at = None
     audit.record(
         db,
         actor_user_id=user.id,

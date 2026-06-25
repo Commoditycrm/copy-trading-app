@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import type { User } from "@/lib/types";
 
 // ── Icons ────────────────────────────────────────────────────────────────────
@@ -107,7 +108,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
       <aside
         className="w-56 flex flex-col h-full shrink-0"
         style={{
-          background: "linear-gradient(180deg,#0a0f0d 0%,#060809 100%)",
+          background: "var(--sidebar-bg)",
           borderRight: "1px solid var(--border)",
         }}
       >
@@ -174,19 +175,22 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           className="flex items-center justify-between px-6 py-3 shrink-0"
           style={{
             borderBottom: "1px solid var(--border)",
-            background: "rgba(7,9,10,0.6)",
+            background: "var(--header-bg)",
             backdropFilter: "blur(8px)",
           }}
         >
           <h1 className="text-sm font-semibold" style={{ color: "var(--text-2)" }}>
             {NAV.find(n => n.href === "/admin" ? pathname === "/admin" : pathname?.startsWith(n.href))?.label ?? "Admin"}
           </h1>
-          <span
-            className="text-xs px-2 py-0.5 rounded-full font-medium"
-            style={{ background: "rgba(239,68,68,0.12)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.2)" }}
-          >
-            Internal — not visible to clients
-          </span>
+          <div className="flex items-center gap-3">
+            <span
+              className="text-xs px-2 py-0.5 rounded-full font-medium"
+              style={{ background: "rgba(239,68,68,0.12)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.2)" }}
+            >
+              Internal — not visible to clients
+            </span>
+            <ThemeToggle />
+          </div>
         </header>
         <main className="flex-1 overflow-y-auto p-6">{children}</main>
       </div>

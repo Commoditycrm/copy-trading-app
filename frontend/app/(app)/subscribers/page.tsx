@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { Search, Trash2, Users, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
-import { Spinner } from "@/components/Spinner";
+import { ConfirmModal } from "@/components/ConfirmModal";
+import { fmtSignedUsd } from "@/lib/format";
 import type { SubscriberSummary } from "@/lib/types";
 
 export default function SubscribersPage() {
@@ -12,6 +14,7 @@ export default function SubscribersPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState<{ ids: string[]; label: string } | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [search, setSearch] = useState("");
 
   async function load() {
     try { setRows(await api<SubscriberSummary[]>("/api/subscribers")); }
@@ -31,12 +34,22 @@ export default function SubscribersPage() {
     });
   }, [rows]);
 
-  const allSelected = rows.length > 0 && selected.size === rows.length;
-  const someSelected = selected.size > 0 && selected.size < rows.length;
+  // Presentational filter (by name / email).
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter(r =>
+      r.email.toLowerCase().includes(q) ||
+      (r.display_name ?? "").toLowerCase().includes(q)
+    );
+  }, [rows, search]);
+
+  const allSelected = filtered.length > 0 && filtered.every(r => selected.has(r.user_id));
+  const someSelected = selected.size > 0 && !allSelected;
 
   function toggleAll() {
     if (allSelected) setSelected(new Set());
-    else setSelected(new Set(rows.map(r => r.user_id)));
+    else setSelected(new Set(filtered.map(r => r.user_id)));
   }
 
   function toggleOne(id: string) {
@@ -76,9 +89,7 @@ export default function SubscribersPage() {
         removed = res.removed ?? 0;
       }
       notify.success(
-        removed === 1
-          ? "Subscriber removed"
-          : `${removed} subscribers removed`
+        removed === 1 ? "Subscriber removed" : `${removed} subscribers removed`
       );
       setSelected(new Set());
       setConfirming(null);
@@ -90,252 +101,189 @@ export default function SubscribersPage() {
     }
   }
 
-  const bulkBar = useMemo(() => {
-    if (selected.size === 0) return null;
-    return (
-      <div
-        className="flex items-center justify-between px-3 py-2 rounded border"
-        style={{ borderColor: "var(--border)", background: "var(--panel)" }}
-      >
-        <div className="text-sm">
-          <strong>{selected.size}</strong> selected
-        </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setSelected(new Set())}
-            className="px-3 py-1 text-sm rounded border"
-            style={{ borderColor: "var(--border)" }}
-          >
-            Clear
-          </button>
-          <button
-            onClick={() => requestRemove(Array.from(selected))}
-            className="px-3 py-1 text-sm rounded"
-            style={{ background: "var(--bad)", color: "#fff" }}
-          >
-            Remove selected ({selected.size})
-          </button>
-        </div>
-      </div>
-    );
-  }, [selected]);
-
-  // At-a-glance counts shown in the page header. `active` = copy_enabled,
-  // `withBroker` = at least one broker connected (broker_count > 0).
-  // All three derive from `rows` so they're always in sync with the table
-  // below — no stale count after a remove / refresh.
   const total = rows.length;
   const active = rows.filter(r => r.copy_enabled).length;
   const withBroker = rows.filter(r => r.broker_count > 0).length;
 
   return (
-    <div className="space-y-4">
-      {/* ── Page header with subscriber counts ──────────────────────────
-          Plain stat strip — total, active, paused — so the trader can
-          see at a glance how many people are following them and how
-          many currently have copy ON. */}
-      <header className="flex items-center justify-between gap-3 flex-wrap">
-        <div>
-          {/* <h1 className="text-xl font-semibold tracking-tight">Subscribers</h1> */}
-          <p className="text-xs mt-0.5" style={{color: "var(--muted)"}}>
-            People copying your trades.
-          </p>
-        </div>
-        <div className="inline-flex items-center gap-4">
-          <CountStat label="Total" value={total} loading={loading} />
-          <Divider />
-          <CountStat label="Copy ON" value={active} loading={loading} color="var(--good)" />
-          <Divider />
-          {/* Number of subscribers with at least one broker hooked up —
-              anyone with 0 brokers gets skipped by copy_engine with
-              status="skipped_no_broker", so this is "how many can
-              actually receive mirrors." */}
-          <CountStat
-            label="Broker Connected"
-            value={withBroker}
-            loading={loading}
-            color={withBroker === total ? "var(--good)" : "var(--text)"}
+    <div className="flex flex-col h-full min-h-0">
+      {/* Toolbar: live counts on the LEFT, search on the RIGHT. While
+          rows are selected, the bulk-action controls replace the counts. */}
+      <div className="flex items-center justify-between mb-3 gap-3 flex-wrap min-h-[34px]">
+        {/* Left: bulk actions while selecting, else the live counts */}
+        {selected.size > 0 ? (
+          <div className="flex items-center gap-3">
+            <span className="text-sm"><strong>{selected.size}</strong> selected</span>
+            <button onClick={() => setSelected(new Set())} className="btn-ghost px-3 py-1 text-xs">Clear</button>
+            <button
+              onClick={() => requestRemove(Array.from(selected))}
+              className="btn-danger px-3 py-1 text-xs inline-flex items-center gap-1.5"
+            >
+              <Trash2 size={13} /> Remove selected ({selected.size})
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 self-end pb-0.5">
+            <Stat label="Total" value={total} />
+            <Stat label="Copy ON" value={active} tone="good" />
+            <Stat label="Broker connected" value={withBroker} tone={withBroker === total && total > 0 ? "good" : "neutral"} />
+          </div>
+        )}
+
+        {/* Right: search */}
+        <div className="relative ml-auto">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search name or email…"
+            className="pl-8 pr-8 py-1.5 text-sm w-52 sm:w-64"
+            aria-label="Search subscribers"
           />
+          {search && (
+            <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
+              <X size={14} />
+            </button>
+          )}
         </div>
-      </header>
-
-      {bulkBar}
-
-      {/* overflow-auto + max-h enables BOTH horizontal scroll (if cols
-          ever exceed width) and vertical scroll once the body is taller
-          than the viewport minus the header chrome. The sticky <thead>
-          below stays pinned to the top of this scroll container so
-          column headers remain visible while the user scrolls rows. */}
-      <div
-        className="overflow-auto rounded border"
-        style={{
-          borderColor: "var(--border)",
-          maxHeight: "calc(100vh - 150px)",
-        }}
-      >
-        <table className="w-full text-sm">
-          {/* sticky top-0 z-10 keeps the header pinned; opaque var(--panel)
-              background prevents row text from bleeding through behind it. */}
-          <thead className="sticky top-0 z-10" style={{background: "var(--panel)"}}>
-            <tr>
-              <th className="px-3 py-2 w-10">
-                <input
-                  type="checkbox"
-                  aria-label="Select all subscribers"
-                  checked={allSelected}
-                  ref={el => { if (el) el.indeterminate = someSelected; }}
-                  onChange={toggleAll}
-                  disabled={loading || rows.length === 0}
-                />
-              </th>
-              {["Subscriber", "Copy", "Broker", "30d realized P&L", ""].map(h =>
-                <th key={h} className="text-left px-3 py-2 font-medium" style={{color: "var(--muted)"}}>{h}</th>
-              )}
-            </tr>
-          </thead>
-          <tbody>
-            {loading && (
-              <tr>
-                <td colSpan={6} className="px-3 py-8 text-center" style={{color: "var(--muted)"}}>
-                  <span className="inline-flex items-center gap-2">
-                    <Spinner />
-                    <span>Loading subscribers…</span>
-                  </span>
-                </td>
-              </tr>
-            )}
-            {!loading && rows.length === 0 && (
-              <tr><td colSpan={6} className="px-3 py-6 text-center" style={{color: "var(--muted)"}}>No subscribers yet.</td></tr>
-            )}
-            {rows.map(r => {
-              const pnl = Number(r.realized_pnl_30d);
-              const isSelected = selected.has(r.user_id);
-              return (
-                <tr key={r.user_id} className="border-t" style={{borderColor: "var(--border)"}}>
-                  <td className="px-3 py-2">
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${r.email}`}
-                      checked={isSelected}
-                      onChange={() => toggleOne(r.user_id)}
-                    />
-                  </td>
-                  <td className="px-3 py-2">
-                    <div>{r.display_name ?? r.email}</div>
-                    <div className="text-xs" style={{color: "var(--muted)"}}>{r.email}</div>
-                  </td>
-                  <td className="px-3 py-2">
-                    <span style={{color: r.copy_enabled ? "var(--good)" : "var(--muted)"}}>
-                      {r.copy_enabled ? "ON" : "OFF"}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2">
-                    {/* Plain status text — green for connected, muted for not.
-                        broker_count == 0 means fanout will skip this row with
-                        status="skipped_no_broker". */}
-                    <span
-                      style={{color: r.broker_count > 0 ? "var(--good)" : "var(--muted)"}}
-                    >
-                      {r.broker_count > 0 ? "Connected" : "Not Connected"}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2" style={{color: pnl >= 0 ? "var(--good)" : "var(--bad)"}}>
-                    {pnl.toLocaleString(undefined, { style: "currency", currency: "USD" })}
-                  </td>
-                  <td className="px-3 py-2">
-                    <button
-                      onClick={() => requestRemove([r.user_id])}
-                      aria-label={`Remove ${r.email}`}
-                      title="Remove subscriber"
-                      className="px-3 py-1 text-sm rounded border"
-                      style={{ borderColor: "var(--border)", color: "var(--bad)" }}
-                    >
-                      Remove
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
       </div>
 
-      {confirming && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="confirm-remove-title"
-          className="fixed inset-0 z-50 flex items-center justify-center px-4"
-          style={{ background: "rgba(0,0,0,0.5)" }}
-          onClick={() => !removing && setConfirming(null)}
-        >
-          <div
-            className="w-full max-w-md rounded border p-4"
-            style={{ borderColor: "var(--border)", background: "var(--panel)" }}
-            onClick={e => e.stopPropagation()}
-          >
-            <h2 id="confirm-remove-title" className="text-base font-semibold mb-2">
-              Remove {confirming.label}?
-            </h2>
-            <p className="text-sm mb-4" style={{ color: "var(--muted)" }}>
-              They will stop receiving new copy trades from you. Their account,
-              broker connections, and order history are preserved — they can
-              re-follow you any time.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setConfirming(null)}
-                disabled={removing}
-                className="px-3 py-1 text-sm rounded border"
-                style={{ borderColor: "var(--border)" }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmRemove}
-                disabled={removing}
-                className="px-3 py-1 text-sm rounded inline-flex items-center gap-2"
-                style={{ background: "var(--bad)", color: "#fff" }}
-              >
-                {removing && <Spinner />}
-                {removing ? "Removing…" : "Remove"}
-              </button>
-            </div>
-          </div>
+      <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
+        <div className="overflow-auto flex-1 min-h-0">
+          <table className={`w-full text-sm ${!loading && filtered.length === 0 ? "h-full" : ""}`}>
+            <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
+              <tr>
+                <th className="px-5 py-3 w-10">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all subscribers"
+                    checked={allSelected}
+                    ref={el => { if (el) el.indeterminate = someSelected; }}
+                    onChange={toggleAll}
+                    disabled={loading || filtered.length === 0}
+                  />
+                </th>
+                {["Subscriber", "Copy", "Broker", "30d realized P&L", ""].map(h =>
+                  <th key={h} className="text-left px-5 py-3 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {loading && Array.from({ length: 5 }).map((_, i) => (
+                <tr key={`sk-${i}`} className="border-t" style={{ height: 54, borderColor: "var(--border)" }}>
+                  {Array.from({ length: 6 }).map((__, j) => (
+                    <td key={j} className="px-5 py-2"><div className="skeleton h-4 w-full" style={{ minWidth: 40 }} /></td>
+                  ))}
+                </tr>
+              ))}
+              {!loading && filtered.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-3 align-middle text-center">
+                    <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
+                      <Users size={28} />
+                      <div className="text-sm" style={{ color: "var(--text)" }}>
+                        {rows.length === 0 ? "No subscribers yet" : `No subscribers match “${search}”`}
+                      </div>
+                      <div className="text-xs">People who follow you and turn copy on will appear here.</div>
+                    </div>
+                  </td>
+                </tr>
+              )}
+              {!loading && filtered.map(r => {
+                const isSelected = selected.has(r.user_id);
+                return (
+                  <tr key={r.user_id} className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ height: 54, borderColor: "var(--border)" }}>
+                    <td className="px-5 py-2">
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${r.email}`}
+                        checked={isSelected}
+                        onChange={() => toggleOne(r.user_id)}
+                      />
+                    </td>
+                    <td className="px-5 py-2">
+                      <div className="font-medium" style={{ color: "var(--text)" }}>{r.display_name ?? r.email}</div>
+                      <div className="text-xs" style={{ color: "var(--muted)" }}>{r.email}</div>
+                    </td>
+                    <td className="px-5 py-2">
+                      <span
+                        className="uppercase font-semibold"
+                        style={{
+                          color: r.copy_enabled ? "var(--good)" : "var(--muted)",
+                          borderColor: "transparent",
+                        }}
+                      >
+                        {r.copy_enabled ? "On" : "Off"}
+                      </span>
+                    </td>
+                    <td className="px-5 py-2">
+                      <span
+                        style={{
+                          color: r.broker_count > 0 ? "var(--good)" : "var(--muted)",
+                          borderColor: "transparent",
+                        }}
+                      >
+                        {r.broker_count > 0 ? "Connected" : "Disconnected"}
+                      </span>
+                    </td>
+                    <td className="px-5 py-2 num font-medium" style={{ color: Number(r.realized_pnl_30d) >= 0 ? "var(--good)" : "var(--bad)" }}>
+                      {fmtSignedUsd(r.realized_pnl_30d)}
+                    </td>
+                    <td className="px-5 py-2 text-right">
+                      <button
+                        onClick={() => requestRemove([r.user_id])}
+                        aria-label={`Remove ${r.email}`}
+                        title="Remove subscriber"
+                        className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                      >
+                        <Trash2 size={13} /> Remove
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
-      )}
+      </div>
+
+      <ConfirmModal
+        open={confirming !== null}
+        title={`Remove ${confirming?.label ?? "subscriber"}?`}
+        message={
+          <>
+            They will stop receiving new copy trades from you. Their account,
+            broker connections, and order history are preserved — they can
+            re-follow you any time.
+          </>
+        }
+        confirmLabel="Remove"
+        cancelLabel="Cancel"
+        variant="danger"
+        busy={removing}
+        onConfirm={confirmRemove}
+        onCancel={() => { if (!removing) setConfirming(null); }}
+      />
     </div>
   );
 }
 
-// ── Header-strip helpers ──────────────────────────────────────────────
-
-/** One labelled count in the header stat strip. Shows a small dash while
- *  the initial fetch is in flight so the row doesn't briefly read "0/0/0"
- *  before real data arrives. */
-function CountStat({
-  label, value, loading, color,
+/** Label + count rendered as a chip, shown beside the search bar. */
+function Stat({
+  label,
+  value,
+  tone = "neutral",
 }: {
   label: string;
   value: number;
-  loading: boolean;
-  color?: string;
+  tone?: "neutral" | "good";
 }) {
+  const color = tone === "good" ? "var(--good)" : "var(--text)";
   return (
-    <span className="inline-flex items-baseline gap-1.5 text-xs">
-      <span className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>
-        {label}
-      </span>
-      <strong
-        className="tabular-nums text-sm"
-        style={{color: color ?? "var(--text)"}}
-      >
-        {loading ? "—" : value}
-      </strong>
+    <span className="chip whitespace-nowrap" style={{ padding: "6px 12px", borderRadius: 10 }}>
+      <span className="uppercase tracking-wider">{label}</span>
+      <span className="num font-semibold" style={{ color }}>{value}</span>
     </span>
   );
-}
-
-function Divider() {
-  return <span aria-hidden className="h-3.5 w-px" style={{background: "var(--border)"}} />;
 }

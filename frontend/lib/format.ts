@@ -103,3 +103,71 @@ export function fmtDate(input: string | Date | null | undefined): string {
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleDateString("en-US", { ...DATE_OPTS, timeZone: APP_TZ });
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Money / number / P&L formatting — single source of truth for currency and
+   metrics so values line up (tabular nums) and gains/losses read consistently.
+   ───────────────────────────────────────────────────────────────────────── */
+
+function _toNum(v: string | number | null | undefined): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+const _usd = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** "$1,234.50" — plain currency, "—" when missing/invalid. */
+export function fmtUsd(v: string | number | null | undefined): string {
+  const n = _toNum(v);
+  return n === null ? "—" : _usd.format(n);
+}
+
+/** "+$1,234.50" / "-$1,234.50" — signed currency for P&L. Zero shows "$0.00". */
+export function fmtSignedUsd(v: string | number | null | undefined): string {
+  const n = _toNum(v);
+  if (n === null) return "—";
+  const sign = n > 0 ? "+" : n < 0 ? "-" : "";
+  return `${sign}${_usd.format(Math.abs(n))}`;
+}
+
+/** Plain number with grouping + fixed decimals (default 2). "—" when invalid. */
+export function fmtNum(
+  v: string | number | null | undefined,
+  dp = 2,
+): string {
+  const n = _toNum(v);
+  return n === null
+    ? "—"
+    : n.toLocaleString("en-US", { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+/** "+12.34%" / "-3.10%" — `v` is already a percentage value (e.g. 12.34). */
+export function fmtPct(
+  v: string | number | null | undefined,
+  dp = 2,
+  signed = true,
+): string {
+  const n = _toNum(v);
+  if (n === null) return "—";
+  const sign = signed && n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(dp)}%`;
+}
+
+/** Direction of a P&L value — drives color. "flat" for 0 / missing. */
+export function pnlTone(v: string | number | null | undefined): "good" | "bad" | "flat" {
+  const n = _toNum(v);
+  if (n === null || n === 0) return "flat";
+  return n > 0 ? "good" : "bad";
+}
+
+/** CSS color variable for a P&L value — `var(--good|--bad|--muted)`. */
+export function pnlColor(v: string | number | null | undefined): string {
+  const t = pnlTone(v);
+  return t === "good" ? "var(--good)" : t === "bad" ? "var(--bad)" : "var(--muted)";
+}

@@ -40,7 +40,7 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderSide, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
@@ -147,6 +147,53 @@ def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) 
     return raw.to_integral_value(rounding=ROUND_DOWN)
 
 
+def _leg_direction(side: OrderSide, leg: str) -> Decimal:
+    """+1 when a correctly-placed leg sits ABOVE entry, -1 when BELOW.
+    Mirrors the frontend InlineBracketCell convention:
+      buy+tp / sell+sl → +1 ; buy+sl / sell+tp → -1."""
+    buy = side == OrderSide.BUY
+    positive = (buy and leg == "tp") or (not buy and leg == "sl")
+    return Decimal("1") if positive else Decimal("-1")
+
+
+def _trader_bracket_for_copy(trader_order: Order) -> tuple[bool, Decimal | None, Decimal | None]:
+    """Describe how to stamp the trader's bracket onto a copied subscriber
+    entry. Returns ``(use_pct, tp_val, sl_val)``:
+
+      * ``use_pct=True``  → tp_val / sl_val are POSITIVE percent distances
+        from entry; the bracket emulator re-anchors them on the
+        subscriber's own fill so each subscriber gets the same risk/reward
+        % regardless of their fill price or multiplier.
+      * ``use_pct=False`` → tp_val / sl_val are ABSOLUTE prices, a fallback
+        used only when the trader order has no usable entry reference yet
+        (e.g. an unfilled market order with no limit price). The exits then
+        match the trader's price levels verbatim.
+
+    Either leg is None when the trader didn't set it (or it computed to a
+    non-positive / inverted percent, which we drop rather than place an
+    exit on the wrong side)."""
+    tp_price = trader_order.take_profit_price
+    sl_price = trader_order.stop_loss_price
+    if tp_price is None and sl_price is None:
+        return (False, None, None)
+
+    entry_ref = trader_order.limit_price or trader_order.filled_avg_price
+    if not entry_ref or entry_ref <= 0:
+        # No anchor to derive a percent from → copy absolute prices.
+        return (False, tp_price, sl_price)
+
+    q = Decimal("0.0001")
+    tp_pct: Decimal | None = None
+    sl_pct: Decimal | None = None
+    if tp_price is not None:
+        pct = _leg_direction(trader_order.side, "tp") * (tp_price / entry_ref - 1) * 100
+        tp_pct = pct.quantize(q) if pct > 0 else None
+    if sl_price is not None:
+        pct = _leg_direction(trader_order.side, "sl") * (sl_price / entry_ref - 1) * 100
+        sl_pct = pct.quantize(q) if pct > 0 else None
+    return (True, tp_pct, sl_pct)
+
+
 def trader_can_trade(db: Session, trader: User) -> bool:
     if trader.role != UserRole.TRADER:
         return False
@@ -190,11 +237,25 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     subs = await cache.get_subscribers_for_trader(db, trader.id)
 
     # ── Daily auto-resume sweep ────────────────────────────────────────────
-    # For every subscriber whose copy was previously auto-paused by a P&L
-    # limit, check whether the pause was set on a PRIOR UTC day. If so,
-    # clear the pause + re-enable copy_enabled so today's trades flow.
-    # The pause is keyed off pnl_auto_paused_at (not just copy_enabled=False)
-    # so we don't re-enable users who manually disabled copy.
+    # For every subscriber whose copy was paused by a DAILY limit
+    # (daily_loss_limit / daily_profit_limit / max_account_pct_per_day,
+    # plus their _pct variants — all stamp `pnl_auto_paused_at`), check
+    # whether the pause was set on a PRIOR UTC day. If so, clear the
+    # pause + re-enable copy_enabled so today's trades flow. Keying off
+    # `pnl_auto_paused_at` (not just `copy_enabled=False`) means a
+    # subscriber who manually paused their own copy won't be re-enabled
+    # — only auto-pauses come back.
+    #
+    # Auto-liquidation (`auto_liquidation_limit`) uses a DIFFERENT column
+    # (`auto_liquidated_at`) and is not affected by this sweep —
+    # liquidation stays sticky until the subscriber manually re-enables
+    # copy. That's the intentional split: daily limits forgive on the
+    # next day, hard-equity liquidation does not.
+    #
+    # We also run the matching sweep in pnl_poller so an idle subscriber
+    # (one whose trader hasn't placed any orders today) still auto-resumes
+    # on schedule. Both sweeps clear `pnl_auto_paused_at` on success so
+    # they're idempotent against each other.
     today_utc = datetime.now(timezone.utc).date()
     resumed_user_ids: list[uuid.UUID] = []
     for sub in subs:
@@ -217,7 +278,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     action="copy.auto_resumed_next_day",
                     entity_type="subscriber_settings",
                     entity_id=sub.user_id,
-                    metadata={"paused_at": paused_iso, "resumed_at": today_utc.isoformat()},
+                    metadata={"paused_at": str(paused_iso), "resumed_at": today_utc.isoformat()},
                 )
                 events.publish(sub.user_id, {
                     "type": "copy.auto_resumed",
@@ -289,6 +350,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         asyncio.to_thread(_accts_sync),
     )
 
+    # The trader's bracket is identical for every subscriber, so resolve it
+    # ONCE here. Only subscribers with copy_trader_bracket=True consume it
+    # (see the child construction below). use_pct chooses re-anchored-percent
+    # vs absolute-price copy; see _trader_bracket_for_copy.
+    copy_use_pct, copy_tp_val, copy_sl_val = _trader_bracket_for_copy(trader_order)
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
@@ -299,8 +366,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         subscriber_picked_at = datetime.now(timezone.utc)
 
         # Daily P&L kill switches (check BEFORE placing). Loss + profit
-        # share the same auto-pause + auto-resume machinery — both stamp
-        # pnl_auto_paused_at so the next-day sweep above re-enables them.
+        # share the same auto-pause path — both stamp pnl_auto_paused_at
+        # as an audit marker. Re-enable is MANUAL ONLY (Settings UI).
         if sub.daily_loss_limit is not None or sub.daily_profit_limit is not None:
             todays_pnl = pnl_by_user.get(sub.user_id, Decimal(0))
             hit_loss = (
@@ -314,9 +381,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if hit_loss or hit_profit:
                 reason = "daily_loss_limit" if hit_loss else "daily_profit_limit"
                 now_utc = datetime.now(timezone.utc)
-                # Flip the DB row off + stamp pnl_auto_paused_at so the
-                # next-day sweep above re-enables this subscriber on the
-                # next fanout after UTC midnight.
+                # Flip the DB row off + stamp pnl_auto_paused_at as the
+                # audit marker for "auto-paused at this time". The
+                # subscriber re-enables manually from the Settings UI.
                 db_settings = db.get(SubscriberSettings, sub.user_id)
                 if db_settings is not None:
                     db_settings.copy_enabled = False
@@ -453,27 +520,36 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 quantity=scaled,
                 limit_price=trader_order.limit_price,
                 stop_price=trader_order.stop_price,
-                # TP/SL are TRADER-ONLY. We deliberately do NOT propagate
-                # the trader's take_profit_price / stop_loss_price onto
-                # the subscriber's mirrored entry. Two reasons we leave
-                # these NULL:
-                #   1. The subscriber's broker should never place a
-                #      native bracket for them — see the
-                #      BrokerOrderRequest below which now hard-codes
-                #      None for both.
-                #   2. The subscriber's listener calls
-                #      bracket_emulator.emulate_bracket_exits when this
-                #      child fills. That function short-circuits when
-                #      BOTH prices are NULL ("if not tp_price and not
-                #      sl_price: return []"), so no exits are spawned.
-                # Net result: subscribers mirror entries only; the
-                # trader manages exits on their own account.
+                # TP/SL handling depends on the subscriber's
+                # copy_trader_bracket toggle:
+                #   * OFF (default): we leave BOTH absolute prices and BOTH
+                #     percents NULL. The subscriber's listener calls
+                #     bracket_emulator.emulate_bracket_exits on fill, which
+                #     short-circuits when nothing is set — no exits. The
+                #     subscriber instead relies on their own per-position
+                #     TP/SL % (position_enforcer). Trader manages own exits.
+                #   * ON: we stamp the trader's bracket below (after the
+                #     row is built) as either a re-anchored percent
+                #     (take_profit_pct/stop_loss_pct) or, when there's no
+                #     usable anchor, absolute prices. We NEVER send a native
+                #     broker bracket for mirrors — the emulator places the
+                #     exits uniformly across all brokers when the entry fills.
                 take_profit_price=None,
                 stop_loss_price=None,
                 status=OrderStatus.PENDING,
                 subscriber_picked_at=subscriber_picked_at,
                 subscriber_accepted_at=subscriber_accepted_at,
             )
+
+            # Copy the trader's bracket onto this mirror when the subscriber
+            # opted in AND the trader actually set one.
+            if sub.copy_trader_bracket:
+                if copy_use_pct:
+                    child.take_profit_pct = copy_tp_val
+                    child.stop_loss_pct = copy_sl_val
+                else:
+                    child.take_profit_price = copy_tp_val
+                    child.stop_loss_price = copy_sl_val
             db.add(child)
             # NOTE: no per-child db.flush() here. Order.id has a Python-side
             # default=uuid.uuid4 (see models/order.py), so child.id is
@@ -757,7 +833,15 @@ def fanout_threadsafe(
             if order is None or trader is None:
                 return []
             results = await fanout_async(db, order, trader)
-            order.fanned_out_to_subscribers = True
+            # Only flag as broadcast if copy was actually ACTIVE. When the
+            # trader's master copy is paused, fanout_async no-ops (returns
+            # early) and nothing was sent to subscribers — so leave the flag
+            # False. Otherwise an order placed (or observed) while copy was
+            # OFF would wrongly land in the trader's "All Orders" tab
+            # (copy-on) instead of "My Orders" (copy-off).
+            ts = db.get(TraderSettings, trader_id)
+            if not (ts is not None and ts.copy_paused):
+                order.fanned_out_to_subscribers = True
             db.commit()
             return results
 

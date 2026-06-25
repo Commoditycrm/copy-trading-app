@@ -459,7 +459,58 @@ class SnapTradeAdapter(BrokerAdapter):
     def _account_id(self) -> str:
         return self.credentials["account_id"]
 
+    @property
+    def _authorization_id(self) -> str | None:
+        return self.credentials.get("authorization_id")
+
     # ── connection ────────────────────────────────────────────────────────
+
+    def force_resync(self) -> str:
+        """Ask SnapTrade to re-pull this connection's data from the brokerage
+        NOW, rather than waiting for its own background sync cadence.
+
+        SnapTrade caches brokerage data and refreshes on its own schedule, so
+        an order cancelled or filled DIRECTLY at the broker (e.g. on the Webull
+        app, outside our app) can lag before it shows up in
+        ``get_user_account_orders`` — which is what the listener polls. The
+        refresh is asynchronous on SnapTrade's side, so the fresh data lands on
+        a later poll, not this one.
+
+        Returns one of:
+          * ``"ok"``        — refresh accepted; fresh data lands on a later poll.
+          * ``"forbidden"`` — this SnapTrade plan does NOT allow manual refresh
+            (real-time plans serve live data already → 403, code 1141), OR no
+            authorization id. The caller should STOP calling — retrying just
+            burns 403s. The residual lag is upstream broker→SnapTrade and isn't
+            fixable from our side on this plan.
+          * ``"error"``     — transient failure (rate-limit/throttle/network);
+            worth a retry on a later eligible tick.
+
+        The CALLER MUST THROTTLE — never call this on every poll."""
+        auth_id = self._authorization_id
+        if not auth_id:
+            return "forbidden"
+        try:
+            self._c().connections.refresh_brokerage_authorization(
+                authorization_id=auth_id,
+                user_id=self._user_id,
+                user_secret=self._user_secret,
+            )
+            return "ok"
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status", None)
+            if status == 403 or "1141" in str(getattr(exc, "body", "")):
+                # Plan doesn't permit manual refresh (data is already
+                # real-time). Permanent for this connection — tell the caller
+                # to stop trying.
+                log.info(
+                    "snaptrade force_resync not permitted on this plan "
+                    "(data already real-time): %s", exc
+                )
+                return "forbidden"
+            # Rate-limited / transient — fine, the next eligible tick retries.
+            log.info("snaptrade force_resync transient failure: %s", exc)
+            return "error"
 
     def verify_connection(self) -> ConnectionInfo:
         """Hit SnapTrade's balance endpoint as a cheap auth + alive check.
@@ -664,7 +715,28 @@ class SnapTradeAdapter(BrokerAdapter):
         )
 
     def cancel_order(self, broker_order_id: str) -> None:
-        """SnapTrade's cancel endpoint takes brokerage_order_id."""
+        """SnapTrade's cancel endpoint takes brokerage_order_id.
+
+        Idempotent against terminal-state orders. When the underlying
+        broker has already cancelled / filled / expired the order before
+        SnapTrade's cancel call reaches it, SnapTrade returns 400 with
+        ``code: '1070'`` and ``detail: "Failed to cancel order with
+        provided brokerage_order_id"``. From the caller's perspective the
+        desired end state ("order is no longer working") is already
+        achieved, so we swallow that specific error and return cleanly
+        instead of bubbling it up to the user as a hard broker error.
+
+        Typical trigger: trader cancels the order in Webull's own app,
+        then a few seconds later clicks Cancel on our Order History
+        (because our DB hadn't synced the terminal status yet). Without
+        this swallow they get a confusing "broker rejected" toast even
+        though the actual broker state matches what they wanted.
+
+        After this returns, the endpoint flips local status to
+        CANCELED. If the broker had actually FILLED (not cancelled) the
+        order, our DB row says CANCELED for the brief window until
+        fills_sync's next tick corrects it.
+        """
         try:
             self._c().trading.cancel_user_account_order(
                 account_id=self._account_id,
@@ -673,6 +745,19 @@ class SnapTradeAdapter(BrokerAdapter):
                 brokerage_order_id=broker_order_id,
             )
         except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            # SnapTrade's error envelope varies slightly across SDK
+            # versions (quote style on the parsed body, presence of
+            # the ``code`` key). Check both the numeric code and the
+            # English detail to be robust.
+            if "'code': '1070'" in err or '"code": "1070"' in err \
+               or "Failed to cancel order with provided brokerage_order_id" in err:
+                log.info(
+                    "snaptrade cancel_order: broker_order_id=%s already in "
+                    "terminal state (code 1070) — treating as success",
+                    broker_order_id,
+                )
+                return
             raise RuntimeError(f"SnapTrade cancel_order: {exc}") from exc
 
     # ── positions ─────────────────────────────────────────────────────────

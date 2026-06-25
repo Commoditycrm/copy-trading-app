@@ -26,13 +26,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.models.broker_account import BrokerAccount, BrokerName
+from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
@@ -404,77 +405,451 @@ def load_test_cleanup(
 
 # ─── Performance (all traders) ────────────────────────────────────────────────
 
+# Cap on how many parent fanouts we load to compute window aggregates, so a wide
+# range (e.g. 30d × all traders) can't pull an unbounded set. If the window
+# exceeds this we aggregate over the most-recent N and flag it (metrics.truncated).
+_AGG_PARENT_CAP = 2000
+
+
+def _median(values: list[int | None]) -> int | None:
+    """Median of a list of ints, skipping Nones (None if empty)."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else int((vals[mid - 1] + vals[mid]) / 2)
+
+
+def _broker_key(account: "BrokerAccount | None") -> tuple[str, str]:
+    """(grouping key, display label) for a subscriber's broker account.
+
+    SnapTrade routes are grouped by their *underlying* brokerage so "Webull via
+    SnapTrade" is distinct from "Robinhood via SnapTrade"; direct integrations
+    group by the broker enum value.
+    """
+    if account is None:
+        return ("unknown", "Unknown")
+    if account.broker == BrokerName.SNAPTRADE and account.brokerage_name:
+        return (f"st:{account.brokerage_name.lower()}", f"{account.brokerage_name} (ST)")
+    val = account.broker.value if account.broker else None
+    return (val or "unknown", val or (account.label or "Unknown"))
+
+
+def _fanout_window_query(trader_id, from_, to):
+    """Base select for parent fanouts in a (trader, time) window.
+
+    Window anchors on COALESCE(trader_submitted_at, created_at) so externally
+    placed orders (which carry trader_submitted_at) and in-app ones both filter
+    correctly.
+    """
+    anchor = func.coalesce(Order.trader_submitted_at, Order.created_at)
+    q = select(Order).where(
+        Order.parent_order_id.is_(None),
+        Order.fanned_out_to_subscribers.is_(True),
+    )
+    if trader_id is not None:
+        q = q.where(Order.user_id == trader_id)
+    if from_ is not None:
+        q = q.where(anchor >= from_)
+    if to is not None:
+        q = q.where(anchor <= to)
+    return q
+
+
 @router.get("/performance/fanouts")
 def admin_list_fanouts(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
+    trader_id: uuid.UUID | None = None,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+    broker: str | None = None,
     limit: int = 50,
 ) -> dict:
-    """All fanouts across every trader — newest first.
-    Same shape as /api/performance/fanouts but not filtered by trader.
-    Includes trader_email so the admin can see who placed each trade.
+    """All fanouts across every trader — newest first, filterable.
+
+    Query params:
+      - trader_id : restrict to one trader's orders.
+      - from / to : window on COALESCE(trader_submitted_at, created_at) (UTC ISO).
+      - broker    : restrict child mirrors to one broker enum value (e.g.
+                    "alpaca") for the latency panels.
+      - limit     : how many fanouts to return in the table. The `metrics`
+                    aggregate over the WHOLE window (capped), not just this page.
     """
-    from app.api.performance import _serialize_fanout  # noqa: PLC0415
-
-    # All parent orders that were fanned out, newest first
-    parents = list(
-        db.execute(
-            select(Order)
-            .where(
-                Order.parent_order_id.is_(None),
-                Order.fanned_out_to_subscribers.is_(True),
-            )
-            .order_by(Order.created_at.desc())
-            .limit(limit)
-        ).scalars()
+    from app.api.performance import (  # noqa: PLC0415
+        _SUCCESS_STATUSES,
+        _ms_between,
+        _serialize_fanout,
     )
+
+    _empty_metrics = {
+        "fanouts_shown": 0, "trade_count": 0, "avg_fanout_ms": None,
+        "max_fanout_ms": None, "median_platform_ms": None, "median_broker_ms": None,
+        "success_rate": None, "pct_within_1s": None, "active_subscribers": 0,
+        "truncated": False,
+    }
+
+    base = _fanout_window_query(trader_id, from_, to)
+    parents = list(db.execute(
+        base.order_by(Order.created_at.desc()).limit(_AGG_PARENT_CAP + 1)
+    ).scalars())
+    truncated = len(parents) > _AGG_PARENT_CAP
+    parents = parents[:_AGG_PARENT_CAP]
     if not parents:
-        return {"fanouts": [], "metrics": {"fanouts_shown": 0,
-                                            "avg_fanout_ms": None,
-                                            "max_fanout_ms": None}}
+        return {"fanouts": [], "metrics": _empty_metrics}
 
-    parent_ids = [p.id for p in parents]
+    parent_by_id = {p.id: p for p in parents}
+    parent_ids = list(parent_by_id)
 
-    # All child orders for these parents
-    children = list(
-        db.execute(
-            select(Order).where(Order.parent_order_id.in_(parent_ids))
-        ).scalars()
-    )
-    children_by_parent: dict[uuid.UUID, list[Order]] = {pid: [] for pid in parent_ids}
-    for c in children:
-        if c.parent_order_id:
-            children_by_parent.setdefault(c.parent_order_id, []).append(c)
+    children = list(db.execute(
+        select(Order).where(Order.parent_order_id.in_(parent_ids))
+    ).scalars())
 
-    # All subscriber user rows for display
-    sub_ids = {c.user_id for c in children}
-    subscribers: dict[uuid.UUID, User] = {}
-    if sub_ids:
-        subscribers = {u.id: u for u in db.execute(
-            select(User).where(User.id.in_(sub_ids))
+    # Broker accounts for child broker resolution / filtering.
+    acct_ids = {c.broker_account_id for c in children if c.broker_account_id is not None}
+    accounts: dict[uuid.UUID, BrokerAccount] = {}
+    if acct_ids:
+        accounts = {a.id: a for a in db.execute(
+            select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
         ).scalars()}
 
-    # All trader user rows for display
+    if broker:
+        children = [
+            c for c in children
+            if (a := accounts.get(c.broker_account_id)) is not None
+            and a.broker is not None and a.broker.value == broker
+        ]
+
+    children_by_parent: dict[uuid.UUID, list[Order]] = {pid: [] for pid in parent_ids}
+    for c in children:
+        if c.parent_order_id in children_by_parent:
+            children_by_parent[c.parent_order_id].append(c)
+
+    sub_ids = {c.user_id for c in children}
+    subscribers = {u.id: u for u in db.execute(
+        select(User).where(User.id.in_(sub_ids))
+    ).scalars()} if sub_ids else {}
     trader_ids = {p.user_id for p in parents}
-    traders: dict[uuid.UUID, User] = {u.id: u for u in db.execute(
+    traders = {u.id: u for u in db.execute(
         select(User).where(User.id.in_(trader_ids))
     ).scalars()}
 
-    fanouts = []
-    for p in parents:
-        serialized = _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers)
-        t = traders.get(p.user_id)
-        serialized["trader_email"]        = t.email if t else None
-        serialized["trader_display_name"] = t.display_name if t else None
-        fanouts.append(serialized)
+    # ── Window aggregates (over ALL children in window, not just the shown page) ─
+    child_total = len(children)
+    success = sum(1 for c in children if c.status in _SUCCESS_STATUSES)
+    submitted_children = sum(1 for c in children if c.submitted_at is not None)
+    within_1s = sum(
+        1 for c in children
+        if (lag := _ms_between(parent_by_id[c.parent_order_id].created_at,
+                               c.submitted_at)) is not None and lag <= 1000
+    )
+    broker_ms = [c.broker_call_ms for c in children if c.broker_call_ms is not None]
+    platform_ms: list[int] = []
+    for pid, kids in children_by_parent.items():
+        last = max((c.submitted_at for c in kids if c.submitted_at), default=None)
+        d = _ms_between(parent_by_id[pid].created_at, last)
+        if d is not None:
+            platform_ms.append(d)
 
-    completed_durations = [f["fanout_duration_ms"] for f in fanouts if f["fanout_duration_ms"]]
+    # ── Serialize the most-recent `limit` for the table ─────────────────────────
+    fanouts = []
+    for p in parents[:limit]:
+        s = _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers, accounts)
+        t = traders.get(p.user_id)
+        s["trader_email"] = t.email if t else None
+        s["trader_display_name"] = t.display_name if t else None
+        fanouts.append(s)
+
     metrics = {
         "fanouts_shown": len(fanouts),
-        "avg_fanout_ms": int(sum(completed_durations) / len(completed_durations)) if completed_durations else None,
-        "max_fanout_ms": max(completed_durations) if completed_durations else None,
+        "trade_count": len(parents),
+        "avg_fanout_ms": int(sum(platform_ms) / len(platform_ms)) if platform_ms else None,
+        "max_fanout_ms": max(platform_ms) if platform_ms else None,
+        "median_platform_ms": _median(platform_ms),
+        "median_broker_ms": _median(broker_ms),
+        "success_rate": round(success / child_total, 4) if child_total else None,
+        "pct_within_1s": round(within_1s / submitted_children, 4) if submitted_children else None,
+        "active_subscribers": len(sub_ids),
+        "truncated": truncated,
     }
     return {"fanouts": fanouts, "metrics": metrics}
+
+
+@router.get("/performance/by-broker")
+def admin_performance_by_broker(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    trader_id: uuid.UUID | None = None,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+) -> list[dict]:
+    """Per-broker leaderboard over the window.
+
+    Groups child mirror orders by the subscriber's broker (SnapTrade split by
+    underlying brokerage) and reports counts, success rate, and median latencies.
+    Sorted by median end-to-end (subscriber) lag — fastest broker first.
+    """
+    from app.api.performance import _SUCCESS_STATUSES, _ms_between  # noqa: PLC0415
+
+    parents = list(db.execute(
+        _fanout_window_query(trader_id, from_, to)
+        .order_by(Order.created_at.desc()).limit(_AGG_PARENT_CAP)
+    ).scalars())
+    if not parents:
+        return []
+    parent_by_id = {p.id: p for p in parents}
+
+    children = list(db.execute(
+        select(Order).where(Order.parent_order_id.in_(list(parent_by_id)))
+    ).scalars())
+    acct_ids = {c.broker_account_id for c in children if c.broker_account_id is not None}
+    accounts = {a.id: a for a in db.execute(
+        select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
+    ).scalars()} if acct_ids else {}
+
+    groups: dict[str, dict] = {}
+    for c in children:
+        key, label = _broker_key(accounts.get(c.broker_account_id))
+        g = groups.setdefault(key, {
+            "broker": label, "accounts": set(), "mirrors": 0, "success": 0,
+            "detection": [], "broker_ms": [], "subscriber_ms": [],
+        })
+        g["mirrors"] += 1
+        if c.broker_account_id is not None:
+            g["accounts"].add(c.broker_account_id)
+        if c.status in _SUCCESS_STATUSES:
+            g["success"] += 1
+        if c.broker_call_ms is not None:
+            g["broker_ms"].append(c.broker_call_ms)
+        parent = parent_by_id.get(c.parent_order_id)
+        if parent is not None:
+            g["detection"].append(_ms_between(parent.submitted_at, parent.created_at))
+            g["subscriber_ms"].append(_ms_between(parent.created_at, c.submitted_at))
+
+    out = [{
+        "broker": g["broker"],
+        "accounts": len(g["accounts"]),
+        "mirrors": g["mirrors"],
+        "success_rate": round(g["success"] / g["mirrors"], 4) if g["mirrors"] else None,
+        "median_detection_ms": _median(g["detection"]),
+        "median_broker_ms": _median(g["broker_ms"]),
+        "median_subscriber_lag_ms": _median(g["subscriber_ms"]),
+    } for g in groups.values()]
+    out.sort(key=lambda r: (r["median_subscriber_lag_ms"] is None, r["median_subscriber_lag_ms"] or 0))
+    return out
+
+
+# ─── Testing results + load-test history ──────────────────────────────────────
+#
+# Two append-only logs (see models/dashboard_metrics.py). The GETs feed the
+# dashboard's Testing and Load-test panels; the POSTs let the test runner / CI
+# (or a load-test trigger) record a row.
+
+
+class TestResultIn(BaseModel):
+    suite: str
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    duration_ms: int | None = None
+    source: str | None = None
+    commit_sha: str | None = None
+
+
+class LoadTestRunIn(BaseModel):
+    subscribers: int
+    total_ms: int | None = None
+    waves: int | None = None
+    errors: int = 0
+    note: str | None = None
+
+
+def _test_out(r: TestResult) -> dict:
+    total = r.passed + r.failed
+    return {
+        "suite": r.suite,
+        "passed": r.passed,
+        "failed": r.failed,
+        "skipped": r.skipped,
+        "duration_ms": r.duration_ms,
+        "source": r.source,
+        "commit_sha": r.commit_sha,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "pass_rate": round(r.passed / total, 4) if total else None,
+    }
+
+
+def _loadrun_out(r: LoadTestRun) -> dict:
+    return {
+        "id": str(r.id),
+        "subscribers": r.subscribers,
+        "total_ms": r.total_ms,
+        "waves": r.waves,
+        "errors": r.errors,
+        "note": r.note,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@router.get("/tests/latest")
+def admin_tests_latest(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[dict]:
+    """Latest result row per test suite (newest scan first, capped)."""
+    rows = db.execute(
+        select(TestResult).order_by(TestResult.created_at.desc()).limit(500)
+    ).scalars()
+    latest: dict[str, TestResult] = {}
+    for r in rows:
+        latest.setdefault(r.suite, r)  # first seen = newest (desc order)
+    return [_test_out(r) for r in sorted(latest.values(), key=lambda r: r.suite)]
+
+
+@router.post("/tests/results", status_code=status.HTTP_201_CREATED)
+def admin_record_test_result(
+    payload: TestResultIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    r = TestResult(**payload.model_dump())
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return _test_out(r)
+
+
+@router.get("/load-test/history")
+def admin_load_test_history(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    limit: int = 20,
+) -> list[dict]:
+    """Recent load-test runs, newest first."""
+    rows = db.execute(
+        select(LoadTestRun).order_by(LoadTestRun.created_at.desc()).limit(limit)
+    ).scalars()
+    return [_loadrun_out(r) for r in rows]
+
+
+@router.post("/load-test/runs", status_code=status.HTTP_201_CREATED)
+def admin_record_load_test_run(
+    payload: LoadTestRunIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    r = LoadTestRun(**payload.model_dump())
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return _loadrun_out(r)
+
+
+# ─── Broker-connection health ─────────────────────────────────────────────────
+#
+# DB-backed (broker_accounts), so it's readable from the web tier. Surfaces
+# accounts whose mirrors WON'T fire — disconnected / errored connections,
+# auto-pull turned off, or a stale last-sync.
+
+
+@router.get("/broker-health")
+def admin_broker_health(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    only_problems: bool = False,
+) -> dict:
+    """Every connected broker account with its connection health. An account is
+    'healthy' only if connection_status == 'connected' AND auto_pull_orders is
+    on — otherwise its owner's mirrors won't fire."""
+    rows = list(db.execute(select(BrokerAccount)).scalars())
+    user_ids = {a.user_id for a in rows}
+    users = {u.id: u for u in db.execute(
+        select(User).where(User.id.in_(user_ids))
+    ).scalars()} if user_ids else {}
+
+    def _label(a: BrokerAccount) -> str:
+        if a.broker == BrokerName.SNAPTRADE and a.brokerage_name:
+            return f"{a.brokerage_name} (ST)"
+        return (a.broker.value if a.broker else None) or a.label
+
+    accounts = []
+    for a in rows:
+        u = users.get(a.user_id)
+        healthy = a.connection_status == "connected" and a.auto_pull_orders
+        accounts.append({
+            "user_email": u.email if u else None,
+            "user_name": u.display_name if u else None,
+            "broker": _label(a),
+            "is_paper": a.is_paper,
+            "connection_status": a.connection_status,
+            "last_error": a.last_error,
+            "auto_pull_orders": a.auto_pull_orders,
+            "last_activity_sync_at": a.last_activity_sync_at.isoformat() if a.last_activity_sync_at else None,
+            "balance_updated_at": a.balance_updated_at.isoformat() if a.balance_updated_at else None,
+            "healthy": healthy,
+        })
+    if only_problems:
+        accounts = [x for x in accounts if not x["healthy"]]
+    # Problems first, then by broker.
+    accounts.sort(key=lambda x: (x["healthy"], x["broker"] or ""))
+
+    summary = {
+        "total": len(rows),
+        "connected": sum(1 for a in rows if a.connection_status == "connected"),
+        "problems": sum(1 for a in rows if a.connection_status != "connected"),
+        "auto_pull_off": sum(1 for a in rows if not a.auto_pull_orders),
+    }
+    return {"summary": summary, "accounts": accounts}
+
+
+# ─── Listener health ──────────────────────────────────────────────────────────
+#
+# Listener state lives in the worker process (in-memory) and is mirrored to
+# Redis by listener_state, so the web tier can read every trader's current
+# detection-listener state here. A down listener = that trader's trades aren't
+# detected and nothing mirrors.
+
+
+@router.get("/listener-health")
+def admin_listener_health(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services import listener_state  # noqa: PLC0415
+
+    statuses = listener_state.get_all_statuses()  # {trader_id_str: status_dict}
+    trader_ids = []
+    for t in statuses:
+        try:
+            trader_ids.append(uuid.UUID(t))
+        except ValueError:
+            continue
+    traders = {str(u.id): u for u in db.execute(
+        select(User).where(User.id.in_(trader_ids))
+    ).scalars()} if trader_ids else {}
+
+    listeners = []
+    for tid, st in statuses.items():
+        u = traders.get(tid)
+        listeners.append({
+            "trader_id": tid,
+            "trader_email": u.email if u else None,
+            "trader_name": u.display_name if u else None,
+            "state": st.get("state"),
+            "last_event_at": st.get("last_event_at"),
+            "state_changed_at": st.get("state_changed_at"),
+            "last_error": st.get("last_error"),
+        })
+    # Down/degraded first, then by trader.
+    listeners.sort(key=lambda x: (x["state"] == "connected", x["trader_email"] or ""))
+
+    summary = {
+        "total": len(listeners),
+        "connected": sum(1 for x in listeners if x["state"] == "connected"),
+        "down": sum(1 for x in listeners if x["state"] != "connected"),
+    }
+    return {"summary": summary, "listeners": listeners}
 
 
 # ── Platform-config: fanout batch threshold ─────────────────────────────────

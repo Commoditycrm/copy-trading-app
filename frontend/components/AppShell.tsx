@@ -3,18 +3,33 @@
 import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
+import { api, ApiError, clearTokens, getAccessToken, resendVerification } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { NotificationBell } from "@/components/NotificationBell";
+import { ChevronsLeft, ChevronsRight } from "lucide-react";
 
-function IconBell() {
+function IconGrid() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+    </svg>
+  );
+}
+
+function IconMenu() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
     </svg>
   );
 }
@@ -106,6 +121,7 @@ function IconSettings() {
 }
 
 const NAV_TRADER = [
+  { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
@@ -115,25 +131,13 @@ const NAV_TRADER = [
   { href: "/brokers", label: "Broker", Icon: IconLink },
 ];
 const NAV_SUBSCRIBER = [
+  { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/brokers", label: "Broker", Icon: IconLink },
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
-
-/** Brand mark — uses the uploaded icon from /public. */
-function LogoMark({ size = 40 }: { size?: number }) {
-  return (
-    <img
-      src="/brand-icon.avif"
-      alt="ARK"
-      width={size}
-      height={size}
-      style={{ width: size, height: size, borderRadius: 8, objectFit: "cover" }}
-    />
-  );
-}
 
 /** Small pill mirroring ListenerPill's visual language, but for the SSE
  *  connection itself rather than the broker stream. Hidden while
@@ -194,6 +198,63 @@ function initials(s: string | null | undefined, fallback: string) {
   return (parts[0]?.[0] ?? "?").concat(parts[1]?.[0] ?? "").toUpperCase();
 }
 
+/** Copy-trading on/off toggle used in the sidebar footer (trader master +
+ *  subscriber personal share the same visual). Logic is unchanged — this is
+ *  just the presentational switch. */
+function CopySwitch({
+  on,
+  busy,
+  collapsed,
+  onToggle,
+  title,
+}: {
+  on: boolean;
+  busy: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
+  title: string;
+}) {
+  return (
+    <div
+      className={`w-full flex items-center gap-2 rounded-token border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
+      style={{ borderColor: "var(--border)", background: "rgba(255,255,255,0.02)" }}
+    >
+      {!collapsed && (
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-sm font-medium truncate">Copy trading</span>
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={busy}
+        role="switch"
+        aria-checked={on}
+        aria-label={title}
+        title={title}
+        className="relative shrink-0 rounded-full transition-colors focus-ring"
+        style={{
+          width: 32, height: 18,
+          background: on ? "var(--good)" : "var(--border)",
+          opacity: busy ? 0.5 : 1,
+          cursor: busy ? "not-allowed" : "pointer",
+        }}
+      >
+        <span
+          className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
+          style={{ width: 14, height: 14, left: on ? 16 : 2, background: "#fff", boxShadow: "0 1px 3px rgba(0,0,0,0.3)" }}
+        >
+          {busy && (
+            <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
+              <Spinner />
+            </span>
+          )}
+        </span>
+      </button>
+    </div>
+  );
+}
+
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -210,6 +271,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // notification.created, and refreshed on a 30s poll as a backstop
   // for SSE drops we didn't fully recover from.
   const [unreadCount, setUnreadCount] = useState<number>(0);
+  // Email-verification banner state (soft enforcement — nag, don't block).
+  const [resendBusy, setResendBusy] = useState(false);
+  const [resendDone, setResendDone] = useState(false);
+
+  async function resendVerify() {
+    if (!user) return;
+    setResendBusy(true);
+    try {
+      await resendVerification(user.email);
+      setResendDone(true);
+      notify.success("Verification email sent — check your inbox.");
+    } catch (e) {
+      notify.fromError(e, "Could not resend verification email");
+    } finally {
+      setResendBusy(false);
+    }
+  }
 
   async function refreshUnreadCount() {
     try {
@@ -370,10 +448,25 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     } catch { /* ignore */ }
   }, [collapsed]);
 
+  // Mobile drawer: below lg the sidebar slides in over an overlay. Default
+  // false (matches SSR). Track desktop so the collapse feature only applies
+  // on large screens; the mobile drawer always shows the full sidebar.
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(true);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const update = () => setIsDesktop(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  // Close the drawer on navigation.
+  useEffect(() => { setMobileOpen(false); }, [pathname]);
+
   if (loading) {
     return (
       <div className="min-h-screen grid place-items-center" style={{ color: "var(--muted)" }}>
-        Loading…
+        <Spinner />
       </div>
     );
   }
@@ -390,92 +483,92 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     (user.role === "trader"
       ? user.business_name
       : subCopy?.following_trader_business_name) || "ARK";
-  // Collapsed sidebar shows just the first letter so the chrome still
-  // reads as branded at narrow widths.
+  // The collapse feature is desktop-only; the mobile drawer always shows the
+  // expanded sidebar (labels visible).
+  const navCollapsed = isDesktop && collapsed;
   const brandShort = brandName.trim().charAt(0).toUpperCase() || "A";
-  const SIDEBAR_W = collapsed ? 72 : 244;
+  const SIDEBAR_W = navCollapsed ? 72 : 244;
 
   return (
     // Row: full-height sidebar on the left, then a column (navbar + main)
     // on the right. h-screen + overflow-hidden locks the outer frame; only
     // <main> scrolls internally.
     <div className="h-screen flex overflow-hidden relative">
-      {/* Edge toggle — anchored to the seam between sidebar and main, rendered
-          last in the outer container so it stacks above both. Vertically
-          centered with the navbar strip. */}
+      {/* Mobile overlay — tap to close the drawer. Desktop never shows it. */}
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 z-40 lg:hidden animate-fade-in"
+          style={{ background: "var(--overlay)", backdropFilter: "blur(2px)" }}
+          onClick={() => setMobileOpen(false)}
+          aria-hidden
+        />
+      )}
+
+      {/* Desktop collapse hinge — floats on the sidebar's right edge near the
+          top (half over the bar). Hidden on mobile (drawer + hamburger). */}
       <button
         type="button"
         onClick={() => setCollapsed(c => !c)}
         title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className="absolute grid place-items-center transition-[left] duration-200"
+        className="absolute hidden lg:grid place-items-center transition-[left,transform] duration-200 focus-ring hover:scale-110"
         style={{
-          // Floating navbar starts at mt-3 (12px) with py-3 padding. A 28px
-          // square button centered on the navbar's vertical midline:
-          // 12 (offset) + (56-28)/2 = 26.
-          top: 26,
-          // Centered on the sidebar's right border — half the button sits
-          // inside the sidebar, half outside, so it reads as a hinge.
-          // Width trimmed another ~10% (24 → 22); height stays 28 so the
-          // chevron icon doesn't crowd the button.
-          left: SIDEBAR_W - 11,
-          width: 22,
+          top: 24,
+          left: SIDEBAR_W - 14,
+          width: 28,
           height: 28,
-          zIndex: 50,
-          borderRadius: 6,
-          border: "1px solid var(--border)",
+          zIndex: 60,
+          borderRadius: 9999,
+          border: "1px solid var(--border-strong)",
           background: "var(--accent)",
           color: "var(--accent-ink)",
-          boxShadow: "0 4px 12px -4px rgba(0,0,0,0.4)",
+          boxShadow: "var(--shadow-card)",
         }}
       >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden
-          style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 200ms" }}
-        >
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
+        {collapsed
+          ? <ChevronsRight size={16} strokeWidth={2.5} />
+          : <ChevronsLeft size={16} strokeWidth={2.5} />}
       </button>
 
-      {/* ── Sidebar (full viewport height) ──────────────────────────────── */}
+      {/* ── Sidebar — static column on desktop, slide-in drawer on mobile ── */}
       <aside
-        className="flex flex-col h-full shrink-0 transition-[width] duration-200 relative"
+        className={`flex flex-col h-full shrink-0 z-50 fixed inset-y-0 left-0 lg:static transition-[transform,width] duration-200 ${mobileOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}
         style={{
           width: SIDEBAR_W,
-          background: "linear-gradient(180deg, rgba(14,20,17,0.7) 0%, rgba(7,9,10,0.4) 100%)",
+          background: "var(--sidebar-bg)",
           borderRight: "1px solid var(--border)",
           backdropFilter: "blur(8px)",
         }}
       >
-        {/* Wordmark only — the image logo is intentionally hidden per
-            product direction. The brand text is derived per role:
-            traders see their own business_name; subscribers see the
-            business_name of the trader they follow. Left-aligned when
-            expanded; first-letter fallback when collapsed so the
-            chrome still reads as branded at narrow widths. */}
-        <div className={`flex items-center ${collapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
-          <div className="leading-tight min-w-0">
+        {/* Wordmark — derived per role (trader's own business_name, or the
+            followed trader's for subscribers). First-letter fallback when
+            collapsed so the chrome still reads as branded at narrow widths. */}
+        <div className={`flex items-center ${navCollapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
+          <div className="flex items-center gap-2.5 min-w-0">
             <div
-              title={collapsed ? brandName : undefined}
+              className="grid place-items-center shrink-0 rounded-token"
               style={{
-                fontWeight: 700,
-                fontSize: collapsed ? 17 : 22,
-                letterSpacing: "0.04em",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
+                width: 30, height: 30,
+                background: "var(--grad-accent)",
+                color: "var(--accent-ink)",
+                fontWeight: 800, fontSize: 15,
+                boxShadow: "0 6px 16px -8px var(--accent-glow)",
               }}
+              aria-hidden
             >
-              {collapsed ? brandShort : brandName}
+              {brandShort}
             </div>
+            {!navCollapsed && (
+              <div
+                title={brandName}
+                style={{
+                  fontWeight: 700, fontSize: 19, letterSpacing: "0.03em",
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}
+              >
+                {brandName}
+              </div>
+            )}
           </div>
         </div>
 
@@ -483,29 +576,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <nav className="flex-1 min-h-0 overflow-y-auto px-3 space-y-1">
           {nav.map((item) => {
             const active = pathname?.startsWith(item.href);
-            // Use Next.js <Link> with prefetch=true (the default) so the
-            // RSC payload for each route is fetched on hover / when the
-            // link scrolls into view. Without this, every navigation
-            // pays the full RSC roundtrip (3-4s on slow links) before
-            // the new page can render. We pair this with the route-
-            // level `loading.tsx` so even a cold prefetch shows the
-            // centered spinner instantly on click.
-            //
-            // (Previously this used router.push + an <a> to dodge an
-            //  RSC auth-wall failure; the route-level loading file
-            //  covers that case now — the user sees the spinner
-            //  immediately rather than a stale page.)
             return (
               <Link
                 key={item.href}
                 href={item.href}
                 prefetch
-                title={collapsed ? item.label : undefined}
-                className={`flex items-center gap-2.5 ${collapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline`}
+                onClick={() => setMobileOpen(false)}
+                title={navCollapsed ? item.label : undefined}
+                aria-current={active ? "page" : undefined}
+                className={`flex items-center gap-2.5 ${navCollapsed ? "justify-center px-2" : "px-4"} py-2.5 rounded-full text-sm transition-colors no-underline focus-ring`}
                 style={{
-                  background: active
-                    ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
-                    : "transparent",
+                  background: active ? "var(--nav-active-bg)" : "transparent",
                   color: active ? "var(--accent)" : "var(--text-2)",
                   fontWeight: active ? 600 : 500,
                   border: active ? "1px solid rgba(10,115,168,0.30)" : "1px solid transparent",
@@ -513,7 +594,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 }}
               >
                 <item.Icon />
-                {!collapsed && <span>{item.label}</span>}
+                {!navCollapsed && <span>{item.label}</span>}
               </Link>
             );
           })}
@@ -521,116 +602,39 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
         {/* Footer — copy-trading switch (trader: master; subscriber: own) + Sign out */}
         <div className="p-3 space-y-2">
-          {user.role === "subscriber" && subCopy && (() => {
-            const isOn = subCopy.copy_enabled;
-            const disabled = subCopyBusy;
-            return (
-              <div
-                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
-                style={{
-                  borderColor: "var(--border)",
-                  background: "rgba(255,255,255,0.02)",
-                }}
-              >
-                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
-                <button
-                  type="button"
-                  onClick={toggleSubscriberCopy}
-                  disabled={disabled}
-                  role="switch"
-                  aria-checked={isOn}
-                  title={isOn ? "Turn copy off" : "Turn copy on"}
-                  className="relative shrink-0 rounded-full transition-colors"
-                  style={{
-                    width: 32, height: 18,
-                    background: isOn ? "var(--good)" : "var(--border)",
-                    opacity: disabled ? 0.5 : 1,
-                    cursor: disabled ? "not-allowed" : "pointer",
-                  }}
-                >
-                  <span
-                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
-                    style={{
-                      width: 14, height: 14,
-                      left: isOn ? 16 : 2,
-                      background: "#fff",
-                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                    }}
-                  >
-                    {subCopyBusy && (
-                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
-                        <Spinner />
-                      </span>
-                    )}
-                  </span>
-                </button>
-              </div>
-            );
-          })()}
-          {user.role === "trader" && bulkCopy && (() => {
-            // The toggle reflects the trader-side master fanout gate, not
-            // subscribers' individual flags. ON = fanout active, OFF = paused.
-            const isOn = !bulkCopy.paused;
-            const disabled = bulkBusy;
-            return (
-              <div
-                className={`w-full flex items-center gap-2 rounded-lg border ${collapsed ? "justify-center px-2" : "justify-between px-3"} py-2`}
-                style={{
-                  borderColor: "var(--border)",
-                  background: "rgba(255,255,255,0.02)",
-                }}
-              >
-                {!collapsed && <div className="text-sm font-medium truncate">Copy trading</div>}
-                <button
-                  type="button"
-                  onClick={toggleBulkCopy}
-                  disabled={disabled}
-                  role="switch"
-                  aria-checked={isOn}
-                  title={isOn ? "Pause copy trading" : "Resume copy trading"}
-                  className="relative shrink-0 rounded-full transition-colors"
-                  style={{
-                    width: 32, height: 18,
-                    background: isOn ? "var(--good)" : "var(--border)",
-                    opacity: disabled ? 0.5 : 1,
-                    cursor: disabled ? "not-allowed" : "pointer",
-                  }}
-                >
-                  <span
-                    className="absolute top-0.5 inline-flex items-center justify-center rounded-full transition-all"
-                    style={{
-                      width: 14, height: 14,
-                      left: isOn ? 16 : 2,
-                      background: "#fff",
-                      boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                    }}
-                  >
-                    {bulkBusy && (
-                      <span style={{ color: "var(--text)", fontSize: 9, lineHeight: 1 }}>
-                        <Spinner />
-                      </span>
-                    )}
-                  </span>
-                </button>
-              </div>
-            );
-          })()}
+          {user.role === "subscriber" && subCopy && (
+            <CopySwitch
+              on={subCopy.copy_enabled}
+              busy={subCopyBusy}
+              collapsed={navCollapsed}
+              onToggle={toggleSubscriberCopy}
+              title={subCopy.copy_enabled ? "Turn copy off" : "Turn copy on"}
+            />
+          )}
+          {user.role === "trader" && bulkCopy && (
+            <CopySwitch
+              on={!bulkCopy.paused}
+              busy={bulkBusy}
+              collapsed={navCollapsed}
+              onToggle={toggleBulkCopy}
+              title={!bulkCopy.paused ? "Pause copy trading" : "Resume copy trading"}
+            />
+          )}
           <button
             onClick={() => {
               clearTokens();
               try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
               router.replace("/login");
             }}
-            title={collapsed ? "Sign out" : undefined}
-            className={`btn-ghost w-full ${collapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2`}
+            title={navCollapsed ? "Sign out" : undefined}
+            className={`btn-ghost w-full ${navCollapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2 focus-ring`}
           >
-            {/* Door-arrow icon — always visible; label hidden in collapsed mode. */}
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
               <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
               <polyline points="16 17 21 12 16 7" />
               <line x1="21" y1="12" x2="9" y2="12" />
             </svg>
-            {!collapsed && <span>Sign out</span>}
+            {!navCollapsed && <span>Sign out</span>}
           </button>
         </div>
       </aside>
@@ -638,69 +642,53 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* ── Right column: navbar on top, scrollable main below ──────────── */}
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <header
-          className="flex items-center justify-between px-5 py-3 shrink-0 mx-4 mt-3 rounded-xl"
+          className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 shrink-0 mx-3 sm:mx-4 mt-3 rounded-xl"
           style={{
-            background: "linear-gradient(180deg, rgba(14,20,17,0.75) 0%, rgba(7,9,10,0.5) 100%)",
+            background: "var(--header-bg)",
             border: "1px solid var(--border)",
             backdropFilter: "blur(10px)",
-            boxShadow: "0 10px 30px -10px rgba(0,0,0,0.55), 0 2px 6px -2px rgba(0,0,0,0.4)",
+            boxShadow: "var(--shadow-card)",
+            // Lift the whole header (and the notification dropdown that
+            // renders inside it) above the scrollable <main> content. The
+            // backdrop-filter above already makes the header its own
+            // stacking context, so without an explicit z-index the cards in
+            // <main> (later in the DOM) paint on top of the open dropdown.
+            position: "relative",
+            zIndex: 50,
           }}
         >
-          {/* Left: listener health pill + SSE connection-status pill.
-              Margin-left clears the sidebar collapse tab so the pill
-              doesn't sit underneath it. */}
-          <div className="flex items-center gap-2">
-            <ListenerPill role={user.role as "trader" | "subscriber"} />
-            <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
-          </div>
-          {/* Right: bell + who's signed in + role chip. */}
-          <div className="flex items-center gap-3">
+          {/* Left: hamburger (mobile only) + listener/SSE status pills. */}
+          <div className="flex items-center gap-2 min-w-0">
             <button
               type="button"
-              onClick={() => router.push("/notifications")}
-              title={unreadCount > 0 ? `${unreadCount} unread notification(s)` : "Notifications"}
-              aria-label="Notifications"
-              className="relative grid place-items-center rounded-full transition-colors"
-              style={{
-                width: 32, height: 32,
-                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
-                border: "1px solid var(--border)",
-                color: unreadCount > 0 ? "var(--accent)" : "var(--text-2)",
-              }}
+              onClick={() => setMobileOpen(true)}
+              aria-label="Open navigation menu"
+              className="lg:hidden grid place-items-center rounded-token shrink-0 focus-ring"
+              style={{ width: 36, height: 36, border: "1px solid var(--border)", background: "rgba(255,255,255,0.02)", color: "var(--text-2)" }}
             >
-              <IconBell />
-              {unreadCount > 0 && (
-                <span
-                  className="absolute text-[10px] font-bold rounded-full grid place-items-center"
-                  style={{
-                    top: -4,
-                    right: -4,
-                    minWidth: 16,
-                    height: 16,
-                    padding: "0 4px",
-                    background: "var(--bad)",
-                    color: "#fff",
-                    border: "1px solid var(--panel)",
-                    lineHeight: 1,
-                  }}
-                >
-                  {unreadCount > 99 ? "99+" : unreadCount}
-                </span>
-              )}
+              <IconMenu />
             </button>
+            <ListenerPill role={user.role as "trader" | "subscriber"} />
+            <div className="hidden sm:block">
+              <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
+            </div>
+          </div>
+          {/* Right: theme toggle + bell + who's signed in + role chip. */}
+          <div className="flex items-center gap-2 sm:gap-3">
+            <ThemeToggle />
+            <NotificationBell unreadCount={unreadCount} onChanged={refreshUnreadCount} />
             <div
-              className="grid place-items-center rounded-full"
+              className="grid place-items-center rounded-full shrink-0"
               style={{
                 width: 32, height: 32,
-                background: "linear-gradient(135deg,rgb(14, 31, 45) 0%,rgb(21, 28, 37) 100%)",
+                background: "var(--chip-bg)",
                 border: "1px solid var(--border)",
-                color: "var(--accent)",
-                fontWeight: 700, fontSize: 14,
+                color: "var(--accent)", fontWeight: 700, fontSize: 14,
               }}
             >
               {initials(user.display_name, user.email)}
             </div>
-            <div className="leading-tight text-right">
+            <div className="leading-tight text-right hidden sm:block">
               <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
               <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
                 {user.role}
@@ -709,7 +697,30 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="flex-1 min-w-0 overflow-y-auto p-5">{children}</main>
+        {!user.email_verified && (
+          <div
+            className="flex items-center justify-between gap-3 mx-3 sm:mx-4 mt-3 px-4 py-2.5 rounded-xl text-sm animate-fade-in"
+            style={{
+              background: "rgba(250,204,21,0.10)",
+              border: "1px solid rgba(250,204,21,0.35)",
+              color: "#facc15",
+            }}
+          >
+            <span className="min-w-0">
+              📧 Please verify your email <strong>{user.email}</strong> to secure your account.
+            </span>
+            <button
+              type="button"
+              onClick={resendVerify}
+              disabled={resendBusy || resendDone}
+              className="btn-ghost px-3 py-1 text-xs whitespace-nowrap shrink-0 focus-ring"
+            >
+              {resendDone ? "Sent ✓" : resendBusy ? "Sending…" : "Resend email"}
+            </button>
+          </div>
+        )}
+
+        <main className="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5">{children}</main>
       </div>
     </div>
   );

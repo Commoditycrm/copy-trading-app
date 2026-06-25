@@ -2,9 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { motion } from "framer-motion";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
+import { fmtSignedUsd } from "@/lib/format";
 import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
@@ -99,116 +102,112 @@ export default function CalendarPage() {
   while (cells.length % 7 !== 0) cells.push(null);
 
   const monthTotal = data.reduce((s, d) => s + Number(d.realized_pnl), 0);
+  const tradingDays = data.filter(d => d.trade_count > 0).length;
+  // Heatmap intensity is scaled to the month's largest absolute day.
+  const maxAbs = Math.max(...data.map(d => Math.abs(Number(d.realized_pnl))), 1);
+  const todayKey = iso(new Date());
 
   // What we display in the heading — "Your P&L" or "<sub> · P&L"
   const viewingLabel = useMemo(() => {
-    if (!viewingUserId || !user) return "Your P&L";
+    if (!viewingUserId || !user) return "P&L Calendar";
     const s = subs.find((s) => s.user_id === viewingUserId);
     return s ? `${s.display_name ?? s.email} · P&L` : "Subscriber P&L";
   }, [viewingUserId, user, subs]);
 
-  // Centered loader for the initial mount — once the first month lands,
-  // subsequent month-switches keep the grid visible and show the small
-  // inline loader at the bottom.
+  // Centered loader for the initial mount.
   if (!firstLoadDone) return <PageLoading />;
 
   return (
-    <div className="space-y-4 max-w-5xl">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-2xl font-semibold">{viewingLabel}</h1>
-          <p className="text-sm" style={{ color: "var(--muted)" }}>
-            Realized P&amp;L from broker fills.
-            {syncing && <span className="ml-2">Syncing…</span>}
-            {syncMsg && <span className="ml-2" style={{ color: "var(--accent)" }}>{syncMsg}</span>}
-          </p>
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          {user?.role === "trader" && (
-            <div className="min-w-[220px]">
-              <SearchableSelect
-                value={viewingUserId ?? ""}
-                onChange={(v) => setViewingUserId(v || null)}
-                options={[
-                  { value: "", label: "— My P&L —" },
-                  ...subs.map((s) => ({
-                    value: s.user_id,
-                    label: s.display_name ?? s.email,
-                  })),
-                ]}
-                placeholder="View P&L for"
-                style={{ height: 34 }}
-              />
+    <div className="max-w-5xl">
+      {/* Month bar: total + nav */}
+      <div className="card p-4 mb-4 flex items-center justify-between gap-3 flex-wrap" style={{ borderRadius: 10 }}>
+        <div className="flex items-center gap-5">
+          <div>
+            <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Month total</div>
+            <div className="num num-lg" style={{ color: monthTotal > 0 ? "var(--good)" : monthTotal < 0 ? "var(--bad)" : "var(--text)" }}>
+              {fmtSignedUsd(monthTotal)}
             </div>
-          )}
+          </div>
+          <span className="h-9 w-px" style={{ background: "var(--border)" }} aria-hidden />
+          <div>
+            <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Trading days</div>
+            <div className="num num-lg" style={{ color: "var(--text)" }}>{tradingDays}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
           <button
             onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() - 1, 1))}
-            className="px-3 py-1 rounded border" style={{ borderColor: "var(--border)" }}
+            className="btn-ghost grid place-items-center" style={{ width: 34, height: 34 }}
+            aria-label="Previous month"
           >
-            ‹
+            <ChevronLeft size={16} />
           </button>
-          <div className="min-w-[10rem] text-center font-medium">
+          <div className="min-w-[10rem] text-center font-semibold" style={{ color: "var(--text)" }}>
             {cursor.toLocaleString(undefined, { month: "long", year: "numeric" })}
           </div>
           <button
             onClick={() => setCursor(new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1))}
-            className="px-3 py-1 rounded border" style={{ borderColor: "var(--border)" }}
+            className="btn-ghost grid place-items-center" style={{ width: 34, height: 34 }}
+            aria-label="Next month"
           >
-            ›
+            <ChevronRight size={16} />
           </button>
         </div>
       </div>
 
-      <div className="text-sm">
-        <span style={{ color: "var(--muted)" }}>Month total: </span>
-        <span style={{ color: monthTotal >= 0 ? "var(--good)" : "var(--bad)" }}>
-          {monthTotal.toLocaleString(undefined, { style: "currency", currency: "USD" })}
-        </span>
+      <div className="grid grid-cols-7 gap-1.5 text-[11px] font-medium mb-1.5" style={{ color: "var(--muted)" }}>
+        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => <div key={d} className="px-2">{d}</div>)}
       </div>
-
-      <div className="grid grid-cols-7 gap-1 text-xs" style={{ color: "var(--muted)" }}>
-        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => <div key={d} className="px-2 py-1">{d}</div>)}
-      </div>
-      <div className="grid grid-cols-7 gap-1">
+      <div className="grid grid-cols-7 gap-1.5">
         {cells.map((d, i) => {
           if (!d) return <div key={i} className="h-24" />;
           const key = iso(d);
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
           const has = !!day;
-          const onClick = has
-            // Show every order (buys + sells) on the picked date, not just
-            // the closing legs.
-            ? () => router.push(`/trades?from=${key}&to=${key}`)
-            : undefined;
+          const isToday = key === todayKey;
+          // Heatmap fill — green for gains / red for losses, opacity scaled to
+          // the day's magnitude vs. the month's biggest move.
+          const intensity = has ? 0.12 + 0.5 * (Math.abs(pnl) / maxAbs) : 0;
+          const bg = has
+            ? (pnl >= 0 ? `rgba(34,197,94,${intensity})` : `rgba(239,68,68,${intensity})`)
+            : "var(--panel)";
           return (
-            <button
+            <motion.button
               key={i}
               type="button"
-              onClick={onClick}
+              onClick={has ? () => router.push(`/trades?from=${key}&to=${key}`) : undefined}
               disabled={!has}
               title={has ? `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}` : undefined}
-              className="h-24 p-2 rounded border flex flex-col text-left transition-colors"
+              whileHover={has ? { y: -2 } : undefined}
+              transition={{ duration: 0.15 }}
+              className="h-24 p-2 border flex flex-col text-left"
               style={{
-                borderColor: "var(--border)",
-                background: has ? (pnl >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)") : "var(--panel)",
+                borderRadius: 10,
+                borderColor: isToday ? "var(--accent)" : "var(--border)",
+                boxShadow: isToday ? "0 0 0 1px var(--accent)" : "none",
+                background: bg,
                 cursor: has ? "pointer" : "default",
               }}
             >
-              <div className="text-xs" style={{ color: "var(--muted)" }}>{d.getDate()}</div>
+              <div className="text-xs font-medium" style={{ color: isToday ? "var(--accent)" : "var(--muted)" }}>
+                {d.getDate()}
+              </div>
               {has && (
                 <>
-                  <div className="mt-auto font-medium" style={{ color: pnl >= 0 ? "var(--good)" : "var(--bad)" }}>
-                    {pnl.toLocaleString(undefined, { style: "currency", currency: "USD" })}
+                  <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--good)" : "var(--bad)" }}>
+                    {fmtSignedUsd(pnl)}
                   </div>
-                  <div className="text-xs" style={{ color: "var(--muted)" }}>{day.trade_count} trade{day.trade_count === 1 ? "" : "s"}</div>
+                  <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
+                  </div>
                 </>
               )}
-            </button>
+            </motion.button>
           );
         })}
       </div>
-      {loading && <p style={{ color: "var(--muted)" }}>Loading…</p>}
+      {loading && <p className="mt-3 text-sm" style={{ color: "var(--muted)" }}>Loading…</p>}
     </div>
   );
 }

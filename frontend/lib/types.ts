@@ -11,6 +11,9 @@ export interface User {
    *  them (see `SubscriberSettings.following_trader_business_name`). */
   business_name: string | null;
   is_active: boolean;
+  /** Whether the user has confirmed their email. Soft-enforced: unverified
+   *  users can still use the app, but see a "verify your email" banner. */
+  email_verified: boolean;
 }
 
 export type BrokerName = "alpaca" | "webull" | "snaptrade" | "ibkr";
@@ -79,6 +82,11 @@ export interface Order {
   stop_price: string | null;
   take_profit_price: string | null;
   stop_loss_price: string | null;
+  /** Set on bracket-exit rows (TP / SL closes); null on entry orders.
+   *  Lets the frontend filter exit legs out of entry-finding lookups. */
+  bracket_parent_id?: string | null;
+  /** "tp" or "sl" on bracket-exit rows; null on entry orders. */
+  bracket_leg?: "tp" | "sl" | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: OptionRight | null;
@@ -119,6 +127,22 @@ export interface DailyPnL {
   trade_count: number;
 }
 
+/** One scope's order-history totals, computed in the DB (GET
+ *  /api/trades/stats) — independent of how many rows the page fetched. */
+export interface TradeScopeStats {
+  total: number;
+  filled: number;
+  working: number;
+  notional: string;   // Decimal as string
+}
+
+export interface TradeStats {
+  /** Every order the user owns. */
+  all: TradeScopeStats;
+  /** Trader's own non-fanned-out orders (the "My Orders" tab). */
+  mine: TradeScopeStats;
+}
+
 export interface SubscriberSettings {
   user_id: string;
   following_trader_id: string | null;
@@ -147,6 +171,8 @@ export interface SubscriberSettings {
   retry_interval_open: RetryInterval;
   /** Retry policy for transient broker errors when *closing* a position. */
   retry_interval_close: RetryInterval;
+  /** How many additional retries after the original failure (1–5, default 1). */
+  retry_max_attempts: number;
   /** Subscriber's symbol denylist — trader trades on these symbols are
    *  NOT mirrored to this subscriber. Empty = no filter. Uppercase. */
   symbol_exclusion_list: string[];
@@ -181,6 +207,11 @@ export interface SubscriberSettings {
    *  closed at market. Per-position only — does NOT affect copy_enabled.
    *  Null disables. */
   position_sl_pct: string | null;
+  /** When true, this subscriber copies the trader's per-trade SL/TP
+   *  (re-anchored onto their own fill) instead of using the per-position
+   *  TP/SL above. Mutually exclusive with position_tp_pct / position_sl_pct
+   *  enforcement — see backend position_enforcer. */
+  copy_trader_bracket: boolean;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

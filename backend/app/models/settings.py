@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -82,11 +82,10 @@ class SubscriberSettings(Base, TimestampMixin):
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
     # When the pnl_poller observes broker-reported equity <= this value,
     # everything on the subscriber's broker is closed at market AND
-    # ``copy_enabled`` flips to False. Unlike the daily limits, copy does
-    # NOT auto-resume next day — the subscriber has to manually re-enable
-    # (that's the contract: "stop until I turn it back on"). NULL = off.
-    # Stamped with ``auto_liquidated_at`` when the trigger fires so the
-    # Settings page can show "Auto-liquidated at HH:MM".
+    # ``copy_enabled`` flips to False. NULL = off. Re-enable is manual
+    # only — the contract is "stop until I turn it back on", same as
+    # every other limit. Stamped with ``auto_liquidated_at`` when the
+    # trigger fires so the Settings page can show "Auto-liquidated at HH:MM".
     auto_liquidation_limit: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )
@@ -94,12 +93,23 @@ class SubscriberSettings(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True,
     )
 
-    # Set to the UTC timestamp at which a P&L-limit (loss OR profit) flipped
-    # copy_enabled to False. NULL means "not paused by a limit" — either the
-    # user manually disabled (we leave them alone), or copy is currently
-    # enabled. On every fanout entry, if this timestamp is set AND its UTC
-    # date is < today's UTC date, copy_engine clears it and re-enables
-    # copy_enabled — that's how "auto-resume next day" works.
+    # Set to the UTC timestamp at which a DAILY limit (loss, profit, or
+    # max_account_pct_per_day, plus their _pct variants) flipped
+    # copy_enabled to False. NULL means "not paused by a daily limit" —
+    # either the user manually disabled (we leave them alone), or copy is
+    # currently enabled, or the pause already auto-resumed.
+    #
+    # Auto-resume: on every fanout entry (copy_engine) AND every pnl_poller
+    # tick, if this timestamp is set AND its UTC date is < today's UTC
+    # date, we flip copy_enabled back to True and clear this stamp. That's
+    # how "auto-resume next UTC day" works for daily limits.
+    #
+    # Auto-liquidation (`auto_liquidation_limit`) deliberately uses a
+    # DIFFERENT column (`auto_liquidated_at`) and is NEVER touched by the
+    # auto-resume sweep — equity-floor liquidation stays sticky until the
+    # subscriber manually re-enables copy. That's the intentional split:
+    # daily limits forgive on the next day, hard-equity liquidation does
+    # not.
     pnl_auto_paused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
@@ -130,6 +140,19 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(5, 2), nullable=True,
     )
 
+    # When True, this subscriber COPIES the trader's per-trade SL/TP instead
+    # of using their own position_tp_pct / position_sl_pct. copy_engine
+    # records the trader's bracket as a percent distance on each mirrored
+    # entry (Order.take_profit_pct / stop_loss_pct), and the bracket
+    # emulator re-anchors it onto the subscriber's own fill when the entry
+    # fills. While True, position_enforcer SKIPS this subscriber's own
+    # per-position TP/SL so the two mechanisms can't double-close a
+    # position. Default False preserves the prior behaviour (own per-
+    # position TP/SL; trader's bracket stripped from mirrors).
+    copy_trader_bracket: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # Percentage of TODAY'S BEGINNING-DAY ACCOUNT BALANCE (Alpaca's
     # ``last_equity`` — equity at yesterday's close) that bounds today's
     # cumulative filled trade NOTIONAL (capital deployed in mirror orders
@@ -155,6 +178,12 @@ class SubscriberSettings(Base, TimestampMixin):
     retry_interval_close: Mapped[RetryInterval] = mapped_column(
         Enum(RetryInterval, name="retry_interval"),
         default=RetryInterval.NEVER, server_default="never", nullable=False,
+    )
+    # How many additional attempts to make after the original failure.
+    # 1 = current behaviour (one retry), max 5. Only consulted when
+    # retry_interval_open/close is not "never".
+    retry_max_attempts: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False,
     )
 
     # Per-subscriber symbol filters. Both stored as JSONB arrays of

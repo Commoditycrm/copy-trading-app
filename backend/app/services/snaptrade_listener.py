@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -55,8 +56,36 @@ POLL_INTERVAL_S = 5.0
 POLL_INTERVAL_BACKSTOP_S = 60.0
 
 
+# Statuses we treat as still-working — an order in one of these on this
+# account could have been cancelled/filled directly at the broker, so it's
+# worth nudging SnapTrade to re-sync. Terminal orders never change again.
+_WORKING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+# Force-resync throttle. SnapTrade rate-limits the refresh endpoint, so we
+# nudge at most once per this interval PER ACCOUNT, and only while a working
+# order exists. Overridable via env for tuning against the SnapTrade plan tier.
+def _refresh_min_interval() -> float:
+    import os  # noqa: PLC0415
+    try:
+        return float(os.getenv("SNAPTRADE_RESYNC_MIN_INTERVAL_SEC", "60"))
+    except ValueError:
+        return 60.0
+
+
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
 _last_seen: dict[uuid.UUID, dict[str, str]] = {}
+# broker_account_id → monotonic timestamp of the last force-resync ATTEMPT
+# (updated even on failure, so a rate-limited refresh still backs off).
+_last_refresh: dict[uuid.UUID, float] = {}
+# broker_account_id set: connections whose SnapTrade plan forbids manual
+# refresh (real-time plans, code 1141). Once seen, we never call force_resync
+# for them again — it'd just 403 every tick. The data is already real-time;
+# any residual lag is the upstream broker→SnapTrade sync, not fixable here.
+_refresh_unsupported: set[uuid.UUID] = set()
 # Per-trader lock so a webhook-triggered immediate poll and the periodic
 # poll can't run _poll_once concurrently for the same trader (which could
 # double-insert a brand-new order — there's no DB unique constraint on
@@ -67,6 +96,29 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 
 def _lock_for(trader_user_id: uuid.UUID) -> "threading.Lock":
     return _poll_locks.setdefault(trader_user_id, threading.Lock())
+
+
+def _should_force_resync(
+    db: "Session", trader_user_id: uuid.UUID, broker_account_id: uuid.UUID
+) -> bool:
+    """True when it's worth asking SnapTrade to re-pull from the upstream
+    broker this tick: throttled to once per interval per account, and only
+    while a working (cancellable/fillable) order exists on the account — a
+    terminal order can't change at the broker, so refreshing for it would
+    just burn rate-limit budget."""
+    if broker_account_id in _refresh_unsupported:
+        return False  # plan forbids manual refresh — never retry (see 1141)
+    last = _last_refresh.get(broker_account_id)
+    if last is not None and (time.monotonic() - last) < _refresh_min_interval():
+        return False
+    return db.execute(
+        select(Order.id).where(
+            Order.user_id == trader_user_id,
+            Order.broker_account_id == broker_account_id,
+            Order.parent_order_id.is_(None),
+            Order.status.in_(_WORKING_STATUSES),
+        ).limit(1)
+    ).first() is not None
 
 
 def _poll_interval() -> float:
@@ -305,11 +357,26 @@ def _poll_once(
         # Gate: master switch off → skip the broker fetch + processing.
         # Reload each poll so the flag can be flipped at runtime via the
         # Brokers-page "Auto Pull Orders" checkbox.
+        need_resync = False
         with SessionLocal() as db:
             acct = db.get(BrokerAccount, broker_account_id)
             if not broker_filters.auto_pull_enabled(acct):
                 listener_state.bump_last_event(trader_user_id)
                 return
+            need_resync = _should_force_resync(db, trader_user_id, broker_account_id)
+        # Nudge SnapTrade to re-pull from the upstream broker BEFORE we read
+        # orders, so an external cancel/fill on the broker app (which SnapTrade
+        # would otherwise reflect only on its own slow cadence) lands on an
+        # upcoming poll. Throttled + best-effort — see _should_force_resync.
+        # Done outside the DB session so we don't hold a connection across the
+        # network call. The refresh is async on SnapTrade's side, so this
+        # poll's fetch may still be stale; the next one won't be.
+        if need_resync:
+            _last_refresh[broker_account_id] = time.monotonic()
+            if adapter.force_resync() == "forbidden":
+                # Real-time plan (or no auth id): manual refresh isn't allowed
+                # and the data is already live — stop trying for this account.
+                _refresh_unsupported.add(broker_account_id)
         orders = adapter.list_recent_activities()
         listener_state.bump_last_event(trader_user_id)
         if not orders:

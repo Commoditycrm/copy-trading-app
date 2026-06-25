@@ -317,13 +317,20 @@ async def snaptrade_webhook(request: Request, background: BackgroundTasks) -> di
     # verify via signature (header), not a shared secret in the body —
     # comparing a body field against our .env secret was wrong and was
     # the source of the 401 on their test deliveries.
-    sig_headers = {
-        k: v for k, v in request.headers.items()
+    # Log only the SHAPE of the request (header + body key names), never the
+    # values — the body and signature headers can carry tokens / PII and this
+    # endpoint is internet-facing + unauthenticated. Full values go to DEBUG
+    # only, for operators who explicitly raise the log level while wiring up
+    # SnapTrade's (still-undocumented-to-us) signature scheme.
+    sig_header_names = [
+        k for k in request.headers.keys()
         if any(t in k.lower() for t in ("sign", "signature", "snaptrade", "webhook", "hmac", "digest"))
-    }
+    ]
     log.info(
-        "snaptrade webhook | headers=%s | sig_headers=%s | body=%s",
-        list(request.headers.keys()), sig_headers, body,
+        "snaptrade webhook | header_names=%s | sig_header_names=%s | body_keys=%s",
+        list(request.headers.keys()),
+        sig_header_names,
+        list(body.keys()) if isinstance(body, dict) else type(body).__name__,
     )
 
     # NOTE: signature verification intentionally not enforced yet — we
@@ -381,7 +388,7 @@ def snaptrade_start(
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("snaptrade make_login_url failed")
-        raise HTTPException(502, f"snaptrade_error: {exc}") from exc
+        raise HTTPException(502, detail="snaptrade_error") from exc
 
     _save_snaptrade_session(user.id, {
         "user_secret": user_secret,
@@ -468,7 +475,7 @@ def snaptrade_finish(
         auths = snap.list_authorizations(str(user.id), user_secret)
     except Exception as exc:  # noqa: BLE001
         log.exception("snaptrade list_authorizations failed")
-        raise HTTPException(502, f"snaptrade_error: {exc}") from exc
+        raise HTTPException(502, detail="snaptrade_error") from exc
 
     if not auths:
         raise HTTPException(
@@ -501,7 +508,7 @@ def snaptrade_finish(
     try:
         accounts = snap.list_accounts(str(user.id), user_secret)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"snaptrade_error: {exc}") from exc
+        raise HTTPException(502, detail="snaptrade_error") from exc
 
     matching = [
         a for a in accounts

@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -45,6 +45,16 @@ from app.services import audit
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
+
+# Cooldown between a position's entry filling and the SL being allowed
+# to trigger. Options have wide bid-ask spreads — the broker reports
+# market_value off the bid while cost_basis is your ask-side fill, so
+# unrealized P&L starts at -spread% and looks like an SL breach when
+# none has actually occurred. 30s is enough for typical option spreads
+# to normalize after a fill without meaningfully delaying real moves.
+# TP is exempt from the cooldown (an instant TP fill can only happen
+# if price genuinely moves the right way, not from the spread).
+_SL_COOLDOWN_SECONDS = 30
 
 
 # Working orders we cancel for the symbol before closing — leftover
@@ -89,6 +99,50 @@ def _round_limit_for_close(
     return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
 
+def _within_post_fill_cooldown(
+    db: Session,
+    user_id: uuid.UUID,
+    broker_account_id: uuid.UUID,
+    pos: BrokerPosition,
+) -> bool:
+    """True if the most recent FILLED entry for this position closed
+    within the last ``_SL_COOLDOWN_SECONDS``. Conservative:
+      * No FILLED entry found → False (don't block, this is a position
+        the broker reports but we don't have a record of — likely held
+        from outside our app; spread is no longer the issue).
+      * Multiple FILLED entries (averaging-in) → check the MOST RECENT
+        one. A late add-on resets the cooldown for the whole position
+        because that's when our cost basis was most recently disturbed.
+    """
+    q = (
+        select(Order.closed_at)
+        .where(
+            Order.user_id == user_id,
+            Order.broker_account_id == broker_account_id,
+            Order.symbol == pos.symbol,
+            Order.instrument_type == pos.instrument_type,
+            Order.status == OrderStatus.FILLED,
+            Order.is_closing.is_(False),
+            Order.closed_at.isnot(None),
+        )
+        .order_by(desc(Order.closed_at))
+        .limit(1)
+    )
+    if pos.option_expiry is not None:
+        q = q.where(Order.option_expiry == pos.option_expiry)
+    if pos.option_strike is not None:
+        q = q.where(Order.option_strike == pos.option_strike)
+    if pos.option_right is not None:
+        q = q.where(Order.option_right == pos.option_right)
+    closed_at = db.execute(q).scalar_one_or_none()
+    if closed_at is None:
+        return False
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - closed_at
+    return age < timedelta(seconds=_SL_COOLDOWN_SECONDS)
+
+
 def _position_pct(pos: BrokerPosition) -> Decimal | None:
     """Return position unrealized P&L as a percent of |cost_basis|.
 
@@ -129,6 +183,12 @@ def enforce_position_tp_sl(
     """
     s = db.get(SubscriberSettings, subscriber_user_id)
     if s is None:
+        return []
+    # When the subscriber copies the trader's per-trade SL/TP, the bracket
+    # emulator manages their exits (re-anchored onto each fill). Skip the
+    # OWN per-position enforcement entirely so the two mechanisms can't
+    # double-close a position — it's a strict either/or toggle.
+    if s.copy_trader_bracket:
         return []
     tp = s.position_tp_pct
     sl = s.position_sl_pct
@@ -181,6 +241,24 @@ def enforce_position_tp_sl(
         elif sl is not None and pct <= -sl:
             leg = "sl"
         if leg is None:
+            continue
+
+        # Post-fill cooldown for SL only. The broker reports
+        # market_value off the bid immediately after a fill while the
+        # cost_basis is your (higher) ask-side fill — unrealized P&L
+        # starts at -spread% and looks like an SL breach when no real
+        # move has happened. Wait for the spread to normalize before
+        # firing. TP is safe from this: a TP breach this early would
+        # require the option to genuinely rally past your fill, which
+        # isn't a spread artifact.
+        if leg == "sl" and _within_post_fill_cooldown(
+            db, subscriber_user_id, acct.id, pos,
+        ):
+            log.debug(
+                "position_enforcer: skipping SL for %s — within %ss "
+                "post-fill cooldown (spread settling)",
+                pos.symbol, _SL_COOLDOWN_SECONDS,
+            )
             continue
 
         # In-flight guard. The poller ticks every 10s; a market close

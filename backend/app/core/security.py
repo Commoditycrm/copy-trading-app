@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -43,3 +45,73 @@ def decode_token(token: str) -> dict[str, Any]:
         return jwt.decode(token, s.jwt_secret, algorithms=[s.jwt_algorithm])
     except JWTError as exc:
         raise ValueError("invalid_token") from exc
+
+
+# ── Password-reset tokens ────────────────────────────────────────────────────
+#
+# A reset token is a short-lived JWT (type="reset") whose ``pwf`` claim is an
+# HMAC fingerprint of the user's CURRENT password hash. Because the fingerprint
+# is checked against the live hash at reset time, the token becomes invalid the
+# instant the password changes — which makes it effectively single-use (using
+# it changes the hash) and also invalidates any outstanding reset links if the
+# user resets via another route. No DB table / migration needed.
+
+
+def _password_fingerprint(password_hash: str) -> str:
+    """Stable, non-reversible fingerprint of a password hash, keyed by the
+    JWT secret. Truncated — collision risk is irrelevant since it's only ever
+    compared against the same user's current hash."""
+    s = get_settings()
+    return hmac.new(
+        s.jwt_secret.encode(), password_hash.encode(), hashlib.sha256
+    ).hexdigest()[:16]
+
+
+def create_password_reset_token(subject: str, password_hash: str) -> str:
+    s = get_settings()
+    return _encode(
+        {"sub": subject, "type": "reset", "pwf": _password_fingerprint(password_hash)},
+        timedelta(minutes=s.password_reset_token_minutes),
+    )
+
+
+def decode_password_reset_token(token: str) -> dict[str, Any]:
+    """Decode + validate a reset token's shape. Raises ValueError on a bad,
+    expired, or wrong-type token. Does NOT check the password fingerprint —
+    the caller does that against the live user row (it needs DB access)."""
+    claims = decode_token(token)
+    if claims.get("type") != "reset":
+        raise ValueError("wrong_token_type")
+    return claims
+
+
+def password_fingerprint_matches(token_claims: dict[str, Any], password_hash: str) -> bool:
+    """True if the reset token was minted against this exact password hash."""
+    return hmac.compare_digest(
+        str(token_claims.get("pwf", "")), _password_fingerprint(password_hash)
+    )
+
+
+# ── Email-verification tokens ────────────────────────────────────────────────
+#
+# A verification token is a short-lived JWT (type="verify") that carries the
+# email it was issued for in the ``eml`` claim. Confirming the token marks that
+# address verified; binding to the email means a link goes stale if the user
+# later changes their email.
+
+
+def create_email_verification_token(subject: str, email: str) -> str:
+    s = get_settings()
+    return _encode(
+        {"sub": subject, "type": "verify", "eml": email},
+        timedelta(minutes=s.email_verification_token_minutes),
+    )
+
+
+def decode_email_verification_token(token: str) -> dict[str, Any]:
+    """Decode + validate a verification token's shape. Raises ValueError on a
+    bad, expired, or wrong-type token."""
+    claims = decode_token(token)
+    if claims.get("type") != "verify":
+        raise ValueError("wrong_token_type")
+    return claims

@@ -2,6 +2,8 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { motion } from "framer-motion";
+import { Check, Lock, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -91,9 +93,9 @@ function LatencyBadge({ broker }: { broker: BrokerName }) {
 /** One labelled metric in the balance row. */
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div>
+    <div className="rounded-token p-3" style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}>
       <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</div>
-      <div className="text-sm font-semibold mt-1 num">{value}</div>
+      <div className="text-sm font-semibold mt-1 num" style={{ color: "var(--text)" }}>{value}</div>
     </div>
   );
 }
@@ -502,21 +504,34 @@ export default function BrokersPage() {
   if (loading) return <PageLoading />;
 
   return (
-    <div className="space-y-6 max-w-[760px]">
-      <div>
-        <h1 className="text-2xl font-semibold">Broker connections</h1>
-        <p className="text-sm mt-1.5" style={{ color: "var(--muted)" }}>
+    <div className="space-y-5 max-w-[820px]">
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+      >
+        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
+          Broker connections
+        </h1>
+        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
           One broker per account — connecting a new one replaces the previous.
-          Keys and passwords are encrypted at rest with Fernet (AES-128) and
-          never leave the server.
         </p>
-      </div>
+        <span className="chip mt-2.5 inline-flex items-center gap-1.5">
+          <Lock size={12} /> Keys encrypted at rest with Fernet (AES-128) — never leave the server
+        </span>
+      </motion.div>
 
       {/* ── Connected account(s) ──────────────────────────────────────── */}
       {accounts.map(a => {
         const meta = BROKER_META[a.broker];
         return (
-          <div key={a.id} className="card p-5">
+          <motion.div
+            key={a.id}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+            className="card p-5"
+          >
             <div className="flex items-start justify-between gap-3.5">
               {/* Avatar is vertically centered against the two-line text
                   block (items-center). The Disconnect button stays pinned
@@ -571,13 +586,13 @@ export default function BrokersPage() {
                 className="btn-ghost px-2.5 py-1 text-xs inline-flex items-center gap-1.5"
                 title="Refresh balance"
               >
-                <span className={refreshing[a.id] ? "animate-spin" : ""} style={{ display: "inline-block" }}>↻</span>
+                <RefreshCw size={13} className={refreshing[a.id] ? "animate-spin" : ""} />
                 <span>Refresh</span>
               </button>
             </div>
 
             <AutoPullOrders acct={a} onChange={(patch) => patchSettings(a.id, patch)} />
-          </div>
+          </motion.div>
         );
       })}
 
@@ -608,7 +623,7 @@ export default function BrokersPage() {
                   key={b}
                   type="button"
                   onClick={() => { setChosenBroker(b); resetConnectForms(); }}
-                  className="text-left p-3 rounded-xl transition"
+                  className="text-left p-3 rounded-xl transition hover-lift relative focus-ring"
                   style={{
                     border: active ? "1px solid var(--accent-2)" : "1px solid var(--border)",
                     background: active ? "var(--accent-glow)" : "var(--panel)",
@@ -617,6 +632,14 @@ export default function BrokersPage() {
                       : "none",
                   }}
                 >
+                  {active && (
+                    <span
+                      className="absolute grid place-items-center rounded-full"
+                      style={{ top: 10, right: 10, width: 18, height: 18, background: "var(--accent)", color: "var(--accent-ink)" }}
+                    >
+                      <Check size={12} />
+                    </span>
+                  )}
                   <div className="flex items-center gap-2.5">
                     <BrokerAvatar broker={b} size={34} />
                     <div className="min-w-0">

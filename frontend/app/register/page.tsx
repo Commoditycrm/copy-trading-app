@@ -1,12 +1,13 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { api, setTokens } from "@/lib/api";
+import { api, getAccessToken, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
+import { AuthCard } from "@/components/auth/AuthCard";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -20,6 +21,12 @@ export default function RegisterPage() {
   const [businessName, setBusinessName] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // Already signed in? Skip the form and bounce to the root, which
+  // role-routes to the right landing page.
+  useEffect(() => {
+    if (getAccessToken()) router.replace("/");
+  }, [router]);
+
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (role === "trader" && !businessName.trim()) {
@@ -28,10 +35,16 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
+      // Emails are treated case-insensitively — normalize once and use
+      // the same value for both /register and the immediate /login that
+      // follows so they can't drift apart. toLowerCase is also applied
+      // on every keystroke in the input below; this is a belt-and-braces
+      // safety net plus a trim for paste-from-clipboard whitespace.
+      const normalizedEmail = email.trim().toLowerCase();
       await api("/api/auth/register", {
         method: "POST",
         body: JSON.stringify({
-          email,
+          email: normalizedEmail,
           password,
           role,
           display_name: displayName || null,
@@ -41,10 +54,10 @@ export default function RegisterPage() {
       });
       const tok = await api<{ access_token: string; refresh_token: string }>(
         "/api/auth/login",
-        { method: "POST", body: JSON.stringify({ email, password }), auth: false }
+        { method: "POST", body: JSON.stringify({ email: normalizedEmail, password }), auth: false }
       );
       setTokens(tok.access_token, tok.refresh_token);
-      notify.success("Account created");
+      notify.success("Account created — check your email to verify it");
       router.replace("/");
     } catch (e) {
       notify.fromError(e, "registration failed");
@@ -53,18 +66,50 @@ export default function RegisterPage() {
     }
   }
 
-  return (
-    <main className="min-h-screen grid place-items-center p-6">
-      <form onSubmit={submit} className="card w-full max-w-md p-8 space-y-5">
-        <div className="text-center">
-          <div style={{ fontWeight: 700, fontSize: 24, letterSpacing: "0.02em" }}>Sign Up</div>
-        </div>
+  const roleBtn = (value: Role, label: string) => {
+    const active = role === value;
+    return (
+      <button
+        type="button"
+        onClick={() => setRole(value)}
+        className="p-2.5 rounded-full text-sm transition-colors focus-ring"
+        style={{
+          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+          background: active ? "var(--nav-active-bg)" : "transparent",
+          color: active ? "var(--accent)" : "var(--text-2)",
+          fontWeight: active ? 600 : 500,
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
 
+  return (
+    <AuthCard
+      title="Create your account"
+      subtitle="Start copying or sharing trades in minutes"
+      footer={
+        <>
+          Have an account?{" "}
+          <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={submit} className="space-y-5">
         <div className="space-y-3">
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email</label>
             <input className="w-full p-2.5" type="email" autoComplete="email" placeholder="you@example.com"
-              value={email} onChange={(e) => setEmail(e.target.value)} required />
+              // Emails are case-insensitive — lowercase on every
+              // keystroke so what the user sees is what we send.
+              // inputMode/autoCapitalize/autoCorrect off prevent
+              // mobile keyboards from inserting capitals or
+              // suggesting corrections.
+              value={email} onChange={(e) => setEmail(e.target.value.toLowerCase())} required
+              inputMode="email" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>
@@ -79,24 +124,8 @@ export default function RegisterPage() {
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-2 block" style={{ color: "var(--muted)" }}>I am a</label>
             <div className="grid grid-cols-2 gap-2">
-              <button type="button" onClick={() => setRole("subscriber")}
-                className="p-2.5 rounded-full text-sm transition-colors"
-                style={{
-                  border: `1px solid ${role === "subscriber" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "subscriber" ? "rgba(10,115,168,0.12)" : "transparent",
-                  color: role === "subscriber" ? "var(--accent)" : "var(--text-2)",
-                  fontWeight: role === "subscriber" ? 600 : 500,
-                }}
-              >Subscriber</button>
-              <button type="button" onClick={() => setRole("trader")}
-                className="p-2.5 rounded-full text-sm transition-colors"
-                style={{
-                  border: `1px solid ${role === "trader" ? "var(--accent)" : "var(--border)"}`,
-                  background: role === "trader" ? "rgba(10,115,168,0.12)" : "transparent",
-                  color: role === "trader" ? "var(--accent)" : "var(--text-2)",
-                  fontWeight: role === "trader" ? 600 : 500,
-                }}
-              >Trader</button>
+              {roleBtn("subscriber", "Subscriber")}
+              {roleBtn("trader", "Trader")}
             </div>
           </div>
           {/* Trader-only: business / brand name. Required server-side too
@@ -128,11 +157,7 @@ export default function RegisterPage() {
           <span>Create account</span>
           {loading && <Spinner />}
         </button>
-
-        <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
-          Have an account? <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>Sign in</Link>
-        </div>
       </form>
-    </main>
+    </AuthCard>
   );
 }

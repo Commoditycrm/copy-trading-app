@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { motion } from "framer-motion";
+import { Bell, BellOff, Check, ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
@@ -88,79 +90,56 @@ export default function NotificationsPage() {
   const unreadCount = items.filter(n => n.read_at === null).length;
 
   return (
-    <div className="flex flex-col h-full max-w-4xl space-y-4">
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Notifications</h1>
-          <p className="text-sm" style={{ color: "var(--muted)" }}>
-            {unreadCount > 0
-              ? `${unreadCount} unread`
-              : "All caught up."}
-            {" · "}Auto-deleted after 30 days.
-          </p>
-        </div>
-        {unreadCount > 0 && (
-          <button
-            onClick={markAllRead}
-            disabled={markingAll}
-            className="px-3 py-2 text-sm rounded border inline-flex items-center gap-2"
-            style={{ borderColor: "var(--border)", color: "var(--text-2)" }}
-          >
-            <span>Mark all read</span>
-            {markingAll && <Spinner />}
-          </button>
-        )}
-      </div>
+    <div className="max-w-3xl">
 
       {loading && (
-        <div className="text-sm" style={{ color: "var(--muted)" }}>
-          <span className="inline-flex items-center gap-2">
-            <Spinner />
-            <span>Loading…</span>
-          </span>
+        <div className="space-y-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="skeleton h-[72px] rounded-card" />
+          ))}
         </div>
       )}
 
       {!loading && items.length === 0 && (
-        <div
-          className="p-8 rounded border text-center"
-          style={{ borderColor: "var(--border)", background: "var(--panel)", color: "var(--muted)" }}
-        >
-          No notifications yet. You&rsquo;ll see one here if a mirror order fails after retry.
+        <div className="card p-10 flex flex-col items-center text-center gap-2" style={{ color: "var(--muted)" }}>
+          <BellOff size={28} />
+          <div className="text-sm" style={{ color: "var(--text)" }}>You&rsquo;re all caught up</div>
+          <div className="text-xs">A notification appears here if a mirror order fails after retry.</div>
         </div>
       )}
 
       <div className="space-y-2">
-        {items.map(n => {
+        {items.map((n, i) => {
           const unread = n.read_at === null;
           const childOrderId = n.metadata?.["child_order_id"] as string | undefined;
           return (
-            <div
+            <motion.div
               key={n.id}
-              className="p-4 rounded border flex items-start gap-4"
-              style={{
-                borderColor: unread ? "rgba(220, 38, 38, 0.4)" : "var(--border)",
-                background: unread ? "rgba(220, 38, 38, 0.04)" : "var(--panel)",
-              }}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.28, delay: Math.min(i * 0.03, 0.2) }}
+              className="card p-4 flex items-start gap-3.5"
+              style={unread ? { borderColor: "rgba(239,68,68,0.35)", background: "var(--bad-soft)" } : undefined}
             >
-              <div
-                className="mt-1 w-2 h-2 rounded-full shrink-0"
-                style={{ background: unread ? "var(--bad)" : "transparent" }}
-                aria-label={unread ? "Unread" : "Read"}
-              />
-              <div className="flex-1 space-y-1">
-                <div className="text-sm" style={{ fontWeight: unread ? 500 : 400 }}>
+              <span
+                className="grid place-items-center rounded-full shrink-0 mt-0.5"
+                style={{
+                  width: 32, height: 32,
+                  background: unread ? "var(--bad-soft)" : "var(--panel-2)",
+                  color: unread ? "var(--bad)" : "var(--muted)",
+                }}
+              >
+                <Bell size={16} />
+              </span>
+              <div className="flex-1 min-w-0 space-y-1">
+                <div className="text-sm" style={{ color: "var(--text)", fontWeight: unread ? 600 : 400 }}>
                   {n.message}
                 </div>
-                <div className="text-xs flex items-center gap-3" style={{ color: "var(--muted)" }}>
+                <div className="text-xs flex items-center gap-3 flex-wrap" style={{ color: "var(--muted)" }}>
                   <span title={fmtAbsolute(n.created_at)}>{fmtRelative(n.created_at)}</span>
                   {childOrderId && (
-                    <Link
-                      href="/trades"
-                      className="underline"
-                      style={{ color: "var(--accent)" }}
-                    >
-                      View in Order History →
+                    <Link href="/trades" className="inline-flex items-center gap-0.5 no-underline focus-ring rounded" style={{ color: "var(--accent)" }}>
+                      View in Order History <ChevronRight size={12} />
                     </Link>
                   )}
                 </div>
@@ -168,13 +147,12 @@ export default function NotificationsPage() {
               {unread && (
                 <button
                   onClick={() => markRead(n.id)}
-                  className="text-xs px-2 py-1 rounded border shrink-0"
-                  style={{ borderColor: "var(--border)", color: "var(--muted)" }}
+                  className="btn-ghost text-xs px-2.5 py-1 shrink-0 inline-flex items-center gap-1"
                 >
-                  Mark read
+                  <Check size={12} /> Mark read
                 </button>
               )}
-            </div>
+            </motion.div>
           );
         })}
       </div>

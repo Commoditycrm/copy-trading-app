@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { BulkExitBar } from "@/components/BulkExitBar";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
@@ -15,20 +16,17 @@ export default function PositionsPage() {
     api<User>("/api/auth/me").then(setUser).catch(() => {});
   }, []);
 
-  // Hold the page until `user` lands — the BulkExitBar gates which
-  // chips render off role, and we don't want a brief flash of the
-  // "my-only" set before the trader-targeted ones appear.
-  if (!user) return <PageLoading />;
-
-  // Hold the page until `user` lands — otherwise the trader-only Exit
-  // buttons briefly appear or disappear once role resolves.
+  // Hold the page until `user` lands — the BulkExitBar gates which chips
+  // render off role, and we don't want a brief flash of the "my-only" set
+  // before the trader-targeted ones appear.
   if (!user) return <PageLoading />;
 
   return (
-    <div className="space-y-4">
-      <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
-
-      <OpenPositionsTable ref={tableRef} />
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex flex-col gap-4 flex-1 min-h-0">
+        <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
+        <OpenPositionsTable ref={tableRef} fillHeight className="flex-1 min-h-0" />
+      </div>
     </div>
   );
 }

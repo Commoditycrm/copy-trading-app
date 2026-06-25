@@ -4,17 +4,25 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
-from app.models.order import Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
-from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
+from app.schemas.order import (
+    BracketUpdateIn,
+    CloseOrderIn,
+    DailyPnL,
+    OrderOut,
+    PlaceOrderIn,
+    TradeScopeStats,
+    TradeStatsOut,
+)
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.pnl import realized_pnl_by_day
@@ -34,7 +42,12 @@ def list_trades(
         select(Order)
         .options(selectinload(Order.fills))
         .where(Order.user_id == user.id)
-        .order_by(Order.created_at.desc())
+        # Order by the ACTUAL trade time, not our DB-insert time. Orders
+        # imported by a fills re-sync (e.g. after reconnecting a broker)
+        # all get created_at = now, which would bunch historical trades at
+        # the top. submitted_at carries the broker's real timestamp; fall
+        # back to created_at for rows that never reached the broker.
+        .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
         .limit(limit)
     )
     if from_:
@@ -42,6 +55,100 @@ def list_trades(
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
     return list(db.execute(q).scalars())
+
+
+# Statuses the UI counts as "working" — must mirror the frontend's
+# OPEN_STATUSES (trades/page.tsx). Deliberately excludes RETRY_PENDING.
+_WORKING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
+@router.get("/trades/stats", response_model=TradeStatsOut)
+def trades_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+) -> TradeStatsOut:
+    """Order-history summary counts computed in the DATABASE via aggregate
+    query — so the totals reflect every matching order, not just the
+    page the client fetched. Returns both the ``all`` scope and the
+    trader's ``mine`` scope in one round-trip (the tab badges need both).
+
+    Computed live (no denormalised counters) so it can never drift out of
+    sync with the orders table; respects the same optional from/to filter
+    as ``list_trades``.
+    """
+    # "All Orders" = every order the user placed (copy ON and OFF) — a
+    # superset. "My Orders" (trader only) = the subset placed while copy
+    # was OFF (fanned_out=False). So a copy-off order shows under BOTH; a
+    # copy-on order shows only under All. Non-traders have no tabs → both
+    # scopes are all their orders.
+    is_trader = user.role == UserRole.TRADER
+    all_cond = true()
+    mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
+    filled_cond = Order.status == OrderStatus.FILLED
+    working_cond = Order.status.in_(_WORKING_STATUSES)
+
+    # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
+    # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
+    mult = case((Order.instrument_type == InstrumentType.OPTION, 100), else_=1)
+    notional_expr = (
+        func.coalesce(Order.filled_quantity, 0)
+        * func.coalesce(Order.filled_avg_price, 0)
+        * mult
+    )
+
+    row = db.execute(
+        select(
+            func.count().filter(all_cond).label("all_total"),
+            func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
+            func.count().filter(and_(all_cond, working_cond)).label("all_working"),
+            func.coalesce(
+                func.sum(case((all_cond, notional_expr), else_=0)), 0
+            ).label("all_notional"),
+            func.count().filter(mine_cond).label("mine_total"),
+            func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
+            func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
+            func.coalesce(
+                func.sum(case((mine_cond, notional_expr), else_=0)), 0
+            ).label("mine_notional"),
+        )
+        .where(Order.user_id == user.id)
+        # Mirror the order-history table's visibility rule: a bracket exit leg
+        # (TP/SL) only belongs in history once it actually filled (the real
+        # close). Resting / cancelled / rejected legs are auto-placed
+        # protective orders, not trades the user placed — excluding them keeps
+        # the summary counts honest and in lockstep with the rows shown.
+        .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
+        .where(
+            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+            if from_ else True
+        )
+        .where(
+            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+            if to else True
+        )
+    ).one()
+
+    return TradeStatsOut(
+        all=TradeScopeStats(
+            total=row.all_total,
+            filled=row.all_filled,
+            working=row.all_working,
+            notional=row.all_notional,
+        ),
+        mine=TradeScopeStats(
+            total=row.mine_total,
+            filled=row.mine_filled,
+            working=row.mine_working,
+            notional=row.mine_notional,
+        ),
+    )
 
 
 @router.get("/trades/{order_id}", response_model=OrderOut)
@@ -479,13 +586,19 @@ def cancel_trade(
     ):
         raise HTTPException(409, f"not_cancellable: status is {order.status.value}")
 
-    acct = db.get(BrokerAccount, order.broker_account_id)
-    if acct is None:
-        raise HTTPException(404, "broker_account_missing")
+    # Resolve which broker account to cancel through. An order placed on a
+    # PREVIOUS connection becomes "orphaned" once that broker is deleted /
+    # reconnected: ON DELETE SET NULL clears broker_account_id. Rather than
+    # stranding it as un-cancellable, route the cancel through the user's
+    # currently-connected account(s) and re-adopt the order onto whichever
+    # one the broker accepts the cancel from.
+    acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+    reattached = False
 
-    # Best-effort broker call. If the broker rejects (e.g. order already filled),
-    # surface the error but DON'T mutate local state — DB stays accurate.
-    if order.broker_order_id:
+    if order.broker_order_id and acct is not None:
+        # Normal path — cancel at the broker on the order's own account.
+        # If the broker rejects (e.g. already filled), surface the error
+        # but DON'T mutate local state — DB stays accurate.
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter_for(acct, creds).cancel_order(order.broker_order_id)
@@ -498,12 +611,53 @@ def cancel_trade(
             db.commit()
             raise HTTPException(502, f"broker_error: {exc}")
 
+    elif order.broker_order_id and acct is None:
+        # Orphaned: try the user's connected accounts. cancel_order with a
+        # broker_order_id the account doesn't own fails cleanly (id not
+        # found there), so trying each is safe.
+        candidates = list(db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars())
+        last_err: Exception | None = None
+        for cand in candidates:
+            try:
+                creds = decrypt_json(cand.encrypted_credentials)
+                adapter_for(cand, creds).cancel_order(order.broker_order_id)
+                acct = cand
+                order.broker_account_id = cand.id   # re-adopt onto the live account
+                reattached = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+        if acct is None and candidates:
+            # A broker is connected but none could cancel it (wrong broker,
+            # or already terminal upstream). Surface the broker error.
+            audit.record(
+                db, actor_user_id=user.id, action="order.cancel_failed",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(last_err)[:480], "orphaned": True},
+                ip_address=client_ip(request),
+            )
+            db.commit()
+            raise HTTPException(502, f"broker_error: {last_err}")
+        # No connected broker at all → unreachable; fall through to a local
+        # cancel so the order doesn't linger forever as a ghost open order.
+
+    # else: order never reached a broker (no broker_order_id) → local cancel.
+
     order.status = OrderStatus.CANCELED
     order.closed_at = datetime.now(timezone.utc)
     audit.record(
         db, actor_user_id=user.id, action="order.cancelled",
         entity_type="order", entity_id=order.id,
-        metadata={"broker_order_id": order.broker_order_id},
+        metadata={
+            "broker_order_id": order.broker_order_id,
+            "reattached_account": str(acct.id) if reattached else None,
+            "local_only": acct is None,
+        },
         ip_address=client_ip(request),
     )
     db.commit()
@@ -956,6 +1110,208 @@ def close_trade(
     )
     db.commit()
     return new_order
+
+
+@router.patch("/trades/{order_id}/bracket", response_model=OrderOut)
+def update_bracket(
+    order_id: uuid.UUID,
+    payload: BracketUpdateIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> Order:
+    """Modify the TP / SL legs on an entry order's bracket.
+
+    Behaviour by state:
+      * Entry not yet filled (pending / submitted / accepted / partially_filled)
+        → just update parent.take_profit_price / stop_loss_price. The
+        bracket_emulator places exit legs at the new prices when the
+        entry eventually fills.
+      * Entry filled, exit legs handled by emulator (i.e. NOT Alpaca-native
+        stocks bracket) → cancel any alive exit leg the caller is replacing,
+        update parent prices, then call emulate_bracket_exits to place fresh
+        legs. emulate_bracket_exits' relaxed idempotency check only blocks
+        on alive/filled siblings, so a canceled leg won't stop a re-place.
+      * Entry filled, Alpaca-native bracket (stocks on AlpacaAdapter direct)
+        → 501. We don't have Alpaca's child-leg broker_order_ids stored,
+        and the project's broker layer is SnapTrade (memory:
+        snaptrade_decision); routing live-Alpaca-bracket modify through
+        Alpaca's PATCH /v2/orders/{id} can be a follow-up if needed.
+      * Entry terminal (canceled / rejected) → 409.
+      * Any exit leg already FILLED (position partially closed via TP/SL)
+        → 409. Modifying around a partial exit is a confusing edge case
+        for v1; trader can place a fresh bracketed order if needed.
+
+    The caller may pass either field, both, or null to clear that leg.
+    Pre-fill clearing just nulls the parent column; post-fill clearing
+    cancels the corresponding live exit leg without re-placing.
+    """
+    entry = db.execute(
+        select(Order).where(Order.id == order_id)
+    ).scalar_one_or_none()
+    if not entry or entry.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if entry.bracket_leg is not None:
+        raise HTTPException(409, "cannot_modify_bracket_leg: pick the entry order, not the exit leg")
+    if entry.broker_account_id is None:
+        raise HTTPException(409, "broker_disconnected: reconnect the broker first")
+
+    # Lock entry row so two concurrent PATCHes can't race on cancel/re-place.
+    db.execute(select(Order).where(Order.id == entry.id).with_for_update())
+
+    # ── Reference price for geometry checks ──────────────────────────────
+    # Use the SAME anchor the order was originally bracketed against —
+    # ``limit_price`` for any order that had one (which is what
+    # PlaceOrderIn's bracket validator uses too) and the actual fill
+    # price as the fallback for market entries that carry a bracket.
+    # The frontend uses the same precedence to display the percentage,
+    # so what the user types as "2%" round-trips to the exact price the
+    # backend then validates against. Using filled_avg_price here while
+    # the frontend used limit_price as its display anchor caused the
+    # "buy_sl_must_be_below_entry" rejections on edits — the two ends
+    # were anchoring on different numbers and could disagree by the
+    # fill-slippage amount.
+    is_filled = entry.status == OrderStatus.FILLED
+    ref_price = entry.limit_price or entry.filled_avg_price
+
+    # Effective values after applying the patch. For fields the caller
+    # omitted, keep the current value. For explicit-null, clear. For a
+    # number, use it.
+    new_tp = payload.take_profit_price if payload.tp_present else entry.take_profit_price
+    new_sl = payload.stop_loss_price if payload.sl_present else entry.stop_loss_price
+
+    # Directional geometry: buy → sl < ref < tp; sell → tp < ref < sl.
+    # Only enforced when ref_price is known AND both legs are set (one-leg
+    # brackets have no directional constraint to check beyond ref-side).
+    if ref_price is not None:
+        if new_tp is not None:
+            if entry.side == OrderSide.BUY and new_tp <= ref_price:
+                raise HTTPException(422, "buy_tp_must_be_above_entry")
+            if entry.side == OrderSide.SELL and new_tp >= ref_price:
+                raise HTTPException(422, "sell_tp_must_be_below_entry")
+        if new_sl is not None:
+            if entry.side == OrderSide.BUY and new_sl >= ref_price:
+                raise HTTPException(422, "buy_sl_must_be_below_entry")
+            if entry.side == OrderSide.SELL and new_sl <= ref_price:
+                raise HTTPException(422, "sell_sl_must_be_above_entry")
+
+    old_tp = entry.take_profit_price
+    old_sl = entry.stop_loss_price
+
+    # ── Pre-fill path: DB-only update ────────────────────────────────────
+    if not is_filled:
+        ALIVE_FOR_MODIFY = (
+            OrderStatus.PENDING, OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+        )
+        if entry.status not in ALIVE_FOR_MODIFY:
+            raise HTTPException(409, f"not_modifiable: entry status is {entry.status.value}")
+        if payload.tp_present:
+            entry.take_profit_price = payload.take_profit_price
+        if payload.sl_present:
+            entry.stop_loss_price = payload.stop_loss_price
+        audit.record(
+            db, actor_user_id=user.id, action="bracket.updated_pre_fill",
+            entity_type="order", entity_id=entry.id,
+            metadata={
+                "old_tp": str(old_tp) if old_tp is not None else None,
+                "new_tp": str(entry.take_profit_price) if entry.take_profit_price is not None else None,
+                "old_sl": str(old_sl) if old_sl is not None else None,
+                "new_sl": str(entry.stop_loss_price) if entry.stop_loss_price is not None else None,
+            },
+            ip_address=client_ip(request),
+        )
+        db.commit()
+        db.refresh(entry)
+        return entry
+
+    # ── Post-fill path: cancel live exit legs + re-place ─────────────────
+    from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+    from app.services.bracket_emulator import emulate_bracket_exits  # noqa: PLC0415
+    from app.models.broker_account import BrokerName  # noqa: PLC0415
+    from app.models.order import InstrumentType  # noqa: PLC0415
+
+    # Alpaca-native bracket = Alpaca-direct stocks. We don't track those
+    # children locally, so a modify needs Alpaca's PATCH /v2/orders/{id}
+    # against the child legs — out of scope for v1.
+    acct = db.get(BrokerAccount, entry.broker_account_id)
+    uses_native = (
+        acct is not None
+        and acct.broker == BrokerName.ALPACA
+        and entry.instrument_type != InstrumentType.OPTION
+    )
+    if uses_native:
+        raise HTTPException(501, "alpaca_native_bracket_modify_not_supported")
+
+    # Inspect the current exit legs. We block modify if any have ALREADY
+    # FILLED — partial exit is a confusing state to modify around.
+    legs = db.execute(
+        select(Order).where(Order.bracket_parent_id == entry.id)
+    ).scalars().all()
+    if any(leg.status == OrderStatus.FILLED for leg in legs):
+        raise HTTPException(409, "position_partially_closed: a bracket leg already filled")
+
+    ALIVE = (
+        OrderStatus.PENDING, OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+    )
+    alive_legs = [leg for leg in legs if leg.status in ALIVE]
+
+    # Cancel each alive leg whose price is changing (or being cleared).
+    # If a side wasn't touched in this patch, leave that leg alone.
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    for leg in alive_legs:
+        if leg.bracket_leg == "tp" and not payload.tp_present:
+            continue
+        if leg.bracket_leg == "sl" and not payload.sl_present:
+            continue
+        if leg.broker_order_id:
+            try:
+                adapter.cancel_order(leg.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                # Broker may have already terminalized it between our last
+                # poll and this call; we still mark it locally and proceed.
+                audit.record(
+                    db, actor_user_id=user.id, action="bracket.leg_cancel_failed",
+                    entity_type="order", entity_id=leg.id,
+                    metadata={
+                        "entry_order_id": str(entry.id),
+                        "leg": leg.bracket_leg,
+                        "broker_order_id": leg.broker_order_id,
+                        "error": str(exc)[:300],
+                    },
+                )
+        leg.status = OrderStatus.CANCELED
+        leg.closed_at = datetime.now(timezone.utc)
+
+    # Apply the new prices to the parent.
+    if payload.tp_present:
+        entry.take_profit_price = payload.take_profit_price
+    if payload.sl_present:
+        entry.stop_loss_price = payload.stop_loss_price
+
+    # Flush so emulate_bracket_exits sees the canceled-leg statuses
+    # (its idempotency guard ignores canceled/rejected legs).
+    db.flush()
+    placed = emulate_bracket_exits(db, entry)
+
+    audit.record(
+        db, actor_user_id=user.id, action="bracket.updated_post_fill",
+        entity_type="order", entity_id=entry.id,
+        metadata={
+            "old_tp": str(old_tp) if old_tp is not None else None,
+            "new_tp": str(entry.take_profit_price) if entry.take_profit_price is not None else None,
+            "old_sl": str(old_sl) if old_sl is not None else None,
+            "new_sl": str(entry.stop_loss_price) if entry.stop_loss_price is not None else None,
+            "legs_cancelled": [str(leg.id) for leg in alive_legs],
+            "legs_placed": [str(leg.id) for leg in placed],
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(entry)
+    return entry
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
