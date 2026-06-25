@@ -366,7 +366,10 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
     enforcement transaction. No-op unless copy_trader_bracket is on."""
     from app.services import fills_sync as _fills_sync  # noqa: PLC0415
     from app.services.bracket_emulator import reconcile_copy_brackets  # noqa: PLC0415
+    from app.services.trader_bracket_monitor import enforce_option_sl  # noqa: PLC0415
+    from app.services import events as _events  # noqa: PLC0415
 
+    closures: list[dict[str, Any]] = []
     with SessionLocal() as db:
         s = db.get(SubscriberSettings, acct.user_id)
         if s is None or not getattr(s, "copy_trader_bracket", False):
@@ -383,6 +386,56 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
             reconcile_copy_brackets(db, acct.id)
         except Exception:  # noqa: BLE001
             log.exception("pnl_poller: copy-bracket reconcile failed for %s", acct.id)
+        # Copied OPTION SL legs can't rest at the broker (Alpaca rejects STOP
+        # on options), so — exactly like the trader path — enforce them with
+        # the price monitor. The mirror entry now carries stop_loss_price
+        # (persisted by emulate_bracket_exits), so the monitor can act on it.
+        try:
+            closures = enforce_option_sl(db, acct.user_id, acct.id)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            log.exception("pnl_poller: subscriber option-SL monitor failed for %s", acct.id)
+
+    if not closures:
+        return
+
+    # Persist notifications in their own session (state durable before the
+    # SSE fires), then publish position.auto_closed so the subscriber's
+    # positions table refreshes live instead of only on manual reload.
+    with SessionLocal() as db:
+        from app.services import notifications as notif_svc  # noqa: PLC0415
+        for c in closures:
+            pnl_pct = c.get("pnl_pct")
+            pnl_phrase = f" Realised P&L: {pnl_pct}%." if pnl_pct is not None else ""
+            try:
+                notif_svc.create_notification(
+                    db,
+                    user_id=acct.user_id,
+                    type="bracket.sl_triggered",
+                    message=(
+                        f"{c['symbol']} option SL hit at ${c['mark']} "
+                        f"(copied threshold ${c['sl_price']}). "
+                        f"Close placed at ${c['limit']} — {c['qty']} contracts."
+                        f"{pnl_phrase}"
+                    ),
+                    metadata=c,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "pnl_poller: subscriber SL notification failed for user=%s",
+                    acct.user_id,
+                )
+        db.commit()
+
+    for c in closures:
+        _events.publish(acct.user_id, {
+            "type": "position.auto_closed",
+            "leg": "sl",
+            "symbol": c["symbol"],
+            "qty": c["qty"],
+            "broker": acct.broker.value,
+        })
 
 
 def _enforce_one_trader(acct: BrokerAccount) -> None:
@@ -515,6 +568,27 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 pending_events.append({
                     "type": "copy.auto_resumed", "reason": "new_day",
                 })
+                # Persist a notification too — not just the toast — so the
+                # subscriber sees that copy came back on when they next log in.
+                # Mirrors the auto-PAUSE notification on the other side.
+                try:
+                    from app.services import notifications as notif_svc  # noqa: PLC0415
+                    notif_svc.create_notification(
+                        db,
+                        user_id=s.user_id,
+                        type="copy.auto_resumed_next_day",
+                        message=(
+                            "Copy trading resumed automatically for the new UTC "
+                            "trading day. It was paused yesterday by one of your "
+                            "daily risk limits."
+                        ),
+                        metadata={"source": "pnl_poller", "reason": "new_day"},
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "pnl_poller: auto-resume notification failed for user=%s",
+                        s.user_id,
+                    )
 
         # today's P&L snapshot (todays_pl / equity / beginning_day_balance) was
         # fetched ABOVE, before this session opened, so we never hold a pool
@@ -751,6 +825,65 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 "todays_trading_value":    str(todays_trading_value),
                 "beginning_day_balance":   str(beginning_day_balance) if beginning_day_balance is not None else None,
             })
+
+            # Persist a notification too — not just the toast — so the
+            # subscriber can see WHY copy trading paused when they next log
+            # in. (Auto-liquidation + per-position TP/SL already do this; the
+            # daily kill switches were the gap.)
+            if reason == "daily_loss_limit":
+                pause_msg = (
+                    f"Daily loss limit reached — today's realized P&L ${todays_pl} "
+                    f"hit your ${s.daily_loss_limit} loss limit. Copy trading is now "
+                    f"OFF; turn it back on when you're ready."
+                )
+            elif reason == "daily_profit_limit":
+                pause_msg = (
+                    f"Daily profit target reached — today's realized P&L ${todays_pl} "
+                    f"hit your ${s.daily_profit_limit} profit target. Copy trading is "
+                    f"now OFF; turn it back on when you're ready."
+                )
+            elif reason == "daily_loss_limit_pct":
+                pause_msg = (
+                    f"Daily loss limit reached — today's realized P&L ${todays_pl} hit "
+                    f"your {s.daily_loss_limit_pct}% loss limit (${loss_pct_dollars}). "
+                    f"Copy trading is now OFF; turn it back on when you're ready."
+                )
+            elif reason == "daily_profit_limit_pct":
+                pause_msg = (
+                    f"Daily profit target reached — today's realized P&L ${todays_pl} "
+                    f"hit your {s.daily_profit_limit_pct}% profit target "
+                    f"(${profit_pct_dollars}). Copy trading is now OFF; turn it back "
+                    f"on when you're ready."
+                )
+            else:  # max_account_pct_per_day
+                pause_msg = (
+                    f"Daily trading cap reached — today's traded value "
+                    f"${todays_trading_value} hit your {s.max_account_pct_per_day}% "
+                    f"of-account cap (${pct_limit_dollars}). Copy trading is now OFF; "
+                    f"turn it back on when you're ready."
+                )
+            try:
+                from app.services import notifications as notif_svc  # noqa: PLC0415
+                notif_svc.create_notification(
+                    db,
+                    user_id=s.user_id,
+                    type=f"copy.auto_paused_{reason}",
+                    message=pause_msg,
+                    metadata={
+                        "reason": reason,
+                        "broker": acct.broker.value,
+                        "todays_realized_pnl": str(todays_pl),
+                        "todays_trading_value": str(todays_trading_value),
+                        "equity": str(equity),
+                        "beginning_day_balance":
+                            str(beginning_day_balance) if beginning_day_balance is not None else None,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "pnl_poller: auto-pause notification failed for user=%s",
+                    s.user_id,
+                )
 
         # ── Per-position TP/SL enforcement ────────────────────────────────
         # Independent of the daily kill switches above — fires whenever

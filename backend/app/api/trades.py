@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import and_, case, func, select, true
+from sqlalchemy import and_, case, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
@@ -119,6 +119,12 @@ def trades_stats(
             ).label("mine_notional"),
         )
         .where(Order.user_id == user.id)
+        # Mirror the order-history table's visibility rule: a bracket exit leg
+        # (TP/SL) only belongs in history once it actually filled (the real
+        # close). Resting / cancelled / rejected legs are auto-placed
+        # protective orders, not trades the user placed — excluding them keeps
+        # the summary counts honest and in lockstep with the rows shown.
+        .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
         .where(
             Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
             if from_ else True

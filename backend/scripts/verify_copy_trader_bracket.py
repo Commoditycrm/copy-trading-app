@@ -186,26 +186,27 @@ def test_emulator_reanchor(broker: BrokerName, instrument: InstrumentType, label
             for e in exits:
                 created_ids.insert(0, e.id)
 
-            # Anchor is limit_price (210), not filled_avg_price.
-            # TP = 210 * 1.10 = 231 ; SL = 210 * 0.95 = 199.50
+            # Anchor is the subscriber's FILL (205), not the limit — risk
+            # parity off what they actually paid.
+            # TP = 205 * 1.10 = 225.50 ; SL = 205 * 0.95 = 194.75
             legs = {e.bracket_leg: e for e in exits}
             if instrument == InstrumentType.OPTION:
                 # Option SL (STOP) is deferred to the monitor → only TP placed.
                 check(f"{label}: TP leg placed", "tp" in legs, f"legs={list(legs)}")
                 if "tp" in legs:
-                    check(f"{label}: TP=231 (re-anchored on limit)",
-                          legs["tp"].limit_price == Decimal("231.00"),
+                    check(f"{label}: TP=225.50 (re-anchored on fill 205)",
+                          legs["tp"].limit_price == Decimal("225.50"),
                           f"got {legs['tp'].limit_price}")
             else:
                 check(f"{label}: both TP+SL placed", set(legs) == {"tp", "sl"},
                       f"legs={list(legs)}")
                 if "tp" in legs:
-                    check(f"{label}: TP=231 (re-anchored on limit, not 205 fill)",
-                          legs["tp"].limit_price == Decimal("231.00"),
+                    check(f"{label}: TP=225.50 (re-anchored on fill 205, not 210 limit)",
+                          legs["tp"].limit_price == Decimal("225.50"),
                           f"got {legs['tp'].limit_price}")
                 if "sl" in legs:
-                    check(f"{label}: SL=199.50",
-                          legs["sl"].stop_price == Decimal("199.50"),
+                    check(f"{label}: SL=194.75",
+                          legs["sl"].stop_price == Decimal("194.75"),
                           f"got {legs['sl'].stop_price}")
                 check(f"{label}: exits sized to filled qty 10",
                       all(e.quantity == Decimal("10") for e in exits))

@@ -246,7 +246,15 @@ def _find_entry_with_sl(
     """Most-recent FILLED entry on this exact option contract with a
     stop_loss_price set. Filters by symbol + expiry + strike + right
     so we don't accidentally pair a position with an entry for a
-    different contract on the same underlying."""
+    different contract on the same underlying.
+
+    Deliberately does NOT filter on parent_order_id: this monitor serves
+    both the trader's own entries (parent_order_id NULL) AND subscriber
+    mirror entries (parent_order_id set). A mirror's copied option SL
+    can't rest at the broker either, so the subscriber needs the same
+    price-monitor enforcement. `user_id == account owner` already scopes
+    the match to the right person, so dropping the parent filter can't
+    pull in someone else's order."""
     q = (
         select(Order)
         .where(
@@ -256,7 +264,6 @@ def _find_entry_with_sl(
             Order.symbol == pos.symbol,
             Order.status == OrderStatus.FILLED,
             Order.is_closing.is_(False),
-            Order.parent_order_id.is_(None),
             Order.bracket_parent_id.is_(None),
             Order.stop_loss_price.isnot(None),
         )
@@ -462,4 +469,10 @@ def _trigger_close(
     }
 
 
-__all__ = ["enforce_trader_option_sl"]
+# The monitor is role-agnostic (see _find_entry_with_sl): it enforces the
+# deferred option SL for whoever owns the account — trader entry or subscriber
+# mirror. `enforce_option_sl` is the role-neutral name; the original is kept as
+# an alias so existing trader-side imports keep working.
+enforce_option_sl = enforce_trader_option_sl
+
+__all__ = ["enforce_trader_option_sl", "enforce_option_sl"]
