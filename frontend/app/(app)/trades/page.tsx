@@ -329,6 +329,13 @@ export default function TradesPage() {
     // order appears under BOTH tabs; a copy-on order only under All.
     return orders.filter(o => {
       if (user?.role === "trader" && tab === "mine" && o.fanned_out_to_subscribers) return false;
+      // Bracket exit legs (TP/SL) are auto-placed protective orders for a
+      // position, not trades the user placed — the bracket already shows as
+      // the position's / entry's TP/SL columns. Surface a leg ONLY when it
+      // actually filled (the real close); hide resting, cancelled, and
+      // rejected legs so they don't clutter history as phantom "not filled"
+      // rows sitting next to the open position they protect.
+      if (o.bracket_parent_id && o.status !== "filled") return false;
       if (fromParam || toParam) return true;
       if (o.status !== "filled") return true;
       return !heldKeys.has(posKey(
@@ -616,11 +623,16 @@ export default function TradesPage() {
                           immutable. Bracket-exit legs (TP/SL closes) never
                           expose an editor. Anchor the % off limit_price (the
                           exact number the Trade Panel used to set the bracket),
-                          falling back to filled_avg_price for market entries. */}
+                          falling back to filled_avg_price for market entries.
+                          For a COPIED mirror (parent_order_id set) the exits are
+                          re-anchored on the subscriber's actual fill, so display
+                          the % off filled_avg_price to match what fires. */}
                       {(() => {
                         const isEntry = !o.bracket_parent_id;
                         const editable = isEntry && isOpen;
-                        const entryPrice = o.limit_price ?? o.filled_avg_price;
+                        const entryPrice = o.parent_order_id
+                          ? (o.filled_avg_price ?? o.limit_price)
+                          : (o.limit_price ?? o.filled_avg_price);
                         const onUpdated = (updated: Order) =>
                           setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
                         return (

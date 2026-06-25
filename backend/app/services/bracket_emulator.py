@@ -82,6 +82,34 @@ def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) ->
     # Quantize to the tick: divide → round → multiply.
     return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
+
+def _reanchor_exit_price(
+    anchor: Decimal, pct: Decimal, side: OrderSide, leg: str,
+    instrument_type: InstrumentType,
+) -> Decimal:
+    """Re-anchor a percent bracket onto `anchor` and tick-round it, then
+    guarantee the result sits at least ONE tick on the correct side of the
+    anchor.
+
+    The guard matters for low-priced options: 5% of a $0.19 option is
+    $0.0095 — less than the $0.01 tick — so the leg-aware rounding (TP down,
+    SL up) collapses the exit onto the entry and it would fire at break-even.
+    Nudging it one tick out keeps the bracket meaningful (TP 0.20 / SL 0.18
+    instead of 0.19 / 0.19)."""
+    direction = _leg_direction(side, leg)
+    raw = anchor * (1 + direction * pct / 100)
+    rounded = _round_to_tick(raw, instrument_type, leg)
+    tick = (
+        _NICKEL
+        if instrument_type == InstrumentType.OPTION and anchor >= _OPTION_NICKEL_THRESHOLD
+        else _PENNY
+    )
+    if direction > 0 and rounded <= anchor:
+        rounded = anchor + tick
+    elif direction < 0 and rounded >= anchor:
+        rounded = anchor - tick
+    return rounded
+
 # OrderStatuses we still consider "alive" — used to decide whether the
 # sibling exit can be cancelled. PENDING covers the brief window between
 # our DB INSERT and the broker accepting.
@@ -140,16 +168,42 @@ def emulate_bracket_exits(db: Session, entry: Order) -> list[Order]:
 
     # Copied percent bracket (subscriber with copy_trader_bracket on):
     # re-anchor the trader's percent distance onto THIS account's own
-    # fill so the exit sits the same % from entry as the trader's,
-    # regardless of the subscriber's fill price or multiplier. limit_price
-    # first (same anchor the trader's bracket uses), else filled_avg_price.
+    # entry so the exit sits the same % from entry as the trader's,
+    # regardless of the subscriber's fill price or multiplier.
+    #
+    # Anchor on the subscriber's actual FILL price first, not the mirror's
+    # limit. The whole point of percent re-anchoring is risk parity: the
+    # subscriber should risk/target the same % off what THEY actually paid.
+    # When a limit mirror fills better than its limit (e.g. limit 0.21,
+    # fill 0.19), anchoring on the limit would place a "+5%" TP at 0.22 —
+    # which is +15.8% off the real 0.19 entry, so it never triggers while
+    # the trader's did. filled_avg_price is the true entry; fall back to
+    # limit_price only when the fill price isn't written back yet.
     if entry.take_profit_pct is not None or entry.stop_loss_pct is not None:
-        anchor = entry.limit_price or entry.filled_avg_price
+        anchor = entry.filled_avg_price or entry.limit_price
         if anchor and anchor > 0:
             if entry.take_profit_pct is not None:
-                tp_price = anchor * (1 + _leg_direction(entry.side, "tp") * entry.take_profit_pct / 100)
+                tp_price = _reanchor_exit_price(
+                    anchor, entry.take_profit_pct, entry.side, "tp", entry.instrument_type
+                )
             if entry.stop_loss_pct is not None:
-                sl_price = anchor * (1 + _leg_direction(entry.side, "sl") * entry.stop_loss_pct / 100)
+                sl_price = _reanchor_exit_price(
+                    anchor, entry.stop_loss_pct, entry.side, "sl", entry.instrument_type
+                )
+            # Persist the re-anchored absolute prices back onto the entry.
+            # Two reasons:
+            #   1. An OPTION SL leg can't rest at the broker (Alpaca rejects
+            #      STOP on options), so it's enforced by the price monitor —
+            #      which reads `entry.stop_loss_price`. A copied option bracket
+            #      only ever carries stop_loss_PCT, so without this the monitor
+            #      would have no concrete trigger and the SL would never fire.
+            #   2. The order-history / positions UI renders the TP/SL columns
+            #      from these absolute prices; a mirror would otherwise show a
+            #      blank bracket. Already tick-rounded by _reanchor_exit_price.
+            if tp_price:
+                entry.take_profit_price = tp_price
+            if sl_price:
+                entry.stop_loss_price = sl_price
 
     if not tp_price and not sl_price:
         return []
