@@ -125,6 +125,16 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start trade listeners")
 
+        # Listen for start/stop requests from the web tier (a trader
+        # connecting/reconnecting a broker). The web container can't start
+        # listeners itself without duplicating ours, so it hands them over
+        # this channel. Worker-only — runs for the life of the process.
+        try:
+            from app.services import listener_control
+            asyncio.create_task(listener_control.run_subscriber())
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start listener_control subscriber")
+
         # 60s sweep that pulls today's P&L from Alpaca directly and
         # auto-pauses copy when loss/profit limits are hit. Covers the
         # "trader is quiet but subscriber's positions move" gap that
