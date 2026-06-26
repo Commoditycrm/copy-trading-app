@@ -18,8 +18,11 @@ import asyncio
 import logging
 import uuid
 
+from sqlalchemy import select
+
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
+from app.models.user import User, UserRole
 from app.services import (
     ibkr_listener,
     listener_state,
@@ -224,3 +227,76 @@ async def run_reconciler(interval_s: float = 10.0) -> None:
 # Backwards-compat re-export — some call sites still import get_status from
 # trade_listener. listener_state is the source of truth now.
 get_status = listener_state.get_status
+
+
+# Brokers that actually run a listener task. WEBULL (dormant — historical
+# rows only) and FAKE have none, so reconcile() ignores them — otherwise it
+# would try to (re)start a non-existent listener on every tick.
+_LISTENED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.IBKR)
+
+
+def _fetch_desired() -> dict[uuid.UUID, tuple[uuid.UUID, BrokerName]]:
+    """DB snapshot (sync) of every active trader's connected, listenable
+    broker → ``{trader_id: (broker_account_id, broker)}``. One-broker-per-user
+    means at most one row per trader."""
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(BrokerAccount.user_id, BrokerAccount.id, BrokerAccount.broker)
+            .join(User, User.id == BrokerAccount.user_id)
+            .where(
+                User.role == UserRole.TRADER,
+                User.is_active.is_(True),
+                BrokerAccount.connection_status == "connected",
+                BrokerAccount.broker.in_(_LISTENED_BROKERS),
+            )
+        ).all()
+    return {user_id: (acct_id, broker) for user_id, acct_id, broker in rows}
+
+
+def _has_running_listener(trader_user_id: uuid.UUID) -> bool:
+    return (
+        trade_listener.has_running_listener(trader_user_id)
+        or snaptrade_listener.has_running_listener(trader_user_id)
+        or ibkr_listener.has_running_listener(trader_user_id)
+    )
+
+
+def _running_trader_ids() -> set[uuid.UUID]:
+    return (
+        trade_listener.running_trader_ids()
+        | snaptrade_listener.running_trader_ids()
+        | ibkr_listener.running_trader_ids()
+    )
+
+
+async def reconcile() -> None:
+    """Re-sync running listeners with the DB. Runs periodically in the WORKER.
+
+    Why this exists: broker connect/disconnect is handled in the WEB
+    container, but listeners run here in the WORKER — and one process cannot
+    start or cancel an ``asyncio.Task`` living in another. Before this, a
+    broker connected at runtime got no listener until the worker was
+    restarted (which re-ran ``start_all_listeners`` and rescanned the DB).
+    This does that rescan continuously:
+
+      - start a listener for every connected broker missing a live task
+        (also self-heals a crashed task — ``done()`` counts as missing), and
+      - stop a listener whose broker was disconnected/removed.
+
+    Must run ON the worker's event loop: ``start_listener`` /
+    ``stop_listener`` touch ``asyncio.Task`` (``create_task`` / ``.cancel()``)
+    which is not thread-safe. Only the DB read is offloaded to a thread so it
+    doesn't block the loop."""
+    desired = await asyncio.to_thread(_fetch_desired)
+
+    for trader_id, (acct_id, broker) in desired.items():
+        if not _has_running_listener(trader_id):
+            log.info(
+                "reconcile: starting listener for trader %s (%s)",
+                trader_id, broker.value,
+            )
+            start_listener(trader_id, acct_id)
+
+    for trader_id in _running_trader_ids() - set(desired):
+        log.info("reconcile: stopping orphaned listener for trader %s", trader_id)
+        stop_listener(trader_id)
