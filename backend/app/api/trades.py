@@ -374,6 +374,50 @@ def _place_trader_order(
     Returns the persisted Order. Caller commits nothing — this function
     commits before returning.
     """
+    # ── Concurrency guard (race-free duplicate suppression) ───────────────
+    # Two near-simultaneous requests for the SAME order would each pass the
+    # dedup SELECT below (the first request's row isn't committed yet) and
+    # each place a REAL broker order — the production duplicate we saw. A
+    # Postgres transaction-level advisory lock keyed on the order's IDENTITY
+    # serializes them: the second request waits until the first commits, then
+    # the dedup SELECT sees that order and returns it instead of placing again.
+    #
+    # The key is the order identity ONLY, so two DIFFERENT orders never block
+    # each other — legitimate distinct trades are completely unaffected. The
+    # lock auto-releases at transaction end (the commit at the bottom of this
+    # function). lock_timeout caps the WAIT so a placement stuck at the broker
+    # can't block the identical order indefinitely; on timeout we fall through
+    # to the dedup window (which still catches an already-committed duplicate).
+    # Postgres-only — on other engines (e.g. SQLite in tests) we skip silently.
+    _bind = db.get_bind()
+    if getattr(getattr(_bind, "dialect", None), "name", "") == "postgresql":
+        import hashlib  # noqa: PLC0415
+        from sqlalchemy import text  # noqa: PLC0415
+        _identity = "|".join(str(x) for x in (
+            trader.id, broker_account_id, payload.instrument_type.value,
+            payload.symbol.upper(), payload.side.value, payload.order_type.value,
+            payload.quantity, payload.limit_price, payload.stop_price,
+            payload.option_expiry, payload.option_strike,
+            payload.option_right.value if payload.option_right else None,
+        ))
+        _lock_key = int.from_bytes(
+            hashlib.sha256(_identity.encode()).digest()[:8], "big", signed=True
+        )
+        # Acquire inside a SAVEPOINT so a lock-wait timeout rolls back ONLY the
+        # lock attempt — never any work a caller (e.g. a position-close path)
+        # already did in this transaction. If acquired, the advisory lock is
+        # held at the top-level tx and released by this function's commit.
+        try:
+            with db.begin_nested():
+                db.execute(text("SET LOCAL lock_timeout = '12s'"))
+                db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _lock_key})
+        except Exception:  # noqa: BLE001 — lock-wait timeout / engine hiccup
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).warning(
+                "trades: advisory lock not acquired (user=%s symbol=%s); "
+                "relying on the dedup window", trader.id, payload.symbol,
+            )
+
     is_trader = trader.role == UserRole.TRADER
     # Trader kill switch only applies to traders. Subscribers can always
     # manage (close/cancel) their own broker accounts.
