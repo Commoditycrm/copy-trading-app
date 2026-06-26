@@ -135,6 +135,16 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start listener_control subscriber")
 
+        # Safety net for the pub/sub handoff above: every 15s reconcile the
+        # listeners running in this process against the connected trader
+        # brokers in the DB, starting any that are missing. Without this a
+        # control message missed during a restart/Redis blip leaves a
+        # connected trader with no listener (status pill stuck offline).
+        try:
+            asyncio.create_task(listeners.run_reconciler())
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start listener reconciler")
+
         # 60s sweep that pulls today's P&L from Alpaca directly and
         # auto-pauses copy when loss/profit limits are hit. Covers the
         # "trader is quiet but subscriber's positions move" gap that

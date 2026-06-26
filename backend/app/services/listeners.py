@@ -124,6 +124,83 @@ def _stop_listener_local(trader_user_id: uuid.UUID) -> None:
     listener_state.clear(trader_user_id)
 
 
+def _running_listener_trader_ids() -> set[uuid.UUID]:
+    """Trader ids with a live (not-done) listener task in THIS process, across
+    all backends. Reads each backend's task registry defensively so a backend
+    without one just contributes nothing."""
+    out: set[uuid.UUID] = set()
+    for mod in (trade_listener, snaptrade_listener, ibkr_listener):
+        tasks = getattr(mod, "_tasks", {})
+        for tid, task in list(tasks.items()):
+            try:
+                if task is not None and not task.done():
+                    out.add(tid)
+            except Exception:  # noqa: BLE001 — never let one bad task block the sweep
+                out.add(tid)
+    return out
+
+
+def reconcile_once() -> None:
+    """Desired-state sync: make the listeners running in THIS process match the
+    connected trader broker accounts in the DB. Starts any missing, stops any
+    orphaned. Idempotent — safe to run on a timer.
+
+    Why this exists: the web tier hands listener start/stop to the worker over
+    Redis pub/sub (``listener_control``), which is fire-and-forget — a message
+    missed during a worker restart, a Redis blip, or a race leaves a connected
+    trader with NO listener (their status pill reads offline) until the next
+    process restart. This periodic reconcile is the safety net that heals that;
+    pub/sub stays as the low-latency fast path.
+
+    Runs ON the event loop (quick indexed query), so start/stop touch asyncio
+    task state from the loop thread — not a worker thread."""
+    from sqlalchemy import select  # noqa: PLC0415
+    from app.models.user import User, UserRole  # noqa: PLC0415
+
+    desired: dict[uuid.UUID, uuid.UUID] = {}  # trader_id -> broker_account_id
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(BrokerAccount.user_id, BrokerAccount.id)
+            .join(User, User.id == BrokerAccount.user_id)
+            .where(
+                User.role == UserRole.TRADER,
+                User.is_active.is_(True),
+                BrokerAccount.connection_status == "connected",
+                BrokerAccount.broker.in_(
+                    [BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.IBKR]
+                ),
+            )
+        ).all()
+    for user_id, acct_id in rows:
+        # One-broker-per-user; if duplicates ever exist, last wins (arbitrary
+        # but stable enough — the listener restarts cleanly either way).
+        desired[user_id] = acct_id
+
+    running = _running_listener_trader_ids()
+
+    for trader_id, acct_id in desired.items():
+        if trader_id not in running:
+            log.info("reconcile: starting missing listener for trader %s", trader_id)
+            _start_listener_local(trader_id, acct_id)
+
+    for trader_id in running - set(desired.keys()):
+        log.info("reconcile: stopping orphaned listener for trader %s", trader_id)
+        _stop_listener_local(trader_id)
+
+
+async def run_reconciler(interval_s: float = 15.0) -> None:
+    """Worker-only loop that calls :func:`reconcile_once` forever. A failed pass
+    is logged and retried next tick — one bad sweep never kills the loop."""
+    while True:
+        try:
+            reconcile_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("listener reconcile pass failed")
+        await asyncio.sleep(interval_s)
+
+
 # Backwards-compat re-export — some call sites still import get_status from
 # trade_listener. listener_state is the source of truth now.
 get_status = listener_state.get_status
