@@ -152,8 +152,12 @@ def reconcile_once() -> None:
     process restart. This periodic reconcile is the safety net that heals that;
     pub/sub stays as the low-latency fast path.
 
-    Runs ON the event loop (quick indexed query), so start/stop touch asyncio
-    task state from the loop thread — not a worker thread."""
+    MUST run OFF the event loop — it issues a synchronous psycopg query, which
+    would freeze the whole worker loop (and with it every listener, the SSE
+    feed, and health) if run inline. ``run_reconciler`` calls it via
+    ``asyncio.to_thread``. The start/stop helpers it calls are already safe to
+    invoke off-loop (they marshal task creation/cancellation onto the loop the
+    same way the web tier's sync request handlers do)."""
     from sqlalchemy import select  # noqa: PLC0415
     from app.models.user import User, UserRole  # noqa: PLC0415
 
@@ -177,23 +181,39 @@ def reconcile_once() -> None:
         desired[user_id] = acct_id
 
     running = _running_listener_trader_ids()
+    desired_ids = set(desired.keys())
 
     for trader_id, acct_id in desired.items():
         if trader_id not in running:
             log.info("reconcile: starting missing listener for trader %s", trader_id)
             _start_listener_local(trader_id, acct_id)
 
-    for trader_id in running - set(desired.keys()):
+    for trader_id in running - desired_ids:
         log.info("reconcile: stopping orphaned listener for trader %s", trader_id)
         _stop_listener_local(trader_id)
 
+    # Clear stale status keys: a trader with neither a connected broker (not
+    # desired) nor a live task (not running) but still a lingering
+    # listener:state key — e.g. a disconnect whose stop message was lost, or a
+    # listener that died across a restart. Without this their pill (and any
+    # subscriber following them) shows "online" forever.
+    for tid_str in list(listener_state.get_all_statuses().keys()):
+        try:
+            tid = uuid.UUID(tid_str)
+        except ValueError:
+            continue
+        if tid not in desired_ids and tid not in running:
+            log.info("reconcile: clearing stale listener state for %s", tid)
+            listener_state.clear(tid)
 
-async def run_reconciler(interval_s: float = 15.0) -> None:
-    """Worker-only loop that calls :func:`reconcile_once` forever. A failed pass
-    is logged and retried next tick — one bad sweep never kills the loop."""
+
+async def run_reconciler(interval_s: float = 10.0) -> None:
+    """Worker-only loop that runs :func:`reconcile_once` forever, OFF the event
+    loop (its DB query must not block the loop). A failed pass is logged and
+    retried next tick — one bad sweep never kills the loop."""
     while True:
         try:
-            reconcile_once()
+            await asyncio.to_thread(reconcile_once)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
