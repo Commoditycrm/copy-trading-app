@@ -82,6 +82,11 @@ export interface Order {
   stop_price: string | null;
   take_profit_price: string | null;
   stop_loss_price: string | null;
+  /** Copied-bracket INTENT as a positive percent (set on subscriber mirror
+   *  entries). The UI shows this verbatim for mirrors instead of re-deriving
+   *  the percent from the tick-rounded exit price. */
+  take_profit_pct?: string | null;
+  stop_loss_pct?: string | null;
   /** Set on bracket-exit rows (TP / SL closes); null on entry orders.
    *  Lets the frontend filter exit legs out of entry-finding lookups. */
   bracket_parent_id?: string | null;

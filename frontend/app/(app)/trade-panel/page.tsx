@@ -378,6 +378,20 @@ export default function TradePanelPage() {
   const isOption = instrument === "option";
   const isBuy = side === "buy";
 
+  // ── CTA readiness gates ───────────────────────────────────────────────
+  // Market CTAs (Buy / Sell): for an OPTION, enable only once the contract is
+  // identified — i.e. the chain has been fetched and an expiry + strike are
+  // selected. Stocks need no chain, so they stay enabled as before.
+  const marketReady = !isOption || (!!expiry && !!strike);
+  // Limit CTAs (Buy LMT / Sell LMT): additionally need the live quote fetched
+  // for THIS exact contract (which seeds the Limit field from bid/ask/mid) AND
+  // a positive limit price — so a limit order can't fire before bid/ask/mid is
+  // in, and illiquid contracts (empty quote) still work once the trader types
+  // a price. `quoteFor` is set to this same key by the quote effect.
+  const optionContractKey = `${acctId}:${symbol.trim().toUpperCase()}:${expiry}:${strike}:${right}`;
+  const hasLimitPrice = !!limit && Number(limit) > 0;
+  const limitReady = !isOption || (quoteFor === optionContractKey && hasLimitPrice);
+
   const occ = useMemo(
     () => isOption ? buildOccSymbol(symbol, expiry, strike, right) : null,
     [isOption, symbol, expiry, strike, right]
@@ -937,19 +951,33 @@ export default function TradePanelPage() {
               ] as const).map(b => {
                 const spinning = submitting && side === b.side && submittingType === b.type;
                 const outlined = b.variant === "outline";
+                // Gate each CTA on its own readiness: Market needs the contract
+                // (expiry+strike); Limit needs the fetched quote + a price.
+                const ready = b.type === "market" ? marketReady : limitReady;
+                const blocked = submitting || !acctId || !ready;
+                const blockedReason = !acctId
+                  ? "Connect a broker first"
+                  : b.type === "market" && !marketReady
+                    ? "Select an expiry and strike first"
+                    : b.type === "limit" && !limitReady
+                      ? (isOption && quoteFor !== optionContractKey
+                          ? "Fetching bid/ask/mid…"
+                          : "Enter a limit price")
+                      : undefined;
                 return (
                   <button
                     key={`${b.side}-${b.type}`}
                     type="button"
                     onClick={() => placeOrder(b.side, b.type)}
-                    disabled={submitting || !acctId}
+                    disabled={blocked}
+                    title={blockedReason}
                     className="w-full px-2 py-2.5 rounded-lg flex flex-col items-center justify-center gap-0.5 transition-all"
                     style={{
                       background: outlined ? b.tint : b.grad,
                       border: outlined ? `1px solid ${b.border}` : "1px solid transparent",
                       color: b.text,
-                      opacity: submitting || !acctId ? 0.6 : 1,
-                      cursor: submitting || !acctId ? "not-allowed" : "pointer",
+                      opacity: blocked ? 0.6 : 1,
+                      cursor: blocked ? "not-allowed" : "pointer",
                     }}
                   >
                     <span className="text-[13px] font-bold tracking-wide leading-none inline-flex items-center gap-1.5">

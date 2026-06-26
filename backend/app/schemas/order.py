@@ -92,6 +92,13 @@ class OrderOut(BaseModel):
     stop_price: Decimal | None
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
+    # Copied-bracket INTENT, as a positive percent distance from entry. Set on
+    # subscriber mirror entries by copy_engine. The UI shows this verbatim for
+    # mirrors (e.g. "2%") instead of re-deriving the percent from the
+    # tick-rounded exit price — which, on a low-priced option, reads as 1.86%
+    # for a nominal 2% and confuses subscribers copying the trader's 2%.
+    take_profit_pct: Decimal | None = None
+    stop_loss_pct: Decimal | None = None
     # Bracket-exit linkage — entry rows have these null; the TP / SL exit
     # rows placed by bracket_emulator point back at their parent and tag
     # themselves with 'tp' or 'sl'. The frontend uses these to filter
