@@ -29,6 +29,7 @@ down. Designed for Lightsail / Render / Fly hosting.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import ssl
 import uuid
@@ -57,7 +58,15 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, broker_filters, copy_engine, events, fills_sync, listener_state
+from app.services import (
+    audit,
+    broker_filters,
+    copy_engine,
+    events,
+    fills_sync,
+    listener_state,
+    order_intent,
+)
 from app.services.crypto import decrypt_json
 from app.services.listener_state import ListenerState, ListenerStatus
 
@@ -436,6 +445,18 @@ _BUY = OrderSide.BUY
 _SELL = OrderSide.SELL
 
 
+def _advisory_key(trader_user_id: uuid.UUID, broker_order_id: str) -> int:
+    """Stable signed 64-bit key for pg_advisory_xact_lock, derived from
+    (trader, broker_order_id). Two handlers for the SAME broker order hash
+    to the same key and serialize; different orders don't contend. Uses
+    blake2b (not Python's salted hash()) so the value is identical across
+    processes."""
+    digest = hashlib.blake2b(
+        f"{trader_user_id}:{broker_order_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
 async def _handle_trade_update(
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
@@ -485,7 +506,18 @@ def _persist_and_fanout(
             return
 
     with SessionLocal() as db:
-        from sqlalchemy import select
+        from sqlalchemy import select, text
+        # Serialize concurrent handling of the SAME broker order so the
+        # check-then-insert below can't race into two parent rows (which
+        # mirror twice — the "doubling" bug). This covers a brief overlap of
+        # two listeners during a worker redeploy and 'new'+'accepted' events
+        # landing together. The advisory lock is held until this transaction
+        # commits/rolls back; a second handler for the same order then sees
+        # the committed row and takes the update path instead of inserting.
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": _advisory_key(trader_user_id, broker_order_id)},
+        )
         # Scope by (user_id, broker_order_id) + LIMIT 1 — NOT scalar_one_or_none.
         # broker_order_id has no unique constraint, so duplicate rows (e.g. from
         # a prior reconnect that orphaned the account) made scalar_one_or_none
@@ -548,6 +580,26 @@ def _persist_and_fanout(
         # order we never saw start are ignored (we have nothing to mirror).
         if event_name not in ("new", "fill", "partial_fill", "accepted"):
             return
+
+        # Don't re-create orders our OWN Trade Panel placed. api/trades.py
+        # marks order.id as app-originated and passes it to the broker as
+        # client_order_id, which is echoed back here. If the lookup above
+        # missed only because our row hasn't committed yet, this stops the
+        # listener from inserting a duplicate parent + second fanout — the
+        # API path owns this order's creation and fanout.
+        coid = getattr(alpaca_order, "client_order_id", None)
+        if coid:
+            try:
+                app_oid = uuid.UUID(str(coid))
+            except (ValueError, TypeError):
+                app_oid = None
+            if app_oid is not None and order_intent.is_app_originated(app_oid):
+                log.info(
+                    "listener[%s] skipping app-originated order "
+                    "(client_order_id=%s, broker_order=%s) — Trade Panel owns it",
+                    trader_user_id, coid, broker_order_id,
+                )
+                return
 
         order = _insert_order_from_alpaca(
             db, trader_user_id, broker_account_id, alpaca_order
