@@ -140,6 +140,19 @@ async def stop_all_listeners() -> None:
         stop_listener(tid)
 
 
+def has_running_listener(trader_user_id: uuid.UUID) -> bool:
+    """True if this backend has a live (not-done) task for the trader. Lets
+    listeners.reconcile() avoid restarting a healthy listener every tick."""
+    t = _tasks.get(trader_user_id)
+    return t is not None and not t.done()
+
+
+def running_trader_ids() -> set[uuid.UUID]:
+    """Trader ids with a live task here. Snapshots _tasks so a concurrent
+    start/stop on the loop can't mutate the dict mid-iteration."""
+    return {tid for tid, t in list(_tasks.items()) if not t.done()}
+
+
 # ── Poll task ───────────────────────────────────────────────────────────────
 
 
