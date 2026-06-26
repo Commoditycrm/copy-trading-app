@@ -41,6 +41,12 @@ interface Props {
    *  a positive percent points in. */
   side: OrderSide;
   canEdit: boolean;
+  /** Display-only override: when set (a copied mirror's stamped percent), the
+   *  cell shows THIS percent verbatim instead of re-deriving it from the
+   *  tick-rounded exit price. Keeps the subscriber's display at the trader's
+   *  intended "2%" rather than a rounding-noisy "1.86%". Ignored while editing
+   *  (mirrors are read-only, so the editor never opens for them anyway). */
+  pctOverride?: number | null;
   /** Called after a successful PATCH so the parent can refresh state. */
   onUpdated?: (updatedOrder: Order) => void;
 }
@@ -97,7 +103,7 @@ function fmtPrice(s: string | null): string {
   return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEdit, onUpdated }: Props) {
+export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEdit, pctOverride, onUpdated }: Props) {
   // Percent mode requires a usable entry-price anchor. Without it (e.g.
   // unfilled market orders) we silently fall back to absolute-price
   // display + edit so the row is still useful.
@@ -132,11 +138,17 @@ export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEd
   const colorVar = leg === "tp" ? "var(--good)" : "var(--bad)";
 
   if (!editing) {
-    const displayColor = value ? colorVar : "var(--faint)";
+    // A copied mirror shows its INTENDED percent verbatim (pctOverride),
+    // regardless of the tick-rounded price — so the subscriber sees the
+    // trader's "2%", not the rounding-derived "1.86%".
+    const hasOverride = pctOverride !== null && pctOverride !== undefined;
+    const displayColor = (value || hasOverride) ? colorVar : "var(--faint)";
     const interactive = canEdit && !!orderId;
-    const display = inPercentMode
-      ? (currentPct !== null ? fmtPct(currentPct) : "—")
-      : fmtPrice(value);
+    const display = hasOverride
+      ? fmtPct(pctOverride as number)
+      : inPercentMode
+        ? (currentPct !== null ? fmtPct(currentPct) : "—")
+        : fmtPrice(value);
     return (
       <span
         className="num inline-flex items-center gap-1 px-1 py-0.5 rounded transition-colors tabular-nums"

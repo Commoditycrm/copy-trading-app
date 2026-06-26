@@ -633,6 +633,12 @@ export default function TradesPage() {
                         const entryPrice = o.parent_order_id
                           ? (o.filled_avg_price ?? o.limit_price)
                           : (o.limit_price ?? o.filled_avg_price);
+                        // A copied mirror shows the trader's INTENDED percent
+                        // verbatim, not the percent re-derived from its
+                        // tick-rounded exit price.
+                        const isMirror = !!o.parent_order_id;
+                        const tpPct = isMirror && o.take_profit_pct != null ? Number(o.take_profit_pct) : null;
+                        const slPct = isMirror && o.stop_loss_pct != null ? Number(o.stop_loss_pct) : null;
                         const onUpdated = (updated: Order) =>
                           setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
                         return (
@@ -646,6 +652,7 @@ export default function TradesPage() {
                                   entryPrice={entryPrice}
                                   side={o.side}
                                   canEdit={editable}
+                                  pctOverride={tpPct}
                                   onUpdated={onUpdated}
                                 />
                               ) : <span style={{ color: "var(--faint)" }}>—</span>}
@@ -659,6 +666,7 @@ export default function TradesPage() {
                                   entryPrice={entryPrice}
                                   side={o.side}
                                   canEdit={editable}
+                                  pctOverride={slPct}
                                   onUpdated={onUpdated}
                                 />
                               ) : <span style={{ color: "var(--faint)" }}>—</span>}
