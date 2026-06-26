@@ -78,7 +78,7 @@ async def run_subscriber() -> None:
                     data = msg.get("data")
                     if data is None:
                         continue
-                    _dispatch(listeners, data)
+                    await _dispatch(listeners, data)
             finally:
                 try:
                     await pubsub.unsubscribe(_CHANNEL)
@@ -95,16 +95,30 @@ async def run_subscriber() -> None:
             backoff = min(30.0, backoff * 2)
 
 
-def _dispatch(listeners, raw) -> None:
+async def _dispatch(listeners, raw) -> None:
+    # CRITICAL: run the local start/stop OFF the event loop via to_thread.
+    # ``trade_listener.stop_listener`` calls alpaca ``stream.stop()``, which
+    # blocks on ``run_coroutine_threadsafe(close, loop).result()`` — it waits
+    # for THIS loop to run the stream's shutdown coroutine. Called inline on the
+    # loop, it deadlocks: the loop is stuck inside ``.result()`` so it can never
+    # run the coroutine it's waiting on, and the whole worker (every listener,
+    # the reconciler, the pnl poller) freezes. Offloading to a worker thread
+    # keeps the loop free to run that coroutine, so stop() completes.
+    # ``_start_listener_local`` is also safe off-loop: ``start_listener``
+    # marshals task creation back onto the loop via ``call_soon_threadsafe``.
     try:
         msg = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
         action = msg.get("action")
         if action == "start":
-            listeners._start_listener_local(  # noqa: SLF001 — same package
-                uuid.UUID(msg["trader"]), uuid.UUID(msg["account"])
+            await asyncio.to_thread(
+                listeners._start_listener_local,  # noqa: SLF001 — same package
+                uuid.UUID(msg["trader"]), uuid.UUID(msg["account"]),
             )
         elif action == "stop":
-            listeners._stop_listener_local(uuid.UUID(msg["trader"]))  # noqa: SLF001
+            await asyncio.to_thread(
+                listeners._stop_listener_local,  # noqa: SLF001
+                uuid.UUID(msg["trader"]),
+            )
         else:
             log.warning("listener_control: unknown action in %s", msg)
     except Exception:  # noqa: BLE001
