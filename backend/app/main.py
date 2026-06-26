@@ -27,6 +27,22 @@ from app.services.redis_client import close_async_redis
 
 log = logging.getLogger(__name__)
 
+# Strong references to fire-and-forget background tasks. asyncio.create_task
+# only keeps a WEAK reference, so a task whose return value isn't stored can be
+# garbage-collected mid-flight and silently cancelled (per the asyncio docs).
+# The listeners survive because trade_listener._tasks holds them; these don't
+# have a natural owner, so we park them here for the life of the process.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    """create_task + keep a strong ref until the task finishes, so the GC can't
+    reap a long-lived background loop out from under us."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 DISCLAIMER = (
     "Educational software. Not investment advice. Copy trading involves substantial risk "
     "of loss. The platform operator may need to register as an investment adviser under "
@@ -131,7 +147,7 @@ def create_app() -> FastAPI:
         # this channel. Worker-only — runs for the life of the process.
         try:
             from app.services import listener_control
-            asyncio.create_task(listener_control.run_subscriber())
+            _spawn_background(listener_control.run_subscriber())
         except Exception:  # noqa: BLE001
             log.exception("failed to start listener_control subscriber")
 
@@ -141,7 +157,7 @@ def create_app() -> FastAPI:
         # control message missed during a restart/Redis blip leaves a
         # connected trader with no listener (status pill stuck offline).
         try:
-            asyncio.create_task(listeners.run_reconciler())
+            _spawn_background(listeners.run_reconciler())
         except Exception:  # noqa: BLE001
             log.exception("failed to start listener reconciler")
 
