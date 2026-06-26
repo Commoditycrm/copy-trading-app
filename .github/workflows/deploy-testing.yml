@@ -49,7 +49,10 @@ jobs:
             git log -1 --oneline
 
             echo "── docker compose build ─────────────────────────────────"
-            docker compose build backend frontend
+            # Build worker too — it shares ./backend but is a separate image;
+            # omitting it leaves the worker on stale code after a deploy while
+            # the DB migrates forward (schema/code drift, e.g. missing columns).
+            docker compose build backend worker frontend
 
             echo "── alembic upgrade head ─────────────────────────────────"
             docker compose run --rm backend alembic upgrade head
