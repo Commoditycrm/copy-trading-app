@@ -228,18 +228,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       const byKey = new Map<string, {
         order_id: string;                          // entry-order id (for bracket modify)
         side: Order["side"];                       // entry-order side (drives TP/SL % direction)
+        parent_order_id: string | null;            // set → this is a copied mirror entry
         submitted_at: string | null;
         filled_at: string | null;
         filled_avg_price: string | null;
-        // limit_price is the SAME anchor the Trade Panel used when it
-        // converted "TP 10% / SL 5%" → absolute prices. Reversing the
-        // % display against filled_avg_price (which can differ due to
-        // slippage) would show 8.11% instead of 10%. Always prefer
-        // limit_price; filled_avg_price stays as a fallback for orders
-        // that had no limit (market entries that somehow carry a bracket).
+        // % anchor. For the TRADER'S OWN entry, prefer limit_price — the same
+        // number the Trade Panel used to convert "TP 10% / SL 5%" → absolute
+        // prices, so reversing it round-trips exactly. For a COPIED MIRROR
+        // (parent_order_id set) the exits are re-anchored on the subscriber's
+        // actual FILL, so the % must be reversed against filled_avg_price to
+        // match what fires — and to match the Order History display. See the
+        // entryPrice selection in the render below.
         limit_price: string | null;
         take_profit_price: string | null;
         stop_loss_price: string | null;
+        take_profit_pct: string | null;       // copied-bracket intent (mirrors)
+        stop_loss_pct: string | null;
       }>();
       for (const o of orders) {
         if (o.status !== "filled" && o.status !== "partially_filled") continue;
@@ -261,12 +265,15 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           byKey.set(k, {
             order_id: o.id,
             side: o.side,
+            parent_order_id: o.parent_order_id,
             submitted_at: o.submitted_at ?? o.created_at,
             filled_at: lastFillAt,
             filled_avg_price: o.filled_avg_price,
             limit_price: o.limit_price,
             take_profit_price: o.take_profit_price,
             stop_loss_price: o.stop_loss_price,
+            take_profit_pct: o.take_profit_pct ?? null,
+            stop_loss_pct: o.stop_loss_pct ?? null,
           });
         }
       }
@@ -571,11 +578,21 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           // connected after the trade) we can't target a
                           // parent → render the cells read-only.
                           const orderId = t?.order_id ?? null;
-                          // Prefer limit_price as the % anchor — it's the same
-                          // number the Trade Panel used to convert "TP 10%" into
-                          // an absolute price, so reversing it round-trips to
-                          // 10% exactly; filled_avg_price is the fallback.
-                          const entryPrice = t?.limit_price ?? t?.filled_avg_price ?? null;
+                          // % anchor — must match the Order History logic so the
+                          // two views agree. A copied mirror (parent_order_id set)
+                          // re-anchors its exits on the subscriber's actual fill,
+                          // so reverse the % off filled_avg_price; the trader's own
+                          // entry reverses off limit_price (what the Trade Panel
+                          // used to set the bracket).
+                          const entryPrice = t?.parent_order_id
+                            ? (t?.filled_avg_price ?? t?.limit_price ?? null)
+                            : (t?.limit_price ?? t?.filled_avg_price ?? null);
+                          // Copied mirror → show the trader's intended percent
+                          // verbatim, not the percent re-derived from the
+                          // tick-rounded exit price.
+                          const isMirror = !!t?.parent_order_id;
+                          const tpPct = isMirror && t?.take_profit_pct != null ? Number(t.take_profit_pct) : null;
+                          const slPct = isMirror && t?.stop_loss_pct != null ? Number(t.stop_loss_pct) : null;
                           const side = t?.side ?? (isLong ? "buy" : "sell");
                           const onUpdated = (updated: Order) => {
                             setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
@@ -593,6 +610,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                                   entryPrice={entryPrice}
                                   side={side}
                                   canEdit={!!orderId}
+                                  pctOverride={tpPct}
                                   onUpdated={onUpdated}
                                 />
                               </td>
@@ -604,6 +622,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                                   entryPrice={entryPrice}
                                   side={side}
                                   canEdit={!!orderId}
+                                  pctOverride={slPct}
                                   onUpdated={onUpdated}
                                 />
                               </td>
