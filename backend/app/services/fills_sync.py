@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +29,18 @@ from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
+
+# Grace window before fills_sync will SYNTHESIZE an order for a fill it can't
+# match to an existing row. A just-happened fill with no matching order is
+# almost always an order placed through our app whose row hasn't committed its
+# broker_order_id yet (the place endpoint commits only after the broker
+# round-trip). Synthesizing here would duplicate that order — and then fan the
+# duplicate out to subscribers. So we skip unmatched fills younger than this;
+# the next sync either matches by broker_order_id (app row now committed) or, if
+# the fill is genuinely external (placed in the broker's own UI), synthesizes it
+# once it ages past the window. The only cost is a short delay before truly
+# external fills appear.
+_SYNTH_ORDER_GRACE = timedelta(seconds=90)
 
 
 @dataclass
@@ -266,6 +278,15 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
                 order.broker_account_id = acct.id
 
         if order is None:
+            # Race guard: don't synthesize a duplicate for an in-flight
+            # app-placed order whose row hasn't committed yet. Skip this fill
+            # for now; a later sync matches it by broker_order_id (or
+            # synthesizes it once it's clearly external — older than the grace
+            # window). We deliberately DON'T add activity_id to `existing`, so
+            # the next sync re-processes it.
+            if (datetime.now(timezone.utc) - trade_at) < _SYNTH_ORDER_GRACE:
+                skipped += 1
+                continue
             order = Order(
                 user_id=acct.user_id,
                 broker_account_id=acct.id,
