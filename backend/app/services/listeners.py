@@ -52,8 +52,26 @@ async def stop_all_listeners() -> None:
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
-    """Route to the right backend based on the account's broker. Looks up
-    the BrokerAccount row to avoid making callers pass the broker name."""
+    """Ensure a listener is running for this (trader, account).
+
+    Listeners must live in EXACTLY ONE process. In the web/worker split the
+    web tier (run_background_workers=false) must NOT start a listener itself —
+    doing so duplicates the worker's listener and double-mirrors every trade.
+    So the web tier hands the request to the worker over Redis; the worker (and
+    any single-process deployment) starts it locally."""
+    from app.config import get_settings
+
+    if get_settings().run_background_workers:
+        _start_listener_local(trader_user_id, broker_account_id)
+    else:
+        from app.services import listener_control
+        listener_control.request_start(trader_user_id, broker_account_id)
+
+
+def _start_listener_local(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
+    """Actually spawn the listener in THIS process. Route to the right backend
+    based on the account's broker. Looks up the BrokerAccount row to avoid
+    making callers pass the broker name."""
     with SessionLocal() as db:
         acct = db.get(BrokerAccount, broker_account_id)
     if acct is None:
@@ -77,9 +95,22 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
 
 
 def stop_listener(trader_user_id: uuid.UUID) -> None:
-    """Stop whichever backend is currently servicing this trader. One-
-    broker-per-user means at most one will have a task — but we call
-    every backend so transitions (Alpaca → SnapTrade → IBKR or any
+    """Stop this trader's listener. Like start_listener, the web tier doesn't
+    own the listener task, so it routes the stop to the worker; the worker /
+    single-process deployment stops it locally."""
+    from app.config import get_settings
+
+    if get_settings().run_background_workers:
+        _stop_listener_local(trader_user_id)
+    else:
+        from app.services import listener_control
+        listener_control.request_stop(trader_user_id)
+
+
+def _stop_listener_local(trader_user_id: uuid.UUID) -> None:
+    """Stop whichever backend is currently servicing this trader, in THIS
+    process. One-broker-per-user means at most one will have a task — but we
+    call every backend so transitions (Alpaca → SnapTrade → IBKR or any
     other permutation) are always clean.
 
     All calls publish a final ``disconnected`` state via

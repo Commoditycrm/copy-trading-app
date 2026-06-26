@@ -476,6 +476,13 @@ def _place_trader_order(
         isinstance(adapter, AlpacaAdapter)
         and order.instrument_type != InstrumentType.OPTION
     )
+    # Tell the broker listener this order is ours BEFORE we place it. The
+    # broker echoes order.id back as client_order_id on the trade_updates
+    # stream; the listener checks this marker and won't create a duplicate
+    # parent + second fanout if its WS event beats our commit below.
+    from app.services import order_intent  # noqa: PLC0415
+    order_intent.mark_app_originated(order.id)
+
     _broker_t0 = time.perf_counter()
     try:
         result = adapter.place_order(
