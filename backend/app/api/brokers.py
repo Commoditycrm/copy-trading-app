@@ -690,7 +690,15 @@ def connect(
     # If the connecting user is a trader, spin up the listener so trades
     # placed directly at the broker propagate to subscribers. The
     # dispatcher routes to Alpaca-WebSocket or Webull-poll as needed.
-    if user.role == UserRole.TRADER:
+    #
+    # Only start it inline when THIS process runs background workers
+    # (single-process dev, or the dedicated worker). In the web/worker split
+    # the WEB container must NOT start a listener — it would run a duplicate
+    # poller in the wrong process (double broker calls + double-processed
+    # fills), and it can't start a task in the worker anyway. There the
+    # worker's periodic listeners.reconcile() picks the new broker up within
+    # one interval.
+    if user.role == UserRole.TRADER and get_settings().run_background_workers:
         try:
             listeners.start_listener(user.id, acct.id)
         except Exception:  # noqa: BLE001

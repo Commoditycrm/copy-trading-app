@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # per worker (which would double broker API calls + double-process fills).
     # Defaults true so a single-process deployment keeps working unchanged.
     run_background_workers: bool = True
+    # How often (seconds) the WORKER reconciles its running broker listeners
+    # against the DB. This is what makes a broker connected/disconnected at
+    # runtime in the WEB container get its listener started/stopped without a
+    # worker restart (the web/worker split can't start a task cross-process).
+    # Only used when run_background_workers=true.
+    listener_reconcile_interval_s: float = 15.0
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300
