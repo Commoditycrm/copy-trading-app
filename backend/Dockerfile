@@ -16,6 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Run as a non-root user so a compromised process can't modify the image,
+# install packages, or escalate. App files copied above are world-readable;
+# all runtime writes go to the noexec tmpfs /tmp (HOME=/tmp in compose). Pairs
+# with read_only + cap_drop + no-new-privileges in docker-compose.yml.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser
+USER appuser
+
 EXPOSE 8000
 
 # Self-migrate on startup so a fresh container picks up new alembic revisions
