@@ -10,9 +10,28 @@
 # worker spawning its own listeners/poller. `worker` (BACKGROUND) is the single
 # process that runs the broker listeners, P&L poller, retry scheduler and
 # crash-recovery sweep (RUN_BACKGROUND_WORKERS=true). Never scale `worker` >1.
+#
+# Container hardening (added after the Jun-2026 XMRig compromise, where a
+# malicious npm dependency dropped a miner into /tmp inside the frontend
+# container and executed it as root). Every app service now runs with:
+#   * read_only root filesystem        — nothing on disk can be modified
+#   * tmpfs scratch mounted noexec      — a dropped binary CANNOT be run, anywhere
+#   * cap_drop: ALL + no-new-privileges — no Linux caps, no privilege escalation
+#   * a non-root user (set in each Dockerfile)
+#   * CPU/memory limits                 — a runaway process can't take the box
+# Net effect: even if a poisoned dependency lands again, it has no writable+
+# executable location to run from, can't escalate, and can't starve the host.
+# YAML anchor so the four security knobs stay identical across services.
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
 
 services:
   backend:
+    <<: *hardening
     build: ./backend
     restart: unless-stopped
     env_file: ./backend/.env
@@ -21,14 +40,25 @@ services:
     # (bump once the instance has RAM headroom for more event loops).
     environment:
       RUN_BACKGROUND_WORKERS: "false"
+      # read_only fs: keep all transient writes on the noexec tmpfs.
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
     command:
       - sh
       - -c
       - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1} --proxy-headers --forwarded-allow-ips=*
+    # Writable scratch only — mounted noexec so nothing here can ever execute.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
     # Force IPv4 to outbound services (broker APIs); Lightsail has no IPv6 egress.
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
       - net.ipv6.conf.default.disable_ipv6=1
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)"]
       interval: 10s
@@ -39,6 +69,7 @@ services:
       - "127.0.0.1:8000:8000"
 
   worker:
+    <<: *hardening
     build: ./backend
     restart: unless-stopped
     env_file: ./backend/.env
@@ -49,24 +80,49 @@ services:
     # container, so this one waits for it to be healthy and does NOT run alembic.
     environment:
       RUN_BACKGROUND_WORKERS: "true"
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
     command:
       - sh
       - -c
       - exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
       - net.ipv6.conf.default.disable_ipv6=1
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
     depends_on:
       backend:
         condition: service_healthy
 
   frontend:
+    <<: *hardening
     build: ./frontend
     restart: unless-stopped
     environment:
       # Server-side proxy target inside the compose network (next.config.js
       # rewrites /api/* -> ${BACKEND_URL}/api/*).
       BACKEND_URL: http://backend:8000
+      # read_only fs: Next writes its runtime cache to .next/cache and uses
+      # HOME for npm/next scratch — both pointed at noexec tmpfs below. Disable
+      # telemetry so it doesn't try to write a telemetry file either.
+      HOME: /tmp
+      NEXT_TELEMETRY_DISABLED: "1"
+    # next start writes ONLY to these (image-opt / ISR / fetch cache + scratch),
+    # all mounted noexec so a dropped binary can't run from them.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=512m
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
     depends_on:
       - backend
     ports:
