@@ -6,6 +6,7 @@ import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
+import { ConfirmModal } from "@/components/ConfirmModal";
 import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -110,6 +111,9 @@ export default function SettingsPage() {
   const [posSlInput, setPosSlInput] = useState("");
   const [posSlBusy, setPosSlBusy] = useState(false);
   const [copyBracketBusy, setCopyBracketBusy] = useState(false);
+  // Reset-to-defaults confirm modal + in-flight flag.
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
   // Today's starting account balance from Alpaca (`last_equity`, =
   // equity at yesterday's close). Hydrated from sessionStorage so
   // navigating away and back keeps the last value visible while the
@@ -446,6 +450,31 @@ export default function SettingsPage() {
       setCopyBracketBusy(false);
     }
   }
+  async function resetSettings() {
+    setResetBusy(true);
+    try {
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/reset", { method: "POST" });
+      setSub(s);
+      // Re-sync every controlled input to the freshly-defaulted values —
+      // same mapping as the initial load so the fields don't keep showing
+      // the pre-reset text.
+      setMultInput(parseFloat(s.multiplier).toString());
+      setLimitInput(s.daily_loss_limit_pct ?? "");
+      setProfitInput(s.daily_profit_limit_pct ?? "");
+      setMaxContractInput(s.max_per_contract ?? "");
+      setMaxPctInput(s.max_account_pct_per_day ?? "");
+      setAutoLiqInput(s.auto_liquidation_limit ?? "");
+      setPosTpInput(s.position_tp_pct ?? "");
+      setPosSlInput(s.position_sl_pct ?? "");
+      setResetOpen(false);
+      notify.success("Settings reset to defaults");
+    } catch (e) {
+      notify.fromError(e, "Could not reset settings");
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
     try {
       const body = direction === "open"
@@ -901,6 +930,28 @@ export default function SettingsPage() {
               </Field>
             </div>
           </Card>
+
+          {/* ── Reset to defaults ──────────────────────────────────── */}
+          {/* Config-only reset: wipes the risk/limit knobs, retry policy and
+              symbol filters. Deliberately leaves who you follow and copy
+              on/off alone (handled server-side). */}
+          <Card
+            icon={<IconRefresh />}
+            title="Reset settings"
+            hint="Restore multiplier, all risk limits, retry policy and symbol filters to their defaults. Doesn't change who you follow or your copy on/off state."
+          >
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <span className="text-[11px]" style={{ color: "var(--muted)" }}>
+                This clears every limit and filter on this page.
+              </span>
+              <button
+                onClick={() => setResetOpen(true)}
+                className="btn-danger-soft px-4 py-2 text-xs font-medium"
+              >
+                Reset to defaults
+              </button>
+            </div>
+          </Card>
         </>
       )}
 
@@ -931,6 +982,24 @@ export default function SettingsPage() {
           </div>
         </Card>
       )}
+
+      <ConfirmModal
+        open={resetOpen}
+        title="Reset all settings?"
+        message={
+          <>
+            This restores your multiplier, every risk limit, the retry policy
+            and your symbol filters to their defaults. Who you follow and your
+            copy on/off state are left unchanged. This can&apos;t be undone.
+          </>
+        }
+        confirmLabel="Reset to defaults"
+        cancelLabel="Cancel"
+        variant="danger"
+        busy={resetBusy}
+        onConfirm={resetSettings}
+        onCancel={() => { if (!resetBusy) setResetOpen(false); }}
+      />
     </div>
   );
 }
