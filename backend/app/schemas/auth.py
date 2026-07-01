@@ -101,11 +101,21 @@ class RefreshIn(BaseModel):
 class ForgotPasswordIn(BaseModel):
     email: EmailStr
 
+    # Normalize like login/register — otherwise a mixed-case local-part won't
+    # match the lowercased stored email and the reset link silently never sends.
+    _norm_email = field_validator("email", mode="before")(_normalize_email)
+
 
 class ResetPasswordIn(BaseModel):
     token: str
-    # Same constraints as registration so a reset can't set a weaker password.
-    new_password: str = Field(min_length=8, max_length=128)
+    # Same policy as registration so a reset can't set a weaker password or one
+    # silently truncated past bcrypt's 72-byte limit.
+    new_password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_policy(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
 
 class VerifyEmailIn(BaseModel):
@@ -115,55 +125,7 @@ class VerifyEmailIn(BaseModel):
 class ResendVerificationIn(BaseModel):
     email: EmailStr
 
-
-class MessageOut(BaseModel):
-    detail: str
-
-
-class ForgotPasswordIn(BaseModel):
-    email: EmailStr
-
-
-class ResetPasswordIn(BaseModel):
-    token: str
-    # Same constraints as registration so a reset can't set a weaker password.
-    new_password: str = Field(min_length=8, max_length=128)
-
-
-class MessageOut(BaseModel):
-    detail: str
-
-
-class ForgotPasswordIn(BaseModel):
-    email: EmailStr
-
-
-class ResetPasswordIn(BaseModel):
-    token: str
-    # Same constraints as registration so a reset can't set a weaker password.
-    new_password: str = Field(min_length=8, max_length=128)
-
-
-class VerifyEmailIn(BaseModel):
-    token: str
-
-
-class ResendVerificationIn(BaseModel):
-    email: EmailStr
-
-
-class MessageOut(BaseModel):
-    detail: str
-
-
-class ForgotPasswordIn(BaseModel):
-    email: EmailStr
-
-
-class ResetPasswordIn(BaseModel):
-    token: str
-    # Same constraints as registration so a reset can't set a weaker password.
-    new_password: str = Field(min_length=8, max_length=128)
+    _norm_email = field_validator("email", mode="before")(_normalize_email)
 
 
 class MessageOut(BaseModel):
