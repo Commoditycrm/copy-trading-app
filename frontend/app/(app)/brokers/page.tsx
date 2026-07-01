@@ -306,6 +306,36 @@ export default function BrokersPage() {
   }
   useEffect(() => { load(); }, []);
 
+  // Mirror `accounts` into a ref so the poll interval below (mounted once)
+  // always sees the latest connected list without re-arming the timer.
+  const accountsRef = useRef<BrokerAccount[]>([]);
+  useEffect(() => { accountsRef.current = accounts; }, [accounts]);
+
+  // Real-time balances: silently re-fetch every connected broker's balance on
+  // a 30s cadence so the card stays live without the user hitting Refresh.
+  // Pauses while the tab is hidden (no point polling brokers for a page nobody
+  // is looking at) and does an immediate catch-up refresh on return.
+  useEffect(() => {
+    const POLL_MS = 30_000;
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      for (const a of accountsRef.current) void refreshBalance(a.id, { silent: true });
+    };
+    const start = () => { if (!timer) timer = setInterval(tick, POLL_MS); };
+    const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else { tick(); start(); }
+    };
+
+    start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => { stop(); document.removeEventListener("visibilitychange", onVisibility); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // SnapTrade portal completion handler. The portal redirects back to
   // /brokers?snaptrade_connected=1 — when we see that param we call
   // /finish to persist the new connection. Strip the param afterwards
@@ -443,16 +473,23 @@ export default function BrokersPage() {
     // NOTE: no setBusy(false) on success — the page is navigating away.
   }
 
-  async function refreshBalance(id: string) {
-    setRefreshing(p => ({ ...p, [id]: true }));
+  // `silent` is the 30s auto-poll path: it hits ?auto=1 (no audit row on the
+  // server), skips the success/error toast, and leaves the manual button's
+  // spinner alone so the UI doesn't flicker every half-minute. A failed
+  // auto-poll is intentionally quiet — the card already surfaces last_error
+  // and a stale "Updated …" timestamp.
+  async function refreshBalance(id: string, opts?: { silent?: boolean }) {
+    const silent = opts?.silent ?? false;
+    if (!silent) setRefreshing(p => ({ ...p, [id]: true }));
     try {
-      const updated = await api<BrokerAccount>(`/api/brokers/${id}/refresh-balance`, { method: "POST" });
+      const path = `/api/brokers/${id}/refresh-balance${silent ? "?auto=1" : ""}`;
+      const updated = await api<BrokerAccount>(path, { method: "POST" });
       setAccounts(cur => cur.map(a => (a.id === id ? updated : a)));
-      notify.success("Balance refreshed");
+      if (!silent) notify.success("Balance refreshed");
     } catch (e) {
-      notify.fromError(e, "Balance refresh failed");
+      if (!silent) notify.fromError(e, "Balance refresh failed");
     } finally {
-      setRefreshing(p => ({ ...p, [id]: false }));
+      if (!silent) setRefreshing(p => ({ ...p, [id]: false }));
     }
   }
 
