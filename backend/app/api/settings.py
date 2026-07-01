@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -81,6 +83,59 @@ def get_subscriber_settings(
     s = db.get(SubscriberSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
+    return _to_out(db, s)
+
+
+@router.post("/subscriber/reset", response_model=SubscriberSettingsOut)
+def reset_subscriber_settings(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Reset the subscriber's risk/config knobs to their model defaults.
+
+    Scope is CONFIG ONLY — deliberately does not touch the active copy
+    setup: ``following_trader_id`` and ``copy_enabled`` are left as-is, and
+    the internal pause stamps (``pnl_auto_paused_at`` / ``auto_liquidated_at``)
+    are untouched so an in-force auto-pause isn't silently cleared. Mirrors
+    the defaults declared on ``SubscriberSettings``; keep this in sync if a
+    new configurable column is added.
+    """
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+
+    s.multiplier = Decimal("1.000")
+    s.daily_loss_limit = None
+    s.daily_profit_limit = None
+    s.daily_loss_limit_pct = None
+    s.daily_profit_limit_pct = None
+    s.auto_liquidation_limit = None
+    s.max_per_contract = None
+    s.max_account_pct_per_day = None
+    s.position_tp_pct = None
+    s.position_sl_pct = None
+    s.copy_trader_bracket = False
+    s.retry_interval_open = RetryInterval.NEVER
+    s.retry_interval_close = RetryInterval.NEVER
+    s.retry_max_attempts = 1
+    s.symbol_exclusion_list = []
+    s.symbol_inclusion_list = []
+
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.settings_reset",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    # Bust the fanout cache so copy_engine picks up the wiped multiplier /
+    # filters on the next mirror instead of a stale snapshot.
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return _to_out(db, s)
 
 
