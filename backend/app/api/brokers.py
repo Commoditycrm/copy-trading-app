@@ -47,7 +47,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -723,17 +723,22 @@ def refresh_balance(
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
+    # Set by the Brokers page's 30s auto-poll. Auto-polls skip the audit row —
+    # otherwise every open tab writes a broker.balance_refreshed entry twice a
+    # minute and buries the deliberate, user-initiated refreshes.
+    auto: bool = Query(False),
 ) -> BrokerAccount:
     acct = db.get(BrokerAccount, account_id)
     if not acct or acct.user_id != user.id:
         raise HTTPException(404, "not_found")
     creds = decrypt_json(acct.encrypted_credentials)
     _refresh_balance_into(acct, creds)
-    audit.record(
-        db, actor_user_id=user.id, action="broker.balance_refreshed",
-        entity_type="broker_account", entity_id=acct.id,
-        ip_address=client_ip(request),
-    )
+    if not auto:
+        audit.record(
+            db, actor_user_id=user.id, action="broker.balance_refreshed",
+            entity_type="broker_account", entity_id=acct.id,
+            ip_address=client_ip(request),
+        )
     db.commit()
     db.refresh(acct)
     return acct
