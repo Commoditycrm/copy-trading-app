@@ -4,12 +4,13 @@ from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, require_trader
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
+from app.models.follow_request import FollowRequest
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User
 from app.schemas.settings import (
@@ -159,6 +160,16 @@ def _unfollow(
     # the subscriber re-follows by mistake later, fanout doesn't resume
     # silently — they have to opt in explicitly.
     s.copy_enabled = False
+    # Revoke the follow approval. A trader removing a subscriber withdraws
+    # permission — the subscriber must send a fresh request (and be approved
+    # again) to re-follow, not just click Follow. Deleting the row resets
+    # their Traders list to "Request to follow".
+    db.execute(
+        delete(FollowRequest).where(
+            FollowRequest.subscriber_id == subscriber_id,
+            FollowRequest.trader_id == trader.id,
+        )
+    )
     audit.record(
         db,
         actor_user_id=trader.id,
