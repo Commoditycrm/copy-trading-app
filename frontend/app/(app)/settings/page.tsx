@@ -175,6 +175,25 @@ export default function SettingsPage() {
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
 
+  // Keep the subscriber's follow state fresh even if a live SSE push is
+  // missed (e.g. the trader approved in another tab): refetch /mine + settings
+  // whenever this tab regains focus/visibility. Without this, the Traders list
+  // could sit on a stale "Pending" and offer a Cancel that the server rejects.
+  useEffect(() => {
+    if (user?.role !== "subscriber") return;
+    const refresh = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [user?.role]);
+
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
@@ -341,7 +360,14 @@ export default function SettingsPage() {
       await api(`/api/follow-requests/${req.id}`, { method: "DELETE" });
       setMyRequests(await api<FollowRequest[]>("/api/follow-requests/mine"));
     } catch (e) {
-      notify.fromError(e, "Could not cancel request");
+      // Likely the request is no longer pending (approved/declined elsewhere).
+      // Resync so the row shows the correct action (e.g. Follow) instead of a
+      // stale Cancel, and skip the scary toast if that's what happened.
+      const fresh = await api<FollowRequest[]>("/api/follow-requests/mine").catch(() => null);
+      if (fresh) setMyRequests(fresh);
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      const stillPending = fresh?.some(r => r.trader_id === traderId && r.status === "pending");
+      if (stillPending) notify.fromError(e, "Could not cancel request");
     } finally {
       setRowBusy(null);
     }
