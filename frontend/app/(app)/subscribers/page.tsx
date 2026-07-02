@@ -5,6 +5,7 @@ import { Search, Trash2, Users, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
+import { FollowRequestsPanel } from "@/components/FollowRequestsPanel";
 import { fmtSignedUsd } from "@/lib/format";
 import type { SubscriberSummary } from "@/lib/types";
 
@@ -148,6 +149,11 @@ export default function SubscribersPage() {
           )}
         </div>
       </div>
+
+      {/* Pending follow-request approvals — renders only when there are any.
+          Approving auto-follows the subscriber, so refresh the table to show
+          the new follower row immediately. */}
+      <FollowRequestsPanel className="mb-3" onDecision={load} />
 
       <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
         <div className="overflow-auto flex-1 min-h-0">

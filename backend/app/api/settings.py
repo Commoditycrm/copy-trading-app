@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user, require_subscriber, require_trader
 from app.database import get_db
+from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.settings import (
@@ -684,6 +685,18 @@ def follow_trader(
         trader = db.get(User, payload.trader_id)
         if not trader or trader.role != UserRole.TRADER:
             raise HTTPException(404, "trader_not_found")
+        # Approval gate: a subscriber may only follow a trader who has
+        # approved their follow request. Existing follows were grandfathered
+        # in as approved by the follow_requests migration.
+        approved = db.execute(
+            select(FollowRequest).where(
+                FollowRequest.subscriber_id == user.id,
+                FollowRequest.trader_id == payload.trader_id,
+                FollowRequest.status == FollowRequestStatus.APPROVED,
+            )
+        ).scalar_one_or_none()
+        if approved is None:
+            raise HTTPException(403, "follow_not_approved")
     old_trader_id = s.following_trader_id
     s.following_trader_id = payload.trader_id
     audit.record(
