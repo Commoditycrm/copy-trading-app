@@ -23,6 +23,19 @@ export function FollowRequestsPanel(
   }, []);
   useEffect(() => { load(); }, [load]);
 
+  // Refetch when the tab regains focus/visibility — a live SSE push can be
+  // missed if the trader was on another tab when the request arrived, and this
+  // guarantees new/withdrawn requests show up the moment they look at it.
+  useEffect(() => {
+    const refresh = () => { if (!(typeof document !== "undefined" && document.hidden)) load(); };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [load]);
+
   // Live-refresh when a follow.requested (new) / follow.* notification lands.
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
