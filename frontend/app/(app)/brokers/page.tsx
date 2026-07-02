@@ -3,13 +3,13 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
-import { Check, Lock, RefreshCw } from "lucide-react";
+import { Check, Lock, RefreshCw, RotateCcw } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
-import type { BrokerAccount, BrokerName } from "@/lib/types";
+import type { BrokerAccount, BrokerHistory, BrokerName } from "@/lib/types";
 
 /** Per-broker presentation metadata — drives the picker tiles, the
  *  connected-account avatar, and the latency badge. Keeping it in one
@@ -244,6 +244,12 @@ function fmtRelative(iso: string | null): string {
 
 export default function BrokersPage() {
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
+  // "Recent connections" — disconnected brokers kept for keyless reconnect.
+  const [history, setHistory] = useState<BrokerHistory[]>([]);
+  const [reconnectingId, setReconnectingId] = useState<string | null>(null);
+  // Id pending "Remove permanently" confirmation (or null when closed).
+  const [forgetId, setForgetId] = useState<string | null>(null);
+  const [forgetBusy, setForgetBusy] = useState(false);
 
   // Which broker the user has chosen to connect. Defaults to alpaca to
   // preserve the previous behaviour for existing users.
@@ -298,8 +304,14 @@ export default function BrokersPage() {
   async function load() {
     // Clear `loading` in a finally so a failed fetch still removes the
     // skeleton instead of stranding the user on a forever-loading page.
+    // History is best-effort — a failure there shouldn't blank the page.
     try {
-      setAccounts(await api<BrokerAccount[]>("/api/brokers"));
+      const [accts, hist] = await Promise.all([
+        api<BrokerAccount[]>("/api/brokers"),
+        api<BrokerHistory[]>("/api/brokers/history").catch(() => [] as BrokerHistory[]),
+      ]);
+      setAccounts(accts);
+      setHistory(hist);
     } finally {
       setLoading(false);
     }
@@ -473,6 +485,38 @@ export default function BrokersPage() {
     // NOTE: no setBusy(false) on success — the page is navigating away.
   }
 
+  // Reconnect a disconnected broker from its stored keys — no re-entry.
+  // The server re-validates the creds; a revoked key surfaces as an error.
+  async function reconnect(id: string) {
+    setReconnectingId(id);
+    try {
+      await api<BrokerAccount>(`/api/brokers/${id}/reconnect`, { method: "POST" });
+      notify.success("Broker reconnected");
+      await load();
+    } catch (e) {
+      notify.fromError(e, "Reconnect failed");
+    } finally {
+      setReconnectingId(null);
+    }
+  }
+
+  // "Remove permanently" a history entry — hard-deletes the row so its
+  // stored keys are wiped. Confirmed via the modal below.
+  async function confirmForget() {
+    if (!forgetId) return;
+    setForgetBusy(true);
+    try {
+      await api(`/api/brokers/${forgetId}`, { method: "DELETE" });
+      notify.success("Connection removed");
+      setForgetId(null);
+      await load();
+    } catch (e) {
+      notify.fromError(e, "Remove failed");
+    } finally {
+      setForgetBusy(false);
+    }
+  }
+
   // `silent` is the 30s auto-poll path: it hits ?auto=1 (no audit row on the
   // server), skips the success/error toast, and leaves the manual button's
   // spinner alone so the UI doesn't flicker every half-minute. A failed
@@ -638,6 +682,86 @@ export default function BrokersPage() {
           Want a different broker? Disconnect the one above first — only one
           broker can be active per account.
         </p>
+      )}
+
+      {/* ── Recent connections (reconnect history) ──────────────────────
+          Disconnected brokers we kept so the user can reconnect without
+          re-pasting API keys. Alpaca / IBKR reconnect from stored creds;
+          SnapTrade shows "via portal" since its authorization is revoked
+          on disconnect. Only the 5 most recent are retained server-side. */}
+      {history.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+          className="card p-5"
+        >
+          <div className="flex items-center gap-2">
+            <h2 className="font-semibold text-[15px]">Recent connections</h2>
+            <span className="chip">{history.length}</span>
+          </div>
+          <p className="text-xs mt-1 mb-4" style={{ color: "var(--muted)" }}>
+            Reconnect a broker you disconnected — no API keys needed. We keep
+            your 5 most recent; keys stay encrypted until you remove them.
+          </p>
+          <div className="space-y-2.5">
+            {history.map(h => {
+              const meta = BROKER_META[h.broker];
+              const busy = reconnectingId === h.id;
+              return (
+                <div
+                  key={h.id}
+                  className="flex items-center gap-3 rounded-token p-3"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+                >
+                  <BrokerAvatar broker={h.broker} size={38} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-medium text-sm truncate">{h.label}</span>
+                      {meta && h.label.trim().toLowerCase() !== meta.name.toLowerCase() && (
+                        <span className="chip">{meta.name}</span>
+                      )}
+                      {h.is_paper && <span className="chip">paper</span>}
+                    </div>
+                    <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+                      {h.broker_account_number && (
+                        <span className="num">{h.broker_account_number} · </span>
+                      )}
+                      Disconnected {fmtRelative(h.disconnected_at)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {h.reconnectable ? (
+                      <button
+                        onClick={() => reconnect(h.id)}
+                        disabled={busy}
+                        className="btn-primary px-3 py-1.5 text-xs font-medium inline-flex items-center gap-1.5"
+                      >
+                        {busy ? <Spinner /> : <RotateCcw size={13} />}
+                        <span>Reconnect</span>
+                      </button>
+                    ) : (
+                      <span
+                        className="text-[11px] px-2"
+                        style={{ color: "var(--muted)" }}
+                        title="SnapTrade must be reconnected through its hosted portal."
+                      >
+                        Reconnect via portal
+                      </span>
+                    )}
+                    <button
+                      onClick={() => setForgetId(h.id)}
+                      className="btn-ghost px-2.5 py-1.5 text-xs shrink-0"
+                      title="Remove permanently — wipes the stored keys"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
       )}
 
       {hasConnected ? null : (
@@ -906,11 +1030,16 @@ export default function BrokersPage() {
         message={(() => {
           const acct = accounts.find(a => a.id === disconnectId);
           const name = acct ? (BROKER_META[acct.broker]?.name ?? acct.broker) : "this broker";
+          // Alpaca / IBKR keep their keys and drop into Recent connections
+          // for keyless reconnect; SnapTrade's authorization is revoked.
+          const keepsKeys = acct ? (acct.broker === "alpaca" || acct.broker === "ibkr") : false;
           return (
             <>
               This disconnects <strong>{acct?.label ?? name}</strong> and stops
-              mirroring its trades. Your order history is kept — you can reconnect
-              anytime.
+              mirroring its trades. Your order history is kept.{" "}
+              {keepsKeys
+                ? "It moves to Recent connections so you can reconnect later without re-entering API keys."
+                : "You'll need to reconnect through the broker's portal."}
             </>
           );
         })()}
@@ -920,6 +1049,29 @@ export default function BrokersPage() {
         busy={disconnectBusy}
         onConfirm={confirmDisconnect}
         onCancel={() => { if (!disconnectBusy) setDisconnectId(null); }}
+      />
+
+      {/* Remove-permanently confirmation for a Recent-connections entry. */}
+      <ConfirmModal
+        open={forgetId !== null}
+        title="Remove connection?"
+        message={(() => {
+          const h = history.find(x => x.id === forgetId);
+          const name = h ? (BROKER_META[h.broker]?.name ?? h.broker) : "this connection";
+          return (
+            <>
+              This permanently removes <strong>{h?.label ?? name}</strong> from
+              Recent connections and <strong>wipes its stored API keys</strong>.
+              You&apos;ll need the keys again to reconnect. This can&apos;t be undone.
+            </>
+          );
+        })()}
+        confirmLabel="Remove permanently"
+        cancelLabel="Cancel"
+        variant="danger"
+        busy={forgetBusy}
+        onConfirm={confirmForget}
+        onCancel={() => { if (!forgetBusy) setForgetId(null); }}
       />
     </div>
   );

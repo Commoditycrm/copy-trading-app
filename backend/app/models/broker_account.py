@@ -72,6 +72,17 @@ class BrokerAccount(Base, TimestampMixin):
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Soft-disconnect marker for the reconnect-history feature. NULL = this
+    # is the user's ACTIVE broker; non-NULL = it was disconnected at this
+    # time and now lives in "Recent connections" as a reconnectable entry
+    # (its encrypted_credentials are retained so reconnect needs no re-entry).
+    # Only direct-credential brokers (Alpaca / IBKR) go to history — SnapTrade
+    # is still hard-deleted on disconnect because its upstream authorization
+    # is revoked and can't be reused. Retention is capped per user in the API.
+    disconnected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     # Underlying broker when this account is routed through an aggregator.
     # For ``broker=snaptrade``, this is the real broker the subscriber
     # connected (e.g. "Webull", "Robinhood", "IBKR") — needed by the trader's

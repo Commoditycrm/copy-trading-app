@@ -66,6 +66,7 @@ from app.models.user import User, UserRole
 from app.schemas.broker import (
     BrokerAccountOut,
     BrokerAccountSettingsIn,
+    BrokerHistoryOut,
     ConnectBrokerIn,
     FinishSnaptradeIn,
     StartSnaptradeIn,
@@ -78,6 +79,38 @@ from app.services.redis_client import get_sync_redis
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/brokers", tags=["brokers"])
+
+# Reconnect-history: how many disconnected connections we retain per user.
+# Older ones are purged (their stored keys wiped) so the credential
+# footprint stays bounded.
+_HISTORY_KEEP = 5
+
+# Only direct-credential brokers can be reconnected from stored keys.
+# SnapTrade's authorization is revoked on disconnect (dead upstream), so it
+# never enters history — it's hard-deleted like before. WEBULL/FAKE aren't
+# user-connectable via the picker; treat them as non-reconnectable too.
+_RECONNECTABLE_BROKERS = {BrokerName.ALPACA, BrokerName.IBKR}
+
+
+def _is_reconnectable(broker: BrokerName) -> bool:
+    return broker in _RECONNECTABLE_BROKERS
+
+
+def _enforce_history_cap(db: Session, user_id: uuid.UUID) -> None:
+    """Keep only the ``_HISTORY_KEEP`` most-recently-disconnected history
+    rows for a user; hard-delete (purge keys) the rest. Called after any
+    action that adds a row to history."""
+    stale = list(db.execute(
+        select(BrokerAccount)
+        .where(
+            BrokerAccount.user_id == user_id,
+            BrokerAccount.disconnected_at.is_not(None),
+        )
+        .order_by(BrokerAccount.disconnected_at.desc())
+        .offset(_HISTORY_KEEP)
+    ).scalars())
+    for acct in stale:
+        db.delete(acct)
 
 
 def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, Any]:
@@ -246,32 +279,45 @@ def _register_or_reset_snaptrade_user(user_id: uuid.UUID) -> str:
 
 
 def _evict_existing_brokers(
-    db: Session, user: User, request: Request
+    db: Session, user: User, request: Request, *, enforce_cap: bool = True
 ) -> None:
-    """One-broker-per-user: delete any existing broker_account rows for
-    this user and stop their listeners. Called before inserting a new
-    one. Audits each eviction so the trail shows why the old connection
-    went away.
+    """One-broker-per-user: retire the user's currently-ACTIVE broker before
+    a new one is connected (or reconnected). Stops its listener and audits
+    the eviction so the trail shows why the old connection went away.
 
-    Existing Order rows survive — broker_account_id is SET NULL on
-    delete (see Order model). The trader's history doesn't disappear
-    just because they switched brokers."""
-    existing = list(db.execute(
-        select(BrokerAccount).where(BrokerAccount.user_id == user.id)
+    Direct-credential brokers (Alpaca / IBKR) are SOFT-disconnected — the row
+    and its encrypted creds are kept and moved to history so the user can
+    reconnect later without re-entering keys. Everything else (SnapTrade) is
+    hard-deleted as before. Existing Order rows survive either way —
+    broker_account_id is SET NULL on hard delete (see Order model).
+
+    Only touches ACTIVE rows (disconnected_at IS NULL) — pre-existing history
+    entries are left alone."""
+    active = list(db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.disconnected_at.is_(None),
+        )
     ).scalars())
-    for acct in existing:
+    for acct in active:
         audit.record(
             db, actor_user_id=user.id, action="broker.replaced",
             entity_type="broker_account", entity_id=acct.id,
             metadata={"broker": acct.broker.value, "label": acct.label},
             ip_address=client_ip(request),
         )
-        db.delete(acct)
-    if existing:
+        if _is_reconnectable(acct.broker):
+            acct.disconnected_at = datetime.now(timezone.utc)
+            acct.connection_status = "disconnected"
+        else:
+            db.delete(acct)
+    if active:
         db.flush()
+        if enforce_cap:
+            _enforce_history_cap(db, user.id)
         # Stop whichever listener was servicing the trader. Safe to call
-        # unconditionally — listeners.stop_listener tries both Alpaca
-        # and Webull backends, no-ops when nothing is running.
+        # unconditionally — listeners.stop_listener tries all backends and
+        # no-ops when nothing is running.
         if user.role == UserRole.TRADER:
             try:
                 listeners.stop_listener(user.id)
@@ -711,10 +757,113 @@ def connect(
 def list_my_brokers(
     db: Session = Depends(get_db), user: User = Depends(current_user)
 ) -> list[BrokerAccount]:
+    # ACTIVE brokers only — disconnected ones live in /history now.
     return list(db.execute(
-        select(BrokerAccount).where(BrokerAccount.user_id == user.id)
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.disconnected_at.is_(None),
+        )
         .order_by(BrokerAccount.created_at.desc())
     ).scalars())
+
+
+@router.get("/history", response_model=list[BrokerHistoryOut])
+def list_broker_history(
+    db: Session = Depends(get_db), user: User = Depends(current_user)
+) -> list[BrokerHistoryOut]:
+    """The user's "Recent connections" — brokers they disconnected but kept
+    for keyless reconnect. Newest first, capped at ``_HISTORY_KEEP``. Returns
+    metadata only; stored credentials never leave the server."""
+    rows = list(db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.disconnected_at.is_not(None),
+        )
+        .order_by(BrokerAccount.disconnected_at.desc())
+        .limit(_HISTORY_KEEP)
+    ).scalars())
+    return [
+        BrokerHistoryOut(
+            id=r.id,
+            broker=r.broker,
+            label=r.label,
+            is_paper=r.is_paper,
+            broker_account_number=r.broker_account_number,
+            brokerage_name=r.brokerage_name,
+            reconnectable=_is_reconnectable(r.broker),
+            disconnected_at=r.disconnected_at,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{account_id}/reconnect", response_model=BrokerAccountOut)
+def reconnect_broker(
+    account_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> BrokerAccount:
+    """Reactivate a disconnected broker from its stored credentials — no key
+    re-entry. Re-validates the creds against the broker first; a revoked /
+    expired key fails here so we never flip a dead connection back to active.
+    Retires the user's current active broker to history (one-broker rule)."""
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if acct.disconnected_at is None:
+        raise HTTPException(409, "already_active")
+    if not _is_reconnectable(acct.broker):
+        # SnapTrade et al. — the stored authorization is dead; the user must
+        # go back through the hosted portal.
+        raise HTTPException(422, "reconnect_via_portal")
+
+    creds = decrypt_json(acct.encrypted_credentials)
+    try:
+        info = adapter_for(acct, creds).verify_connection()
+    except Exception as exc:  # noqa: BLE001
+        acct.last_error = f"reconnect failed: {str(exc)[:400]}"
+        audit.record(
+            db, actor_user_id=user.id, action="broker.reconnect_failed",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata={"broker": acct.broker.value, "error": str(exc)[:480]},
+            ip_address=client_ip(request),
+        )
+        db.commit()
+        raise HTTPException(400, f"broker_error: {exc}")
+
+    # Retire whatever's currently active before promoting this one. Defer the
+    # history-cap until AFTER we reactivate `acct` below — otherwise the cap
+    # could purge `acct` itself (if it's the oldest history row) mid-reconnect.
+    _evict_existing_brokers(db, user, request, enforce_cap=False)
+
+    acct.disconnected_at = None
+    acct.connection_status = "connected"
+    acct.last_error = None
+    acct.broker_account_number = info.broker_account_id
+    acct.supports_fractional = info.supports_fractional
+    _refresh_balance_into(acct, creds)
+    # Now that `acct` is active (out of the history set), trim history to cap.
+    db.flush()
+    _enforce_history_cap(db, user.id)
+    audit.record(
+        db, actor_user_id=user.id, action="broker.reconnected",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"broker": acct.broker.value, "label": acct.label},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
+
+    if user.role == UserRole.TRADER and get_settings().run_background_workers:
+        try:
+            listeners.start_listener(user.id, acct.id)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start listener after reconnect")
+
+    return acct
 
 
 @router.post("/{account_id}/refresh-balance", response_model=BrokerAccountOut)
@@ -797,11 +946,50 @@ def delete_broker(
     if not acct or acct.user_id != user.id:
         raise HTTPException(404, "not_found")
 
-    # For SnapTrade, also remove the authorization on SnapTrade's side
-    # so we're not leaving an orphan upstream that keeps polling the
-    # user's broker. Best-effort — a failure here doesn't block our
-    # local delete because the local DB row is the source of truth for
-    # whether we still consider this user connected.
+    # Already in history → this is "Remove permanently": hard-delete the row
+    # so its stored keys are wiped. The listener is long stopped; nothing to
+    # revoke (SnapTrade never reaches history).
+    if acct.disconnected_at is not None:
+        audit.record(
+            db, actor_user_id=user.id, action="broker.history_purged",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata={"broker": acct.broker.value, "label": acct.label},
+            ip_address=client_ip(request),
+        )
+        db.delete(acct)
+        db.commit()
+        return
+
+    was_trader = user.role == UserRole.TRADER
+
+    # Active + reconnectable (Alpaca / IBKR) → SOFT-disconnect: keep the row
+    # and its encrypted creds as a reconnectable history entry instead of
+    # wiping them. This is what lets the user reconnect later without
+    # re-entering API keys.
+    if _is_reconnectable(acct.broker):
+        acct.disconnected_at = datetime.now(timezone.utc)
+        acct.connection_status = "disconnected"
+        audit.record(
+            db, actor_user_id=user.id, action="broker.disconnected",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata={"broker": acct.broker.value, "label": acct.label},
+            ip_address=client_ip(request),
+        )
+        db.flush()
+        _enforce_history_cap(db, user.id)
+        db.commit()
+        cache.invalidate_broker_accounts(user.id)
+        if was_trader:
+            try:
+                listeners.stop_listener(user.id)
+            except Exception:  # noqa: BLE001
+                log.exception("stop_listener after broker disconnect failed")
+        return
+
+    # SnapTrade (and any other non-reconnectable broker) → hard-delete, and
+    # revoke the authorization upstream so we don't leave an orphan that
+    # keeps polling the user's broker. Best-effort — a failure here doesn't
+    # block our local delete because the local DB row is the source of truth.
     if acct.broker == BrokerName.SNAPTRADE:
         try:
             creds = decrypt_json(acct.encrypted_credentials)
@@ -823,14 +1011,12 @@ def delete_broker(
         metadata={"broker": acct.broker.value, "label": acct.label},
         ip_address=client_ip(request),
     )
-    was_trader = user.role == UserRole.TRADER
     db.delete(acct)
     db.commit()
     cache.invalidate_broker_accounts(user.id)
 
-    # Stop whichever listener was running for the trader (Alpaca,
-    # Webull, or SnapTrade). Dispatcher tries all — safe even if none
-    # was active.
+    # Stop whichever listener was running for the trader. Dispatcher tries
+    # all backends — safe even if none was active.
     if was_trader:
         try:
             listeners.stop_listener(user.id)

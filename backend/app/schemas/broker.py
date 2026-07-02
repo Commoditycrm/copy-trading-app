@@ -97,6 +97,28 @@ class BrokerAccountOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BrokerHistoryOut(BaseModel):
+    """One entry in a user's "Recent connections" list — a broker that was
+    disconnected but kept for keyless reconnect.
+
+    Metadata ONLY: deliberately carries no credentials and no live balance,
+    so the browser never receives stored secrets. ``reconnectable`` is true
+    for direct-credential brokers whose stored keys can be re-validated
+    (Alpaca / IBKR); it's informational for the UI's button state."""
+
+    id: uuid.UUID
+    broker: BrokerName
+    label: str
+    is_paper: bool
+    broker_account_number: str | None
+    brokerage_name: str | None = None
+    reconnectable: bool
+    disconnected_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class BrokerAccountSettingsIn(BaseModel):
     """Partial-update payload for the three listener-gating flags. Any
     field left unset is unchanged on the server."""

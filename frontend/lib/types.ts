@@ -46,6 +46,21 @@ export interface BrokerAccount {
   bring_filled_orders: boolean;
 }
 
+/** A disconnected broker kept for keyless reconnect ("Recent connections").
+ *  Metadata only — the server never ships stored credentials to the browser.
+ *  `reconnectable` is false for SnapTrade (must re-do the portal). */
+export interface BrokerHistory {
+  id: string;
+  broker: BrokerName;
+  label: string;
+  is_paper: boolean;
+  broker_account_number: string | null;
+  brokerage_name?: string | null;
+  reconnectable: boolean;
+  disconnected_at: string | null;
+  created_at: string;
+}
+
 
 export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
