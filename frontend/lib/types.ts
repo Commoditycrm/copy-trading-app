@@ -16,6 +16,24 @@ export interface User {
   email_verified: boolean;
 }
 
+export type FollowRequestStatus = "pending" | "approved" | "rejected";
+
+/** A subscriber's request to follow a trader. Approval grants permission to
+ *  follow; the subscriber then sets following_trader_id via /settings/follow. */
+export interface FollowRequest {
+  id: string;
+  subscriber_id: string;
+  trader_id: string;
+  status: FollowRequestStatus;
+  decided_at: string | null;
+  created_at: string;
+  // Display fields — populated depending on the view (see backend _to_out).
+  subscriber_name?: string | null;
+  subscriber_email?: string | null;
+  trader_name?: string | null;
+  trader_business_name?: string | null;
+}
+
 export type BrokerName = "alpaca" | "webull" | "snaptrade" | "ibkr";
 
 export interface BrokerAccount {

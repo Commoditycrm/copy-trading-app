@@ -11,6 +11,7 @@ from app.api import (
     auth,
     brokers,
     events,
+    follow_requests,
     listener as listener_api,
     notifications as notifications_api,
     options,
@@ -98,6 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(trades.router)
     app.include_router(settings.router)
     app.include_router(subscribers.router)
+    app.include_router(follow_requests.router)
     app.include_router(events.router)
     app.include_router(options.router)
     app.include_router(positions.router)
