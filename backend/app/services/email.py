@@ -182,6 +182,99 @@ def send_password_reset_email(to: str, reset_link: str, display_name: str | None
     )
 
 
+def _shell(app: str, heading: str, body_html: str) -> str:
+    """Shared branded card wrapper for the transactional emails below, so a
+    new notification email is body copy + a link, not another 40-line table."""
+    return f"""\
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 12px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <tr><td align="center">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="width:480px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(15,23,42,0.08)">
+      <tr><td style="background:#0f172a;padding:22px 32px">
+        <span style="color:#ffffff;font-size:20px;font-weight:800;letter-spacing:0.5px">{app}</span>
+        <span style="color:#60a5fa;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-left:8px">Copy trading</span>
+      </td></tr>
+      <tr><td style="padding:32px 32px 24px">
+        <h1 style="margin:0 0 16px;font-size:20px;font-weight:700;color:#0f172a">{heading}</h1>
+        {body_html}
+      </td></tr>
+      <tr><td style="background:#f8fafc;padding:18px 32px;border-top:1px solid #e2e8f0">
+        <p style="margin:0;font-size:12px;color:#94a3b8">{app} · Automated copy trading</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>"""
+
+
+def send_follow_request_email(
+    to: str, trader_name: str | None, subscriber_name: str
+) -> bool:
+    """Notify a trader that a subscriber has requested to follow them. Safe to
+    call from a BackgroundTask."""
+    s = get_settings()
+    app = s.email_from_name
+    name = (trader_name or "").strip() or "there"
+    link = f"{s.frontend_base_url}/settings"
+    subject = f"{subscriber_name} requested to follow you on {app}"
+    text = (
+        f"Hi {name},\n\n"
+        f"{subscriber_name} has requested to copy your trades on {app}.\n\n"
+        f"Review and approve or decline the request here:\n{link}\n\n"
+        f"— The {app} team\n"
+    )
+    body = f"""\
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">Hi {name},</p>
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">
+          <strong>{subscriber_name}</strong> has requested to copy your trades on
+          <strong>{app}</strong>. They won't mirror anything until you approve.</p>
+        <p style="margin:24px 0">
+          <a href="{link}" style="background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;font-size:15px;display:inline-block">
+            Review request
+          </a>
+        </p>"""
+    return send_email(to, subject, _shell(app, "New follow request", body), text)
+
+
+def send_follow_decision_email(
+    to: str, subscriber_name: str | None, trader_label: str, approved: bool
+) -> bool:
+    """Notify a subscriber that a trader approved or declined their follow
+    request. Safe to call from a BackgroundTask."""
+    s = get_settings()
+    app = s.email_from_name
+    name = (subscriber_name or "").strip() or "there"
+    link = f"{s.frontend_base_url}/settings"
+    if approved:
+        subject = f"{trader_label} approved your follow request"
+        lead = (
+            f"<strong>{trader_label}</strong> approved your request — you're now "
+            "following them. Turn on copy trading in your settings to start "
+            "mirroring their trades.")
+        text_lead = (
+            f"{trader_label} approved your request — you're now following them. "
+            "Turn on copy trading in your settings to start mirroring their trades.")
+        cta = "Go to settings"
+    else:
+        subject = f"Update on your follow request to {trader_label}"
+        lead = (
+            f"<strong>{trader_label}</strong> declined your follow request. You "
+            "can request a different trader anytime from your settings.")
+        text_lead = (
+            f"{trader_label} declined your follow request. You can request a "
+            "different trader anytime from your settings.")
+        cta = "Browse traders"
+    text = f"Hi {name},\n\n{text_lead}\n\n{link}\n\n— The {app} team\n"
+    body = f"""\
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">Hi {name},</p>
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">{lead}</p>
+        <p style="margin:24px 0">
+          <a href="{link}" style="background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;font-size:15px;display:inline-block">
+            {cta}
+          </a>
+        </p>"""
+    heading = "Follow request approved" if approved else "Follow request update"
+    return send_email(to, subject, _shell(app, heading, body), text)
+
+
 def send_verification_email(to: str, verify_link: str, display_name: str | None) -> bool:
     """Compose + send the email-verification email. Safe to call from a
     BackgroundTask. Returns the underlying send result."""

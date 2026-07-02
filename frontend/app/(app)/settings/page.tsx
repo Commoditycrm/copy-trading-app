@@ -7,7 +7,7 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
-import type { RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
+import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
   { value: "never", label: "Never (REJECT)" },
@@ -81,7 +81,16 @@ export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
   const [trd, setTrd] = useState<TraderSettings | null>(null);
-  const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string }[]>([]);
+  const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string; business_name?: string | null }[]>([]);
+  // Follow-request workflow. Subscriber: their own requests (chips + which
+  // traders they may follow). Trader: incoming pending requests to action.
+  const [myRequests, setMyRequests] = useState<FollowRequest[]>([]);
+  const [incoming, setIncoming] = useState<FollowRequest[]>([]);
+  // Which trader row has an action in flight (request/follow/cancel/unfollow),
+  // so only that row's button shows a busy state. "__unfollow__" = the active
+  // follow is being cleared.
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const [decidingId, setDecidingId] = useState<string | null>(null);
   const [multInput, setMultInput] = useState("");
   const [multBusy, setMultBusy] = useState(false);
   const [limitInput, setLimitInput] = useState("");
@@ -153,9 +162,15 @@ export default function SettingsPage() {
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setPosTpInput(s.position_tp_pct ?? "");
         setPosSlInput(s.position_sl_pct ?? "");
-        setTraders(await api("/api/settings/traders"));
+        const [trs, reqs] = await Promise.all([
+          api<typeof traders>("/api/settings/traders"),
+          api<FollowRequest[]>("/api/follow-requests/mine").catch(() => [] as FollowRequest[]),
+        ]);
+        setTraders(trs);
+        setMyRequests(reqs);
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
+        setIncoming(await api<FollowRequest[]>("/api/follow-requests/incoming").catch(() => [] as FollowRequest[]));
       }
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
@@ -163,6 +178,17 @@ export default function SettingsPage() {
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
+    // Live-refresh the follow-request panels when a follow.* notification
+    // lands (trader gets follow.requested; subscriber gets approved/rejected).
+    if (e?.type === "notification.created" && typeof e.notification?.type === "string"
+        && e.notification.type.startsWith("follow.")) {
+      api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => {});
+      api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
+      // Approval auto-follows server-side — refetch settings so the "Following"
+      // card reflects the new trader without a page refresh.
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      return;
+    }
     if (e?.type === "copy.auto_paused") {
       // The same event fires for loss / profit / pct triggers — branch
       // on `reason` so the toast doesn't say "today's loss ... ($null)"
@@ -275,10 +301,64 @@ export default function SettingsPage() {
     }
   });
 
+  // Subscriber: follow an approved trader, or unfollow (traderId = null).
   async function follow(traderId: string | null) {
-    setSub(await api<SubscriberSettings>("/api/settings/subscriber/follow", {
-      method: "PATCH", body: JSON.stringify({ trader_id: traderId })
-    }));
+    setRowBusy(traderId ?? "__unfollow__");
+    try {
+      setSub(await api<SubscriberSettings>("/api/settings/subscriber/follow", {
+        method: "PATCH", body: JSON.stringify({ trader_id: traderId })
+      }));
+    } catch (e) {
+      notify.fromError(e, "Could not update following");
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  // Subscriber: request permission to follow a specific trader (or re-request
+  // after a rejection).
+  async function requestFollow(traderId: string) {
+    setRowBusy(traderId);
+    try {
+      await api<FollowRequest>("/api/follow-requests", {
+        method: "POST", body: JSON.stringify({ trader_id: traderId }),
+      });
+      setMyRequests(await api<FollowRequest[]>("/api/follow-requests/mine"));
+      notify.success("Request sent — you'll be notified when the trader responds");
+    } catch (e) {
+      notify.fromError(e, "Could not send follow request");
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  // Subscriber: withdraw the still-pending request for a trader.
+  async function cancelRequest(traderId: string) {
+    const req = myRequests.find(r => r.trader_id === traderId && r.status === "pending");
+    if (!req) return;
+    setRowBusy(traderId);
+    try {
+      await api(`/api/follow-requests/${req.id}`, { method: "DELETE" });
+      setMyRequests(await api<FollowRequest[]>("/api/follow-requests/mine"));
+    } catch (e) {
+      notify.fromError(e, "Could not cancel request");
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  // Trader: approve / reject an incoming request.
+  async function decide(id: string, approve: boolean) {
+    setDecidingId(id);
+    try {
+      await api<FollowRequest>(`/api/follow-requests/${id}/${approve ? "approve" : "reject"}`, { method: "POST" });
+      setIncoming(await api<FollowRequest[]>("/api/follow-requests/incoming"));
+      notify.success(approve ? "Request approved" : "Request declined");
+    } catch (e) {
+      notify.fromError(e, "Could not update request");
+    } finally {
+      setDecidingId(null);
+    }
   }
   async function saveMultiplier() {
     setMultBusy(true);
@@ -593,50 +673,139 @@ export default function SettingsPage() {
     ? traders.find(t => t.id === sub.following_trader_id) ?? null
     : null;
 
+  // Follow-request derived data (subscriber view). The unified Traders list
+  // computes each trader's row state from these.
+  const traderLabel = (t: { display_name: string | null; email: string; business_name?: string | null }) =>
+    (t.business_name || "").trim() || t.display_name || t.email;
+  const requestByTraderId = new Map(myRequests.map(r => [r.trader_id, r] as const));
+  const approvedTraderIds = new Set(
+    myRequests.filter(r => r.status === "approved").map(r => r.trader_id),
+  );
+
   return (
     <div className="space-y-5 max-w-6xl pb-12">
       {user.role === "subscriber" && sub && (
         <>
-          {/* ── Trader + Multiplier ─────────────────────────────────── */}
+          {/* ── Traders (request · follow · unfollow in one list) ─────────
+              One row per trader with a single contextual action reflecting the
+              subscriber's exact state. Following requires the trader's approval;
+              an approved request starts following automatically. */}
           <Card
             icon={<IconUsers />}
-            title="Following trader & multiplier"
-            hint="Pick whose trades to mirror, and scale them by a factor of 0.1× to 10×."
+            title="Traders"
+            hint="Request to follow a trader, then mirror their trades. Approved requests start following automatically — turn on copy trading to begin mirroring."
           >
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <Field label="Following">
-                <SelectInput
-                  value={sub.following_trader_id ?? ""}
-                  onChange={v => follow(v || null)}
-                  options={[
-                    { value: "", label: "— not following anyone —" },
-                    ...traders.map(t => ({ value: t.id, label: t.display_name ?? t.email })),
-                  ]}
+            {/* Compact copy-size multiplier — applies to whoever you follow. */}
+            <div className="flex items-center justify-between gap-3 pb-3 flex-wrap"
+                 style={{ borderBottom: "1px solid var(--border)" }}>
+              <span className="text-xs" style={{ color: "var(--muted)" }}>
+                Copy size multiplier — scales every mirrored order (0.1×–10×).
+              </span>
+              <div className="flex items-center gap-2">
+                <NumberInput
+                  value={multInput}
+                  onChange={setMultInput}
+                  step={0.1} min={0.1} max={10}
+                  className="w-20"
                 />
-              </Field>
-
-              <Field label={<>Multiplier <span className="opacity-50">· 0.1–10</span></>}>
-                <div className="flex items-center gap-2">
-                  <NumberInput
-                    value={multInput}
-                    onChange={setMultInput}
-                    step={0.1} min={0.1} max={10}
-                    className="w-24"
-                  />
-                  <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                    current ×{fmtMultiplier(sub.multiplier)}
-                  </span>
-                  <PrimaryButton
-                    busy={multBusy}
-                    onClick={saveMultiplier}
-                    disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
-                    className="ml-auto"
-                  >
-                    Save
-                  </PrimaryButton>
-                </div>
-              </Field>
+                <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                  ×{fmtMultiplier(sub.multiplier)}
+                </span>
+                <PrimaryButton
+                  busy={multBusy}
+                  onClick={saveMultiplier}
+                  disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
+                >
+                  Save
+                </PrimaryButton>
+              </div>
             </div>
+
+            {traders.length === 0 ? (
+              <p className="text-sm mt-3" style={{ color: "var(--muted)" }}>
+                No traders available yet.
+              </p>
+            ) : (
+              <div>
+                {traders.map((t, idx) => {
+                  const req = requestByTraderId.get(t.id);
+                  const isFollowing = sub.following_trader_id === t.id;
+                  const isApproved = approvedTraderIds.has(t.id);
+                  const isPending = req?.status === "pending";
+                  const isRejected = req?.status === "rejected";
+                  const busy = rowBusy === t.id || (isFollowing && rowBusy === "__unfollow__");
+                  const label = traderLabel(t);
+                  const state = isFollowing ? "Following"
+                    : isApproved ? "Approved"
+                    : isPending ? "Requested"
+                    : isRejected ? "Declined"
+                    : "Not following";
+                  return (
+                    <div
+                      key={t.id}
+                      className="flex items-center gap-3 py-3"
+                      style={{ borderTop: idx === 0 ? "none" : "1px solid var(--border)" }}
+                    >
+                      <div
+                        className="grid place-items-center rounded-full shrink-0 font-semibold"
+                        style={{ width: 36, height: 36, background: "var(--accent-glow)", color: "var(--accent)", fontSize: 13 }}
+                      >
+                        {label.slice(0, 2).toUpperCase()}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium truncate">{label}</div>
+                        <div className="text-xs" style={{ color: isRejected ? "var(--bad)" : "var(--muted)" }}>
+                          {state}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {isFollowing ? (
+                          <>
+                            <span className="chip chip-good">Following</span>
+                            <button
+                              onClick={() => follow(null)}
+                              disabled={busy}
+                              className="btn-danger-soft px-3 py-1 text-xs"
+                              title="Stop following this trader"
+                            >
+                              Unfollow
+                            </button>
+                          </>
+                        ) : isApproved ? (
+                          <button
+                            onClick={() => follow(t.id)}
+                            disabled={busy}
+                            className="btn-primary px-4 py-1.5 text-xs inline-flex items-center gap-1.5"
+                          >
+                            {busy && <Spinner />} Follow
+                          </button>
+                        ) : isPending ? (
+                          <>
+                            <span className="chip">Pending</span>
+                            <button
+                              onClick={() => cancelRequest(t.id)}
+                              disabled={busy}
+                              className="text-xs underline"
+                              style={{ color: "var(--muted)" }}
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => requestFollow(t.id)}
+                            disabled={busy}
+                            className="btn-ghost px-3 py-1.5 text-xs inline-flex items-center gap-1.5"
+                          >
+                            {busy && <Spinner />} {isRejected ? "Request again" : "Request to follow"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </Card>
 
           {/* ── Risk Controls (all four limits in one table) ──────────── */}
@@ -956,6 +1125,58 @@ export default function SettingsPage() {
       )}
 
       {user.role === "trader" && trd && (
+        <>
+        {/* ── Follow requests ─────────────────────────────────────────
+            Subscribers who asked to copy this trader. Approve grants them
+            permission to follow; they're notified by email + in-app. */}
+        <Card
+          icon={<IconUsers />}
+          title="Follow requests"
+          hint="Subscribers requesting to copy your trades. Approve to let them follow you, or decline."
+        >
+          {incoming.length === 0 ? (
+            <p className="text-sm" style={{ color: "var(--muted)" }}>
+              No pending follow requests.
+            </p>
+          ) : (
+            <div className="space-y-2.5">
+              {incoming.map(r => {
+                const busy = decidingId === r.id;
+                return (
+                  <div
+                    key={r.id}
+                    className="flex items-center justify-between gap-3 rounded-lg border p-3"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium truncate">
+                        {r.subscriber_name || r.subscriber_email || "A subscriber"}
+                      </div>
+                      {r.subscriber_name && r.subscriber_email && (
+                        <div className="text-xs truncate" style={{ color: "var(--muted)" }}>
+                          {r.subscriber_email}
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => decide(r.id, false)}
+                        disabled={busy}
+                        className="btn-ghost px-3 py-1.5 text-xs"
+                      >
+                        Decline
+                      </button>
+                      <PrimaryButton busy={busy} onClick={() => decide(r.id, true)} disabled={busy}>
+                        Approve
+                      </PrimaryButton>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
         <Card
           icon={<IconPower />}
           title="Master trading switch"
@@ -981,6 +1202,7 @@ export default function SettingsPage() {
             </button>
           </div>
         </Card>
+        </>
       )}
 
       <ConfirmModal
