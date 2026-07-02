@@ -180,11 +180,15 @@ export default function SettingsPage() {
   // whenever this tab regains focus/visibility. Without this, the Traders list
   // could sit on a stale "Pending" and offer a Cancel that the server rejects.
   useEffect(() => {
-    if (user?.role !== "subscriber") return;
+    if (!user) return;
     const refresh = () => {
       if (typeof document !== "undefined" && document.hidden) return;
-      api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
-      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      if (user.role === "subscriber") {
+        api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
+        api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      } else if (user.role === "trader") {
+        api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => {});
+      }
     };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
@@ -197,10 +201,12 @@ export default function SettingsPage() {
   useEventStream((evt) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
-    // Live-refresh the follow-request panels when a follow.* notification
-    // lands (trader gets follow.requested; subscriber gets approved/rejected).
+    // Live-refresh the follow panels on any follow.* notification (request /
+    // approve / reject), and on trader.unfollowed_you (the trader removing this
+    // subscriber revokes approval → the row must fall back to "Request to
+    // follow").
     if (e?.type === "notification.created" && typeof e.notification?.type === "string"
-        && e.notification.type.startsWith("follow.")) {
+        && (e.notification.type.startsWith("follow.") || e.notification.type === "trader.unfollowed_you")) {
       api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => {});
       api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
       // Approval auto-follows server-side — refetch settings so the "Following"
