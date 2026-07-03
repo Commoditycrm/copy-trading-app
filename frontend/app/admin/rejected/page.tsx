@@ -1,0 +1,209 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { api } from "@/lib/api";
+import { notify } from "@/lib/toast";
+
+interface Rejection {
+  order_id: string;
+  user_email: string | null;
+  user_name: string | null;
+  user_role: string | null;
+  is_mirror: boolean;
+  symbol: string;
+  side: string;
+  instrument_type: string;
+  quantity: string;
+  status: string;         // "rejected" | "retry_pending"
+  reject_reason: string | null;
+  broker: string | null;
+  created_at: string | null;
+}
+
+const ROLE_COLORS: Record<string, { bg: string; color: string }> = {
+  trader:     { bg: "rgba(10,115,168,0.15)", color: "var(--accent)" },
+  subscriber: { bg: "rgba(34,197,94,0.12)",  color: "#22c55e" },
+  admin:      { bg: "rgba(239,68,68,0.12)",   color: "#ef4444" },
+};
+
+const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
+  rejected:      { bg: "rgba(239,68,68,0.12)", color: "#ef4444" },
+  retry_pending: { bg: "rgba(255,200,87,0.14)", color: "#f59e0b" },
+};
+
+function Badge({ text, map }: { text: string; map: Record<string, { bg: string; color: string }> }) {
+  const c = map[text] ?? { bg: "var(--panel-2)", color: "var(--text-2)" };
+  return (
+    <span
+      className="text-xs font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider whitespace-nowrap"
+      style={{ background: c.bg, color: c.color }}
+    >
+      {text.replace(/_/g, " ")}
+    </span>
+  );
+}
+
+function fmtTime(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+export default function AdminRejectedPage() {
+  const [rows, setRows] = useState<Rejection[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [role, setRole] = useState<"all" | "trader" | "subscriber">("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | "rejected" | "retry_pending">("all");
+  const [search, setSearch] = useState("");
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api<{ rejections: Rejection[]; truncated: boolean }>(
+        "/api/admin/rejected-orders?limit=300",
+      );
+      setRows(res.rejections);
+      setTruncated(res.truncated);
+    } catch (e) {
+      notify.fromError(e, "Could not load rejected orders");
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rows.filter(r => {
+      if (role !== "all" && r.user_role !== role) return false;
+      if (statusFilter !== "all" && r.status !== statusFilter) return false;
+      if (!q) return true;
+      return (
+        (r.user_email ?? "").toLowerCase().includes(q) ||
+        (r.user_name ?? "").toLowerCase().includes(q) ||
+        r.symbol.toLowerCase().includes(q) ||
+        (r.reject_reason ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [rows, role, statusFilter, search]);
+
+  const countByRole = (r: string) => rows.filter(x => x.user_role === r).length;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-bold">Rejected trades</h2>
+          <p className="text-sm mt-0.5" style={{ color: "var(--muted)" }}>
+            Every order that failed — status rejected or awaiting retry — with the broker&apos;s reason.
+            {truncated && " Showing the 300 most recent."}
+          </p>
+        </div>
+        <button
+          onClick={load}
+          className="text-sm px-3 py-1.5 rounded-lg"
+          style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+        >
+          Refresh
+        </button>
+      </div>
+
+      {/* Filters */}
+      <div className="flex flex-wrap items-center gap-3">
+        <input
+          type="text"
+          placeholder="Search user, symbol, or reason…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          className="text-sm px-3 py-1.5 rounded-lg"
+          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", color: "var(--text)", outline: "none", minWidth: 240 }}
+        />
+        <div className="flex gap-1">
+          {(["all", "trader", "subscriber"] as const).map(r => (
+            <button
+              key={r}
+              onClick={() => setRole(r)}
+              className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
+              style={{
+                background: role === r ? "var(--accent)" : "var(--panel-2)",
+                color:      role === r ? "var(--accent-ink)" : "var(--text-2)",
+                border:     "1px solid " + (role === r ? "var(--accent)" : "var(--border)"),
+              }}
+            >
+              {r === "all" ? `All (${rows.length})` : `${r}s (${countByRole(r)})`}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-1">
+          {(["all", "rejected", "retry_pending"] as const).map(s => (
+            <button
+              key={s}
+              onClick={() => setStatusFilter(s)}
+              className="text-xs px-3 py-1 rounded-full font-medium transition-colors"
+              style={{
+                background: statusFilter === s ? "var(--accent)" : "var(--panel-2)",
+                color:      statusFilter === s ? "var(--accent-ink)" : "var(--text-2)",
+                border:     "1px solid " + (statusFilter === s ? "var(--accent)" : "var(--border)"),
+              }}
+            >
+              {s === "all" ? "Any status" : s.replace(/_/g, " ")}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Table */}
+      {loading ? (
+        <div style={{ color: "var(--muted)" }}>Loading rejected orders…</div>
+      ) : (
+        <div className="rounded-xl overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+          <table className="w-full text-sm">
+            <thead>
+              <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
+                {["User", "Role", "Trade", "Broker", "Status", "Reason", "When"].map(h => (
+                  <th key={h} className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                    No rejected trades match this filter.
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((r, i) => (
+                  <tr key={r.order_id} style={{ borderBottom: i < filtered.length - 1 ? "1px solid var(--border)" : "none" }}>
+                    <td className="px-4 py-3">
+                      <div className="font-medium" style={{ color: "var(--text)" }}>{r.user_name ?? r.user_email ?? "—"}</div>
+                      {r.user_name && <div className="text-xs" style={{ color: "var(--muted)" }}>{r.user_email}</div>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1.5">
+                        <Badge text={r.user_role ?? "—"} map={ROLE_COLORS} />
+                        {r.is_mirror && <span className="text-[10px]" style={{ color: "var(--muted)" }}>mirror</span>}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      <span className="uppercase font-semibold" style={{ color: r.side === "buy" ? "#22c55e" : "#ef4444" }}>{r.side}</span>
+                      {" "}<span style={{ color: "var(--text)" }}>{r.symbol}</span>
+                      <span className="text-xs" style={{ color: "var(--muted)" }}> ×{r.quantity}</span>
+                    </td>
+                    <td className="px-4 py-3" style={{ color: "var(--text-2)" }}>{r.broker ?? "—"}</td>
+                    <td className="px-4 py-3"><Badge text={r.status} map={STATUS_COLORS} /></td>
+                    <td className="px-4 py-3" style={{ color: r.reject_reason ? "var(--bad)" : "var(--muted)", maxWidth: 360 }}>
+                      {r.reject_reason ?? "—"}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{fmtTime(r.created_at)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
