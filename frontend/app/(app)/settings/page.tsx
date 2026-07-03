@@ -718,6 +718,22 @@ export default function SettingsPage() {
     <div className="space-y-5 max-w-6xl pb-12">
       {user.role === "subscriber" && sub && (
         <>
+          {/* Sticky action bar — keeps Reset reachable from anywhere on a long
+              settings page. Sits at the top and stays pinned while scrolling. */}
+          <div
+            className="sticky top-0 z-20 flex items-center justify-between gap-3 py-2.5 mb-1"
+            style={{ background: "var(--bg)", borderBottom: "1px solid var(--border)" }}
+          >
+            <span className="text-sm font-semibold" style={{ color: "var(--text)" }}>Settings</span>
+            <button
+              onClick={() => setResetOpen(true)}
+              className="btn-danger-soft px-3 py-1.5 text-xs font-medium"
+              title="Restore multiplier, limits, retry policy and symbol filters to defaults"
+            >
+              Reset to defaults
+            </button>
+          </div>
+
           {/* ── Traders (request · follow · unfollow in one list) ─────────
               One row per trader with a single contextual action reflecting the
               subscriber's exact state. Following requires the trader's approval;
@@ -1132,27 +1148,6 @@ export default function SettingsPage() {
             </div>
           </Card>
 
-          {/* ── Reset to defaults ──────────────────────────────────── */}
-          {/* Config-only reset: wipes the risk/limit knobs, retry policy and
-              symbol filters. Deliberately leaves who you follow and copy
-              on/off alone (handled server-side). */}
-          <Card
-            icon={<IconRefresh />}
-            title="Reset settings"
-            hint="Restore multiplier, all risk limits, retry policy and symbol filters to their defaults. Doesn't change who you follow or your copy on/off state."
-          >
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <span className="text-[11px]" style={{ color: "var(--muted)" }}>
-                This clears every limit and filter on this page.
-              </span>
-              <button
-                onClick={() => setResetOpen(true)}
-                className="btn-danger-soft px-4 py-2 text-xs font-medium"
-              >
-                Reset to defaults
-              </button>
-            </div>
-          </Card>
         </>
       )}
 
