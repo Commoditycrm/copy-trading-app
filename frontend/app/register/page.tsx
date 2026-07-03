@@ -29,10 +29,9 @@ export default function RegisterPage() {
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (role === "trader" && !businessName.trim()) {
-      notify.error("Business name is required for traders");
-      return;
-    }
+    // Empty business name for a trader is caught by the field's `required`
+    // attribute (client) and the RegisterIn validator (server); no JS guard
+    // needed here.
     setLoading(true);
     try {
       // Emails are treated case-insensitively — normalize once and use
@@ -101,8 +100,8 @@ export default function RegisterPage() {
       <form onSubmit={submit} className="space-y-5">
         <div className="space-y-3">
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email</label>
-            <input className="w-full p-2.5" type="email" autoComplete="email" placeholder="you@example.com"
+            <label htmlFor="reg-email" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Email</label>
+            <input id="reg-email" className="w-full p-2.5" type="email" autoComplete="email" placeholder="you@example.com"
               // Emails are case-insensitive — lowercase on every
               // keystroke so what the user sees is what we send.
               // inputMode/autoCapitalize/autoCorrect off prevent
@@ -112,13 +111,13 @@ export default function RegisterPage() {
               inputMode="email" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
           </div>
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>
-            <PasswordInput className="w-full p-2.5" autoComplete="new-password" placeholder="8+ characters"
+            <label htmlFor="reg-password" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Password</label>
+            <PasswordInput id="reg-password" className="w-full p-2.5" autoComplete="new-password" placeholder="8+ characters"
               value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} />
           </div>
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Display name (optional)</label>
-            <input className="w-full p-2.5" type="text" autoComplete="name"
+            <label htmlFor="reg-display-name" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Display name (optional)</label>
+            <input id="reg-display-name" className="w-full p-2.5" type="text" autoComplete="name"
               value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
           </div>
           <div>
@@ -134,10 +133,11 @@ export default function RegisterPage() {
               them, replacing the default "ARK" wordmark. */}
           {role === "trader" && (
             <div>
-              <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+              <label htmlFor="reg-business-name" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
                 Business name <span style={{ color: "var(--bad)" }}>*</span>
               </label>
               <input
+                id="reg-business-name"
                 className="w-full p-2.5"
                 type="text"
                 autoComplete="organization"

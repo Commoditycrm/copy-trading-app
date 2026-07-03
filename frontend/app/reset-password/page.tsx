@@ -61,10 +61,11 @@ function ResetPasswordForm() {
   return (
     <form onSubmit={submit} className="space-y-5">
       <div>
-        <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+        <label htmlFor="reset-new-password" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
           New password
         </label>
         <PasswordInput
+          id="reset-new-password"
           className="w-full p-2.5"
           autoComplete="new-password"
           placeholder="••••••••"
@@ -75,10 +76,11 @@ function ResetPasswordForm() {
         />
       </div>
       <div>
-        <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+        <label htmlFor="reset-confirm-password" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
           Confirm new password
         </label>
         <PasswordInput
+          id="reset-confirm-password"
           className="w-full p-2.5"
           autoComplete="new-password"
           placeholder="••••••••"

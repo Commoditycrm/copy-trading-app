@@ -62,10 +62,11 @@ export default function LoginPage() {
       <form onSubmit={submit} className="space-y-5">
         <div className="space-y-3">
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+            <label htmlFor="login-email" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
               Email
             </label>
             <input
+              id="login-email"
               className="w-full p-2.5"
               type="email" autoComplete="email" placeholder="you@example.com"
               // Emails are case-insensitive — store and display the
@@ -80,10 +81,11 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
+            <label htmlFor="login-password" className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>
               Password
             </label>
             <PasswordInput
+              id="login-password"
               className="w-full p-2.5"
               autoComplete="current-password" placeholder="••••••••"
               value={password} onChange={(e) => setPassword(e.target.value)} required
