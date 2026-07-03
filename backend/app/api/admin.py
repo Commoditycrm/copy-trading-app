@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.dashboard_metrics import LoadTestRun, TestResult
-from app.models.order import Order
+from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.services.crypto import encrypt_json
@@ -574,6 +574,77 @@ def admin_list_fanouts(
         "truncated": truncated,
     }
     return {"fanouts": fanouts, "metrics": metrics}
+
+
+@router.get("/rejected-orders")
+def admin_rejected_orders(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    role: str | None = None,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+    limit: int = 100,
+) -> dict:
+    """Every failed order across the platform — status REJECTED or
+    RETRY_PENDING — newest first, with the broker's reason. Lets an admin see
+    at a glance why a trader's or subscriber's trade didn't go through.
+
+    Query params:
+      - role      : "trader" | "subscriber" to restrict to one side.
+      - from / to : window on Order.created_at (UTC ISO).
+      - limit     : cap on rows returned (1–500).
+    """
+    limit = max(1, min(limit, 500))
+    q = (
+        select(Order, User)
+        .join(User, User.id == Order.user_id)
+        .where(Order.status.in_([OrderStatus.REJECTED, OrderStatus.RETRY_PENDING]))
+    )
+    if role:
+        try:
+            q = q.where(User.role == UserRole(role))
+        except ValueError:
+            raise HTTPException(422, f"invalid role: {role!r}")
+    if from_ is not None:
+        q = q.where(Order.created_at >= from_)
+    if to is not None:
+        q = q.where(Order.created_at <= to)
+    q = q.order_by(Order.created_at.desc()).limit(limit + 1)
+
+    rows = list(db.execute(q).all())
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+
+    # Resolve broker names in bulk for the display column.
+    acct_ids = {o.broker_account_id for o, _u in rows if o.broker_account_id is not None}
+    accounts: dict[uuid.UUID, BrokerAccount] = {}
+    if acct_ids:
+        accounts = {a.id: a for a in db.execute(
+            select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
+        ).scalars()}
+
+    rejections = []
+    for o, u in rows:
+        acct = accounts.get(o.broker_account_id) if o.broker_account_id else None
+        rejections.append({
+            "order_id": str(o.id),
+            "user_id": str(o.user_id),
+            "user_email": u.email if u else None,
+            "user_name": u.display_name if u else None,
+            "user_role": u.role.value if u else None,
+            # parent_order_id set → this is a subscriber's mirror of a trader's
+            # order; null → the user's own (trader or standalone) order.
+            "is_mirror": o.parent_order_id is not None,
+            "symbol": o.symbol,
+            "side": o.side.value,
+            "instrument_type": o.instrument_type.value,
+            "quantity": str(o.quantity),
+            "status": o.status.value,
+            "reject_reason": o.reject_reason,
+            "broker": acct.broker.value if acct and acct.broker else None,
+            "created_at": o.created_at.isoformat() if o.created_at else None,
+        })
+    return {"rejections": rejections, "truncated": truncated}
 
 
 @router.get("/performance/by-broker")
