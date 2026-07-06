@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
@@ -145,6 +145,36 @@ def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) 
     if fractional:
         return raw.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     return raw.to_integral_value(rounding=ROUND_DOWN)
+
+
+def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decimal:
+    """Net filled position the subscriber holds in the direction ``order`` would
+    CLOSE — their net long for a SELL, their net short for a BUY. Computed from
+    ``filled_quantity`` across the user's own orders for the exact contract, so
+    it tracks reality as fills sync in (SnapTrade reconciler + fills_sync).
+    Returns a non-negative quantity."""
+    rows = db.execute(
+        select(Order.side, func.coalesce(func.sum(Order.filled_quantity), 0))
+        .where(
+            Order.user_id == user_id,
+            Order.symbol == order.symbol,
+            Order.instrument_type == order.instrument_type,
+            Order.option_expiry.is_not_distinct_from(order.option_expiry),
+            Order.option_strike.is_not_distinct_from(order.option_strike),
+            Order.option_right.is_not_distinct_from(order.option_right),
+        )
+        .group_by(Order.side)
+    ).all()
+    buys = Decimal(0)
+    sells = Decimal(0)
+    for side, qty in rows:
+        if side == OrderSide.BUY:
+            buys = Decimal(str(qty))
+        elif side == OrderSide.SELL:
+            sells = Decimal(str(qty))
+    net_long = buys - sells
+    closeable = net_long if order.side == OrderSide.SELL else -net_long
+    return closeable if closeable > 0 else Decimal(0)
 
 
 def _leg_direction(side: OrderSide, leg: str) -> Decimal:
@@ -478,6 +508,31 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             scaled = _scale_quantity(
                 trader_order.quantity, sub.multiplier, acct.supports_fractional
             )
+            # Defense-in-depth: never mirror a CLOSE larger than the subscriber
+            # actually holds. A position desync (e.g. an earlier open that never
+            # filled on their account, or a multiplier that put them out of step
+            # with the trader) would otherwise make the broker reject the whole
+            # close with "No matching position to close". Clamp to their net
+            # filled position for this contract so the close flattens what they
+            # hold and no more. is_closing is set by the broker listeners (e.g.
+            # SnapTrade's SELL_TO_CLOSE); non-close orders are never touched.
+            if trader_order.is_closing and scaled > 0:
+                closeable = _closeable_quantity(db, sub.user_id, trader_order)
+                if closeable < scaled:
+                    audit.record(
+                        db,
+                        actor_user_id=sub.user_id,
+                        action="copy.close_clamped",
+                        entity_type="order",
+                        entity_id=trader_order.id,
+                        metadata={
+                            "requested_qty": str(scaled),
+                            "held_qty": str(closeable),
+                            "symbol": trader_order.symbol,
+                            "broker_account_id": str(acct.id),
+                        },
+                    )
+                    scaled = closeable
             if scaled <= 0:
                 audit.record(
                     db,
