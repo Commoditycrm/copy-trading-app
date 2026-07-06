@@ -685,18 +685,21 @@ def follow_trader(
         trader = db.get(User, payload.trader_id)
         if not trader or trader.role != UserRole.TRADER:
             raise HTTPException(404, "trader_not_found")
-        # Approval gate: a subscriber may only follow a trader who has
-        # approved their follow request. Existing follows were grandfathered
-        # in as approved by the follow_requests migration.
-        approved = db.execute(
-            select(FollowRequest).where(
-                FollowRequest.subscriber_id == user.id,
-                FollowRequest.trader_id == payload.trader_id,
-                FollowRequest.status == FollowRequestStatus.APPROVED,
-            )
-        ).scalar_one_or_none()
-        if approved is None:
-            raise HTTPException(403, "follow_not_approved")
+        # Approval gate: a subscriber may only follow a trader who has approved
+        # their follow request — UNLESS the trader has "auto-allow" on, in which
+        # case anyone may follow directly with no request. Existing follows were
+        # grandfathered in as approved by the follow_requests migration.
+        ts = db.get(TraderSettings, payload.trader_id)
+        if not (ts and ts.auto_approve_follows):
+            approved = db.execute(
+                select(FollowRequest).where(
+                    FollowRequest.subscriber_id == user.id,
+                    FollowRequest.trader_id == payload.trader_id,
+                    FollowRequest.status == FollowRequestStatus.APPROVED,
+                )
+            ).scalar_one_or_none()
+            if approved is None:
+                raise HTTPException(403, "follow_not_approved")
     old_trader_id = s.following_trader_id
     s.following_trader_id = payload.trader_id
     audit.record(
@@ -737,16 +740,23 @@ def toggle_trading(
     s = db.get(TraderSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
-    s.trading_enabled = payload.trading_enabled
-    audit.record(
-        db,
-        actor_user_id=user.id,
-        action="trader.trading_toggled",
-        entity_type="trader_settings",
-        entity_id=user.id,
-        metadata={"trading_enabled": payload.trading_enabled},
-        ip_address=client_ip(request),
-    )
+    changes: dict[str, object] = {}
+    if payload.trading_enabled is not None and payload.trading_enabled != s.trading_enabled:
+        s.trading_enabled = payload.trading_enabled
+        changes["trading_enabled"] = payload.trading_enabled
+    if payload.auto_approve_follows is not None and payload.auto_approve_follows != s.auto_approve_follows:
+        s.auto_approve_follows = payload.auto_approve_follows
+        changes["auto_approve_follows"] = payload.auto_approve_follows
+    if changes:
+        audit.record(
+            db,
+            actor_user_id=user.id,
+            action="trader.settings_changed",
+            entity_type="trader_settings",
+            entity_id=user.id,
+            metadata=changes,
+            ip_address=client_ip(request),
+        )
     db.commit()
     db.refresh(s)
     return s
@@ -754,14 +764,21 @@ def toggle_trading(
 
 @router.get("/traders", response_model=list[dict])
 def list_available_traders(db: Session = Depends(get_db), _: User = Depends(current_user)) -> list[dict]:
-    """Subscribers use this to find the trader to follow."""
-    rows = db.execute(select(User).where(User.role == UserRole.TRADER, User.is_active.is_(True))).scalars()
+    """Subscribers use this to find the trader to follow. Includes each
+    trader's ``auto_approve_follows`` so the UI can show a direct Follow button
+    (auto-allow) vs a Request-to-follow button (approval required)."""
+    rows = db.execute(
+        select(User, TraderSettings.auto_approve_follows)
+        .join(TraderSettings, TraderSettings.user_id == User.id, isouter=True)
+        .where(User.role == UserRole.TRADER, User.is_active.is_(True))
+    ).all()
     return [
         {
             "id": str(t.id),
             "display_name": t.display_name,
             "email": t.email,
             "business_name": t.business_name,
+            "auto_approve_follows": bool(auto),
         }
-        for t in rows
+        for t, auto in rows
     ]

@@ -36,6 +36,15 @@ class TraderSettings(Base, TimestampMixin):
     # regardless of their preference.
     copy_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Follow-request policy. False (default) = a subscriber must request to
+    # follow and the trader approves (the request/approval flow). True =
+    # "auto-allow": any subscriber can follow this trader directly, no request
+    # or approval needed. Surfaced on the trader's Subscribers page as a
+    # dropdown, and consulted by settings.follow_trader's approval gate.
+    auto_approve_follows: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     user = relationship("User", back_populates="trader_settings")
 
 

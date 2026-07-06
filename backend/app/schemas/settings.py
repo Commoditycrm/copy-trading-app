@@ -79,6 +79,9 @@ class SubscriberSettingsOut(BaseModel):
 class TraderSettingsOut(BaseModel):
     user_id: uuid.UUID
     trading_enabled: bool
+    # False = subscribers must request + be approved to follow; True = anyone
+    # can follow this trader directly ("auto-allow").
+    auto_approve_follows: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -202,7 +205,11 @@ class FollowTraderIn(BaseModel):
 
 
 class TraderToggleIn(BaseModel):
-    trading_enabled: bool
+    """Partial update of the trader's own settings. Any field left unset is
+    unchanged, so the master-switch toggle and the follow-policy dropdown can
+    each PATCH just their field."""
+    trading_enabled: bool | None = None
+    auto_approve_follows: bool | None = None
 
 
 class SubscriberMultiplierIn(BaseModel):

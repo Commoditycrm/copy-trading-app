@@ -81,7 +81,7 @@ export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
   const [trd, setTrd] = useState<TraderSettings | null>(null);
-  const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string; business_name?: string | null }[]>([]);
+  const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string; business_name?: string | null; auto_approve_follows?: boolean }[]>([]);
   // Follow-request workflow. Subscriber: their own requests (chips + which
   // traders they may follow). Trader: incoming pending requests to action.
   const [myRequests, setMyRequests] = useState<FollowRequest[]>([]);
@@ -781,12 +781,15 @@ export default function SettingsPage() {
                   const isApproved = approvedTraderIds.has(t.id);
                   const isPending = req?.status === "pending";
                   const isRejected = req?.status === "rejected";
+                  // Auto-allow traders can be followed directly — no request.
+                  const canFollowDirect = isApproved || !!t.auto_approve_follows;
                   const busy = rowBusy === t.id || (isFollowing && rowBusy === "__unfollow__");
                   const label = traderLabel(t);
                   const state = isFollowing ? "Following"
                     : isApproved ? "Approved"
                     : isPending ? "Requested"
                     : isRejected ? "Declined"
+                    : t.auto_approve_follows ? "Open to all"
                     : "Not following";
                   return (
                     <div
@@ -819,7 +822,7 @@ export default function SettingsPage() {
                               Unfollow
                             </button>
                           </>
-                        ) : isApproved ? (
+                        ) : canFollowDirect ? (
                           <button
                             onClick={() => follow(t.id)}
                             disabled={busy}
