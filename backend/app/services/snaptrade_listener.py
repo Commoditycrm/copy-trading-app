@@ -156,6 +156,9 @@ async def start_all_listeners() -> None:
                 )
             ).scalars():
                 start_listener(trader.id, acct.id)
+    # Also keep subscribers' mirror-order fills in sync (they have no per-user
+    # listener) — see the reconciler at the bottom of this module.
+    start_subscriber_reconciler()
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
@@ -203,6 +206,7 @@ def stop_listener(trader_user_id: uuid.UUID) -> None:
 async def stop_all_listeners() -> None:
     for tid in list(_tasks.keys()):
         stop_listener(tid)
+    await stop_subscriber_reconciler()
 
 
 def has_running_listener(trader_user_id: uuid.UUID) -> bool:
@@ -724,3 +728,200 @@ def _as_dt(v: Any) -> datetime | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+# ── Subscriber mirror-order fill reconciler ─────────────────────────────────
+#
+# The per-trader listeners above poll TRADER accounts (to detect trades and fan
+# them out). Nothing polls a SUBSCRIBER's SnapTrade account, so their mirror
+# orders — placed by copy_engine as status=SUBMITTED / filled_quantity=0 — never
+# terminalize. That leaves the app blind to the subscriber's real position, which
+# in turn lets it fire closes larger than the position held ("No matching
+# position to close" rejects). This reconciler closes that gap: it periodically
+# polls SnapTrade subscriber accounts that have working mirror orders and syncs
+# their status + filled quantity, reusing the same update logic the trader poll
+# applies in _persist_and_fanout — minus the fanout (subscribers don't fan out).
+
+_RECONCILE_INTERVAL_S = 30.0
+_reconciler_task: "asyncio.Task | None" = None
+_TERMINAL_STATUSES = (
+    OrderStatus.FILLED,
+    OrderStatus.CANCELED,
+    OrderStatus.REJECTED,
+    OrderStatus.EXPIRED,
+)
+
+
+def start_subscriber_reconciler() -> None:
+    """Spawn the subscriber mirror-order fill reconciler. Idempotent. Started
+    from start_all_listeners(), so it only runs where the periodic listeners do
+    (the worker / single-process dev), never on the web tier."""
+    global _reconciler_task
+    if _reconciler_task is not None and not _reconciler_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _main_loop
+    if loop is None:
+        log.warning("snaptrade subscriber reconciler: no loop bound; not starting")
+        return
+    _reconciler_task = loop.create_task(_run_subscriber_reconciler())
+    log.info(
+        "snaptrade subscriber fill reconciler: started (interval=%.0fs)",
+        _RECONCILE_INTERVAL_S,
+    )
+
+
+async def stop_subscriber_reconciler() -> None:
+    global _reconciler_task
+    if _reconciler_task is not None and not _reconciler_task.done():
+        _reconciler_task.cancel()
+        try:
+            await _reconciler_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _reconciler_task = None
+
+
+async def _run_subscriber_reconciler() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_reconcile_subscriber_fills_once)
+        except asyncio.CancelledError:
+            log.info("snaptrade subscriber fill reconciler: cancelled")
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("snaptrade subscriber fill reconciler: tick failed")
+        await asyncio.sleep(_RECONCILE_INTERVAL_S)
+
+
+def _reconcile_subscriber_fills_once() -> None:
+    """One sweep. Find SnapTrade subscriber accounts that have working mirror
+    orders and re-pull their order status from SnapTrade. Only accounts with
+    something pending are polled, so quota use is proportional to real work.
+    Sequential + best-effort per account so one bad account can't stall the
+    rest or burst SnapTrade's shared rate limit."""
+    with SessionLocal() as db:
+        working_user_ids = (
+            select(Order.user_id)
+            .where(
+                Order.parent_order_id.is_not(None),
+                Order.status.in_(_WORKING_STATUSES),
+                Order.broker_order_id.is_not(None),
+            )
+            .distinct()
+        )
+        targets = [
+            (a.user_id, a.id)
+            for a in db.execute(
+                select(BrokerAccount).where(
+                    BrokerAccount.broker == BrokerName.SNAPTRADE,
+                    BrokerAccount.connection_status == "connected",
+                    BrokerAccount.user_id.in_(working_user_ids),
+                )
+            ).scalars()
+        ]
+    for subscriber_id, broker_account_id in targets:
+        try:
+            _reconcile_one_subscriber_account(subscriber_id, broker_account_id)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "snaptrade subscriber reconcile: account %s failed", broker_account_id
+            )
+
+
+def _reconcile_one_subscriber_account(
+    subscriber_id: uuid.UUID, broker_account_id: uuid.UUID
+) -> None:
+    creds = _load_creds(subscriber_id, broker_account_id)
+    if creds is None:
+        return
+    adapter = SnapTradeAdapter(creds)
+    orders = adapter.list_recent_activities()
+    if not orders:
+        return
+    for o in orders:
+        broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
+        if not broker_order_id:
+            continue
+        status_str = str(_attr(o, "status", default="")).upper()
+        _persist_subscriber_fill(
+            subscriber_id, broker_account_id, broker_order_id, status_str, o
+        )
+
+
+def _persist_subscriber_fill(
+    subscriber_id: uuid.UUID,
+    broker_account_id: uuid.UUID,
+    broker_order_id: str,
+    status_str: str,
+    order_obj: Any,
+) -> None:
+    """Update one subscriber mirror order from a SnapTrade order snapshot.
+    Matches by (broker_order_id, user_id, parent_order_id NOT NULL) so it only
+    ever touches mirror rows — never the trader's own orders. No fanout."""
+    from app.brokers.snaptrade import _STATUS_IN as SNAP_STATUS_IN
+
+    status_enum = SNAP_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
+    with SessionLocal() as db:
+        existing = db.execute(
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .where(Order.user_id == subscriber_id)
+            .where(Order.parent_order_id.is_not(None))
+            .order_by(Order.created_at)
+            .limit(1)
+        ).scalars().first()
+        if existing is None:
+            return
+        # Already terminal + unchanged → nothing to do (don't re-publish a
+        # settled order on every sweep).
+        if existing.status == status_enum and existing.status in _TERMINAL_STATUSES:
+            return
+
+        changed = False
+        if existing.broker_account_id != broker_account_id:
+            existing.broker_account_id = broker_account_id
+            changed = True
+        status_changed = existing.status != status_enum
+        if status_changed:
+            existing.status = status_enum
+            changed = True
+        fq = _to_dec(_attr(order_obj, "filled_units", "filled_quantity"))
+        if fq is not None and fq != existing.filled_quantity:
+            existing.filled_quantity = fq
+            changed = True
+        fap = _to_dec(_attr(order_obj, "execution_price", "filled_avg_price"))
+        if fap is not None and fap != existing.filled_avg_price:
+            existing.filled_avg_price = fap
+            changed = True
+        if status_enum in _TERMINAL_STATUSES and existing.closed_at is None:
+            existing.closed_at = datetime.now(timezone.utc)
+            changed = True
+
+        if not changed:
+            return
+
+        # On the entry fill, run the bracket emulator so the subscriber's own
+        # TP/SL exits get placed — the same hooks the trader poll uses. Each
+        # short-circuits when the order isn't its case, so calling both is safe.
+        if status_changed and status_enum == OrderStatus.FILLED:
+            try:
+                from app.services.bracket_emulator import (  # noqa: PLC0415
+                    cancel_sibling_on_fill,
+                    emulate_bracket_exits,
+                )
+                emulate_bracket_exits(db, existing)
+                cancel_sibling_on_fill(db, existing)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "snaptrade subscriber reconcile: bracket emulator failed for order %s",
+                    existing.id,
+                )
+        db.commit()
+        db.refresh(existing)
+        events.publish(
+            subscriber_id,
+            copy_engine._order_event("order.placed", existing),  # noqa: SLF001
+        )
