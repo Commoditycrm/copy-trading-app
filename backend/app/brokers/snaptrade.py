@@ -644,6 +644,32 @@ class SnapTradeAdapter(BrokerAdapter):
             filled_avg_price=None,
         )
 
+    def _held_long_option_qty(self, req: BrokerOrderRequest) -> Decimal:
+        """Contracts of the EXACT option in ``req`` currently held long on this
+        account (0 if none). Ground truth for SELL_TO_CLOSE vs SELL_TO_OPEN:
+        SnapTrade reports ingested order 'action' WITHOUT an open/close suffix,
+        so ``req.is_closing`` can't be trusted (it defaults False, which routed
+        copied exits to SELL_TO_OPEN → broker rejects "no position to close").
+        Options-only (single API call); never raises."""
+        try:
+            positions = self._get_option_positions()
+        except Exception:  # noqa: BLE001
+            log.exception("snaptrade: option-position lookup failed in close-detection")
+            return Decimal(0)
+        for p in positions:
+            if (
+                p.instrument_type == InstrumentType.OPTION
+                and p.option_right == req.option_right
+                and p.option_expiry == req.option_expiry
+                and p.option_strike is not None
+                and req.option_strike is not None
+                and Decimal(p.option_strike) == Decimal(req.option_strike)
+                and str(p.symbol).upper() == str(req.symbol).upper()
+                and p.quantity and p.quantity > 0
+            ):
+                return Decimal(p.quantity)
+        return Decimal(0)
+
     def _place_option_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Place a single-leg option order via SnapTrade's multi-leg endpoint.
 
@@ -657,10 +683,36 @@ class SnapTradeAdapter(BrokerAdapter):
         occ = _occ_symbol_21(
             req.symbol, req.option_expiry, req.option_strike, req.option_right
         )
+        # Decide open-vs-close for a SELL from the ACTUAL held position, not the
+        # unreliable is_closing flag (SnapTrade omits the _TO_OPEN/_TO_CLOSE
+        # suffix on ingested orders, so is_closing defaults False — which sent
+        # copied exits out as SELL_TO_OPEN, a naked short the broker rejects).
+        # If we hold this exact contract long, this SELL is a close: force
+        # SELL_TO_CLOSE and never oversell what's held. If no long is held we
+        # leave the action as-is (don't block a deliberate sell-to-open) but log.
+        action = _option_action(req.side, req.is_closing)
+        units = int(req.quantity)  # options trade in whole contracts
+        if req.side == OrderSide.SELL:
+            held = int(self._held_long_option_qty(req))
+            if held > 0:
+                action = "SELL_TO_CLOSE"
+                if units > held:
+                    log.warning(
+                        "snaptrade: clamping SELL_TO_CLOSE %s→%s contracts for %s "
+                        "(copied exit larger than held position)",
+                        units, held, occ,
+                    )
+                    units = held
+            else:
+                log.warning(
+                    "snaptrade: SELL %s with no matching long held (is_closing=%s) — "
+                    "placing as %s; a copied exit here will likely reject",
+                    occ, req.is_closing, action,
+                )
         leg = {
-            "action":     _option_action(req.side, req.is_closing),
+            "action":     action,
             "instrument": {"symbol": occ, "instrument_type": "OPTION"},
-            "units":      int(req.quantity),  # options trade in whole contracts
+            "units":      units,
         }
         kwargs: dict[str, Any] = {
             "account_id":    self._account_id,
