@@ -679,7 +679,22 @@ class SnapTradeAdapter(BrokerAdapter):
         try:
             resp = self._c().trading.place_mleg_order(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"SnapTrade place_mleg_order: {exc}") from exc
+            # SnapTrade's ApiException str() leads with the status + a wall of
+            # HTTP headers, which buries the response BODY — the actual
+            # validation reason — past our 500-char reject_reason cap (and the
+            # toast). Surface the body first so the real reason survives, and
+            # log the full detail (untruncated) for debugging.
+            status = getattr(exc, "status", None)
+            reason = getattr(exc, "reason", None)
+            body = getattr(exc, "body", None)
+            log.warning(
+                "SnapTrade place_mleg_order failed: status=%s reason=%s "
+                "legs=%s order_type=%s limit=%s body=%s",
+                status, reason, kwargs.get("legs"), kwargs.get("order_type"),
+                kwargs.get("limit_price"), body,
+            )
+            detail = (str(body).strip() if body else str(reason or exc))[:300]
+            raise RuntimeError(f"SnapTrade place_mleg_order: {detail}") from exc
 
         body = getattr(resp, "body", resp)
         order_id = _attr(body, "brokerage_order_id", "id", "trade_id")
