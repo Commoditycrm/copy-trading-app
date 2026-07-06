@@ -192,8 +192,8 @@ def _unfollow(
             type="trader.unfollowed_you",
             message=(
                 f"{trader_label} has removed you from their subscribers. "
-                f"You will not receive new copy trades from them. Existing "
-                f"positions in your account are not affected."
+                f"You will not receive new copy trades from them. Please "
+                f"manage all existing positions in your account yourself."
             ),
             metadata={
                 "trader_id": str(trader.id),

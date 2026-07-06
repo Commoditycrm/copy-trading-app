@@ -16,6 +16,8 @@ export default function SubscribersPage() {
   const [confirming, setConfirming] = useState<{ ids: string[]; label: string } | null>(null);
   const [removing, setRemoving] = useState(false);
   const [search, setSearch] = useState("");
+  // Follow policy: null until loaded, then true = auto-allow, false = require approval.
+  const [autoApprove, setAutoApprove] = useState<boolean | null>(null);
 
   async function load() {
     try { setRows(await api<SubscriberSummary[]>("/api/subscribers")); }
@@ -23,6 +25,29 @@ export default function SubscribersPage() {
     finally { setLoading(false); }
   }
   useEffect(() => { load(); }, []);
+
+  // Load the trader's current follow policy for the dropdown.
+  useEffect(() => {
+    api<{ auto_approve_follows: boolean }>("/api/settings/trader")
+      .then(s => setAutoApprove(!!s.auto_approve_follows))
+      .catch(() => {});
+  }, []);
+
+  async function setFollowPolicy(auto: boolean) {
+    const prev = autoApprove;
+    setAutoApprove(auto); // optimistic
+    try {
+      await api("/api/settings/trader", {
+        method: "PATCH", body: JSON.stringify({ auto_approve_follows: auto }),
+      });
+      notify.success(auto
+        ? "Auto-allow on — anyone can follow you without approval"
+        : "Follow requests now require your approval");
+    } catch (e) {
+      setAutoApprove(prev);
+      notify.fromError(e, "Could not update follow policy");
+    }
+  }
 
   // Drop selections that point at rows no longer present (e.g. after a refresh
   // or bulk delete). Keeps "Delete selected (N)" honest.
@@ -131,22 +156,37 @@ export default function SubscribersPage() {
           </div>
         )}
 
-        {/* Right: search */}
-        <div className="relative ml-auto">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search name or email…"
-            className="pl-8 pr-8 py-1.5 text-sm w-52 sm:w-64"
-            aria-label="Search subscribers"
-          />
-          {search && (
-            <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
-              className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
-              <X size={14} />
-            </button>
-          )}
+        {/* Right: follow policy + search */}
+        <div className="flex items-center gap-2 ml-auto">
+          {/* Follow policy — auto-allow lets subscribers follow with no request. */}
+          <select
+            value={autoApprove ? "auto" : "approval"}
+            onChange={(e) => setFollowPolicy(e.target.value === "auto")}
+            disabled={autoApprove === null}
+            className="text-sm px-2.5 py-1.5 rounded-lg cursor-pointer disabled:opacity-50"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            title="Control who can follow you"
+            aria-label="Follow policy"
+          >
+            <option value="approval">Follow: require approval</option>
+            <option value="auto">Follow: auto-allow</option>
+          </select>
+          <div className="relative">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search name or email…"
+              className="pl-8 pr-8 py-1.5 text-sm w-52 sm:w-64"
+              aria-label="Search subscribers"
+            />
+            {search && (
+              <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
+                className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
+                <X size={14} />
+              </button>
+            )}
+          </div>
         </div>
       </div>
 

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import client_ip, require_subscriber, require_trader
 from app.database import get_db
 from app.models.follow_request import FollowRequest, FollowRequestStatus
-from app.models.settings import SubscriberSettings
+from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.follow import FollowRequestCreate, FollowRequestOut
 from app.services import audit, cache, notifications
@@ -77,6 +77,34 @@ def create_follow_request(
 
     if existing and existing.status == FollowRequestStatus.APPROVED:
         return _to_out(existing, trader=trader)
+
+    # Auto-allow traders: no approval step — record the pair as approved right
+    # away (idempotent) and skip the trader notification. The subscriber then
+    # follows directly; settings.follow_trader also permits it via the trader's
+    # auto_approve_follows flag.
+    ts = db.get(TraderSettings, trader.id)
+    if ts and ts.auto_approve_follows:
+        if existing:
+            existing.status = FollowRequestStatus.APPROVED
+            existing.decided_at = datetime.now(timezone.utc)
+            fr = existing
+        else:
+            fr = FollowRequest(
+                subscriber_id=user.id, trader_id=trader.id,
+                status=FollowRequestStatus.APPROVED,
+                decided_at=datetime.now(timezone.utc),
+            )
+            db.add(fr)
+        db.flush()
+        audit.record(
+            db, actor_user_id=user.id, action="follow.auto_approved",
+            entity_type="follow_request", entity_id=fr.id,
+            metadata={"trader_id": str(trader.id)},
+            ip_address=client_ip(request),
+        )
+        db.commit()
+        db.refresh(fr)
+        return _to_out(fr, trader=trader)
 
     if existing:
         # Pending (idempotent re-ask) or rejected (re-open) → pending.
