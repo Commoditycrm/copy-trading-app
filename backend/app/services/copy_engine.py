@@ -40,7 +40,7 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
@@ -508,15 +508,54 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             scaled = _scale_quantity(
                 trader_order.quantity, sub.multiplier, acct.supports_fractional
             )
-            # Defense-in-depth: never mirror a CLOSE larger than the subscriber
-            # actually holds. A position desync (e.g. an earlier open that never
-            # filled on their account, or a multiplier that put them out of step
-            # with the trader) would otherwise make the broker reject the whole
-            # close with "No matching position to close". Clamp to their net
-            # filled position for this contract so the close flattens what they
-            # hold and no more. is_closing is set by the broker listeners (e.g.
-            # SnapTrade's SELL_TO_CLOSE); non-close orders are never touched.
-            if trader_order.is_closing and scaled > 0:
+            # ── Open vs. close detection (option-aware) ────────────────────
+            # For OPTIONS the broker action must be SELL_TO_CLOSE /
+            # BUY_TO_CLOSE when the leg reduces a held position and
+            # SELL_TO_OPEN / BUY_TO_OPEN otherwise (see snaptrade
+            # `_option_action`). The upstream `is_closing` flag is NOT
+            # reliable — the SnapTrade listener derives it from an action
+            # string the brokerage often reports as a bare "BUY"/"SELL"
+            # (no _TO_OPEN/_TO_CLOSE suffix), and the app's own close
+            # endpoints don't set it at all. Trusting it made mirrored
+            # option SELLs go out as SELL_TO_OPEN and get rejected with
+            # "No matching position to close" — the position never closed
+            # for the subscriber (real-money loss; see the close incident).
+            #
+            # So for options we decide open/close from what the subscriber
+            # actually HOLDS: if this leg reduces a net position they hold
+            # in that exact contract, it's a close — force is_closing True
+            # and clamp to the held quantity. If they hold nothing to
+            # reduce, treat it as an open (respect the trader's flag) so a
+            # legitimate opening short still goes out as *_TO_OPEN.
+            #
+            # For non-options (stocks) there's no open/close action
+            # distinction at the broker, so we keep the prior behaviour:
+            # only clamp an explicit close, and never touch a plain sell
+            # (which could be a legitimate short).
+            child_is_closing = trader_order.is_closing
+            if trader_order.instrument_type == InstrumentType.OPTION and scaled > 0:
+                closeable = _closeable_quantity(db, sub.user_id, trader_order)
+                if closeable > 0:
+                    child_is_closing = True
+                    if closeable < scaled:
+                        audit.record(
+                            db,
+                            actor_user_id=sub.user_id,
+                            action="copy.close_clamped",
+                            entity_type="order",
+                            entity_id=trader_order.id,
+                            metadata={
+                                "requested_qty": str(scaled),
+                                "held_qty": str(closeable),
+                                "symbol": trader_order.symbol,
+                                "broker_account_id": str(acct.id),
+                                "detected": "held_position",
+                            },
+                        )
+                        scaled = closeable
+            elif trader_order.is_closing and scaled > 0:
+                # Non-option close: clamp to the subscriber's held position
+                # so an oversized close doesn't get rejected wholesale.
                 closeable = _closeable_quantity(db, sub.user_id, trader_order)
                 if closeable < scaled:
                     audit.record(
@@ -569,7 +608,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 option_expiry=trader_order.option_expiry,
                 option_strike=trader_order.option_strike,
                 option_right=trader_order.option_right,
-                is_closing=trader_order.is_closing,
+                is_closing=child_is_closing,
                 side=trader_order.side,
                 order_type=trader_order.order_type,
                 quantity=scaled,
