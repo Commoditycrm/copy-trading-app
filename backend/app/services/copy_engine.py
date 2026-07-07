@@ -213,6 +213,184 @@ def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decima
     return closeable if closeable > 0 else Decimal(0)
 
 
+# Statuses a mirror can be modified in: fully working AND untouched by any
+# fill. PARTIALLY_FILLED is deliberately excluded — cancel+replace of the full
+# new quantity would double-count the portion that already filled.
+_MODIFIABLE_MIRROR_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+)
+
+
+def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
+    """A trader modified their still-working order (new limit / stop / qty /
+    type) at the broker. Propagate that to every still-working, unfilled
+    subscriber mirror via cancel-and-replace: cancel the old broker order, place
+    a replacement with the re-scaled terms, and update the mirror row in place.
+
+    Broker adapters expose no native "replace", so cancel+replace is the only
+    broker-agnostic path (Alpaca / SnapTrade / IBKR all support cancel + place).
+    Modelled on ``trades._run_cancel_fanout_in_background``: runs in a worker/
+    background thread with a small pool for the blocking SDK calls, and per-
+    mirror failures are audited, never raised.
+
+    Mirrors that are partially/fully filled or terminal are skipped — they
+    can't be safely modified by cancel+replace."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    with SessionLocal() as db:
+        trader_order = db.get(Order, trader_order_id)
+        if trader_order is None:
+            return
+        children = list(db.execute(
+            select(Order).where(
+                Order.parent_order_id == trader_order_id,
+                Order.status.in_(_MODIFIABLE_MIRROR_STATUSES),
+                func.coalesce(Order.filled_quantity, 0) == 0,
+            )
+        ).scalars())
+        if not children:
+            return
+
+        pending: list[tuple[Order, Any, BrokerOrderRequest]] = []
+        for child in children:
+            if not child.broker_order_id:
+                continue  # never reached the broker — nothing to replace
+            acct = db.get(BrokerAccount, child.broker_account_id)
+            if acct is None:
+                continue
+
+            # Re-scale off the trader's NEW quantity with the subscriber's
+            # current multiplier, then apply the same close-clamp the original
+            # fanout used so a modify can't oversell what they actually hold.
+            sub = db.get(SubscriberSettings, child.user_id)
+            multiplier = sub.multiplier if sub is not None else Decimal("1.000")
+            new_qty = _scale_quantity(
+                trader_order.quantity, multiplier, acct.supports_fractional
+            )
+            if trader_order.is_closing and new_qty > 0:
+                closeable = _closeable_quantity(db, child.user_id, trader_order)
+                if closeable < new_qty:
+                    new_qty = closeable
+
+            new_type = trader_order.order_type
+            new_limit = trader_order.limit_price
+            new_stop = trader_order.stop_price
+
+            # No-op if nothing the subscriber's broker cares about changed, or
+            # the clamp wiped the quantity to zero (leave the resting order be).
+            if (
+                child.quantity == new_qty
+                and child.order_type == new_type
+                and child.limit_price == new_limit
+                and child.stop_price == new_stop
+            ) or new_qty <= 0:
+                continue
+
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=child.user_id,
+                    action="order.mirror_modify_creds_error",
+                    entity_type="order", entity_id=child.id,
+                    metadata={"parent_order_id": str(trader_order_id), "error": str(exc)[:300]},
+                )
+                continue
+
+            pending.append((child, adapter, BrokerOrderRequest(
+                instrument_type=child.instrument_type,
+                symbol=child.symbol,
+                side=child.side,
+                order_type=new_type,
+                quantity=new_qty,
+                limit_price=new_limit,
+                stop_price=new_stop,
+                take_profit_price=None,
+                stop_loss_price=None,
+                option_expiry=child.option_expiry,
+                option_strike=child.option_strike,
+                option_right=child.option_right,
+                is_closing=child.is_closing,
+                client_order_id=str(child.id),
+            )))
+
+        if not pending:
+            return
+
+        def _replace(item: tuple[Order, Any, BrokerOrderRequest]):
+            ch, ad, rq = item
+            # Cancel the old resting order, THEN place the replacement. A cancel
+            # failure almost always means the mirror just filled — abort the
+            # replace so we never stack a duplicate order on top of a fill.
+            try:
+                ad.cancel_order(ch.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                return ch.id, None, f"cancel_failed: {exc}"[:300]
+            try:
+                return ch.id, ad.place_order(rq), None
+            except Exception as exc:  # noqa: BLE001
+                return ch.id, None, f"replace_failed: {exc}"[:300]
+
+        with ThreadPoolExecutor(max_workers=min(32, len(pending))) as pool:
+            results = list(pool.map(_replace, pending))
+
+        req_by_id = {ch.id: rq for ch, _ad, rq in pending}
+        for child_id, resp, err in results:
+            ch = db.get(Order, child_id)
+            if ch is None:
+                continue
+            if resp is not None:
+                rq = req_by_id[child_id]
+                ch.order_type = rq.order_type
+                ch.quantity = rq.quantity
+                ch.limit_price = rq.limit_price
+                ch.stop_price = rq.stop_price
+                ch.broker_order_id = resp.broker_order_id
+                ch.status = resp.status
+                ch.submitted_at = resp.submitted_at
+                ch.filled_quantity = resp.filled_quantity
+                ch.filled_avg_price = resp.filled_avg_price
+                ch.closed_at = None
+                ch.redis_published_at = datetime.now(timezone.utc)
+                audit.record(
+                    db, actor_user_id=ch.user_id, action="order.mirror_modified",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={
+                        "parent_order_id": str(trader_order_id),
+                        "broker_order_id": resp.broker_order_id,
+                        "order_type": rq.order_type.value,
+                        "quantity": str(rq.quantity),
+                        "limit_price": str(rq.limit_price) if rq.limit_price is not None else None,
+                        "stop_price": str(rq.stop_price) if rq.stop_price is not None else None,
+                    },
+                )
+                events.publish(ch.user_id, _order_event("order.copy_submitted", ch))
+            else:
+                # Cancel failed → OLD order is still live (subscriber keeps a
+                # working order, just with stale terms) — leave status alone.
+                # Replace failed AFTER a successful cancel → the mirror is now
+                # gone; mark it canceled so our state is truthful.
+                lost = err is not None and err.startswith("replace_failed")
+                if lost:
+                    ch.status = OrderStatus.CANCELED
+                    ch.closed_at = datetime.now(timezone.utc)
+                    events.publish(ch.user_id, _order_event("order.cancelled", ch))
+                audit.record(
+                    db, actor_user_id=ch.user_id, action="order.mirror_modify_failed",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={
+                        "parent_order_id": str(trader_order_id),
+                        "broker_order_id": ch.broker_order_id,
+                        "error": err,
+                        "old_order_lost": lost,
+                    },
+                )
+        db.commit()
+
+
 def _leg_direction(side: OrderSide, leg: str) -> Decimal:
     """+1 when a correctly-placed leg sits ABOVE entry, -1 when BELOW.
     Mirrors the frontend InlineBracketCell convention:
@@ -951,11 +1129,21 @@ def _order_event(event_type: str, order: Order) -> dict[str, Any]:
             "side": order.side.value,
             "order_type": order.order_type.value,
             "quantity": str(order.quantity),
+            # Order TERMS — carried so the frontend reflects a broker-side
+            # MODIFY (new limit/stop/qty/type) instantly on the SSE frame,
+            # instead of waiting for the ~1.5s reconcile refetch.
+            "limit_price": str(order.limit_price) if order.limit_price is not None else None,
+            "stop_price": str(order.stop_price) if order.stop_price is not None else None,
             "filled_quantity": str(order.filled_quantity or 0),
             "filled_avg_price": str(order.filled_avg_price) if order.filled_avg_price else None,
             "status": order.status.value,
             "broker_order_id": order.broker_order_id,
             "instrument_type": order.instrument_type.value,
+            # Option fields — let the Order History Call/Put + Expiry columns
+            # render immediately for a freshly-arrived option order.
+            "option_expiry": order.option_expiry.isoformat() if order.option_expiry else None,
+            "option_strike": str(order.option_strike) if order.option_strike is not None else None,
+            "option_right": order.option_right.value if order.option_right else None,
             "created_at": order.created_at.isoformat() if order.created_at else None,
             "reject_reason": order.reject_reason,
         },

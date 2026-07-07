@@ -405,10 +405,24 @@ def _poll_once(
             if not broker_order_id:
                 continue
             status_str = str(_attr(o, "status", default="")).upper()
+            # Dedup fingerprint = status + the mutable order TERMS (type / qty /
+            # limit / stop). A broker-side MODIFY (e.g. Webull qty 2→3, limit
+            # 9→9.5) leaves the STATUS unchanged, so a status-only dedup would
+            # skip it here and the change would never reach _persist_and_fanout's
+            # update path. Folding the terms into the fingerprint makes a modify
+            # look changed enough to re-dispatch, where it's applied to our row
+            # and cascaded to subscriber mirrors.
+            fingerprint = "|".join((
+                status_str,
+                str(_attr(o, "order_type", default="")),
+                str(_attr(o, "total_quantity", "units", default="")),
+                str(_attr(o, "limit_price", "price", default="")),
+                str(_attr(o, "stop_price", "stop", default="")),
+            ))
             prev = seen.get(broker_order_id)
-            if prev == status_str:
+            if prev == fingerprint:
                 continue
-            seen[broker_order_id] = status_str
+            seen[broker_order_id] = fingerprint
 
             _persist_and_fanout(
                 trader_user_id, broker_account_id, broker_order_id, status_str, o
@@ -468,6 +482,28 @@ def _persist_and_fanout(
             status_changed = existing.status != status_enum
             if status_changed:
                 existing.status = status_enum
+            # Reflect broker-side MODIFICATIONS (limit price / stop / qty /
+            # type) while the order is still working. Without this the row keeps
+            # the terms it was first observed with, so a modify at Alpaca/Webull
+            # never shows up in our app. Guarded to working statuses so a
+            # terminal order's final terms are never rewritten by a late poll.
+            # Prices are only overwritten when SnapTrade actually reports one, so
+            # a sparse payload can't wipe a good limit/stop back to null.
+            terms_changed = False
+            if status_enum in _WORKING_STATUSES:
+                n_type, n_qty, n_limit, n_stop = _order_terms_from_snaptrade(order_obj)
+                if n_qty and existing.quantity != n_qty:
+                    existing.quantity = n_qty
+                    terms_changed = True
+                if existing.order_type != n_type:
+                    existing.order_type = n_type
+                    terms_changed = True
+                if n_limit is not None and existing.limit_price != n_limit:
+                    existing.limit_price = n_limit
+                    terms_changed = True
+                if n_stop is not None and existing.stop_price != n_stop:
+                    existing.stop_price = n_stop
+                    terms_changed = True
             fq = _attr(order_obj, "filled_units", "filled_quantity")
             if fq is not None:
                 try:
@@ -507,6 +543,22 @@ def _persist_and_fanout(
                         "snaptrade_listener: bracket emulator failed for order %s",
                         existing.id,
                     )
+            if terms_changed:
+                audit.record(
+                    db,
+                    actor_user_id=trader_user_id,
+                    action="listener.order_modified",
+                    entity_type="order",
+                    entity_id=existing.id,
+                    metadata={
+                        "broker": "snaptrade",
+                        "broker_order_id": broker_order_id,
+                        "order_type": existing.order_type.value,
+                        "quantity": str(existing.quantity),
+                        "limit_price": str(existing.limit_price) if existing.limit_price is not None else None,
+                        "stop_price": str(existing.stop_price) if existing.stop_price is not None else None,
+                    },
+                )
             db.commit()
             db.refresh(existing)
             events.publish(
@@ -533,6 +585,23 @@ def _persist_and_fanout(
                     )
                 else:
                     _cascade_cancel_to_mirrors(existing.id)
+            elif (
+                terms_changed
+                and existing.parent_order_id is None
+                and existing.fanned_out_to_subscribers
+            ):
+                # Trader MODIFIED a still-working order (new limit / stop / qty /
+                # type). Cascade the change to every still-working subscriber
+                # mirror via cancel-and-replace. Guarded to fanned-out root
+                # orders; the helper itself no-ops when there are no working
+                # mirrors. Committed above, so the new terms are visible to the
+                # fresh session the helper opens. Failures are audited, not raised.
+                try:
+                    copy_engine.propagate_modify_to_mirrors(existing.id)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "snaptrade-listener modify-cascade failed for %s", existing.id
+                    )
             return
 
         # Brand-new order — only act on working/terminal-success states.
@@ -612,6 +681,27 @@ def _persist_and_fanout(
                 db.commit()
 
 
+def _order_terms_from_snaptrade(
+    order_obj: Any,
+) -> tuple[OrderType, Decimal, Decimal | None, Decimal | None]:
+    """Extract the mutable order *terms* — (type, quantity, limit, stop) — from a
+    SnapTrade order payload. Shared by the insert path and the modify-detection
+    update path so both read these fields identically. SnapTrade reports the
+    order's CURRENT terms on every poll, so a broker-side modify surfaces here as
+    changed values."""
+    type_raw = str(_attr(order_obj, "order_type", default="")).capitalize()
+    order_type = {
+        "Market":    OrderType.MARKET,
+        "Limit":     OrderType.LIMIT,
+        "Stop":      OrderType.STOP,
+        "Stoplimit": OrderType.STOP_LIMIT,
+    }.get(type_raw, OrderType.MARKET)
+    qty = _to_dec(_attr(order_obj, "total_quantity", "units")) or Decimal(0)
+    limit_price = _to_dec(_attr(order_obj, "limit_price", "price"))
+    stop_price = _to_dec(_attr(order_obj, "stop_price", "stop"))
+    return order_type, qty, limit_price, stop_price
+
+
 def _insert_order_from_snaptrade(
     db: Any,
     trader_user_id: uuid.UUID,
@@ -637,17 +727,7 @@ def _insert_order_from_snaptrade(
     side = _BUY if "BUY" in side_raw else _SELL
     is_closing = "CLOSE" in side_raw
 
-    type_raw = str(_attr(order_obj, "order_type", default="")).capitalize()
-    order_type = {
-        "Market":    OrderType.MARKET,
-        "Limit":     OrderType.LIMIT,
-        "Stop":      OrderType.STOP,
-        "Stoplimit": OrderType.STOP_LIMIT,
-    }.get(type_raw, OrderType.MARKET)
-
-    qty = _to_dec(_attr(order_obj, "total_quantity", "units")) or Decimal(0)
-    limit_price = _to_dec(_attr(order_obj, "limit_price", "price"))
-    stop_price = _to_dec(_attr(order_obj, "stop_price", "stop"))
+    order_type, qty, limit_price, stop_price = _order_terms_from_snaptrade(order_obj)
     filled_q = _to_dec(_attr(order_obj, "filled_units", "filled_quantity")) or Decimal(0)
     filled_avg = _to_dec(_attr(order_obj, "execution_price", "filled_avg_price"))
     submitted_at = (

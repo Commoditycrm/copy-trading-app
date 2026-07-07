@@ -73,6 +73,16 @@ from app.services.listener_state import ListenerState, ListenerStatus
 log = logging.getLogger(__name__)
 
 
+# Statuses in which an order is still "working" at the broker — the only window
+# a MODIFY (Alpaca 'replaced') can arrive in. Used to gate term-change detection.
+_WORKING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
 # ── Public state surface ────────────────────────────────────────────────────
 #
 # Status itself lives in ``listener_state._status`` so the Webull listener
@@ -551,8 +561,11 @@ def _persist_and_fanout(
             if existing.broker_account_id != broker_account_id:
                 existing.broker_account_id = broker_account_id
             # We already know about this order (Trade Panel placement, or an
-            # earlier event for the same order). Just update status / fills.
-            _apply_event_to_existing(db, existing, alpaca_order, update, event_name)
+            # earlier event for the same order). Update status / fills, and
+            # detect a broker-side MODIFY (Alpaca 'replaced' → new terms).
+            terms_changed = _apply_event_to_existing(
+                db, existing, alpaca_order, update, event_name
+            )
             # Lifecycle: stamp the first WS sighting of this order (only on
             # first event; later events keep the original timestamp so the
             # field reflects the *initial* notification latency).
@@ -586,7 +599,65 @@ def _persist_and_fanout(
                     )
                 else:
                     _cascade_cancel_to_mirrors(existing.id)
+            elif (
+                terms_changed
+                and existing.parent_order_id is None
+                and existing.fanned_out_to_subscribers
+            ):
+                # Trader MODIFIED a still-working order (new limit / stop / qty /
+                # type). Cascade the change to every still-working subscriber
+                # mirror via cancel-and-replace. Guarded to fanned-out root
+                # orders; the helper no-ops when there are no working mirrors.
+                # Committed above, so the new terms are visible to the fresh
+                # session the helper opens. Failures are audited, not raised.
+                try:
+                    copy_engine.propagate_modify_to_mirrors(existing.id)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "alpaca-listener modify-cascade failed for %s", existing.id
+                    )
             return
+
+        # Alpaca REPLACE semantics: modifying an order creates a NEW broker order
+        # id (the original transitions to 'replaced'). The replacement carries a
+        # `replaces` field pointing at the original id. If that original is an
+        # order we already track, this is a MODIFY — repurpose the existing row
+        # onto the new id + new terms and cascade to subscriber mirrors, instead
+        # of inserting a duplicate parent + re-fanning-out. (SnapTrade keeps the
+        # same id and is handled by the in-place update branch above.)
+        replaces_id = getattr(alpaca_order, "replaces", None)
+        if replaces_id:
+            prior = db.execute(
+                select(Order)
+                .where(Order.broker_order_id == str(replaces_id))
+                .where(Order.user_id == trader_user_id)
+                .where(Order.parent_order_id.is_(None))
+                .order_by(Order.created_at)
+                .limit(1)
+            ).scalars().first()
+            if prior is not None:
+                terms_changed = _apply_event_to_existing(
+                    db, prior, alpaca_order, update, event_name
+                )
+                # Repurpose onto the new broker order id so future events and the
+                # subscriber-mirror reconcilers keep matching the live order.
+                prior.broker_order_id = broker_order_id
+                if prior.socket_received_at is None:
+                    prior.socket_received_at = socket_received_at
+                prior.redis_published_at = datetime.now(timezone.utc)
+                db.commit()
+                db.refresh(prior)
+                events.publish(
+                    trader_user_id, copy_engine._order_event("order.placed", prior)  # noqa: SLF001
+                )
+                if terms_changed and prior.fanned_out_to_subscribers:
+                    try:
+                        copy_engine.propagate_modify_to_mirrors(prior.id)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "alpaca-listener modify-cascade failed for %s", prior.id
+                        )
+                return
 
         # Brand-new order: trader placed it on Alpaca directly, outside our app.
         # Only act on "new" / "fill" / "partial_fill" — terminal events on an
@@ -684,9 +755,13 @@ def _persist_and_fanout(
 
 def _apply_event_to_existing(
     db: Any, order: Order, alpaca_order: Any, update: Any, event_name: str
-) -> None:
+) -> bool:
     """Update an existing Order row from a TradeUpdate event (status,
-    filled_qty, filled_avg_price, closed_at)."""
+    filled_qty, filled_avg_price, closed_at).
+
+    Returns True when the order's *terms* (limit / stop / qty / type) changed —
+    i.e. the trader MODIFIED a still-working order (Alpaca emits a 'replaced'
+    event) — so the caller can cascade the change to subscriber mirrors."""
     try:
         new_status = _STATUS_IN.get(alpaca_order.status, order.status)
     except Exception:  # noqa: BLE001
@@ -699,6 +774,38 @@ def _apply_event_to_existing(
     )
     if new_status != order.status:
         order.status = new_status
+    # Reflect broker-side MODIFICATIONS (limit / stop / qty / type) while the
+    # order is still working. Without this the row keeps the terms it was first
+    # observed with, so a modify at Alpaca (a 'replaced' event) never shows up in
+    # our app. Prices are only overwritten when Alpaca actually reports one, so a
+    # sparse event can't wipe a good limit/stop back to null.
+    terms_changed = False
+    if new_status in _WORKING_STATUSES:
+        try:
+            type_raw = str(getattr(alpaca_order.order_type, "value", alpaca_order.order_type)).lower()
+            n_type = {
+                "market": OrderType.MARKET,
+                "limit": OrderType.LIMIT,
+                "stop": OrderType.STOP,
+                "stop_limit": OrderType.STOP_LIMIT,
+            }.get(type_raw, order.order_type)
+            n_qty = Decimal(str(alpaca_order.qty)) if alpaca_order.qty is not None else None
+            n_limit = Decimal(str(alpaca_order.limit_price)) if getattr(alpaca_order, "limit_price", None) else None
+            n_stop = Decimal(str(alpaca_order.stop_price)) if getattr(alpaca_order, "stop_price", None) else None
+            if n_qty is not None and order.quantity != n_qty:
+                order.quantity = n_qty
+                terms_changed = True
+            if order.order_type != n_type:
+                order.order_type = n_type
+                terms_changed = True
+            if n_limit is not None and order.limit_price != n_limit:
+                order.limit_price = n_limit
+                terms_changed = True
+            if n_stop is not None and order.stop_price != n_stop:
+                order.stop_price = n_stop
+                terms_changed = True
+        except Exception:  # noqa: BLE001
+            log.exception("alpaca_listener: failed to parse modified terms for %s", order.id)
     fq = getattr(alpaca_order, "filled_qty", None)
     if fq is not None:
         try:
@@ -738,6 +845,8 @@ def _apply_event_to_existing(
             log.exception(
                 "alpaca_listener: bracket emulator failed for order %s", order.id
             )
+
+    return terms_changed
 
 
 def _insert_order_from_alpaca(
