@@ -40,18 +40,6 @@ function matchesStatusTab(status: OrderStatus, tab: StatusTab): boolean {
   }
 }
 
-/** Stable key for matching an order to a held position (same scheme the
- *  Positions table uses). Options key on the full contract; stocks on symbol. */
-function orderPosKey(
-  acctId: string, instrument: string, symbol: string,
-  expiry: string | null, strike: string | null, right: string | null,
-): string {
-  const normStrike = strike == null ? "" : (Number.isFinite(Number(strike)) ? String(Number(strike)) : strike);
-  return instrument === "option"
-    ? `${acctId}:OPT:${symbol.toUpperCase()}:${(expiry ?? "").slice(0, 10)}:${normStrike}:${right ?? ""}`
-    : `${acctId}:STK:${symbol.toUpperCase()}`;
-}
-
 function fmt(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined) return "—";
   const v = Number(n);
@@ -346,20 +334,6 @@ export default function TradesPage() {
     }
   }
 
-  // Keys of currently-held positions. Used to suppress the Cancel button on an
-  // order that has effectively filled into an open position — even if our own
-  // status is briefly stale from fill-sync lag (the reason a "filled" order
-  // could otherwise still show a Cancel button).
-  const heldKeys = useMemo(() => new Set(
-    positions
-      .filter(p => Number(p.quantity) !== 0)
-      .map(p => orderPosKey(p.broker_account_id, p.instrument_type, p.symbol, p.option_expiry, p.option_strike, p.option_right))
-  ), [positions]);
-  const isHeld = useCallback((o: Order) => heldKeys.has(orderPosKey(
-    o.broker_account_id ?? "", o.instrument_type, o.symbol,
-    o.option_expiry, o.option_strike, o.option_right,
-  )), [heldKeys]);
-
   // Base set shared by the tab counts and the visible rows: every order EXCEPT
   // resting/cancelled/rejected bracket exit legs (internal protective orders,
   // not trades the user placed — a filled leg IS a real close, so keep those).
@@ -564,12 +538,16 @@ export default function TradesPage() {
               )}
               {!loading && rows.map(o => {
                 const isOpen = OPEN_STATUSES.includes(o.status);
-                // Only offer Cancel for genuinely-working orders that haven't
-                // already filled into a held position. The isHeld guard covers
-                // the fill-sync lag window where an order has really filled at
-                // the broker but our status is briefly still "accepted" — so a
-                // filled order that's now a position never shows a Cancel.
-                const canCancel = isOpen && !isHeld(o);
+                // Cancel is available for genuinely-working orders that aren't
+                // already FULLY filled. We key off the order's own fill — NOT
+                // whether we hold a position in the same symbol — so a resting
+                // order stays cancellable even when a position is already open
+                // in that symbol. A fully-filled order (status stale to
+                // "accepted", but filled_quantity caught up) still hides Cancel.
+                const orderQty = Number(o.quantity) || 0;
+                const filledQty = Number(o.filled_quantity) || 0;
+                const fullyFilled = orderQty > 0 && filledQty >= orderQty;
+                const canCancel = isOpen && !fullyFilled;
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;

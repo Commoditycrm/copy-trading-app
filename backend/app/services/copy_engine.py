@@ -391,6 +391,182 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
+def cancel_and_replace_mirrors_for_modify(
+    old_trader_order_id: uuid.UUID, new_trader_order_id: uuid.UUID
+) -> None:
+    """Trader modified a working order, represented app-wide as cancel-old +
+    place-new. For every still-working, UNFILLED subscriber mirror of the OLD
+    trader order: cancel it at the subscriber's broker, mark that mirror
+    CANCELED, and place a brand-NEW mirror order (a fresh row) linked to the NEW
+    trader order with the re-scaled modified terms.
+
+    Differs from ``propagate_modify_to_mirrors`` (which updates the mirror row
+    in place): here the old mirror stays in history as CANCELED and the new
+    order is a separate row — matching the trader-side cancel+new representation.
+
+    Only touches fully-working, unfilled mirrors: a partially/fully filled
+    mirror is a real (partial) position, and placing a new order on top would
+    double the subscriber's exposure. Per-mirror failures are audited, never
+    raised. A cancel failure aborts that mirror's replace (the old order is
+    likely mid-fill) so we never stack a new order on a fill."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+    with SessionLocal() as db:
+        new_order = db.get(Order, new_trader_order_id)
+        if new_order is None:
+            return
+        children = list(db.execute(
+            select(Order).where(
+                Order.parent_order_id == old_trader_order_id,
+                Order.status.in_(_MODIFIABLE_MIRROR_STATUSES),
+                func.coalesce(Order.filled_quantity, 0) == 0,
+            )
+        ).scalars())
+        if not children:
+            return
+
+        # Phase 1 (session thread): build the plan. Pre-generate the NEW mirror
+        # id so it can be the broker client_order_id, but only INSERT the row in
+        # phase 3 on success — a cancel failure leaves no phantom row behind.
+        plan: list[tuple[Order, Any, BrokerOrderRequest, uuid.UUID]] = []
+        for child in children:
+            if not child.broker_order_id:
+                continue
+            acct = db.get(BrokerAccount, child.broker_account_id)
+            if acct is None:
+                continue
+            sub = db.get(SubscriberSettings, child.user_id)
+            multiplier = sub.multiplier if sub is not None else Decimal("1.000")
+            new_qty = _scale_quantity(
+                new_order.quantity, multiplier, acct.supports_fractional
+            )
+            if new_order.is_closing and new_qty > 0:
+                closeable = _closeable_quantity(db, child.user_id, new_order)
+                if closeable < new_qty:
+                    new_qty = closeable
+            if new_qty <= 0:
+                continue
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=child.user_id,
+                    action="order.mirror_modify_creds_error",
+                    entity_type="order", entity_id=child.id,
+                    metadata={"parent_order_id": str(old_trader_order_id), "error": str(exc)[:300]},
+                )
+                continue
+            new_child_id = uuid.uuid4()
+            plan.append((child, adapter, BrokerOrderRequest(
+                instrument_type=child.instrument_type,
+                symbol=child.symbol,
+                side=child.side,
+                order_type=new_order.order_type,
+                quantity=new_qty,
+                limit_price=new_order.limit_price,
+                stop_price=new_order.stop_price,
+                take_profit_price=None,
+                stop_loss_price=None,
+                option_expiry=child.option_expiry,
+                option_strike=child.option_strike,
+                option_right=child.option_right,
+                is_closing=child.is_closing,
+                client_order_id=str(new_child_id),
+            ), new_child_id))
+
+        if not plan:
+            return
+
+        # Phase 2 (thread pool): cancel the old mirror, then place the new one.
+        def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
+            old_ch, ad, rq, new_id = item
+            try:
+                ad.cancel_order(old_ch.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+            try:
+                return old_ch.id, new_id, ad.place_order(rq), None
+            except Exception as exc:  # noqa: BLE001
+                return old_ch.id, new_id, None, f"place_failed: {exc}"[:300]
+
+        with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
+            results = list(pool.map(_cancel_then_place, plan))
+
+        # Phase 3 (session thread): apply.
+        req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
+        for old_id, new_id, resp, err in results:
+            old_ch = db.get(Order, old_id)
+            if old_ch is None:
+                continue
+            rq = req_by_new_id[new_id]
+            if err is not None and err.startswith("cancel_failed"):
+                # Old order still live (likely mid-fill) — leave it, place nothing.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id, action="order.mirror_modify_cancel_failed",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(old_trader_order_id), "broker_order_id": old_ch.broker_order_id, "error": err},
+                )
+                continue
+            # Cancel succeeded — the old mirror is gone at the broker.
+            old_ch.status = OrderStatus.CANCELED
+            old_ch.closed_at = datetime.now(timezone.utc)
+            events.publish(old_ch.user_id, _order_event("order.cancelled", old_ch))
+            if resp is None:
+                # Replace failed after a successful cancel — subscriber lost the
+                # order. Truthfully leave the old mirror canceled; no new row.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id, action="order.mirror_modify_failed",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(old_trader_order_id), "error": err, "old_order_lost": True},
+                )
+                continue
+            # Place succeeded — insert the NEW mirror row linked to the NEW
+            # trader order, carrying the broker's result.
+            new_child = Order(
+                id=new_id,
+                user_id=old_ch.user_id,
+                broker_account_id=old_ch.broker_account_id,
+                parent_order_id=new_trader_order_id,
+                instrument_type=old_ch.instrument_type,
+                symbol=old_ch.symbol,
+                option_expiry=old_ch.option_expiry,
+                option_strike=old_ch.option_strike,
+                option_right=old_ch.option_right,
+                is_closing=old_ch.is_closing,
+                side=old_ch.side,
+                order_type=rq.order_type,
+                quantity=rq.quantity,
+                limit_price=rq.limit_price,
+                stop_price=rq.stop_price,
+                take_profit_price=None,
+                stop_loss_price=None,
+                status=resp.status,
+                broker_order_id=resp.broker_order_id,
+                filled_quantity=resp.filled_quantity,
+                filled_avg_price=resp.filled_avg_price,
+                submitted_at=resp.submitted_at,
+                broker_accepted_at=resp.submitted_at or datetime.now(timezone.utc),
+                redis_published_at=datetime.now(timezone.utc),
+            )
+            db.add(new_child)
+            audit.record(
+                db, actor_user_id=new_child.user_id, action="order.mirror_replaced_on_modify",
+                entity_type="order", entity_id=new_child.id,
+                metadata={
+                    "old_mirror_id": str(old_ch.id),
+                    "old_parent_order_id": str(old_trader_order_id),
+                    "new_parent_order_id": str(new_trader_order_id),
+                    "broker_order_id": resp.broker_order_id,
+                    "quantity": str(rq.quantity),
+                    "limit_price": str(rq.limit_price) if rq.limit_price is not None else None,
+                },
+            )
+            db.flush()
+            events.publish(new_child.user_id, _order_event("order.copy_submitted", new_child))
+        db.commit()
+
+
 def _leg_direction(side: OrderSide, leg: str) -> Decimal:
     """+1 when a correctly-placed leg sits ABOVE entry, -1 when BELOW.
     Mirrors the frontend InlineBracketCell convention:
