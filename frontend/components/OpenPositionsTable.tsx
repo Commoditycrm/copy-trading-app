@@ -364,7 +364,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       );
     };
 
-    const COLSPAN = 18;
+    const COLSPAN = 19;
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -417,6 +417,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Symbol" sortKey="symbol" />
                   <Th label="Expiry Date" />
                   <Th label="Type" />
+                  <Th label="Call/Put" />
                   <Th label="Side" />
                   <Th label="Quantity" sortKey="quantity" />
                   <Th label="Close %" />
@@ -476,6 +477,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         </td>
                         <td className="px-5 py-3.5">
                           <span className="chip capitalize">{p.instrument_type}</span>
+                        </td>
+                        <td className="px-5 py-3.5 capitalize font-semibold whitespace-nowrap" style={{
+                          color: p.instrument_type === "option" && p.option_right
+                            ? (p.option_right === "call" ? "var(--good)" : "var(--bad)")
+                            : "var(--faint)",
+                        }}>
+                          {p.instrument_type === "option" && p.option_right ? p.option_right : "—"}
                         </td>
                         <td className="px-5 py-3.5">
                           <span

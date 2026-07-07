@@ -210,13 +210,22 @@ export default function TradesPage() {
         side: incoming.side as Order["side"],
         order_type: incoming.order_type as Order["order_type"],
         quantity: incoming.quantity,
-        limit_price: idx >= 0 ? cur[idx].limit_price : null,
-        stop_price: idx >= 0 ? cur[idx].stop_price : null,
+        // Prefer the event's terms (so a broker-side MODIFY shows the new
+        // limit/stop immediately), falling back to the existing row when the
+        // event omits them. `?? undefined` guards older payloads that lack
+        // the field entirely (undefined) vs a real null clear.
+        limit_price: incoming.limit_price !== undefined
+          ? incoming.limit_price : (idx >= 0 ? cur[idx].limit_price : null),
+        stop_price: incoming.stop_price !== undefined
+          ? incoming.stop_price : (idx >= 0 ? cur[idx].stop_price : null),
         take_profit_price: idx >= 0 ? cur[idx].take_profit_price : null,
         stop_loss_price: idx >= 0 ? cur[idx].stop_loss_price : null,
-        option_expiry: idx >= 0 ? cur[idx].option_expiry : null,
-        option_strike: idx >= 0 ? cur[idx].option_strike : null,
-        option_right: idx >= 0 ? cur[idx].option_right : null,
+        option_expiry: incoming.option_expiry !== undefined
+          ? incoming.option_expiry : (idx >= 0 ? cur[idx].option_expiry : null),
+        option_strike: incoming.option_strike !== undefined
+          ? incoming.option_strike : (idx >= 0 ? cur[idx].option_strike : null),
+        option_right: incoming.option_right !== undefined
+          ? incoming.option_right : (idx >= 0 ? cur[idx].option_right : null),
         status: incoming.status as Order["status"],
         broker_order_id: incoming.broker_order_id,
         filled_quantity: incoming.filled_quantity,
@@ -406,7 +415,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 16;
+  const COLSPAN = 17;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -493,6 +502,7 @@ export default function TradesPage() {
                 <Th label="Symbol" sortKey="symbol" />
                 <Th label="Expiry Date" />
                 <Th label="Type" />
+                <Th label="Call/Put" />
                 <Th label="Side" />
                 <Th label="Quantity" sortKey="quantity" />
                 <Th label="Actions" />
@@ -554,6 +564,13 @@ export default function TradesPage() {
                         {o.option_expiry ? fmtDate(o.option_expiry) : "—"}
                       </td>
                       <td className="px-5 py-3.5"><span className="chip capitalize">{o.instrument_type}</span></td>
+                      <td className="px-5 py-3.5 capitalize font-semibold whitespace-nowrap" style={{
+                        color: o.instrument_type === "option" && o.option_right
+                          ? (o.option_right === "call" ? "var(--good)" : "var(--bad)")
+                          : "var(--faint)",
+                      }}>
+                        {o.instrument_type === "option" && o.option_right ? o.option_right : "—"}
+                      </td>
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: buy ? "var(--good-soft)" : "var(--bad-soft)", color: buy ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
                           {o.side}
