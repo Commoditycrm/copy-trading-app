@@ -35,11 +35,43 @@ function RoleBadge({ role }: { role: string }) {
   );
 }
 
+type SortKey = "email" | "role" | "business_name" | "status" | "created_at";
+
+// Clickable header cell. Shows a neutral ↕ when inactive and the current
+// direction when it's the active sort column.
+function SortableTh({
+  label, colKey, sortKey, sortDir, onSort,
+}: {
+  label: string;
+  colKey: SortKey;
+  sortKey: SortKey;
+  sortDir: "asc" | "desc";
+  onSort: (k: SortKey) => void;
+}) {
+  const active = sortKey === colKey;
+  return (
+    <th
+      onClick={() => onSort(colKey)}
+      className="text-left px-4 py-3 font-semibold cursor-pointer select-none"
+      style={{ color: active ? "var(--text)" : "var(--text-2)" }}
+      title={`Sort by ${label}`}
+    >
+      {label}
+      <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.35 }}>
+        {active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}
+      </span>
+    </th>
+  );
+}
+
 export default function AdminUsersPage() {
   const [users, setUsers]     = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter]   = useState<"all" | "trader" | "subscriber" | "admin">("all");
+  const [status, setStatus]   = useState<"all" | "active" | "inactive">("all");
   const [search, setSearch]   = useState("");
+  const [sortKey, setSortKey] = useState<SortKey>("created_at");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [busy, setBusy]       = useState<string | null>(null); // user id being actioned
   // Inline edit for trader business name. Holds {userId, draft} while
   // a row is being edited; null means no edit in progress. Centralised
@@ -124,18 +156,34 @@ export default function AdminUsersPage() {
     }
   }
 
+  function toggleSort(k: SortKey) {
+    if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(k); setSortDir("asc"); }
+  }
+
   const filtered = users.filter(u => {
     const matchRole   = filter === "all" || u.role === filter;
+    const matchStatus = status === "all" || (status === "active" ? u.is_active : !u.is_active);
     const matchSearch = !search ||
       u.email.toLowerCase().includes(search.toLowerCase()) ||
       (u.display_name ?? "").toLowerCase().includes(search.toLowerCase());
-    return matchRole && matchSearch;
+    return matchRole && matchStatus && matchSearch;
   });
 
   // Exclude fake load-test users from this view — they clutter the list
   // and are managed on the Load Test page.
   const isFake = (email: string) => email.startsWith("fake-load-test-");
-  const realUsers = filtered.filter(u => !isFake(u.email));
+  const realUsers = filtered.filter(u => !isFake(u.email)).sort((a, b) => {
+    const dir = sortDir === "asc" ? 1 : -1;
+    switch (sortKey) {
+      case "email":         return a.email.localeCompare(b.email) * dir;
+      case "role":          return a.role.localeCompare(b.role) * dir;
+      case "business_name": return (a.business_name ?? "").localeCompare(b.business_name ?? "") * dir;
+      case "status":        return (Number(a.is_active) - Number(b.is_active)) * dir;
+      case "created_at":    return (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) * dir;
+      default:              return 0;
+    }
+  });
   const fakeCount = users.filter(u => isFake(u.email)).length;
   // Role-chip counts must also exclude the fake test users — otherwise
   // "Subscribers (66)" includes 50 fake rows that the table hides, which
@@ -199,6 +247,24 @@ export default function AdminUsersPage() {
             </button>
           ))}
         </div>
+
+        {/* Status filter */}
+        <div className="flex gap-1">
+          {(["all", "active", "inactive"] as const).map(s => (
+            <button
+              key={s}
+              onClick={() => setStatus(s)}
+              className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
+              style={{
+                background: status === s ? "var(--accent)" : "var(--panel-2)",
+                color:      status === s ? "var(--accent-ink)" : "var(--text-2)",
+                border:     "1px solid " + (status === s ? "var(--accent)" : "var(--border)"),
+              }}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Table */}
@@ -212,11 +278,11 @@ export default function AdminUsersPage() {
           <table className="w-full text-sm">
             <thead>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>User</th>
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Role</th>
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Business Name</th>
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Status</th>
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Joined</th>
+                <SortableTh label="User"          colKey="email"         sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Role"          colKey="role"          sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Business Name" colKey="business_name" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Status"        colKey="status"        sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Joined"        colKey="created_at"    sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Actions</th>
               </tr>
             </thead>

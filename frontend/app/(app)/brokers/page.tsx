@@ -299,7 +299,14 @@ export default function BrokersPage() {
     // Clear `loading` in a finally so a failed fetch still removes the
     // skeleton instead of stranding the user on a forever-loading page.
     try {
-      setAccounts(await api<BrokerAccount[]>("/api/brokers"));
+      const accts = await api<BrokerAccount[]>("/api/brokers");
+      setAccounts(accts);
+      // Pull live balances immediately on entry, so opening (or being
+      // redirected to) the page shows fresh numbers right away instead of the
+      // cached snapshot + a 30s wait for the first poll tick. Silent = no
+      // toast / no audit, same as an auto-poll tick. The 30s cycle then keeps
+      // them live from here.
+      for (const a of accts) void refreshBalance(a.id, { silent: true });
     } finally {
       setLoading(false);
     }
