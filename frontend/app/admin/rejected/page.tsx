@@ -88,13 +88,45 @@ function fmtTime(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
 
+type RejSortKey = "user" | "role" | "symbol" | "broker" | "status" | "created_at";
+
+// Clickable header cell — neutral ↕ when inactive, direction arrow when active.
+function SortableTh({
+  label, colKey, sortKey, sortDir, onSort,
+}: {
+  label: string;
+  colKey: RejSortKey;
+  sortKey: RejSortKey;
+  sortDir: "asc" | "desc";
+  onSort: (k: RejSortKey) => void;
+}) {
+  const active = sortKey === colKey;
+  return (
+    <th
+      onClick={() => onSort(colKey)}
+      className="text-left px-4 py-3 font-semibold cursor-pointer select-none"
+      style={{ color: active ? "var(--text)" : "var(--text-2)" }}
+      title={`Sort by ${label}`}
+    >
+      {label}
+      <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.35 }}>
+        {active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}
+      </span>
+    </th>
+  );
+}
+
 export default function AdminRejectedPage() {
   const [rows, setRows] = useState<Rejection[]>([]);
   const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(true);
   const [role, setRole] = useState<"all" | "trader" | "subscriber">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "rejected" | "retry_pending">("all");
+  const [broker, setBroker] = useState<string>("all");
+  const [delivery, setDelivery] = useState<"all" | "sent" | "never">("all");
   const [search, setSearch] = useState("");
+  const [sortKey, setSortKey] = useState<RejSortKey>("created_at");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   function toggleRow(id: string) {
@@ -103,6 +135,11 @@ export default function AdminRejectedPage() {
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+  }
+
+  function toggleSort(k: RejSortKey) {
+    if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(k); setSortDir("asc"); }
   }
 
   async function load() {
@@ -121,11 +158,20 @@ export default function AdminRejectedPage() {
   }
   useEffect(() => { load(); }, []);
 
+  // Brokers present in the current result set — drives the broker filter chips.
+  const brokers = useMemo(
+    () => Array.from(new Set(rows.map(r => r.broker).filter(Boolean) as string[])).sort(),
+    [rows],
+  );
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return rows.filter(r => {
+    const out = rows.filter(r => {
       if (role !== "all" && r.user_role !== role) return false;
       if (statusFilter !== "all" && r.status !== statusFilter) return false;
+      if (broker !== "all" && r.broker !== broker) return false;
+      if (delivery === "sent" && neverSent(r)) return false;
+      if (delivery === "never" && !neverSent(r)) return false;
       if (!q) return true;
       return (
         (r.user_email ?? "").toLowerCase().includes(q) ||
@@ -134,7 +180,22 @@ export default function AdminRejectedPage() {
         (r.reject_reason ?? "").toLowerCase().includes(q)
       );
     });
-  }, [rows, role, statusFilter, search]);
+
+    const dir = sortDir === "asc" ? 1 : -1;
+    const userLabel = (r: Rejection) => (r.user_name ?? r.user_email ?? "").toLowerCase();
+    out.sort((a, b) => {
+      switch (sortKey) {
+        case "user":       return userLabel(a).localeCompare(userLabel(b)) * dir;
+        case "role":       return (a.user_role ?? "").localeCompare(b.user_role ?? "") * dir;
+        case "symbol":     return a.symbol.localeCompare(b.symbol) * dir;
+        case "broker":     return (a.broker ?? "").localeCompare(b.broker ?? "") * dir;
+        case "status":     return a.status.localeCompare(b.status) * dir;
+        case "created_at": return ((a.created_at ? Date.parse(a.created_at) : 0) - (b.created_at ? Date.parse(b.created_at) : 0)) * dir;
+        default:           return 0;
+      }
+    });
+    return out;
+  }, [rows, role, statusFilter, broker, delivery, search, sortKey, sortDir]);
 
   const countByRole = (r: string) => rows.filter(x => x.user_role === r).length;
 
@@ -199,6 +260,44 @@ export default function AdminRejectedPage() {
             </button>
           ))}
         </div>
+
+        {/* Broker filter — only shown when there's more than one broker to pick from */}
+        {brokers.length > 1 && (
+          <div className="flex gap-1">
+            {["all", ...brokers].map(b => (
+              <button
+                key={b}
+                onClick={() => setBroker(b)}
+                className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
+                style={{
+                  background: broker === b ? "var(--accent)" : "var(--panel-2)",
+                  color:      broker === b ? "var(--accent-ink)" : "var(--text-2)",
+                  border:     "1px solid " + (broker === b ? "var(--accent)" : "var(--border)"),
+                }}
+              >
+                {b === "all" ? "Any broker" : b}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Delivery filter — did the order reach the broker or fail internally first? */}
+        <div className="flex gap-1">
+          {([["all", "Any"], ["sent", "Reached broker"], ["never", "Never sent"]] as const).map(([val, lbl]) => (
+            <button
+              key={val}
+              onClick={() => setDelivery(val)}
+              className="text-xs px-3 py-1 rounded-full font-medium transition-colors"
+              style={{
+                background: delivery === val ? "var(--accent)" : "var(--panel-2)",
+                color:      delivery === val ? "var(--accent-ink)" : "var(--text-2)",
+                border:     "1px solid " + (delivery === val ? "var(--accent)" : "var(--border)"),
+              }}
+            >
+              {lbl}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Table */}
@@ -209,9 +308,13 @@ export default function AdminRejectedPage() {
           <table className="w-full text-sm">
             <thead>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                {["User", "Role", "Trade", "Broker", "Status", "Reason", "When"].map(h => (
-                  <th key={h} className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>{h}</th>
-                ))}
+                <SortableTh label="User"   colKey="user"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Role"   colKey="role"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Trade"  colKey="symbol"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Broker" colKey="broker"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <SortableTh label="Status" colKey="status"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Reason</th>
+                <SortableTh label="When"   colKey="created_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
             </thead>
             <tbody>
