@@ -47,6 +47,19 @@ class BrokerOrderRequest:
 
 
 @dataclass(frozen=True)
+class BrokerOrderLeg:
+    """A child order of a native bracket (the take-profit / stop-loss legs
+    Alpaca creates alongside the entry). Surfaced so the copy engine can
+    materialise them as visible mirror rows for the subscriber."""
+    broker_order_id: str
+    side: OrderSide
+    order_type: OrderType
+    status: OrderStatus
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class BrokerOrderResult:
     broker_order_id: str
     status: OrderStatus
@@ -54,6 +67,8 @@ class BrokerOrderResult:
     filled_quantity: Decimal = Decimal(0)
     filled_avg_price: Decimal | None = None
     reject_reason: str | None = None
+    # Child legs of a native bracket entry (empty for plain orders).
+    bracket_legs: tuple[BrokerOrderLeg, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,7 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
@@ -895,6 +895,35 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             continue
 
         for acct in sub_accounts:
+            # ── Externally-placed bracket handling (SnapTrade/Webull) ──
+            # A trader bracket arrives as 3 linked orders: a TRIGGER entry (which
+            # our listener stamps with take_profit_price/stop_loss_price) and its
+            # CONDITIONAL exit legs (bracket_parent_id set). For ALPACA stock
+            # subscribers we reproduce it as a single NATIVE bracket on the entry
+            # — so the exits go in with the entry and arm on fill (Alpaca rejects
+            # 3 separate opposite-side orders as a wash trade). Scoped to Alpaca +
+            # stocks for now; every other broker/instrument keeps prior behavior.
+            is_alpaca = acct.broker == BrokerName.ALPACA
+            is_stock = trader_order.instrument_type == InstrumentType.STOCK
+            is_exit_leg = trader_order.bracket_parent_id is not None
+            # Mirror the trader's exit(s) natively on the entry: BOTH legs → an
+            # Alpaca bracket, ONE leg → an OTO (the adapter picks the class). So
+            # we go native whenever AT LEAST ONE exit is attached.
+            alpaca_native_bracket = (
+                is_alpaca
+                and is_stock
+                and not is_exit_leg
+                and (
+                    trader_order.take_profit_price is not None
+                    or trader_order.stop_loss_price is not None
+                )
+            )
+            # Don't mirror a STOCK exit leg to Alpaca — the native bracket on the
+            # entry already carries it. Non-Alpaca accounts, and option legs
+            # (Alpaca has no native option bracket), keep the prior behavior.
+            if is_exit_leg and is_alpaca and is_stock:
+                continue
+
             scaled = _scale_quantity(
                 trader_order.quantity, sub.multiplier, acct.supports_fractional
             )
@@ -979,16 +1008,21 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 #     usable anchor, absolute prices. We NEVER send a native
                 #     broker bracket for mirrors — the emulator places the
                 #     exits uniformly across all brokers when the entry fills.
-                take_profit_price=None,
-                stop_loss_price=None,
+                # Alpaca native bracket: stamp the trader's exit prices so the
+                # entry submits as an OrderClass.BRACKET (see the adapter). All
+                # other cases leave these NULL and rely on the emulator / copy-
+                # trader-bracket path below.
+                take_profit_price=(trader_order.take_profit_price if alpaca_native_bracket else None),
+                stop_loss_price=(trader_order.stop_loss_price if alpaca_native_bracket else None),
                 status=OrderStatus.PENDING,
                 subscriber_picked_at=subscriber_picked_at,
                 subscriber_accepted_at=subscriber_accepted_at,
             )
 
             # Copy the trader's bracket onto this mirror when the subscriber
-            # opted in AND the trader actually set one.
-            if sub.copy_trader_bracket:
+            # opted in AND the trader actually set one. Skipped for an Alpaca
+            # native bracket — the entry already carries the real exit prices.
+            if sub.copy_trader_bracket and not alpaca_native_bracket:
                 if copy_use_pct:
                     child.take_profit_pct = copy_tp_val
                     child.stop_loss_pct = copy_sl_val
@@ -1040,8 +1074,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     quantity=child.quantity,
                     limit_price=child.limit_price,
                     stop_price=child.stop_price,
-                    take_profit_price=None,
-                    stop_loss_price=None,
+                    # Native bracket ONLY for the Alpaca-stock case — this is the
+                    # single place a mirror is allowed to send a broker-native
+                    # bracket. Everyone else stays None (emulator handles exits).
+                    take_profit_price=(trader_order.take_profit_price if alpaca_native_bracket else None),
+                    stop_loss_price=(trader_order.stop_loss_price if alpaca_native_bracket else None),
                     option_expiry=child.option_expiry,
                     option_strike=child.option_strike,
                     option_right=child.option_right,
@@ -1120,6 +1157,41 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # Lifecycle: stamp broadcast moment before publishing.
             child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", child))
+
+            # Native bracket: Alpaca returns the TP/SL child legs it created
+            # alongside the entry. Materialise them as visible mirror rows so the
+            # subscriber sees 1 buy + 2 sells like the trader. They're linked to
+            # the entry mirror (bracket_parent_id) and carry the leg's own broker
+            # order id, so the reconciler updates them when they arm/fill.
+            for leg in resp.bracket_legs:
+                leg_row = Order(
+                    id=uuid.uuid4(),
+                    user_id=item.subscriber_user_id,
+                    broker_account_id=item.broker_account_id,
+                    parent_order_id=trader_order.id,
+                    bracket_parent_id=child.id,
+                    instrument_type=child.instrument_type,
+                    symbol=child.symbol,
+                    option_expiry=child.option_expiry,
+                    option_strike=child.option_strike,
+                    option_right=child.option_right,
+                    is_closing=True,
+                    side=leg.side,
+                    order_type=leg.order_type,
+                    quantity=child.quantity,
+                    limit_price=leg.limit_price,
+                    stop_price=leg.stop_price,
+                    status=leg.status,
+                    broker_order_id=leg.broker_order_id,
+                    submitted_at=resp.submitted_at,
+                    broker_accepted_at=resp.submitted_at or datetime.now(timezone.utc),
+                    subscriber_picked_at=child.subscriber_picked_at,
+                    subscriber_accepted_at=child.subscriber_accepted_at,
+                    redis_published_at=datetime.now(timezone.utc),
+                )
+                db.add(leg_row)
+                db.flush()
+                events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", leg_row))
         else:
             # Broker call failed. Classify the error to decide between:
             #   1. User-fixable (insufficient buying power, after-hours

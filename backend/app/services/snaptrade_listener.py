@@ -400,7 +400,37 @@ def _poll_once(
             return
 
         seen = _last_seen.setdefault(trader_user_id, {})
+
+        # ── Reconstruct complex-order (bracket) groups from this batch ──
+        # Webull/SnapTrade returns bracket legs sharing a `brokerage_group_order_id`
+        # with an `order_role` of TRIGGER (entry) or CONDITIONAL (SL/TP exit).
+        # Precompute, per group: the entry's broker_order_id, and the exit prices
+        # (a CONDITIONAL LIMIT is the take-profit, a CONDITIONAL STOP the
+        # stop-loss). This lets us stamp the entry with tp/sl and link legs to it.
+        group_entry_boid: dict[str, str] = {}
+        group_tp: dict[str, Decimal] = {}
+        group_sl: dict[str, Decimal] = {}
         for o in orders:
+            gid = str(_attr(o, "brokerage_group_order_id", default="") or "")
+            if not gid:
+                continue
+            role = str(_attr(o, "order_role", default="")).upper()
+            boid = str(_attr(o, "brokerage_order_id", "id", default=""))
+            if role == "TRIGGER":
+                group_entry_boid[gid] = boid
+            elif role == "CONDITIONAL":
+                o_type, _q, o_limit, o_stop = _order_terms_from_snaptrade(o)
+                if o_type == OrderType.LIMIT and o_limit is not None:
+                    group_tp[gid] = o_limit
+                elif o_type in (OrderType.STOP, OrderType.STOP_LIMIT) and o_stop is not None:
+                    group_sl[gid] = o_stop
+
+        # Process TRIGGER entries before their CONDITIONAL legs so the entry row
+        # exists (and carries tp/sl) before we link legs to it.
+        def _role_order(o: Any) -> int:
+            return 0 if str(_attr(o, "order_role", default="")).upper() == "TRIGGER" else 1
+
+        for o in sorted(orders, key=_role_order):
             broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
             if not broker_order_id:
                 continue
@@ -424,8 +454,17 @@ def _poll_once(
                 continue
             seen[broker_order_id] = fingerprint
 
+            # Build this order's bracket context from the precomputed group maps.
+            bracket: dict[str, Any] | None = None
+            gid = str(_attr(o, "brokerage_group_order_id", default="") or "")
+            role = str(_attr(o, "order_role", default="")).upper()
+            if gid and role == "TRIGGER":
+                bracket = {"role": "TRIGGER", "tp": group_tp.get(gid), "sl": group_sl.get(gid)}
+            elif gid and role == "CONDITIONAL":
+                bracket = {"role": "CONDITIONAL", "entry_broker_order_id": group_entry_boid.get(gid)}
+
             _persist_and_fanout(
-                trader_user_id, broker_account_id, broker_order_id, status_str, o
+                trader_user_id, broker_account_id, broker_order_id, status_str, o, bracket
             )
 
 
@@ -435,7 +474,17 @@ def _persist_and_fanout(
     broker_order_id: str,
     status_str: str,
     order_obj: Any,
+    bracket: dict[str, Any] | None = None,
 ) -> None:
+    """``bracket`` carries complex-order (Webull bracket) context reconstructed
+    in _poll_once from the shared ``brokerage_group_order_id`` + ``order_role``:
+      * TRIGGER entry → {"role": "TRIGGER", "tp": Decimal|None, "sl": Decimal|None}
+        — stamp the entry with take_profit_price/stop_loss_price so the copy
+        engine can mirror it as a NATIVE Alpaca bracket.
+      * CONDITIONAL exit → {"role": "CONDITIONAL", "entry_broker_order_id": str}
+        — link the leg to its entry via bracket_parent_id so it's recognised as
+        a bracket leg (and the Alpaca fanout folds it into the entry's bracket).
+    """
     from app.brokers.snaptrade import _STATUS_IN as SNAP_STATUS_IN
 
     status_enum = SNAP_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
@@ -589,6 +638,28 @@ def _persist_and_fanout(
         order = _insert_order_from_snaptrade(
             db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
         )
+
+        # Apply reconstructed bracket context (see docstring). A TRIGGER entry
+        # gets the exit prices stamped on it; a CONDITIONAL leg is linked to its
+        # entry so it's treated as a bracket leg rather than a standalone trade.
+        if bracket:
+            role = bracket.get("role")
+            if role == "TRIGGER":
+                if bracket.get("tp") is not None:
+                    order.take_profit_price = bracket["tp"]
+                if bracket.get("sl") is not None:
+                    order.stop_loss_price = bracket["sl"]
+            elif role == "CONDITIONAL" and bracket.get("entry_broker_order_id"):
+                entry = db.execute(
+                    select(Order)
+                    .where(Order.broker_order_id == str(bracket["entry_broker_order_id"]))
+                    .where(Order.user_id == trader_user_id)
+                    .where(Order.parent_order_id.is_(None))
+                    .order_by(Order.created_at.desc())
+                    .limit(1)
+                ).scalars().first()
+                if entry is not None:
+                    order.bracket_parent_id = entry.id
 
         # Lifecycle stamps. `socket_received_at` is reused for poll-time
         # so the Performance page can report "broker → us" latency in

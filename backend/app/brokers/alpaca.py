@@ -33,6 +33,7 @@ from alpaca.trading.requests import (
 
 from app.brokers.base import (
     BrokerAdapter,
+    BrokerOrderLeg,
     BrokerOrderRequest,
     BrokerOrderResult,
     BrokerPosition,
@@ -58,6 +59,9 @@ _STATUS_IN = {
     AlpacaStatus.REJECTED: OrderStatus.REJECTED,
     AlpacaStatus.SUSPENDED: OrderStatus.SUBMITTED,
     AlpacaStatus.CALCULATED: OrderStatus.FILLED,
+    # A bracket's TP/SL legs sit HELD until the entry fills — treat as a live
+    # (accepted) working order so they surface as the subscriber's SL/TP rows.
+    AlpacaStatus.HELD: OrderStatus.ACCEPTED,
 }
 
 
@@ -172,31 +176,33 @@ class AlpacaAdapter(BrokerAdapter):
             qty = float(req.quantity)
 
         side = _SIDE_OUT[req.side]
-        # Bracket entries (take_profit and/or stop_loss attached) require
-        # OrderClass.BRACKET + GTC TIF + at least one of the child legs.
-        # Alpaca enforces both legs in production; we pass whichever the
-        # trader set and let Alpaca's validator surface a precise error
-        # if it insists on both.
-        has_bracket = (
-            req.take_profit_price is not None or req.stop_loss_price is not None
-        )
-        is_bracket = has_bracket and req.order_type in (OrderType.MARKET, OrderType.LIMIT)
+        # Attached exits (take_profit and/or stop_loss) require a "complex" order
+        # class + GTC TIF. Alpaca has two flavours:
+        #   * BOTH legs → OrderClass.BRACKET (OTOCO).
+        #   * ONE leg   → OrderClass.OTO (One-Triggers-Other) — BRACKET would be
+        #     rejected because it demands both legs.
+        # Either way the exit(s) arm only once the entry fills.
+        has_tp = req.take_profit_price is not None
+        has_sl = req.stop_loss_price is not None
+        is_advanced = (has_tp or has_sl) and req.order_type in (OrderType.MARKET, OrderType.LIMIT)
         common = {
             "symbol": sym,
             "qty": qty,
             "side": side,
-            # Bracket exit legs may not fire same-day, so they require GTC.
+            # Complex exits may not fire same-day, so they require GTC.
             # Plain orders keep DAY (cancel at session close).
-            "time_in_force": TimeInForce.GTC if is_bracket else TimeInForce.DAY,
+            "time_in_force": TimeInForce.GTC if is_advanced else TimeInForce.DAY,
             "client_order_id": req.client_order_id,
         }
-        if is_bracket:
-            common["order_class"] = AlpacaOrderClass.BRACKET
-            if req.take_profit_price is not None:
+        if is_advanced:
+            common["order_class"] = (
+                AlpacaOrderClass.BRACKET if (has_tp and has_sl) else AlpacaOrderClass.OTO
+            )
+            if has_tp:
                 common["take_profit"] = TakeProfitRequest(
                     limit_price=float(req.take_profit_price)
                 )
-            if req.stop_loss_price is not None:
+            if has_sl:
                 common["stop_loss"] = StopLossRequest(
                     stop_price=float(req.stop_loss_price)
                 )
@@ -216,12 +222,33 @@ class AlpacaAdapter(BrokerAdapter):
             raise ValueError(f"unsupported order_type {req.order_type}")
 
         resp = self._c().submit_order(order_req)
+        # A bracket submit returns its child legs (TP/SL) under `resp.legs`, each
+        # a held order with its own id. Surface them so the copy engine can show
+        # them as the subscriber's SL/TP rows (Alpaca activates them on fill).
+        legs: list[BrokerOrderLeg] = []
+        for leg in (getattr(resp, "legs", None) or []):
+            try:
+                lt = str(getattr(leg.order_type, "value", leg.order_type)).lower()
+                legs.append(BrokerOrderLeg(
+                    broker_order_id=str(leg.id),
+                    side=OrderSide.SELL if str(getattr(leg.side, "value", leg.side)).lower() == "sell" else OrderSide.BUY,
+                    order_type={
+                        "market": OrderType.MARKET, "limit": OrderType.LIMIT,
+                        "stop": OrderType.STOP, "stop_limit": OrderType.STOP_LIMIT,
+                    }.get(lt, OrderType.LIMIT),
+                    status=_STATUS_IN.get(leg.status, OrderStatus.ACCEPTED),
+                    limit_price=Decimal(str(leg.limit_price)) if getattr(leg, "limit_price", None) else None,
+                    stop_price=Decimal(str(leg.stop_price)) if getattr(leg, "stop_price", None) else None,
+                ))
+            except Exception:  # noqa: BLE001
+                log.exception("alpaca: failed to parse bracket leg %s", getattr(leg, "id", "?"))
         return BrokerOrderResult(
             broker_order_id=str(resp.id),
             status=_STATUS_IN.get(resp.status, OrderStatus.SUBMITTED),
             submitted_at=resp.submitted_at or datetime.now(timezone.utc),
             filled_quantity=Decimal(str(resp.filled_qty or 0)),
             filled_avg_price=Decimal(str(resp.filled_avg_price)) if resp.filled_avg_price else None,
+            bracket_legs=tuple(legs),
         )
 
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
