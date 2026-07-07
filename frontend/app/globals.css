@@ -33,6 +33,11 @@
   --bad:          #ef4444;
   --bad-soft:     rgba(239, 68, 68, 0.10);
   --warn:         #ffc857;
+  /* P&L text meant to sit ON a green/red heat fill (e.g. the calendar cells).
+     Lighter than --good/--bad so it reads as green/red without washing out
+     against the tinted background. Dark theme → light tints. */
+  --pnl-pos:      #86efac;
+  --pnl-neg:      #fca5a5;
 
   /* Gradients — buttons / pill toggles. 135° gives a soft "light from upper-left" feel. */
   --grad-accent:    linear-gradient(135deg, #2c93c5 0%, #0a73a8 45%, #074d70 100%);
@@ -89,6 +94,10 @@
   --bad:          #dc2626;
   --bad-soft:     rgba(220, 38, 38, 0.08);
   --warn:         #b45309;
+  /* On light theme the heat fill sits over white → a light-green cell, so P&L
+     text needs to be DARKER (not lighter) to contrast. */
+  --pnl-pos:      #15803d;
+  --pnl-neg:      #b91c1c;
 
   --grad-ghost:   linear-gradient(180deg, rgba(15,23,42,0.05) 0%, rgba(15,23,42,0.015) 100%);
 

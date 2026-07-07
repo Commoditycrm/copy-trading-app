@@ -15,6 +15,42 @@ import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, OrderStatus, Position, TradeStats, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
+// "Working" = still live at the broker: the open lifecycle plus retry_pending
+// (queued for a copy retry). These are the only orders a Cancel makes sense for.
+const WORKING_STATUSES: OrderStatus[] = [...OPEN_STATUSES, "retry_pending"];
+
+// Webull-style status tabs. Each maps to a set of order statuses.
+type StatusTab = "all" | "working" | "filled" | "cancelled" | "rejected";
+const STATUS_TABS: { key: StatusTab; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "working", label: "Working" },
+  { key: "filled", label: "Filled" },
+  { key: "cancelled", label: "Cancelled" },
+  { key: "rejected", label: "Rejected" },
+];
+function matchesStatusTab(status: OrderStatus, tab: StatusTab): boolean {
+  switch (tab) {
+    case "all": return true;
+    case "working": return WORKING_STATUSES.includes(status);
+    case "filled": return status === "filled";
+    // Expired orders never filled and are no longer working — group them with
+    // cancelled (Webull lumps "didn't fill, not rejected" together here).
+    case "cancelled": return status === "canceled" || status === "expired";
+    case "rejected": return status === "rejected";
+  }
+}
+
+/** Stable key for matching an order to a held position (same scheme the
+ *  Positions table uses). Options key on the full contract; stocks on symbol. */
+function orderPosKey(
+  acctId: string, instrument: string, symbol: string,
+  expiry: string | null, strike: string | null, right: string | null,
+): string {
+  const normStrike = strike == null ? "" : (Number.isFinite(Number(strike)) ? String(Number(strike)) : strike);
+  return instrument === "option"
+    ? `${acctId}:OPT:${symbol.toUpperCase()}:${(expiry ?? "").slice(0, 10)}:${normStrike}:${right ?? ""}`
+    : `${acctId}:STK:${symbol.toUpperCase()}`;
+}
 
 function fmt(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined) return "—";
@@ -115,7 +151,7 @@ export default function TradesPage() {
   const [loading, setLoading] = useState(true);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [user, setUser] = useState<User | null>(null);
-  const [tab, setTab] = useState<"all" | "mine">("all");
+  const [tab, setTab] = useState<StatusTab>("all");
 
   // Presentational only.
   const [search, setSearch] = useState("");
@@ -310,49 +346,45 @@ export default function TradesPage() {
     }
   }
 
-  // Held-position keys + tab/date filter — hoisted to a memo so the summary
-  // strip and the table body share one source of truth (logic unchanged).
-  const visibleOrders = useMemo(() => {
-    const normStrike = (s: string | null) => {
-      if (s == null) return "";
-      const n = Number(s);
-      return Number.isFinite(n) ? String(n) : s;
-    };
-    const normExpiry = (s: string | null) => (s ?? "").slice(0, 10);
-    const posKey = (
-      acctId: string, instrument: string, symbol: string,
-      expiry: string | null, strike: string | null, right: string | null,
-    ) =>
-      instrument === "option"
-        ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
-        : `${acctId}:STK:${symbol.toUpperCase()}`;
+  // Keys of currently-held positions. Used to suppress the Cancel button on an
+  // order that has effectively filled into an open position — even if our own
+  // status is briefly stale from fill-sync lag (the reason a "filled" order
+  // could otherwise still show a Cancel button).
+  const heldKeys = useMemo(() => new Set(
+    positions
+      .filter(p => Number(p.quantity) !== 0)
+      .map(p => orderPosKey(p.broker_account_id, p.instrument_type, p.symbol, p.option_expiry, p.option_strike, p.option_right))
+  ), [positions]);
+  const isHeld = useCallback((o: Order) => heldKeys.has(orderPosKey(
+    o.broker_account_id ?? "", o.instrument_type, o.symbol,
+    o.option_expiry, o.option_strike, o.option_right,
+  )), [heldKeys]);
 
-    const heldKeys = new Set(
-      positions
-        .filter(p => Number(p.quantity) !== 0)
-        .map(p => posKey(p.broker_account_id, p.instrument_type, p.symbol, p.option_expiry, p.option_strike, p.option_right))
-    );
+  // Base set shared by the tab counts and the visible rows: every order EXCEPT
+  // resting/cancelled/rejected bracket exit legs (internal protective orders,
+  // not trades the user placed — a filled leg IS a real close, so keep those).
+  const baseOrders = useMemo(
+    () => orders.filter(o => !(o.bracket_parent_id && o.status !== "filled")),
+    [orders],
+  );
 
-    // "All Orders" = every order (no filter — a superset). "My Orders"
-    // (trader only) = the subset placed while copy was OFF. So a copy-off
-    // order appears under BOTH tabs; a copy-on order only under All.
-    return orders.filter(o => {
-      if (user?.role === "trader" && tab === "mine" && o.fanned_out_to_subscribers) return false;
-      // Bracket exit legs (TP/SL) are auto-placed protective orders for a
-      // position, not trades the user placed — the bracket already shows as
-      // the position's / entry's TP/SL columns. Surface a leg ONLY when it
-      // actually filled (the real close); hide resting, cancelled, and
-      // rejected legs so they don't clutter history as phantom "not filled"
-      // rows sitting next to the open position they protect.
-      if (o.bracket_parent_id && o.status !== "filled") return false;
-      if (fromParam || toParam) return true;
-      if (o.status !== "filled") return true;
-      return !heldKeys.has(posKey(
-        o.broker_account_id ?? "", o.instrument_type, o.symbol,
-        o.option_expiry, o.option_strike, o.option_right,
-      ));
-    });
-  }, [orders, positions, tab, fromParam, toParam, user]);
+  // Per-tab counts for the tab badges, derived from the loaded window.
+  const tabCounts = useMemo(() => {
+    const c: Record<StatusTab, number> = { all: baseOrders.length, working: 0, filled: 0, cancelled: 0, rejected: 0 };
+    for (const o of baseOrders) {
+      if (WORKING_STATUSES.includes(o.status)) c.working++;
+      else if (o.status === "filled") c.filled++;
+      else if (o.status === "canceled" || o.status === "expired") c.cancelled++;
+      else if (o.status === "rejected") c.rejected++;
+    }
+    return c;
+  }, [baseOrders]);
+
+  // Rows for the active status tab.
+  const visibleOrders = useMemo(
+    () => baseOrders.filter(o => matchesStatusTab(o.status, tab)),
+    [baseOrders, tab],
+  );
 
   // search → sort (presentational)
   const rows = useMemo(() => {
@@ -371,17 +403,18 @@ export default function TradesPage() {
 
   const summary = useMemo(() => {
     let filled = 0, working = 0, notional = 0;
-    for (const o of visibleOrders) {
+    for (const o of baseOrders) {
       if (o.status === "filled") filled++;
       if (OPEN_STATUSES.includes(o.status)) working++;
       notional += notionalFor(o);
     }
-    return { total: visibleOrders.length, filled, working, notional };
-  }, [visibleOrders]);
+    return { total: baseOrders.length, filled, working, notional };
+  }, [baseOrders]);
 
-  // Prefer DB-computed totals (every matching order); fall back to the
-  // local page-derived counts only until the first stats response lands.
-  const scopeStats = stats ? (tab === "mine" ? stats.mine : stats.all) : null;
+  // Summary tiles are GLOBAL (across all orders, all statuses) — independent of
+  // the active status tab. Prefer DB-computed totals; fall back to the local
+  // page-derived counts only until the first stats response lands.
+  const scopeStats = stats ? stats.all : null;
   const view = {
     total: scopeStats ? scopeStats.total : summary.total,
     filled: scopeStats ? scopeStats.filled : summary.filled,
@@ -444,37 +477,27 @@ export default function TradesPage() {
 
       {/* Toolbar: tabs (trader) + symbol search */}
       <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
-        <div className="flex gap-2 items-center">
-          {user?.role === "trader" && (() => {
-            // Prefer DB totals so the badges reflect every order, not just
-            // the fetched window. Fall back to local counts pre-load.
-            // Counts come from the DB stats; null until they load so we
-            // show the tab without a misleading "(0)" during the fetch.
-            const mineCount = stats ? stats.mine.total : null;
-            const allCount = stats ? stats.all.total : null;
-            const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number | null }) => {
-              const active = tab === k;
-              return (
-                <button
-                  key={k}
-                  type="button"
-                  onClick={() => setTab(k)}
-                  className="px-3 py-1.5 text-xs font-medium rounded-full transition-colors focus-ring"
-                  style={{
-                    border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
-                    background: active ? "var(--nav-active-bg)" : "transparent",
-                    color: active ? "var(--accent)" : "var(--text-2)",
-                  }}
-                >
-                  {label}
-                  {count != null && (
-                    <span style={{ color: active ? "var(--accent)" : "var(--muted)" }}> ({count})</span>
-                  )}
-                </button>
-              );
-            };
-            return (<><Tab k="all" label="All Orders" count={allCount} /><Tab k="mine" label="My Orders" count={mineCount} /></>);
-          })()}
+        <div className="flex gap-2 items-center flex-wrap">
+          {STATUS_TABS.map(({ key, label }) => {
+            const active = tab === key;
+            const count = tabCounts[key];
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setTab(key)}
+                className="px-3 py-1.5 text-xs font-medium rounded-full transition-colors focus-ring"
+                style={{
+                  border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                  background: active ? "var(--nav-active-bg)" : "transparent",
+                  color: active ? "var(--accent)" : "var(--text-2)",
+                }}
+              >
+                {label}
+                <span style={{ color: active ? "var(--accent)" : "var(--muted)" }}> ({count})</span>
+              </button>
+            );
+          })}
         </div>
         <div className="relative">
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
@@ -541,7 +564,12 @@ export default function TradesPage() {
               )}
               {!loading && rows.map(o => {
                 const isOpen = OPEN_STATUSES.includes(o.status);
-                const canCancel = isOpen;
+                // Only offer Cancel for genuinely-working orders that haven't
+                // already filled into a held position. The isHeld guard covers
+                // the fill-sync lag window where an order has really filled at
+                // the broker but our status is briefly still "accepted" — so a
+                // filled order that's now a position never shows a Cancel.
+                const canCancel = isOpen && !isHeld(o);
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;
