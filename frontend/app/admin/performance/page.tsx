@@ -82,6 +82,34 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+type PerfSortKey = "symbol" | "trader" | "time" | "subscribers" | "detection" | "fanout" | "total";
+
+// Clickable header cell for the fanout table.
+function PerfTh({
+  label, colKey, sortKey, sortDir, onSort,
+}: {
+  label: string;
+  colKey: PerfSortKey;
+  sortKey: PerfSortKey;
+  sortDir: "asc" | "desc";
+  onSort: (k: PerfSortKey) => void;
+}) {
+  const active = sortKey === colKey;
+  return (
+    <th
+      onClick={() => onSort(colKey)}
+      className="px-3 py-3 text-left text-xs font-semibold cursor-pointer select-none"
+      style={{ color: active ? "var(--text-2)" : "var(--muted)" }}
+      title={`Sort by ${label}`}
+    >
+      {label}
+      <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.4 }}>
+        {active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}
+      </span>
+    </th>
+  );
+}
+
 // ── Expandable fanout row ──────────────────────────────────────────────────────
 function FanoutRow({ fanout }: { fanout: Fanout }) {
   const [open, setOpen] = useState(false);
@@ -164,6 +192,15 @@ export default function AdminPerformancePage() {
   const [data, setData]       = useState<PerfData | null>(null);
   const [loading, setLoading] = useState(true);
   const [limit, setLimit]     = useState(50);
+  const [q, setQ]             = useState("");                              // search: symbol / trader
+  const [side, setSide]       = useState<"all" | "buy" | "sell">("all");
+  const [sortKey, setSortKey] = useState<PerfSortKey>("time");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  function toggleSort(k: PerfSortKey) {
+    if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(k); setSortDir("asc"); }
+  }
 
   async function load(lim = limit) {
     setLoading(true);
@@ -179,6 +216,38 @@ export default function AdminPerformancePage() {
 
   useEffect(() => { load(); }, []);
 
+  // Null lags/times sort as -1 so missing values sink to the bottom on
+  // a descending sort (where the interesting rows are).
+  const num = (v: number | null) => (v ?? -1);
+  const time = (iso: string | null) => (iso ? new Date(iso).getTime() : -1);
+
+  const visibleFanouts = (data?.fanouts ?? [])
+    .filter(f => {
+      const needle = q.trim().toLowerCase();
+      const matchQ = !needle ||
+        f.symbol.toLowerCase().includes(needle) ||
+        (f.trader_email ?? "").toLowerCase().includes(needle) ||
+        (f.trader_display_name ?? "").toLowerCase().includes(needle);
+      const matchSide = side === "all" || f.side === side;
+      return matchQ && matchSide;
+    })
+    .sort((a, b) => {
+      const dir = sortDir === "asc" ? 1 : -1;
+      switch (sortKey) {
+        case "symbol":      return a.symbol.localeCompare(b.symbol) * dir;
+        case "trader":      return (a.trader_display_name ?? a.trader_email ?? "")
+                                     .localeCompare(b.trader_display_name ?? b.trader_email ?? "") * dir;
+        case "time":        return (time(a.broker_accepted_at) - time(b.broker_accepted_at)) * dir;
+        case "subscribers": return (a.subscribers.total - b.subscribers.total) * dir;
+        case "detection":   return (num(a.detection_lag_ms) - num(b.detection_lag_ms)) * dir;
+        case "fanout":      return (num(a.fanout_duration_ms) - num(b.fanout_duration_ms)) * dir;
+        case "total":       return (num(a.total_ms) - num(b.total_ms)) * dir;
+        default:            return 0;
+      }
+    });
+
+  const filtersActive = q.trim() !== "" || side !== "all";
+
   return (
     <div className="space-y-5">
       {/* Header */}
@@ -189,7 +258,39 @@ export default function AdminPerformancePage() {
             Every fanout across all traders. Click a row to expand subscriber-level breakdown.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Search by symbol or trader */}
+          <input
+            type="text"
+            placeholder="Filter by symbol or trader…"
+            value={q}
+            onChange={e => setQ(e.target.value)}
+            className="text-sm px-3 py-1.5 rounded-lg"
+            style={{
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid var(--border)",
+              color: "var(--text)",
+              outline: "none",
+              minWidth: 200,
+            }}
+          />
+          {/* Side filter */}
+          <div className="flex gap-1">
+            {(["all", "buy", "sell"] as const).map(s => (
+              <button
+                key={s}
+                onClick={() => setSide(s)}
+                className="text-xs px-3 py-1.5 rounded-lg capitalize font-medium transition-colors"
+                style={{
+                  background: side === s ? "var(--accent)" : "rgba(255,255,255,0.06)",
+                  color:      side === s ? "var(--accent-ink)" : "var(--text-2)",
+                  border:     "1px solid " + (side === s ? "var(--accent)" : "var(--border)"),
+                }}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
           <select
             value={limit}
             onChange={e => { setLimit(+e.target.value); load(+e.target.value); }}
@@ -234,18 +335,31 @@ export default function AdminPerformancePage() {
         <div className="rounded-xl p-8 text-center" style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--muted)" }}>
           No fanout data yet. A trade must be placed and fanned out to subscribers first.
         </div>
+      ) : visibleFanouts.length === 0 ? (
+        <div className="rounded-xl p-8 text-center" style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--muted)" }}>
+          No fanouts match your filter.
+        </div>
       ) : (
         <div className="rounded-xl overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+          {filtersActive && (
+            <div className="px-3 py-2 text-xs" style={{ background: "rgba(255,255,255,0.02)", color: "var(--muted)", borderBottom: "1px solid var(--border)" }}>
+              Showing {visibleFanouts.length} of {data.fanouts.length} fanouts
+            </div>
+          )}
           <table className="w-full text-sm">
             <thead>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                {["Trade", "Trader", "Time", "Subscribers", "Detection Lag", "Fanout Duration", "Total Time"].map(h => (
-                  <th key={h} className="px-3 py-3 text-left text-xs font-semibold" style={{ color: "var(--muted)" }}>{h}</th>
-                ))}
+                <PerfTh label="Trade"           colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Trader"          colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Time"            colKey="time"        sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Subscribers"     colKey="subscribers" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Detection Lag"   colKey="detection"   sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Fanout Duration" colKey="fanout"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Total Time"      colKey="total"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
             </thead>
             <tbody>
-              {data.fanouts.map(f => <FanoutRow key={f.parent_order_id} fanout={f} />)}
+              {visibleFanouts.map(f => <FanoutRow key={f.parent_order_id} fanout={f} />)}
             </tbody>
           </table>
         </div>
