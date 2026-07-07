@@ -721,10 +721,10 @@ export default function SettingsPage() {
           {/* Sticky action bar — keeps Reset reachable from anywhere on a long
               settings page. Sits at the top and stays pinned while scrolling. */}
           <div
-            className="sticky top-0 z-20 flex items-center justify-between gap-3 py-2.5 mb-1"
-            style={{ background: "var(--bg)", borderBottom: "1px solid var(--border)" }}
+            className="z-20 flex items-center justify-between gap-3 py-2.5 mb-1"
+            style={{ background: "var(--bg)" }}
           >
-            <span className="text-sm font-semibold" style={{ color: "var(--text)" }}>Settings</span>
+            <span className="text-md font-semibold" style={{ color: "var(--text)" }}>Settings</span>
             <button
               onClick={() => setResetOpen(true)}
               className="btn-danger-soft px-3 py-1.5 text-xs font-medium"
