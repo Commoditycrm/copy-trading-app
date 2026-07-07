@@ -190,15 +190,25 @@ export default function CalendarPage() {
                 cursor: has ? "pointer" : "default",
               }}
             >
-              <div className="text-xs font-medium" style={{ color: isToday ? "var(--accent)" : "var(--muted)" }}>
+              {/* On a heat-filled cell the semi-transparent green/red fill
+                  washes out --muted/--good/--bad text (green-on-green was the
+                  worst). Use the theme's primary foreground instead: --text is
+                  near-white in dark mode and dark-slate in light, so it stays
+                  readable on the fill in BOTH themes (a hardcoded white would
+                  break light mode). The +/- sign + fill colour still convey
+                  profit vs loss. */}
+              {/* On a filled cell always use --text — even for today, whose
+                  --accent (teal) is invisible on the green/red fill. The accent
+                  border + ring still marks today, so we don't lose that cue. */}
+              <div className="text-xs font-medium" style={{ color: has ? "var(--text)" : isToday ? "var(--accent)" : "var(--muted)" }}>
                 {d.getDate()}
               </div>
               {has && (
                 <>
-                  <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--good)" : "var(--bad)" }}>
+                  <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
                     {fmtSignedUsd(pnl)}
                   </div>
-                  <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                  <div className="text-[11px]" style={{ color: "var(--text-2)" }}>
                     {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
                   </div>
                 </>
