@@ -461,12 +461,16 @@ def _persist_and_fanout(
         # so use LIMIT 1 + .first() — a dup group can never raise
         # MultipleResultsFound and crash the poll loop; deterministic order_by
         # keeps the chosen row stable across polls.
+        # NEWEST-first: a broker-side modify is recorded as cancel-old + new-row,
+        # so two of our rows can share one broker_order_id (the old CANCELED one
+        # and the live replacement). We always want the latest — the live row —
+        # so subsequent events (e.g. the fill) land on it, not the canceled row.
         existing = db.execute(
             select(Order)
             .where(Order.broker_order_id == broker_order_id)
             .where(Order.user_id == trader_user_id)
             .where(Order.parent_order_id.is_(None))
-            .order_by(Order.created_at)
+            .order_by(Order.created_at.desc())
             .limit(1)
         ).scalars().first()
 
@@ -475,6 +479,32 @@ def _persist_and_fanout(
             # reconnect) back onto the live account so it stays linked.
             if existing.broker_account_id != broker_account_id:
                 existing.broker_account_id = broker_account_id
+            # Detect a broker-side MODIFY (new limit / stop / qty / type) on a
+            # still-working order — WITHOUT mutating `existing`. A modify is
+            # represented app-wide as CANCEL-OLD + PLACE-NEW (see
+            # _handle_trader_modify_as_replace), so the original stays in Order
+            # History as Canceled and the modified order is a fresh row. The
+            # _poll_once fingerprint already gates dispatch on these fields
+            # changing, so reaching here with a diff means a real modify.
+            if (
+                existing.status in _WORKING_STATUSES
+                and status_enum in _WORKING_STATUSES
+            ):
+                n_type, n_qty, n_limit, n_stop = _order_terms_from_snaptrade(order_obj)
+                modified = (
+                    (bool(n_qty) and existing.quantity != n_qty)
+                    or existing.order_type != n_type
+                    or (n_limit is not None and existing.limit_price != n_limit)
+                    or (n_stop is not None and existing.stop_price != n_stop)
+                )
+                if modified:
+                    _handle_trader_modify_as_replace(
+                        db, trader_user_id, existing, order_obj,
+                        status_enum, broker_order_id,
+                    )
+                    return
+
+            # ── Not a modify: normal in-place status / fill update. ──
             # Track whether *this* poll observed a status transition — the
             # bracket emulator hooks below only fire on actual transitions
             # so we don't pay for them on every quiescent poll of an
@@ -482,28 +512,6 @@ def _persist_and_fanout(
             status_changed = existing.status != status_enum
             if status_changed:
                 existing.status = status_enum
-            # Reflect broker-side MODIFICATIONS (limit price / stop / qty /
-            # type) while the order is still working. Without this the row keeps
-            # the terms it was first observed with, so a modify at Alpaca/Webull
-            # never shows up in our app. Guarded to working statuses so a
-            # terminal order's final terms are never rewritten by a late poll.
-            # Prices are only overwritten when SnapTrade actually reports one, so
-            # a sparse payload can't wipe a good limit/stop back to null.
-            terms_changed = False
-            if status_enum in _WORKING_STATUSES:
-                n_type, n_qty, n_limit, n_stop = _order_terms_from_snaptrade(order_obj)
-                if n_qty and existing.quantity != n_qty:
-                    existing.quantity = n_qty
-                    terms_changed = True
-                if existing.order_type != n_type:
-                    existing.order_type = n_type
-                    terms_changed = True
-                if n_limit is not None and existing.limit_price != n_limit:
-                    existing.limit_price = n_limit
-                    terms_changed = True
-                if n_stop is not None and existing.stop_price != n_stop:
-                    existing.stop_price = n_stop
-                    terms_changed = True
             fq = _attr(order_obj, "filled_units", "filled_quantity")
             if fq is not None:
                 try:
@@ -543,22 +551,6 @@ def _persist_and_fanout(
                         "snaptrade_listener: bracket emulator failed for order %s",
                         existing.id,
                     )
-            if terms_changed:
-                audit.record(
-                    db,
-                    actor_user_id=trader_user_id,
-                    action="listener.order_modified",
-                    entity_type="order",
-                    entity_id=existing.id,
-                    metadata={
-                        "broker": "snaptrade",
-                        "broker_order_id": broker_order_id,
-                        "order_type": existing.order_type.value,
-                        "quantity": str(existing.quantity),
-                        "limit_price": str(existing.limit_price) if existing.limit_price is not None else None,
-                        "stop_price": str(existing.stop_price) if existing.stop_price is not None else None,
-                    },
-                )
             db.commit()
             db.refresh(existing)
             events.publish(
@@ -585,23 +577,6 @@ def _persist_and_fanout(
                     )
                 else:
                     _cascade_cancel_to_mirrors(existing.id)
-            elif (
-                terms_changed
-                and existing.parent_order_id is None
-                and existing.fanned_out_to_subscribers
-            ):
-                # Trader MODIFIED a still-working order (new limit / stop / qty /
-                # type). Cascade the change to every still-working subscriber
-                # mirror via cancel-and-replace. Guarded to fanned-out root
-                # orders; the helper itself no-ops when there are no working
-                # mirrors. Committed above, so the new terms are visible to the
-                # fresh session the helper opens. Failures are audited, not raised.
-                try:
-                    copy_engine.propagate_modify_to_mirrors(existing.id)
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "snaptrade-listener modify-cascade failed for %s", existing.id
-                    )
             return
 
         # Brand-new order — only act on working/terminal-success states.
@@ -700,6 +675,102 @@ def _order_terms_from_snaptrade(
     limit_price = _to_dec(_attr(order_obj, "limit_price", "price"))
     stop_price = _to_dec(_attr(order_obj, "stop_price", "stop"))
     return order_type, qty, limit_price, stop_price
+
+
+def _handle_trader_modify_as_replace(
+    db: Any,
+    trader_user_id: uuid.UUID,
+    existing: Order,
+    order_obj: Any,
+    status_enum: OrderStatus,
+    broker_order_id: str,
+) -> None:
+    """Record a broker-side MODIFY as CANCEL-OLD + PLACE-NEW instead of an
+    in-place update: mark ``existing`` CANCELED and insert a fresh Order row
+    carrying the modified terms, then cancel + re-place every unfilled
+    subscriber mirror against the new row.
+
+    Note the trader's actual Webull order is ONE live order (Webull modifies in
+    place, same brokerage id) — we do NOT cancel it at the broker. The new row
+    shares ``broker_order_id`` with the canceled one; the NEWEST-first lookup in
+    ``_persist_and_fanout`` ensures later events (the fill) land on the new row.
+    Subscribers, whose mirror is a real order on their own broker, get a genuine
+    cancel + new placement (handled in copy_engine)."""
+    n_type, n_qty, n_limit, n_stop = _order_terms_from_snaptrade(order_obj)
+    now = datetime.now(timezone.utc)
+    old_id = existing.id
+    was_fanned_out = existing.fanned_out_to_subscribers
+
+    new_order = Order(
+        user_id=trader_user_id,
+        broker_account_id=existing.broker_account_id,
+        instrument_type=existing.instrument_type,
+        symbol=existing.symbol,
+        option_expiry=existing.option_expiry,
+        option_strike=existing.option_strike,
+        option_right=existing.option_right,
+        side=existing.side,
+        order_type=n_type,
+        quantity=n_qty if n_qty else existing.quantity,
+        limit_price=n_limit if n_limit is not None else existing.limit_price,
+        stop_price=n_stop if n_stop is not None else existing.stop_price,
+        is_closing=existing.is_closing,
+        status=status_enum,
+        broker_order_id=broker_order_id,
+        filled_quantity=Decimal(0),
+        filled_avg_price=None,
+        submitted_at=now,
+        trader_submitted_at=existing.trader_submitted_at,
+        socket_received_at=now,
+        redis_published_at=now,
+        # If the OLD order already had mirrors, we drive the cancel+replace
+        # ourselves below — mark the new row resolved so the generic fanout
+        # worker doesn't ALSO fan it out. If it hadn't been fanned out yet
+        # (no subscribers / predates connection), leave it False so the worker
+        # handles it normally; there are no old mirrors to cancel in that case.
+        fanned_out_to_subscribers=was_fanned_out,
+    )
+    db.add(new_order)
+
+    # Old row → CANCELED (superseded). Same live broker order underneath; this
+    # is purely our record representation of the modify.
+    existing.status = OrderStatus.CANCELED
+    if existing.closed_at is None:
+        existing.closed_at = now
+    db.flush()
+
+    audit.record(
+        db,
+        actor_user_id=trader_user_id,
+        action="listener.order_modified_as_replace",
+        entity_type="order",
+        entity_id=new_order.id,
+        metadata={
+            "broker": "snaptrade",
+            "broker_order_id": broker_order_id,
+            "old_order_id": str(old_id),
+            "order_type": new_order.order_type.value,
+            "quantity": str(new_order.quantity),
+            "limit_price": str(new_order.limit_price) if new_order.limit_price is not None else None,
+            "stop_price": str(new_order.stop_price) if new_order.stop_price is not None else None,
+        },
+    )
+    db.commit()
+    db.refresh(existing)
+    db.refresh(new_order)
+
+    events.publish(trader_user_id, copy_engine._order_event("order.cancelled", existing))  # noqa: SLF001
+    events.publish(trader_user_id, copy_engine._order_event("order.placed", new_order))  # noqa: SLF001
+
+    # Subscribers: cancel each unfilled mirror of the OLD order and place a new
+    # one linked to the NEW order. No-ops when there were no mirrors.
+    if was_fanned_out:
+        try:
+            copy_engine.cancel_and_replace_mirrors_for_modify(old_id, new_order.id)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "snaptrade-listener modify cancel+replace mirrors failed for %s", old_id
+            )
 
 
 def _insert_order_from_snaptrade(

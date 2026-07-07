@@ -81,6 +81,14 @@ _WORKING_STATUSES = (
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
 )
+# Terminal statuses — an order here is settled and its status must not be
+# regressed (e.g. a late 'replaced' event must not un-fill/un-cancel a row).
+_TERMINAL_STATUSES = (
+    OrderStatus.FILLED,
+    OrderStatus.CANCELED,
+    OrderStatus.REJECTED,
+    OrderStatus.EXPIRED,
+)
 
 
 # ── Public state surface ────────────────────────────────────────────────────
@@ -560,6 +568,26 @@ def _persist_and_fanout(
             # reconnect) back onto the live account so the link is restored.
             if existing.broker_account_id != broker_account_id:
                 existing.broker_account_id = broker_account_id
+            # Alpaca REPLACE: when the trader modifies an order, the ORIGINAL
+            # emits a 'replaced' event and Alpaca creates a NEW order id. We
+            # represent a modify as cancel-old + place-new, so mark this old row
+            # CANCELED here. Its replacement arrives as its own 'new' event
+            # (replaces=this.id) and is handled below, which also drives the
+            # subscriber mirror cancel+replace. We deliberately do NOT cascade
+            # to mirrors here — that would cancel mirrors without placing their
+            # replacement.
+            if event_name == "replaced":
+                if existing.status not in _TERMINAL_STATUSES:
+                    existing.status = OrderStatus.CANCELED
+                if existing.closed_at is None:
+                    existing.closed_at = datetime.now(timezone.utc)
+                existing.redis_published_at = datetime.now(timezone.utc)
+                db.commit()
+                db.refresh(existing)
+                events.publish(
+                    trader_user_id, copy_engine._order_event("order.cancelled", existing)  # noqa: SLF001
+                )
+                return
             # We already know about this order (Trade Panel placement, or an
             # earlier event for the same order). Update status / fills, and
             # detect a broker-side MODIFY (Alpaca 'replaced' → new terms).
@@ -621,10 +649,11 @@ def _persist_and_fanout(
         # Alpaca REPLACE semantics: modifying an order creates a NEW broker order
         # id (the original transitions to 'replaced'). The replacement carries a
         # `replaces` field pointing at the original id. If that original is an
-        # order we already track, this is a MODIFY — repurpose the existing row
-        # onto the new id + new terms and cascade to subscriber mirrors, instead
-        # of inserting a duplicate parent + re-fanning-out. (SnapTrade keeps the
-        # same id and is handled by the in-place update branch above.)
+        # order we already track, this is a MODIFY — recorded as CANCEL-OLD +
+        # PLACE-NEW: mark the original CANCELED and insert a fresh row for the
+        # replacement, then cancel + re-place every unfilled subscriber mirror
+        # against the new row. (SnapTrade keeps the same id and is handled by the
+        # split in the update branch above.)
         replaces_id = getattr(alpaca_order, "replaces", None)
         if replaces_id:
             prior = db.execute(
@@ -632,30 +661,58 @@ def _persist_and_fanout(
                 .where(Order.broker_order_id == str(replaces_id))
                 .where(Order.user_id == trader_user_id)
                 .where(Order.parent_order_id.is_(None))
-                .order_by(Order.created_at)
+                .order_by(Order.created_at.desc())
                 .limit(1)
             ).scalars().first()
             if prior is not None:
-                terms_changed = _apply_event_to_existing(
-                    db, prior, alpaca_order, update, event_name
+                now = datetime.now(timezone.utc)
+                old_id = prior.id
+                was_fanned_out = prior.fanned_out_to_subscribers
+                # Old order → CANCELED (Alpaca replaced it at the broker; may
+                # already be set by its own 'replaced' event above — idempotent).
+                if prior.status not in _TERMINAL_STATUSES:
+                    prior.status = OrderStatus.CANCELED
+                if prior.closed_at is None:
+                    prior.closed_at = now
+                # New order → a fresh row carrying the modified terms + new id.
+                new_order = _insert_order_from_alpaca(
+                    db, trader_user_id, broker_account_id, alpaca_order
                 )
-                # Repurpose onto the new broker order id so future events and the
-                # subscriber-mirror reconcilers keep matching the live order.
-                prior.broker_order_id = broker_order_id
-                if prior.socket_received_at is None:
-                    prior.socket_received_at = socket_received_at
-                prior.redis_published_at = datetime.now(timezone.utc)
+                new_order.trader_submitted_at = getattr(alpaca_order, "submitted_at", None)
+                new_order.socket_received_at = socket_received_at
+                new_order.redis_published_at = now
+                # Drive the mirror cancel+replace ourselves when the old order had
+                # mirrors, so the generic fanout worker doesn't ALSO fan this out.
+                new_order.fanned_out_to_subscribers = was_fanned_out
+                audit.record(
+                    db, actor_user_id=trader_user_id,
+                    action="listener.order_modified_as_replace",
+                    entity_type="order", entity_id=new_order.id,
+                    metadata={
+                        "broker": "alpaca",
+                        "broker_order_id": broker_order_id,
+                        "old_order_id": str(old_id),
+                        "order_type": new_order.order_type.value,
+                        "quantity": str(new_order.quantity),
+                        "limit_price": str(new_order.limit_price) if new_order.limit_price is not None else None,
+                        "stop_price": str(new_order.stop_price) if new_order.stop_price is not None else None,
+                    },
+                )
                 db.commit()
                 db.refresh(prior)
+                db.refresh(new_order)
                 events.publish(
-                    trader_user_id, copy_engine._order_event("order.placed", prior)  # noqa: SLF001
+                    trader_user_id, copy_engine._order_event("order.cancelled", prior)  # noqa: SLF001
                 )
-                if terms_changed and prior.fanned_out_to_subscribers:
+                events.publish(
+                    trader_user_id, copy_engine._order_event("order.placed", new_order)  # noqa: SLF001
+                )
+                if was_fanned_out:
                     try:
-                        copy_engine.propagate_modify_to_mirrors(prior.id)
+                        copy_engine.cancel_and_replace_mirrors_for_modify(old_id, new_order.id)
                     except Exception:  # noqa: BLE001
                         log.exception(
-                            "alpaca-listener modify-cascade failed for %s", prior.id
+                            "alpaca-listener modify cancel+replace mirrors failed for %s", old_id
                         )
                 return
 
