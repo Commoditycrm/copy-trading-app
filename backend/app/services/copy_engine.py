@@ -147,22 +147,42 @@ def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) 
     return raw.to_integral_value(rounding=ROUND_DOWN)
 
 
+# Statuses whose UNFILLED remainder still reserves shares at the broker
+# (the broker's "held_for_orders"). A second close of the same shares while
+# one of these is working gets rejected (e.g. Alpaca 40310000).
+_WORKING_ORDER_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+
 def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decimal:
-    """Net filled position the subscriber holds in the direction ``order`` would
-    CLOSE — their net long for a SELL, their net short for a BUY. Computed from
-    ``filled_quantity`` across the user's own orders for the exact contract, so
-    it tracks reality as fills sync in (SnapTrade reconciler + fills_sync).
-    Returns a non-negative quantity."""
+    """Quantity the subscriber can still CLOSE in ``order``'s direction: their
+    net filled position for the contract, MINUS what their own still-working
+    orders on the same side have already reserved at the broker.
+
+    Two things reduce what a new close can take:
+      * net filled position (filled buys − sells) — what they actually hold;
+      * unfilled qty on open same-side orders — the broker's ``held_for_orders``.
+        Without subtracting this, a second close of shares a prior working close
+        already reserved rejects with "insufficient qty available".
+
+    Tracks reality as fills sync in (SnapTrade reconciler + fills_sync). Returns
+    a non-negative quantity."""
+    same_contract = (
+        Order.user_id == user_id,
+        Order.symbol == order.symbol,
+        Order.instrument_type == order.instrument_type,
+        Order.option_expiry.is_not_distinct_from(order.option_expiry),
+        Order.option_strike.is_not_distinct_from(order.option_strike),
+        Order.option_right.is_not_distinct_from(order.option_right),
+    )
+    # Net filled position (signed long).
     rows = db.execute(
         select(Order.side, func.coalesce(func.sum(Order.filled_quantity), 0))
-        .where(
-            Order.user_id == user_id,
-            Order.symbol == order.symbol,
-            Order.instrument_type == order.instrument_type,
-            Order.option_expiry.is_not_distinct_from(order.option_expiry),
-            Order.option_strike.is_not_distinct_from(order.option_strike),
-            Order.option_right.is_not_distinct_from(order.option_right),
-        )
+        .where(*same_contract)
         .group_by(Order.side)
     ).all()
     buys = Decimal(0)
@@ -173,7 +193,23 @@ def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decima
         elif side == OrderSide.SELL:
             sells = Decimal(str(qty))
     net_long = buys - sells
-    closeable = net_long if order.side == OrderSide.SELL else -net_long
+    net_in_direction = net_long if order.side == OrderSide.SELL else -net_long
+
+    # Unfilled qty already reserved by this subscriber's OWN working orders on
+    # the same side (buy-to-close for a short, sell-to-close for a long).
+    reserved = db.execute(
+        select(
+            func.coalesce(
+                func.sum(Order.quantity - func.coalesce(Order.filled_quantity, 0)), 0
+            )
+        ).where(
+            *same_contract,
+            Order.side == order.side,
+            Order.status.in_(_WORKING_ORDER_STATUSES),
+        )
+    ).scalar_one()
+
+    closeable = net_in_direction - Decimal(str(reserved))
     return closeable if closeable > 0 else Decimal(0)
 
 
