@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { Spinner } from "@/components/Spinner";
 import type { User } from "@/lib/types";
 
 // ── Icons ────────────────────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   const pathname = usePathname();
   const [user, setUser]       = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
@@ -168,12 +170,13 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         {/* Footer */}
         <div className="p-3">
           <button
-            onClick={() => { clearTokens(); router.replace("/login"); }}
-            className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm transition-colors"
+            disabled={signingOut}
+            onClick={() => { setSigningOut(true); clearTokens(); router.replace("/login"); }}
+            className="flex items-center gap-2 w-full px-3 py-2 rounded-lg text-sm transition-colors disabled:opacity-60"
             style={{ color: "var(--text-2)" }}
           >
-            <IconLogOut />
-            Sign out
+            {signingOut ? <Spinner /> : <IconLogOut />}
+            {signingOut ? "Signing out…" : "Sign out"}
           </button>
         </div>
       </aside>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 
@@ -18,7 +18,46 @@ interface Rejection {
   reject_reason: string | null;
   broker: string | null;
   created_at: string | null;
+  // Payload fields — used to reconstruct the order as sent to the broker.
+  order_type: string;
+  limit_price: string | null;
+  stop_price: string | null;
+  option_expiry: string | null;
+  option_strike: string | null;
+  option_right: string | null;
+  is_closing: boolean;
+  broker_order_id: string | null;
+  broker_call_ms: number | null;
 }
+
+// Rebuild the order the way it was sent to the broker. The raw broker request
+// body isn't persisted, so this is reconstructed from the stored columns.
+// time_in_force is omitted on purpose — it's an adapter default ("day"), not
+// stored per order.
+function buildPayload(r: Rejection): Record<string, unknown> {
+  const p: Record<string, unknown> = {
+    symbol: r.symbol,
+    side: r.side,
+    qty: r.quantity,
+    type: r.order_type,
+  };
+  if (r.limit_price) p.limit_price = r.limit_price;
+  if (r.stop_price && Number(r.stop_price) !== 0) p.stop_price = r.stop_price;
+  if (r.instrument_type === "option") {
+    p.instrument = "option";
+    if (r.option_expiry) p.expiry = r.option_expiry;
+    if (r.option_strike) p.strike = r.option_strike;
+    if (r.option_right) p.right = r.option_right;
+  }
+  p.is_closing = r.is_closing;
+  return p;
+}
+
+// An order that never hit the broker: no broker id and no round-trip time.
+// These are internal rejections (e.g. credential decrypt) — there is no
+// broker payload/response to show.
+const neverSent = (r: Rejection) =>
+  !r.broker_order_id && (r.broker_call_ms === null || r.broker_call_ms === undefined);
 
 const ROLE_COLORS: Record<string, { bg: string; color: string }> = {
   trader:     { bg: "rgba(10,115,168,0.15)", color: "var(--accent)" },
@@ -56,6 +95,15 @@ export default function AdminRejectedPage() {
   const [role, setRole] = useState<"all" | "trader" | "subscriber">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "rejected" | "retry_pending">("all");
   const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggleRow(id: string) {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
 
   async function load() {
     setLoading(true);
@@ -174,11 +222,23 @@ export default function AdminRejectedPage() {
                   </td>
                 </tr>
               ) : (
-                filtered.map((r, i) => (
-                  <tr key={r.order_id} style={{ borderBottom: i < filtered.length - 1 ? "1px solid var(--border)" : "none" }}>
+                filtered.map((r, i) => {
+                  const open = expanded.has(r.order_id);
+                  const border = i < filtered.length - 1 ? "1px solid var(--border)" : "none";
+                  return (
+                  <Fragment key={r.order_id}>
+                  <tr
+                    onClick={() => toggleRow(r.order_id)}
+                    className="cursor-pointer transition-colors"
+                    style={{ borderBottom: open ? "none" : border }}
+                    title="Click to see the payload and broker response"
+                  >
                     <td className="px-4 py-3">
-                      <div className="font-medium" style={{ color: "var(--text)" }}>{r.user_name ?? r.user_email ?? "—"}</div>
-                      {r.user_name && <div className="text-xs" style={{ color: "var(--muted)" }}>{r.user_email}</div>}
+                      <div className="font-medium flex items-center gap-1.5" style={{ color: "var(--text)" }}>
+                        <span style={{ color: "var(--muted)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+                        {r.user_name ?? r.user_email ?? "—"}
+                      </div>
+                      {r.user_name && <div className="text-xs pl-4" style={{ color: "var(--muted)" }}>{r.user_email}</div>}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
@@ -194,11 +254,63 @@ export default function AdminRejectedPage() {
                     <td className="px-4 py-3" style={{ color: "var(--text-2)" }}>{r.broker ?? "—"}</td>
                     <td className="px-4 py-3"><Badge text={r.status} map={STATUS_COLORS} /></td>
                     <td className="px-4 py-3" style={{ color: r.reject_reason ? "var(--bad)" : "var(--muted)", maxWidth: 360 }}>
-                      {r.reject_reason ?? "—"}
+                      <div className="truncate" style={{ maxWidth: 340 }}>{r.reject_reason ?? "—"}</div>
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{fmtTime(r.created_at)}</td>
                   </tr>
-                ))
+
+                  {open && (
+                    <tr style={{ borderBottom: border, background: "rgba(255,255,255,0.02)" }}>
+                      <td colSpan={7} className="px-4 pb-4 pt-1">
+                        <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
+                          {/* Reconstructed payload */}
+                          <div>
+                            <div className="text-xs font-semibold mb-1.5 flex items-center gap-2" style={{ color: "var(--text-2)" }}>
+                              Payload sent to broker
+                              {neverSent(r) && (
+                                <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase tracking-wider"
+                                  style={{ background: "rgba(245,158,11,0.14)", color: "#f59e0b" }}>
+                                  never sent
+                                </span>
+                              )}
+                            </div>
+                            <pre className="text-xs rounded-lg p-3 overflow-x-auto"
+                              style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text)", fontFamily: "monospace", margin: 0 }}>
+{JSON.stringify(buildPayload(r), null, 2)}
+                            </pre>
+                            <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+                              {neverSent(r)
+                                ? "This order was rejected internally before the broker call — the payload above is what we would have sent."
+                                : "Reconstructed from stored order fields. time_in_force isn’t persisted (adapter default: day)."}
+                            </div>
+                          </div>
+
+                          {/* Broker response / reason */}
+                          <div>
+                            <div className="text-xs font-semibold mb-1.5" style={{ color: "var(--text-2)" }}>Broker response</div>
+                            <div className="text-xs space-y-1" style={{ color: "var(--text-2)" }}>
+                              <div className="flex justify-between gap-3">
+                                <span style={{ color: "var(--muted)" }}>Broker order ID</span>
+                                <span style={{ fontFamily: "monospace" }}>{r.broker_order_id ?? "— (none issued)"}</span>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <span style={{ color: "var(--muted)" }}>Round-trip</span>
+                                <span style={{ fontFamily: "monospace" }}>{r.broker_call_ms != null ? `${r.broker_call_ms.toLocaleString()}ms` : "— (never called)"}</span>
+                              </div>
+                            </div>
+                            <div className="text-xs font-semibold mt-3 mb-1" style={{ color: "var(--text-2)" }}>Reject reason (full)</div>
+                            <pre className="text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap"
+                              style={{ background: "var(--panel-2)", border: "1px solid rgba(239,68,68,0.25)", color: "var(--bad)", fontFamily: "monospace", margin: 0 }}>
+{r.reject_reason ?? "—"}
+                            </pre>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
+                  );
+                })
               )}
             </tbody>
           </table>

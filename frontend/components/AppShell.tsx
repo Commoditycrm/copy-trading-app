@@ -274,6 +274,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Email-verification banner state (soft enforcement — nag, don't block).
   const [resendBusy, setResendBusy] = useState(false);
   const [resendDone, setResendDone] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   async function resendVerify() {
     if (!user) return;
@@ -621,20 +622,26 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             />
           )}
           <button
+            disabled={signingOut}
             onClick={() => {
+              setSigningOut(true);
               clearTokens();
               try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
               router.replace("/login");
             }}
             title={navCollapsed ? "Sign out" : undefined}
-            className={`btn-ghost w-full ${navCollapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2 focus-ring`}
+            className={`btn-ghost w-full ${navCollapsed ? "px-2 justify-center" : "px-3"} py-2 text-sm flex items-center gap-2 focus-ring disabled:opacity-60`}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
-              <polyline points="16 17 21 12 16 7" />
-              <line x1="21" y1="12" x2="9" y2="12" />
-            </svg>
-            {!navCollapsed && <span>Sign out</span>}
+            {signingOut ? (
+              <Spinner />
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+            )}
+            {!navCollapsed && <span>{signingOut ? "Signing out…" : "Sign out"}</span>}
           </button>
         </div>
       </aside>

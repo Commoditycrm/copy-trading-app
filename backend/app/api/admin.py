@@ -643,6 +643,20 @@ def admin_rejected_orders(
             "reject_reason": o.reject_reason,
             "broker": acct.broker.value if acct and acct.broker else None,
             "created_at": o.created_at.isoformat() if o.created_at else None,
+            # Payload fields — let the admin panel reconstruct the order the way
+            # it was sent to the broker. The raw broker request body isn't
+            # persisted, so these columns are the source of truth.
+            "order_type": o.order_type.value,
+            "limit_price": str(o.limit_price) if o.limit_price is not None else None,
+            "stop_price": str(o.stop_price) if o.stop_price is not None else None,
+            "option_expiry": o.option_expiry.isoformat() if o.option_expiry else None,
+            "option_strike": str(o.option_strike) if o.option_strike is not None else None,
+            "option_right": o.option_right.value if o.option_right else None,
+            "is_closing": o.is_closing,
+            "broker_order_id": o.broker_order_id,
+            # null broker_call_ms + null broker_order_id ⇒ the order never
+            # reached the broker (rejected internally, e.g. credential decrypt).
+            "broker_call_ms": o.broker_call_ms,
         })
     return {"rejections": rejections, "truncated": truncated}
 
