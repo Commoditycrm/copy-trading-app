@@ -334,11 +334,16 @@ export default function TradesPage() {
     }
   }
 
-  // Base set shared by the tab counts and the visible rows: every order EXCEPT
-  // resting/cancelled/rejected bracket exit legs (internal protective orders,
-  // not trades the user placed — a filled leg IS a real close, so keep those).
+  // Base set shared by the tab counts and the visible rows. We show bracket
+  // exit legs (SL/TP) while they're WORKING or FILLED — so a trader who placed
+  // a bracket (e.g. on Webull) sees all three orders — and only hide legs that
+  // ended DEAD (canceled/rejected/expired), which are just noise next to the
+  // entry that already displays their prices in its TP/SL columns.
   const baseOrders = useMemo(
-    () => orders.filter(o => !(o.bracket_parent_id && o.status !== "filled")),
+    () => orders.filter(o => !(
+      o.bracket_parent_id &&
+      (o.status === "canceled" || o.status === "rejected" || o.status === "expired")
+    )),
     [orders],
   );
 
