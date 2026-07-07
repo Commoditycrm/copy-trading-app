@@ -51,11 +51,18 @@ export interface OrderEventPayload {
   side: string;
   order_type: string;
   quantity: string;
+  // Order terms — present so a broker-side MODIFY reflects instantly.
+  limit_price?: string | null;
+  stop_price?: string | null;
   filled_quantity: string;
   filled_avg_price: string | null;
   status: string;
   broker_order_id: string | null;
   instrument_type: string;
+  // Option fields — let Call/Put + Expiry columns render on arrival.
+  option_expiry?: string | null;
+  option_strike?: string | null;
+  option_right?: "call" | "put" | null;
   created_at: string | null;
   reject_reason: string | null;
 }
