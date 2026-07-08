@@ -33,6 +33,25 @@ function posKey(p: Position): string {
   return `${p.broker_account_id}:${p.broker_symbol}`;
 }
 
+/** Option expiry as "10 Jul 26" (Webull style). Input is an ISO "YYYY-MM-DD". */
+function optionExpiryShort(isoDate: string): string {
+  const d = new Date(isoDate.length === 10 ? isoDate + "T00:00:00Z" : isoDate);
+  if (Number.isNaN(d.getTime())) return isoDate;
+  const mon = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+  return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+/** Full descriptor shown in the Symbol column, Webull style:
+ *  stock  → "META";  option → "META C $372 10 Jul 26". */
+function positionSymbolLabel(p: Position): string {
+  if (p.instrument_type !== "option") return p.symbol.toUpperCase();
+  const cp = p.option_right === "call" ? "C" : p.option_right === "put" ? "P" : "";
+  const strike = p.option_strike != null && p.option_strike !== ""
+    ? `$${Number(p.option_strike)}` : "";
+  const exp = p.option_expiry ? optionExpiryShort(p.option_expiry) : "";
+  return [p.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
+}
+
 /** Days from today (UTC midnight) until an ISO date. Negative if past. */
 function daysUntil(isoDate: string): number {
   const target = new Date(isoDate + (isoDate.length === 10 ? "T00:00:00Z" : ""));
@@ -415,20 +434,17 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
                   <Th label="Symbol" sortKey="symbol" />
-                  <Th label="Expiry Date" />
-                  <Th label="Type" />
-                  <Th label="Call/Put" />
-                  <Th label="Side" />
-                  <Th label="Quantity" sortKey="quantity" />
+                  <Th label="Qty" sortKey="quantity" />
                   <Th label="Close %" />
                   <Th label="Actions" />
+                  <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
                   <Th label="Filled price" />
                   <Th label="TP" />
                   <Th label="SL" />
                   <Th label="Market value" sortKey="market_value" />
-                  <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
+                  <Th label="Side" />
                   <Th label="Submitted at" />
                   <Th label="Filled at" />
                   <Th label="Time Taken to Filled" />
@@ -470,33 +486,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   return (
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                        <td className="px-5 py-3.5 font-semibold" style={{ color: "var(--text)" }}>{p.symbol}</td>
+                        <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>{positionSymbolLabel(p)}</td>
                         {/* Expiry Date — absolute date for options, "—" for stocks. */}
-                        <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: p.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
-                          {p.option_expiry ? fmtDate(p.option_expiry) : "—"}
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <span className="chip capitalize">{p.instrument_type}</span>
-                        </td>
-                        <td className="px-5 py-3.5 capitalize font-semibold whitespace-nowrap" style={{
-                          color: p.instrument_type === "option" && p.option_right
-                            ? (p.option_right === "call" ? "var(--good)" : "var(--bad)")
-                            : "var(--faint)",
-                        }}>
-                          {p.instrument_type === "option" && p.option_right ? p.option_right : "—"}
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <span
-                            className="chip uppercase font-semibold"
-                            style={{
-                              background: isLong ? "var(--good-soft)" : "var(--bad-soft)",
-                              color: isLong ? "var(--good)" : "var(--bad)",
-                              borderColor: "transparent",
-                            }}
-                          >
-                            {isLong ? "Long" : "Short"}
-                          </span>
-                        </td>
                         <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
                         {/* Close % — pick a fraction of the position to close.
                             Pills that would round to zero (e.g. 25% of one
@@ -573,6 +564,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </div>
                           </div>
                         </td>
+                        <td className="px-5 py-3.5 num font-medium">
+                          <span className="inline-flex items-center gap-1" style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}>
+                            {pnl.sign === 1 && <TrendingUp size={13} />}
+                            {pnl.sign === -1 && <TrendingDown size={13} />}
+                            {pnl.text}
+                          </span>
+                        </td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.current_price, 2)}</td>
                         {(() => {
@@ -638,11 +636,16 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           );
                         })()}
                         <td className="px-5 py-3.5 num">{fmtNum(p.market_value, 2)}</td>
-                        <td className="px-5 py-3.5 num font-medium">
-                          <span className="inline-flex items-center gap-1" style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}>
-                            {pnl.sign === 1 && <TrendingUp size={13} />}
-                            {pnl.sign === -1 && <TrendingDown size={13} />}
-                            {pnl.text}
+                        <td className="px-5 py-3.5">
+                          <span
+                            className="chip uppercase font-semibold"
+                            style={{
+                              background: isLong ? "var(--good-soft)" : "var(--bad-soft)",
+                              color: isLong ? "var(--good)" : "var(--bad)",
+                              borderColor: "transparent",
+                            }}
+                          >
+                            {isLong ? "Long" : "Short"}
                           </span>
                         </td>
                         {(() => {

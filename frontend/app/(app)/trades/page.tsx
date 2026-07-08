@@ -507,13 +507,13 @@ export default function TradesPage() {
                 <Th label="Call/Put" />
                 <Th label="Side" />
                 <Th label="Quantity" sortKey="quantity" />
+                <Th label="Status" sortKey="status" />
                 <Th label="Actions" />
                 <Th label="Expected price" />
                 <Th label="Filled price" />
                 <Th label="TP" />
                 <Th label="SL" />
                 <Th label="Notional" sortKey="notional" />
-                <Th label="Status" sortKey="status" />
                 <Th label="Submitted at" sortKey="submitted" />
                 <Th label="Filled at" sortKey="filled" />
                 <Th label="Time Taken to Filled" />
@@ -588,6 +588,14 @@ export default function TradesPage() {
                         </span>
                       </td>
                       <td className="px-5 py-3.5 num">{fmt(o.quantity, 0)}</td>
+                      <td className="px-5 py-3.5">
+                        <span
+                          className="chip uppercase tracking-wider font-medium whitespace-nowrap"
+                          style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
+                        >
+                          {o.status}{o.parent_order_id ? " · copy" : ""}
+                        </span>
+                      </td>
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           {canCancel && (
@@ -704,14 +712,6 @@ export default function TradesPage() {
                       })()}
                       <td className="px-5 py-3.5 num">
                         {notionalFor(o) ? fmt(String(notionalFor(o))) : <span style={{ color: "var(--faint)" }}>—</span>}
-                      </td>
-                      <td className="px-5 py-3.5">
-                        <span
-                          className="chip uppercase tracking-wider font-medium whitespace-nowrap"
-                          style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
-                        >
-                          {o.status}{o.parent_order_id ? " · copy" : ""}
-                        </span>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                         {fmtDateTimeMs(submittedTs, "America/New_York")}
