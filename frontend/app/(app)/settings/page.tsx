@@ -7,6 +7,7 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
+import { NotificationsPanel } from "@/components/settings/NotificationsPanel";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -1234,6 +1235,9 @@ export default function SettingsPage() {
         </Card>
         </>
       )}
+
+      {/* Notification channels — available to every role. */}
+      <NotificationsPanel />
 
       <ConfirmModal
         open={resetOpen}
