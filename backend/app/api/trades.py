@@ -1,7 +1,9 @@
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timezone
+from decimal import ROUND_DOWN
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, case, func, or_, select, true
@@ -25,6 +27,7 @@ from app.schemas.order import (
 )
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
+from app.services.order_retry import is_order_conflict_error
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -357,29 +360,6 @@ async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.
         db.commit()
 
 
-def _is_order_conflict_error(exc: Exception) -> bool:
-    """True when a broker rejected an order because ANOTHER working order for the
-    same contract is blocking it — resolvable by cancelling that order and
-    retrying. Covers both directions of the conflict:
-      * OPPOSITE side → wash trade (Alpaca 40310000 'wash trade' / 'opposite
-        side ... order exists' / 'cannot open a short sell while a long buy
-        order is open');
-      * SAME side → the existing order already reserves the position, so a second
-        close is 'uncovered' (options) or 'insufficient qty available' (stocks).
-    """
-    m = str(exc).lower()
-    return (
-        "40310000" in m
-        or "wash trade" in m
-        or "opposite side" in m
-        or "opposite-side" in m
-        or "uncovered" in m
-        or "insufficient qty" in m
-        or "insufficient quantity" in m
-        or "held_for_orders" in m
-    )
-
-
 def _cancel_conflicting_orders(
     db: Session, user: User, acct: BrokerAccount, adapter, close_order: Order,
 ) -> list[uuid.UUID]:
@@ -564,6 +544,10 @@ def _place_trader_order(
         take_profit_price=payload.take_profit_price,
         stop_loss_price=payload.stop_loss_price,
         status=OrderStatus.PENDING,
+        # Close paths pass resolve_wash_trade=True — mark the order as a close so
+        # the flag propagates to the subscriber mirror (which uses it to gate the
+        # close-side quantity clamp and the copy-engine conflict-resolve retry).
+        is_closing=resolve_wash_trade,
         fanned_out_to_subscribers=will_fanout,
         trader_submitted_at=trader_submitted_at,
     )
@@ -617,12 +601,35 @@ def _place_trader_order(
     # auto-cancel resting orders to force an ENTRY through.
     _cancelled_conflicts = False
     _wash_retries = 0
+    _rounded_whole = False
     while True:
         try:
             result = adapter.place_order(broker_req)
             break
         except Exception as exc:  # noqa: BLE001
-            if resolve_wash_trade and _is_order_conflict_error(exc):
+            # Non-fractionable asset + fractional qty (e.g. closing 25% of 10 =
+            # 2.5 shares of a stock Alpaca won't split) → round the quantity DOWN
+            # to whole shares and retry once. Applies to any order; rounding down
+            # never exceeds the intended size / held position.
+            if (
+                not _rounded_whole
+                and "not fractionable" in str(exc).lower()
+                and order.quantity != order.quantity.to_integral_value(rounding=ROUND_DOWN)
+            ):
+                _rounded_whole = True
+                whole = order.quantity.to_integral_value(rounding=ROUND_DOWN)
+                if whole > 0:
+                    audit.record(
+                        db, actor_user_id=trader.id, action="order.rounded_to_whole",
+                        entity_type="order", entity_id=order.id,
+                        metadata={"from_qty": str(order.quantity), "to_qty": str(whole),
+                                  "symbol": order.symbol, "reason": "not_fractionable"},
+                        ip_address=client_ip(request),
+                    )
+                    order.quantity = whole
+                    broker_req = replace(broker_req, quantity=whole)
+                    continue
+            if resolve_wash_trade and is_order_conflict_error(exc):
                 if not _cancelled_conflicts:
                     _cancelled_conflicts = True
                     cancelled = _cancel_conflicting_orders(db, trader, acct, adapter, order)

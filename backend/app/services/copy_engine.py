@@ -25,10 +25,11 @@ return_exceptions=True on gather + per-task exception capture.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -46,8 +47,10 @@ from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
-from app.services.order_retry import classify_error
+from app.services.order_retry import classify_error, is_order_conflict_error
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
+
+log = logging.getLogger(__name__)
 
 
 # ── Historical-order replay guard ───────────────────────────────────────────
@@ -158,7 +161,94 @@ _WORKING_ORDER_STATUSES = (
 )
 
 
-def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decimal:
+def _cancel_subscriber_conflicts(item: "_PendingMirror") -> list[uuid.UUID]:
+    """Cancel the subscriber's still-working orders for the SAME contract as the
+    mirror close in ``item`` — the ones blocking it (wash trade / uncovered /
+    insufficient qty). Cancels at the subscriber's broker and marks each CANCELED
+    (its own session — this runs in a worker thread). Returns cancelled ids."""
+    req = item.request
+    cancelled: list[uuid.UUID] = []
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(Order).where(
+                Order.user_id == item.subscriber_user_id,
+                Order.broker_account_id == item.broker_account_id,
+                Order.instrument_type == req.instrument_type,
+                Order.symbol == req.symbol,
+                Order.option_expiry.is_not_distinct_from(req.option_expiry),
+                Order.option_strike.is_not_distinct_from(req.option_strike),
+                Order.option_right.is_not_distinct_from(req.option_right),
+                Order.status.in_(_WORKING_ORDER_STATUSES),
+                Order.broker_order_id.isnot(None),
+                Order.id != item.child_order_id,
+            )
+        ).scalars().all()
+        now = datetime.now(timezone.utc)
+        published: list[Order] = []
+        for o in rows:
+            try:
+                item.adapter.cancel_order(o.broker_order_id)
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "copy: failed to cancel conflicting order %s (broker_order=%s)",
+                    o.id, o.broker_order_id,
+                )
+                continue
+            o.status = OrderStatus.CANCELED
+            o.closed_at = now
+            cancelled.append(o.id)
+            published.append(o)
+        if cancelled:
+            db.commit()
+            for o in published:
+                db.refresh(o)
+                events.publish(item.subscriber_user_id, _order_event("order.cancelled", o))
+    return cancelled
+
+
+def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderResult:
+    """Place the mirror order. If a CLOSE is rejected because another working
+    order on the subscriber's account blocks it (wash trade / uncovered /
+    insufficient qty), cancel those orders and retry — the copy-engine analog of
+    the direct-close auto-resolve in api.trades. Runs in a worker thread (called
+    via ``asyncio.to_thread``); raising propagates to the normal reject path."""
+    req = item.request
+    try:
+        return item.adapter.place_order(req)
+    except Exception as exc:  # noqa: BLE001
+        # Non-fractionable asset + fractional mirror qty (a fractional multiplier
+        # can produce e.g. 2.5 shares of a stock Alpaca won't split) → round the
+        # qty DOWN to whole and retry. item.request is updated so Phase 3 records
+        # the quantity actually placed.
+        if "not fractionable" in str(exc).lower():
+            whole = req.quantity.to_integral_value(rounding=ROUND_DOWN)
+            if whole > 0 and whole != req.quantity:
+                req = replace(req, quantity=whole)
+                item.request = req
+                try:
+                    return item.adapter.place_order(req)
+                except Exception as exc2:  # noqa: BLE001
+                    exc = exc2  # fall through to conflict handling with new error
+        if not (req.is_closing and is_order_conflict_error(exc)):
+            raise
+        if not _cancel_subscriber_conflicts(item):
+            raise  # nothing on our side to cancel — retrying won't help
+        last_exc: BaseException = exc
+        for _ in range(3):
+            time.sleep(0.5)  # let the broker release the reservation
+            try:
+                return item.adapter.place_order(req)
+            except Exception as exc2:  # noqa: BLE001
+                last_exc = exc2
+                if is_order_conflict_error(exc2):
+                    continue
+                raise
+        raise last_exc
+
+
+def _closeable_quantity(
+    db: Session, user_id: uuid.UUID, order: Order, subtract_reserved: bool = True,
+) -> Decimal:
     """Quantity the subscriber can still CLOSE in ``order``'s direction: their
     net filled position for the contract, MINUS what their own still-working
     orders on the same side have already reserved at the broker.
@@ -168,6 +258,12 @@ def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decima
       * unfilled qty on open same-side orders — the broker's ``held_for_orders``.
         Without subtracting this, a second close of shares a prior working close
         already reserved rejects with "insufficient qty available".
+
+    ``subtract_reserved=False`` skips the second term — clamp to the raw held
+    position only. Used by the fanout close-clamp, which pairs with the
+    copy-engine conflict-resolve retry: we place the full held quantity and, if a
+    working order reserves it, CANCEL that order and retry rather than shrinking
+    the close around it.
 
     Tracks reality as fills sync in (SnapTrade reconciler + fills_sync). Returns
     a non-negative quantity."""
@@ -197,19 +293,21 @@ def _closeable_quantity(db: Session, user_id: uuid.UUID, order: Order) -> Decima
 
     # Unfilled qty already reserved by this subscriber's OWN working orders on
     # the same side (buy-to-close for a short, sell-to-close for a long).
-    reserved = db.execute(
-        select(
-            func.coalesce(
-                func.sum(Order.quantity - func.coalesce(Order.filled_quantity, 0)), 0
+    reserved = Decimal(0)
+    if subtract_reserved:
+        reserved = Decimal(str(db.execute(
+            select(
+                func.coalesce(
+                    func.sum(Order.quantity - func.coalesce(Order.filled_quantity, 0)), 0
+                )
+            ).where(
+                *same_contract,
+                Order.side == order.side,
+                Order.status.in_(_WORKING_ORDER_STATUSES),
             )
-        ).where(
-            *same_contract,
-            Order.side == order.side,
-            Order.status.in_(_WORKING_ORDER_STATUSES),
-        )
-    ).scalar_one()
+        ).scalar_one()))
 
-    closeable = net_in_direction - Decimal(str(reserved))
+    closeable = net_in_direction - reserved
     return closeable if closeable > 0 else Decimal(0)
 
 
@@ -936,7 +1034,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # hold and no more. is_closing is set by the broker listeners (e.g.
             # SnapTrade's SELL_TO_CLOSE); non-close orders are never touched.
             if trader_order.is_closing and scaled > 0:
-                closeable = _closeable_quantity(db, sub.user_id, trader_order)
+                # Clamp to the raw held position (not minus reserved): if a
+                # working order reserves it, the conflict-resolve retry in
+                # _place_mirror_with_conflict_resolve cancels that order and
+                # re-places, rather than shrinking the close to zero here.
+                closeable = _closeable_quantity(
+                    db, sub.user_id, trader_order, subtract_reserved=False,
+                )
                 if closeable < scaled:
                     audit.record(
                         db,
@@ -1108,7 +1212,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             start = time.perf_counter()
             try:
                 # to_thread keeps the event loop free while the sync SDK does I/O.
-                resp = await asyncio.to_thread(item.adapter.place_order, item.request)
+                # For a CLOSE this also auto-resolves order-conflict rejections
+                # (wash trade / uncovered / insufficient qty) by cancelling the
+                # blocking order(s) on the subscriber's account and retrying —
+                # mirroring the direct-close behaviour in api.trades.
+                resp = await asyncio.to_thread(_place_mirror_with_conflict_resolve, item)
                 return item, resp, None, int((time.perf_counter() - start) * 1000)
             except Exception as exc:  # noqa: BLE001
                 return item, None, exc, int((time.perf_counter() - start) * 1000)
@@ -1127,6 +1235,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         child = db.get(Order, item.child_order_id)
         child.broker_call_ms = call_ms
         if resp is not None:
+            # The place path may have rounded the qty (non-fractionable asset);
+            # keep the row in sync with what was actually placed.
+            if item.request.quantity != child.quantity:
+                child.quantity = item.request.quantity
             child.status = resp.status
             child.broker_order_id = resp.broker_order_id
             child.submitted_at = resp.submitted_at
