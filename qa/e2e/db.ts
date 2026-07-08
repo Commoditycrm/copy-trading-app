@@ -94,3 +94,113 @@ export async function countUnread(userId: string): Promise<number> {
     return r.rows[0].n as number;
   });
 }
+
+// ── Sprint 4: orders / fills / fake broker ──────────────────────────────────
+
+export interface SeedOrderOpts {
+  instrumentType?: "stock" | "option";
+  symbol?: string;
+  side?: "buy" | "sell";
+  orderType?: "market" | "limit";
+  quantity?: number;
+  status?: string;
+  filledQuantity?: number;
+  filledAvgPrice?: number | null;
+  limitPrice?: number | null;
+  fannedOut?: boolean;
+  bracketParentId?: string | null;
+  bracketLeg?: "tp" | "sl" | null;
+  ageSeconds?: number;
+  optionExpiry?: string | null;
+  optionStrike?: number | null;
+  optionRight?: "call" | "put" | null;
+}
+
+export async function seedOrder(userId: string, opts: SeedOrderOpts = {}): Promise<string> {
+  const status = opts.status ?? "filled";
+  const qty = opts.quantity ?? 1;
+  const filledQty = opts.filledQuantity ?? (status === "filled" ? qty : 0);
+  const filledPx = opts.filledAvgPrice ?? (status === "filled" ? 100 : null);
+  const ts = `now() - interval '${Math.floor(opts.ageSeconds ?? 0)} seconds'`;
+  // The order enum columns store UPPERCASE member NAMES in Postgres (no
+  // values_callable on the model), while the API I/O uses lowercase values.
+  const up = (s?: string | null) => (s == null ? null : s.toUpperCase());
+  return withDb(async (c) => {
+    const r = await c.query(
+      `INSERT INTO orders
+        (id,user_id,broker_account_id,instrument_type,symbol,option_expiry,option_strike,option_right,
+         side,order_type,quantity,limit_price,status,filled_quantity,filled_avg_price,
+         bracket_parent_id,bracket_leg,fanned_out_to_subscribers,retry_count,is_closing,
+         submitted_at,created_at,updated_at)
+       VALUES (gen_random_uuid(),$1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,false,
+         ${ts},${ts},${ts})
+       RETURNING id`,
+      [
+        userId,
+        up(opts.instrumentType ?? "stock"),
+        opts.symbol ?? "AAPL",
+        opts.optionExpiry ?? null,
+        opts.optionStrike ?? null,
+        up(opts.optionRight ?? null),
+        up(opts.side ?? "buy"),
+        up(opts.orderType ?? "market"),
+        qty,
+        opts.limitPrice ?? null,
+        up(status),
+        filledQty,
+        filledPx,
+        opts.bracketParentId ?? null,
+        opts.bracketLeg ?? null,
+        opts.fannedOut ?? false,
+      ],
+    );
+    return r.rows[0].id as string;
+  });
+}
+
+export async function seedFill(
+  orderId: string,
+  opts: { quantity: number; price: number; fee?: number; ageSeconds?: number },
+): Promise<void> {
+  const ts = `now() - interval '${Math.floor(opts.ageSeconds ?? 0)} seconds'`;
+  await withDb((c) =>
+    c.query(
+      `INSERT INTO fills (id,order_id,quantity,price,fee,filled_at)
+       VALUES (gen_random_uuid(),$1,$2,$3,$4, ${ts})`,
+      [orderId, opts.quantity, opts.price, opts.fee ?? 0],
+    ),
+  );
+}
+
+// A Fernet-encrypted dummy credential, valid for the local backend/.env
+// CREDENTIAL_ENCRYPTION_KEY. The Fake adapter ignores the contents; it just
+// needs to decrypt. Override via env if the local key rotates.
+export const FAKE_BROKER_CREDS =
+  process.env.E2E_FAKE_BROKER_CREDS ||
+  "gAAAAABqTfJkJNBJkgFf9VvGu26Z5tDHy44WRpKncCwEasyVGs6HlT_uUB4Ks8_hROz9bPsvzjRnU5nb9megUM1WFkr76iaVuN4sVfj1jdUKzk9hhBEy5pc=";
+
+/** Insert a FAKE broker with a Fernet-encrypted creds blob (connected by default). */
+export async function seedFakeBroker(
+  userId: string,
+  connectionStatus: string = "connected",
+  encryptedCreds: string = FAKE_BROKER_CREDS,
+): Promise<string> {
+  return withDb(async (c) => {
+    const r = await c.query(
+      `INSERT INTO broker_accounts
+         (id,user_id,broker,label,is_paper,supports_fractional,encrypted_credentials,
+          connection_status,created_at,updated_at)
+       VALUES (gen_random_uuid(),$1,'fake','QA Fake',true,true,$3,$2,now(),now())
+       RETURNING id`,
+      [userId, connectionStatus, encryptedCreds],
+    );
+    return r.rows[0].id as string;
+  });
+}
+
+export async function getOrderStatus(id: string): Promise<string | null> {
+  return withDb(async (c) => {
+    const r = await c.query(`SELECT status FROM orders WHERE id=$1`, [id]);
+    return r.rows.length ? (r.rows[0].status as string) : null;
+  });
+}
