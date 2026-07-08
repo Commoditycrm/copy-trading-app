@@ -272,11 +272,11 @@ export default function AdminUsersPage() {
         <div style={{ color: "var(--muted)" }}>Loading users…</div>
       ) : (
         <div
-          className="rounded-xl overflow-hidden"
-          style={{ border: "1px solid var(--border)" }}
+          className="rounded-xl overflow-auto"
+          style={{ border: "1px solid var(--border)", maxHeight: "70vh" }}
         >
           <table className="w-full text-sm">
-            <thead>
+            <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <SortableTh label="User"          colKey="email"         sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Role"          colKey="role"          sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
