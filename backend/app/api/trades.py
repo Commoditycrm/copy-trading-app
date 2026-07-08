@@ -357,6 +357,71 @@ async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.
         db.commit()
 
 
+def _is_order_conflict_error(exc: Exception) -> bool:
+    """True when a broker rejected an order because ANOTHER working order for the
+    same contract is blocking it — resolvable by cancelling that order and
+    retrying. Covers both directions of the conflict:
+      * OPPOSITE side → wash trade (Alpaca 40310000 'wash trade' / 'opposite
+        side ... order exists' / 'cannot open a short sell while a long buy
+        order is open');
+      * SAME side → the existing order already reserves the position, so a second
+        close is 'uncovered' (options) or 'insufficient qty available' (stocks).
+    """
+    m = str(exc).lower()
+    return (
+        "40310000" in m
+        or "wash trade" in m
+        or "opposite side" in m
+        or "opposite-side" in m
+        or "uncovered" in m
+        or "insufficient qty" in m
+        or "insufficient quantity" in m
+        or "held_for_orders" in m
+    )
+
+
+def _cancel_conflicting_orders(
+    db: Session, user: User, acct: BrokerAccount, adapter, close_order: Order,
+) -> list[uuid.UUID]:
+    """Cancel ALL of this user's still-working orders for the SAME contract —
+    both the opposite-side ones (wash trade) and the same-side ones that already
+    reserve the position (a second close is 'uncovered' / 'insufficient qty').
+    These are exactly the orders blocking the close. Cancels at the broker and
+    marks each CANCELED locally. Returns the ids we actually cancelled. The
+    close order itself is excluded (it has no broker_order_id yet)."""
+    rows = db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.broker_account_id == acct.id,
+            Order.instrument_type == close_order.instrument_type,
+            Order.symbol == close_order.symbol,
+            Order.option_expiry.is_not_distinct_from(close_order.option_expiry),
+            Order.option_strike.is_not_distinct_from(close_order.option_strike),
+            Order.option_right.is_not_distinct_from(close_order.option_right),
+            Order.status.in_(_CANCELLABLE_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars().all()
+    cancelled: list[uuid.UUID] = []
+    now = datetime.now(timezone.utc)
+    for o in rows:
+        try:
+            adapter.cancel_order(o.broker_order_id)
+        except Exception:  # noqa: BLE001
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).warning(
+                "close: failed to cancel conflicting order %s (broker_order=%s)",
+                o.id, o.broker_order_id,
+            )
+            continue
+        o.status = OrderStatus.CANCELED
+        o.closed_at = now
+        cancelled.append(o.id)
+    if cancelled:
+        db.flush()
+    return cancelled
+
+
 def _place_trader_order(
     db: Session,
     trader: User,
@@ -365,6 +430,7 @@ def _place_trader_order(
     background: BackgroundTasks,
     request: Request,
     skip_fanout: bool = False,
+    resolve_wash_trade: bool = False,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -527,43 +593,75 @@ def _place_trader_order(
     from app.services import order_intent  # noqa: PLC0415
     order_intent.mark_app_originated(order.id)
 
+    broker_req = BrokerOrderRequest(
+        instrument_type=order.instrument_type,
+        symbol=order.symbol,
+        side=order.side,
+        order_type=order.order_type,
+        quantity=order.quantity,
+        limit_price=order.limit_price,
+        stop_price=order.stop_price,
+        take_profit_price=order.take_profit_price if use_native_bracket else None,
+        stop_loss_price=order.stop_loss_price if use_native_bracket else None,
+        option_expiry=order.option_expiry,
+        option_strike=order.option_strike,
+        option_right=order.option_right,
+        client_order_id=str(order.id),
+    )
+
     _broker_t0 = time.perf_counter()
-    try:
-        result = adapter.place_order(
-            BrokerOrderRequest(
-                instrument_type=order.instrument_type,
-                symbol=order.symbol,
-                side=order.side,
-                order_type=order.order_type,
-                quantity=order.quantity,
-                limit_price=order.limit_price,
-                stop_price=order.stop_price,
-                take_profit_price=order.take_profit_price if use_native_bracket else None,
-                stop_loss_price=order.stop_loss_price if use_native_bracket else None,
-                option_expiry=order.option_expiry,
-                option_strike=order.option_strike,
-                option_right=order.option_right,
-                client_order_id=str(order.id),
+    # Auto-resolve wash-trade rejections on CLOSE orders: if the broker rejects
+    # because an opposite-side order for this contract is still working, cancel
+    # that order and retry — so the user doesn't have to cancel it manually and
+    # re-close. `resolve_wash_trade` gates this to close paths; we never
+    # auto-cancel resting orders to force an ENTRY through.
+    _cancelled_conflicts = False
+    _wash_retries = 0
+    while True:
+        try:
+            result = adapter.place_order(broker_req)
+            break
+        except Exception as exc:  # noqa: BLE001
+            if resolve_wash_trade and _is_order_conflict_error(exc):
+                if not _cancelled_conflicts:
+                    _cancelled_conflicts = True
+                    cancelled = _cancel_conflicting_orders(db, trader, acct, adapter, order)
+                    if cancelled:
+                        audit.record(
+                            db, actor_user_id=trader.id,
+                            action="close.cancelled_conflicting_order",
+                            entity_type="order", entity_id=order.id,
+                            metadata={
+                                "cancelled_order_ids": [str(x) for x in cancelled],
+                                "symbol": order.symbol,
+                                "reason": str(exc)[:200],
+                            },
+                            ip_address=client_ip(request),
+                        )
+                        # Give the broker a moment to release the reservation
+                        # before we retry (a few short attempts).
+                        _wash_retries = 3
+                if _wash_retries > 0:
+                    _wash_retries -= 1
+                    time.sleep(0.5)
+                    continue
+            order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = str(exc)[:480]
+            order.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db, actor_user_id=trader.id, action="trader.order_rejected_at_broker",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(exc)[:480]}, ip_address=client_ip(request),
             )
-        )
-    except Exception as exc:  # noqa: BLE001
-        order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
-        order.status = OrderStatus.REJECTED
-        order.reject_reason = str(exc)[:480]
-        order.closed_at = datetime.now(timezone.utc)
-        audit.record(
-            db, actor_user_id=trader.id, action="trader.order_rejected_at_broker",
-            entity_type="order", entity_id=order.id,
-            metadata={"error": str(exc)[:480]}, ip_address=client_ip(request),
-        )
-        db.commit()
-        # Tell subscribers the trader tried to enter and got rejected — so
-        # the rejection isn't silent on their side. Only when this order
-        # would have fanned out (i.e. trader-originated AND copy not paused
-        # AND `skip_fanout=False`). Runs AFTER the response is sent.
-        if will_fanout:
-            background.add_task(_run_rejection_notify_in_background, order.id, trader.id)
-        raise HTTPException(502, f"broker_error: {exc}")
+            db.commit()
+            # Tell subscribers the trader tried to enter and got rejected — so
+            # the rejection isn't silent on their side. Only when this order
+            # would have fanned out (i.e. trader-originated AND copy not paused
+            # AND `skip_fanout=False`). Runs AFTER the response is sent.
+            if will_fanout:
+                background.add_task(_run_rejection_notify_in_background, order.id, trader.id)
+            raise HTTPException(502, f"broker_error: {exc}")
 
     # Perf instrumentation: broker place-order round-trip (request->response)
     # and when the broker accepted. broker_call_ms was previously never
@@ -1146,7 +1244,8 @@ def close_trade(
     )
 
     new_order = _place_trader_order(
-        db, user, new_payload, original.broker_account_id, background, request
+        db, user, new_payload, original.broker_account_id, background, request,
+        resolve_wash_trade=True,
     )
 
     audit.record(
