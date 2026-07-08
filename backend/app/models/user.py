@@ -39,6 +39,16 @@ class User(Base, TimestampMixin):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phone + SMS verification (Twilio Verify). Null number = no SMS on file.
+    # phone_verified flips true only after a successful OTP check; SMS
+    # notifications require it (an unverified number is never texted).
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    phone_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     broker_accounts = relationship(
         "BrokerAccount", back_populates="user", cascade="all, delete-orphan"

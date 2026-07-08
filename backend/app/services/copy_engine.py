@@ -1242,6 +1242,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 child.redis_published_at = datetime.now(timezone.utc)
                 events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
+                # Multi-channel alert (in-app + email/SMS per prefs). Only the
+                # user-fixable branch notifies — systemic errors (credential
+                # decrypt, transient) are intentionally left to in-app SSE to
+                # avoid emailing every subscriber during a fanout-wide failure.
+                try:
+                    from app.services import notifications as _notifications  # noqa: PLC0415
+                    _notifications.notify_order_event(db, child, "order.rejected")
+                except Exception:  # noqa: BLE001
+                    log.exception("copy_engine: reject notify failed for %s", child.id)
 
             elif (
                 cls is not None

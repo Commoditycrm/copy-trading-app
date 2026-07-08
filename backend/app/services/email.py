@@ -275,6 +275,19 @@ def send_follow_decision_email(
     return send_email(to, subject, _shell(app, heading, body), text)
 
 
+def send_notification_email(to: str, subject: str, heading: str, message: str) -> bool:
+    """Generic branded notification email — one heading + one line of copy.
+    Used by the multi-channel notification dispatcher (services/notifications.py)
+    so an order-filled / order-rejected alert reuses the same card wrapper as
+    the auth emails. Safe to call from a background thread."""
+    s = get_settings()
+    body = (
+        f'<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">'
+        f'{message}</p>'
+    )
+    return send_email(to, subject, _shell(s.email_from_name, heading, body), message)
+
+
 def send_verification_email(to: str, verify_link: str, display_name: str | None) -> bool:
     """Compose + send the email-verification email. Safe to call from a
     BackgroundTask. Returns the underlying send result."""

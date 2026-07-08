@@ -111,6 +111,10 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
     # place we learn a copied TP/SL hit — surface it as an SSE so the positions
     # table can refresh live instead of only on manual reload.
     newly_closed: list[Order] = []
+    # Orders that flipped to a terminal state this pass → multi-channel notify
+    # (in-app + email/SMS per the owner's prefs). Fired after the loop so a
+    # slow send can't stall the reconcile.
+    notify_events: list[tuple[Order, str]] = []
     for order in open_orders:
         try:
             res = adapter.get_order(order.broker_order_id)
@@ -138,8 +142,19 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
             and order.bracket_leg is not None
         ):
             newly_closed.append(order)
+        if res.status == OrderStatus.FILLED and prev_status != OrderStatus.FILLED:
+            notify_events.append((order, "order.filled"))
+        elif res.status == OrderStatus.REJECTED and prev_status != OrderStatus.REJECTED:
+            notify_events.append((order, "order.rejected"))
         if changed:
             refreshed += 1
+
+    for order, event_type in notify_events:
+        try:
+            from app.services import notifications as _notifications  # noqa: PLC0415
+            _notifications.notify_order_event(db, order, event_type)
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: notify %s failed for order=%s", event_type, order.id)
 
     for order in newly_closed:
         try:

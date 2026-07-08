@@ -1,12 +1,15 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user, require_subscriber, require_trader
 from app.database import get_db
 from app.models.follow_request import FollowRequest, FollowRequestStatus
+from app.models.notification_preference import NOTIFY_EVENTS, NotificationPreference
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.settings import (
@@ -30,7 +33,8 @@ from app.schemas.settings import (
     TraderToggleIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit, cache
+from app.services.sms import check_phone_verification, start_phone_verification
+from app.services import audit, cache, notifications
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -782,3 +786,133 @@ def list_available_traders(db: Session = Depends(get_db), _: User = Depends(curr
         }
         for t, auto in rows
     ]
+
+
+# ── Notification preferences + phone verification ─────────────────────────────
+# Available to every role (traders and subscribers both get notifications), so
+# these use `current_user` rather than a role-specific dependency.
+
+class NotificationPrefsOut(BaseModel):
+    email_enabled: bool
+    sms_enabled: bool
+    event_overrides: dict
+    phone_number: str | None
+    phone_verified: bool
+    sms_available: bool  # Twilio configured server-side (drives UI enablement)
+
+
+class NotificationPrefsIn(BaseModel):
+    email_enabled: bool | None = None
+    sms_enabled: bool | None = None
+    # {"order.filled": {"email": true, "sms": false}, ...}
+    event_overrides: dict | None = None
+
+
+class PhoneIn(BaseModel):
+    phone_number: str = Field(min_length=8, max_length=20)
+
+
+class PhoneVerifyIn(BaseModel):
+    code: str = Field(min_length=4, max_length=10)
+
+
+def _prefs_out(user: User, pref: NotificationPreference) -> NotificationPrefsOut:
+    from app.services.sms import verify_configured  # noqa: PLC0415
+    return NotificationPrefsOut(
+        email_enabled=pref.email_enabled,
+        sms_enabled=pref.sms_enabled,
+        event_overrides=pref.event_overrides or {},
+        phone_number=user.phone_number,
+        phone_verified=user.phone_verified,
+        sms_available=verify_configured(),
+    )
+
+
+@router.get("/notifications", response_model=NotificationPrefsOut)
+def get_notification_prefs(
+    db: Session = Depends(get_db), user: User = Depends(current_user)
+) -> NotificationPrefsOut:
+    pref = notifications.get_or_create_prefs(db, user.id)
+    db.commit()
+    return _prefs_out(user, pref)
+
+
+@router.patch("/notifications", response_model=NotificationPrefsOut)
+def update_notification_prefs(
+    payload: NotificationPrefsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> NotificationPrefsOut:
+    pref = notifications.get_or_create_prefs(db, user.id)
+    if payload.email_enabled is not None:
+        pref.email_enabled = payload.email_enabled
+    if payload.sms_enabled is not None:
+        # SMS master can't be turned on without a verified number.
+        if payload.sms_enabled and not user.phone_verified:
+            raise HTTPException(400, "phone_not_verified")
+        pref.sms_enabled = payload.sms_enabled
+    if payload.event_overrides is not None:
+        # Whitelist to known events + channels so the UI can't stash junk.
+        cleaned: dict = {}
+        for ev, chans in payload.event_overrides.items():
+            if ev not in NOTIFY_EVENTS or not isinstance(chans, dict):
+                continue
+            cleaned[ev] = {c: bool(v) for c, v in chans.items() if c in ("email", "sms")}
+        pref.event_overrides = cleaned
+    audit.record(
+        db, actor_user_id=user.id, action="notifications.prefs_updated",
+        entity_type="user", entity_id=user.id,
+    )
+    db.commit()
+    return _prefs_out(user, pref)
+
+
+@router.post("/phone")
+def set_phone(
+    payload: PhoneIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Save a phone number and send a Twilio Verify OTP to it. The number is
+    stored unverified; SMS notifications stay off until /phone/verify succeeds."""
+    phone = payload.phone_number.strip().replace(" ", "")
+    # E.164: leading '+' then 8–15 digits. Keeps Twilio from 400-ing on obvious junk.
+    if not (phone.startswith("+") and phone[1:].isdigit() and 8 <= len(phone[1:]) <= 15):
+        raise HTTPException(422, "phone_must_be_e164")  # e.g. +15551234567
+    user.phone_number = phone
+    user.phone_verified = False
+    user.phone_verified_at = None
+    db.commit()
+
+    ok, detail = start_phone_verification(phone)
+    audit.record(
+        db, actor_user_id=user.id, action="notifications.phone_set",
+        entity_type="user", entity_id=user.id, metadata={"otp_sent": ok},
+    )
+    db.commit()
+    if not ok:
+        raise HTTPException(503, f"otp_send_failed:{detail}")
+    return {"ok": True, "detail": "otp_sent"}
+
+
+@router.post("/phone/verify", response_model=NotificationPrefsOut)
+def verify_phone(
+    payload: PhoneVerifyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> NotificationPrefsOut:
+    """Check the OTP; on success mark the phone verified and default SMS on."""
+    if not user.phone_number:
+        raise HTTPException(400, "no_phone_on_file")
+    if not check_phone_verification(user.phone_number, payload.code.strip()):
+        raise HTTPException(400, "invalid_code")
+    user.phone_verified = True
+    user.phone_verified_at = datetime.now(timezone.utc)
+    pref = notifications.get_or_create_prefs(db, user.id)
+    pref.sms_enabled = True  # they just added + verified a number — opt them in
+    audit.record(
+        db, actor_user_id=user.id, action="notifications.phone_verified",
+        entity_type="user", entity_id=user.id,
+    )
+    db.commit()
+    return _prefs_out(user, pref)

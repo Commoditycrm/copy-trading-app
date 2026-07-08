@@ -94,6 +94,20 @@ class Settings(BaseSettings):
     # {{verify_link}}, {{name}}, {{app_name}}. Blank → built-in inline HTML.
     sendgrid_verification_template_id: str = ""
 
+    # ── SMS + phone verification (Twilio) ─────────────────────────────────
+    # Twilio REST creds. Blank by default so dev/QA work without SMS — the sms
+    # service then logs instead of sending (mirrors services/email.py). From
+    # the Twilio console: https://console.twilio.com/.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    # E.164 sender number (e.g. "+15551234567") for outbound SMS. Blank
+    # disables send_sms.
+    twilio_from_number: str = ""
+    # Twilio Verify Service SID (starts "VA…"). Powers phone-number OTP —
+    # Twilio owns code generation, delivery, expiry and rate-limiting. Create
+    # one under Verify → Services. Blank disables the OTP verify flow.
+    twilio_verify_service_sid: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
