@@ -32,6 +32,7 @@ from app.schemas.auth import (
     ResendVerificationIn,
     ResetPasswordIn,
     TokenPair,
+    UpdateMeIn,
     UserOut,
     VerifyEmailIn,
 )
@@ -318,4 +319,24 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenPair:
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user)) -> User:
+    return user
+
+
+@router.patch("/me", response_model=UserOut)
+def update_me(
+    payload: UpdateMeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> User:
+    """Self-service profile update — currently just the display name. The name
+    is surfaced across the app (shell, follow lists, admin views), so the
+    change is visible immediately on the next fetch."""
+    user.display_name = payload.display_name
+    audit.record(
+        db, actor_user_id=user.id, action="user.profile_updated",
+        entity_type="user", entity_id=user.id,
+        metadata={"display_name": payload.display_name},
+    )
+    db.commit()
+    db.refresh(user)
     return user

@@ -85,6 +85,18 @@ class RegisterIn(BaseModel):
         return self
 
 
+class UpdateMeIn(BaseModel):
+    """Self-service profile edit. Only the display name is editable here —
+    email is identity (change is a separate, verified flow) and business_name
+    is trader-brand managed elsewhere."""
+    display_name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def _strip(cls, v: object) -> object:
+        return v.strip() if isinstance(v, str) else v
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
