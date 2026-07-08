@@ -435,6 +435,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                 <tr>
                   <Th label="Symbol" sortKey="symbol" />
                   <Th label="Qty" sortKey="quantity" />
+                  <Th label="Side" />
                   <Th label="Close %" />
                   <Th label="Actions" />
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
@@ -444,7 +445,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Market value" sortKey="market_value" />
                   <Th label="TP" />
                   <Th label="SL" />
-                  <Th label="Side" />
                   <Th label="Submitted at" />
                   <Th label="Filled at" />
                   <Th label="Time Taken to Filled" />
@@ -487,8 +487,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
                         <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>{positionSymbolLabel(p)}</td>
-                        {/* Expiry Date — absolute date for options, "—" for stocks. */}
                         <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
+                        {/* Side — Long / Short. */}
+                        <td className="px-5 py-3.5">
+                          <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
+                            {isLong ? "Long" : "Short"}
+                          </span>
+                        </td>
                         {/* Close % — pick a fraction of the position to close.
                             Pills that would round to zero (e.g. 25% of one
                             contract) are disabled. */}
@@ -636,18 +641,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </>
                           );
                         })()}
-                        <td className="px-5 py-3.5">
-                          <span
-                            className="chip uppercase font-semibold"
-                            style={{
-                              background: isLong ? "var(--good-soft)" : "var(--bad-soft)",
-                              color: isLong ? "var(--good)" : "var(--bad)",
-                              borderColor: "transparent",
-                            }}
-                          >
-                            {isLong ? "Long" : "Short"}
-                          </span>
-                        </td>
                         {(() => {
                           const t = orderTimestamps.byKey.get(orderTimestamps.key(
                             p.broker_account_id, p.instrument_type, p.symbol,
