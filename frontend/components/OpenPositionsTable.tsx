@@ -106,7 +106,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // Per-row close size as a percentage of the held quantity. Defaults to 100%.
     const [closePercents, setClosePercents] = useState<Record<string, number>>({});
     // Filter: default to options since that's the most common workflow here.
-    const [filter, setFilter] = useState<"all" | "stock" | "option">("option");
+    const [filter, setFilter] = useState<"all" | "stock" | "option">("all");
     // Presentational only — symbol search + column sort.
     const [search, setSearch] = useState("");
     const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
@@ -406,9 +406,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         {/* Toolbar: type tabs + symbol search */}
         <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
           <div className="flex items-center gap-2">
+            {tabBtn("all", "All")}
             {tabBtn("option", "Options")}
             {tabBtn("stock", "Stocks")}
-            {tabBtn("all", "All")}
           </div>
           <div className="relative">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
@@ -441,9 +441,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
                   <Th label="Filled price" />
+                  <Th label="Market value" sortKey="market_value" />
                   <Th label="TP" />
                   <Th label="SL" />
-                  <Th label="Market value" sortKey="market_value" />
                   <Th label="Side" />
                   <Th label="Submitted at" />
                   <Th label="Filled at" />
@@ -608,6 +608,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               <td className="px-5 py-3.5 num">
                                 {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
+                              <td className="px-5 py-3.5 num">{fmtNum(p.market_value, 2)}</td>
                               <td className="px-5 py-3.5 num">
                                 <InlineBracketCell
                                   orderId={orderId}
@@ -635,7 +636,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </>
                           );
                         })()}
-                        <td className="px-5 py-3.5 num">{fmtNum(p.market_value, 2)}</td>
                         <td className="px-5 py-3.5">
                           <span
                             className="chip uppercase font-semibold"
