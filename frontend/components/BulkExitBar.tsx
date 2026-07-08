@@ -75,13 +75,12 @@ const EXIT_DEFS: Record<ExitKey, ExitDef> = {
   },
 };
 
+// Theme-aware surface: was a hardcoded dark glass gradient that looked wrong
+// (dark box) in light mode. Use the panel token so it adapts to both themes.
 const cardStyle: React.CSSProperties = {
-  background:
-    "linear-gradient(180deg, rgba(20,26,32,0.55) 0%, rgba(10,14,18,0.35) 100%)",
+  background: "var(--panel)",
   border: "1px solid var(--border)",
   borderRadius: 10,
-  backdropFilter: "blur(10px)",
-  WebkitBackdropFilter: "blur(10px)",
 };
 
 interface Props {
@@ -186,21 +185,25 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 title={def.message}
                 className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{
+                  // Subs (destructive-to-subscribers) keep the red tint — it
+                  // reads on both themes. Non-subs use the elevated panel token
+                  // so they're a visible pill on both light and dark (the old
+                  // white overlay vanished on a light card).
                   background: isSubs
                     ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
-                    : "linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))",
+                    : "var(--panel-2)",
                   border: `1px solid ${isSubs ? "rgba(239,68,68,0.35)" : "var(--border)"}`,
                   color: isSubs ? "var(--bad)" : "var(--text)",
                 }}
                 onMouseEnter={e => {
                   e.currentTarget.style.background = isSubs
                     ? "linear-gradient(180deg, rgba(239,68,68,0.28), rgba(239,68,68,0.10))"
-                    : "linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.04))";
+                    : "var(--accent-glow)";
                 }}
                 onMouseLeave={e => {
                   e.currentTarget.style.background = isSubs
                     ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
-                    : "linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02))";
+                    : "var(--panel-2)";
                 }}
               >
                 <svg

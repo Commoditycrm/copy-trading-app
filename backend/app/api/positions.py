@@ -177,7 +177,7 @@ def close_all_positions(
             try:
                 order = _place_trader_order(
                     db, user, payload, acct.id, background, request,
-                    skip_fanout=skip_fanout,
+                    skip_fanout=skip_fanout, resolve_wash_trade=True,
                 )
                 closed.append({
                     "broker_account_id": str(acct.id),
@@ -382,7 +382,7 @@ def _close_account_positions_sync(
             try:
                 order = _place_trader_order(
                     db_local, sub_user, payload, acct.id, bg, request=req_shim,  # type: ignore[arg-type]
-                    skip_fanout=True,
+                    skip_fanout=True, resolve_wash_trade=True,
                 )
                 closed.append({
                     "subscriber_user_id": str(sub_id),
@@ -463,4 +463,6 @@ def close_position(
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
 
-    return _place_trader_order(db, user, new_payload, acct.id, background, request)
+    return _place_trader_order(
+        db, user, new_payload, acct.id, background, request, resolve_wash_trade=True,
+    )
