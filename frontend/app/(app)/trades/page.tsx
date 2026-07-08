@@ -447,7 +447,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 13;
+  const COLSPAN = 14;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -523,6 +523,7 @@ export default function TradesPage() {
               <tr>
                 <Th label="Symbol" sortKey="symbol" />
                 <Th label="Qty" sortKey="quantity" />
+                <Th label="Side" />
                 <Th label="Actions" />
                 <Th label="Status" sortKey="status" />
                 <Th label="Expected price" />
@@ -587,6 +588,11 @@ export default function TradesPage() {
                     >
                       <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>{orderSymbolLabel(o)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.quantity, 0)}</td>
+                      <td className="px-5 py-3.5">
+                        <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
+                          {o.side}
+                        </span>
+                      </td>
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           {canCancel && (
