@@ -1,0 +1,19 @@
+{
+  "name": "copy-trading-qa",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-contained E2E / a11y / perf suite for the copy-trading app. Portable — this folder has no imports from the app, so it can be moved to its own repo without rewiring. Runs against a locally running stack (frontend :3000 + backend :8000).",
+  "scripts": {
+    "test": "playwright test",
+    "test:auth": "playwright test e2e/auth",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.1",
+    "@playwright/test": "^1.49.1",
+    "@types/pg": "^8.20.0"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
+  }
+}

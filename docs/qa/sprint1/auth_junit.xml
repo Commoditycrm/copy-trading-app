@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="4" skipped="0" tests="77" time="212.413" timestamp="2026-06-29T20:08:53.743472+05:30" hostname="LAPTOP-J8C9G8ET"><testcase classname="tests.test_auth_forgot_password" name="test_existing_user_gets_reset" time="9.028" /><testcase classname="tests.test_auth_forgot_password" name="test_nonexistent_email_no_audit" time="0.306" /><testcase classname="tests.test_auth_forgot_password" name="test_inactive_user_no_token" time="0.737" /><testcase classname="tests.test_auth_forgot_password" name="test_response_identical_existing_vs_not" time="1.890" /><testcase classname="tests.test_auth_forgot_password" name="test_malformed_email" time="0.168" /><testcase classname="tests.test_auth_forgot_password" name="test_mixed_case_local_part_still_sends" time="0.896"><failure message="AssertionError: forgot-password did not normalize the email local-part (W1)&#10;assert 'user.password_reset_requested' in []&#10; +  where [] = audit_actions()">client = &lt;starlette.testclient.TestClient object at 0x00000170A6FF5100&gt;
+db = &lt;sqlalchemy.orm.session.Session object at 0x00000170A72473E0&gt;
+
+    @pytest.mark.candidate_bug
+    def test_mixed_case_local_part_still_sends(client, db):  # AUTH-FORGOT-NEG-003 (W1)
+        """User stored lowercased; requesting reset with a mixed-case local-part
+        SHOULD still find them (email is a case-insensitive identity). If the
+        endpoint doesn't normalize, no reset is sent → finding."""
+        make_user(db, "person@qatest.io")
+        r = _forgot(client, "Person@qatest.io")
+        assert r.status_code == 200
+&gt;       assert "user.password_reset_requested" in audit_actions(), (
+            "forgot-password did not normalize the email local-part (W1)"
+        )
+E       AssertionError: forgot-password did not normalize the email local-part (W1)
+E       assert 'user.password_reset_requested' in []
+E        +  where [] = audit_actions()
+
+tests\test_auth_forgot_password.py:58: AssertionError</failure></testcase><testcase classname="tests.test_auth_login" name="test_login_trader_returns_tokenpair" time="1.092" /><testcase classname="tests.test_auth_login" name="test_login_subscriber" time="1.389" /><testcase classname="tests.test_auth_login" name="test_login_admin" time="0.655"><failure message="Failed: cannot create admin via ORM (enum mismatch, BUG-AUTH-001): DataError">self = &lt;sqlalchemy.engine.base.Connection object at 0x00000170A7110EF0&gt;
+dialect = &lt;sqlalchemy.dialects.postgresql.psycopg.PGDialect_psycopg object at 0x0000017083AE76B0&gt;
+context = &lt;sqlalchemy.dialects.postgresql.psycopg.PGExecutionContext_psycopg object at 0x00000170A7246600&gt;
+statement = &lt;sqlalchemy.dialects.postgresql.psycopg.PGCompiler_psycopg object at 0x00000170A7247E30&gt;
+parameters = [{'id': UUID('6a5073cd-901d-4aaf-93b6-c39041b96d91'), 'email': 'admin@qatest.io', 'password_hash': '$2b$12$tonFkqoc.6uPGvh2QYt0..STHBC.Ki0jadew2IdNKQeX3VmFV0Xnq', 'role': 'ADMIN', ...}]
+
+    def _exec_single_context(
+        self,
+        dialect: Dialect,
+        context: ExecutionContext,
+        statement: Union[str, Compiled],
+        parameters: Optional[_AnyMultiExecuteParams],
+    ) -&gt; CursorResult[Any]:
+        """continue the _execute_context() method for a single DBAPI
+        cursor.execute() or cursor.executemany() call.
+    
+        """
+        if dialect.bind_typing is BindTyping.SETINPUTSIZES:
+            generic_setinputsizes = context._prepare_set_input_sizes()
+    
+            if generic_setinputsizes:
+                try:
+                    dialect.do_set_input_sizes(
+                        context.cursor, generic_setinputsizes, context
+                    )
+                except BaseException as e:
+                    self._handle_dbapi_exception(
+                        e, str(statement), parameters, None, context
+                    )
+    
+        cursor, str_statement, parameters = (
+            context.cursor,
+            context.statement,
+            context.parameters,
+        )
+    
+        effective_parameters: Optional[_AnyExecuteParams]
+    
+        if not context.executemany:
+            effective_parameters = parameters[0]
+        else:
+            effective_parameters = parameters
+    
+        if self._has_events or self.engine._has_events:
+            for fn in self.dispatch.before_cursor_execute:
+                str_statement, effective_parameters = fn(
+                    self,
+                    cursor,
+                    str_statement,
+                    effective_parameters,
+                    context,
+                    context.executemany,
+                )
+    
+        if self._echo:
+            self._log_info(str_statement)
+    
+            stats = context._get_cache_stats()
+    
+            if not self.engine.hide_parameters:
+                self._log_info(
+                    "[%s] %r",
+                    stats,
+                    sql_util._repr_params(
+                        effective_parameters,
+                        batches=10,
+                        ismulti=context.executemany,
+                    ),
+                )
+            else:
+                self._log_info(
+                    "[%s] [SQL parameters hidden due to hide_parameters=True]",
+                    stats,
+                )
+    
+        evt_handled: bool = False
+        try:
+            if context.execute_style is ExecuteStyle.EXECUTEMANY:
+                effective_parameters = cast(
+                    "_CoreMultiExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_executemany:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_executemany(
+                        cursor,
+                        str_statement,
+                        effective_parameters,
+                        context,
+                    )
+            elif not effective_parameters and context.no_parameters:
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute_no_params:
+                        if fn(cursor, str_statement, context):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_execute_no_params(
+                        cursor, str_statement, context
+                    )
+            else:
+                effective_parameters = cast(
+                    "_CoreSingleExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+&gt;                   self.dialect.do_execute(
+                        cursor, str_statement, effective_parameters, context
+                    )
+
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\.venv\Lib\site-packages\sqlalchemy\engine\default.py:941: in do_execute
+    cursor.execute(statement, parameters)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = &lt;psycopg.Cursor [closed] [IDLE] (host=localhost port=5433 user=trading database=trading_app_test) at 0x170a6fe3050&gt;
+query = 'INSERT INTO users (id, email, password_hash, role, display_name, business_name, is_active, email_verified, email_veri...e)s, %(email_verified)s, %(email_verified_at)s::TIMESTAMP WITH TIME ZONE) RETURNING users.created_at, users.updated_at'
+params = {'id': UUID('6a5073cd-901d-4aaf-93b6-c39041b96d91'), 'email': 'admin@qatest.io', 'password_hash': '$2b$12$tonFkqoc.6uPGvh2QYt0..STHBC.Ki0jadew2IdNKQeX3VmFV0Xnq', 'role': 'ADMIN', ...}
+prepare = None, binary = None
+
+    def execute(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -&gt; Self:
+        """
+        Execute a query or command to the database.
+        """
+        try:
+            with self._conn.lock:
+                self._conn.wait(
+                    self._execute_gen(query, params, prepare=prepare, binary=binary)
+                )
+        except e._NO_TRACEBACK as ex:
+&gt;           raise ex.with_traceback(None)
+E           psycopg.errors.InvalidTextRepresentation: invalid input value for enum user_role: "ADMIN"
+E           CONTEXT:  unnamed portal parameter $4 = '...'
+
+..\.venv\Lib\site-packages\psycopg\cursor.py:97: InvalidTextRepresentation
+
+The above exception was the direct cause of the following exception:
+
+client = &lt;starlette.testclient.TestClient object at 0x00000170A6FF5100&gt;
+db = &lt;sqlalchemy.orm.session.Session object at 0x00000170A7110440&gt;
+
+    @pytest.mark.candidate_bug
+    def test_login_admin(client, db):  # AUTH-LOGIN-FUNC-003 / BUG-AUTH-001
+        """Admin login requires an admin user. The user_role enum stores 'admin'
+        lowercase while TRADER/SUBSCRIBER are stored as their uppercase member
+        names, so the ORM can neither create nor read an admin row. This SHOULD
+        succeed once the enum label is fixed."""
+        try:
+            u = User(email="admin@qatest.io", password_hash=hash_password(DEFAULT_PW),
+                     role=UserRole.ADMIN, is_active=True)
+            db.add(u)
+&gt;           db.commit()
+
+tests\test_auth_login.py:47: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:2028: in commit
+    trans.commit(_to_root=True)
+&lt;string&gt;:2: in commit
+    ???
+..\.venv\Lib\site-packages\sqlalchemy\orm\state_changes.py:139: in _go
+    ret_value = fn(self, *arg, **kw)
+                ^^^^^^^^^^^^^^^^^^^^
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:1313: in commit
+    self._prepare_impl()
+&lt;string&gt;:2: in _prepare_impl
+    ???
+..\.venv\Lib\site-packages\sqlalchemy\orm\state_changes.py:139: in _go
+    ret_value = fn(self, *arg, **kw)
+                ^^^^^^^^^^^^^^^^^^^^
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:1288: in _prepare_impl
+    self.session.flush()
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:4352: in flush
+    self._flush(objects)
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:4487: in _flush
+    with util.safe_reraise():
+         ^^^^^^^^^^^^^^^^^^^
+..\.venv\Lib\site-packages\sqlalchemy\util\langhelpers.py:146: in __exit__
+    raise exc_value.with_traceback(exc_tb)
+..\.venv\Lib\site-packages\sqlalchemy\orm\session.py:4448: in _flush
+    flush_context.execute()
+..\.venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py:466: in execute
+    rec.execute(self)
+..\.venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py:642: in execute
+    util.preloaded.orm_persistence.save_obj(
+..\.venv\Lib\site-packages\sqlalchemy\orm\persistence.py:93: in save_obj
+    _emit_insert_statements(
+..\.venv\Lib\site-packages\sqlalchemy\orm\persistence.py:1233: in _emit_insert_statements
+    result = connection.execute(
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1418: in execute
+    return meth(
+..\.venv\Lib\site-packages\sqlalchemy\sql\elements.py:515: in _execute_on_connection
+    return connection._execute_clauseelement(
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1640: in _execute_clauseelement
+    ret = self._execute_context(
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1846: in _execute_context
+    return self._exec_single_context(
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1986: in _exec_single_context
+    self._handle_dbapi_exception(
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:2355: in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+..\.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: in _exec_single_context
+    self.dialect.do_execute(
+..\.venv\Lib\site-packages\sqlalchemy\engine\default.py:941: in do_execute
+    cursor.execute(statement, parameters)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = &lt;psycopg.Cursor [closed] [IDLE] (host=localhost port=5433 user=trading database=trading_app_test) at 0x170a6fe3050&gt;
+query = 'INSERT INTO users (id, email, password_hash, role, display_name, business_name, is_active, email_verified, email_veri...e)s, %(email_verified)s, %(email_verified_at)s::TIMESTAMP WITH TIME ZONE) RETURNING users.created_at, users.updated_at'
+params = {'id': UUID('6a5073cd-901d-4aaf-93b6-c39041b96d91'), 'email': 'admin@qatest.io', 'password_hash': '$2b$12$tonFkqoc.6uPGvh2QYt0..STHBC.Ki0jadew2IdNKQeX3VmFV0Xnq', 'role': 'ADMIN', ...}
+prepare = None, binary = None
+
+    def execute(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -&gt; Self:
+        """
+        Execute a query or command to the database.
+        """
+        try:
+            with self._conn.lock:
+                self._conn.wait(
+                    self._execute_gen(query, params, prepare=prepare, binary=binary)
+                )
+        except e._NO_TRACEBACK as ex:
+&gt;           raise ex.with_traceback(None)
+E           sqlalchemy.exc.DataError: (psycopg.errors.InvalidTextRepresentation) invalid input value for enum user_role: "ADMIN"
+E           CONTEXT:  unnamed portal parameter $4 = '...'
+E           [SQL: INSERT INTO users (id, email, password_hash, role, display_name, business_name, is_active, email_verified, email_verified_at) VALUES (%(id)s::UUID, %(email)s::VARCHAR, %(password_hash)s::VARCHAR, %(role)s, %(display_name)s::VARCHAR, %(business_name)s::VARCHAR, %(is_active)s, %(email_verified)s, %(email_verified_at)s::TIMESTAMP WITH TIME ZONE) RETURNING users.created_at, users.updated_at]
+E           [parameters: {'id': UUID('6a5073cd-901d-4aaf-93b6-c39041b96d91'), 'email': 'admin@qatest.io', 'password_hash': '$2b$12$tonFkqoc.6uPGvh2QYt0..STHBC.Ki0jadew2IdNKQeX3VmFV0Xnq', 'role': 'ADMIN', 'display_name': None, 'business_name': None, 'is_active': True, 'email_verified': False, 'email_verified_at': None}]
+E           (Background on this error at: https://sqlalche.me/e/20/9h9h)
+
+..\.venv\Lib\site-packages\psycopg\cursor.py:97: DataError
+
+During handling of the above exception, another exception occurred:
+
+client = &lt;starlette.testclient.TestClient object at 0x00000170A6FF5100&gt;
+db = &lt;sqlalchemy.orm.session.Session object at 0x00000170A7110440&gt;
+
+    @pytest.mark.candidate_bug
+    def test_login_admin(client, db):  # AUTH-LOGIN-FUNC-003 / BUG-AUTH-001
+        """Admin login requires an admin user. The user_role enum stores 'admin'
+        lowercase while TRADER/SUBSCRIBER are stored as their uppercase member
+        names, so the ORM can neither create nor read an admin row. This SHOULD
+        succeed once the enum label is fixed."""
+        try:
+            u = User(email="admin@qatest.io", password_hash=hash_password(DEFAULT_PW),
+                     role=UserRole.ADMIN, is_active=True)
+            db.add(u)
+            db.commit()
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+&gt;           pytest.fail(f"cannot create admin via ORM (enum mismatch, BUG-AUTH-001): {type(e).__name__}")
+E           Failed: cannot create admin via ORM (enum mismatch, BUG-AUTH-001): DataError
+
+tests\test_auth_login.py:50: Failed</failure></testcase><testcase classname="tests.test_auth_login" name="test_login_email_case_insensitive" time="1.131" /><testcase classname="tests.test_auth_login" name="test_login_email_trimmed" time="1.171" /><testcase classname="tests.test_auth_login" name="test_unverified_user_can_login" time="0.914" /><testcase classname="tests.test_auth_login" name="test_inactive_user_blocked" time="0.816" /><testcase classname="tests.test_auth_login" name="test_wrong_password" time="0.871" /><testcase classname="tests.test_auth_login" name="test_unknown_email_same_401" time="0.276" /><testcase classname="tests.test_auth_login" name="test_missing_password" time="0.189" /><testcase classname="tests.test_auth_login" name="test_malformed_email" time="0.205" /><testcase classname="tests.test_auth_login" name="test_empty_body" time="0.257" /><testcase classname="tests.test_auth_login" name="test_email_lockout_after_8_failures" time="3.551" /><testcase classname="tests.test_auth_login" name="test_success_resets_failure_counter" time="9.026" /><testcase classname="tests.test_auth_login" name="test_ip_throttle_over_40" time="3.938" /><testcase classname="tests.test_auth_refresh_me" name="test_refresh_returns_new_pair" time="0.879" /><testcase classname="tests.test_auth_refresh_me" name="test_refresh_rejects_access_token" time="0.570" /><testcase classname="tests.test_auth_refresh_me" name="test_refresh_garbage" time="0.179" /><testcase classname="tests.test_auth_refresh_me" name="test_refresh_inactive_user" time="0.661" /><testcase classname="tests.test_auth_refresh_me" name="test_me_no_token" time="0.157" /><testcase classname="tests.test_auth_refresh_me" name="test_me_returns_self" time="0.509" /><testcase classname="tests.test_auth_refresh_me" name="test_me_rejects_refresh_token" time="0.539" /><testcase classname="tests.test_auth_register" name="test_register_subscriber_happy" time="1.475" /><testcase classname="tests.test_auth_register" name="test_register_trader_with_business_name" time="2.019" /><testcase classname="tests.test_auth_register" name="test_multi_trader_allowed" time="3.462" /><testcase classname="tests.test_auth_register" name="test_register_display_name_optional" time="2.146" /><testcase classname="tests.test_auth_register" name="test_trader_requires_business_name" time="0.206" /><testcase classname="tests.test_auth_register" name="test_subscriber_business_name_forced_null" time="1.735" /><testcase classname="tests.test_auth_register" name="test_duplicate_email_conflict" time="1.602" /><testcase classname="tests.test_auth_register" name="test_duplicate_email_case_insensitive" time="2.108" /><testcase classname="tests.test_auth_register" name="test_cannot_self_register_admin" time="0.434" /><testcase classname="tests.test_auth_register" name="test_unknown_role_rejected" time="0.219" /><testcase classname="tests.test_auth_register" name="test_register_ignores_mass_assignment" time="2.170" /><testcase classname="tests.test_auth_register" name="test_password_min_ok" time="2.466" /><testcase classname="tests.test_auth_register" name="test_password_too_short" time="0.325" /><testcase classname="tests.test_auth_register" name="test_password_needs_three_classes" time="0.206" /><testcase classname="tests.test_auth_register" name="test_password_over_72_bytes" time="0.423" /><testcase classname="tests.test_auth_register" name="test_business_name_max_length" time="0.261" /><testcase classname="tests.test_auth_register" name="test_malformed_email_rejected" time="0.287" /><testcase classname="tests.test_auth_register" name="test_email_stored_normalized" time="1.916" /><testcase classname="tests.test_auth_register" name="test_register_ip_throttle" time="106.472" /><testcase classname="tests.test_auth_register" name="test_password_hashed_not_plaintext" time="11.220" /><testcase classname="tests.test_auth_reset_password" name="test_valid_reset_changes_password" time="2.454" /><testcase classname="tests.test_auth_reset_password" name="test_token_single_use" time="0.930" /><testcase classname="tests.test_auth_reset_password" name="test_tampered_token" time="0.204" /><testcase classname="tests.test_auth_reset_password" name="test_wrong_token_type_rejected" time="0.577" /><testcase classname="tests.test_auth_reset_password" name="test_expired_token_rejected" time="0.506" /><testcase classname="tests.test_auth_reset_password" name="test_missing_token_field" time="0.220" /><testcase classname="tests.test_auth_reset_password" name="test_new_password_too_short" time="0.489" /><testcase classname="tests.test_auth_reset_password" name="test_reset_enforces_complexity" time="0.854"><failure message="AssertionError: reset-password accepted a password register would reject (W2)&#10;assert 200 == 422&#10; +  where 200 = &lt;Response [200 OK]&gt;.status_code">client = &lt;starlette.testclient.TestClient object at 0x00000170A6FF5100&gt;
+db = &lt;sqlalchemy.orm.session.Session object at 0x00000170A854A7B0&gt;
+
+    @pytest.mark.candidate_bug
+    def test_reset_enforces_complexity(client, db):  # AUTH-RESET-SEC-003 (W2)
+        """Reset SHOULD enforce the same complexity policy as register. Currently
+        ResetPasswordIn only checks length → an all-lowercase password is accepted."""
+        u = make_user(db, "weakreset@qatest.io")
+        r = _reset(client, reset_token_for(u), "aaaaaaaa")
+&gt;       assert r.status_code == 422, "reset-password accepted a password register would reject (W2)"
+E       AssertionError: reset-password accepted a password register would reject (W2)
+E       assert 200 == 422
+E        +  where 200 = &lt;Response [200 OK]&gt;.status_code
+
+tests\test_auth_reset_password.py:79: AssertionError</failure></testcase><testcase classname="tests.test_auth_reset_password" name="test_reset_caps_at_72_bytes" time="0.750"><failure message="AssertionError: reset-password accepts &gt;72-byte password (bcrypt truncates) (W2)&#10;assert 200 == 422&#10; +  where 200 = &lt;Response [200 OK]&gt;.status_code">client = &lt;starlette.testclient.TestClient object at 0x00000170A6FF5100&gt;
+db = &lt;sqlalchemy.orm.session.Session object at 0x00000170A751A150&gt;
+
+    @pytest.mark.candidate_bug
+    def test_reset_caps_at_72_bytes(client, db):  # AUTH-RESET-BND-002 (W2)
+        """Register caps passwords at 72 bytes (bcrypt limit); reset allows up to
+        128, so &gt;72 bytes is silently truncated. Expect parity (reject &gt;72)."""
+        u = make_user(db, "longreset@qatest.io")
+        r = _reset(client, reset_token_for(u), "Ab1!" + "x" * 80)
+&gt;       assert r.status_code == 422, "reset-password accepts &gt;72-byte password (bcrypt truncates) (W2)"
+E       AssertionError: reset-password accepts &gt;72-byte password (bcrypt truncates) (W2)
+E       assert 200 == 422
+E        +  where 200 = &lt;Response [200 OK]&gt;.status_code
+
+tests\test_auth_reset_password.py:88: AssertionError</failure></testcase><testcase classname="tests.test_auth_security" name="test_forged_token_wrong_secret_rejected" time="0.474" /><testcase classname="tests.test_auth_security" name="test_alg_none_rejected" time="0.562" /><testcase classname="tests.test_auth_security" name="test_expired_access_rejected" time="0.488" /><testcase classname="tests.test_auth_security" name="test_sqli_login_no_bypass" time="0.857" /><testcase classname="tests.test_auth_security" name="test_cors_allowed_origin_echoed" time="0.754" /><testcase classname="tests.test_auth_security" name="test_cors_unknown_origin_not_allowed" time="0.781" /><testcase classname="tests.test_auth_security" name="test_error_body_is_generic_json" time="0.210" /><testcase classname="tests.test_auth_verify_email" name="test_valid_token_verifies" time="0.544" /><testcase classname="tests.test_auth_verify_email" name="test_verify_idempotent" time="0.492" /><testcase classname="tests.test_auth_verify_email" name="test_tampered_token" time="0.176" /><testcase classname="tests.test_auth_verify_email" name="test_wrong_token_type" time="0.477" /><testcase classname="tests.test_auth_verify_email" name="test_expired_token" time="0.477" /><testcase classname="tests.test_auth_verify_email" name="test_eml_mismatch_after_email_change" time="0.492" /><testcase classname="tests.test_auth_verify_email" name="test_resend_unverified" time="10.943" /><testcase classname="tests.test_auth_verify_email" name="test_resend_already_verified_no_send" time="0.990" /><testcase classname="tests.test_auth_verify_email" name="test_resend_nonexistent_no_leak" time="0.233" /><testcase classname="tests.test_harness" name="test_health_ok" time="0.191" /><testcase classname="tests.test_harness" name="test_db_roundtrip_and_isolation" time="0.603" /><testcase classname="tests.test_harness" name="test_isolation_truncated_between_tests" time="0.233" /><testcase classname="tests.test_harness" name="test_login_via_api" time="0.872" /></testsuite></testsuites>
