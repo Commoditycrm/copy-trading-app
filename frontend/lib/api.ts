@@ -124,6 +124,23 @@ export async function verifyEmail(token: string): Promise<{ detail: string }> {
   });
 }
 
+/** Request an email change — sends a confirmation link to the new address. */
+export async function changeEmail(newEmail: string, password: string): Promise<{ detail: string }> {
+  return api("/api/auth/change-email", {
+    method: "POST",
+    body: JSON.stringify({ new_email: newEmail, password }),
+  });
+}
+
+/** Confirm a pending email change from its link token. */
+export async function verifyEmailChange(token: string): Promise<{ detail: string }> {
+  return api("/api/auth/verify-email-change", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+    auth: false,
+  });
+}
+
 /** Re-send the verification email. Always resolves (no account enumeration). */
 export async function resendVerification(email: string): Promise<{ detail: string }> {
   return api("/api/auth/resend-verification", {

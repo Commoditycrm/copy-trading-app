@@ -4,7 +4,7 @@ import { Suspense, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { CheckCircle2, AlertTriangle } from "lucide-react";
-import { verifyEmail, getAccessToken } from "@/lib/api";
+import { verifyEmail, verifyEmailChange, getAccessToken } from "@/lib/api";
 import { Spinner } from "@/components/Spinner";
 import { AuthCard } from "@/components/auth/AuthCard";
 
@@ -15,7 +15,11 @@ const USER_CACHE_KEY = "trading-app:user";
 type State = "verifying" | "success" | "error";
 
 function VerifyEmailInner() {
-  const token = useSearchParams().get("token") ?? "";
+  const params = useSearchParams();
+  const token = params.get("token") ?? "";
+  // ?change=1 → this link confirms an email *change* (a different endpoint +
+  // copy) rather than an initial signup verification.
+  const isChange = params.get("change") === "1";
   const [state, setState] = useState<State>(token ? "verifying" : "error");
   const [message, setMessage] = useState<string>(
     token ? "" : "This verification link is invalid or incomplete.",
@@ -32,19 +36,19 @@ function VerifyEmailInner() {
   useEffect(() => {
     if (!token || ran.current) return;
     ran.current = true;
-    verifyEmail(token)
+    (isChange ? verifyEmailChange(token) : verifyEmail(token))
       .then((r) => {
         setState("success");
-        setMessage(r.detail || "Your email has been verified.");
-        // Bust the cached user so the app shell re-fetches /me and drops the
-        // "verify your email" banner the next time they land in the app.
+        setMessage(r.detail || (isChange ? "Your email has been updated." : "Your email has been verified."));
+        // Bust the cached user so the app shell re-fetches /me — drops the
+        // "verify your email" banner, and reflects a changed email.
         try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
       })
       .catch(() => {
         setState("error");
-        setMessage("This verification link is invalid or has expired.");
+        setMessage("This link is invalid or has expired.");
       });
-  }, [token]);
+  }, [token, isChange]);
 
   return (
     <div className="space-y-5 text-center">
