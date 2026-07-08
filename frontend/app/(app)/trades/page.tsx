@@ -6,7 +6,7 @@ import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
-import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
+import { fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -52,6 +52,26 @@ function notionalFor(order: Order): number {
   if (!order.filled_quantity || !order.filled_avg_price) return 0;
   const base = Number(order.filled_quantity) * Number(order.filled_avg_price);
   return order.instrument_type === "option" ? base * 100 : base;
+}
+
+/** Short option expiry, matching the Positions table ("10 Jul 26"). */
+function optionExpiryShort(isoDate: string): string {
+  const d = new Date(isoDate.length === 10 ? isoDate + "T00:00:00Z" : isoDate);
+  if (Number.isNaN(d.getTime())) return isoDate;
+  const mon = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+  return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+/** Full contract descriptor for the Symbol column — same style as the Positions
+ *  table: stock → "META"; option → "META C $372 10 Jul 26". Folds in call/put,
+ *  strike and expiry so no separate columns are needed. */
+function orderSymbolLabel(o: Order): string {
+  if (o.instrument_type !== "option") return o.symbol.toUpperCase();
+  const cp = o.option_right === "call" ? "C" : o.option_right === "put" ? "P" : "";
+  const strike = o.option_strike != null && o.option_strike !== ""
+    ? `$${Number(o.option_strike)}` : "";
+  const exp = o.option_expiry ? optionExpiryShort(o.option_expiry) : "";
+  return [o.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
 }
 
 /** "Expected" price the user asked for: the limit (or stop) price they set,
@@ -414,10 +434,10 @@ export default function TradesPage() {
     return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
   };
 
-  const Th = ({ label, sortKey }: { label: string; sortKey?: SortKey }) => {
+  const Th = ({ label, sortKey, className: thc = "" }: { label: string; sortKey?: SortKey; className?: string }) => {
     const active = sortKey && sort?.key === sortKey;
     return (
-      <th className="text-left px-5 py-3 font-medium whitespace-nowrap select-none" style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
+      <th className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
         {sortKey ? (
           <button type="button" onClick={() => toggleSort(sortKey)} className="inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors uppercase tracking-[0.06em] text-[11px]">
             {label}<SortIcon k={sortKey} />
@@ -427,7 +447,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 17;
+  const COLSPAN = 13;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -502,13 +522,9 @@ export default function TradesPage() {
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
                 <Th label="Symbol" sortKey="symbol" />
-                <Th label="Expiry Date" />
-                <Th label="Type" />
-                <Th label="Call/Put" />
-                <Th label="Side" />
-                <Th label="Quantity" sortKey="quantity" />
-                <Th label="Status" sortKey="status" />
+                <Th label="Qty" sortKey="quantity" />
                 <Th label="Actions" />
+                <Th label="Status" sortKey="status" />
                 <Th label="Expected price" />
                 <Th label="Filled price" />
                 <Th label="TP" />
@@ -556,7 +572,6 @@ export default function TradesPage() {
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;
-                const buy = o.side === "buy";
                 const st = STATUS_STYLE[o.status] ?? STATUS_DEFAULT;
                 const fillTs = lastFillTs(o);
                 const submittedTs = o.submitted_at ?? o.created_at;
@@ -570,32 +585,8 @@ export default function TradesPage() {
                         background: flashId === o.id ? "var(--good-soft)" : undefined,
                       }}
                     >
-                      <td className="px-5 py-3.5 font-semibold" style={{ color: "var(--text)" }}>{o.symbol}</td>
-                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: o.option_expiry ? "var(--text-2)" : "var(--faint)" }}>
-                        {o.option_expiry ? fmtDate(o.option_expiry) : "—"}
-                      </td>
-                      <td className="px-5 py-3.5"><span className="chip capitalize">{o.instrument_type}</span></td>
-                      <td className="px-5 py-3.5 capitalize font-semibold whitespace-nowrap" style={{
-                        color: o.instrument_type === "option" && o.option_right
-                          ? (o.option_right === "call" ? "var(--good)" : "var(--bad)")
-                          : "var(--faint)",
-                      }}>
-                        {o.instrument_type === "option" && o.option_right ? o.option_right : "—"}
-                      </td>
-                      <td className="px-5 py-3.5">
-                        <span className="chip uppercase font-semibold" style={{ background: buy ? "var(--good-soft)" : "var(--bad-soft)", color: buy ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
-                          {o.side}
-                        </span>
-                      </td>
+                      <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>{orderSymbolLabel(o)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.quantity, 0)}</td>
-                      <td className="px-5 py-3.5">
-                        <span
-                          className="chip uppercase tracking-wider font-medium whitespace-nowrap"
-                          style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
-                        >
-                          {o.status}{o.parent_order_id ? " · copy" : ""}
-                        </span>
-                      </td>
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           {canCancel && (
@@ -649,6 +640,14 @@ export default function TradesPage() {
                             <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
                           )}
                         </div>
+                      </td>
+                      <td className="px-5 py-3.5">
+                        <span
+                          className="chip uppercase tracking-wider font-medium whitespace-nowrap"
+                          style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
+                        >
+                          {o.status}{o.parent_order_id ? " · copy" : ""}
+                        </span>
                       </td>
                       <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>
