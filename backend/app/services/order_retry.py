@@ -36,6 +36,35 @@ from app.brokers.base import BrokerAdapter, BrokerOrderRequest, BrokerOrderResul
 
 log = logging.getLogger(__name__)
 
+
+def is_order_conflict_error(exc: Exception) -> bool:
+    """True when a broker rejected an order because ANOTHER working order for the
+    same contract is blocking it — resolvable by cancelling that order and
+    retrying. Covers both directions:
+      * OPPOSITE side → wash trade ('wash trade' / 'opposite side ... order
+        exists' / 'cannot open a short sell while a long buy order is open');
+      * SAME side → the existing order already reserves the position, so a second
+        close is 'uncovered' (options) or 'insufficient qty available' (stocks).
+
+    Matches on the specific MESSAGE — NOT the bare Alpaca code 40310000, which is
+    a broad family that also covers non-cancellable rejections like 'asset X is
+    not fractionable' / 'not tradable'. Matching the code would wrongly cancel
+    the user's working orders for those. Shared by the direct-close path
+    (api.trades) and the copy-engine mirror-close path."""
+    m = str(exc).lower()
+    return (
+        "wash trade" in m
+        or "opposite side" in m
+        or "opposite-side" in m
+        or "long buy order is open" in m
+        or "short sell order is open" in m
+        or "uncovered" in m
+        or "insufficient qty" in m
+        or "insufficient quantity" in m
+        or "held_for_orders" in m
+    )
+
+
 # Default policy. Override per call if needed.
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_INITIAL_BACKOFF_S = 0.4
