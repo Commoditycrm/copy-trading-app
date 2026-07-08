@@ -346,8 +346,9 @@ export default function AdminPerformancePage() {
               Showing {visibleFanouts.length} of {data.fanouts.length} fanouts
             </div>
           )}
+          <div className="overflow-auto" style={{ maxHeight: "70vh" }}>
           <table className="w-full text-sm">
-            <thead>
+            <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <PerfTh label="Trade"           colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Trader"          colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
@@ -362,6 +363,7 @@ export default function AdminPerformancePage() {
               {visibleFanouts.map(f => <FanoutRow key={f.parent_order_id} fanout={f} />)}
             </tbody>
           </table>
+          </div>
         </div>
       )}
 
