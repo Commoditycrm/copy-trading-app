@@ -50,7 +50,15 @@ def is_order_conflict_error(exc: Exception) -> bool:
     a broad family that also covers non-cancellable rejections like 'asset X is
     not fractionable' / 'not tradable'. Matching the code would wrongly cancel
     the user's working orders for those. Shared by the direct-close path
-    (api.trades) and the copy-engine mirror-close path."""
+    (api.trades) and the copy-engine mirror-close path.
+
+    Covers BOTH broker vocabularies:
+      * Alpaca (direct) — 'wash trade' / 'opposite side' / 'insufficient qty' /
+        'held_for_orders';
+      * Webull via SnapTrade — 'cancel the existing order first to place the new
+        order' and its variants.
+    A false positive is harmless: the caller looks for a same-contract working
+    order to cancel and, finding none, re-raises the original error unchanged."""
     m = str(exc).lower()
     return (
         "wash trade" in m
@@ -62,6 +70,17 @@ def is_order_conflict_error(exc: Exception) -> bool:
         or "insufficient qty" in m
         or "insufficient quantity" in m
         or "held_for_orders" in m
+        # Webull / SnapTrade "there's already a working order — cancel it first".
+        # Real message (code 1119): "You can not place order in excess of current
+        # holding quantity to create a position on the other side of the market.
+        # Please check your open orders and try again."
+        or "existing order" in m
+        or "cancel the existing" in m
+        or "cancel existing" in m
+        or "cancel your open" in m
+        or "in excess of current holding" in m
+        or "other side of the market" in m
+        or "check your open orders" in m
     )
 
 
