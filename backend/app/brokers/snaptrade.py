@@ -906,14 +906,17 @@ class SnapTradeAdapter(BrokerAdapter):
             else:
                 right = None
 
-            # OCC contract multiplier = 100 shares per contract. SnapTrade
-            # returns price/avg as per-contract premium, not per-share,
-            # so the multiplier turns these into the dollar amounts the
-            # position TP/SL enforcer expects (it computes pct as
-            # unrealized_pnl / |cost_basis|).
+            # OCC multiplier = 100 shares/contract. SnapTrade reports the two
+            # price fields on DIFFERENT scales: `price` (current) is per-share,
+            # but `average_purchase_price` is per-contract (already ×100). So
+            # normalise avg to per-share before applying the multiplier — else
+            # cost basis and P&L come out 100× too large, and the displayed
+            # avg-entry doesn't line up with current_price. The TP/SL enforcer
+            # depends on these too (it computes pct as unrealized_pnl / |cost_basis|).
             mult = Decimal(100)
+            avg_per_share = avg_entry / mult if avg_entry is not None else None
             market_value = current_price * qty * mult if current_price is not None else None
-            cost_basis = avg_entry * qty * mult if avg_entry is not None else None
+            cost_basis = avg_per_share * qty * mult if avg_per_share is not None else None
             unrealized_pnl = (
                 market_value - cost_basis
                 if market_value is not None and cost_basis is not None
@@ -925,7 +928,7 @@ class SnapTradeAdapter(BrokerAdapter):
                 symbol=ticker,
                 instrument_type=InstrumentType.OPTION,
                 quantity=qty,
-                avg_entry_price=avg_entry,
+                avg_entry_price=avg_per_share,
                 current_price=current_price,
                 market_value=market_value,
                 unrealized_pnl=unrealized_pnl,
