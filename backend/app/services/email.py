@@ -275,6 +275,63 @@ def send_follow_decision_email(
     return send_email(to, subject, _shell(app, heading, body), text)
 
 
+def send_email_change_verification(to: str, verify_link: str, display_name: str | None) -> bool:
+    """Send the confirm-your-new-email link to the NEW address during an email
+    change. The change doesn't take effect until this link is clicked."""
+    s = get_settings()
+    app = s.email_from_name
+    name = (display_name or "").strip() or "there"
+    subject = f"Confirm your new {app} email"
+    text = (
+        f"Hi {name},\n\n"
+        f"We received a request to change the email on your {app} account to this "
+        "address. Confirm it here to finish the change:\n"
+        f"{verify_link}\n\n"
+        "If you didn't request this, you can ignore this email — nothing changes "
+        "until the link is clicked.\n\n"
+        f"— The {app} team\n"
+    )
+    body = f"""\
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">Hi {name},</p>
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">
+          We received a request to change the email on your <strong>{app}</strong> account to
+          this address. Confirm it to finish the change — nothing changes until you do.</p>
+        <p style="margin:24px 0">
+          <a href="{verify_link}" style="background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;font-size:15px;display:inline-block">
+            Confirm new email
+          </a>
+        </p>
+        <p style="margin:0 0 8px;font-size:13px;color:#64748b">If the button doesn't work, paste this link into your browser:</p>
+        <p style="margin:0;font-size:13px"><a href="{verify_link}" style="color:#2563eb;word-break:break-all">{verify_link}</a></p>"""
+    return send_email(to, subject, _shell(app, "Confirm your new email", body), text)
+
+
+def send_email_change_notice(to_old: str, new_email: str, display_name: str | None) -> bool:
+    """Heads-up to the OLD address that an email change was requested, so the
+    user is alerted if it wasn't them."""
+    s = get_settings()
+    app = s.email_from_name
+    name = (display_name or "").strip() or "there"
+    subject = f"Email change requested on your {app} account"
+    text = (
+        f"Hi {name},\n\n"
+        f"Someone requested to change your {app} account email to {new_email}. "
+        "The change only completes once the new address is confirmed.\n\n"
+        "If this wasn't you, change your password immediately — your account may "
+        "be compromised.\n\n"
+        f"— The {app} team\n"
+    )
+    body = f"""\
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">Hi {name},</p>
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155">
+          Someone requested to change your <strong>{app}</strong> account email to
+          <strong>{new_email}</strong>. The change only completes once that address is
+          confirmed.</p>
+        <p style="margin:0;font-size:13px;color:#64748b">
+          🔒 If this wasn't you, change your password immediately — your account may be compromised.</p>"""
+    return send_email(to_old, subject, _shell(app, "Email change requested", body), text)
+
+
 def send_verification_email(to: str, verify_link: str, display_name: str | None) -> bool:
     """Compose + send the email-verification email. Safe to call from a
     BackgroundTask. Returns the underlying send result."""

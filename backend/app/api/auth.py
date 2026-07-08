@@ -24,6 +24,7 @@ from app.database import get_db
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.auth import (
+    ChangeEmailIn,
     ForgotPasswordIn,
     LoginIn,
     MessageOut,
@@ -37,7 +38,12 @@ from app.schemas.auth import (
     VerifyEmailIn,
 )
 from app.services import audit, rate_limit
-from app.services.email import send_password_reset_email, send_verification_email
+from app.services.email import (
+    send_email_change_notice,
+    send_email_change_verification,
+    send_password_reset_email,
+    send_verification_email,
+)
 
 
 def _send_verification(background: BackgroundTasks, user: User) -> None:
@@ -340,3 +346,77 @@ def update_me(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.post("/change-email", response_model=MessageOut)
+def change_email(
+    payload: ChangeEmailIn,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> MessageOut:
+    """Start an email change. Re-authenticates with the current password, then
+    emails a confirmation link to the NEW address — the change only takes
+    effect once that link is clicked (see /verify-email-change). Also sends a
+    heads-up to the old address in case the session was hijacked."""
+    if not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="invalid_password")
+    new_email = payload.new_email  # normalized (lowercased/stripped) by the schema
+    if new_email == user.email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="email_unchanged")
+    taken = db.execute(select(User).where(User.email == new_email)).scalar_one_or_none()
+    if taken is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="email_taken")
+
+    token = create_email_verification_token(str(user.id), new_email)
+    link = f"{get_settings().frontend_base_url}/verify-email?token={token}&change=1"
+    background.add_task(send_email_change_verification, new_email, link, user.display_name)
+    background.add_task(send_email_change_notice, user.email, new_email, user.display_name)
+    audit.record(
+        db, actor_user_id=user.id, action="user.email_change_requested",
+        entity_type="user", entity_id=user.id,
+        metadata={"new_email": new_email}, ip_address=client_ip(request),
+    )
+    db.commit()
+    return MessageOut(detail=f"We sent a confirmation link to {new_email}. Click it to finish the change.")
+
+
+@router.post("/verify-email-change", response_model=MessageOut)
+def verify_email_change(
+    payload: VerifyEmailIn,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Apply a pending email change from its confirmation token. The token's
+    ``eml`` claim is the NEW address; on success the account moves to it and is
+    marked verified. Idempotent if already applied."""
+    try:
+        claims = decode_email_verification_token(payload.token)
+        user = db.get(User, uuid.UUID(claims["sub"]))
+    except (ValueError, KeyError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+
+    new_email = claims.get("eml")
+    if user is None or not new_email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+
+    if user.email != new_email:
+        # Someone else may have claimed the address between request and confirm.
+        clash = db.execute(
+            select(User).where(User.email == new_email, User.id != user.id)
+        ).scalar_one_or_none()
+        if clash is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="email_taken")
+        old_email = user.email
+        user.email = new_email
+        user.email_verified = True
+        user.email_verified_at = datetime.now(timezone.utc)
+        audit.record(
+            db, actor_user_id=user.id, action="user.email_changed",
+            entity_type="user", entity_id=user.id,
+            metadata={"old_email": old_email, "new_email": new_email},
+            ip_address=client_ip(request),
+        )
+        db.commit()
+    return MessageOut(detail=f"Your email has been updated to {new_email}.")

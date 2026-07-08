@@ -97,6 +97,16 @@ class UpdateMeIn(BaseModel):
         return v.strip() if isinstance(v, str) else v
 
 
+class ChangeEmailIn(BaseModel):
+    """Request an email change. The new address is verified before it takes
+    effect; the current password re-authenticates the (already logged-in)
+    user so a hijacked session can't silently move the account."""
+    new_email: EmailStr
+    password: str
+
+    _norm_email = field_validator("new_email", mode="before")(_normalize_email)
+
+
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
