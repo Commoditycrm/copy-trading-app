@@ -336,17 +336,44 @@ def update_me(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> User:
-    """Self-service profile update — currently just the display name. The name
-    is surfaced across the app (shell, follow lists, admin views), so the
-    change is visible immediately on the next fetch."""
-    user.display_name = payload.display_name
+    """Self-service profile update — display name and, for traders, business
+    name (their brand). Both are surfaced across the app (shell, follow lists,
+    admin views), so changes show on the next fetch. Fields are applied only
+    when present, so name and brand can be saved independently."""
+    changed: dict = {}
+    if payload.display_name is not None:
+        if not payload.display_name:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="display_name_required")
+        user.display_name = payload.display_name
+        changed["display_name"] = payload.display_name
+    if payload.business_name is not None:
+        # Business name is the trader brand shown to their subscribers; it's
+        # meaningless for subscribers/admins.
+        if user.role != UserRole.TRADER:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="business_name only applies to traders")
+        if not payload.business_name:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="business_name_blank")
+        user.business_name = payload.business_name
+        changed["business_name"] = payload.business_name
+
+    if not changed:
+        return user
+
     audit.record(
         db, actor_user_id=user.id, action="user.profile_updated",
-        entity_type="user", entity_id=user.id,
-        metadata={"display_name": payload.display_name},
+        entity_type="user", entity_id=user.id, metadata=changed,
     )
     db.commit()
     db.refresh(user)
+
+    # A brand rename must reach every follower — bust the per-trader subscriber
+    # cache so their next fetch sees it without waiting on the Redis TTL.
+    if "business_name" in changed:
+        try:
+            from app.services import cache as cache_svc  # noqa: PLC0415
+            cache_svc.invalidate_subscribers_for_trader(user.id)
+        except Exception:  # noqa: BLE001
+            pass
     return user
 
 
