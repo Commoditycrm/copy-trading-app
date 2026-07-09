@@ -14,10 +14,8 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {}) {
   const [user, setUser] = useState<User | null>(null);
   const [name, setName] = useState("");
-  const [biz, setBiz] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [savingBiz, setSavingBiz] = useState(false);
   const [emailOpen, setEmailOpen] = useState(false);
   const [newEmail, setNewEmail] = useState("");
   const [pwd, setPwd] = useState("");
@@ -25,33 +23,12 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
 
   useEffect(() => {
     api<User>("/api/auth/me")
-      .then(u => { setUser(u); setName(u.display_name ?? ""); setBiz(u.business_name ?? ""); })
+      .then(u => { setUser(u); setName(u.display_name ?? ""); })
       .catch(e => notify.fromError(e, "Could not load your profile"))
       .finally(() => setLoading(false));
   }, []);
 
   const dirty = user != null && name.trim() !== (user.display_name ?? "").trim();
-  const isTrader = user?.role === "trader";
-  const bizDirty = isTrader && biz.trim() !== (user?.business_name ?? "").trim();
-
-  async function saveBusiness() {
-    const v = biz.trim();
-    if (!v) { notify.warn("Business name can't be empty"); return; }
-    setSavingBiz(true);
-    try {
-      const updated = await api<User>("/api/auth/me", {
-        method: "PATCH", body: JSON.stringify({ business_name: v }),
-      });
-      setUser(updated);
-      setBiz(updated.business_name ?? "");
-      onUpdated?.(updated);
-      notify.success("Business name updated");
-    } catch (e) {
-      notify.fromError(e, "Could not update business name");
-    } finally {
-      setSavingBiz(false);
-    }
-  }
 
   async function save() {
     const v = name.trim();
@@ -127,43 +104,6 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
           Save {saving && <Spinner />}
         </button>
       </div>
-
-      {/* Business name — traders only (their brand, shown to subscribers) */}
-      {isTrader && (
-        <div className="mt-3">
-          <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: "var(--muted)" }}>
-            Business name
-          </label>
-          <div className="flex items-center gap-2">
-            <input
-              value={biz}
-              maxLength={120}
-              placeholder="Your brand"
-              onChange={e => setBiz(e.target.value)}
-              onKeyDown={e => { if (e.key === "Enter" && bizDirty && !savingBiz) saveBusiness(); }}
-              className="flex-1 text-sm px-3 py-1.5 rounded-lg"
-              style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
-            />
-            <button
-              onClick={saveBusiness}
-              disabled={!bizDirty || savingBiz}
-              className="text-sm px-4 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-medium"
-              style={{
-                background: bizDirty ? "var(--accent)" : "var(--panel-2)",
-                color: bizDirty ? "var(--accent-ink)" : "var(--text-2)",
-                border: "1px solid " + (bizDirty ? "var(--accent)" : "var(--border)"),
-                opacity: savingBiz ? 0.6 : 1,
-                cursor: !bizDirty || savingBiz ? "not-allowed" : "pointer",
-              }}
-            >
-              Save {savingBiz && <Spinner />}
-            </button>
-          </div>
-          <p className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
-            Shown as your brand to your subscribers.
-          </p>
-        </div>
-      )}
 
       {/* Email */}
       <div className="mt-4 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
