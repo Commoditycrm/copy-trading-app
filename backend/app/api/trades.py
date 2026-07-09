@@ -27,7 +27,7 @@ from app.schemas.order import (
 )
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
-from app.services.order_retry import is_order_conflict_error
+from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -600,6 +600,7 @@ def _place_trader_order(
     # re-close. `resolve_wash_trade` gates this to close paths; we never
     # auto-cancel resting orders to force an ENTRY through.
     _cancelled_conflicts = False
+    _reclamped_to_live = False
     _wash_retries = 0
     _rounded_whole = False
     while True:
@@ -630,6 +631,26 @@ def _place_trader_order(
                     broker_req = replace(broker_req, quantity=whole)
                     continue
             if resolve_wash_trade and is_order_conflict_error(exc):
+                # Re-clamp to the broker's LIVE held quantity (source of truth).
+                # Fixes a close rejected for exceeding holdings when our DB
+                # position was stale (e.g. a prior partial fill hadn't synced).
+                # Only ever SHRINKS the order, so it can never oversell.
+                if not _reclamped_to_live:
+                    _reclamped_to_live = True
+                    live = live_closeable_quantity(adapter, broker_req)
+                    if live is not None and 0 < live < broker_req.quantity:
+                        audit.record(
+                            db, actor_user_id=trader.id,
+                            action="close.reclamped_to_live_qty",
+                            entity_type="order", entity_id=order.id,
+                            metadata={"from_qty": str(broker_req.quantity),
+                                      "to_qty": str(live), "symbol": order.symbol,
+                                      "reason": str(exc)[:200]},
+                            ip_address=client_ip(request),
+                        )
+                        order.quantity = live
+                        broker_req = replace(broker_req, quantity=live)
+                        _wash_retries = max(_wash_retries, 3)
                 if not _cancelled_conflicts:
                     _cancelled_conflicts = True
                     cancelled = _cancel_conflicting_orders(db, trader, acct, adapter, order)
