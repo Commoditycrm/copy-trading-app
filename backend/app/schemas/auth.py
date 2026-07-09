@@ -86,12 +86,13 @@ class RegisterIn(BaseModel):
 
 
 class UpdateMeIn(BaseModel):
-    """Self-service profile edit. Only the display name is editable here —
-    email is identity (change is a separate, verified flow) and business_name
-    is trader-brand managed elsewhere."""
-    display_name: str = Field(min_length=1, max_length=120)
+    """Self-service profile edit. Both fields are optional so name and (trader-
+    only) business name can be saved independently. Email is identity — changed
+    via its own verified flow, not here."""
+    display_name: str | None = Field(default=None, max_length=120)
+    business_name: str | None = Field(default=None, max_length=120)
 
-    @field_validator("display_name", mode="before")
+    @field_validator("display_name", "business_name", mode="before")
     @classmethod
     def _strip(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
