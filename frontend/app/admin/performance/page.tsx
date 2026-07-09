@@ -82,7 +82,13 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-type PerfSortKey = "symbol" | "trader" | "time" | "subscribers" | "detection" | "fanout" | "total";
+type PerfSortKey = "symbol" | "instrument" | "trader" | "time" | "subscribers" | "success" | "detection" | "fanout" | "total";
+
+// Per-fanout mirror success ratio (submitted / total). -1 when no subscribers,
+// so those sort to the bottom on a descending sort.
+function successRatio(f: Fanout): number {
+  return f.subscribers.total > 0 ? f.subscribers.submitted / f.subscribers.total : -1;
+}
 
 // Clickable header cell for the fanout table.
 function PerfTh({
@@ -135,6 +141,13 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           <span className="ml-1 text-xs" style={{ color: "var(--muted)" }}>×{fanout.quantity}</span>
         </td>
 
+        {/* Instrument type */}
+        <td className="px-3 py-2.5">
+          <span className="text-xs px-2 py-0.5 rounded-full capitalize" style={{ background: "var(--panel-2)", color: "var(--text-2)" }}>
+            {fanout.instrument_type}
+          </span>
+        </td>
+
         {/* Trader */}
         <td className="px-3 py-2.5 text-xs" style={{ color: "var(--text-2)" }}>
           {fanout.trader_display_name ?? fanout.trader_email ?? "—"}
@@ -160,6 +173,15 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           </div>
         </td>
 
+        {/* Success rate */}
+        <td className="px-3 py-2.5 text-xs font-medium" style={{
+          color: fanout.subscribers.total === 0 ? "var(--muted)"
+               : successRate === 100 ? "var(--good)"
+               : successRate >= 50 ? "#facc15" : "var(--bad)",
+        }}>
+          {fanout.subscribers.total === 0 ? "—" : `${successRate}%`}
+        </td>
+
         {/* Timing */}
         <td className="px-3 py-2.5">{ms(fanout.detection_lag_ms)}</td>
         <td className="px-3 py-2.5">{ms(fanout.fanout_duration_ms)}</td>
@@ -175,9 +197,11 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
             </div>
             <div className="text-xs" style={{ color: "var(--muted)" }}>{child.subscriber_email}</div>
           </td>
+          <td className="px-3 py-2" />{/* Type column — parent-level only */}
           <td className="px-3 py-2 text-xs" style={{ color: "var(--muted)" }}>subscriber</td>
           <td className="px-3 py-2 text-xs" style={{ color: "var(--muted)" }}>{fmt(child.submitted_at)}</td>
           <td className="px-3 py-2"><StatusBadge status={child.status} /></td>
+          <td className="px-3 py-2" />{/* Success column — parent-level only */}
           <td className="px-3 py-2 text-xs" style={{ color: "var(--muted)" }}>{ms(child.pick_lag_ms)}</td>
           <td className="px-3 py-2 text-xs">{ms(child.broker_lag_ms)}</td>
           <td className="px-3 py-2 text-xs">{ms(child.subscriber_lag_ms)}</td>
@@ -235,6 +259,8 @@ export default function AdminPerformancePage() {
       const dir = sortDir === "asc" ? 1 : -1;
       switch (sortKey) {
         case "symbol":      return a.symbol.localeCompare(b.symbol) * dir;
+        case "instrument":  return a.instrument_type.localeCompare(b.instrument_type) * dir;
+        case "success":     return (successRatio(a) - successRatio(b)) * dir;
         case "trader":      return (a.trader_display_name ?? a.trader_email ?? "")
                                      .localeCompare(b.trader_display_name ?? b.trader_email ?? "") * dir;
         case "time":        return (time(a.broker_accepted_at) - time(b.broker_accepted_at)) * dir;
@@ -351,9 +377,11 @@ export default function AdminPerformancePage() {
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <PerfTh label="Trade"           colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Type"            colKey="instrument"  sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Trader"          colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Time"            colKey="time"        sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Subscribers"     colKey="subscribers" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PerfTh label="Success"         colKey="success"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Detection Lag"   colKey="detection"   sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Fanout Duration" colKey="fanout"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Total Time"      colKey="total"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
