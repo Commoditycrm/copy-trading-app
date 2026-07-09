@@ -31,8 +31,10 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 
 from app.brokers.base import BrokerAdapter, BrokerOrderRequest, BrokerOrderResult
+from app.models.order import InstrumentType, OrderSide
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +84,55 @@ def is_order_conflict_error(exc: Exception) -> bool:
         or "other side of the market" in m
         or "check your open orders" in m
     )
+
+
+def live_closeable_quantity(
+    adapter: BrokerAdapter, req: BrokerOrderRequest
+) -> "Decimal | None":
+    """Ask the BROKER (live, source of truth) how much of ``req``'s contract can
+    still be closed in ``req.side``'s direction — a long balance for a SELL close,
+    a short balance for a BUY close.
+
+    Used to re-clamp a CLOSE that the broker rejected for exceeding the held
+    quantity (e.g. our DB position was stale from a partial fill that hadn't
+    synced). Broker-agnostic: works for direct Alpaca and Webull-via-SnapTrade,
+    since both implement ``get_positions()``.
+
+    Returns:
+      * the closeable quantity (>= 0) when we could read positions;
+        ``0`` means the account is already flat on this contract;
+      * ``None`` when positions couldn't be read — callers must then NOT clamp
+        (we can't prove the size is wrong, so leave the order untouched).
+    """
+    try:
+        positions = adapter.get_positions()
+    except Exception:  # noqa: BLE001
+        log.exception("live_closeable_quantity: get_positions failed for %s", req.symbol)
+        return None
+
+    want_right = req.option_right.value if req.option_right else None
+    for p in positions:
+        if p.instrument_type != req.instrument_type:
+            continue
+        if (p.symbol or "").upper() != req.symbol.upper():
+            continue
+        if req.instrument_type == InstrumentType.OPTION:
+            if p.option_expiry != req.option_expiry:
+                continue
+            # Numeric strike compare so "11" == "11.0".
+            if (p.option_strike is None) != (req.option_strike is None):
+                continue
+            if p.option_strike is not None and req.option_strike is not None \
+                    and Decimal(str(p.option_strike)) != Decimal(str(req.option_strike)):
+                continue
+            p_right = p.option_right.value if p.option_right else None
+            if p_right != want_right:
+                continue
+        qty = p.quantity  # signed: + long, - short
+        if req.side == OrderSide.SELL:
+            return qty if qty > 0 else Decimal(0)
+        return (-qty) if qty < 0 else Decimal(0)  # BUY close covers a short
+    return Decimal(0)  # no matching position → already flat
 
 
 # Default policy. Override per call if needed.
