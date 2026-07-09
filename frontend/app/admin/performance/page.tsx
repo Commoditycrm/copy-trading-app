@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { SubscriberPill } from "@/components/performance/PerformanceView";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface ChildOrder {
@@ -243,16 +244,9 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           {blStats.maxBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.maxBroker})</span>}
         </td>
 
-        {/* Subscribers */}
-        <td className="px-3 py-2.5 text-xs">
-          <span style={{ color: "#22c55e" }}>{fanout.subscribers.submitted}</span>
-          <span style={{ color: "var(--muted)" }}>/{fanout.subscribers.total}</span>
-          {fanout.subscribers.errors > 0 && (
-            <span className="ml-1" style={{ color: "#ef4444" }}>({fanout.subscribers.errors} err)</span>
-          )}
-          <div className="mt-0.5 rounded-full overflow-hidden" style={{ height: 3, background: "var(--border)", width: 60 }}>
-            <div style={{ width: `${successRate}%`, height: "100%", background: successRate === 100 ? "var(--good)" : "#facc15" }} />
-          </div>
+        {/* Subscribers — same pill as the trader Performance table */}
+        <td className="px-3 py-2.5">
+          <SubscriberPill counts={fanout.subscribers} />
         </td>
 
         {/* Success rate */}
