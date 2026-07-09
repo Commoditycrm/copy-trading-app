@@ -129,6 +129,7 @@ const NAV_TRADER = [
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
   { href: "/performance", label: "Performance", Icon: IconActivity },
   { href: "/brokers", label: "Broker", Icon: IconLink },
+  { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 const NAV_SUBSCRIBER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
@@ -684,23 +685,30 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <div className="flex items-center gap-2 sm:gap-3">
             <ThemeToggle />
             <NotificationBell unreadCount={unreadCount} onChanged={refreshUnreadCount} />
-            <div
-              className="grid place-items-center rounded-full shrink-0"
-              style={{
-                width: 32, height: 32,
-                background: "var(--chip-bg)",
-                border: "1px solid var(--border)",
-                color: "var(--accent)", fontWeight: 700, fontSize: 14,
-              }}
+            <Link
+              href="/settings"
+              title="Profile & settings"
+              className="flex items-center gap-2 sm:gap-3 rounded-lg px-1.5 py-1 no-underline transition-colors hover:bg-[var(--panel-2)] focus-ring"
+              style={{ color: "inherit" }}
             >
-              {initials(user.display_name, user.email)}
-            </div>
-            <div className="leading-tight text-right hidden sm:block">
-              <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
-              <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
-                {user.role}
+              <div
+                className="grid place-items-center rounded-full shrink-0"
+                style={{
+                  width: 32, height: 32,
+                  background: "var(--chip-bg)",
+                  border: "1px solid var(--border)",
+                  color: "var(--accent)", fontWeight: 700, fontSize: 14,
+                }}
+              >
+                {initials(user.display_name, user.email)}
               </div>
-            </div>
+              <div className="leading-tight text-right hidden sm:block">
+                <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
+                <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
+                  {user.role}
+                </div>
+              </div>
+            </Link>
           </div>
         </header>
 
