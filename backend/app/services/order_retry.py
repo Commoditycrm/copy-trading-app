@@ -83,6 +83,22 @@ def is_order_conflict_error(exc: Exception) -> bool:
         or "in excess of current holding" in m
         or "other side of the market" in m
         or "check your open orders" in m
+        # Same code-1119 conflict, "naked position" framing: an existing order +
+        # this close net to MORE than the held qty, so the broker thinks we're
+        # trying to open a naked short. e.g. "you cannot open additional naked
+        # call positions" / "...naked put...".
+        or "naked call" in m
+        or "naked put" in m
+        or "naked position" in m
+        or "open additional naked" in m
+        # Belt-and-braces: any Webull/SnapTrade code-1119 rejection. 1119 is the
+        # "would exceed holding / create opposite (naked/short) position" family;
+        # we only ever act on it for a CLOSE, where the safe resolution (cancel a
+        # same-contract working order + re-clamp to live held qty) applies. If
+        # there's nothing to cancel and the size is fine, we re-raise unchanged.
+        or "'code': '1119'" in m
+        or '"code": "1119"' in m
+        or "code': 1119" in m
     )
 
 
