@@ -11,6 +11,7 @@ import type { SubscriberSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { NotificationBell } from "@/components/NotificationBell";
+import { ProfileModal } from "@/components/profile/ProfileModal";
 import { ChevronsLeft, ChevronsRight } from "lucide-react";
 
 function IconGrid() {
@@ -129,6 +130,7 @@ const NAV_TRADER = [
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
   { href: "/performance", label: "Performance", Icon: IconActivity },
   { href: "/brokers", label: "Broker", Icon: IconLink },
+  { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 const NAV_SUBSCRIBER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
@@ -259,6 +261,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const [user, setUser] = useState<User | null>(null);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   // Trader-only master switch for copying to subscribers. `null` while
   // unloaded so we can hide the toggle until we know the state.
@@ -684,25 +687,47 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <div className="flex items-center gap-2 sm:gap-3">
             <ThemeToggle />
             <NotificationBell unreadCount={unreadCount} onChanged={refreshUnreadCount} />
-            <div
-              className="grid place-items-center rounded-full shrink-0"
-              style={{
-                width: 32, height: 32,
-                background: "var(--chip-bg)",
-                border: "1px solid var(--border)",
-                color: "var(--accent)", fontWeight: 700, fontSize: 14,
-              }}
+            <button
+              type="button"
+              onClick={() => setProfileOpen(true)}
+              title="Profile"
+              className="flex items-center gap-2 sm:gap-3 rounded-lg px-1.5 py-1 transition-colors hover:bg-[var(--panel-2)] focus-ring"
             >
-              {initials(user.display_name, user.email)}
-            </div>
-            <div className="leading-tight text-right hidden sm:block">
-              <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
-              <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
-                {user.role}
+              <div
+                className="grid place-items-center rounded-full shrink-0"
+                style={{
+                  width: 32, height: 32,
+                  background: "var(--chip-bg)",
+                  border: "1px solid var(--border)",
+                  color: "var(--accent)", fontWeight: 700, fontSize: 14,
+                }}
+              >
+                {initials(user.display_name, user.email)}
               </div>
-            </div>
+              <div className="leading-tight text-right hidden sm:block">
+                <div className="text-sm" style={{ fontWeight: 600 }}>{displayName}</div>
+                <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
+                  {user.role}
+                </div>
+              </div>
+            </button>
           </div>
         </header>
+
+        <ProfileModal
+          open={profileOpen}
+          user={user}
+          onClose={() => setProfileOpen(false)}
+          onSignOut={() => {
+            clearTokens();
+            try { sessionStorage.removeItem(USER_CACHE_KEY); } catch {}
+            router.replace("/login");
+          }}
+          onUpdated={(u) => {
+            setUser(u);
+            try { sessionStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)); } catch {}
+          }}
+        />
 
         {!user.email_verified && (
           <div
