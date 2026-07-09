@@ -10,9 +10,11 @@ from app.api.deps import client_ip, current_user
 from app.config import get_settings
 from app.core.security import (
     create_access_token,
+    create_email_change_token,
     create_email_verification_token,
     create_password_reset_token,
     create_refresh_token,
+    decode_email_change_token,
     decode_email_verification_token,
     decode_password_reset_token,
     decode_token,
@@ -362,6 +364,14 @@ def change_email(
     heads-up to the old address in case the session was hijacked."""
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="invalid_password")
+    # Per-user cap: each request emails a confirmation to an arbitrary address,
+    # so an unbounded endpoint is an email-bombing vector.
+    if rate_limit.email_change_throttled(str(user.id)):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="too_many_requests",
+            headers={"Retry-After": str(rate_limit.RETRY_AFTER_S)},
+        )
     new_email = payload.new_email  # normalized (lowercased/stripped) by the schema
     if new_email == user.email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="email_unchanged")
@@ -369,7 +379,9 @@ def change_email(
     if taken is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="email_taken")
 
-    token = create_email_verification_token(str(user.id), new_email)
+    # Token is bound to the CURRENT email — any later change invalidates it,
+    # so stale/overlapping confirmation links can't be replayed to revert.
+    token = create_email_change_token(str(user.id), new_email, user.email)
     link = f"{get_settings().frontend_base_url}/verify-email?token={token}&change=1"
     background.add_task(send_email_change_verification, new_email, link, user.display_name)
     background.add_task(send_email_change_notice, user.email, new_email, user.display_name)
@@ -388,20 +400,27 @@ def verify_email_change(
     request: Request,
     db: Session = Depends(get_db),
 ) -> MessageOut:
-    """Apply a pending email change from its confirmation token. The token's
-    ``eml`` claim is the NEW address; on success the account moves to it and is
-    marked verified. Idempotent if already applied."""
+    """Apply a pending email change from its confirmation token. The token
+    carries the NEW address (``new``) and the email at request time (``cur``);
+    on success the account moves to the new address and is marked verified.
+    Idempotent if already applied."""
     try:
-        claims = decode_email_verification_token(payload.token)
+        claims = decode_email_change_token(payload.token)
         user = db.get(User, uuid.UUID(claims["sub"]))
     except (ValueError, KeyError):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
 
-    new_email = claims.get("eml")
+    new_email = claims.get("new")
     if user is None or not new_email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
 
     if user.email != new_email:
+        # Stale-token guard: the account's email must still be what it was when
+        # this token was minted. If it changed since (a newer request landed, or
+        # another link was clicked), this link is stale — reject it so an old
+        # link can't silently revert a subsequent change.
+        if claims.get("cur") != user.email:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
         # Someone else may have claimed the address between request and confirm.
         clash = db.execute(
             select(User).where(User.email == new_email, User.id != user.id)
