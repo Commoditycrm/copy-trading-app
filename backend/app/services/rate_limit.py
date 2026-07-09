@@ -38,6 +38,11 @@ _LOGIN_IP_WINDOW_S = 900
 _REGISTER_IP_LIMIT = 15
 _REGISTER_IP_WINDOW_S = 3600
 
+# Email-change requests, per user — each one emails a confirmation to an
+# arbitrary address, so an unbounded endpoint is an email-bombing vector.
+_EMAIL_CHANGE_LIMIT = 5
+_EMAIL_CHANGE_WINDOW_S = 3600  # 1 hour
+
 # Surfaced in the Retry-After header on a 429.
 RETRY_AFTER_S = _FAIL_EMAIL_WINDOW_S
 
@@ -104,3 +109,11 @@ def register_ip_throttled(ip: str | None) -> bool:
         return False
     count = _incr_with_ttl(f"rl:register:ip:{ip}", _REGISTER_IP_WINDOW_S)
     return count is not None and count > _REGISTER_IP_LIMIT
+
+
+def email_change_throttled(user_id: str) -> bool:
+    """Count this email-change request against the per-user budget; True if
+    over. Caps how fast one account can fire confirmation emails at arbitrary
+    addresses."""
+    count = _incr_with_ttl(f"rl:email_change:{user_id}", _EMAIL_CHANGE_WINDOW_S)
+    return count is not None and count > _EMAIL_CHANGE_LIMIT

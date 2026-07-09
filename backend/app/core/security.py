@@ -115,3 +115,30 @@ def decode_email_verification_token(token: str) -> dict[str, Any]:
     if claims.get("type") != "verify":
         raise ValueError("wrong_token_type")
     return claims
+
+
+# ── Email-change tokens ──────────────────────────────────────────────────────
+#
+# A change token (type="email_change") carries the NEW address (``new``) plus
+# the account's CURRENT email at request time (``cur``). At confirm time the
+# caller re-checks ``cur`` against the live email, so the instant the email
+# actually changes any outstanding change tokens go stale — the same "bind to
+# mutable state" invalidation the reset token gets from its password fingerprint.
+
+
+def create_email_change_token(subject: str, new_email: str, current_email: str) -> str:
+    s = get_settings()
+    return _encode(
+        {"sub": subject, "type": "email_change", "new": new_email, "cur": current_email},
+        timedelta(minutes=s.email_verification_token_minutes),
+    )
+
+
+def decode_email_change_token(token: str) -> dict[str, Any]:
+    """Decode + validate a change token's shape. Raises ValueError on a bad,
+    expired, or wrong-type token. The ``cur`` claim must still be re-checked
+    against the live user row by the caller."""
+    claims = decode_token(token)
+    if claims.get("type") != "email_change":
+        raise ValueError("wrong_token_type")
+    return claims
