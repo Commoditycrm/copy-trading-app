@@ -72,6 +72,7 @@ function IconAlert() {
 const NAV = [
   { href: "/admin",              label: "Dashboard",    Icon: IconGrid },
   { href: "/admin/users",        label: "Users",        Icon: IconUsers },
+  { href: "/admin/traders",      label: "Traders",      Icon: IconActivity },
   { href: "/admin/rejected",     label: "Rejected",     Icon: IconAlert },
   { href: "/admin/load-test",    label: "Load Test",    Icon: IconFlask },
   { href: "/admin/performance",  label: "Performance",  Icon: IconActivity },
