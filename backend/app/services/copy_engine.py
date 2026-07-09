@@ -47,7 +47,7 @@ from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
-from app.services.order_retry import classify_error, is_order_conflict_error
+from app.services.order_retry import classify_error, is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
 
 log = logging.getLogger(__name__)
@@ -231,8 +231,34 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                     exc = exc2  # fall through to conflict handling with new error
         if not (req.is_closing and is_order_conflict_error(exc)):
             raise
-        if not _cancel_subscriber_conflicts(item):
-            raise  # nothing on our side to cancel — retrying won't help
+
+        # Re-clamp to the broker's LIVE held quantity (source of truth). Fixes
+        # the fill-sync-lag case where our DB thought the subscriber held more
+        # than they do — e.g. a mirror close that only PARTIALLY filled, so the
+        # next close for the full size is rejected as "in excess of current
+        # holding". Only ever SHRINKS the order, so it can never oversell.
+        live = live_closeable_quantity(item.adapter, req)
+        reclamped = False
+        if live is not None:
+            if live <= 0:
+                # Broker says the subscriber is already flat — nothing to close.
+                raise RuntimeError(
+                    f"position_already_flat: broker reports 0 held for {req.symbol}"
+                )
+            if live < req.quantity:
+                log.info(
+                    "mirror close re-clamped to live held qty %s for %s (was %s)",
+                    live, req.symbol, req.quantity,
+                )
+                req = replace(req, quantity=live)
+                item.request = req
+                reclamped = True
+
+        # Also cancel any of our OWN working orders reserving the position.
+        cancelled = _cancel_subscriber_conflicts(item)
+        if not reclamped and not cancelled:
+            raise  # neither an oversized qty nor a cancellable order — retry won't help
+
         last_exc: BaseException = exc
         for _ in range(3):
             time.sleep(0.5)  # let the broker release the reservation
@@ -241,6 +267,11 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
             except Exception as exc2:  # noqa: BLE001
                 last_exc = exc2
                 if is_order_conflict_error(exc2):
+                    # Held qty may have moved again — re-clamp once more.
+                    live2 = live_closeable_quantity(item.adapter, req)
+                    if live2 is not None and 0 < live2 < req.quantity:
+                        req = replace(req, quantity=live2)
+                        item.request = req
                     continue
                 raise
         raise last_exc
