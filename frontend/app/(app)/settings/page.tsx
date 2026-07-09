@@ -7,7 +7,6 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
-import { ProfileNameCard } from "@/components/settings/ProfileNameCard";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -1235,9 +1234,6 @@ export default function SettingsPage() {
         </Card>
         </>
       )}
-
-      {/* Profile — self-service display-name edit, available to every role. */}
-      <ProfileNameCard />
 
       <ConfirmModal
         open={resetOpen}
