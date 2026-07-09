@@ -485,9 +485,9 @@ def admin_list_fanouts(
 
     _empty_metrics = {
         "fanouts_shown": 0, "trade_count": 0, "avg_fanout_ms": None,
-        "max_fanout_ms": None, "median_platform_ms": None, "median_broker_ms": None,
-        "success_rate": None, "pct_within_1s": None, "active_subscribers": 0,
-        "truncated": False,
+        "max_fanout_ms": None, "avg_total_ms": None, "median_platform_ms": None,
+        "median_broker_ms": None, "success_rate": None, "pct_within_1s": None,
+        "active_subscribers": 0, "truncated": False,
     }
 
     base = _fanout_window_query(trader_id, from_, to)
@@ -561,11 +561,18 @@ def admin_list_fanouts(
         s["trader_display_name"] = t.display_name if t else None
         fanouts.append(s)
 
+    # Client-facing total latency (trader submit → last subscriber's broker
+    # accepted), averaged over the shown fanouts — parity with the trader
+    # Performance view's "Total Latency" card, which the admin per-trader page
+    # reuses.
+    totals = [s["total_ms"] for s in fanouts if s.get("total_ms") is not None]
+
     metrics = {
         "fanouts_shown": len(fanouts),
         "trade_count": len(parents),
         "avg_fanout_ms": int(sum(platform_ms) / len(platform_ms)) if platform_ms else None,
         "max_fanout_ms": max(platform_ms) if platform_ms else None,
+        "avg_total_ms": int(sum(totals) / len(totals)) if totals else None,
         "median_platform_ms": _median(platform_ms),
         "median_broker_ms": _median(broker_ms),
         "success_rate": round(success / child_total, 4) if child_total else None,
