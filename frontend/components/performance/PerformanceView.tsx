@@ -554,7 +554,7 @@ const IcoTarget = () => (
   </svg>
 );
 
-function SubscriberPill({ counts }: { counts: SubscriberCounts }) {
+export function SubscriberPill({ counts }: { counts: { total: number; submitted: number; errors: number } }) {
   // "6 ✓ / 0 ✗ of 6" — green ok, red errors, neutral denominator.
   // `whitespace-nowrap` keeps the whole pill on a single line even when
   // the column is narrow; without it the column was breaking each
