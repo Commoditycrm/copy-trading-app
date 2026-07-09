@@ -9,6 +9,7 @@ interface ChildOrder {
   order_id: string;
   subscriber_email: string | null;
   subscriber_name: string | null;
+  broker_name: string | null;
   status: string;
   quantity: string;
   filled_quantity: string;
@@ -142,12 +143,43 @@ function PlainTh({ label }: { label: string }) {
   );
 }
 
+// Broker-lag min/avg/max across a fanout's subscriber children, with which
+// broker hit the min/max. Mirrors the trader Performance table. avgBroker is
+// only labelled when every contributing child shares one broker.
+function brokerLagStats(children: ChildOrder[]): {
+  min: number | null; minBroker: string | null;
+  avg: number | null; avgBroker: string | null;
+  max: number | null; maxBroker: string | null;
+} {
+  type Row = { ms: number; broker: string | null };
+  const rows: Row[] = children
+    .map(c => ({ ms: c.broker_lag_ms as number, broker: c.broker_name ?? null }))
+    .filter((r): r is Row => typeof r.ms === "number" && Number.isFinite(r.ms) && r.ms >= 0);
+  if (rows.length === 0) {
+    return { min: null, minBroker: null, avg: null, avgBroker: null, max: null, maxBroker: null };
+  }
+  let minRow = rows[0], maxRow = rows[0], sum = 0;
+  for (const r of rows) {
+    if (r.ms < minRow.ms) minRow = r;
+    if (r.ms > maxRow.ms) maxRow = r;
+    sum += r.ms;
+  }
+  const distinct = new Set(rows.map(r => r.broker).filter(Boolean));
+  return {
+    min: minRow.ms, minBroker: minRow.broker,
+    avg: Math.round(sum / rows.length),
+    avgBroker: distinct.size === 1 ? Array.from(distinct)[0] : null,
+    max: maxRow.ms, maxBroker: maxRow.broker,
+  };
+}
+
 // ── Expandable fanout row ──────────────────────────────────────────────────────
 function FanoutRow({ fanout }: { fanout: Fanout }) {
   const [open, setOpen] = useState(false);
   const successRate = fanout.subscribers.total > 0
     ? Math.round((fanout.subscribers.submitted / fanout.subscribers.total) * 100)
     : 0;
+  const blStats = brokerLagStats(fanout.children);
 
   return (
     <>
@@ -197,6 +229,20 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
         <td className="px-3 py-2.5">{ms(fanout.fanout_duration_ms)}</td>
         <td className="px-3 py-2.5">{ms(fanout.total_ms)}</td>
 
+        {/* Broker lag min / avg / max across subscriber children */}
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.min)}
+          {blStats.minBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.minBroker})</span>}
+        </td>
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.avg)}
+          {blStats.avgBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.avgBroker})</span>}
+        </td>
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.max)}
+          {blStats.maxBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.maxBroker})</span>}
+        </td>
+
         {/* Subscribers */}
         <td className="px-3 py-2.5 text-xs">
           <span style={{ color: "#22c55e" }}>{fanout.subscribers.submitted}</span>
@@ -222,7 +268,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={16} className="px-4 py-3">
+          <td colSpan={19} className="px-4 py-3">
             <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
               Per-subscriber breakdown ({fanout.children.length})
             </div>
@@ -441,6 +487,9 @@ export default function AdminPerformancePage() {
                 <PerfTh label="Detection Lag"    colKey="detection"   sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Fanout Duration"  colKey="fanout"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Total Time"       colKey="total"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PlainTh label="Lowest Broker Lag" />
+                <PlainTh label="Average Broker Lag" />
+                <PlainTh label="Highest Broker Lag" />
                 <PerfTh label="Subscribers"      colKey="subscribers" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Success"          colKey="success"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
