@@ -22,11 +22,11 @@ Trader-only.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_trader
@@ -46,6 +46,26 @@ _SUCCESS_STATUSES = {
     OrderStatus.FILLED,
 }
 _ERROR_STATUSES = {OrderStatus.REJECTED}
+
+# A real fanout is detected within moments of the broker accepting the trader's
+# order. Anything with a much larger gap between broker-acceptance (submitted_at)
+# and our detection (created_at) was NOT a live fanout — it's a resting order that
+# filled long after placement, or a historical/backfilled order the listener
+# replay-guard recorded (see trade_listener order_predates_connection). Those
+# carry a meaningless multi-hour/day "detection lag" and skew every latency metric,
+# so the fanout views exclude them. Conservative 1h cut — real detections are
+# sub-second to seconds; tune down if the latency view should be stricter.
+FANOUT_REALTIME_MAX_DETECTION = timedelta(hours=1)
+
+
+def realtime_fanout_clause():
+    """SQL filter: keep only parent fanouts detected within
+    FANOUT_REALTIME_MAX_DETECTION of broker acceptance. Fail-open when
+    submitted_at is NULL (can't judge — don't drop it)."""
+    return or_(
+        Order.submitted_at.is_(None),
+        Order.submitted_at >= Order.created_at - FANOUT_REALTIME_MAX_DETECTION,
+    )
 
 
 def _ms_between(a: datetime | None, b: datetime | None) -> int | None:
@@ -206,6 +226,7 @@ def list_fanouts(
                 Order.user_id == trader.id,
                 Order.parent_order_id.is_(None),
                 Order.fanned_out_to_subscribers.is_(True),
+                realtime_fanout_clause(),
             )
             .order_by(Order.created_at.desc())
             .limit(limit)
