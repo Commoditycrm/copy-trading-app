@@ -34,6 +34,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
 from app.models.user import User
+from app.services.broker_names import heal_snaptrade_brokerage_names
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
 
@@ -250,77 +251,10 @@ def list_fanouts(
             ).scalars()
         }
 
-    # Self-heal SnapTrade accounts whose denormalized ``brokerage_name`` is
-    # still NULL — pre-migration rows, rows whose decrypt failed during the
-    # 33ee68c24d53 backfill, or rows connected before ``brokerage_name`` was
-    # being written into the credentials JSON. Order of recovery, cheapest
-    # first:
-    #   1. ``creds["brokerage_name"]``  — direct hit (most accounts).
-    #   2. ``creds["brokerage_slug"]``  — fallback for older creds that
-    #      only stored the slug ("ROBINHOOD" → "Robinhood").
-    #   3. SnapTrade ``list_brokerage_authorizations`` API call — last
-    #      resort for legacy rows with neither. One network round-trip per
-    #      affected account, but only on the very first page load after
-    #      this code ships; the column is persisted afterward.
-    needs_heal = [
-        a for a in accounts.values()
-        if a.broker == BrokerName.SNAPTRADE and not a.brokerage_name
-    ]
-    if needs_heal:
-        from app.brokers import snaptrade as snap_module  # noqa: PLC0415
-        from app.services.crypto import decrypt_json  # noqa: PLC0415
-
-        def _pluck(obj: Any, *names: str) -> Any:
-            """Tolerant attribute/key getter — SnapTrade SDK returns mixed dict/typed objects."""
-            for n in names:
-                v = obj.get(n) if isinstance(obj, dict) else getattr(obj, n, None)
-                if v is not None:
-                    return v
-            return None
-
-        healed = False
-        for a in needs_heal:
-            try:
-                creds = decrypt_json(a.encrypted_credentials)
-            except Exception:  # noqa: BLE001
-                continue
-            name = (creds.get("brokerage_name") or "").strip()
-            if not name:
-                slug = (creds.get("brokerage_slug") or "").strip()
-                if slug:
-                    name = slug.title()
-            if not name:
-                # Live lookup against SnapTrade — find the auth row matching
-                # this account's authorization_id and pull the brokerage's
-                # display name. Best-effort; on any error we leave the
-                # column NULL and the column will render "snaptrade" until
-                # the next attempt.
-                sid = creds.get("snaptrade_user_id")
-                secret = creds.get("snaptrade_user_secret")
-                auth_id = creds.get("authorization_id")
-                if sid and secret and auth_id:
-                    try:
-                        auths = snap_module.list_authorizations(sid, secret)
-                    except Exception:  # noqa: BLE001
-                        auths = []
-                    for auth in auths:
-                        if str(_pluck(auth, "id", "authorizationId")) != str(auth_id):
-                            continue
-                        brokerage = _pluck(auth, "brokerage") or {}
-                        cand = _pluck(brokerage, "name") or _pluck(brokerage, "slug")
-                        if cand:
-                            name = str(cand).strip()
-                            # If we only got the slug (uppercase), title-case it.
-                            if name.isupper():
-                                name = name.title()
-                        break
-            # Don't persist the generic "snaptrade" — that's exactly what
-            # the column already falls back to. Treat it as "still NULL".
-            if name and name.lower() != "snaptrade":
-                a.brokerage_name = name
-                healed = True
-        if healed:
-            db.commit()
+    # Fill in NULL SnapTrade brokerage names so the label is resolved before
+    # serializing. The admin endpoint calls the same helper — that's what keeps
+    # the broker column identical in both the trader and admin views.
+    heal_snaptrade_brokerage_names(db, accounts.values())
 
     fanouts = [
         _serialize_fanout(p, children_by_parent.get(p.id, []), subscribers, accounts) for p in parents

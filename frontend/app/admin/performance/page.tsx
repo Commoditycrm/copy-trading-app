@@ -54,9 +54,16 @@ interface PerfData {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function ms(v: number | null) {
-  if (v === null || v === undefined) return <span style={{ color: "var(--muted)" }}>—</span>;
-  const color = v < 500 ? "var(--good)" : v < 2000 ? "#facc15" : "var(--bad)";
-  return <span style={{ color, fontFamily: "monospace" }}>{v.toLocaleString()}ms</span>;
+  if (v === null || v === undefined || v < 0) return <span style={{ color: "var(--muted)" }}>—</span>;
+  // Format + color identically to the trader Performance panel (fmtMs/colorFor):
+  // ms under 1s, centisecond-floored seconds under a minute, m/s above. Without
+  // this the same trade read "1,567ms" here but "1.56s" on the trader panel.
+  const color = v <= 1500 ? "var(--good)" : v <= 4000 ? "var(--warn)" : "var(--bad)";
+  let text: string;
+  if (v < 1000) text = `${v}ms`;
+  else if (v < 60_000) text = `${(Math.floor(v / 10) / 100).toFixed(2)}s`;
+  else { const ts = Math.floor(v / 1000); text = `${Math.floor(ts / 60)}m ${String(ts % 60).padStart(2, "0")}s`; }
+  return <span style={{ color, fontFamily: "monospace" }}>{text}</span>;
 }
 
 function fmt(iso: string | null) {
@@ -76,9 +83,13 @@ function fmtClock(iso: string | null): string {
   return `${t}.${String(d.getMilliseconds()).padStart(3, "0")}`;
 }
 
+// Calendar date in US Eastern, e.g. "Jul 9, 2026" — the timestamp columns are
+// time-only (fmtClock), so this is the only place the day is shown.
 function fmtDate(iso: string | null) {
   if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", { timeZone: "America/New_York", year: "numeric", month: "short", day: "numeric" });
 }
 
 const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
@@ -215,6 +226,9 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           )}
         </td>
 
+        {/* Trade date (ET) — the timestamp columns show time-of-day only. */}
+        <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtDate(fanout.broker_accepted_at ?? fanout.detected_at)}</td>
+
         {/* Timeline timestamps (HH:MM:SS.mmm ET) — mirrors the trader table. */}
         <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.trader_submitted_at)}</td>
         <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.broker_accepted_at)}</td>
@@ -262,7 +276,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={19} className="px-4 py-3">
+          <td colSpan={20} className="px-4 py-3">
             <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
               Per-subscriber breakdown ({fanout.children.length})
             </div>
@@ -470,6 +484,7 @@ export default function AdminPerformancePage() {
                 <PerfTh label="Trade"            colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Type"             colKey="instrument"  sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Trader"           colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PlainTh label="Date" />
                 <PlainTh label="Trader Submitted At" />
                 <PerfTh label="Broker Accepted At" colKey="time"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PlainTh label="Trader Listened At" />
@@ -498,7 +513,7 @@ export default function AdminPerformancePage() {
 
       {/* Legend */}
       <div className="text-xs space-y-1 pt-2" style={{ color: "var(--muted)" }}>
-        <div><span style={{ color: "var(--good)" }}>Green</span> = under 500ms · <span style={{ color: "#facc15" }}>Yellow</span> = 500ms–2s · <span style={{ color: "var(--bad)" }}>Red</span> = over 2s</div>
+        <div><span style={{ color: "var(--good)" }}>Green</span> = under 1.5s · <span style={{ color: "var(--warn)" }}>Yellow</span> = 1.5–4s · <span style={{ color: "var(--bad)" }}>Red</span> = over 4s</div>
         <div>Detection Lag = time from broker accepting trader's order → our backend detecting it</div>
         <div>Fanout Duration = time from our backend detecting → last subscriber's broker accepting</div>
         <div>Total Time = broker accepted trader's order → last subscriber's broker accepted copy</div>

@@ -124,6 +124,20 @@ function fmtClock(iso: string | null | undefined): string {
   return `${t}.${ms}`;
 }
 
+/** Calendar date in US Eastern, e.g. "Jul 9, 2026". Pairs with fmtClock, which
+ *  is time-only — the timestamp columns show the clock, this shows the day. */
+function fmtDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 /** Quantity without trailing-zero noise: "3.000000" → "3", "3.5" → "3.5". */
 function fmtQty(q: string | number | null | undefined): string {
   if (q === null || q === undefined || q === "") return "—";
@@ -1033,6 +1047,7 @@ export function PerformanceView({
                 ["Symbol", "Ticker symbol the trader bought or sold."],
                 ["Side", "BUY or SELL."],
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
+                ["Date", "Calendar date of the trade (US Eastern). The timestamp columns show time-of-day only."],
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
                 ["Trader Listened At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
@@ -1070,7 +1085,7 @@ export function PerformanceView({
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={18} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={19} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -1080,7 +1095,7 @@ export function PerformanceView({
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={18} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={19} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
                   <div className="flex items-center justify-center min-h-[240px]">
                     No fanouts yet. Place a trade to see latency metrics here.
                   </div>
@@ -1120,6 +1135,9 @@ export function PerformanceView({
                       </span>
                     </td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtQty(f.quantity)}</td>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                      {fmtDate(f.broker_accepted_at ?? f.detected_at)}
+                    </td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums" style={{ color: "var(--muted)" }}>
                       {fmtClock(f.trader_submitted_at)}
                     </td>
@@ -1185,7 +1203,7 @@ export function PerformanceView({
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={18} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
+                      <td colSpan={19} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
