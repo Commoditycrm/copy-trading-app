@@ -172,6 +172,11 @@ def _serialize_fanout(
         "side": parent.side.value,
         "quantity": str(parent.quantity),
         "instrument_type": parent.instrument_type.value,
+        # Expected = the trader's limit price (NULL for market orders); filled =
+        # the broker's average fill price. Surfaced side-by-side so the table can
+        # show slippage.
+        "expected_price": str(parent.limit_price) if parent.limit_price is not None else None,
+        "filled_avg_price": str(parent.filled_avg_price) if parent.filled_avg_price is not None else None,
         "broker_accepted_at": parent.submitted_at.isoformat() if parent.submitted_at else None,
         "detected_at": parent.created_at.isoformat() if parent.created_at else None,
         "fanout_completed_at": last_accept_at.isoformat() if last_accept_at else None,

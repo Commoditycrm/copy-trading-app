@@ -32,6 +32,8 @@ interface Fanout {
   side: string;
   quantity: string;
   instrument_type: string;
+  expected_price: string | null;
+  filled_avg_price: string | null;
   trader_submitted_at: string | null;
   broker_accepted_at: string | null;
   socket_received_at: string | null;
@@ -90,6 +92,14 @@ function fmtDate(iso: string | null) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleDateString("en-US", { timeZone: "America/New_York", year: "numeric", month: "short", day: "numeric" });
+}
+
+// Price as $X.XX; "—" for null (market orders have no expected price).
+function fmtPrice(p: string | null) {
+  if (p === null || p === undefined || p === "") return "—";
+  const n = Number(p);
+  if (!Number.isFinite(n)) return "—";
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
@@ -218,6 +228,10 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           </span>
         </td>
 
+        {/* Expected (limit) vs filled price */}
+        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>
+        <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>
+
         {/* Trader */}
         <td className="px-3 py-2.5 text-xs" style={{ color: "var(--text-2)" }}>
           {fanout.trader_display_name ?? fanout.trader_email ?? "—"}
@@ -276,7 +290,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={20} className="px-4 py-3">
+          <td colSpan={22} className="px-4 py-3">
             <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
               Per-subscriber breakdown ({fanout.children.length})
             </div>
@@ -483,6 +497,8 @@ export default function AdminPerformancePage() {
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <PerfTh label="Trade"            colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Type"             colKey="instrument"  sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PlainTh label="Expected Price" />
+                <PlainTh label="Filled Price" />
                 <PerfTh label="Trader"           colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PlainTh label="Date" />
                 <PlainTh label="Trader Submitted At" />
