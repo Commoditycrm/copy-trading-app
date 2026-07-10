@@ -51,6 +51,8 @@ interface FanoutRow {
   side: string;
   quantity: string;
   instrument_type: string;
+  expected_price: string | null;
+  filled_avg_price: string | null;
   broker_accepted_at: string | null;
   detected_at: string | null;
   fanout_completed_at: string | null;
@@ -144,6 +146,14 @@ function fmtQty(q: string | number | null | undefined): string {
   const n = Number(q);
   if (!Number.isFinite(n)) return String(q);
   return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+/** Price as $X.XX. "—" for null (e.g. market orders have no expected price). */
+function fmtPrice(p: string | number | null | undefined): string {
+  if (p === null || p === undefined || p === "") return "—";
+  const n = Number(p);
+  if (!Number.isFinite(n)) return "—";
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 /** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors,
@@ -1047,6 +1057,8 @@ export function PerformanceView({
                 ["Symbol", "Ticker symbol the trader bought or sold."],
                 ["Side", "BUY or SELL."],
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
+                ["Expected Price", "The trader's limit price. Blank for market orders (no expected price)."],
+                ["Filled Price", "The broker's average fill price for this order. Compare with Expected Price to gauge slippage."],
                 ["Date", "Calendar date of the trade (US Eastern). The timestamp columns show time-of-day only."],
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
@@ -1085,7 +1097,7 @@ export function PerformanceView({
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={19} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={21} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -1095,7 +1107,7 @@ export function PerformanceView({
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={19} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={21} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
                   <div className="flex items-center justify-center min-h-[240px]">
                     No fanouts yet. Place a trade to see latency metrics here.
                   </div>
@@ -1135,6 +1147,8 @@ export function PerformanceView({
                       </span>
                     </td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtQty(f.quantity)}</td>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtPrice(f.expected_price)}</td>
+                    <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtPrice(f.filled_avg_price)}</td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
                       {fmtDate(f.broker_accepted_at ?? f.detected_at)}
                     </td>
@@ -1203,7 +1217,7 @@ export function PerformanceView({
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={19} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
+                      <td colSpan={21} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
                         <div className="px-5 py-4">
                           {/* Headline summary — the client-friendly framing.
                               Avoids the "trade took 15.9s" misread by showing
