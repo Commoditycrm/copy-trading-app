@@ -444,10 +444,13 @@ def _fanout_window_query(trader_id, from_, to):
     placed orders (which carry trader_submitted_at) and in-app ones both filter
     correctly.
     """
+    from app.api.performance import realtime_fanout_clause  # noqa: PLC0415
+
     anchor = func.coalesce(Order.trader_submitted_at, Order.created_at)
     q = select(Order).where(
         Order.parent_order_id.is_(None),
         Order.fanned_out_to_subscribers.is_(True),
+        realtime_fanout_clause(),
     )
     if trader_id is not None:
         q = q.where(Order.user_id == trader_id)
