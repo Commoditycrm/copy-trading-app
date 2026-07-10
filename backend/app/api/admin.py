@@ -37,6 +37,7 @@ from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
+from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
 
 log = logging.getLogger(__name__)
@@ -513,6 +514,11 @@ def admin_list_fanouts(
         accounts = {a.id: a for a in db.execute(
             select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
         ).scalars()}
+
+    # Resolve NULL SnapTrade brokerage names the same way the trader endpoint
+    # does — without this the admin table shows "snaptrade" where the trader's
+    # own Performance page shows the real broker ("Webull (ST)").
+    heal_snaptrade_brokerage_names(db, accounts.values())
 
     if broker:
         children = [
