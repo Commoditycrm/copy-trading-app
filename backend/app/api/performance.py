@@ -190,10 +190,19 @@ def _serialize_fanout(
         "redis_published_at": redis_pub.isoformat() if redis_pub else None,
 
         # Derived per-step parent lags (ms).
-        # api_to_broker_lag: our backend received → broker accepted.
-        # ≈0 for in-app orders; large for externally-placed orders where
-        # trader_submitted_at = Alpaca's own receive time.
-        "api_to_broker_lag_ms": _ms_between(trader_submitted, parent.submitted_at),
+        # api_to_broker_lag: our backend submitted → broker accepted. Only
+        # meaningful for orders WE place (Alpaca via the Trade Panel), where
+        # trader_submitted_at is our own pre-call clock. For externally-placed /
+        # SnapTrade (detect-only, e.g. Webull) orders we never submit — both
+        # stamps come from the broker's single order timestamp, so the "lag"
+        # would be a misleading 0ms. Emit None (renders "—") when they're equal.
+        "api_to_broker_lag_ms": (
+            None
+            if trader_submitted is not None
+            and parent.submitted_at is not None
+            and trader_submitted == parent.submitted_at
+            else _ms_between(trader_submitted, parent.submitted_at)
+        ),
         # socket_lag: broker accept → our WS handler heard.
         # Only meaningful for externally-placed orders (NULL otherwise).
         "socket_lag_ms": _ms_between(parent.submitted_at, socket_received),
