@@ -635,6 +635,17 @@ def _persist_and_fanout(
         ):
             return
 
+        # Never synthesize a trader-style order for a SUBSCRIBER's account. A
+        # subscriber's SnapTrade feed is the copy-mirror fills we placed on
+        # their behalf; anything not already matched above (by broker_order_id)
+        # is that same fill re-surfaced under a different feed id. Recording it
+        # as a standalone order duplicates the mirror and double-counts realized
+        # P&L (see realized_pnl_by_day mirrors_only). Subscribers aren't trade
+        # sources, so skip creation — matched updates still flow through above.
+        owner = db.get(User, trader_user_id)
+        if owner is not None and owner.role == UserRole.SUBSCRIBER:
+            return
+
         order = _insert_order_from_snaptrade(
             db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
         )
