@@ -266,6 +266,7 @@ def realized_pnl_by_day(
     start: date | None = None,
     end: date | None = None,
     tz_name: str | None = None,
+    mirrors_only: bool = False,
 ) -> dict[date, tuple[Decimal, int]]:
     """Returns {day: (realized_pnl, trade_count)}. trade_count is the number of
     closing fills on that day.
@@ -275,15 +276,23 @@ def realized_pnl_by_day(
     we synthesize a single fill from the order's aggregate `filled_quantity`
     + `filled_avg_price` so P&L shows up immediately instead of lagging
     minutes behind the broker.
+
+    mirrors_only: count ONLY copy-mirror orders (parent_order_id set), ignoring
+    standalone rows. Set for SUBSCRIBERS — the SnapTrade listener re-records a
+    subscriber's Webull mirror fills as duplicate standalone orders, so counting
+    both double-counts and scrambles the FIFO. A pure copy-subscriber's real
+    trades ARE the mirrors, so this de-duplicates them.
     """
-    # All orders the user owns that have any fill quantity recorded.
-    orders: list[Order] = list(db.execute(
-        select(Order).where(
-            Order.user_id == user_id,
-            Order.filled_quantity > 0,
-            Order.filled_avg_price.isnot(None),
-        )
-    ).scalars())
+    # Orders the user owns with any fill recorded. For subscribers we take
+    # mirrors only (see mirrors_only) so listener duplicates don't double-count.
+    conds = [
+        Order.user_id == user_id,
+        Order.filled_quantity > 0,
+        Order.filled_avg_price.isnot(None),
+    ]
+    if mirrors_only:
+        conds.append(Order.parent_order_id.isnot(None))
+    orders: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
 
     # All Fill rows for those orders (one query, then bucket).
     order_ids = [o.id for o in orders]
