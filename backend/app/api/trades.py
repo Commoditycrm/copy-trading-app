@@ -1534,7 +1534,14 @@ def calendar_pnl(
         # Sync failures are non-fatal; we still return whatever P&L exists.
         db.rollback()
 
-    daily = realized_pnl_by_day(db, target_user_id, start=from_, end=to, tz_name=tz)
+    # Subscribers' Webull/SnapTrade orders get re-recorded by the listener as
+    # duplicate standalone rows; count only their copy-mirror orders so realized
+    # P&L isn't double-counted. See realized_pnl_by_day(mirrors_only=...).
+    target = db.get(User, target_user_id)
+    mirrors_only = target is not None and target.role == UserRole.SUBSCRIBER
+    daily = realized_pnl_by_day(
+        db, target_user_id, start=from_, end=to, tz_name=tz, mirrors_only=mirrors_only
+    )
     return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(daily.items())]
 
 
