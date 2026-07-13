@@ -41,7 +41,7 @@ from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
@@ -206,6 +206,48 @@ def _cancel_subscriber_conflicts(item: "_PendingMirror") -> list[uuid.UUID]:
     return cancelled
 
 
+def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
+    """Rewrite a CLOSE order so it fills IMMEDIATELY — so a subscriber always
+    exits when the trader does. A copied LIMIT close routinely rests unfilled
+    (the price moves during copy latency), leaving the subscriber stuck in a
+    position the trader already left. This forces the exit:
+
+      * STOCK  → MARKET order (fills at the current market).
+      * OPTION → a MARKETABLE LIMIT at the current bid (SELL) / ask (BUY).
+        Alpaca rejects option MARKET orders ("no available quote", 40310000),
+        so we price a limit through the market instead — it fills like a market
+        order. If the quote can't be read, we leave the order unchanged (no
+        worse than today) rather than guess a bad price.
+
+    Only ever called for closes (is_closing=True); entries are never touched.
+    """
+    if req.instrument_type == InstrumentType.STOCK:
+        return replace(req, order_type=OrderType.MARKET, limit_price=None, stop_price=None)
+
+    # ── OPTION: marketable limit ──
+    if not (req.option_expiry and req.option_strike and req.option_right):
+        return req
+    if not hasattr(adapter, "get_option_latest_quote"):
+        return req
+    try:
+        from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+        occ = build_occ_symbol(
+            req.symbol, req.option_expiry, req.option_strike, req.option_right.value
+        )
+        bid, ask = adapter.get_option_latest_quote(occ)
+    except Exception:  # noqa: BLE001
+        log.warning("immediate-close: option quote failed for %s — leaving order as-is", req.symbol)
+        return req
+    # SELL hits the bid, BUY (cover short) lifts the ask — either fills now.
+    px = bid if req.side == OrderSide.SELL else ask
+    if px is None or px <= 0:
+        log.warning("immediate-close: no usable option quote for %s — leaving order as-is", req.symbol)
+        return req
+    from app.services.trader_bracket_monitor import _round_close_limit  # noqa: PLC0415
+    limit = _round_close_limit(px, req.side)  # rounds to a valid, fill-friendly option tick
+    return replace(req, order_type=OrderType.LIMIT, limit_price=limit, stop_price=None)
+
+
 def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderResult:
     """Place the mirror order. If a CLOSE is rejected because another working
     order on the subscriber's account blocks it (wash trade / uncovered /
@@ -213,6 +255,13 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
     the direct-close auto-resolve in api.trades. Runs in a worker thread (called
     via ``asyncio.to_thread``); raising propagates to the normal reject path."""
     req = item.request
+    # Force CLOSES to fill immediately so subscribers actually exit when the
+    # trader does (a copied LIMIT close often rests unfilled after the price
+    # moves). Entries are untouched. item.request is updated so Phase 3 records
+    # the order type/price we actually placed.
+    if req.is_closing:
+        req = _to_immediate_close(item.adapter, req)
+        item.request = req
     try:
         return item.adapter.place_order(req)
     except Exception as exc:  # noqa: BLE001
@@ -1056,22 +1105,39 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             scaled = _scale_quantity(
                 trader_order.quantity, sub.multiplier, acct.supports_fractional
             )
-            # Defense-in-depth: never mirror a CLOSE larger than the subscriber
-            # actually holds. A position desync (e.g. an earlier open that never
-            # filled on their account, or a multiplier that put them out of step
-            # with the trader) would otherwise make the broker reject the whole
-            # close with "No matching position to close". Clamp to their net
-            # filled position for this contract so the close flattens what they
-            # hold and no more. is_closing is set by the broker listeners (e.g.
-            # SnapTrade's SELL_TO_CLOSE); non-close orders are never touched.
-            if trader_order.is_closing and scaled > 0:
-                # Clamp to the raw held position (not minus reserved): if a
-                # working order reserves it, the conflict-resolve retry in
-                # _place_mirror_with_conflict_resolve cancels that order and
-                # re-places, rather than shrinking the close to zero here.
+            # ── Determine whether THIS is a close for the subscriber ──
+            # The broker's is_closing flag is only reliable for OPTIONS (SnapTrade
+            # sets SELL_TO_CLOSE); for STOCKS it's ALWAYS False (SnapTrade just
+            # says "SELL"). So we also treat any order that REDUCES the
+            # subscriber's own held position for this exact contract as a close.
+            # This drives BOTH the close-clamp below AND the immediate-fill close
+            # behavior in _place_mirror_with_conflict_resolve — without it, stock
+            # closes would keep the trader's limit and get stuck unfilled.
+            if trader_order.is_closing:
+                # Option close (SnapTrade SELL_TO_CLOSE) — flag is reliable; we
+                # still need the held qty for the clamp below.
                 closeable = _closeable_quantity(
                     db, sub.user_id, trader_order, subtract_reserved=False,
                 )
+                is_closing_effective = True
+            elif trader_order.instrument_type == InstrumentType.STOCK:
+                # Stock — flag is never set, so a close is anything that reduces
+                # the subscriber's held position for this symbol.
+                closeable = _closeable_quantity(
+                    db, sub.user_id, trader_order, subtract_reserved=False,
+                )
+                is_closing_effective = closeable > 0
+            else:
+                # Option ENTRY — no position check needed (avoids a DB query).
+                closeable = Decimal(0)
+                is_closing_effective = False
+
+            # Defense-in-depth: never mirror a CLOSE larger than the subscriber
+            # actually holds. Clamp to the raw held position (not minus reserved):
+            # if a working order reserves it, the conflict-resolve retry in
+            # _place_mirror_with_conflict_resolve cancels that order and re-places,
+            # rather than shrinking the close to zero here.
+            if is_closing_effective and scaled > 0:
                 if closeable < scaled:
                     audit.record(
                         db,
@@ -1123,7 +1189,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 option_expiry=trader_order.option_expiry,
                 option_strike=trader_order.option_strike,
                 option_right=trader_order.option_right,
-                is_closing=trader_order.is_closing,
+                is_closing=is_closing_effective,
                 side=trader_order.side,
                 order_type=trader_order.order_type,
                 quantity=scaled,
@@ -1266,10 +1332,16 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         child = db.get(Order, item.child_order_id)
         child.broker_call_ms = call_ms
         if resp is not None:
-            # The place path may have rounded the qty (non-fractionable asset);
-            # keep the row in sync with what was actually placed.
+            # The place path may have rewritten the order to make it fill (qty
+            # rounded for non-fractionable assets; a CLOSE forced to market /
+            # marketable-limit). Keep the row in sync with what was ACTUALLY
+            # placed so Order History and the TP/SL columns are accurate.
             if item.request.quantity != child.quantity:
                 child.quantity = item.request.quantity
+            if item.request.order_type != child.order_type:
+                child.order_type = item.request.order_type
+            child.limit_price = item.request.limit_price
+            child.stop_price = item.request.stop_price
             child.status = resp.status
             child.broker_order_id = resp.broker_order_id
             child.submitted_at = resp.submitted_at
