@@ -150,6 +150,21 @@ def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) 
     return raw.to_integral_value(rounding=ROUND_DOWN)
 
 
+class _DanglingEntryCancelled(Exception):
+    """Raised inside ``_place_mirror_with_conflict_resolve`` when the trader
+    CLOSED a position but the subscriber holds NOTHING — their entry never
+    filled (its mirror BUY is still working, or already gone). There's nothing
+    to sell, and a naked SELL would just reject as a short/wash conflict. So we
+    cancel the dangling working entry (so it can't fill LATER into a position
+    the trader already exited) and report the mirror as CANCELED — no retry.
+
+    ``cancelled_ids`` are the working entry rows we cancelled at the broker."""
+
+    def __init__(self, cancelled_ids: list[uuid.UUID]):
+        super().__init__("trader closed before subscriber entry filled; entry cancelled")
+        self.cancelled_ids = cancelled_ids
+
+
 # Statuses whose UNFILLED remainder still reserves shares at the broker
 # (the broker's "held_for_orders"). A second close of the same shares while
 # one of these is working gets rejected (e.g. Alpaca 40310000).
@@ -256,12 +271,71 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
     via ``asyncio.to_thread``); raising propagates to the normal reject path."""
     req = item.request
     # Force CLOSES to fill immediately so subscribers actually exit when the
-    # trader does (a copied LIMIT close often rests unfilled after the price
-    # moves). Entries are untouched. item.request is updated so Phase 3 records
-    # the order type/price we actually placed.
-    if req.is_closing:
+    # trader does (a copied LIMIT close routinely rests unfilled / gets rejected
+    # once the price moves). Entries are untouched.
+    #
+    # The fanout already flags most closes from the subscriber's DB position, but
+    # that can LAG — the entry fill may not have synced when the trader closes
+    # (the webhook makes closes arrive even faster). And we CANNOT fall back on
+    # the broker's is_closing flag: SnapTrade reports Webull actions as plain
+    # BUY/SELL, so a genuine close has is_closing=False for OPTIONS as well as
+    # stocks. So for any SELL our DB did NOT flag as closing, ask the BROKER
+    # directly: if the subscriber actually holds the position this SELL would
+    # reduce, it's really a close. (We skip BUYs to avoid a get_positions call on
+    # every entry — buy-to-close of a short is not a case this trader hits.)
+    should_close_now = req.is_closing
+    cancelled_working_entry = False
+    if (
+        not should_close_now
+        and req.side == OrderSide.SELL
+        and req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION)
+    ):
+        held = live_closeable_quantity(item.adapter, req)
+        if held is not None and held > 0:
+            should_close_now = True
+        elif held is not None and held == 0:
+            # The trader is selling to close, but we see NO position yet — the
+            # subscriber's entry BUY is still working. This is a RACE: the
+            # trader's buy→sell was fast enough that the SELL close arrives
+            # while our BUY hasn't filled. A naked SELL here just rejects
+            # ("cannot open a short sell while a long buy order is open" /
+            # SnapTrade 400).
+            #
+            # First cancel the working entry so it can't strand the subscriber.
+            # But the cancel can RACE the fill (the buy may be filling at this
+            # very instant — the exact AGEN case where the buy showed FILLED
+            # right after the sell rejected). So re-check the LIVE position a
+            # few times; if a fill landed anyway, market-close it so the
+            # subscriber ends flat. Only if it's truly flat do we report the
+            # entry cancelled. (If there was nothing to cancel, fall through:
+            # the trader may genuinely be OPENING a short, which we mirror.)
+            cancelled = _cancel_subscriber_conflicts(item)
+            cancelled_working_entry = bool(cancelled)
+            if cancelled:
+                for _ in range(3):
+                    recheck = live_closeable_quantity(item.adapter, req)
+                    if recheck is not None and recheck > 0:
+                        should_close_now = True  # a fill snuck in → close it
+                        break
+                    time.sleep(1.0)
+                if not should_close_now:
+                    raise _DanglingEntryCancelled(cancelled)
+    if should_close_now:
         req = _to_immediate_close(item.adapter, req)
+        if not req.is_closing:
+            # Mark closing so the conflict-resolve + live re-clamp below treat it
+            # as a close too.
+            req = replace(req, is_closing=True)
         item.request = req
+        # Flatten FULLY. The fanout already clamps the close to what the
+        # subscriber holds (e.g. trader sold 10 but only 6 filled → we sell 6).
+        # But the other 4 may still be a WORKING, partially-filled entry — if it
+        # fills later, the subscriber is stranded long in a name the trader has
+        # left. The trader is now selling, so their accumulation window is over:
+        # cancel any leftover same-contract working entry before placing the
+        # close. (Skip if the race path above already cancelled it.)
+        if not cancelled_working_entry:
+            _cancel_subscriber_conflicts(item)
     try:
         return item.adapter.place_order(req)
     except Exception as exc:  # noqa: BLE001
@@ -1113,24 +1187,20 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # This drives BOTH the close-clamp below AND the immediate-fill close
             # behavior in _place_mirror_with_conflict_resolve — without it, stock
             # closes would keep the trader's limit and get stuck unfilled.
-            if trader_order.is_closing:
-                # Option close (SnapTrade SELL_TO_CLOSE) — flag is reliable; we
-                # still need the held qty for the clamp below.
-                closeable = _closeable_quantity(
-                    db, sub.user_id, trader_order, subtract_reserved=False,
-                )
-                is_closing_effective = True
-            elif trader_order.instrument_type == InstrumentType.STOCK:
-                # Stock — flag is never set, so a close is anything that reduces
-                # the subscriber's held position for this symbol.
-                closeable = _closeable_quantity(
-                    db, sub.user_id, trader_order, subtract_reserved=False,
-                )
-                is_closing_effective = closeable > 0
-            else:
-                # Option ENTRY — no position check needed (avoids a DB query).
-                closeable = Decimal(0)
-                is_closing_effective = False
+            # We CANNOT trust the broker's is_closing flag. SnapTrade reports
+            # Webull actions as plain BUY/SELL (no _TO_OPEN/_TO_CLOSE), so a real
+            # close arrives with is_closing=False — for OPTIONS as well as stocks
+            # (confirmed in prod: every Webull-Canada order had is_closing=f,
+            # which made mirror SELLs get sent as opening sells and rejected as
+            # "no position to close" / "insufficient buying power"). So detect a
+            # close the reliable, broker-agnostic way for BOTH instruments — by
+            # whether the subscriber actually holds a position this order reduces.
+            # _closeable_quantity matches the exact option contract and nets by
+            # direction, so an entry (nothing held to reduce) returns 0.
+            closeable = _closeable_quantity(
+                db, sub.user_id, trader_order, subtract_reserved=False,
+            )
+            is_closing_effective = bool(trader_order.is_closing) or closeable > 0
 
             # Defense-in-depth: never mirror a CLOSE larger than the subscriber
             # actually holds. Clamp to the raw held position (not minus reserved):
@@ -1407,6 +1477,37 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 db.add(leg_row)
                 db.flush()
                 events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", leg_row))
+        elif isinstance(exc, _DanglingEntryCancelled):
+            # The trader closed before the subscriber's entry filled. We already
+            # cancelled the dangling working entry at the broker; record THIS
+            # mirror (the would-be sell) as CANCELED so the subscriber ends flat,
+            # not stuck with a rejected sell + a live buy. No retry.
+            child.status = OrderStatus.CANCELED
+            child.reject_reason = (
+                "Trader closed before your entry filled — the unfilled entry "
+                "was cancelled, so there was nothing to sell."
+            )[:480]
+            child.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db,
+                actor_user_id=item.subscriber_user_id,
+                action="copy.close_skipped_entry_cancelled",
+                entity_type="order",
+                entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(trader_order.id),
+                    "symbol": child.symbol,
+                    "cancelled_entry_ids": [str(i) for i in exc.cancelled_ids],
+                },
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=item.subscriber_user_id,
+                broker_account_id=item.broker_account_id,
+                order_id=child.id,
+                status="cancelled_unfilled_entry",
+            ))
+            child.redis_published_at = datetime.now(timezone.utc)
+            events.publish(item.subscriber_user_id, _order_event("order.cancelled", child))
         else:
             # Broker call failed. Classify the error to decide between:
             #   1. User-fixable (insufficient buying power, after-hours
