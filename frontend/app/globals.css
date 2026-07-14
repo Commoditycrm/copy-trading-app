@@ -261,7 +261,7 @@ body {
 
 /* Inputs */
 input:not([type]), input[type="text"], input[type="email"], input[type="password"],
-input[type="number"], input[type="date"], select, textarea {
+input[type="number"], input[type="date"], input[type="tel"], select, textarea {
   background: rgba(255, 255, 255, 0.02);
   color: var(--text);
   border-radius: var(--r-sm);

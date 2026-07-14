@@ -8,6 +8,7 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PasswordInput } from "@/components/PasswordInput";
 import { AuthCard } from "@/components/auth/AuthCard";
+import { PhoneInput } from "@/components/PhoneInput";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
@@ -144,8 +145,7 @@ export default function RegisterPage() {
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Phone (optional) — get SMS alerts</label>
-            <input className="w-full p-2.5" type="tel" autoComplete="tel" inputMode="tel" placeholder="+91 98765 43210"
-              value={phone} onChange={(e) => setPhone(e.target.value)} maxLength={24} />
+            <PhoneInput value={phone} onChange={setPhone} />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-2 block" style={{ color: "var(--muted)" }}>I am a</label>

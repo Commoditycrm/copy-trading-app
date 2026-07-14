@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api, changeEmail } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PhoneInput } from "@/components/PhoneInput";
 import type { User } from "@/lib/types";
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -201,12 +202,9 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
           SMS notifications
         </label>
         <div className="flex items-center gap-2">
-          <input
-            type="tel" value={phone} maxLength={24} placeholder="+91 98765 43210"
-            onChange={e => setPhone(e.target.value)}
-            className="flex-1 text-sm px-3 py-1.5 rounded-lg"
-            style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
-          />
+          <div className="flex-1 min-w-0">
+            <PhoneInput value={phone} onChange={setPhone} />
+          </div>
           <button
             onClick={saveSms}
             disabled={!smsDirty || savingSms}
