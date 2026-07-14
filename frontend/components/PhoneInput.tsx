@@ -94,11 +94,11 @@ export function PhoneInput({
         value={dial}
         onChange={(e) => { setDial(e.target.value); emit(e.target.value, local); }}
         className="p-2.5 shrink-0"
-        style={{ maxWidth: 118 }}
+        style={{ maxWidth: 168 }}
       >
         {COUNTRIES.map((c) => (
           <option key={c.code} value={c.dial}>
-            {c.flag} +{c.dial}
+            {c.flag} {c.name} +{c.dial}
           </option>
         ))}
       </select>
