@@ -14,6 +14,10 @@ export interface User {
   /** Whether the user has confirmed their email. Soft-enforced: unverified
    *  users can still use the app, but see a "verify your email" banner. */
   email_verified: boolean;
+  /** E.164 phone for SMS notifications ("+15551234567"); null if unset. */
+  phone: string | null;
+  /** Opt-in for the notification→SMS fanout. Off unless the user enables it. */
+  sms_notifications_enabled: boolean;
 }
 
 export type FollowRequestStatus = "pending" | "approved" | "rejected";

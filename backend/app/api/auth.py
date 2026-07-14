@@ -355,6 +355,13 @@ def update_me(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="business_name_blank")
         user.business_name = payload.business_name
         changed["business_name"] = payload.business_name
+    if payload.phone is not None:
+        # Already validated E.164 (or "") in UpdateMeIn. Empty clears it.
+        user.phone = payload.phone or None
+        changed["phone"] = user.phone
+    if payload.sms_notifications_enabled is not None:
+        user.sms_notifications_enabled = payload.sms_notifications_enabled
+        changed["sms_notifications_enabled"] = payload.sms_notifications_enabled
 
     if not changed:
         return user
