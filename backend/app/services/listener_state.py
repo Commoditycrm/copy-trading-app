@@ -29,6 +29,52 @@ from app.services import events
 
 log = logging.getLogger(__name__)
 
+# Debounce: user_ids we've already SMS-notified about a broker disconnect, so a
+# listener's credentials_invalid retry loop doesn't text repeatedly. Cleared on
+# reconnect via clear_disconnect_debounce(). Shared across every broker listener.
+_disconnect_notified: set[uuid.UUID] = set()
+
+
+def notify_broker_disconnected(
+    trader_user_id: uuid.UUID, broker_account_id: uuid.UUID, reason: str
+) -> None:
+    """Once-per-episode notification (in-app + SMS) that a broker connection
+    went invalid and needs reconnecting. Shared by every broker listener
+    (Alpaca / IBKR / SnapTrade). Best-effort; opens its own session since
+    listeners run off the request path."""
+    if trader_user_id in _disconnect_notified:
+        return
+    _disconnect_notified.add(trader_user_id)
+    from app.database import SessionLocal  # noqa: PLC0415
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.services.notifications import create_notification  # noqa: PLC0415
+    with SessionLocal() as db:
+        try:
+            acct = db.get(BrokerAccount, broker_account_id)
+            label = None
+            if acct is not None:
+                label = acct.brokerage_name or (acct.broker.value if acct.broker else None)
+            label = label or "Your broker"
+            create_notification(
+                db,
+                user_id=trader_user_id,
+                type="broker.disconnected",
+                message=(
+                    f"{label} disconnected — reconnect it to resume copy trading. "
+                    f"({reason[:100]})"
+                ),
+                metadata={"broker_account_id": str(broker_account_id), "reason": reason[:300]},
+            )
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            log.exception("listener_state: disconnect notification failed for %s", trader_user_id)
+
+
+def clear_disconnect_debounce(trader_user_id: uuid.UUID) -> None:
+    """Reset the disconnect debounce for a user — call on reconnect."""
+    _disconnect_notified.discard(trader_user_id)
+
 
 # "connecting" | "connected" | "reconnecting" | "disconnected" |
 # "credentials_invalid" | "mfa_required"  (webull-only)
