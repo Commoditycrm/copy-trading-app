@@ -59,9 +59,10 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
     && (phone.trim() !== (user.phone ?? "") || sms !== user.sms_notifications_enabled);
 
   async function saveSms() {
-    const p = phone.trim();
+    // Accept any format/country: strip spaces/dashes/parens, 00 -> +.
+    const p = phone.trim().replace(/[\s\-().]/g, "").replace(/^00/, "+");
     if (p && !/^\+[1-9]\d{6,14}$/.test(p)) {
-      notify.warn("Enter your number in international format, e.g. +15551234567");
+      notify.warn("Enter your number with country code, e.g. +91 98765 43210");
       return;
     }
     if (sms && !p) { notify.warn("Add a phone number to receive SMS"); return; }
@@ -201,7 +202,7 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
         </label>
         <div className="flex items-center gap-2">
           <input
-            type="tel" value={phone} maxLength={20} placeholder="+15551234567"
+            type="tel" value={phone} maxLength={24} placeholder="+91 98765 43210"
             onChange={e => setPhone(e.target.value)}
             className="flex-1 text-sm px-3 py-1.5 rounded-lg"
             style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
@@ -226,7 +227,7 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
           <span>Text me my notifications</span>
         </label>
         <p className="text-[11px] mt-1.5" style={{ color: "var(--muted)" }}>
-          Use international format (E.164), e.g. +15551234567. Standard message rates may apply.
+          Include your country code (any country), e.g. +91 98765 43210 or +1 555 123 4567. Standard message rates may apply.
         </p>
       </div>
     </>
