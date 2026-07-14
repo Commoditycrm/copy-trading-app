@@ -15,6 +15,7 @@ scheduled tasks natively.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -23,6 +24,7 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.models.notification import Notification
+from app.models.user import User
 from app.services import events
 
 log = logging.getLogger(__name__)
@@ -87,6 +89,20 @@ def create_notification(
             "created_at": notif.created_at.isoformat(),
         },
     })
+
+    # Opt-in SMS fanout: mirror the notification to Twilio for users who gave a
+    # phone and enabled SMS. Fire off-thread so a slow/failing send never blocks
+    # the caller — send_sms reads only config + httpx (no DB/session), so it's
+    # safe outside this request's session. Best-effort; never raises upward.
+    try:
+        user = db.get(User, user_id)
+        if user is not None and user.phone and user.sms_notifications_enabled:
+            from app.services.sms import send_sms  # noqa: PLC0415
+            threading.Thread(
+                target=send_sms, args=(user.phone, message), daemon=True,
+            ).start()
+    except Exception:  # noqa: BLE001
+        log.exception("notifications: SMS fanout failed for user=%s", user_id)
 
     log.info(
         "notifications: created user=%s type=%s id=%s",
