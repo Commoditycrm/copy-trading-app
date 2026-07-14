@@ -53,6 +53,28 @@ def _normalize_email(v: object) -> object:
     return v
 
 
+def _normalize_phone(v: object) -> object:
+    """Accept a phone in any common format and normalize to E.164 for Twilio.
+
+    Strips spaces, dashes, parentheses and dots; treats a leading international
+    "00" prefix as "+". Works for ANY country (not just US) — the only hard
+    requirement is a country code (a leading "+"), since Twilio needs E.164.
+    Empty string / None is passed through (clears the phone)."""
+    if not isinstance(v, str):
+        return v
+    v = v.strip()
+    if not v:
+        return v
+    cleaned = re.sub(r"[\s\-().]", "", v)
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if not re.match(r"^\+[1-9]\d{6,14}$", cleaned):
+        raise ValueError(
+            "Enter your phone with country code, e.g. +91 98765 43210 or +1 555 123 4567"
+        )
+    return cleaned
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
@@ -73,15 +95,7 @@ class RegisterIn(BaseModel):
     def _password_policy(cls, v: str) -> str:
         return _validate_password_strength(v)
 
-    @field_validator("phone", mode="before")
-    @classmethod
-    def _phone(cls, v: object) -> object:
-        if not isinstance(v, str):
-            return v
-        v = v.strip()
-        if v and not re.match(r"^\+[1-9]\d{6,14}$", v):
-            raise ValueError("phone must be E.164, e.g. +15551234567")
-        return v
+    _norm_phone = field_validator("phone", mode="before")(_normalize_phone)
 
     @model_validator(mode="after")
     def _require_business_name_for_trader(self) -> "RegisterIn":
@@ -115,15 +129,7 @@ class UpdateMeIn(BaseModel):
     def _strip(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
 
-    @field_validator("phone", mode="before")
-    @classmethod
-    def _phone(cls, v: object) -> object:
-        if not isinstance(v, str):
-            return v
-        v = v.strip()
-        if v and not re.match(r"^\+[1-9]\d{6,14}$", v):
-            raise ValueError("phone must be E.164, e.g. +15551234567")
-        return v
+    _norm_phone = field_validator("phone", mode="before")(_normalize_phone)
 
 
 class ChangeEmailIn(BaseModel):
