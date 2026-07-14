@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # ── End-of-day subscriber safety auto-close ───────────────────────────
+    # At 15:55 ET (5 minutes before the 16:00 US close) the worker market-closes
+    # every subscriber's SAME-DAY-EXPIRY (0DTE) option positions, and the fanout
+    # refuses new same-day-expiry subscriber orders for that final 5 minutes.
+    # Safety net so a trader who forgets to close expiring options doesn't leave
+    # subscribers holding contracts that expire worthless overnight. Later-expiry
+    # options and all stocks are untouched. Set false to disable BOTH halves
+    # without a redeploy. The sweep loop runs in the worker only
+    # (run_background_workers=true); the order lockout runs wherever fanout runs.
+    eod_autoclose_enabled: bool = True
     # ── Password reset / transactional email (SendGrid) ───────────────────
     # SendGrid Web API v3 key. Blank by default so dev/QA work without it —
     # the email service then logs the reset link instead of sending (see

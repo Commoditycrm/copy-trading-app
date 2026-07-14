@@ -23,7 +23,11 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, require_trader
 from app.api.trades import _place_trader_order
+from collections.abc import Callable
+from decimal import Decimal
+
 from app.brokers import adapter_for
+from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderType
@@ -315,17 +319,55 @@ async def _bulk_close_subscriber_positions_background(
     )
 
 
+def _marketable_option_close_price(
+    adapter, pos: BrokerPosition, side: OrderSide,
+) -> Decimal | None:
+    """Marketable-limit price to close an option NOW: hit the bid on a SELL,
+    lift the ask on a BUY, rounded to a valid option tick. Returns None if the
+    contract can't be quoted — the caller then falls back to a MARKET order.
+
+    Why: Alpaca REJECTS option MARKET orders ("no available quote", 40310000), so
+    on Alpaca a same-day-expiry option can only be flattened via a limit priced
+    through the market. Webull/SnapTrade accept either, and a marketable limit
+    fills just like a market there too — so this is safe for EVERY broker."""
+    if not hasattr(adapter, "get_option_latest_quote"):
+        return None
+    try:
+        from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+        occ = build_occ_symbol(
+            pos.symbol, pos.option_expiry, pos.option_strike, pos.option_right.value
+        )
+        bid, ask = adapter.get_option_latest_quote(occ)
+    except Exception:  # noqa: BLE001
+        return None
+    px = bid if side == OrderSide.SELL else ask
+    if px is None or px <= 0:
+        return None
+    from app.services.trader_bracket_monitor import _round_close_limit  # noqa: PLC0415
+    return _round_close_limit(px, side)
+
+
 def _close_account_positions_sync(
     sub_id: uuid.UUID,
     acct_id: uuid.UUID,
     trader_user_id: uuid.UUID,
     client_ip_str: str | None,
+    position_filter: "Callable[[BrokerPosition], bool] | None" = None,
+    option_marketable_limit: bool = False,
 ) -> dict:
     """Synchronous worker for one (subscriber, broker_account) pair.
 
     Opens its OWN DB session — must never share the request-scoped
     session across threads. Returns ``{"closed": [...], "failed": [...]}``
     so the caller can aggregate without further locking.
+
+    ``position_filter`` (optional): when given, only positions for which it
+    returns True are closed. Used by the EOD safety sweep to close ONLY
+    same-day-expiry options; a plain full-exit passes None (close everything).
+
+    ``option_marketable_limit`` (optional): when True, OPTION positions are
+    closed with a marketable LIMIT instead of MARKET so they also flatten on
+    Alpaca (which rejects option MARKET orders). Stocks stay MARKET regardless.
 
     The position placement uses BackgroundTasks() as a no-op — the
     bulk-exit flow doesn't need the post-response audit hooks
@@ -365,15 +407,29 @@ def _close_account_positions_sync(
         for pos in positions:
             if pos.quantity == 0:
                 continue
+            if position_filter is not None and not position_filter(pos):
+                continue
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
+            # Default: plain MARKET (works for stocks everywhere, and for options
+            # on Webull/SnapTrade). When option_marketable_limit is set, close
+            # OPTIONS with a marketable LIMIT so they also flatten on Alpaca,
+            # which rejects option MARKET orders. Falls back to MARKET if the
+            # contract can't be quoted right now.
+            close_type = OrderType.MARKET
+            close_limit: Decimal | None = None
+            if option_marketable_limit and pos.instrument_type == InstrumentType.OPTION:
+                px = _marketable_option_close_price(adapter, pos, reverse_side)
+                if px is not None:
+                    close_type = OrderType.LIMIT
+                    close_limit = px
             payload = PlaceOrderIn(
                 instrument_type=pos.instrument_type,
                 symbol=pos.symbol,
                 side=reverse_side,
-                order_type=OrderType.MARKET,
+                order_type=close_type,
                 quantity=qty,
-                limit_price=None,
+                limit_price=close_limit,
                 stop_price=None,
                 option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
                 option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
