@@ -1058,3 +1058,30 @@ def set_alpaca_poll_interval(
         payload.interval_s,
     )
     return get_alpaca_pnl_poll_interval_state()
+
+
+# ─── SMS test (Twilio) ────────────────────────────────────────────────────────
+
+class TestSmsIn(BaseModel):
+    # E.164, e.g. "+15551234567". Twilio validates the number itself; we only
+    # do a light shape check so an obvious typo fails fast with a 422.
+    to: str = Field(pattern=r"^\+[1-9]\d{6,14}$")
+    body: str = Field(
+        default="Test SMS from Kopyya — your Twilio Messaging Service works.",
+        min_length=1,
+        max_length=320,
+    )
+
+
+@router.post("/sms/test")
+def send_test_sms(
+    payload: TestSmsIn,
+    _: User = Depends(require_admin),
+) -> dict:
+    """Fire a one-off SMS to confirm the Twilio credentials + Messaging Service
+    are wired up. ``ok=false`` with no error usually means the creds are blank
+    (the service no-ops in dev/QA) — check the logs for the exact reason."""
+    from app.services.sms import send_sms  # noqa: PLC0415
+    ok = send_sms(payload.to, payload.body)
+    log.info("admin sent test SMS to=%s ok=%s", payload.to, ok)
+    return {"ok": ok, "to": payload.to}

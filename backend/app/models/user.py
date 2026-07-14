@@ -39,6 +39,14 @@ class User(Base, TimestampMixin):
     email_verified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # SMS notifications (opt-in). phone is E.164 ("+15551234567"); nullable since
+    # most users won't provide one. sms_notifications_enabled gates the
+    # notification→SMS fanout in services/notifications.py — off by default so we
+    # never text anyone who hasn't consented.
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    sms_notifications_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     broker_accounts = relationship(
         "BrokerAccount", back_populates="user", cascade="all, delete-orphan"
