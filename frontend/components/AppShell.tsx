@@ -277,13 +277,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Email-verification banner state (soft enforcement — nag, don't block).
   const [resendBusy, setResendBusy] = useState(false);
   const [resendDone, setResendDone] = useState(false);
-  // Phone-nudge banner: dismissible reminder shown when the user has no phone,
-  // pointing them to Settings to enable SMS alerts. Default hidden until we read
-  // localStorage on mount so it doesn't flash during hydration.
-  const [phoneNudgeOff, setPhoneNudgeOff] = useState(true);
-  useEffect(() => {
-    setPhoneNudgeOff(localStorage.getItem("kopyya:phone-nudge-dismissed") === "1");
-  }, []);
   const [signingOut, setSigningOut] = useState(false);
 
   async function resendVerify() {
@@ -756,34 +749,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             >
               {resendDone ? "Sent ✓" : resendBusy ? "Sending…" : "Resend email"}
             </button>
-          </div>
-        )}
-
-        {!user.phone && !phoneNudgeOff && (
-          <div
-            className="flex items-center justify-between gap-3 mx-3 sm:mx-4 mt-3 px-4 py-2.5 rounded-xl text-sm animate-fade-in"
-            style={{
-              background: "rgba(31,111,235,0.10)",
-              border: "1px solid rgba(31,111,235,0.35)",
-              color: "var(--accent)",
-            }}
-          >
-            <span className="min-w-0">
-              📱 Add your phone to get SMS alerts for rejected orders, auto-liquidation and broker disconnects.
-            </span>
-            <div className="flex items-center gap-2 shrink-0">
-              <Link href="/settings" className="btn-ghost px-3 py-1 text-xs whitespace-nowrap focus-ring no-underline">
-                Add phone
-              </Link>
-              <button
-                type="button"
-                onClick={() => { localStorage.setItem("kopyya:phone-nudge-dismissed", "1"); setPhoneNudgeOff(true); }}
-                className="btn-ghost px-2 py-1 text-xs focus-ring"
-                aria-label="Dismiss"
-              >
-                ✕
-              </button>
-            </div>
           </div>
         )}
 

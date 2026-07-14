@@ -256,14 +256,10 @@ async def _run_listener(
             try:
                 await asyncio.to_thread(adapter.verify_connection)
             except Exception as exc:  # noqa: BLE001
-                listener_state.notify_broker_disconnected(trader_user_id, broker_account_id, str(exc))
                 _set_state(trader_user_id, "credentials_invalid", error=str(exc)[:300])
                 await asyncio.sleep(60)
                 continue
 
-            # Reconnected — clear the disconnect debounce so a future drop
-            # notifies again.
-            listener_state.clear_disconnect_debounce(trader_user_id)
             _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
 

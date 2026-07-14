@@ -15,7 +15,6 @@ scheduled tasks natively.
 from __future__ import annotations
 
 import logging
-import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -24,22 +23,11 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.models.notification import Notification
-from app.models.user import User
 from app.services import events
 
 log = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
-
-# Notification type → in-app path appended to the SMS body (NOT the in-app
-# message, which stays clean) so a tapped text drops the user on the right
-# screen. Types not listed get no link.
-_SMS_DEEP_LINK = {
-    "copy.rejected": "/trades",
-    "order.rejected": "/trades",
-    "copy.auto_liquidated": "/positions",
-    "broker.disconnected": "/broker",
-}
 
 
 def create_notification(
@@ -99,28 +87,6 @@ def create_notification(
             "created_at": notif.created_at.isoformat(),
         },
     })
-
-    # Opt-in SMS fanout: mirror the notification to Twilio for users who gave a
-    # phone and enabled SMS. Fire off-thread so a slow/failing send never blocks
-    # the caller — send_sms reads only config + httpx (no DB/session), so it's
-    # safe outside this request's session. Best-effort; never raises upward.
-    try:
-        user = db.get(User, user_id)
-        if user is not None and user.phone and user.sms_notifications_enabled:
-            from app.services.sms import send_sms  # noqa: PLC0415
-            # Append a deep link for SMS only (keeps the in-app message clean),
-            # so tapping the text opens the relevant screen.
-            sms_body = message
-            path = _SMS_DEEP_LINK.get(type)
-            if path:
-                from app.config import get_settings  # noqa: PLC0415
-                base = get_settings().frontend_base_url.rstrip("/")
-                sms_body = f"{message} View: {base}{path}"
-            threading.Thread(
-                target=send_sms, args=(user.phone, sms_body), daemon=True,
-            ).start()
-    except Exception:  # noqa: BLE001
-        log.exception("notifications: SMS fanout failed for user=%s", user_id)
 
     log.info(
         "notifications: created user=%s type=%s id=%s",

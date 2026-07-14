@@ -1,4 +1,3 @@
-import re
 import uuid
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -62,9 +61,6 @@ class RegisterIn(BaseModel):
     # the trader and every subscriber who follows them. Ignored for
     # subscribers (they inherit the brand from the trader they follow).
     business_name: str | None = Field(default=None, max_length=120)
-    # Optional phone (E.164) collected at sign-up so users can opt into SMS
-    # alerts immediately. "" / None = no phone; providing one enables SMS.
-    phone: str | None = Field(default=None, max_length=20)
 
     _norm_email = field_validator("email", mode="before")(_normalize_email)
 
@@ -72,16 +68,6 @@ class RegisterIn(BaseModel):
     @classmethod
     def _password_policy(cls, v: str) -> str:
         return _validate_password_strength(v)
-
-    @field_validator("phone", mode="before")
-    @classmethod
-    def _phone(cls, v: object) -> object:
-        if not isinstance(v, str):
-            return v
-        v = v.strip()
-        if v and not re.match(r"^\+[1-9]\d{6,14}$", v):
-            raise ValueError("phone must be E.164, e.g. +15551234567")
-        return v
 
     @model_validator(mode="after")
     def _require_business_name_for_trader(self) -> "RegisterIn":
@@ -105,25 +91,11 @@ class UpdateMeIn(BaseModel):
     via its own verified flow, not here."""
     display_name: str | None = Field(default=None, max_length=120)
     business_name: str | None = Field(default=None, max_length=120)
-    # E.164 phone for SMS notifications ("+15551234567"). "" clears it.
-    phone: str | None = Field(default=None, max_length=20)
-    # Opt-in toggle for the notification→SMS fanout (needs a phone to matter).
-    sms_notifications_enabled: bool | None = None
 
     @field_validator("display_name", "business_name", mode="before")
     @classmethod
     def _strip(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
-
-    @field_validator("phone", mode="before")
-    @classmethod
-    def _phone(cls, v: object) -> object:
-        if not isinstance(v, str):
-            return v
-        v = v.strip()
-        if v and not re.match(r"^\+[1-9]\d{6,14}$", v):
-            raise ValueError("phone must be E.164, e.g. +15551234567")
-        return v
 
 
 class ChangeEmailIn(BaseModel):
@@ -233,8 +205,6 @@ class UserOut(BaseModel):
     role: UserRole
     display_name: str | None
     business_name: str | None = None
-    phone: str | None = None
-    sms_notifications_enabled: bool = False
     is_active: bool
     email_verified: bool = True
 

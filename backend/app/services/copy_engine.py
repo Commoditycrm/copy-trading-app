@@ -1525,37 +1525,6 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 child.redis_published_at = datetime.now(timezone.utc)
                 events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
 
-    # Notify each subscriber whose mirror was REJECTED — in-app + SMS for
-    # opted-in users (create_notification fans out to Twilio off-thread).
-    # status == "error" is a FINAL rejection; retries are notified separately
-    # only once all attempts are exhausted (retry_scheduler), so no double-send.
-    if any(r.status == "error" for r in results):
-        from app.services.notifications import create_notification  # noqa: PLC0415
-        _side = trader_order.side.value.upper()
-        for r in results:
-            if r.status != "error":
-                continue
-            try:
-                create_notification(
-                    db,
-                    user_id=r.subscriber_user_id,
-                    type="copy.rejected",
-                    message=(
-                        f"Your copy of the {_side} {trader_order.symbol} order was "
-                        f"rejected: {(r.detail or 'unknown error')[:180]}"
-                    ),
-                    metadata={
-                        "parent_order_id": str(trader_order.id),
-                        "order_id": str(r.order_id),
-                        "symbol": trader_order.symbol,
-                        "side": _side,
-                        "reason": (r.detail or "")[:300],
-                        "trader_id": str(trader_order.user_id),
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("copy: rejection notification failed for order %s", r.order_id)
-
     return results
 
 

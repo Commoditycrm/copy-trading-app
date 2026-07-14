@@ -19,7 +19,6 @@ export default function RegisterPage() {
   // Business name is REQUIRED when role=trader (enforced server-side too).
   // For subscribers we just don't send it.
   const [businessName, setBusinessName] = useState("");
-  const [phone, setPhone] = useState("");
   const [loading, setLoading] = useState(false);
 
   // Already signed in? Skip the form and bounce to the root, which
@@ -32,10 +31,6 @@ export default function RegisterPage() {
     e.preventDefault();
     if (role === "trader" && !businessName.trim()) {
       notify.error("Business name is required for traders");
-      return;
-    }
-    if (phone.trim() && !/^\+[1-9]\d{6,14}$/.test(phone.trim())) {
-      notify.error("Enter your phone in international format, e.g. +15551234567");
       return;
     }
     setLoading(true);
@@ -54,7 +49,6 @@ export default function RegisterPage() {
           role,
           display_name: displayName || null,
           business_name: role === "trader" ? businessName.trim() : null,
-          phone: phone.trim() || null,
         }),
         auth: false,
       });
@@ -97,23 +91,10 @@ export default function RegisterPage() {
       subtitle="Start copying or sharing trades in minutes"
       footer={
         <>
-          <span>
-            Have an account?{" "}
-            <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
-              Sign in
-            </Link>
-          </span>
-          <p className="mt-3 text-xs" style={{ color: "var(--muted)" }}>
-            By creating an account you agree to our{" "}
-            <Link href="/terms" className="underline" style={{ color: "var(--muted)" }}>
-              Terms of Service
-            </Link>{" "}
-            and{" "}
-            <Link href="/privacy" className="underline" style={{ color: "var(--muted)" }}>
-              Privacy Policy
-            </Link>
-            .
-          </p>
+          Have an account?{" "}
+          <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
+            Sign in
+          </Link>
         </>
       }
     >
@@ -139,11 +120,6 @@ export default function RegisterPage() {
             <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Display name (optional)</label>
             <input className="w-full p-2.5" type="text" autoComplete="name"
               value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-          </div>
-          <div>
-            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Phone (optional) — get SMS alerts</label>
-            <input className="w-full p-2.5" type="tel" autoComplete="tel" inputMode="tel" placeholder="+15551234567"
-              value={phone} onChange={(e) => setPhone(e.target.value)} maxLength={20} />
           </div>
           <div>
             <label className="text-[11px] uppercase tracking-wider mb-2 block" style={{ color: "var(--muted)" }}>I am a</label>
