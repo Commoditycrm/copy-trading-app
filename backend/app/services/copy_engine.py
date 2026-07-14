@@ -45,6 +45,7 @@ from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, Orde
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
+from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
 from app.services.order_retry import classify_error, is_order_conflict_error, live_closeable_quantity
@@ -1028,6 +1029,19 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # vs absolute-price copy; see _trader_bracket_for_copy.
     copy_use_pct, copy_tp_val, copy_sl_val = _trader_bracket_for_copy(trader_order)
 
+    # End-of-day lockout (order-level, so computed once). In the last 5 minutes
+    # before the US close we do NOT mirror SAME-DAY-EXPIRY option orders to
+    # subscribers — the eod_autoclose sweep is flattening those very contracts at
+    # 15:55, so letting a fresh 0DTE mirror through would just re-strand the
+    # subscriber (or, for a close, no-op against a position we already flattened).
+    # Later-expiry options and all stocks pass through untouched.
+    eod_locked = (
+        get_settings().eod_autoclose_enabled
+        and trader_order.instrument_type == InstrumentType.OPTION
+        and market_hours.in_eod_close_window()
+        and market_hours.is_same_day_expiry(trader_order.option_expiry)
+    )
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
@@ -1036,6 +1050,28 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # all picked_at values are within microseconds — pick_lag is now a
         # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
+
+        # EOD lockout: refuse new same-day-expiry option mirrors in the final 5
+        # minutes before the US close (see eod_locked above).
+        if eod_locked:
+            audit.record(
+                db,
+                actor_user_id=sub.user_id,
+                action="copy.skipped_eod_same_day_expiry",
+                entity_type="order",
+                entity_id=trader_order.id,
+                metadata={
+                    "symbol": trader_order.symbol,
+                    "option_expiry": str(trader_order.option_expiry),
+                },
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=sub.user_id,
+                broker_account_id=uuid.UUID(int=0),
+                order_id=None,
+                status="skipped_eod_same_day_expiry",
+            ))
+            continue
 
         # Daily P&L kill switches (check BEFORE placing). Loss + profit
         # share the same auto-pause path — both stamp pnl_auto_paused_at
