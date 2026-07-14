@@ -260,6 +260,9 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             # been rotated or the account marked disconnected since last try.
             creds, is_paper = _load_creds(trader_user_id, broker_account_id)
             if creds is None:
+                listener_state.notify_broker_disconnected(
+                    trader_user_id, broker_account_id, "credentials missing / disconnected"
+                )
                 _set_state(trader_user_id, "credentials_invalid",
                            error="broker disconnected or credentials missing")
                 log.warning(
@@ -321,6 +324,7 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             # this as "broker connecting..." indefinitely. Move backfill
             # off the connect path: schedule it as an independent task
             # so it can run in parallel with the WebSocket consumer.
+            listener_state.clear_disconnect_debounce(trader_user_id)
             _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
             log.info(
