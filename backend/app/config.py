@@ -94,6 +94,19 @@ class Settings(BaseSettings):
     # {{verify_link}}, {{name}}, {{app_name}}. Blank → built-in inline HTML.
     sendgrid_verification_template_id: str = ""
 
+    # ── SMS (Twilio) ──────────────────────────────────────────────────────
+    # Twilio REST credentials — Account SID + Auth Token from the Twilio Console
+    # dashboard. Blank by default so dev/QA work without them: services/sms.py
+    # then logs the message instead of sending, keeping SMS flows testable.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    # Preferred sender: a Messaging Service SID (MG…) from Twilio Console →
+    # Messaging → Services. Owns the sender pool, opt-out handling and retries.
+    # If blank we fall back to twilio_from_number (a single SMS-capable Twilio
+    # number in E.164, e.g. +15551234567). One of the two must be set to send.
+    twilio_messaging_service_sid: str = ""
+    twilio_from_number: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
