@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * Country-code dropdown + local number, emitting a normalized E.164 string
@@ -79,29 +79,117 @@ export function PhoneInput({
   id?: string;
 }) {
   const init = parse(value);
-  const [dial, setDial] = useState(init.dial);
+  const [country, setCountry] = useState<Country>(
+    () => COUNTRIES.find((c) => c.dial === init.dial) ?? COUNTRIES[0],
+  );
   const [local, setLocal] = useState(init.local);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   function emit(d: string, l: string) {
     const digits = l.replace(/\D/g, "");
     onChange(digits ? `+${d}${digits}` : "");
   }
 
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    // Focus the search box when the menu opens.
+    searchRef.current?.focus();
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // Search matches country name, ISO code, or dial code — even though the list
+  // shows only the flag + dial code, so typing "india" or "91" both work.
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? COUNTRIES.filter(
+        (c) =>
+          c.name.toLowerCase().includes(q) ||
+          c.code.toLowerCase().includes(q) ||
+          c.dial.includes(q),
+      )
+    : COUNTRIES;
+
+  function pick(c: Country) {
+    setCountry(c);
+    emit(c.dial, local);
+    setOpen(false);
+    setQuery("");
+  }
+
   return (
     <div className="flex gap-2">
-      <select
-        aria-label="Country code"
-        value={dial}
-        onChange={(e) => { setDial(e.target.value); emit(e.target.value, local); }}
-        className="p-2.5 shrink-0"
-        style={{ maxWidth: 168 }}
-      >
-        {COUNTRIES.map((c) => (
-          <option key={c.code} value={c.dial}>
-            {c.flag} {c.name} +{c.dial}
-          </option>
-        ))}
-      </select>
+      <div ref={wrapRef} className="relative shrink-0">
+        <button
+          type="button"
+          aria-label="Country code"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
+          className="p-2.5 inline-flex items-center gap-1.5 rounded-md w-full"
+          style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)" }}
+        >
+          <span>{country.flag}</span>
+          <span className="tabular-nums">+{country.dial}</span>
+          <span style={{ color: "var(--muted)", fontSize: 10 }}>▾</span>
+        </button>
+
+        {open && (
+          <div
+            className="absolute z-50 mt-1 rounded-lg overflow-hidden"
+            style={{
+              background: "var(--panel)",
+              border: "1px solid var(--border)",
+              boxShadow: "0 16px 40px -18px rgba(0,0,0,0.6)",
+              width: 160,
+            }}
+          >
+            <div className="p-1.5" style={{ borderBottom: "1px solid var(--border)" }}>
+              <input
+                ref={searchRef}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && filtered[0]) { e.preventDefault(); pick(filtered[0]); } }}
+                placeholder="Search…"
+                className="w-full text-sm px-2 py-1 rounded-md"
+                style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
+              />
+            </div>
+            <div className="overflow-auto" style={{ maxHeight: 220 }}>
+              {filtered.length === 0 ? (
+                <div className="px-3 py-2 text-xs" style={{ color: "var(--muted)" }}>No match</div>
+              ) : (
+                filtered.map((c) => (
+                  <button
+                    key={c.code}
+                    type="button"
+                    onClick={() => pick(c)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors hover:bg-[var(--panel-2)]"
+                    style={{ background: c.code === country.code ? "var(--panel-2)" : "transparent", color: "var(--text)" }}
+                    title={c.name}
+                  >
+                    <span>{c.flag}</span>
+                    <span className="tabular-nums">+{c.dial}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
       <input
         id={id}
         type="tel"
@@ -109,7 +197,7 @@ export function PhoneInput({
         autoComplete="tel-national"
         placeholder="98765 43210"
         value={local}
-        onChange={(e) => { setLocal(e.target.value); emit(dial, e.target.value); }}
+        onChange={(e) => { setLocal(e.target.value); emit(country.dial, e.target.value); }}
         className="flex-1 p-2.5"
         maxLength={15}
       />
