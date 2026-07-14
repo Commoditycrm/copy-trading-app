@@ -31,6 +31,16 @@ log = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
 
+# Notification type → in-app path appended to the SMS body (NOT the in-app
+# message, which stays clean) so a tapped text drops the user on the right
+# screen. Types not listed get no link.
+_SMS_DEEP_LINK = {
+    "copy.rejected": "/trades",
+    "order.rejected": "/trades",
+    "copy.auto_liquidated": "/positions",
+    "broker.disconnected": "/broker",
+}
+
 
 def create_notification(
     db: Session,
@@ -98,8 +108,16 @@ def create_notification(
         user = db.get(User, user_id)
         if user is not None and user.phone and user.sms_notifications_enabled:
             from app.services.sms import send_sms  # noqa: PLC0415
+            # Append a deep link for SMS only (keeps the in-app message clean),
+            # so tapping the text opens the relevant screen.
+            sms_body = message
+            path = _SMS_DEEP_LINK.get(type)
+            if path:
+                from app.config import get_settings  # noqa: PLC0415
+                base = get_settings().frontend_base_url.rstrip("/")
+                sms_body = f"{message} View: {base}{path}"
             threading.Thread(
-                target=send_sms, args=(user.phone, message), daemon=True,
+                target=send_sms, args=(user.phone, sms_body), daemon=True,
             ).start()
     except Exception:  # noqa: BLE001
         log.exception("notifications: SMS fanout failed for user=%s", user_id)
