@@ -198,6 +198,17 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start pnl_poller")
 
+        # End-of-day safety net: at 15:55 ET, market-close every subscriber's
+        # SAME-DAY-EXPIRY option positions so a trader who forgets to flatten
+        # 0DTE contracts doesn't strand subscribers holding them into expiry.
+        # Loop checks the clock every 30s and fires once per trading day; the
+        # matching last-5-minutes new-order lockout lives in copy_engine fanout.
+        try:
+            from app.services import eod_autoclose
+            _spawn_background(eod_autoclose.run_loop(shutdown_check=shutdown_event.is_set))
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start eod_autoclose loop")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep

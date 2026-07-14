@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # ── End-of-day subscriber safety auto-close ───────────────────────────
+    # At 15:55 ET (5 minutes before the 16:00 US close) the worker market-closes
+    # every subscriber's SAME-DAY-EXPIRY (0DTE) option positions, and the fanout
+    # refuses new same-day-expiry subscriber orders for that final 5 minutes.
+    # Safety net so a trader who forgets to close expiring options doesn't leave
+    # subscribers holding contracts that expire worthless overnight. Later-expiry
+    # options and all stocks are untouched. Set false to disable BOTH halves
+    # without a redeploy. The sweep loop runs in the worker only
+    # (run_background_workers=true); the order lockout runs wherever fanout runs.
+    eod_autoclose_enabled: bool = True
     # ── Password reset / transactional email (SendGrid) ───────────────────
     # SendGrid Web API v3 key. Blank by default so dev/QA work without it —
     # the email service then logs the reset link instead of sending (see
@@ -93,6 +103,19 @@ class Settings(BaseSettings):
     # Optional SendGrid Dynamic Template for the verification email. Receives
     # {{verify_link}}, {{name}}, {{app_name}}. Blank → built-in inline HTML.
     sendgrid_verification_template_id: str = ""
+
+    # ── SMS (Twilio) ──────────────────────────────────────────────────────
+    # Twilio REST credentials — Account SID + Auth Token from the Twilio Console
+    # dashboard. Blank by default so dev/QA work without them: services/sms.py
+    # then logs the message instead of sending, keeping SMS flows testable.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    # Preferred sender: a Messaging Service SID (MG…) from Twilio Console →
+    # Messaging → Services. Owns the sender pool, opt-out handling and retries.
+    # If blank we fall back to twilio_from_number (a single SMS-capable Twilio
+    # number in E.164, e.g. +15551234567). One of the two must be set to send.
+    twilio_messaging_service_sid: str = ""
+    twilio_from_number: str = ""
 
     @property
     def cors_origins_list(self) -> list[str]:

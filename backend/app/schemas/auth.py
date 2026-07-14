@@ -1,3 +1,4 @@
+import re
 import uuid
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -52,6 +53,28 @@ def _normalize_email(v: object) -> object:
     return v
 
 
+def _normalize_phone(v: object) -> object:
+    """Accept a phone in any common format and normalize to E.164 for Twilio.
+
+    Strips spaces, dashes, parentheses and dots; treats a leading international
+    "00" prefix as "+". Works for ANY country (not just US) — the only hard
+    requirement is a country code (a leading "+"), since Twilio needs E.164.
+    Empty string / None is passed through (clears the phone)."""
+    if not isinstance(v, str):
+        return v
+    v = v.strip()
+    if not v:
+        return v
+    cleaned = re.sub(r"[\s\-().]", "", v)
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if not re.match(r"^\+[1-9]\d{6,14}$", cleaned):
+        raise ValueError(
+            "Enter your phone with country code, e.g. +91 98765 43210 or +1 555 123 4567"
+        )
+    return cleaned
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
@@ -61,6 +84,9 @@ class RegisterIn(BaseModel):
     # the trader and every subscriber who follows them. Ignored for
     # subscribers (they inherit the brand from the trader they follow).
     business_name: str | None = Field(default=None, max_length=120)
+    # Optional phone (E.164) collected at sign-up so users can opt into SMS
+    # alerts immediately. "" / None = no phone; providing one enables SMS.
+    phone: str | None = Field(default=None, max_length=20)
 
     _norm_email = field_validator("email", mode="before")(_normalize_email)
 
@@ -68,6 +94,8 @@ class RegisterIn(BaseModel):
     @classmethod
     def _password_policy(cls, v: str) -> str:
         return _validate_password_strength(v)
+
+    _norm_phone = field_validator("phone", mode="before")(_normalize_phone)
 
     @model_validator(mode="after")
     def _require_business_name_for_trader(self) -> "RegisterIn":
@@ -91,11 +119,17 @@ class UpdateMeIn(BaseModel):
     via its own verified flow, not here."""
     display_name: str | None = Field(default=None, max_length=120)
     business_name: str | None = Field(default=None, max_length=120)
+    # E.164 phone for SMS notifications ("+15551234567"). "" clears it.
+    phone: str | None = Field(default=None, max_length=20)
+    # Opt-in toggle for the notification→SMS fanout (needs a phone to matter).
+    sms_notifications_enabled: bool | None = None
 
     @field_validator("display_name", "business_name", mode="before")
     @classmethod
     def _strip(cls, v: object) -> object:
         return v.strip() if isinstance(v, str) else v
+
+    _norm_phone = field_validator("phone", mode="before")(_normalize_phone)
 
 
 class ChangeEmailIn(BaseModel):
@@ -205,6 +239,8 @@ class UserOut(BaseModel):
     role: UserRole
     display_name: str | None
     business_name: str | None = None
+    phone: str | None = None
+    sms_notifications_enabled: bool = False
     is_active: bool
     email_verified: bool = True
 

@@ -93,6 +93,10 @@ def register(
         # business_name is required for traders (enforced by RegisterIn) and
         # forced to None for everyone else, so this is safe to pass through.
         business_name=payload.business_name,
+        # Phone is optional at sign-up. Providing one opts the user into SMS
+        # alerts straight away (they can toggle it off later in Settings).
+        phone=(payload.phone or None),
+        sms_notifications_enabled=bool(payload.phone),
     )
     db.add(user)
     db.flush()
@@ -355,6 +359,13 @@ def update_me(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="business_name_blank")
         user.business_name = payload.business_name
         changed["business_name"] = payload.business_name
+    if payload.phone is not None:
+        # Already validated E.164 (or "") in UpdateMeIn. Empty clears it.
+        user.phone = payload.phone or None
+        changed["phone"] = user.phone
+    if payload.sms_notifications_enabled is not None:
+        user.sms_notifications_enabled = payload.sms_notifications_enabled
+        changed["sms_notifications_enabled"] = payload.sms_notifications_enabled
 
     if not changed:
         return user

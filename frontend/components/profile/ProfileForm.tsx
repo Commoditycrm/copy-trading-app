@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api, changeEmail } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PhoneInput } from "@/components/PhoneInput";
 import type { User } from "@/lib/types";
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -20,10 +21,16 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
   const [newEmail, setNewEmail] = useState("");
   const [pwd, setPwd] = useState("");
   const [sendingEmail, setSendingEmail] = useState(false);
+  const [phone, setPhone] = useState("");
+  const [sms, setSms] = useState(false);
+  const [savingSms, setSavingSms] = useState(false);
 
   useEffect(() => {
     api<User>("/api/auth/me")
-      .then(u => { setUser(u); setName(u.display_name ?? ""); })
+      .then(u => {
+        setUser(u); setName(u.display_name ?? "");
+        setPhone(u.phone ?? ""); setSms(u.sms_notifications_enabled);
+      })
       .catch(e => notify.fromError(e, "Could not load your profile"))
       .finally(() => setLoading(false));
   }, []);
@@ -46,6 +53,35 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
       notify.fromError(e, "Could not update your name");
     } finally {
       setSaving(false);
+    }
+  }
+
+  const smsDirty = user != null
+    && (phone.trim() !== (user.phone ?? "") || sms !== user.sms_notifications_enabled);
+
+  async function saveSms() {
+    // Accept any format/country: strip spaces/dashes/parens, 00 -> +.
+    const p = phone.trim().replace(/[\s\-().]/g, "").replace(/^00/, "+");
+    if (p && !/^\+[1-9]\d{6,14}$/.test(p)) {
+      notify.warn("Enter your number with country code, e.g. +91 98765 43210");
+      return;
+    }
+    if (sms && !p) { notify.warn("Add a phone number to receive SMS"); return; }
+    setSavingSms(true);
+    try {
+      const updated = await api<User>("/api/auth/me", {
+        method: "PATCH",
+        body: JSON.stringify({ phone: p, sms_notifications_enabled: sms }),
+      });
+      setUser(updated);
+      setPhone(updated.phone ?? "");
+      setSms(updated.sms_notifications_enabled);
+      onUpdated?.(updated);
+      notify.success("SMS settings saved");
+    } catch (e) {
+      notify.fromError(e, "Could not save your SMS settings");
+    } finally {
+      setSavingSms(false);
     }
   }
 
@@ -158,6 +194,39 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
             </p>
           </div>
         )}
+      </div>
+
+      {/* SMS notifications */}
+      <div className="mt-4 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+        <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: "var(--muted)" }}>
+          SMS notifications
+        </label>
+        <div className="flex items-center gap-2">
+          <div className="flex-1 min-w-0">
+            <PhoneInput value={phone} onChange={setPhone} />
+          </div>
+          <button
+            onClick={saveSms}
+            disabled={!smsDirty || savingSms}
+            className="text-sm px-4 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-medium"
+            style={{
+              background: smsDirty ? "var(--accent)" : "var(--panel-2)",
+              color: smsDirty ? "var(--accent-ink)" : "var(--text-2)",
+              border: "1px solid " + (smsDirty ? "var(--accent)" : "var(--border)"),
+              opacity: savingSms ? 0.6 : 1,
+              cursor: !smsDirty || savingSms ? "not-allowed" : "pointer",
+            }}
+          >
+            Save {savingSms && <Spinner />}
+          </button>
+        </div>
+        <label className="flex items-center gap-2 mt-2.5 text-sm cursor-pointer select-none">
+          <input type="checkbox" checked={sms} onChange={e => setSms(e.target.checked)} />
+          <span>Text me my notifications</span>
+        </label>
+        <p className="text-[11px] mt-1.5" style={{ color: "var(--muted)" }}>
+          Include your country code (any country), e.g. +91 98765 43210 or +1 555 123 4567. Standard message rates may apply.
+        </p>
       </div>
     </>
   );

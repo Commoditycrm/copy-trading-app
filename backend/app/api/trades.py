@@ -682,6 +682,31 @@ def _place_trader_order(
                 entity_type="order", entity_id=order.id,
                 metadata={"error": str(exc)[:480]}, ip_address=client_ip(request),
             )
+            # Notify the trader too — in-app + SMS for opted-in traders. Always
+            # fired (not gated on will_fanout): the trader wants to know their
+            # own order was rejected regardless of copy scope.
+            try:
+                from app.services import notifications as notif_svc  # noqa: PLC0415
+                notif_svc.create_notification(
+                    db,
+                    user_id=trader.id,
+                    type="order.rejected",
+                    message=(
+                        f"Your {order.side.value.upper()} {order.symbol} order was "
+                        f"rejected: {str(exc)[:180]}"
+                    ),
+                    metadata={
+                        "order_id": str(order.id),
+                        "symbol": order.symbol,
+                        "side": order.side.value,
+                        "reason": str(exc)[:300],
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                import logging  # noqa: PLC0415
+                logging.getLogger(__name__).exception(
+                    "trades: trader rejection notification failed for order %s", order.id
+                )
             db.commit()
             # Tell subscribers the trader tried to enter and got rejected — so
             # the rejection isn't silent on their side. Only when this order

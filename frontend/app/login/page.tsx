@@ -52,10 +52,17 @@ export default function LoginPage() {
       subtitle="Sign in to your account"
       footer={
         <>
-          New here?{" "}
-          <Link href="/register" className="underline" style={{ color: "var(--accent)" }}>
-            Create an account
-          </Link>
+          <span>
+            New here?{" "}
+            <Link href="/register" className="underline" style={{ color: "var(--accent)" }}>
+              Create an account
+            </Link>
+          </span>
+          <p className="mt-3 text-xs" style={{ color: "var(--muted)" }}>
+            <Link href="/terms" className="underline" style={{ color: "var(--muted)" }}>Terms of Service</Link>
+            {"  ·  "}
+            <Link href="/privacy" className="underline" style={{ color: "var(--muted)" }}>Privacy Policy</Link>
+          </p>
         </>
       }
     >
