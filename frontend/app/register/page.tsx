@@ -91,10 +91,23 @@ export default function RegisterPage() {
       subtitle="Start copying or sharing trades in minutes"
       footer={
         <>
-          Have an account?{" "}
-          <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
-            Sign in
-          </Link>
+          <span>
+            Have an account?{" "}
+            <Link href="/login" className="underline" style={{ color: "var(--accent)" }}>
+              Sign in
+            </Link>
+          </span>
+          <p className="mt-3 text-xs" style={{ color: "var(--muted)" }}>
+            By creating an account you agree to our{" "}
+            <Link href="/terms" className="underline" style={{ color: "var(--muted)" }}>
+              Terms of Service
+            </Link>{" "}
+            and{" "}
+            <Link href="/privacy" className="underline" style={{ color: "var(--muted)" }}>
+              Privacy Policy
+            </Link>
+            .
+          </p>
         </>
       }
     >
