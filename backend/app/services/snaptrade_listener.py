@@ -46,6 +46,46 @@ from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
 
+# Debounce: user_ids we've already SMS-notified about a broker disconnect, so
+# the 60s credentials_invalid retry loop doesn't text them repeatedly. Cleared
+# when the listener reconnects (state -> connected).
+_disconnect_notified: set[uuid.UUID] = set()
+
+
+def _notify_broker_disconnected(
+    trader_user_id: uuid.UUID, broker_account_id: uuid.UUID, reason: str
+) -> None:
+    """Once-per-episode notification (in-app + SMS) that a broker connection
+    went invalid and needs reconnecting. Best-effort; opens its own session
+    since the listener runs off the request path."""
+    if trader_user_id in _disconnect_notified:
+        return
+    _disconnect_notified.add(trader_user_id)
+    db = SessionLocal()
+    try:
+        from app.services.notifications import create_notification  # noqa: PLC0415
+        acct = db.get(BrokerAccount, broker_account_id)
+        label = None
+        if acct is not None:
+            label = acct.brokerage_name or (acct.broker.value if acct.broker else None)
+        label = label or "Your broker"
+        create_notification(
+            db,
+            user_id=trader_user_id,
+            type="broker.disconnected",
+            message=(
+                f"{label} disconnected — reconnect it to resume copy trading. "
+                f"({reason[:100]})"
+            ),
+            metadata={"broker_account_id": str(broker_account_id), "reason": reason[:300]},
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.exception("snaptrade-listener: disconnect notification failed for %s", trader_user_id)
+    finally:
+        db.close()
+
 
 # Per the module docstring: SnapTrade's own upstream poll cadence sets a
 # floor on useful freshness. 5s is a fine default for the self-poller.
@@ -256,10 +296,14 @@ async def _run_listener(
             try:
                 await asyncio.to_thread(adapter.verify_connection)
             except Exception as exc:  # noqa: BLE001
+                _notify_broker_disconnected(trader_user_id, broker_account_id, str(exc))
                 _set_state(trader_user_id, "credentials_invalid", error=str(exc)[:300])
                 await asyncio.sleep(60)
                 continue
 
+            # Reconnected — clear the disconnect debounce so a future drop
+            # notifies again.
+            _disconnect_notified.discard(trader_user_id)
             _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
 
