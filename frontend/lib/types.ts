@@ -18,6 +18,11 @@ export interface User {
   phone: string | null;
   /** Opt-in for the notification→SMS fanout. Off unless the user enables it. */
   sms_notifications_enabled: boolean;
+  /** Per-category toggles, ANDed with sms_notifications_enabled. Only these
+   *  three categories can text at all — everything else is in-app only. */
+  sms_on_auto_actions: boolean;
+  sms_on_trade_rejected: boolean;
+  sms_on_broker_connection: boolean;
 }
 
 export type FollowRequestStatus = "pending" | "approved" | "rejected";

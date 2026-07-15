@@ -366,6 +366,13 @@ def update_me(
     if payload.sms_notifications_enabled is not None:
         user.sms_notifications_enabled = payload.sms_notifications_enabled
         changed["sms_notifications_enabled"] = payload.sms_notifications_enabled
+    # Per-category SMS toggles. Same partial-update contract as the fields
+    # above: absent means "leave alone", not "set false".
+    for field in ("sms_on_auto_actions", "sms_on_trade_rejected", "sms_on_broker_connection"):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(user, field, value)
+            changed[field] = value
 
     if not changed:
         return user

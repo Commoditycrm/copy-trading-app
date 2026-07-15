@@ -41,6 +41,42 @@ _SMS_DEEP_LINK = {
     "broker.disconnected": "/broker",
 }
 
+# Notification type → the User column that gates its SMS.
+#
+# A type absent from BOTH maps below NEVER sends SMS — it stays in-app only.
+# That's deliberate: our A2P 10DLC campaign is registered with sample messages
+# covering exactly these three categories, and carriers audit live traffic
+# against the samples on file. Texting a follow request — which no sample
+# covers — is how a campaign gets flagged. Adding a category here means filing
+# a new sample message with Twilio first.
+_SMS_PREF_EXACT = {
+    "copy.auto_liquidated": "sms_on_auto_actions",
+    "copy.auto_resumed_next_day": "sms_on_auto_actions",
+    "order.rejected": "sms_on_trade_rejected",
+    "copy.rejected": "sms_on_trade_rejected",
+    "trader.order_rejected": "sms_on_trade_rejected",
+    "broker.disconnected": "sms_on_broker_connection",
+}
+
+# These types are built with f-strings (e.g. f"copy.auto_paused_{reason}"), so
+# exact lookup can't match them — the suffix is runtime data.
+_SMS_PREF_PREFIX = (
+    ("copy.auto_paused_", "sms_on_auto_actions"),
+    ("position.auto_closed_", "sms_on_auto_actions"),
+)
+
+
+def _sms_pref_attr(notif_type: str) -> str | None:
+    """The User flag gating SMS for this notification type, or None when the
+    type is in-app only."""
+    attr = _SMS_PREF_EXACT.get(notif_type)
+    if attr is not None:
+        return attr
+    for prefix, prefix_attr in _SMS_PREF_PREFIX:
+        if notif_type.startswith(prefix):
+            return prefix_attr
+    return None
+
 
 def create_notification(
     db: Session,
@@ -105,8 +141,14 @@ def create_notification(
     # the caller — send_sms reads only config + httpx (no DB/session), so it's
     # safe outside this request's session. Best-effort; never raises upward.
     try:
-        user = db.get(User, user_id)
-        if user is not None and user.phone and user.sms_notifications_enabled:
+        pref_attr = _sms_pref_attr(type)
+        user = db.get(User, user_id) if pref_attr else None
+        if (
+            user is not None
+            and user.phone
+            and user.sms_notifications_enabled      # master switch
+            and getattr(user, pref_attr)            # this category
+        ):
             from app.services.sms import send_sms  # noqa: PLC0415
             # Append a deep link for SMS only (keeps the in-app message clean),
             # so tapping the text opens the relevant screen.

@@ -123,6 +123,10 @@ class UpdateMeIn(BaseModel):
     phone: str | None = Field(default=None, max_length=20)
     # Opt-in toggle for the notification→SMS fanout (needs a phone to matter).
     sms_notifications_enabled: bool | None = None
+    # Per-category toggles, ANDed with the master switch above.
+    sms_on_auto_actions: bool | None = None
+    sms_on_trade_rejected: bool | None = None
+    sms_on_broker_connection: bool | None = None
 
     @field_validator("display_name", "business_name", mode="before")
     @classmethod
@@ -241,6 +245,9 @@ class UserOut(BaseModel):
     business_name: str | None = None
     phone: str | None = None
     sms_notifications_enabled: bool = False
+    sms_on_auto_actions: bool = True
+    sms_on_trade_rejected: bool = True
+    sms_on_broker_connection: bool = True
     is_active: bool
     email_verified: bool = True
 
