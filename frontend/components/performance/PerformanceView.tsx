@@ -19,7 +19,9 @@ import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 
 interface SubscriberCounts { total: number; submitted: number; errors: number; }
-interface FanoutChild {
+// Exported: the admin performance table renders the same rows from the same
+// serializer, so it shares this type instead of re-declaring a subset.
+export interface FanoutChild {
   order_id: string;
   subscriber_user_id: string;
   subscriber_email: string | null;
@@ -790,6 +792,299 @@ type ChildSortField =
 type SortDir = "asc" | "desc";
 interface ChildSort { field: ChildSortField; dir: SortDir; }
 
+/** Per-subscriber breakdown — the trade summary card plus the full mirror
+ *  timeline. Exported so the admin performance table renders the SAME columns
+ *  as the trader Performance view instead of a parallel copy. Owns its own
+ *  sort state, so each open drawer sorts independently. */
+export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
+  const [sort, setSort] = useState<ChildSort | null>(null);
+
+  // unsorted -> asc -> desc -> unsorted, so the reader can get back to
+  // chronological order without collapsing the row.
+  function cycleSort(field: ChildSortField) {
+    setSort((cur) => {
+      if (!cur || cur.field !== field) return { field, dir: "asc" };
+      if (cur.dir === "asc") return { field, dir: "desc" };
+      return null;
+    });
+  }
+
+  // Null timestamps sort LAST either way — a mirror that never reached
+  // "Broker Accepted At" shouldn't shove real rows around.
+  function applyChildSort(children: FanoutChild[]): FanoutChild[] {
+    if (!sort) return children;
+    const sorted = [...children];
+    sorted.sort((a, b) => {
+      const av = (a as unknown as Record<ChildSortField, string | null>)[sort.field];
+      const bv = (b as unknown as Record<ChildSortField, string | null>)[sort.field];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+      return sort.dir === "asc" ? cmp : -cmp;
+    });
+    return sorted;
+  }
+
+  return (
+    <>
+                          {/* Headline summary — the client-friendly framing.
+                              Avoids the "trade took 15.9s" misread by showing
+                              what most subscribers actually experienced (p50,
+                              # placed within 1s) and naming the slowest as a
+                              named outlier rather than a platform stat. */}
+                          {mirrors.length > 0 && <TradeSummaryCard mirrors={mirrors} />}
+                          <div
+                            className="text-[10px] uppercase tracking-widest mb-3"
+                            style={{ color: "var(--muted)" }}
+                          >
+                            Per-Subscriber Timeline ({mirrors.length} target{mirrors.length === 1 ? "" : "s"})
+                          </div>
+                          {mirrors.length === 0 ? (
+                            <div className="text-xs" style={{ color: "var(--muted)" }}>
+                              No subscribers received this trade.
+                            </div>
+                          ) : (
+                            // Scroll wrapper so the inner per-subscriber table
+                            // gets the same sticky-header treatment as the
+                            // outer fanout table. max-h caps the drawer's own
+                            // height (already nested inside the page-level
+                            // scrolling container).
+                            <div
+                              className="overflow-auto max-h-[50vh] rounded"
+                              style={{ border: "1px solid var(--border)" }}
+                            >
+                            <table
+                              className="w-full text-xs"
+                              style={{ borderCollapse: "separate", borderSpacing: 0, tableLayout: "auto" }}
+                            >
+                              {/* Sticky thead pinned to the wrapper. Opaque
+                                  panel background prevents row text from
+                                  bleeding through behind the sticky row. */}
+                              <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
+                                <tr style={{ color: "var(--muted)" }}>
+                                  {/* Per-column header definitions. The optional third element is the
+                                      sort field — when present, the column renders a clickable sort
+                                      indicator that cycles unsorted → asc → desc → unsorted. */}
+                                  {([
+                                    ["Subscriber", "The subscriber whose account this mirror was placed on."],
+                                    ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
+                                    ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
+                                    ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
+                                    ["Expected Price", "This mirror's limit price. Blank for market orders (no expected price)."],
+                                    ["Filled Price", "The subscriber's broker average fill price for this mirror. Compare with Expected Price to gauge their slippage."],
+                                    ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING).", "created_at"],
+                                    ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line.", "subscriber_picked_at"],
+                                    ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
+                                    ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order.", "broker_accepted_at"],
+                                    ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time.", "redis_published_at"],
+                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent DB SAVED AT. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Eligibility Lag", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
+                                    ["Broker Lag", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
+                                    ["Broker Response", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
+                                    // ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
+                                    ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
+                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent DB SAVED AT."],
+                                    ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
+                                  ] as ([string, string] | [string, string, ChildSortField])[]).map((row) => {
+                                    const [h, tip] = row;
+                                    const sortField = row[2] as ChildSortField | undefined;
+                                    const active = sortField && sort?.field === sortField;
+                                    const dir = active ? sort?.dir : undefined;
+                                    return (
+                                      <th
+                                        key={h}
+                                        title={tip}
+                                        onClick={sortField ? () => cycleSort(sortField) : undefined}
+                                        className="text-left px-2 py-2 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap select-none"
+                                        style={{
+                                          borderBottom: "1px solid var(--border)",
+                                          cursor: sortField ? "pointer" : "help",
+                                          textDecoration: sortField ? "none" : "underline dotted var(--border)",
+                                          textUnderlineOffset: 4,
+                                          color: active ? "var(--accent)" : "var(--muted)",
+                                        }}
+                                      >
+                                        <span className="inline-flex items-center gap-1">
+                                          <span>{h}</span>
+                                          {sortField && (
+                                            <SortChevron dir={dir} active={!!active} />
+                                          )}
+                                        </span>
+                                      </th>
+                                    );
+                                  })}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {applyChildSort(mirrors).map(c => {
+                                  const displayName =
+                                    c.subscriber_name ||
+                                    (c.subscriber_email ? c.subscriber_email.split("@")[0] : null) ||
+                                    c.subscriber_user_id.slice(0, 8);
+                                  return (
+                                    <tr
+                                      key={c.order_id}
+                                      style={{ borderTop: "1px solid var(--border)", verticalAlign: "top" }}
+                                    >
+                                      <td className="px-2 py-2 whitespace-nowrap">{displayName}</td>
+                                      <td className="px-2 py-2 whitespace-nowrap">
+                                        <span
+                                          className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium"
+                                          style={{
+                                            background:
+                                              c.status === "rejected"
+                                                ? "rgba(239,68,68,0.15)"
+                                                : c.status === "filled"
+                                                ? "rgba(34,197,94,0.15)"
+                                                : c.status === "pending"
+                                                ? "rgba(234,179,8,0.15)"
+                                                : "rgba(148,163,184,0.15)",
+                                            color:
+                                              c.status === "rejected"
+                                                ? "var(--bad)"
+                                                : c.status === "filled"
+                                                ? "var(--good)"
+                                                : c.status === "pending"
+                                                ? "var(--warn)"
+                                                : "var(--text-2)",
+                                            border: "1px solid",
+                                            borderColor:
+                                              c.status === "rejected"
+                                                ? "rgba(239,68,68,0.3)"
+                                                : c.status === "filled"
+                                                ? "rgba(34,197,94,0.3)"
+                                                : c.status === "pending"
+                                                ? "rgba(234,179,8,0.3)"
+                                                : "rgba(148,163,184,0.3)",
+                                          }}
+                                        >
+                                          {c.status}
+                                        </span>
+                                      </td>
+                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: Number(c.filled_quantity) > 0 ? "var(--text)" : "var(--muted)" }}
+                                      >
+                                        {fmtQty(c.filled_quantity)}
+                                      </td>
+                                      {/* Mirror's own expected (limit) vs filled price */}
+                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                                        {c.expected_price ?? "—"}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: c.filled_avg_price ? "var(--text)" : "var(--muted)" }}
+                                      >
+                                        {c.filled_avg_price ?? "—"}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.created_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.subscriber_picked_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.subscriber_accepted_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.broker_accepted_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.redis_published_at)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.pick_lag_ms) }}
+                                      >
+                                        {fmtMs(c.pick_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.eligibility_lag_ms) }}
+                                      >
+                                        {fmtMs(c.eligibility_lag_ms)}
+                                      </td>
+                                      <td className="px-2 py-2 whitespace-nowrap capitalize" style={{ color: "var(--text-2)" }}>
+                                        {c.broker_name ?? "—"}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.broker_lag_ms) }}
+                                      >
+                                        {fmtMs(c.broker_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.broker_response_ms) }}
+                                      >
+                                        {fmtMs(c.broker_response_ms)}
+                                      </td>
+                                      {/* Split bar — Platform (green) vs Broker (blue) */}
+                                      {/* <td className="px-2 py-2 whitespace-nowrap">
+                                        <PlatformBrokerBar
+                                          platformMs={(c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0)}
+                                          brokerMs={c.broker_lag_ms}
+                                        />
+                                      </td> */}
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.publish_lag_ms) }}
+                                      >
+                                        {fmtMs(c.publish_lag_ms)}
+                                      </td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: colorFor(c.subscriber_lag_ms) }}
+                                      >
+                                        {fmtMs(c.subscriber_lag_ms)}
+                                      </td>
+                                      <td className="px-2 py-2 whitespace-nowrap">
+                                        {c.reject_reason ? (
+                                          <span
+                                            title={c.reject_reason}
+                                            className="text-[11px]"
+                                            style={{
+                                              color: "var(--bad)",
+                                              cursor: "help",
+                                              textDecoration: "underline dotted var(--bad)",
+                                              textUnderlineOffset: 3,
+                                            }}
+                                          >
+                                            Hover to see error
+                                          </span>
+                                        ) : (
+                                          <span style={{ color: "var(--muted)" }}>—</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                            </div>
+                          )}
+    </>
+  );
+}
+
 /** Shared Performance view — the trader panel renders it against the caller's
  *  own fanouts; the admin per-trader page passes the admin endpoint scoped to
  *  one trader. Same table, cards and drawer either way. */
@@ -799,11 +1094,6 @@ export function PerformanceView({
   const [data, setData] = useState<FanoutResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  // Per-fanout sort state for the per-subscriber inner table. Keyed by
-  // parent_order_id so each open expansion remembers its own sort, and
-  // they don't bleed into each other if the user opens multiple at once.
-  // Missing key = chronological (API order, by created_at).
-  const [childSort, setChildSort] = useState<Map<string, ChildSort>>(new Map());
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   async function load() {
@@ -839,46 +1129,6 @@ export function PerformanceView({
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
-  }
-
-  // Cycle the sort state for a given fanout's date/time column:
-  //   unsorted → asc → desc → unsorted → ...
-  // 3-state cycle lets the user return to chronological order without
-  // collapsing/re-expanding the row.
-  function cycleChildSort(parentId: string, field: ChildSortField) {
-    setChildSort(prev => {
-      const next = new Map(prev);
-      const cur = next.get(parentId);
-      if (!cur || cur.field !== field) {
-        next.set(parentId, { field, dir: "asc" });
-      } else if (cur.dir === "asc") {
-        next.set(parentId, { field, dir: "desc" });
-      } else {
-        next.delete(parentId);
-      }
-      return next;
-    });
-  }
-
-  // Sort a fanout's children by the active sort field+dir. Null timestamps
-  // sort LAST regardless of direction (e.g. a mirror that never made it
-  // to "Broker Accepted At" shouldn't push real rows around). Returns the
-  // original array if no sort is active.
-  function applyChildSort(parentId: string, children: FanoutChild[]): FanoutChild[] {
-    const sort = childSort.get(parentId);
-    if (!sort) return children;
-    const sorted = [...children];
-    sorted.sort((a, b) => {
-      const av = (a as unknown as Record<ChildSortField, string | null>)[sort.field];
-      const bv = (b as unknown as Record<ChildSortField, string | null>)[sort.field];
-      if (av == null && bv == null) return 0;
-      if (av == null) return 1;
-      if (bv == null) return -1;
-      // ISO 8601 timestamps sort correctly as strings — no need to parse.
-      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-      return sort.dir === "asc" ? cmp : -cmp;
-    });
-    return sorted;
   }
 
   const m = data?.metrics;
@@ -1222,259 +1472,7 @@ export function PerformanceView({
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
                       <td colSpan={21} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
                         <div className="px-5 py-4">
-                          {/* Headline summary — the client-friendly framing.
-                              Avoids the "trade took 15.9s" misread by showing
-                              what most subscribers actually experienced (p50,
-                              # placed within 1s) and naming the slowest as a
-                              named outlier rather than a platform stat. */}
-                          {f.children.length > 0 && <TradeSummaryCard mirrors={f.children} />}
-                          <div
-                            className="text-[10px] uppercase tracking-widest mb-3"
-                            style={{ color: "var(--muted)" }}
-                          >
-                            Per-Subscriber Timeline ({f.children.length} target{f.children.length === 1 ? "" : "s"})
-                          </div>
-                          {f.children.length === 0 ? (
-                            <div className="text-xs" style={{ color: "var(--muted)" }}>
-                              No subscribers received this trade.
-                            </div>
-                          ) : (
-                            // Scroll wrapper so the inner per-subscriber table
-                            // gets the same sticky-header treatment as the
-                            // outer fanout table. max-h caps the drawer's own
-                            // height (already nested inside the page-level
-                            // scrolling container).
-                            <div
-                              className="overflow-auto max-h-[50vh] rounded"
-                              style={{ border: "1px solid var(--border)" }}
-                            >
-                            <table
-                              className="w-full text-xs"
-                              style={{ borderCollapse: "separate", borderSpacing: 0, tableLayout: "auto" }}
-                            >
-                              {/* Sticky thead pinned to the wrapper. Opaque
-                                  panel background prevents row text from
-                                  bleeding through behind the sticky row. */}
-                              <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
-                                <tr style={{ color: "var(--muted)" }}>
-                                  {/* Per-column header definitions. The optional third element is the
-                                      sort field — when present, the column renders a clickable sort
-                                      indicator that cycles unsorted → asc → desc → unsorted. */}
-                                  {([
-                                    ["Subscriber", "The subscriber whose account this mirror was placed on."],
-                                    ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
-                                    ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
-                                    ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
-                                    ["Expected Price", "This mirror's limit price. Blank for market orders (no expected price)."],
-                                    ["Filled Price", "The subscriber's broker average fill price for this mirror. Compare with Expected Price to gauge their slippage."],
-                                    ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING).", "created_at"],
-                                    ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line.", "subscriber_picked_at"],
-                                    ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
-                                    ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order.", "broker_accepted_at"],
-                                    ["Published to UI", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time.", "redis_published_at"],
-                                    ["Pick Lag", "Platform-owned. Parent detected → this subscriber picked. Picked At − parent DB SAVED AT. Grows with the number of subscribers ahead of this one in the fanout queue."],
-                                    ["Eligibility Lag", "Platform-owned. Picked → ready to call broker. Submitted to Broker − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
-                                    ["Broker Name", "The subscriber's connected broker that this mirror order was placed on."],
-                                    ["Broker Lag", "Broker-owned (external). Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip — outside platform control."],
-                                    ["Broker Response", "Broker-owned (external). How long the broker's place-order call took to return ANY response — success or error. Measured around the SDK call itself."],
-                                    // ["Split", "Visual split: 🟢 green = Platform lag (pick + eligibility) · 🔵 blue = Broker lag (Alpaca round-trip). Hover for exact ms."],
-                                    ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published to UI − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
-                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent DB SAVED AT."],
-                                    ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
-                                  ] as ([string, string] | [string, string, ChildSortField])[]).map((row) => {
-                                    const [h, tip] = row;
-                                    const sortField = row[2] as ChildSortField | undefined;
-                                    const active = sortField && childSort.get(f.parent_order_id)?.field === sortField;
-                                    const dir = active ? childSort.get(f.parent_order_id)?.dir : undefined;
-                                    return (
-                                      <th
-                                        key={h}
-                                        title={tip}
-                                        onClick={sortField ? () => cycleChildSort(f.parent_order_id, sortField) : undefined}
-                                        className="text-left px-2 py-2 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap select-none"
-                                        style={{
-                                          borderBottom: "1px solid var(--border)",
-                                          cursor: sortField ? "pointer" : "help",
-                                          textDecoration: sortField ? "none" : "underline dotted var(--border)",
-                                          textUnderlineOffset: 4,
-                                          color: active ? "var(--accent)" : "var(--muted)",
-                                        }}
-                                      >
-                                        <span className="inline-flex items-center gap-1">
-                                          <span>{h}</span>
-                                          {sortField && (
-                                            <SortChevron dir={dir} active={!!active} />
-                                          )}
-                                        </span>
-                                      </th>
-                                    );
-                                  })}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {applyChildSort(f.parent_order_id, f.children).map(c => {
-                                  const displayName =
-                                    c.subscriber_name ||
-                                    (c.subscriber_email ? c.subscriber_email.split("@")[0] : null) ||
-                                    c.subscriber_user_id.slice(0, 8);
-                                  return (
-                                    <tr
-                                      key={c.order_id}
-                                      style={{ borderTop: "1px solid var(--border)", verticalAlign: "top" }}
-                                    >
-                                      <td className="px-2 py-2 whitespace-nowrap">{displayName}</td>
-                                      <td className="px-2 py-2 whitespace-nowrap">
-                                        <span
-                                          className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium"
-                                          style={{
-                                            background:
-                                              c.status === "rejected"
-                                                ? "rgba(239,68,68,0.15)"
-                                                : c.status === "filled"
-                                                ? "rgba(34,197,94,0.15)"
-                                                : c.status === "pending"
-                                                ? "rgba(234,179,8,0.15)"
-                                                : "rgba(148,163,184,0.15)",
-                                            color:
-                                              c.status === "rejected"
-                                                ? "var(--bad)"
-                                                : c.status === "filled"
-                                                ? "var(--good)"
-                                                : c.status === "pending"
-                                                ? "var(--warn)"
-                                                : "var(--text-2)",
-                                            border: "1px solid",
-                                            borderColor:
-                                              c.status === "rejected"
-                                                ? "rgba(239,68,68,0.3)"
-                                                : c.status === "filled"
-                                                ? "rgba(34,197,94,0.3)"
-                                                : c.status === "pending"
-                                                ? "rgba(234,179,8,0.3)"
-                                                : "rgba(148,163,184,0.3)",
-                                          }}
-                                        >
-                                          {c.status}
-                                        </span>
-                                      </td>
-                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: Number(c.filled_quantity) > 0 ? "var(--text)" : "var(--muted)" }}
-                                      >
-                                        {fmtQty(c.filled_quantity)}
-                                      </td>
-                                      {/* Mirror's own expected (limit) vs filled price */}
-                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                                        {c.expected_price ?? "—"}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: c.filled_avg_price ? "var(--text)" : "var(--muted)" }}
-                                      >
-                                        {c.filled_avg_price ?? "—"}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.created_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.subscriber_picked_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.subscriber_accepted_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.broker_accepted_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: "var(--muted)" }}
-                                      >
-                                        {fmtClock(c.redis_published_at)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.pick_lag_ms) }}
-                                      >
-                                        {fmtMs(c.pick_lag_ms)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.eligibility_lag_ms) }}
-                                      >
-                                        {fmtMs(c.eligibility_lag_ms)}
-                                      </td>
-                                      <td className="px-2 py-2 whitespace-nowrap capitalize" style={{ color: "var(--text-2)" }}>
-                                        {c.broker_name ?? "—"}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.broker_lag_ms) }}
-                                      >
-                                        {fmtMs(c.broker_lag_ms)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.broker_response_ms) }}
-                                      >
-                                        {fmtMs(c.broker_response_ms)}
-                                      </td>
-                                      {/* Split bar — Platform (green) vs Broker (blue) */}
-                                      {/* <td className="px-2 py-2 whitespace-nowrap">
-                                        <PlatformBrokerBar
-                                          platformMs={(c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0)}
-                                          brokerMs={c.broker_lag_ms}
-                                        />
-                                      </td> */}
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.publish_lag_ms) }}
-                                      >
-                                        {fmtMs(c.publish_lag_ms)}
-                                      </td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: colorFor(c.subscriber_lag_ms) }}
-                                      >
-                                        {fmtMs(c.subscriber_lag_ms)}
-                                      </td>
-                                      <td className="px-2 py-2 whitespace-nowrap">
-                                        {c.reject_reason ? (
-                                          <span
-                                            title={c.reject_reason}
-                                            className="text-[11px]"
-                                            style={{
-                                              color: "var(--bad)",
-                                              cursor: "help",
-                                              textDecoration: "underline dotted var(--bad)",
-                                              textUnderlineOffset: 3,
-                                            }}
-                                          >
-                                            Hover to see error
-                                          </span>
-                                        ) : (
-                                          <span style={{ color: "var(--muted)" }}>—</span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                            </div>
-                          )}
+                          <SubscriberBreakdown mirrors={f.children} />
                         </div>
                       </td>
                     </tr>
