@@ -7,6 +7,7 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
+import { SmsNotificationsForm } from "@/components/settings/SmsNotificationsForm";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -1235,6 +1236,16 @@ export default function SettingsPage() {
         </>
       )}
 
+      {/* Outside the role gates on purpose — SMS applies to traders and
+          subscribers alike. */}
+      <Card
+        icon={<IconBell />}
+        title="SMS notifications"
+        hint="Get a text when something needs your attention. Off by default; you choose which categories."
+      >
+        <SmsNotificationsForm />
+      </Card>
+
       <ConfirmModal
         open={resetOpen}
         title="Reset all settings?"
@@ -2131,6 +2142,15 @@ function IconPower() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
       <line x1="12" y1="2" x2="12" y2="12" />
+    </svg>
+  );
+}
+
+function IconBell() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
     </svg>
   );
 }
