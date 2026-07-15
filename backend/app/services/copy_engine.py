@@ -142,6 +142,12 @@ class _PendingMirror:
     broker: BrokerName
     adapter: Any                                # BrokerAdapter, pre-built
     request: BrokerOrderRequest
+    # True when the TRADER's own order is already FILLED at the moment we mirror.
+    # Only then do we FORCE a close to fill immediately (see
+    # _place_mirror_with_conflict_resolve). While the trader's close is still
+    # working we mirror their limit as-is so the subscriber rests a cancellable
+    # order — and Part B sweeps it to market if the trader's close later fills.
+    trader_filled: bool = False
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -271,72 +277,72 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
     the direct-close auto-resolve in api.trades. Runs in a worker thread (called
     via ``asyncio.to_thread``); raising propagates to the normal reject path."""
     req = item.request
-    # Force CLOSES to fill immediately so subscribers actually exit when the
-    # trader does (a copied LIMIT close routinely rests unfilled / gets rejected
-    # once the price moves). Entries are untouched.
-    #
-    # The fanout already flags most closes from the subscriber's DB position, but
-    # that can LAG — the entry fill may not have synced when the trader closes
-    # (the webhook makes closes arrive even faster). And we CANNOT fall back on
-    # the broker's is_closing flag: SnapTrade reports Webull actions as plain
-    # BUY/SELL, so a genuine close has is_closing=False for OPTIONS as well as
-    # stocks. So for any SELL our DB did NOT flag as closing, ask the BROKER
-    # directly: if the subscriber actually holds the position this SELL would
-    # reduce, it's really a close. (We skip BUYs to avoid a get_positions call on
-    # every entry — buy-to-close of a short is not a case this trader hits.)
-    should_close_now = req.is_closing
-    cancelled_working_entry = False
-    if (
-        not should_close_now
-        and req.side == OrderSide.SELL
-        and req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION)
-    ):
-        held = live_closeable_quantity(item.adapter, req)
-        if held is not None and held > 0:
-            should_close_now = True
-        elif held is not None and held == 0:
-            # The trader is selling to close, but we see NO position yet — the
-            # subscriber's entry BUY is still working. This is a RACE: the
-            # trader's buy→sell was fast enough that the SELL close arrives
-            # while our BUY hasn't filled. A naked SELL here just rejects
-            # ("cannot open a short sell while a long buy order is open" /
-            # SnapTrade 400).
-            #
-            # First cancel the working entry so it can't strand the subscriber.
-            # But the cancel can RACE the fill (the buy may be filling at this
-            # very instant — the exact AGEN case where the buy showed FILLED
-            # right after the sell rejected). So re-check the LIVE position a
-            # few times; if a fill landed anyway, market-close it so the
-            # subscriber ends flat. Only if it's truly flat do we report the
-            # entry cancelled. (If there was nothing to cancel, fall through:
-            # the trader may genuinely be OPENING a short, which we mirror.)
-            cancelled = _cancel_subscriber_conflicts(item)
-            cancelled_working_entry = bool(cancelled)
-            if cancelled:
-                for _ in range(3):
-                    recheck = live_closeable_quantity(item.adapter, req)
-                    if recheck is not None and recheck > 0:
-                        should_close_now = True  # a fill snuck in → close it
-                        break
-                    time.sleep(1.0)
-                if not should_close_now:
-                    raise _DanglingEntryCancelled(cancelled)
-    if should_close_now:
-        req = _to_immediate_close(item.adapter, req)
-        if not req.is_closing:
-            # Mark closing so the conflict-resolve + live re-clamp below treat it
-            # as a close too.
-            req = replace(req, is_closing=True)
-        item.request = req
-        # Flatten FULLY. The fanout already clamps the close to what the
-        # subscriber holds (e.g. trader sold 10 but only 6 filled → we sell 6).
-        # But the other 4 may still be a WORKING, partially-filled entry — if it
-        # fills later, the subscriber is stranded long in a name the trader has
-        # left. The trader is now selling, so their accumulation window is over:
-        # cancel any leftover same-contract working entry before placing the
-        # close. (Skip if the race path above already cancelled it.)
-        if not cancelled_working_entry:
-            _cancel_subscriber_conflicts(item)
+    # We only FORCE a close to fill immediately (market / marketable-limit, and
+    # cancel any dangling / leftover entry) once the TRADER's OWN close has
+    # actually FILLED — i.e. the trader has genuinely exited. While the trader's
+    # close is still WORKING we mirror their LIMIT unchanged, so the subscriber
+    # rests a cancellable order at a potentially better price; if the trader then
+    # CANCELS, the cancel propagates and the mirror is cancelled instead of
+    # leaving the subscriber with a phantom fill (the 3.20 divergence). Part B —
+    # force_close_mirrors_to_market, fired from the listeners when a trader's
+    # working close LATER fills — sweeps any still-resting mirror to market so
+    # the exit is still guaranteed. Entries are never touched either way.
+    if item.trader_filled:
+        # The fanout already flags most closes from the subscriber's DB position,
+        # but that can LAG — the entry fill may not have synced yet. And we CANNOT
+        # trust the broker's is_closing flag: SnapTrade reports Webull actions as
+        # plain BUY/SELL, so a genuine close has is_closing=False for OPTIONS as
+        # well as stocks. So for any SELL our DB did NOT flag as closing, ask the
+        # BROKER directly: if the subscriber actually holds the position this SELL
+        # would reduce, it's really a close. (We skip BUYs to avoid a
+        # get_positions call on every entry.)
+        should_close_now = req.is_closing
+        cancelled_working_entry = False
+        if (
+            not should_close_now
+            and req.side == OrderSide.SELL
+            and req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION)
+        ):
+            held = live_closeable_quantity(item.adapter, req)
+            if held is not None and held > 0:
+                should_close_now = True
+            elif held is not None and held == 0:
+                # Trader is selling to close but we see NO position yet — the
+                # subscriber's entry BUY is still working (a RACE: the trader's
+                # buy→sell was fast enough that the close arrives while our BUY
+                # hasn't filled). A naked SELL here just rejects. Cancel the
+                # working entry so it can't strand the subscriber, then re-check
+                # the LIVE position a few times — if a fill landed anyway,
+                # market-close it; only if truly flat do we report the entry
+                # cancelled. (Nothing to cancel → fall through: may be a genuine
+                # opening short, which we mirror.)
+                cancelled = _cancel_subscriber_conflicts(item)
+                cancelled_working_entry = bool(cancelled)
+                if cancelled:
+                    for _ in range(3):
+                        recheck = live_closeable_quantity(item.adapter, req)
+                        if recheck is not None and recheck > 0:
+                            should_close_now = True  # a fill snuck in → close it
+                            break
+                        time.sleep(1.0)
+                    if not should_close_now:
+                        raise _DanglingEntryCancelled(cancelled)
+        if should_close_now:
+            req = _to_immediate_close(item.adapter, req)
+            if not req.is_closing:
+                # Mark closing so the conflict-resolve + live re-clamp below
+                # treat it as a close too.
+                req = replace(req, is_closing=True)
+            item.request = req
+            # Flatten FULLY. The fanout already clamps the close to what the
+            # subscriber holds (e.g. trader sold 10 but only 6 filled → sell 6).
+            # But the other 4 may still be a WORKING, partially-filled entry — if
+            # it fills later the subscriber is stranded long in a name the trader
+            # has left. The trader has now exited, so their accumulation window is
+            # over: cancel any leftover same-contract working entry before placing
+            # the close. (Skip if the race path above already cancelled it.)
+            if not cancelled_working_entry:
+                _cancel_subscriber_conflicts(item)
     try:
         return item.adapter.place_order(req)
     except Exception as exc:  # noqa: BLE001
@@ -813,6 +819,172 @@ def cancel_and_replace_mirrors_for_modify(
                     "broker_order_id": resp.broker_order_id,
                     "quantity": str(rq.quantity),
                     "limit_price": str(rq.limit_price) if rq.limit_price is not None else None,
+                },
+            )
+            db.flush()
+            events.publish(new_child.user_id, _order_event("order.copy_submitted", new_child))
+        db.commit()
+
+
+def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
+    """A trader's CLOSE just FILLED — sweep any subscriber mirror of it that is
+    STILL a resting limit to a market / marketable-limit fill, so the subscriber
+    exits now that the trader has.
+
+    Background: while the trader's close is WORKING we mirror it as a cancellable
+    limit (the ``trader_filled`` gate in _place_mirror_with_conflict_resolve), so
+    a trader CANCEL just cancels the mirror instead of stranding a phantom fill.
+    The flip side is this: when the trader's working close instead FILLS, we must
+    force any mirror whose limit hasn't filled to market. Cancel the resting
+    order, then place an immediate close for the UNFILLED remainder (cancel-old +
+    place-new, the same shape as a modify).
+
+    NO-OP in the common cases — a close detected AT fill was already forced to
+    market in fanout, and a mirror whose limit already filled is left alone. Only
+    ever touches WORKING, ``is_closing`` mirrors of THIS trader order, so it can
+    never disturb entries or unrelated trades. Opens its OWN session; safe to call
+    from a listener fill hook after the trader row is committed."""
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    with SessionLocal() as db:
+        children = list(db.execute(
+            select(Order).where(
+                Order.parent_order_id == trader_order_id,
+                Order.is_closing.is_(True),
+                Order.status.in_(_WORKING_ORDER_STATUSES),
+                Order.broker_order_id.isnot(None),
+            )
+        ).scalars())
+        if not children:
+            return
+
+        # Build a cancel + immediate-close plan for each still-resting mirror.
+        plan: list[tuple[Order, Any, BrokerOrderRequest, uuid.UUID]] = []
+        for ch in children:
+            remaining = ch.quantity - (ch.filled_quantity or Decimal(0))
+            if remaining <= 0:
+                continue
+            acct = db.get(BrokerAccount, ch.broker_account_id)
+            if acct is None:
+                continue
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=ch.user_id,
+                    action="order.mirror_force_close_creds_error",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "error": str(exc)[:300]},
+                )
+                continue
+            new_id = uuid.uuid4()
+            # Immediate close for the unfilled remainder — MARKET for a stock,
+            # marketable-LIMIT for an option (via _to_immediate_close).
+            req = BrokerOrderRequest(
+                instrument_type=ch.instrument_type,
+                symbol=ch.symbol,
+                side=ch.side,
+                order_type=ch.order_type,
+                quantity=remaining,
+                limit_price=ch.limit_price,
+                stop_price=ch.stop_price,
+                option_expiry=ch.option_expiry,
+                option_strike=ch.option_strike,
+                option_right=ch.option_right,
+                is_closing=True,
+                client_order_id=str(new_id),
+            )
+            req = _to_immediate_close(adapter, req)
+            if not req.is_closing:
+                req = replace(req, is_closing=True)
+            if req.client_order_id != str(new_id):
+                req = replace(req, client_order_id=str(new_id))
+            plan.append((ch, adapter, req, new_id))
+
+        if not plan:
+            return
+
+        # Phase 2 (thread pool): cancel the resting mirror, then place the close.
+        def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
+            old_ch, ad, rq, new_id = item
+            try:
+                ad.cancel_order(old_ch.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+            try:
+                return old_ch.id, new_id, ad.place_order(rq), None
+            except Exception as exc:  # noqa: BLE001
+                return old_ch.id, new_id, None, f"place_failed: {exc}"[:300]
+
+        with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
+            results = list(pool.map(_cancel_then_place, plan))
+
+        # Phase 3 (session thread): apply.
+        req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
+        for old_id, new_id, resp, err in results:
+            old_ch = db.get(Order, old_id)
+            if old_ch is None:
+                continue
+            rq = req_by_new_id[new_id]
+            if err is not None and err.startswith("cancel_failed"):
+                # Couldn't cancel — most likely the resting limit JUST filled on
+                # its own (the subscriber exited at the better price). Leave it.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_force_close_cancel_failed",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "broker_order_id": old_ch.broker_order_id, "error": err},
+                )
+                continue
+            # Cancel succeeded — the resting mirror is gone at the broker.
+            old_ch.status = OrderStatus.CANCELED
+            old_ch.closed_at = datetime.now(timezone.utc)
+            events.publish(old_ch.user_id, _order_event("order.cancelled", old_ch))
+            if resp is None:
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_force_close_place_failed",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "error": err},
+                )
+                continue
+            # Insert the NEW market/marketable close row (same trader parent).
+            new_child = Order(
+                id=new_id,
+                user_id=old_ch.user_id,
+                broker_account_id=old_ch.broker_account_id,
+                parent_order_id=trader_order_id,
+                instrument_type=old_ch.instrument_type,
+                symbol=old_ch.symbol,
+                option_expiry=old_ch.option_expiry,
+                option_strike=old_ch.option_strike,
+                option_right=old_ch.option_right,
+                is_closing=True,
+                side=old_ch.side,
+                order_type=rq.order_type,
+                quantity=rq.quantity,
+                limit_price=rq.limit_price,
+                stop_price=rq.stop_price,
+                take_profit_price=None,
+                stop_loss_price=None,
+                status=resp.status,
+                broker_order_id=resp.broker_order_id,
+                filled_quantity=resp.filled_quantity,
+                filled_avg_price=resp.filled_avg_price,
+                submitted_at=resp.submitted_at,
+                broker_accepted_at=resp.submitted_at or datetime.now(timezone.utc),
+                redis_published_at=datetime.now(timezone.utc),
+            )
+            db.add(new_child)
+            audit.record(
+                db, actor_user_id=new_child.user_id,
+                action="order.mirror_force_closed_on_trader_fill",
+                entity_type="order", entity_id=new_child.id,
+                metadata={
+                    "old_mirror_id": str(old_ch.id),
+                    "parent_order_id": str(trader_order_id),
+                    "broker_order_id": resp.broker_order_id,
+                    "quantity": str(rq.quantity),
                 },
             )
             db.flush()
@@ -1392,6 +1564,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     is_closing=child.is_closing,
                     client_order_id=str(child.id),
                 ),
+                # Force-fill a close only when the trader has ALREADY filled.
+                # A working trader order (mirrored via bring_open_orders) stays a
+                # cancellable limit until it fills; Part B forces it then.
+                trader_filled=(trader_order.status == OrderStatus.FILLED),
             ))
 
     # End of Phase 1: one batched flush for every child we just added.
