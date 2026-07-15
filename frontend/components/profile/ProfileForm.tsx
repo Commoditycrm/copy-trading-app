@@ -9,6 +9,32 @@ import type { User } from "@/lib/types";
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
+/** The only notification categories that can send SMS. Anything else is in-app
+ *  only — our A2P 10DLC campaign is registered with sample messages covering
+ *  just these three, and carriers audit live traffic against what's on file. */
+type SmsCats = Pick<User, "sms_on_trade_rejected" | "sms_on_auto_actions" | "sms_on_broker_connection">;
+
+const DEFAULT_CATS: SmsCats = {
+  sms_on_trade_rejected: true,
+  sms_on_auto_actions: true,
+  sms_on_broker_connection: true,
+};
+
+const SMS_CATEGORIES: { key: keyof SmsCats; label: string; hint: string }[] = [
+  { key: "sms_on_trade_rejected", label: "Rejected trades",
+    hint: "An order, or your copy of one, was rejected by the broker." },
+  { key: "sms_on_auto_actions", label: "Auto liquidation & pauses",
+    hint: "A position was auto-liquidated or closed, or copying paused on a daily limit." },
+  { key: "sms_on_broker_connection", label: "Broker connection",
+    hint: "A broker disconnected and needs reconnecting to resume copying." },
+];
+
+const pickCats = (u: SmsCats): SmsCats => ({
+  sms_on_trade_rejected: u.sms_on_trade_rejected,
+  sms_on_auto_actions: u.sms_on_auto_actions,
+  sms_on_broker_connection: u.sms_on_broker_connection,
+});
+
 /** Self-service profile editor — display name + email change. Wrapper-free so
  *  it can drop into either the Settings card or the avatar modal. `onUpdated`
  *  fires after a successful save so the app shell can refresh the shown name. */
@@ -23,6 +49,7 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
   const [sendingEmail, setSendingEmail] = useState(false);
   const [phone, setPhone] = useState("");
   const [sms, setSms] = useState(false);
+  const [cats, setCats] = useState<SmsCats>(DEFAULT_CATS);
   const [savingSms, setSavingSms] = useState(false);
 
   useEffect(() => {
@@ -30,6 +57,7 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
       .then(u => {
         setUser(u); setName(u.display_name ?? "");
         setPhone(u.phone ?? ""); setSms(u.sms_notifications_enabled);
+        setCats(pickCats(u));
       })
       .catch(e => notify.fromError(e, "Could not load your profile"))
       .finally(() => setLoading(false));
@@ -56,8 +84,11 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
     }
   }
 
-  const smsDirty = user != null
-    && (phone.trim() !== (user.phone ?? "") || sms !== user.sms_notifications_enabled);
+  const smsDirty = user != null && (
+    phone.trim() !== (user.phone ?? "")
+    || sms !== user.sms_notifications_enabled
+    || SMS_CATEGORIES.some(c => cats[c.key] !== user[c.key])
+  );
 
   async function saveSms() {
     // Accept any format/country: strip spaces/dashes/parens, 00 -> +.
@@ -71,11 +102,12 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
     try {
       const updated = await api<User>("/api/auth/me", {
         method: "PATCH",
-        body: JSON.stringify({ phone: p, sms_notifications_enabled: sms }),
+        body: JSON.stringify({ phone: p, sms_notifications_enabled: sms, ...cats }),
       });
       setUser(updated);
       setPhone(updated.phone ?? "");
       setSms(updated.sms_notifications_enabled);
+      setCats(pickCats(updated));
       onUpdated?.(updated);
       notify.success("SMS settings saved");
     } catch (e) {
@@ -251,6 +283,39 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
         <p className="text-[11px] mt-1.5" style={{ color: "var(--muted)" }}>
           Include your country code (any country), e.g. +91 98765 43210 or +1 555 123 4567.
         </p>
+
+        {/* Per-category toggles. Greyed out rather than hidden when SMS is off,
+            so the user can see what they'd be signing up for before opting in. */}
+        <div
+          className="mt-3 pt-3 pl-1"
+          style={{ borderTop: "1px dashed var(--border)", opacity: sms ? 1 : 0.5 }}
+        >
+          <div className="text-[10px] uppercase tracking-wider mb-2 font-medium" style={{ color: "var(--muted)" }}>
+            Text me about
+          </div>
+          {SMS_CATEGORIES.map(c => (
+            <label
+              key={c.key}
+              className="flex items-start gap-2 mb-2 text-sm select-none"
+              style={{ cursor: sms ? "pointer" : "not-allowed" }}
+            >
+              <input
+                type="checkbox"
+                disabled={!sms}
+                checked={cats[c.key]}
+                onChange={e => setCats(p => ({ ...p, [c.key]: e.target.checked }))}
+                className="mt-0.5 shrink-0"
+              />
+              <span>
+                {c.label}
+                <span className="block text-[11px]" style={{ color: "var(--muted)" }}>{c.hint}</span>
+              </span>
+            </label>
+          ))}
+          <p className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+            Everything else — follow requests, filled orders — stays in the app only.
+          </p>
+        </div>
       </div>
     </>
   );

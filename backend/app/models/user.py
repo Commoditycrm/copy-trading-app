@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, String, false
+from sqlalchemy import Boolean, DateTime, Enum, String, false, true
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -46,6 +46,20 @@ class User(Base, TimestampMixin):
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     sms_notifications_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false(), nullable=False
+    )
+    # Per-category SMS opt-outs, ANDed with the master switch above. Default ON:
+    # anyone who already enabled SMS keeps getting these three, and since they
+    # previously got EVERY notification type by text, this is a net reduction.
+    # Only categories with a sample message filed on our A2P 10DLC campaign are
+    # SMS-able at all — see services/notifications.py.
+    sms_on_auto_actions: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    sms_on_trade_rejected: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    sms_on_broker_connection: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
     )
 
     broker_accounts = relationship(
