@@ -3,26 +3,13 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
-import { SubscriberPill } from "@/components/performance/PerformanceView";
+import { SubscriberPill, SubscriberBreakdown, type FanoutChild } from "@/components/performance/PerformanceView";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-interface ChildOrder {
-  order_id: string;
-  subscriber_email: string | null;
-  subscriber_name: string | null;
-  broker_name: string | null;
-  status: string;
-  quantity: string;
-  filled_quantity: string;
-  broker_order_id: string | null;
-  submitted_at: string | null;
-  reject_reason: string | null;
-  subscriber_lag_ms: number | null;
-  pick_lag_ms: number | null;
-  eligibility_lag_ms: number | null;
-  broker_lag_ms: number | null;
-  publish_lag_ms: number | null;
-}
+// Both /api/performance/fanouts and /api/admin/performance/fanouts serialize
+// children through the same backend helper, so reuse the trader view's type
+// rather than maintaining a second copy that silently drifts.
+type ChildOrder = FanoutChild;
 
 interface Fanout {
   parent_order_id: string;
@@ -100,25 +87,6 @@ function fmtPrice(p: string | null) {
   const n = Number(p);
   if (!Number.isFinite(n)) return "—";
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
-  submitted:       { bg: "rgba(34,197,94,0.12)",   color: "#22c55e" },
-  accepted:        { bg: "rgba(34,197,94,0.12)",   color: "#22c55e" },
-  filled:          { bg: "rgba(34,197,94,0.18)",   color: "#16a34a" },
-  partially_filled:{ bg: "rgba(250,204,21,0.12)",  color: "#facc15" },
-  rejected:        { bg: "rgba(239,68,68,0.12)",   color: "#ef4444" },
-  retry_pending:   { bg: "rgba(250,204,21,0.12)",  color: "#facc15" },
-  skipped_no_broker: { bg: "rgba(148,163,184,0.12)", color: "#94a3b8" },
-};
-
-function StatusBadge({ status }: { status: string }) {
-  const c = STATUS_COLORS[status] ?? { bg: "rgba(255,255,255,0.08)", color: "var(--text-2)" };
-  return (
-    <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: c.bg, color: c.color }}>
-      {status.replace(/_/g, " ")}
-    </span>
-  );
 }
 
 type PerfSortKey = "symbol" | "instrument" | "trader" | "time" | "subscribers" | "success" | "detection" | "fanout" | "total";
@@ -291,38 +259,9 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
           <td colSpan={22} className="px-4 py-3">
-            <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
-              Per-subscriber breakdown ({fanout.children.length})
-            </div>
-            {fanout.children.length === 0 ? (
-              <div className="text-xs" style={{ color: "var(--muted)" }}>No subscribers received this trade.</div>
-            ) : (
-              <div className="overflow-auto rounded" style={{ border: "1px solid var(--border)", maxHeight: "40vh" }}>
-                <table className="w-full text-xs">
-                  <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
-                    <tr>
-                      {["Subscriber", "Status", "Pick Lag", "Broker Lag", "Sub Lag"].map(h => (
-                        <th key={h} className="text-left px-3 py-2 font-semibold" style={{ color: "var(--muted)" }}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {fanout.children.map(child => (
-                      <tr key={child.order_id} style={{ borderTop: "1px solid var(--border)" }}>
-                        <td className="px-3 py-2">
-                          <div style={{ color: "var(--text-2)" }}>{child.subscriber_name ?? child.subscriber_email ?? "unknown"}</div>
-                          {child.subscriber_email && <div style={{ color: "var(--muted)" }}>{child.subscriber_email}</div>}
-                        </td>
-                        <td className="px-3 py-2"><StatusBadge status={child.status} /></td>
-                        <td className="px-3 py-2">{ms(child.pick_lag_ms)}</td>
-                        <td className="px-3 py-2">{ms(child.broker_lag_ms)}</td>
-                        <td className="px-3 py-2">{ms(child.subscriber_lag_ms)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            {/* Shared with the trader Performance view so admins see the exact
+                same per-subscriber columns — no second copy to keep in sync. */}
+            <SubscriberBreakdown mirrors={fanout.children} />
           </td>
         </tr>
       )}
