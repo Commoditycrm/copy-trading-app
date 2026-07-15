@@ -115,6 +115,10 @@ def _serialize_child(
         "status": child.status.value,
         "quantity": str(child.quantity),
         "filled_quantity": str(child.filled_quantity or 0),
+        # The mirror's OWN expected (limit) vs actual fill price — the same pair
+        # the parent row exposes, so per-subscriber slippage is visible too.
+        "expected_price": str(child.limit_price) if child.limit_price is not None else None,
+        "filled_avg_price": str(child.filled_avg_price) if child.filled_avg_price is not None else None,
         "broker_order_id": child.broker_order_id,
         "submitted_at": accepted_at.isoformat() if accepted_at else None,
         "created_at": child.created_at.isoformat() if child.created_at else None,
