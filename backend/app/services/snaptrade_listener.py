@@ -610,6 +610,23 @@ def _persist_and_fanout(
                 trader_user_id,
                 copy_engine._order_event("order.placed", existing),  # noqa: SLF001
             )
+            # A trader CLOSE that just filled may have subscriber mirrors still
+            # resting as limits (mirrored while the trader's close was working) —
+            # sweep those to market now so the subscriber exits with the trader.
+            # No-op for entries / already-filled mirrors. Own session, so it's
+            # called AFTER the commit above.
+            if (
+                status_changed
+                and status_enum == OrderStatus.FILLED
+                and existing.parent_order_id is None
+            ):
+                try:
+                    copy_engine.force_close_mirrors_to_market(existing.id)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "snaptrade_listener: force-close mirrors failed for %s",
+                        existing.id,
+                    )
             if (
                 status_str.upper() in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "FAILED")
                 and existing.parent_order_id is None
