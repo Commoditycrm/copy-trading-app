@@ -220,12 +220,36 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
             Save {savingSms && <Spinner />}
           </button>
         </div>
-        <label className="flex items-center gap-2 mt-2.5 text-sm cursor-pointer select-none">
-          <input type="checkbox" checked={sms} onChange={e => setSms(e.target.checked)} />
-          <span>Text me my notifications</span>
+        {/* This wording is what our A2P 10DLC campaign registration declares as
+            the consent mechanism, and a screenshot of it is filed with the
+            carriers — brand, frequency, rates and opt-out have to stay on the
+            checkbox itself. Keep it in sync with services/sms.py compose(). */}
+        <label className="flex items-start gap-2 mt-2.5 text-sm cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={sms}
+            onChange={e => setSms(e.target.checked)}
+            className="mt-0.5 shrink-0"
+          />
+          <span>
+            I agree to receive SMS notifications from Kopyya about my account activity.
+            Msg frequency varies. Msg &amp; data rates may apply. Reply STOP to opt out,
+            HELP for help. See our{" "}
+            {/* stopPropagation: without it, clicking the link also toggles the box. */}
+            <a
+              href="/terms" target="_blank" rel="noopener noreferrer"
+              onClick={e => e.stopPropagation()}
+              style={{ color: "var(--accent)", textDecoration: "underline" }}
+            >Terms</a>{" "}and{" "}
+            <a
+              href="/privacy" target="_blank" rel="noopener noreferrer"
+              onClick={e => e.stopPropagation()}
+              style={{ color: "var(--accent)", textDecoration: "underline" }}
+            >Privacy Policy</a>.
+          </span>
         </label>
         <p className="text-[11px] mt-1.5" style={{ color: "var(--muted)" }}>
-          Include your country code (any country), e.g. +91 98765 43210 or +1 555 123 4567. Standard message rates may apply.
+          Include your country code (any country), e.g. +91 98765 43210 or +1 555 123 4567.
         </p>
       </div>
     </>

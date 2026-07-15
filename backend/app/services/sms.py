@@ -32,20 +32,57 @@ log = logging.getLogger(__name__)
 _API_ROOT = "https://api.twilio.com/2010-04-01"
 _TIMEOUT = 10.0
 
+_BRAND = "Kopyya"
+_OPT_OUT = "Reply STOP to opt out."
+
+# Anything outside GSM-7 forces the WHOLE message to UCS-2, which drops a
+# segment from 160 chars to 70 — so one stray em dash can double the bill.
+# Fold the non-GSM characters our notification copy actually emits.
+_GSM_FOLD = str.maketrans({
+    "—": "-",    # em dash
+    "–": "-",    # en dash
+    "‘": "'",
+    "’": "'",
+    "“": '"',
+    "”": '"',
+    "…": "...",
+})
+
+
+def compose(body: str) -> str:
+    """Brand + opt-out wrap required for registered A2P 10DLC traffic.
+
+    Carriers filter messages that don't identify the sender or carry opt-out
+    instructions, and our 10DLC campaign registration declares that every
+    message has both — so this MUST stay in sync with the sample messages
+    submitted to Twilio. Applied centrally so no call site can forget it.
+
+    Both additions are idempotent: a caller that already branded or already
+    included the opt-out line won't get it twice.
+    """
+    text = body.translate(_GSM_FOLD).strip()
+    if not text.startswith(f"{_BRAND}:"):
+        text = f"{_BRAND}: {text}"
+    if _OPT_OUT not in text:
+        text = f"{text} {_OPT_OUT}"
+    return text
+
 
 def send_sms(to: str, body: str) -> bool:
     """Send one SMS to ``to`` (E.164, e.g. "+15551234567"). Returns True on a
     Twilio accept (HTTP 2xx), False otherwise. Never raises — SMS is
     best-effort; callers must not crash if Twilio is down."""
     s = get_settings()
+    text = compose(body)
 
     if not (s.twilio_account_sid and s.twilio_auth_token):
         # No credentials — log instead of sending so dev/QA flows work.
-        log.warning("sms: TWILIO creds not set; NOT sending. to=%s body=%r", to, body)
+        # Log the composed text so what dev sees is what prod would send.
+        log.warning("sms: TWILIO creds not set; NOT sending. to=%s body=%r", to, text)
         return False
 
     # Sender: a Messaging Service SID wins; else a from-number. One is required.
-    data = {"To": to, "Body": body}
+    data = {"To": to, "Body": text}
     if s.twilio_messaging_service_sid:
         data["MessagingServiceSid"] = s.twilio_messaging_service_sid
     elif s.twilio_from_number:
