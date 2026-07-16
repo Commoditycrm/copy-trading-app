@@ -284,7 +284,7 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
     # rests a cancellable order at a potentially better price; if the trader then
     # CANCELS, the cancel propagates and the mirror is cancelled instead of
     # leaving the subscriber with a phantom fill (the 3.20 divergence). Part B —
-    # force_close_mirrors_to_market, fired from the listeners when a trader's
+    # force_fill_mirrors_to_market, fired from the listeners when a trader's
     # working close LATER fills — sweeps any still-resting mirror to market so
     # the exit is still guaranteed. Entries are never touched either way.
     if item.trader_filled:
@@ -343,6 +343,15 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
             # the close. (Skip if the race path above already cancelled it.)
             if not cancelled_working_entry:
                 _cancel_subscriber_conflicts(item)
+        elif req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION):
+            # NOT a close, but the trader has FILLED — so this is an ENTRY the
+            # trader just got into. Force the subscriber's entry to fill at market
+            # too, so they actually get INTO the trade (their copied limit may not
+            # reach on the subscriber's venue — the "trader filled, subscriber
+            # didn't" gap). _to_immediate_close prices through the market in the
+            # order's own direction (BUY → ask), so it works for entries as well.
+            req = _to_immediate_close(item.adapter, req)
+            item.request = req
     try:
         return item.adapter.place_order(req)
     except Exception as exc:  # noqa: BLE001
@@ -826,30 +835,32 @@ def cancel_and_replace_mirrors_for_modify(
         db.commit()
 
 
-def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
-    """A trader's CLOSE just FILLED — sweep any subscriber mirror of it that is
+def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
+    """A trader's order just FILLED — sweep any subscriber mirror of it that is
     STILL a resting limit to a market / marketable-limit fill, so the subscriber
-    exits now that the trader has.
+    ends up in the SAME state as the trader. Applies to BOTH sides:
+      * a filled SELL/close → force the subscriber's SELL so they EXIT too;
+      * a filled BUY/entry  → force the subscriber's BUY so they get INTO the
+        trade (their copied limit may not reach on the subscriber's venue).
 
-    Background: while the trader's close is WORKING we mirror it as a cancellable
+    Background: while the trader's order is WORKING we mirror it as a cancellable
     limit (the ``trader_filled`` gate in _place_mirror_with_conflict_resolve), so
     a trader CANCEL just cancels the mirror instead of stranding a phantom fill.
-    The flip side is this: when the trader's working close instead FILLS, we must
-    force any mirror whose limit hasn't filled to market. Cancel the resting
-    order, then place an immediate close for the UNFILLED remainder (cancel-old +
+    The flip side is this: when the trader's working order instead FILLS, we force
+    any mirror whose limit hasn't filled to market — cancel the resting order,
+    then place an immediate fill for the UNFILLED remainder (cancel-old +
     place-new, the same shape as a modify).
 
-    NO-OP in the common cases — a close detected AT fill was already forced to
+    NO-OP in the common cases — an order detected AT fill was already forced to
     market in fanout, and a mirror whose limit already filled is left alone. Only
-    ever touches WORKING, ``is_closing`` mirrors of THIS trader order, so it can
-    never disturb entries or unrelated trades. Opens its OWN session; safe to call
-    from a listener fill hook after the trader row is committed."""
+    ever touches WORKING mirrors of THIS trader order, so it can never disturb
+    unrelated trades. Opens its OWN session; safe to call from a listener fill
+    hook after the trader row is committed."""
     from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
     with SessionLocal() as db:
         children = list(db.execute(
             select(Order).where(
                 Order.parent_order_id == trader_order_id,
-                Order.is_closing.is_(True),
                 Order.status.in_(_WORKING_ORDER_STATUSES),
                 Order.broker_order_id.isnot(None),
             )
@@ -857,8 +868,9 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
         if not children:
             return
 
-        # Build a cancel + immediate-close plan for each still-resting mirror.
+        # Build a cancel + immediate-fill plan for each still-resting mirror.
         plan: list[tuple[Order, Any, BrokerOrderRequest, uuid.UUID]] = []
+        synced_any = False
         for ch in children:
             remaining = ch.quantity - (ch.filled_quantity or Decimal(0))
             if remaining <= 0:
@@ -872,14 +884,51 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             except Exception as exc:  # noqa: BLE001
                 audit.record(
                     db, actor_user_id=ch.user_id,
-                    action="order.mirror_force_close_creds_error",
+                    action="order.mirror_force_fill_creds_error",
                     entity_type="order", entity_id=ch.id,
                     metadata={"parent_order_id": str(trader_order_id), "error": str(exc)[:300]},
                 )
                 continue
+            # CRITICAL: ask the broker for THIS order's TRUE status before doing
+            # anything. SnapTrade's cancel_order is UNRELIABLE — it sometimes
+            # silently "succeeds" on an order that has already FILLED, which made
+            # us mark a filled close as CANCELED and then reject a duplicate
+            # replacement ("no position"). So if the broker says it already
+            # FILLED, sync our row to FILLED and SKIP — never cancel/replace it.
+            try:
+                live = adapter.get_order(ch.broker_order_id)
+            except Exception:  # noqa: BLE001
+                live = None
+            if live is not None and live.status == OrderStatus.FILLED:
+                ch.status = OrderStatus.FILLED
+                if live.filled_quantity is not None:
+                    ch.filled_quantity = live.filled_quantity
+                if live.filled_avg_price is not None:
+                    ch.filled_avg_price = live.filled_avg_price
+                if ch.closed_at is None:
+                    ch.closed_at = datetime.now(timezone.utc)
+                synced_any = True
+                audit.record(
+                    db, actor_user_id=ch.user_id,
+                    action="order.mirror_force_fill_already_filled",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "broker_order_id": ch.broker_order_id},
+                )
+                events.publish(ch.user_id, _order_event("order.placed", ch))
+                continue
+            # Honor any partial fill the broker reports — only sweep the rest.
+            if live is not None and live.filled_quantity is not None and live.filled_quantity > (ch.filled_quantity or Decimal(0)):
+                ch.filled_quantity = live.filled_quantity
+                remaining = ch.quantity - live.filled_quantity
+                if remaining <= 0:
+                    synced_any = True
+                    continue
             new_id = uuid.uuid4()
-            # Immediate close for the unfilled remainder — MARKET for a stock,
-            # marketable-LIMIT for an option (via _to_immediate_close).
+            # Immediate fill for the unfilled remainder — MARKET for a stock,
+            # marketable-LIMIT for an option (via _to_immediate_close, which
+            # prices through the market in the order's own direction: BUY → ask,
+            # SELL → bid — so it works for entries and closes alike). is_closing
+            # is preserved from the mirror so a SnapTrade close stays SELL_TO_CLOSE.
             req = BrokerOrderRequest(
                 instrument_type=ch.instrument_type,
                 symbol=ch.symbol,
@@ -891,17 +940,19 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 option_expiry=ch.option_expiry,
                 option_strike=ch.option_strike,
                 option_right=ch.option_right,
-                is_closing=True,
+                is_closing=ch.is_closing,
                 client_order_id=str(new_id),
             )
             req = _to_immediate_close(adapter, req)
-            if not req.is_closing:
-                req = replace(req, is_closing=True)
+            # Preserve the mirror's own is_closing (set above from ch) — do NOT
+            # force it True, or an ENTRY would be sent as a *_TO_CLOSE action.
             if req.client_order_id != str(new_id):
                 req = replace(req, client_order_id=str(new_id))
             plan.append((ch, adapter, req, new_id))
 
         if not plan:
+            if synced_any:
+                db.commit()  # persist the "already filled" status syncs above
             return
 
         # Phase 2 (thread pool): cancel the resting mirror, then place the close.
@@ -931,24 +982,34 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 # its own (the subscriber exited at the better price). Leave it.
                 audit.record(
                     db, actor_user_id=old_ch.user_id,
-                    action="order.mirror_force_close_cancel_failed",
+                    action="order.mirror_force_fill_cancel_failed",
                     entity_type="order", entity_id=old_ch.id,
                     metadata={"parent_order_id": str(trader_order_id), "broker_order_id": old_ch.broker_order_id, "error": err},
                 )
                 continue
-            # Cancel succeeded — the resting mirror is gone at the broker.
+            if resp is None:
+                # cancel_order returned OK but the REPLACEMENT failed. Do NOT
+                # mark the old mirror CANCELED — SnapTrade's cancel can silently
+                # "succeed" on an order that actually FILLED, and the place then
+                # fails precisely because the position is already closed. Marking
+                # it CANCELED (terminal) would mislabel a real fill and block
+                # fill-sync from correcting it. Instead LEAVE the mirror as-is and
+                # let fill-sync record its TRUE final status (FILLED or CANCELED)
+                # from the broker. Also avoids leaving a phantom duplicate.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_force_fill_place_failed",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "error": err, "left_for_fill_sync": True},
+                )
+                continue
+            # BOTH cancel AND place succeeded — the old order was genuinely open,
+            # is now cancelled at the broker, and the replacement is live. Only
+            # NOW is it safe to mark the old mirror CANCELED.
             old_ch.status = OrderStatus.CANCELED
             old_ch.closed_at = datetime.now(timezone.utc)
             events.publish(old_ch.user_id, _order_event("order.cancelled", old_ch))
-            if resp is None:
-                audit.record(
-                    db, actor_user_id=old_ch.user_id,
-                    action="order.mirror_force_close_place_failed",
-                    entity_type="order", entity_id=old_ch.id,
-                    metadata={"parent_order_id": str(trader_order_id), "error": err},
-                )
-                continue
-            # Insert the NEW market/marketable close row (same trader parent).
+            # Insert the NEW market/marketable fill row (same trader parent).
             new_child = Order(
                 id=new_id,
                 user_id=old_ch.user_id,
@@ -959,7 +1020,7 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 option_expiry=old_ch.option_expiry,
                 option_strike=old_ch.option_strike,
                 option_right=old_ch.option_right,
-                is_closing=True,
+                is_closing=old_ch.is_closing,
                 side=old_ch.side,
                 order_type=rq.order_type,
                 quantity=rq.quantity,
@@ -978,7 +1039,7 @@ def force_close_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             db.add(new_child)
             audit.record(
                 db, actor_user_id=new_child.user_id,
-                action="order.mirror_force_closed_on_trader_fill",
+                action="order.mirror_force_filled_on_trader_fill",
                 entity_type="order", entity_id=new_child.id,
                 metadata={
                     "old_mirror_id": str(old_ch.id),

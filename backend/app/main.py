@@ -209,6 +209,17 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start eod_autoclose loop")
 
+        # Alpaca subscriber mirror-fill reconciler — the Alpaca twin of the
+        # SnapTrade subscriber reconciler. Alpaca subscriber accounts have no
+        # real-time listener, so without this a mirror that fills there can stay
+        # WORKING in our DB (breaking close-detection + order history). Every 30s
+        # it refreshes only those orders' status from Alpaca. Worker-only.
+        try:
+            from app.services import alpaca_subscriber_reconciler
+            alpaca_subscriber_reconciler.start_alpaca_subscriber_reconciler()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start alpaca subscriber reconciler")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep
@@ -238,6 +249,11 @@ def create_app() -> FastAPI:
             await pnl_poller.stop()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop pnl_poller cleanly")
+        try:
+            from app.services import alpaca_subscriber_reconciler
+            await alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop alpaca subscriber reconciler cleanly")
         try:
             await close_async_redis()
         except Exception:  # noqa: BLE001
