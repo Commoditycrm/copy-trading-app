@@ -146,6 +146,27 @@ def export_trades(
 
     orders = list(db.execute(q).scalars())
     now = datetime.now(timezone.utc)
+    truncated = len(orders) > excel_export.ROW_CAP
+    orders = orders[:excel_export.ROW_CAP]
+
+    audit.record(
+        db, actor_user_id=user.id, action="trades.exported",
+        entity_type="user", entity_id=user.id,
+        metadata={"rows": len(orders), "status": status, "search": search,
+                  "from": str(from_) if from_ else None, "to": str(to) if to else None},
+    )
+    # Commit BEFORE building the file. build_workbook is pure CPU and runs for
+    # ~0.8ms/row — 20k rows is ~15s, which is exactly Postgres's
+    # idle_in_transaction_session_timeout here. Hold the transaction open
+    # through the build and the connection gets killed mid-request, then
+    # get_db's teardown blows up on a dead connection (a 500 with no app frames
+    # in the traceback, because it dies in the dependency, not the endpoint).
+    # expire_on_commit=False keeps the rows we already loaded readable
+    # afterwards — the default would expire them and re-query on every single
+    # attribute the columns touch.
+    db.expire_on_commit = False
+    db.commit()
+
     data = excel_export.build_workbook(
         columns=trade_export_columns(),
         rows=orders,
@@ -160,15 +181,10 @@ def export_trades(
             ("From", from_ or "(all time)"),
             ("To", to or "(all time)"),
             ("Rows", len(orders)),
+            ("Truncated", f"YES — capped at {excel_export.ROW_CAP:,} rows"
+             if truncated else "no"),
         ),
     )
-    audit.record(
-        db, actor_user_id=user.id, action="trades.exported",
-        entity_type="user", entity_id=user.id,
-        metadata={"rows": len(orders), "status": status, "search": search,
-                  "from": str(from_) if from_ else None, "to": str(to) if to else None},
-    )
-    db.commit()
     return Response(
         content=data,
         media_type=excel_export.XLSX_MEDIA_TYPE,
