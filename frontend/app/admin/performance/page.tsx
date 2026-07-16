@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { ExportButton } from "@/components/ExportButton";
 import { SubscriberPill, SubscriberBreakdown, type FanoutChild } from "@/components/performance/PerformanceView";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -279,6 +280,16 @@ export default function AdminPerformancePage() {
   const [sortKey, setSortKey] = useState<PerfSortKey>("time");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
+  // The table filters q/side in the browser; the export is built server-side,
+  // so pass them along or the file won't match what's on screen.
+  function exportEndpoint() {
+    const p = new URLSearchParams();
+    if (q.trim()) p.set("search", q.trim());
+    if (side !== "all") p.set("side", side);
+    const qs = p.toString();
+    return `/api/admin/performance/export${qs ? `?${qs}` : ""}`;
+  }
+
   function toggleSort(k: PerfSortKey) {
     if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
     else { setSortKey(k); setSortDir("asc"); }
@@ -393,6 +404,9 @@ export default function AdminPerformancePage() {
           >
             Refresh
           </button>
+          {/* One row per subscriber mirror. Ignores the "Last N" selector on
+              purpose — that bounds the on-screen table, not the export. */}
+          <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-fanouts.xlsx" />
         </div>
       </div>
 
