@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -37,6 +37,7 @@ from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
+from app.services import excel_export
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
 
@@ -590,6 +591,158 @@ def admin_list_fanouts(
         "truncated": truncated,
     }
     return {"fanouts": fanouts, "metrics": metrics}
+
+
+def _num(v):
+    """Serialized payloads carry Decimals as strings so JSON stays exact.
+    Excel needs real numbers — a string here is a cell you can't sum."""
+    if v is None or v == "":
+        return None
+    try:
+        return Decimal(str(v))
+    except Exception:  # noqa: BLE001
+        return str(v)
+
+
+def _ts(v):
+    """ISO string -> datetime, so Excel sorts it as a date not as text."""
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return str(v)
+
+
+def _fanout_export_columns() -> list[excel_export.Column]:
+    """One row per MIRROR, with the parent trade's context repeated.
+
+    Flattened rather than nested because that's what Excel can actually work
+    with — filter by subscriber, group by broker, average the lags. Keys match
+    _serialize_fanout / _serialize_child exactly (see api/performance.py).
+    """
+    C = excel_export.Column
+    M, D, I = "#,##0.00######", "yyyy-mm-dd hh:mm:ss", "#,##0"
+    p = lambda k: (lambda r: r[0].get(k))          # noqa: E731 — parent field
+    c = lambda k: (lambda r: (r[1] or {}).get(k))  # noqa: E731 — mirror field
+    return [
+        # ── the trade ──────────────────────────────────────────────
+        # Keys are _serialize_fanout's, plus trader_email/trader_display_name
+        # which admin_list_fanouts injects afterwards. Note the parent carries
+        # no status of its own — the fanout's health is subscribers.errors.
+        C("Trade Time (UTC)", lambda r: _ts(r[0].get("trader_submitted_at") or r[0].get("detected_at")), 19, D),
+        C("Trader", p("trader_display_name"), 20),
+        C("Trader Email", p("trader_email"), 26),
+        C("Symbol", p("symbol"), 12),
+        C("Side", lambda r: (r[0].get("side") or "").upper(), 8),
+        C("Type", p("instrument_type"), 9),
+        C("Trade Qty", lambda r: _num(r[0].get("quantity")), 11, M),
+        C("Expected Price", lambda r: _num(r[0].get("expected_price")), 13, M),
+        C("Filled Price", lambda r: _num(r[0].get("filled_avg_price")), 13, M),
+        C("Subscribers", lambda r: (r[0].get("subscribers") or {}).get("total"), 11, I),
+        C("Mirrors Submitted", lambda r: (r[0].get("subscribers") or {}).get("submitted"), 15, I),
+        C("Mirror Errors", lambda r: (r[0].get("subscribers") or {}).get("errors"), 12, I),
+        C("Detection Lag (ms)", lambda r: r[0].get("detection_lag_ms"), 15, I),
+        C("Fanout Duration (ms)", lambda r: r[0].get("fanout_duration_ms"), 17, I),
+        C("Total Time (ms)", lambda r: r[0].get("total_ms"), 14, I),
+        # ── the mirror ─────────────────────────────────────────────
+        C("Subscriber", c("subscriber_name"), 20),
+        C("Subscriber Email", c("subscriber_email"), 26),
+        C("Mirror Status", c("status"), 14),
+        C("Broker", c("broker_name"), 14),
+        C("Mirror Qty", lambda r: _num((r[1] or {}).get("quantity")), 11, M),
+        C("Mirror Filled Qty", lambda r: _num((r[1] or {}).get("filled_quantity")), 14, M),
+        C("Mirror Expected Price", lambda r: _num((r[1] or {}).get("expected_price")), 17, M),
+        C("Mirror Filled Price", lambda r: _num((r[1] or {}).get("filled_avg_price")), 16, M),
+        C("Pick Lag (ms)", c("pick_lag_ms"), 12, I),
+        C("Eligibility Lag (ms)", c("eligibility_lag_ms"), 16, I),
+        C("Broker Lag (ms)", c("broker_lag_ms"), 14, I),
+        C("Subscriber Lag (ms)", c("subscriber_lag_ms"), 16, I),
+        C("Reject Reason", c("reject_reason"), 40),
+        C("Mirror Broker Order ID", c("broker_order_id"), 26),
+        C("Parent Order ID", p("parent_order_id"), 36),
+    ]
+
+
+@router.get("/performance/export")
+def admin_export_fanouts(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    trader_id: uuid.UUID | None = None,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = None,
+    broker: str | None = None,
+    search: str | None = Query(default=None, description="Symbol / trader, as the admin table's box"),
+    side: str | None = Query(default=None, description="all | buy | sell"),
+) -> Response:
+    """Fanout data as .xlsx, one row per subscriber mirror.
+
+    Builds on admin_list_fanouts rather than re-querying, so the file is
+    generated from the exact payload the table renders — the export can't drift
+    away from the UI the way a parallel query would.
+    """
+    payload = admin_list_fanouts(
+        db=db, _=admin, trader_id=trader_id, from_=from_, to=to,
+        broker=broker, limit=_AGG_PARENT_CAP,
+    )
+    fanouts = payload.get("fanouts") or []
+
+    # The admin table applies these two IN THE BROWSER, over this same
+    # serialized payload — so filter the payload rather than the query. Same
+    # data, same predicate, so the file can't disagree with the screen.
+    # Mirrors `visibleFanouts` in app/admin/performance/page.tsx.
+    needle = (search or "").strip().lower()
+    if needle:
+        fanouts = [
+            f for f in fanouts
+            if needle in (f.get("symbol") or "").lower()
+            or needle in (f.get("trader_email") or "").lower()
+            or needle in (f.get("trader_display_name") or "").lower()
+        ]
+    if side and side != "all":
+        fanouts = [f for f in fanouts if (f.get("side") or "") == side]
+
+    # Flatten. A trade that reached NOBODY still gets a row (blank mirror
+    # columns) — a fanout with zero subscribers is exactly what an admin is
+    # usually hunting for, so it must not vanish from the sheet.
+    rows: list[tuple[dict, dict | None]] = []
+    for f in fanouts:
+        children = f.get("children") or []
+        if not children:
+            rows.append((f, None))
+        else:
+            rows.extend((f, c) for c in children)
+
+    now = datetime.now(timezone.utc)
+    data = excel_export.build_workbook(
+        columns=_fanout_export_columns(),
+        rows=rows,
+        sheet_title="Fanouts",
+        meta=(
+            ("Exported (UTC)", now.replace(tzinfo=None)),
+            ("Exported by", admin.email),
+            ("Trader filter", str(trader_id) if trader_id else "(all traders)"),
+            ("Broker filter", broker or "(all brokers)"),
+            ("Search", search or "(none)"),
+            ("Side filter", side or "all"),
+            ("From", from_.replace(tzinfo=None) if from_ else "(all time)"),
+            ("To", to.replace(tzinfo=None) if to else "(all time)"),
+            ("Trades", len(fanouts)),
+            ("Mirror rows", len(rows)),
+            # admin_list_fanouts caps at _AGG_PARENT_CAP parents. Say so in the
+            # file — a silently truncated export reads as the whole picture.
+            ("Truncated", "YES — capped at %d trades" % _AGG_PARENT_CAP
+             if (payload.get("metrics") or {}).get("truncated") else "no"),
+        ),
+    )
+    return Response(
+        content=data,
+        media_type=excel_export.XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{excel_export.filename("fanouts", when=now)}"',
+        },
+    )
 
 
 @router.get("/rejected-orders")
