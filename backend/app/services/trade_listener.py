@@ -907,18 +907,19 @@ def _apply_event_to_existing(
                 "alpaca_listener: bracket emulator failed for order %s", order.id
             )
 
-    # A TRADER close that just filled may have subscriber mirrors still resting
-    # as limits (mirrored while the trader's close was working) — sweep those to
-    # market so the subscriber exits with the trader. No-op for entries /
-    # already-filled mirrors. Gated on parent_order_id IS NULL because subscriber
-    # mirrors also flow through this function (their own account's listener) and
-    # must never trigger a sweep. Runs in its own session.
+    # A TRADER order that just filled (BUY or SELL) may have subscriber mirrors
+    # still resting as limits (mirrored while it was working) — sweep those to
+    # market so the subscriber ends in the same state as the trader (in for a
+    # filled entry, out for a filled close). No-op for already-filled mirrors.
+    # Gated on parent_order_id IS NULL because subscriber mirrors also flow
+    # through this function (their own account's listener) and must never trigger
+    # a sweep. Runs in its own session.
     if status_changed_to_filled and order.parent_order_id is None:
         try:
-            copy_engine.force_close_mirrors_to_market(order.id)
+            copy_engine.force_fill_mirrors_to_market(order.id)
         except Exception:  # noqa: BLE001
             log.exception(
-                "alpaca_listener: force-close mirrors failed for %s", order.id
+                "alpaca_listener: force-fill mirrors failed for %s", order.id
             )
 
     return terms_changed
