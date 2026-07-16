@@ -12,6 +12,10 @@ python-multipart==0.0.12
 cryptography==43.0.3
 httpx==0.27.2
 redis==5.2.0
+# Excel export (services/excel_export.py). Pure Python — no compiler, no
+# transitive deps. write_only mode streams rows instead of holding the sheet
+# in memory, so a 50k-row export doesn't balloon the worker.
+openpyxl==3.1.5
 alpaca-py==0.33.0
 # REMOVED 2026-05-31 (security + architecture): webull==0.6.1 — unofficial
 # reverse-engineered SDK, root cause of the May 2026 prod supply-chain
