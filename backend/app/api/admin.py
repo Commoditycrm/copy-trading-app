@@ -713,6 +713,19 @@ def admin_export_fanouts(
         else:
             rows.extend((f, c) for c in children)
 
+    row_capped = len(rows) > excel_export.ROW_CAP
+    rows = rows[:excel_export.ROW_CAP]
+
+    # Release the DB before building. One parent can fan out to dozens of
+    # mirrors, so this endpoint reaches tens of thousands of rows easily (QA
+    # holds 252k mirrors), and the build is ~0.8ms/row of pure CPU. Holding the
+    # transaction open across it trips idle_in_transaction_session_timeout (15s)
+    # and the request dies in get_db's teardown. Committing rather than rolling
+    # back also persists the brokerage-name healing admin_list_fanouts does.
+    # Safe to commit here: `fanouts` is plain dicts, so nothing below re-reads
+    # the ORM.
+    db.commit()
+
     now = datetime.now(timezone.utc)
     data = excel_export.build_workbook(
         columns=_fanout_export_columns(),
@@ -729,10 +742,13 @@ def admin_export_fanouts(
             ("To", to.replace(tzinfo=None) if to else "(all time)"),
             ("Trades", len(fanouts)),
             ("Mirror rows", len(rows)),
-            # admin_list_fanouts caps at _AGG_PARENT_CAP parents. Say so in the
-            # file — a silently truncated export reads as the whole picture.
-            ("Truncated", "YES — capped at %d trades" % _AGG_PARENT_CAP
-             if (payload.get("metrics") or {}).get("truncated") else "no"),
+            # Two independent caps, and a silently-truncated export reads as the
+            # whole picture — so say which one bit.
+            ("Truncated", "; ".join(filter(None, (
+                f"YES — capped at {excel_export.ROW_CAP:,} mirror rows" if row_capped else None,
+                f"YES — capped at {_AGG_PARENT_CAP:,} trades"
+                if (payload.get("metrics") or {}).get("truncated") else None,
+            ))) or "no"),
         ),
     )
     return Response(
