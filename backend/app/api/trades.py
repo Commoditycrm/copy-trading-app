@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import ROUND_DOWN
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import and_, case, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
@@ -25,12 +25,67 @@ from app.schemas.order import (
     TradeScopeStats,
     TradeStatsOut,
 )
-from app.services import audit, copy_engine, events, fills_sync
+from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
+
+
+def _instrument_label(o: Order) -> str:
+    """"AAPL" for stock; "SPXW 500 CALL 2026-12-19" for an option — the same
+    shape the Trades page renders, so a reader can match rows to the UI."""
+    if o.instrument_type != InstrumentType.OPTION:
+        return o.symbol.upper()
+    parts = [o.symbol.upper()]
+    if o.option_strike is not None:
+        parts.append(str(o.option_strike))
+    if o.option_right is not None:
+        parts.append(o.option_right.value.upper())
+    if o.option_expiry is not None:
+        parts.append(str(o.option_expiry))
+    return " ".join(parts)
+
+
+def trade_export_columns() -> list[excel_export.Column]:
+    """Columns for an order-level export. Values stay native (datetime /
+    Decimal) so Excel can sort and filter them — see services/excel_export."""
+    C = excel_export.Column
+    M, D = "#,##0.00######", "yyyy-mm-dd hh:mm:ss"
+    return [
+        C("Placed At (UTC)", lambda o: o.submitted_at or o.created_at, 19, D),
+        C("Instrument", _instrument_label, 26),
+        C("Symbol", lambda o: o.symbol.upper(), 12),
+        C("Type", lambda o: o.instrument_type.value, 10),
+        C("Side", lambda o: o.side.value.upper(), 8),
+        C("Order Type", lambda o: o.order_type.value, 12),
+        C("Status", lambda o: o.status.value, 15),
+        C("Quantity", lambda o: o.quantity, 11, M),
+        C("Filled Qty", lambda o: o.filled_quantity, 11, M),
+        C("Limit Price", lambda o: o.limit_price, 13, M),
+        C("Stop Price", lambda o: o.stop_price, 13, M),
+        C("Avg Fill Price", lambda o: o.filled_avg_price, 14, M),
+        # Notional is the number people actually want and the one they'd get
+        # wrong by hand: options are per-contract, so 100x the share price.
+        C("Filled Notional", _filled_notional, 15, M),
+        C("Take Profit", lambda o: o.take_profit_price, 12, M),
+        C("Stop Loss", lambda o: o.stop_loss_price, 12, M),
+        C("Copied Trade", lambda o: "yes" if o.parent_order_id else "no", 12),
+        C("Sent To Subscribers", lambda o: "yes" if o.fanned_out_to_subscribers else "no", 17),
+        C("Reject Reason", lambda o: o.reject_reason, 40),
+        C("Broker Order ID", lambda o: o.broker_order_id, 26),
+        C("Closed At (UTC)", lambda o: o.closed_at, 19, D),
+        C("Order ID", lambda o: str(o.id), 36),
+    ]
+
+
+def _filled_notional(o: Order):
+    """filled_qty x avg_price, x100 for options (contract multiplier)."""
+    if o.filled_avg_price is None or not o.filled_quantity:
+        return None
+    mult = 100 if o.instrument_type == InstrumentType.OPTION else 1
+    return o.filled_quantity * o.filled_avg_price * mult
 
 
 @router.get("/trades", response_model=list[OrderOut])
@@ -58,6 +113,69 @@ def list_trades(
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
     return list(db.execute(q).scalars())
+
+
+@router.get("/trades/export")
+def export_trades(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+    status: str = Query(default="all", description="Trades-page status tab"),
+    search: str | None = Query(default=None, description="Symbol substring"),
+) -> Response:
+    """The caller's own orders as .xlsx, honouring the Trades page filters.
+
+    Deliberately NOT limited: /trades caps at 1000 rows for the UI window, but
+    an export that silently stopped at 1000 would look complete and not be —
+    the whole point is to get everything matching the filter.
+    """
+    q = (
+        select(Order)
+        .options(selectinload(Order.fills))
+        .where(Order.user_id == user.id)
+        .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
+    )
+    if from_:
+        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
+    if to:
+        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
+    q = trade_filters.exclude_dead_bracket_legs(q)
+    q = trade_filters.apply_status_tab(q, status)
+    q = trade_filters.apply_symbol_search(q, search)
+
+    orders = list(db.execute(q).scalars())
+    now = datetime.now(timezone.utc)
+    data = excel_export.build_workbook(
+        columns=trade_export_columns(),
+        rows=orders,
+        sheet_title="Trades",
+        # Record the filters IN the file — otherwise a filtered export is
+        # indistinguishable from a full dump once it's been emailed around.
+        meta=(
+            ("Exported (UTC)", now.replace(tzinfo=None)),
+            ("Account", user.email),
+            ("Status filter", status),
+            ("Symbol search", search or "(none)"),
+            ("From", from_ or "(all time)"),
+            ("To", to or "(all time)"),
+            ("Rows", len(orders)),
+        ),
+    )
+    audit.record(
+        db, actor_user_id=user.id, action="trades.exported",
+        entity_type="user", entity_id=user.id,
+        metadata={"rows": len(orders), "status": status, "search": search,
+                  "from": str(from_) if from_ else None, "to": str(to) if to else None},
+    )
+    db.commit()
+    return Response(
+        content=data,
+        media_type=excel_export.XLSX_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{excel_export.filename("trades", when=now)}"',
+        },
+    )
 
 
 # Statuses the UI counts as "working" — must mirror the frontend's
