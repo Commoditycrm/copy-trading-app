@@ -89,6 +89,34 @@ export async function api<T>(
   return data as T;
 }
 
+/** api() for binary downloads (.xlsx exports).
+ *
+ *  api() parses JSON, which a spreadsheet isn't — so this returns the raw
+ *  Response and lets the caller read the blob plus Content-Disposition. It
+ *  shares the same 401 → refresh → retry path, so exporting from a tab that's
+ *  been open past the access-token lifetime still works instead of silently
+ *  failing at the moment the user asks for their data.
+ */
+export async function apiBlob(path: string): Promise<Response> {
+  const send = async () => {
+    const h = new Headers();
+    const tok = getAccessToken();
+    if (tok) h.set("Authorization", `Bearer ${tok}`);
+    return fetch(path, { headers: h });
+  };
+
+  let r = await send();
+  if (r.status === 401 && getRefreshToken()) {
+    if (await tryRefresh()) r = await send();
+  }
+  if (!r.ok) {
+    // The happy path is a spreadsheet, but errors still come back as JSON.
+    const data = await r.json().catch(() => null);
+    throw new ApiError(r.status, data?.detail ?? data ?? r.statusText);
+  }
+  return r;
+}
+
 // ── Password reset ──────────────────────────────────────────────────────────
 
 /** Request a reset link. Always resolves (the API never reveals whether the

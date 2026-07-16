@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { ExportButton } from "@/components/ExportButton";
 import { fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
@@ -184,6 +185,23 @@ export default function TradesPage() {
     }
     return `/api/trades?${q.toString()}`;
   }, [fromParam, toParam]);
+
+  // Same date window as tradesEndpoint(), PLUS the tab and search that this
+  // page normally applies in the browser — the export is built server-side, so
+  // it has to be told about them or the file won't match what's on screen.
+  // No `limit` on purpose: the table shows a window, the export is everything.
+  const exportEndpoint = useCallback(() => {
+    const q = new URLSearchParams();
+    if (fromParam) q.set("from", fromParam);
+    if (toParam) {
+      const t = new Date(toParam + "T00:00:00Z");
+      t.setUTCDate(t.getUTCDate() + 1);
+      q.set("to", t.toISOString().slice(0, 10));
+    }
+    if (tab !== "all") q.set("status", tab);
+    if (search.trim()) q.set("search", search.trim());
+    return `/api/trades/export?${q.toString()}`;
+  }, [fromParam, toParam, tab, search]);
 
   // DB-aggregate totals, same date filter as the list. Fetched alongside
   // the rows and refreshed whenever orders change (SSE / reconcile) so the
@@ -498,21 +516,28 @@ export default function TradesPage() {
             );
           })}
         </div>
-        <div className="relative">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search symbol…"
-            className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
-            aria-label="Search orders by symbol"
-          />
-          {search && (
-            <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
-              className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
-              <X size={14} />
-            </button>
-          )}
+        {/* Search + Export share a group so the toolbar's justify-between
+            still puts the tabs left and this cluster right. */}
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search symbol…"
+              className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
+              aria-label="Search orders by symbol"
+            />
+            {search && (
+              <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
+                className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
+                <X size={14} />
+              </button>
+            )}
+          </div>
+          {/* Exports EVERY row matching these filters, not just the loaded
+              window — see /api/trades/export. */}
+          <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-trades.xlsx" />
         </div>
       </div>
 
