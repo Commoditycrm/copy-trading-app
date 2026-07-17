@@ -694,13 +694,13 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
 
   return (
     <div
-      className="mb-3 rounded-lg border px-4 py-3"
+      className="mb-2 rounded-lg border px-3 py-2"
       style={{
         borderColor: "var(--border)",
         background: "linear-gradient(180deg, rgba(34,197,94,0.06) 0%, rgba(0,0,0,0) 100%)",
       }}
     >
-      <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
+      <div className="text-[10px] uppercase tracking-widest mb-1" style={{ color: "var(--muted)" }}>
         Trade summary
       </div>
       <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
@@ -743,7 +743,7 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
       </div>
       {/* ── Platform vs Broker split ──────────────────────────────────── */}
       {medPlatform !== null && medBroker !== null && (
-        <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border)" }}>
+        <div className="mt-2 pt-2" style={{ borderTop: "1px solid var(--border)" }}>
           <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
             Median Lag Split
           </div>
@@ -771,7 +771,7 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
         </div>
       )}
 
-      <div className="mt-2 text-[11px]" style={{ color: "var(--muted)" }}>
+      <div className="mt-1.5 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
         Note: per-subscriber timings below show <b>trade latency</b> (Subscriber Lag). The
         separate <b>UI Notification Lag</b> column is when the subscriber&apos;s browser
         received the SSE update — independent of when their order was actually placed.
@@ -835,7 +835,7 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                               named outlier rather than a platform stat. */}
                           {mirrors.length > 0 && <TradeSummaryCard mirrors={mirrors} />}
                           <div
-                            className="text-[10px] uppercase tracking-widest mb-3"
+                            className="text-[10px] uppercase tracking-widest mb-1.5"
                             style={{ color: "var(--muted)" }}
                           >
                             Per-Subscriber Timeline ({mirrors.length} target{mirrors.length === 1 ? "" : "s"})
@@ -1471,7 +1471,7 @@ export function PerformanceView({
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
                       <td colSpan={21} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
-                        <div className="px-5 py-4">
+                        <div className="px-4 py-2.5">
                           <SubscriberBreakdown mirrors={f.children} />
                         </div>
                       </td>
