@@ -7,6 +7,7 @@ import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { ExportButton } from "@/components/ExportButton";
+import { PositionIcon, orderKind } from "@/components/PositionIcon";
 import { fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
@@ -611,7 +612,13 @@ export default function TradesPage() {
                         background: flashId === o.id ? "var(--good-soft)" : undefined,
                       }}
                     >
-                      <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>{orderSymbolLabel(o)}</td>
+                      <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>
+                        {/* gap-1.5 = 6px between glyph and symbol. */}
+                        <span className="inline-flex items-center gap-1.5">
+                          <PositionIcon kind={orderKind(o)} />
+                          {orderSymbolLabel(o)}
+                        </span>
+                      </td>
                       <td className="px-5 py-3.5 num">{fmt(o.quantity, 0)}</td>
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
