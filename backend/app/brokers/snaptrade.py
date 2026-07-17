@@ -729,8 +729,11 @@ class SnapTradeAdapter(BrokerAdapter):
             f"SnapTrade order {broker_order_id} not found in recent history"
         )
 
-    def cancel_order(self, broker_order_id: str) -> None:
+    def cancel_order(self, broker_order_id: str) -> bool:
         """SnapTrade's cancel endpoint takes brokerage_order_id.
+
+        Returns True when we actually cancelled a working order; False when
+        SnapTrade reports it was already terminal (the 1070 case below).
 
         Idempotent against terminal-state orders. When the underlying
         broker has already cancelled / filled / expired the order before
@@ -747,7 +750,15 @@ class SnapTradeAdapter(BrokerAdapter):
         this swallow they get a confusing "broker rejected" toast even
         though the actual broker state matches what they wanted.
 
-        After this returns, the endpoint flips local status to
+        Swallowing 1070 is right for a user clicking Cancel, but not enough for
+        cancel-then-REPLACE callers. 1070 means "I could not cancel it", and the
+        usual reason is that it FILLED — so a replacement doubles the position.
+        Prod did exactly that: a mirror filled at Webull, SnapTrade hadn't
+        reported the fill yet, 1070 came back, we read it as success and placed
+        a second order that also filled. Hence the bool — see
+        copy_engine.force_fill_mirrors_to_market.
+
+        After this returns True, the endpoint flips local status to
         CANCELED. If the broker had actually FILLED (not cancelled) the
         order, our DB row says CANCELED for the brief window until
         fills_sync's next tick corrects it.
@@ -769,11 +780,12 @@ class SnapTradeAdapter(BrokerAdapter):
                or "Failed to cancel order with provided brokerage_order_id" in err:
                 log.info(
                     "snaptrade cancel_order: broker_order_id=%s already in "
-                    "terminal state (code 1070) — treating as success",
+                    "terminal state (code 1070) — nothing was cancelled",
                     broker_order_id,
                 )
-                return
+                return False
             raise RuntimeError(f"SnapTrade cancel_order: {exc}") from exc
+        return True
 
     # ── positions ─────────────────────────────────────────────────────────
 

@@ -261,8 +261,12 @@ class AlpacaAdapter(BrokerAdapter):
             filled_avg_price=Decimal(str(resp.filled_avg_price)) if resp.filled_avg_price else None,
         )
 
-    def cancel_order(self, broker_order_id: str) -> None:
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """True — Alpaca raises if the order isn't cancellable, so reaching the
+        return means we really did cancel a working order. See base.cancel_order
+        for why the distinction matters."""
         self._c().cancel_order_by_id(broker_order_id)
+        return True
 
     # ── positions ─────────────────────────────────────────────────────────
 
