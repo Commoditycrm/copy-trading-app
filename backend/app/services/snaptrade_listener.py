@@ -54,6 +54,12 @@ POLL_INTERVAL_S = 5.0
 # webhook becomes the primary trigger and our self-poll is only a
 # backstop — so we slow it down to avoid redundant API calls.
 POLL_INTERVAL_BACKSTOP_S = 60.0
+# How long a webhook-triggered poll waits before its second pass. SnapTrade's
+# force-resync is async, so the first fetch after asking for one still returns
+# their pre-trade cache; this is the beat we give them to finish re-pulling.
+# Too short and pass 2 is just as stale; too long and we lose to the 5s
+# self-poller, which is the thing we're trying to beat.
+WEBHOOK_RESYNC_WAIT_S = 1.5
 
 
 # Statuses we treat as still-working — an order in one of these on this
@@ -297,17 +303,30 @@ async def _run_listener(
 
 
 async def poll_now_for_trader(trader_user_id: uuid.UUID) -> bool:
-    """Run one poll immediately for this trader, outside the periodic
-    loop. Called by the SnapTrade Trade-Detection webhook so a new order
-    is picked up the instant SnapTrade notifies us, instead of waiting
-    for the next periodic tick.
+    """Run a poll immediately for this trader, outside the periodic loop.
+    Called by the SnapTrade Trade-Detection webhook so a new order is picked
+    up when SnapTrade notifies us instead of waiting for the next tick.
 
-    Returns True if a poll ran, False if the trader has no connected
-    SnapTrade account or the poll errored. Shares ``_last_seen`` + the
-    per-trader lock with the periodic loop, so it's safe to run
-    concurrently — the lock serialises the SELECT-then-INSERT in
-    _poll_once. Exception-safe because it runs as a fire-and-forget
-    background task from the webhook handler."""
+    Two passes, because one doesn't work:
+
+      1. Force the resync. The default heuristic (_should_force_resync) only
+         re-pulls while a WORKING order already exists on the account — but a
+         brand-new order has no row of ours yet, so that gate skips the resync
+         on exactly the polls that most need it. A webhook is itself proof
+         something changed, which beats the heuristic outright.
+      2. Re-fetch after a beat. SnapTrade's resync is async, so pass 1's fetch
+         usually still returns their pre-trade cache. Pass 2 sees the re-pulled
+         data. Skipped when pass 1 already found the change.
+
+    Measured before this: only ~5 of 52 externally-placed trades were detected
+    inside the webhook's window; the rest fell through to the 5s poller at
+    7-15s. The single pass was fetching a stale view and finding nothing.
+
+    Returns True if a poll ran, False if the trader has no connected SnapTrade
+    account, credentials are unusable, or the poll errored. Shares
+    ``_last_seen`` + the per-trader lock with the periodic loop, so it's safe
+    to run concurrently — the lock serialises the SELECT-then-INSERT in
+    _poll_once. Exception-safe: it runs fire-and-forget from the webhook."""
     try:
         with SessionLocal() as db:
             acct = db.execute(
@@ -318,17 +337,45 @@ async def poll_now_for_trader(trader_user_id: uuid.UUID) -> bool:
                 )
             ).scalar_one_or_none()
             if acct is None:
+                # Was a silent `return False`. The webhook discards our result,
+                # so an unpollable trader looked identical to a healthy one in
+                # the logs — "scheduling immediate poll" every time, nothing
+                # happening. Say so.
+                log.warning(
+                    "snaptrade webhook-poll[%s]: no connected SnapTrade account; nothing polled",
+                    trader_user_id,
+                )
                 return False
             broker_account_id = acct.id
 
         creds = _load_creds(trader_user_id, broker_account_id)
         if creds is None:
+            log.warning(
+                "snaptrade webhook-poll[%s]: credentials unusable; nothing polled",
+                trader_user_id,
+            )
             return False
         adapter = SnapTradeAdapter(creds)
-        await asyncio.to_thread(_poll_once, trader_user_id, broker_account_id, adapter)
+
+        n1 = await asyncio.to_thread(
+            _poll_once, trader_user_id, broker_account_id, adapter, True,
+        )
+        n2 = -1
+        if n1 == 0:
+            await asyncio.sleep(WEBHOOK_RESYNC_WAIT_S)
+            # force_resync=False: pass 1 already asked. _should_force_resync's
+            # throttle will now say no anyway, so we just read the fresh view.
+            n2 = await asyncio.to_thread(
+                _poll_once, trader_user_id, broker_account_id, adapter, False,
+            )
+        log.info(
+            "snaptrade webhook-poll[%s]: pass1=%d change(s)%s",
+            trader_user_id, n1,
+            "" if n2 < 0 else f", pass2 after {WEBHOOK_RESYNC_WAIT_S}s={n2} change(s)",
+        )
         return True
     except Exception:  # noqa: BLE001
-        log.exception("snaptrade poll_now_for_trader failed for %s", trader_user_id)
+        log.exception("snaptrade webhook-poll[%s] failed", trader_user_id)
         return False
 
 
@@ -367,13 +414,22 @@ def _poll_once(
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
     adapter: SnapTradeAdapter,
-) -> None:
+    force_resync: bool = False,
+) -> int:
     """Pull recent orders, diff against last-seen, route changes through
     the persist+fanout pipeline. Sync — runs in a thread.
+
+    ``force_resync`` skips the _should_force_resync heuristic and asks
+    SnapTrade to re-pull from the upstream broker regardless. Set by the
+    webhook path — see poll_now_for_trader for why.
+
+    Returns the number of order changes dispatched, so callers can tell a
+    productive poll from one that fetched a stale view and found nothing.
 
     Guarded by a per-trader lock so the periodic loop and a
     webhook-triggered poll (poll_now_for_trader) never race on the
     SELECT-then-INSERT dedup inside _persist_and_fanout."""
+    dispatched = 0
     with _lock_for(trader_user_id):
         # Gate: master switch off → skip the broker fetch + processing.
         # Reload each poll so the flag can be flipped at runtime via the
@@ -383,8 +439,13 @@ def _poll_once(
             acct = db.get(BrokerAccount, broker_account_id)
             if not broker_filters.auto_pull_enabled(acct):
                 listener_state.bump_last_event(trader_user_id)
-                return
-            need_resync = _should_force_resync(db, trader_user_id, broker_account_id)
+                return 0
+            if force_resync:
+                # Still honour _refresh_unsupported — if the plan forbids manual
+                # refresh, asking again just burns a call for a known "forbidden".
+                need_resync = broker_account_id not in _refresh_unsupported
+            else:
+                need_resync = _should_force_resync(db, trader_user_id, broker_account_id)
         # Nudge SnapTrade to re-pull from the upstream broker BEFORE we read
         # orders, so an external cancel/fill on the broker app (which SnapTrade
         # would otherwise reflect only on its own slow cadence) lands on an
@@ -401,7 +462,7 @@ def _poll_once(
         orders = adapter.list_recent_activities()
         listener_state.bump_last_event(trader_user_id)
         if not orders:
-            return
+            return 0
 
         seen = _last_seen.setdefault(trader_user_id, {})
 
@@ -470,6 +531,8 @@ def _poll_once(
             _persist_and_fanout(
                 trader_user_id, broker_account_id, broker_order_id, status_str, o, bracket
             )
+            dispatched += 1
+    return dispatched
 
 
 def _persist_and_fanout(
