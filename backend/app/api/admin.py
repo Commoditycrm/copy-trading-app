@@ -617,50 +617,95 @@ def _ts(v):
 def _fanout_export_columns() -> list[excel_export.Column]:
     """One row per MIRROR, with the parent trade's context repeated.
 
-    Flattened rather than nested because that's what Excel can actually work
-    with — filter by subscriber, group by broker, average the lags. Keys match
-    _serialize_fanout / _serialize_child exactly (see api/performance.py).
+    Flattened rather than nested because that's what Excel can work with —
+    filter by subscriber, group by broker, average the lags.
+
+    Columns run in TIMELINE order, trader-side then subscriber-side, so reading
+    left to right walks the trade from the trader's broker to the subscriber's.
+    That's the point: to answer "where did the delay happen" you compare
+    adjacent timestamps, and every step's raw stamp AND its derived lag are
+    both here — the lag tells you which hop was slow, the stamps let you check
+    the lag is real.
+
+    Keys match _serialize_fanout / _serialize_child (api/performance.py), plus
+    trader_email / trader_display_name which admin_list_fanouts injects after.
     """
     C = excel_export.Column
     M, D, I = "#,##0.00######", "yyyy-mm-dd hh:mm:ss", "#,##0"
-    p = lambda k: (lambda r: r[0].get(k))          # noqa: E731 — parent field
-    c = lambda k: (lambda r: (r[1] or {}).get(k))  # noqa: E731 — mirror field
+    p = lambda k: (lambda r: r[0].get(k))              # noqa: E731 — parent field
+    c = lambda k: (lambda r: (r[1] or {}).get(k))      # noqa: E731 — mirror field
+    pt = lambda k: (lambda r: _ts(r[0].get(k)))        # noqa: E731 — parent stamp
+    ct = lambda k: (lambda r: _ts((r[1] or {}).get(k)))  # noqa: E731 — mirror stamp
+    pn = lambda k: (lambda r: _num(r[0].get(k)))       # noqa: E731 — parent number
+    cn = lambda k: (lambda r: _num((r[1] or {}).get(k)))  # noqa: E731 — mirror number
     return [
-        # ── the trade ──────────────────────────────────────────────
-        # Keys are _serialize_fanout's, plus trader_email/trader_display_name
-        # which admin_list_fanouts injects afterwards. Note the parent carries
-        # no status of its own — the fanout's health is subscribers.errors.
-        C("Trade Time (UTC)", lambda r: _ts(r[0].get("trader_submitted_at") or r[0].get("detected_at")), 19, D),
+        # ── WHO / WHAT ────────────────────────────────────────────────
         C("Trader", p("trader_display_name"), 20),
         C("Trader Email", p("trader_email"), 26),
+        # The trader's broker drives detection latency — Alpaca streams over a
+        # websocket, SnapTrade is polled. Without it a slow detection looks
+        # like a platform bug when it's the source broker's cadence.
+        C("Trader Broker", p("trader_broker"), 16),
         C("Symbol", p("symbol"), 12),
         C("Side", lambda r: (r[0].get("side") or "").upper(), 8),
-        C("Type", p("instrument_type"), 9),
-        C("Trade Qty", lambda r: _num(r[0].get("quantity")), 11, M),
-        C("Expected Price", lambda r: _num(r[0].get("expected_price")), 13, M),
-        C("Filled Price", lambda r: _num(r[0].get("filled_avg_price")), 13, M),
+        C("Instrument", p("instrument_type"), 10),
+        C("Order Type", p("order_type"), 11),
+        C("Trade Status", p("status"), 14),
+        C("Trade Qty", pn("quantity"), 11, M),
+        C("Trade Filled Qty", pn("filled_quantity"), 14, M),
+        C("Trade Expected Price", pn("expected_price"), 17, M),
+        C("Trade Filled Price", pn("filled_avg_price"), 16, M),
+
+        # ── TRADER-SIDE TIMELINE (T0 -> T5) ───────────────────────────
+        C("T0 Trader Submitted At", pt("trader_submitted_at"), 20, D),
+        C("T1 Broker Accepted At", pt("broker_accepted_at"), 20, D),
+        C("T2 Socket Received At", pt("socket_received_at"), 20, D),
+        C("T3 Detected At", pt("detected_at"), 20, D),
+        C("T4 Published For Subs At", pt("redis_published_at"), 20, D),
+        C("T5 All Subs Completed At", pt("fanout_completed_at"), 20, D),
+
+        # ── TRADER-SIDE LAGS ──────────────────────────────────────────
+        C("API to Broker (ms)", p("api_to_broker_lag_ms"), 16, I),
+        C("Socket Lag (ms)", p("socket_lag_ms"), 14, I),
+        C("Detection Lag (ms)", p("detection_lag_ms"), 15, I),
+        C("Publish Lag (ms)", p("publish_lag_ms"), 14, I),
+        C("Fanout Duration (ms)", p("fanout_duration_ms"), 17, I),
+        C("Total Time (ms)", p("total_ms"), 14, I),
         C("Subscribers", lambda r: (r[0].get("subscribers") or {}).get("total"), 11, I),
         C("Mirrors Submitted", lambda r: (r[0].get("subscribers") or {}).get("submitted"), 15, I),
         C("Mirror Errors", lambda r: (r[0].get("subscribers") or {}).get("errors"), 12, I),
-        C("Detection Lag (ms)", lambda r: r[0].get("detection_lag_ms"), 15, I),
-        C("Fanout Duration (ms)", lambda r: r[0].get("fanout_duration_ms"), 17, I),
-        C("Total Time (ms)", lambda r: r[0].get("total_ms"), 14, I),
-        # ── the mirror ─────────────────────────────────────────────
+
+        # ── SUBSCRIBER-SIDE ───────────────────────────────────────────
         C("Subscriber", c("subscriber_name"), 20),
         C("Subscriber Email", c("subscriber_email"), 26),
+        C("Subscriber Broker", c("broker_name"), 16),
         C("Mirror Status", c("status"), 14),
-        C("Broker", c("broker_name"), 14),
-        C("Mirror Qty", lambda r: _num((r[1] or {}).get("quantity")), 11, M),
-        C("Mirror Filled Qty", lambda r: _num((r[1] or {}).get("filled_quantity")), 14, M),
-        C("Mirror Expected Price", lambda r: _num((r[1] or {}).get("expected_price")), 17, M),
-        C("Mirror Filled Price", lambda r: _num((r[1] or {}).get("filled_avg_price")), 16, M),
-        C("Pick Lag (ms)", c("pick_lag_ms"), 12, I),
-        C("Eligibility Lag (ms)", c("eligibility_lag_ms"), 16, I),
+        C("Mirror Qty", cn("quantity"), 11, M),
+        C("Mirror Filled Qty", cn("filled_quantity"), 14, M),
+        C("Mirror Expected Price", cn("expected_price"), 17, M),
+        C("Mirror Filled Price", cn("filled_avg_price"), 16, M),
+
+        # ── SUBSCRIBER-SIDE TIMELINE (S1 -> S5) ───────────────────────
+        C("S1 Mirror Created At", ct("created_at"), 20, D),
+        C("S2 Picked At", ct("subscriber_picked_at"), 20, D),
+        C("S3 Submitted To Broker At", ct("submitted_at"), 20, D),
+        C("S4 Broker Accepted At", ct("broker_accepted_at"), 20, D),
+        C("S5 Published To UI At", ct("redis_published_at"), 20, D),
+
+        # ── SUBSCRIBER-SIDE LAGS ──────────────────────────────────────
+        C("Pick Lag (ms)", c("pick_lag_ms"), 13, I),
+        C("Eligibility Lag (ms)", c("eligibility_lag_ms"), 17, I),
         C("Broker Lag (ms)", c("broker_lag_ms"), 14, I),
+        C("Broker Response (ms)", c("broker_response_ms"), 17, I),
+        C("Sub Publish Lag (ms)", c("publish_lag_ms"), 17, I),
         C("Subscriber Lag (ms)", c("subscriber_lag_ms"), 16, I),
+
+        # ── IDs / diagnosis ───────────────────────────────────────────
         C("Reject Reason", c("reject_reason"), 40),
+        C("Trade Broker Order ID", p("broker_order_id"), 26),
         C("Mirror Broker Order ID", c("broker_order_id"), 26),
         C("Parent Order ID", p("parent_order_id"), 36),
+        C("Mirror Order ID", c("order_id"), 36),
     ]
 
 

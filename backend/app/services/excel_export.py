@@ -37,12 +37,15 @@ _INT_FMT = "#,##0"
 _HEADER_FILL = PatternFill("solid", fgColor="1F3350")
 _HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
 
-# Ceiling on rows per export. Building costs ~0.8ms/row at 30 columns, measured:
-#   1k -> 0.6s | 5k -> 3.1s | 20k -> 15.6s | 60k -> 47.5s
-# That's CPU inside the request, so it bounds how long a user waits AND (before
-# the caller commits) how long a DB transaction would sit idle. Raising this
-# means someone waits proportionally longer — 20k is already ~15s. Past this,
-# an export wants to be a background job with a download link, not a request.
+# Ceiling on rows per export. Build cost is linear in rows AND columns, measured:
+#   30 cols: 1k -> 0.6s | 5k -> 3.1s | 20k -> 15.6s | 60k -> 47.5s
+#   51 cols: 1k -> 0.9s | 5k -> 4.6s | 20k -> 19.6s        (the fanout export)
+# That's CPU inside the request, so it bounds how long a user waits — and, if a
+# caller forgets to commit first, how long a DB transaction sits idle (Postgres
+# kills those at 15s here, which is how this cap got written). At 20k the widest
+# export is already ~20s. Anything beyond wants to be a background job with a
+# download link, not a request — widen the sheet and this gets worse, so
+# re-measure if you add columns.
 # Callers MUST disclose truncation in the file; a silently-cut export reads as
 # the whole picture.
 ROW_CAP = 20_000

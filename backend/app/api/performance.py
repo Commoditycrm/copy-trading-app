@@ -74,6 +74,28 @@ def _ms_between(a: datetime | None, b: datetime | None) -> int | None:
     return int((b - a).total_seconds() * 1000)
 
 
+def _broker_label(account: BrokerAccount | None) -> str | None:
+    """Human broker name for an account. Precedence:
+      1. SnapTrade-routed accounts → the *underlying* broker
+         (Webull / Robinhood / IBKR / …) captured at connect time and
+         denormalized onto BrokerAccount.brokerage_name. Without this
+         every SnapTrade account would render as the generic "snaptrade",
+         hiding which actual broker handled the order.
+      2. Direct broker integrations → the broker enum value
+         (alpaca / webull / ibkr).
+      3. Fallback to the user-typed label (last resort — the label is
+         free-form text and doesn't reliably identify the broker).
+    """
+    if account is None:
+        return None
+    if account.broker == BrokerName.SNAPTRADE and account.brokerage_name:
+        # Suffix " (ST)" so the reader can tell at a glance that this
+        # "Alpaca" / "Webull" / "Robinhood" was routed via SnapTrade, not a
+        # direct integration. Direct connections stay bare — see below.
+        return f"{account.brokerage_name} (ST)"
+    return (account.broker.value if account.broker else None) or account.label
+
+
 def _serialize_child(
     child: Order,
     parent: Order,
@@ -81,26 +103,7 @@ def _serialize_child(
     account: BrokerAccount | None = None,
 ) -> dict[str, Any]:
     accepted_at = child.submitted_at
-    # Subscriber's connected broker for this mirror. Precedence:
-    #   1. SnapTrade-routed accounts → the *underlying* broker
-    #      (Webull / Robinhood / IBKR / …) captured at connect time and
-    #      denormalized onto BrokerAccount.brokerage_name. Without this
-    #      every SnapTrade subscriber would render as the generic
-    #      "snaptrade" which hides which actual broker handled each mirror.
-    #   2. Direct broker integrations → the broker enum value
-    #      (alpaca / webull / ibkr).
-    #   3. Fallback to the user-typed label (last resort — the label is
-    #      free-form text and doesn't reliably identify the broker).
-    broker_name = None
-    if account is not None:
-        if account.broker == BrokerName.SNAPTRADE and account.brokerage_name:
-            # Suffix " (ST)" so the trader can tell at a glance that this
-            # subscriber's "Alpaca" / "Webull" / "Robinhood" was routed via
-            # SnapTrade, not a direct integration. Direct connections stay
-            # bare ("Alpaca", "Webull") — see the else branch.
-            broker_name = f"{account.brokerage_name} (ST)"
-        else:
-            broker_name = (account.broker.value if account.broker else None) or account.label
+    broker_name = _broker_label(account)
     # New lifecycle stamps — see Order model / alembic e7a1d2c40f01.
     picked = child.subscriber_picked_at
     sub_accepted = child.subscriber_accepted_at
@@ -176,6 +179,16 @@ def _serialize_fanout(
         "side": parent.side.value,
         "quantity": str(parent.quantity),
         "instrument_type": parent.instrument_type.value,
+        # The trader's own order facts. Needed to compare a fanout against its
+        # source: detection latency depends on the TRADER's broker (Alpaca
+        # streams over a websocket; SnapTrade is polled), and a market vs limit
+        # order changes what "slow" even means. Callers previously had to infer
+        # all of this from the mirrors.
+        "trader_broker": _broker_label((accounts or {}).get(parent.broker_account_id)),
+        "order_type": parent.order_type.value if parent.order_type else None,
+        "status": parent.status.value if parent.status else None,
+        "filled_quantity": str(parent.filled_quantity or 0),
+        "broker_order_id": parent.broker_order_id,
         # Expected = the trader's limit price (NULL for market orders); filled =
         # the broker's average fill price. Surfaced side-by-side so the table can
         # show slippage.
