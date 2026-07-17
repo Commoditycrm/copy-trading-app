@@ -617,6 +617,19 @@ export function SubscriberPill({ counts }: { counts: { total: number; submitted:
  * per-subscriber latency, NOT `publish_lag_ms`. The latter is browser
  * notification lag and isn't part of the actual trade timing.
  */
+/** A mirror placed more than this after we detected the parent wasn't part of a
+ *  live fanout — it's a backfill, a re-sync, or a retry that landed hours later.
+ *  Its "lag" measures wall-clock between unrelated events, so folding it into
+ *  the median makes the card report hours of platform lag for a trade the
+ *  platform actually handled in milliseconds (a real example read
+ *  "Platform: 1000m 18s" next to "Broker: 73ms").
+ *
+ *  The backend already drops such rows from the fanout list on the parent side
+ *  — FANOUT_REALTIME_MAX_DETECTION in api/performance.py, same 1h cut. This is
+ *  the child-side equivalent: a parent can be a genuine live fanout and still
+ *  have one mirror backfilled long afterwards. Keep the two in sync. */
+const REALTIME_MAX_LAG_MS = 60 * 60 * 1000;
+
 function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
   // Pull the per-subscriber trade latencies. Subscribers whose mirror
   // never reached the broker (rejected up front) have null lag — we
@@ -625,21 +638,27 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
   const lags: number[] = [];
   const slowest: { ms: number; name: string | null } = { ms: -1, name: null };
   let errored = 0;
+  let backfilled = 0;
 
   for (const c of mirrors) {
-    if (c.subscriber_lag_ms === null || c.subscriber_lag_ms === undefined) {
+    const lag = c.subscriber_lag_ms;
+    if (lag === null || lag === undefined) {
       errored += 1;
       continue;
     }
-    lags.push(c.subscriber_lag_ms);
-    if (c.subscriber_lag_ms > slowest.ms) {
-      slowest.ms = c.subscriber_lag_ms;
+    if (lag > REALTIME_MAX_LAG_MS) {
+      backfilled += 1;
+      continue;
+    }
+    lags.push(lag);
+    if (lag > slowest.ms) {
+      slowest.ms = lag;
       slowest.name = c.subscriber_name
         || (c.subscriber_email ? c.subscriber_email.split("@")[0] : null);
     }
   }
 
-  
+
   const placedCount = lags.length;
   const under1s = lags.filter(l => l <= 1000).length;
   // Median: sort + pick middle. Skip when we have no samples.
@@ -675,7 +694,11 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
   const platformLags: number[] = [];
   const brokerLagsSplit: number[] = [];
   for (const c of mirrors) {
-    if (c.subscriber_lag_ms === null || c.subscriber_lag_ms === undefined) continue;
+    const lag = c.subscriber_lag_ms;
+    // Same realtime cut as the headline stats — pick_lag is measured from the
+    // parent's detection, so a backfilled mirror poisons Platform in exactly
+    // the way it poisons the median.
+    if (lag === null || lag === undefined || lag > REALTIME_MAX_LAG_MS) continue;
     platformLags.push((c.pick_lag_ms ?? 0) + (c.eligibility_lag_ms ?? 0));
     if (c.broker_lag_ms !== null && c.broker_lag_ms !== undefined) {
       brokerLagsSplit.push(c.broker_lag_ms);
@@ -704,16 +727,25 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
         Trade summary
       </div>
       <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+        {/* Every mirror was a backfill, so there's no live latency to report.
+            Say that rather than rendering a hollow "0 of 0 within 1 second",
+            which reads as a platform failure when nothing failed. */}
+        {placedCount === 0 && backfilled > 0 && (
+          <div style={{ color: "var(--muted)" }}>
+            No live fanout to measure — {backfilled === 1 ? "this mirror was" : `all ${backfilled} mirrors were`}{" "}
+            placed over an hour after the trade was detected (backfilled or retried, not copied live).
+          </div>
+        )}
         {/* Headline: how many subs got placed quickly. */}
-        <div>
-          <span style={{ color: pctUnder1s >= 90 ? "var(--good)" : "var(--warn)", fontWeight: 600 }}>
-            {under1s} of {placedCount}
-          </span>
-          <span style={{ color: "var(--muted)" }}> subscribers placed within 1 second</span>
-          {placedCount > 0 && (
+        {placedCount > 0 && (
+          <div>
+            <span style={{ color: pctUnder1s >= 90 ? "var(--good)" : "var(--warn)", fontWeight: 600 }}>
+              {under1s} of {placedCount}
+            </span>
+            <span style={{ color: "var(--muted)" }}> subscribers placed within 1 second</span>
             <span style={{ color: "var(--muted)" }}> ({pctUnder1s}%)</span>
-          )}
-        </div>
+          </div>
+        )}
         {/* Median latency — the "typical" subscriber experience. */}
         {median !== null && (
           <div>
@@ -738,6 +770,14 @@ function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
           <div>
             <span style={{ color: "var(--bad)", fontWeight: 600 }}>{errored} errored</span>
             <span style={{ color: "var(--muted)" }}> (e.g. credential issues — see Reject Reason)</span>
+          </div>
+        )}
+        {/* Excluded backfills — shown so the counts still reconcile against the
+            timeline below, which lists every mirror including these. */}
+        {backfilled > 0 && placedCount > 0 && (
+          <div>
+            <span style={{ color: "var(--muted)", fontWeight: 600 }}>{backfilled} excluded</span>
+            <span style={{ color: "var(--muted)" }}> (placed over an hour later — backfill or retry)</span>
           </div>
         )}
       </div>
