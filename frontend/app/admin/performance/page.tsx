@@ -259,7 +259,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={22} className="px-4 py-3">
+          <td colSpan={22} className="px-4 py-2.5">
             {/* Shared with the trader Performance view so admins see the exact
                 same per-subscriber columns — no second copy to keep in sync. */}
             <SubscriberBreakdown mirrors={fanout.children} />
