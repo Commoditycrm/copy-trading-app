@@ -8,6 +8,7 @@ import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
+import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, Position } from "@/lib/types";
@@ -486,7 +487,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   return (
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                        <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>{positionSymbolLabel(p)}</td>
+                        <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
+                          {/* gap-1.5 = 6px between glyph and symbol. */}
+                          <span className="inline-flex items-center gap-1.5">
+                            <PositionIcon kind={positionKind(p)} />
+                            {positionSymbolLabel(p)}
+                          </span>
+                        </td>
                         <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
                         {/* Side — Long / Short. */}
                         <td className="px-5 py-3.5">
