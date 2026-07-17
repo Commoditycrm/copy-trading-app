@@ -1,3 +1,4 @@
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -121,19 +122,44 @@ def export_trades(
     user: User = Depends(current_user),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
-    status: str = Query(default="all", description="Trades-page status tab"),
+    # aliased: the URL param stays ?status=, but binding it to `status` here
+    # would shadow fastapi's `status` module and turn every HTTPException in
+    # this function into an AttributeError.
+    status_tab: str = Query(default="all", alias="status", description="Trades-page status tab"),
     search: str | None = Query(default=None, description="Symbol substring"),
+    user_id: uuid.UUID | None = Query(
+        default=None,
+        description="ADMIN ONLY — export this user's orders instead of your own.",
+    ),
 ) -> Response:
-    """The caller's own orders as .xlsx, honouring the Trades page filters.
+    """Orders as .xlsx, honouring the Trades page filters.
 
-    Deliberately NOT limited: /trades caps at 1000 rows for the UI window, but
-    an export that silently stopped at 1000 would look complete and not be —
-    the whole point is to get everything matching the filter.
+    Defaults to the caller's own orders. Admins may pass ?user_id= to export
+    someone else's — unlike the admin Performance export, this covers a trader's
+    COMPLETE order history, including orders that never fanned out (Just-me
+    scope, copy paused, no subscribers).
+
+    Deliberately NOT limited to the UI's window: /trades caps at 1000 rows for
+    the table, but an export that silently stopped at 1000 would look complete
+    and not be. (ROW_CAP still applies, and is disclosed in the file.)
     """
+    # Authorization. Reading another user's trade history is admin-only — this
+    # is the whole ballgame for this endpoint, so it's an explicit deny rather
+    # than a silent fallback to `user`: a non-admin passing ?user_id= is either
+    # probing or hitting a bug, and both deserve a 403 over quietly handing back
+    # their own rows as if the filter had applied.
+    target = user
+    if user_id is not None and user_id != user.id:
+        if user.role != UserRole.ADMIN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="admin_only")
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
     q = (
         select(Order)
         .options(selectinload(Order.fills))
-        .where(Order.user_id == user.id)
+        .where(Order.user_id == target.id)
         .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
     )
     if from_:
@@ -141,7 +167,7 @@ def export_trades(
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
     q = trade_filters.exclude_dead_bracket_legs(q)
-    q = trade_filters.apply_status_tab(q, status)
+    q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
 
     orders = list(db.execute(q).scalars())
@@ -149,11 +175,15 @@ def export_trades(
     truncated = len(orders) > excel_export.ROW_CAP
     orders = orders[:excel_export.ROW_CAP]
 
+    # actor = who clicked, entity = whose data left the building. They differ on
+    # an admin export, and that distinction is the point of logging it.
     audit.record(
-        db, actor_user_id=user.id, action="trades.exported",
-        entity_type="user", entity_id=user.id,
-        metadata={"rows": len(orders), "status": status, "search": search,
-                  "from": str(from_) if from_ else None, "to": str(to) if to else None},
+        db, actor_user_id=user.id,
+        action="trades.exported_other" if target.id != user.id else "trades.exported",
+        entity_type="user", entity_id=target.id,
+        metadata={"rows": len(orders), "status": status_tab, "search": search,
+                  "from": str(from_) if from_ else None, "to": str(to) if to else None,
+                  "subject_email": target.email if target.id != user.id else None},
     )
     # Commit BEFORE building the file. build_workbook is pure CPU and runs for
     # ~0.8ms/row — 20k rows is ~15s, which is exactly Postgres's
@@ -175,8 +205,12 @@ def export_trades(
         # indistinguishable from a full dump once it's been emailed around.
         meta=(
             ("Exported (UTC)", now.replace(tzinfo=None)),
-            ("Account", user.email),
-            ("Status filter", status),
+            # Whose trades these are — not who clicked. On an admin export those
+            # differ, and mislabelling the file is how someone ends up reading
+            # one trader's history as another's.
+            ("Account", target.email),
+            *((("Exported by", user.email),) if target.id != user.id else ()),
+            ("Status filter", status_tab),
             ("Symbol search", search or "(none)"),
             ("From", from_ or "(all time)"),
             ("To", to or "(all time)"),
@@ -185,11 +219,23 @@ def export_trades(
              if truncated else "no"),
         ),
     )
+    # Name the subject in the file when it isn't the caller — an admin pulling
+    # several traders otherwise gets a folder of same-named downloads.
+    # Prefer the business/display name over the email: traders here use
+    # admin@<their-domain>, so the email's local part slugs to "admin" for all
+    # of them — colliding again, and reading like the ADMIN's own trades.
+    prefix = "trades"
+    if target.id != user.id:
+        label = ((target.business_name or "").strip()
+                 or (target.display_name or "").strip()
+                 or target.email.replace("@", "-at-"))
+        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+        prefix = f"trades-{slug or target.id.hex[:8]}"
     return Response(
         content=data,
         media_type=excel_export.XLSX_MEDIA_TYPE,
         headers={
-            "Content-Disposition": f'attachment; filename="{excel_export.filename("trades", when=now)}"',
+            "Content-Disposition": f'attachment; filename="{excel_export.filename(prefix, when=now)}"',
         },
     )
 
