@@ -5,13 +5,13 @@ of the US session, so every subscriber is left holding contracts that expire
 worthless that evening (this actually happened — SPXW puts expiring 13 Jul stayed
 open for subscribers after the trader flattened their own book).
 
-What it does: at 15:55 ET — 5 minutes before the 16:00 close — sweep every
+What it does: at 15:45 ET — 15 minutes before the 16:00 close — sweep every
 subscriber's connected broker accounts and market-close any OPTION position whose
 expiry is TODAY. Positions expiring on a later date, and all stock positions, are
 left completely untouched. It runs INDEPENDENT of the trader — a pure safety net.
 
-Pairs with the last-5-minutes new-order lockout in ``copy_engine.fanout_async``:
-once the sweep starts flattening at 15:55, we also stop mirroring fresh
+Pairs with the last-15-minutes new-order lockout in ``copy_engine.fanout_async``:
+once the sweep starts flattening at 15:45, we also stop mirroring fresh
 same-day-expiry orders, so nothing re-opens behind the sweep.
 
 Runs as a background asyncio loop in the WORKER process only (see app/main.py),
@@ -44,14 +44,14 @@ _BULK_CONCURRENCY = 4
 _PER_ACCOUNT_TIMEOUT_S = 60.0
 
 # ET date we last swept, so the sweep runs ONCE even though the loop ticks every
-# 30s across the whole 5-minute window. Process-local — a worker restart inside
+# 30s across the whole 15-minute window. Process-local — a worker restart inside
 # the window resets it, which just re-runs the (idempotent) sweep.
 _last_swept: date | None = None
 
 
 async def run_loop(shutdown_check=None) -> None:
     """Background loop. Every ``_CHECK_INTERVAL_S`` seconds, if we're inside the
-    15:55–16:00 ET window and haven't swept today, run the same-day-expiry close.
+    15:45–16:00 ET window and haven't swept today, run the same-day-expiry close.
 
     ``shutdown_check`` is a zero-arg callable returning True when the process is
     shutting down (we reuse main.py's shared threading.Event.is_set)."""
