@@ -1156,6 +1156,26 @@ def trader_can_trade(db: Session, trader: User) -> bool:
     return bool(settings and settings.trading_enabled)
 
 
+def fanout_suppressed(ts: "TraderSettings | None") -> bool:
+    """True when the trader has switched copying off, so a detected order must
+    NOT be mirrored to subscribers.
+
+    Honours BOTH trader switches, which is the fix for the reported bug:
+      * copy_paused      — the top-nav "master fanout gate".
+      * trading_enabled  — the Settings-page "Trading — Turn OFF" button.
+
+    Before this, fanout gated only on copy_paused, so a trader who turned
+    "Trading OFF" (trading_enabled=false) and then placed an order at their
+    broker still had it copied — the listener path never consulted
+    trading_enabled (only the in-app placement path did, via trader_can_trade).
+
+    A missing settings row (ts is None) is treated as NOT suppressed, matching
+    the prior copy_paused-only behaviour — the row is created at registration
+    with trading_enabled=True, so None is an anomaly we stay permissive on
+    rather than silently freezing an existing trader's copying."""
+    return ts is not None and (ts.copy_paused or not ts.trading_enabled)
+
+
 # ── Async fanout (the live path used by BackgroundTasks) ──────────────────
 
 
@@ -1183,9 +1203,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     if trader_order.bracket_parent_id is not None:
         return results
 
-    # Trader master pause — skip all fanout when set.
+    # Trader switched copying off — skip all fanout. Covers BOTH the master
+    # fanout pause (copy_paused) AND the Settings "Trading OFF" switch
+    # (trading_enabled); see fanout_suppressed for why both matter.
     ts = db.get(TraderSettings, trader.id)
-    if ts is not None and ts.copy_paused:
+    if fanout_suppressed(ts):
         return results
 
     # ── Phase 1: build child orders + skip records ─────────────────────────
@@ -2020,13 +2042,14 @@ def fanout_threadsafe(
                 return []
             results = await fanout_async(db, order, trader)
             # Only flag as broadcast if copy was actually ACTIVE. When the
-            # trader's master copy is paused, fanout_async no-ops (returns
-            # early) and nothing was sent to subscribers — so leave the flag
-            # False. Otherwise an order placed (or observed) while copy was
-            # OFF would wrongly land in the trader's "All Orders" tab
-            # (copy-on) instead of "My Orders" (copy-off).
+            # trader has copying switched off (master pause OR Trading OFF),
+            # fanout_async no-ops (returns early) and nothing was sent to
+            # subscribers — so leave the flag False. Otherwise an order placed
+            # (or observed) while copy was OFF would wrongly land in the
+            # trader's "All Orders" tab (copy-on) instead of "My Orders". Uses
+            # the SAME predicate as fanout_async so the two can't disagree.
             ts = db.get(TraderSettings, trader_id)
-            if not (ts is not None and ts.copy_paused):
+            if not fanout_suppressed(ts):
                 order.fanned_out_to_subscribers = True
             db.commit()
             return results
