@@ -166,13 +166,21 @@ def close_all_positions(
                 continue
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
+            # Stocks close at MARKET; OPTIONS always as a LIMIT — both brokers
+            # refuse option market orders (Alpaca always; Webull on
+            # limited-liquidity contracts). See _option_close_limit.
+            close_type = OrderType.MARKET
+            close_limit: Decimal | None = None
+            if pos.instrument_type == InstrumentType.OPTION:
+                close_type = OrderType.LIMIT
+                close_limit = _option_close_limit(adapter, pos, reverse_side)
             payload = PlaceOrderIn(
                 instrument_type=pos.instrument_type,
                 symbol=pos.symbol,
                 side=reverse_side,
-                order_type=OrderType.MARKET,
+                order_type=close_type,
                 quantity=qty,
-                limit_price=None,
+                limit_price=close_limit,
                 stop_price=None,
                 option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
                 option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
@@ -347,6 +355,29 @@ def _marketable_option_close_price(
     return _round_close_limit(px, side)
 
 
+def _option_close_limit(adapter, pos: BrokerPosition, side: OrderSide) -> Decimal:
+    """A LIMIT price to close an option NOW — ALWAYS non-None, so we NEVER send a
+    market order for an option. Both brokers refuse option market orders: Alpaca
+    always (no available quote), Webull on limited-liquidity contracts (e.g. a
+    deep-OTM 0DTE — "This contract has limited liquidity and does not support
+    market or stop orders"). Priority: marketable price (bid/ask) → the position's
+    mark → a minimum tick. Worst case the order simply RESTS (it fills if a bid
+    appears, otherwise the option cash-settles at expiration) instead of being
+    rejected outright."""
+    px = _marketable_option_close_price(adapter, pos, side)
+    if px is not None and px > 0:
+        return px
+    mark = pos.current_price
+    if mark is not None and mark > 0:
+        from app.services.trader_bracket_monitor import _round_close_limit  # noqa: PLC0415
+        rounded = _round_close_limit(mark, side)
+        # ROUND_DOWN on a SELL can floor a sub-tick mark (e.g. 0.005) to 0.00 —
+        # never return a non-positive limit.
+        if rounded > 0:
+            return rounded
+    return Decimal("0.01")
+
+
 def _close_account_positions_sync(
     sub_id: uuid.UUID,
     acct_id: uuid.UUID,
@@ -411,18 +442,17 @@ def _close_account_positions_sync(
                 continue
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
-            # Default: plain MARKET (works for stocks everywhere, and for options
-            # on Webull/SnapTrade). When option_marketable_limit is set, close
-            # OPTIONS with a marketable LIMIT so they also flatten on Alpaca,
-            # which rejects option MARKET orders. Falls back to MARKET if the
-            # contract can't be quoted right now.
+            # Stocks close at MARKET (works on both brokers in regular hours).
+            # OPTIONS ALWAYS close as a LIMIT, never market — both brokers refuse
+            # option market orders (Alpaca always; Webull on limited-liquidity
+            # contracts like a deep-OTM 0DTE). _option_close_limit always returns
+            # a price (marketable → mark → floor). The `option_marketable_limit`
+            # param is retained for signature stability but no longer gates this.
             close_type = OrderType.MARKET
             close_limit: Decimal | None = None
-            if option_marketable_limit and pos.instrument_type == InstrumentType.OPTION:
-                px = _marketable_option_close_price(adapter, pos, reverse_side)
-                if px is not None:
-                    close_type = OrderType.LIMIT
-                    close_limit = px
+            if pos.instrument_type == InstrumentType.OPTION:
+                close_type = OrderType.LIMIT
+                close_limit = _option_close_limit(adapter, pos, reverse_side)
             payload = PlaceOrderIn(
                 instrument_type=pos.instrument_type,
                 symbol=pos.symbol,
@@ -449,11 +479,44 @@ def _close_account_positions_sync(
                     "order_id": str(order.id),
                 })
             except Exception as exc:  # noqa: BLE001
+                emsg = str(exc)
+                # Safety net: the broker refused the order TYPE, not the trade —
+                # e.g. "does not support market" / "limited liquidity" on an
+                # illiquid contract. Retry ONCE as a plain LIMIT (options are
+                # already limit, so this covers an illiquid stock) at the mark
+                # price, so the close rests instead of failing outright.
+                retriable = (
+                    close_type == OrderType.MARKET
+                    and ("does not support market" in emsg.lower()
+                         or "limited liquidity" in emsg.lower())
+                )
+                retry_px = pos.current_price if (pos.current_price and pos.current_price > 0) else None
+                if retriable and retry_px is not None:
+                    try:
+                        retry_payload = payload.model_copy(update={
+                            "order_type": OrderType.LIMIT, "limit_price": retry_px,
+                        })
+                        order = _place_trader_order(
+                            db_local, sub_user, retry_payload, acct.id, bg, request=req_shim,  # type: ignore[arg-type]
+                            skip_fanout=True, resolve_wash_trade=True,
+                        )
+                        closed.append({
+                            "subscriber_user_id": str(sub_id),
+                            "broker_account_id": str(acct_id),
+                            "symbol": pos.symbol,
+                            "qty": str(qty),
+                            "side": reverse_side.value,
+                            "order_id": str(order.id),
+                            "note": "retried_as_limit",
+                        })
+                        continue
+                    except Exception as exc2:  # noqa: BLE001
+                        emsg = str(exc2)
                 failed.append({
                     "subscriber_user_id": str(sub_id),
                     "broker_account_id": str(acct_id),
                     "symbol": pos.symbol,
-                    "error": str(exc)[:300],
+                    "error": emsg[:300],
                 })
 
     return {"closed": closed, "failed": failed}
@@ -504,15 +567,27 @@ def close_position(
     if close_qty > full_qty:
         raise HTTPException(422, "quantity_exceeds_position")
 
+    # Options can't be closed with a market order — Alpaca rejects them always,
+    # Webull rejects them on limited-liquidity contracts ("does not support
+    # market or stop orders"). Force a LIMIT priced through the market (or a
+    # floor) UNLESS the caller supplied their own limit price.
+    close_type = payload.order_type
+    close_limit = payload.limit_price
+    if pos.instrument_type == InstrumentType.OPTION and (
+        close_type == OrderType.MARKET or close_limit is None
+    ):
+        close_type = OrderType.LIMIT
+        close_limit = _option_close_limit(adapter, pos, reverse_side)
+
     # For options, _place_trader_order rebuilds the OCC symbol from
     # (expiry, strike, right), so we pass the bare root in `symbol`.
     new_payload = PlaceOrderIn(
         instrument_type=pos.instrument_type,
         symbol=pos.symbol,
         side=reverse_side,
-        order_type=payload.order_type,
+        order_type=close_type,
         quantity=close_qty,
-        limit_price=payload.limit_price,
+        limit_price=close_limit,
         stop_price=None,
         option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
         option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
