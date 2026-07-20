@@ -750,9 +750,20 @@ def cancel_and_replace_mirrors_for_modify(
         def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
             old_ch, ad, rq, new_id = item
             try:
-                ad.cancel_order(old_ch.broker_order_id)
+                cancelled = ad.cancel_order(old_ch.broker_order_id)
             except Exception as exc:  # noqa: BLE001
                 return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+            # A False here means the broker had nothing to cancel — the order is
+            # already terminal, and the overwhelmingly likely reason is that it
+            # FILLED. Placing the replacement now would double the position, so
+            # bail. This is not hypothetical: prod doubled a subscriber's META
+            # entry exactly this way. SnapTrade returns 1070 ("failed to cancel")
+            # while its own order feed still shows the mirror as working — its
+            # data lagged the real fill by ~42s — so neither our DB nor a
+            # get_order re-check could see the truth. The cancel result is the
+            # only signal that reflects the broker's ACTUAL state at this moment.
+            if cancelled is False:
+                return old_ch.id, new_id, None, "cancel_noop_already_terminal"
             try:
                 return old_ch.id, new_id, ad.place_order(rq), None
             except Exception as exc:  # noqa: BLE001
@@ -768,6 +779,19 @@ def cancel_and_replace_mirrors_for_modify(
             if old_ch is None:
                 continue
             rq = req_by_new_id[new_id]
+            if err == "cancel_noop_already_terminal":
+                # The broker had nothing to cancel — the mirror is already
+                # terminal, and that almost always means it FILLED. Place
+                # nothing (a replacement doubles the position) and do NOT mark
+                # it CANCELED, because it isn't. Leave the row alone; fills_sync
+                # settles it to FILLED on its next tick.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_modify_skipped_already_terminal",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(old_trader_order_id), "broker_order_id": old_ch.broker_order_id},
+                )
+                continue
             if err is not None and err.startswith("cancel_failed"):
                 # Old order still live (likely mid-fill) — leave it, place nothing.
                 audit.record(
@@ -959,9 +983,20 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
         def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
             old_ch, ad, rq, new_id = item
             try:
-                ad.cancel_order(old_ch.broker_order_id)
+                cancelled = ad.cancel_order(old_ch.broker_order_id)
             except Exception as exc:  # noqa: BLE001
                 return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+            # A False here means the broker had nothing to cancel — the order is
+            # already terminal, and the overwhelmingly likely reason is that it
+            # FILLED. Placing the replacement now would double the position, so
+            # bail. This is not hypothetical: prod doubled a subscriber's META
+            # entry exactly this way. SnapTrade returns 1070 ("failed to cancel")
+            # while its own order feed still shows the mirror as working — its
+            # data lagged the real fill by ~42s — so neither our DB nor a
+            # get_order re-check could see the truth. The cancel result is the
+            # only signal that reflects the broker's ACTUAL state at this moment.
+            if cancelled is False:
+                return old_ch.id, new_id, None, "cancel_noop_already_terminal"
             try:
                 return old_ch.id, new_id, ad.place_order(rq), None
             except Exception as exc:  # noqa: BLE001
@@ -977,6 +1012,20 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             if old_ch is None:
                 continue
             rq = req_by_new_id[new_id]
+            if err == "cancel_noop_already_terminal":
+                # The broker had nothing to cancel: the mirror already reached a
+                # terminal state, i.e. it FILLED while we still believed it was
+                # resting. Place nothing — this is the exact path that
+                # double-bought a subscriber's META entry in prod — and do NOT
+                # mark it CANCELED, because it isn't. fills_sync settles the real
+                # status on its next tick.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_force_fill_skipped_already_terminal",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(trader_order_id), "broker_order_id": old_ch.broker_order_id},
+                )
+                continue
             if err is not None and err.startswith("cancel_failed"):
                 # Couldn't cancel — most likely the resting limit JUST filled on
                 # its own (the subscriber exited at the better price). Leave it.

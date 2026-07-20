@@ -192,10 +192,11 @@ class FakeBrokerAdapter(BrokerAdapter):
             reject_reason=None,
         )
 
-    def cancel_order(self, broker_order_id: str) -> None:
+    def cancel_order(self, broker_order_id: str) -> bool:
         # Tiny sleep so cancel-fanout latency in the metrics isn't an
         # unrealistic zero.
         time.sleep(0.05)
+        return True
 
     def get_positions(self) -> list[BrokerPosition]:
         # Test users don't have real positions; the positions page will

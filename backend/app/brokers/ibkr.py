@@ -307,7 +307,9 @@ class IBKRAdapter(BrokerAdapter):
                 return self._order_to_result(o)
         raise LookupError(f"IBKR order {broker_order_id} not in recent orders feed")
 
-    def cancel_order(self, broker_order_id: str) -> None:
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """True — a failed cancel raises, so reaching the return means the order
+        was live and is now cancelled. See base.cancel_order."""
         try:
             self._request(
                 "DELETE",
@@ -315,6 +317,7 @@ class IBKRAdapter(BrokerAdapter):
             )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"IBKR cancel_order: {exc}") from exc
+        return True
 
     # ── Positions ─────────────────────────────────────────────────────────
 

@@ -114,7 +114,20 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def get_order(self, broker_order_id: str) -> BrokerOrderResult: ...
 
-    def cancel_order(self, broker_order_id: str) -> None:
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """Cancel a working order.
+
+        Returns True when we actually cancelled a live order, False when the
+        broker reports it was ALREADY terminal (filled / cancelled / expired) —
+        i.e. there was nothing to cancel.
+
+        That distinction matters to anything doing cancel-then-replace: a False
+        means the order may have FILLED, so placing a replacement would double
+        the position. Callers that only want the end state ("no longer working")
+        can keep ignoring the return value — both outcomes satisfy that.
+
+        Raises only when the cancel genuinely failed and the order's state is
+        unknown."""
         raise NotImplementedError
 
     def get_positions(self) -> list[BrokerPosition]:
