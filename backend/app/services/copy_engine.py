@@ -1333,10 +1333,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # vs absolute-price copy; see _trader_bracket_for_copy.
     copy_use_pct, copy_tp_val, copy_sl_val = _trader_bracket_for_copy(trader_order)
 
-    # End-of-day lockout (order-level, so computed once). In the last 5 minutes
+    # End-of-day lockout (order-level, so computed once). In the last 15 minutes
     # before the US close we do NOT mirror SAME-DAY-EXPIRY option orders to
     # subscribers — the eod_autoclose sweep is flattening those very contracts at
-    # 15:55, so letting a fresh 0DTE mirror through would just re-strand the
+    # 15:45, so letting a fresh 0DTE mirror through would just re-strand the
     # subscriber (or, for a close, no-op against a position we already flattened).
     # Later-expiry options and all stocks pass through untouched.
     eod_locked = (
@@ -1355,7 +1355,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
 
-        # EOD lockout: refuse new same-day-expiry option mirrors in the final 5
+        # EOD lockout: refuse new same-day-expiry option mirrors in the final 15
         # minutes before the US close (see eod_locked above).
         if eod_locked:
             audit.record(
