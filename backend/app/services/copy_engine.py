@@ -172,6 +172,28 @@ class _DanglingEntryCancelled(Exception):
         self.cancelled_ids = cancelled_ids
 
 
+class _DeferUntilEntryFills(Exception):
+    """Raised inside ``_place_mirror_with_conflict_resolve`` when a close can't be
+    placed YET because the subscriber's own ENTRY for this contract is still
+    working (unfilled) — e.g. a pre-market BUY queued for the 09:30 open, or a
+    fast scalp where the SELL arrives before the BUY has filled. Placing the SELL
+    now just rejects (Alpaca "opposite side order exists" wash-trade / SnapTrade
+    "no position to close"). Instead we DEFER: park the close as RETRY_PENDING and
+    fire it the moment the entry fills (see fire_deferred_closes_for_entry, called
+    from the fill-detection paths). The close must NOT be thrown away — it's valid,
+    just not yet."""
+
+    def __init__(self, entry_ids: list[uuid.UUID]):
+        super().__init__("close deferred until subscriber entry fills")
+        self.entry_ids = entry_ids
+
+
+# How long a deferred close waits before the retry-scheduler gives up on it (a
+# safety net if the entry-fill event is ever missed). Comfortably spans
+# pre-market → close so a 09:30 fill always fires the event-driven path first.
+_DEFERRED_CLOSE_TTL_HOURS = 8
+
+
 # Statuses whose UNFILLED remainder still reserves shares at the broker
 # (the broker's "held_for_orders"). A second close of the same shares while
 # one of these is working gets rejected (e.g. Alpaca 40310000).
@@ -226,6 +248,56 @@ def _cancel_subscriber_conflicts(item: "_PendingMirror") -> list[uuid.UUID]:
                 db.refresh(o)
                 events.publish(item.subscriber_user_id, _order_event("order.cancelled", o))
     return cancelled
+
+
+def _working_entry_order_ids(item: "_PendingMirror") -> list[uuid.UUID]:
+    """Read-only: the subscriber's still-WORKING, unfilled ENTRY orders for the
+    SAME contract as this close (the OPPOSITE side — a BUY blocking a SELL close).
+    Used to decide whether a close should be DEFERRED (entry still on its way)
+    rather than rejected. Distinct from _cancel_subscriber_conflicts: this only
+    LOOKS, it never cancels."""
+    req = item.request
+    entry_side = OrderSide.BUY if req.side == OrderSide.SELL else OrderSide.SELL
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(Order.id).where(
+                Order.user_id == item.subscriber_user_id,
+                Order.broker_account_id == item.broker_account_id,
+                Order.instrument_type == req.instrument_type,
+                Order.symbol == req.symbol,
+                Order.option_expiry.is_not_distinct_from(req.option_expiry),
+                Order.option_strike.is_not_distinct_from(req.option_strike),
+                Order.option_right.is_not_distinct_from(req.option_right),
+                Order.side == entry_side,
+                Order.is_closing.is_(False),
+                Order.status.in_(_WORKING_ORDER_STATUSES),
+                func.coalesce(Order.filled_quantity, 0) < Order.quantity,
+                Order.id != item.child_order_id,
+            )
+        ).scalars().all()
+    return list(rows)
+
+
+def _has_working_entry_for_contract(db: Session, user_id: uuid.UUID, order: Order) -> bool:
+    """True if the subscriber has a still-WORKING ENTRY (opposite side of this
+    close) for the exact contract. Lets the fanout tell a FILL-SYNC RACE (entry
+    filled at the broker but not yet reflected in our filled_quantity) apart from
+    a genuine 'nothing to close' — so it doesn't shrink a close to zero and skip
+    it while the entry's fill is still landing. Uses the caller's session."""
+    entry_side = OrderSide.BUY if order.side == OrderSide.SELL else OrderSide.SELL
+    return db.execute(
+        select(Order.id).where(
+            Order.user_id == user_id,
+            Order.symbol == order.symbol,
+            Order.instrument_type == order.instrument_type,
+            Order.option_expiry.is_not_distinct_from(order.option_expiry),
+            Order.option_strike.is_not_distinct_from(order.option_strike),
+            Order.option_right.is_not_distinct_from(order.option_right),
+            Order.side == entry_side,
+            Order.is_closing.is_(False),
+            Order.status.in_(_WORKING_ORDER_STATUSES),
+        ).limit(1)
+    ).first() is not None
 
 
 def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
@@ -298,35 +370,46 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
         # get_positions call on every entry.)
         should_close_now = req.is_closing
         cancelled_working_entry = False
-        if (
-            not should_close_now
-            and req.side == OrderSide.SELL
-            and req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION)
+        if req.side == OrderSide.SELL and req.instrument_type in (
+            InstrumentType.STOCK, InstrumentType.OPTION
         ):
+            # Ask the broker what the subscriber actually holds. This drives BOTH
+            # close-detection (SnapTrade never sets is_closing, so a genuine close
+            # arrives flagged False) AND the defer/dangling decision below — so we
+            # run it for flagged closes too, not just unflagged ones.
             held = live_closeable_quantity(item.adapter, req)
             if held is not None and held > 0:
-                should_close_now = True
+                should_close_now = True                        # position held → close it
             elif held is not None and held == 0:
-                # Trader is selling to close but we see NO position yet — the
-                # subscriber's entry BUY is still working (a RACE: the trader's
-                # buy→sell was fast enough that the close arrives while our BUY
-                # hasn't filled). A naked SELL here just rejects. Cancel the
-                # working entry so it can't strand the subscriber, then re-check
-                # the LIVE position a few times — if a fill landed anyway,
-                # market-close it; only if truly flat do we report the entry
-                # cancelled. (Nothing to cancel → fall through: may be a genuine
-                # opening short, which we mirror.)
-                cancelled = _cancel_subscriber_conflicts(item)
-                cancelled_working_entry = bool(cancelled)
-                if cancelled:
-                    for _ in range(3):
-                        recheck = live_closeable_quantity(item.adapter, req)
-                        if recheck is not None and recheck > 0:
-                            should_close_now = True  # a fill snuck in → close it
-                            break
-                        time.sleep(1.0)
-                    if not should_close_now:
+                # Nothing held yet. Is this SELL a CLOSE — flagged, or does the
+                # subscriber have a still-working ENTRY it would close?
+                entry_ids = _working_entry_order_ids(item)
+                if should_close_now or entry_ids:
+                    if entry_ids:
+                        # The entry is on its way (pre-market BUY queued for the
+                        # 09:30 open, or a fast scalp where the SELL beat the BUY).
+                        # Placing the SELL now just rejects (Alpaca "opposite side
+                        # order exists" / SnapTrade "no position"). Give a just-
+                        # landed fill a brief beat; if still nothing, DEFER — park
+                        # the close and fire it the instant the entry fills
+                        # (fire_deferred_closes_for_entry). We do NOT cancel the entry.
+                        filled_during_recheck = False
+                        for _ in range(3):
+                            recheck = live_closeable_quantity(item.adapter, req)
+                            if recheck is not None and recheck > 0:
+                                should_close_now = True  # fill landed → close now
+                                filled_during_recheck = True
+                                break
+                            time.sleep(1.0)
+                        if not filled_during_recheck:
+                            raise _DeferUntilEntryFills(entry_ids)
+                    else:
+                        # Flagged close, no position, and no entry coming → nothing
+                        # to sell. Cancel any leftover working order; report the
+                        # mirror skipped. Never place a naked SELL.
+                        cancelled = _cancel_subscriber_conflicts(item)
                         raise _DanglingEntryCancelled(cancelled)
+                # else: not a close and no entry → genuine opening short; fall through.
         if should_close_now:
             req = _to_immediate_close(item.adapter, req)
             if not req.is_closing:
@@ -538,7 +621,14 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
                 trader_order.quantity, multiplier, acct.supports_fractional
             )
             if trader_order.is_closing and new_qty > 0:
-                closeable = _closeable_quantity(db, child.user_id, trader_order)
+                # Clamp to the RAW held position (subtract_reserved=False). The
+                # order being modified is itself a working close that RESERVES the
+                # position; subtracting that reservation would compute closeable=0
+                # and drop the modify entirely (held 5 − reserved-by-old-close 5 =
+                # 0). We're about to CANCEL that old order, so it must not count.
+                closeable = _closeable_quantity(
+                    db, child.user_id, trader_order, subtract_reserved=False
+                )
                 if closeable < new_qty:
                     new_qty = closeable
 
@@ -709,7 +799,15 @@ def cancel_and_replace_mirrors_for_modify(
                 new_order.quantity, multiplier, acct.supports_fractional
             )
             if new_order.is_closing and new_qty > 0:
-                closeable = _closeable_quantity(db, child.user_id, new_order)
+                # Clamp to the RAW held position (subtract_reserved=False). The
+                # old mirror we're about to CANCEL is a working close that
+                # RESERVES the position; subtracting it would compute closeable=0
+                # and skip the whole modify (the prod bug: an AMZN close-price
+                # change from 3.00→3.20 never reached subscribers because their
+                # own resting close reserved the shares).
+                closeable = _closeable_quantity(
+                    db, child.user_id, new_order, subtract_reserved=False
+                )
                 if closeable < new_qty:
                     new_qty = closeable
             if new_qty <= 0:
@@ -1099,6 +1197,125 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             )
             db.flush()
             events.publish(new_child.user_id, _order_event("order.copy_submitted", new_child))
+        db.commit()
+
+
+def _deferred_close_query(sub_id, acct_id, it_type, sym, exp, strike, right):
+    """Rows for a DEFERRED close on this exact contract (parked RETRY_PENDING with
+    no broker order — see _DeferUntilEntryFills)."""
+    return select(Order).where(
+        Order.user_id == sub_id,
+        Order.broker_account_id == acct_id,
+        Order.instrument_type == it_type,
+        Order.symbol == sym,
+        Order.option_expiry.is_not_distinct_from(exp),
+        Order.option_strike.is_not_distinct_from(strike),
+        Order.option_right.is_not_distinct_from(right),
+        Order.is_closing.is_(True),
+        Order.status == OrderStatus.RETRY_PENDING,
+        Order.broker_order_id.is_(None),
+    )
+
+
+def fire_deferred_closes_for_entry(entry: Order) -> None:
+    """A subscriber ENTRY just FILLED — place any close we DEFERRED for this exact
+    contract (a close that arrived before its entry filled, e.g. a pre-market SELL
+    queued behind a BUY, or a fast scalp). Now that the position exists, the close
+    can go through. Called from the fill-detection paths (Alpaca fills_sync +
+    SnapTrade subscriber reconciler) on a mirror BUY→FILLED transition. Opens its
+    OWN session and reads the LIVE broker position, so it doesn't depend on the
+    caller's transaction. NO-OP when there's nothing deferred."""
+    if entry.is_closing or entry.parent_order_id is None:
+        return
+    sub_id, acct_id = entry.user_id, entry.broker_account_id
+    it_type, sym = entry.instrument_type, entry.symbol
+    exp, strike, right = entry.option_expiry, entry.option_strike, entry.option_right
+    with SessionLocal() as db:
+        deferred = list(db.execute(
+            _deferred_close_query(sub_id, acct_id, it_type, sym, exp, strike, right)
+        ).scalars().all())
+        if not deferred:
+            return
+        acct = db.get(BrokerAccount, acct_id)
+        if acct is None:
+            return
+        try:
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter = adapter_for(acct, creds)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("fire_deferred_closes: adapter build failed for %s", acct_id)
+            return
+        for ch in deferred:
+            req = BrokerOrderRequest(
+                instrument_type=ch.instrument_type, symbol=ch.symbol, side=ch.side,
+                order_type=ch.order_type, quantity=ch.quantity, limit_price=ch.limit_price,
+                stop_price=ch.stop_price, option_expiry=ch.option_expiry,
+                option_strike=ch.option_strike, option_right=ch.option_right,
+                is_closing=True, client_order_id=str(ch.id),
+            )
+            # Clamp to what's actually held now; the entry may have partially filled.
+            held = live_closeable_quantity(adapter, req)
+            if held is not None and held <= 0:
+                continue  # position still not there — leave for the retry-scheduler TTL
+            if held is not None and held < req.quantity:
+                req = replace(req, quantity=held)
+            req = _to_immediate_close(adapter, req)
+            if not req.is_closing:
+                req = replace(req, is_closing=True)
+            try:
+                resp = adapter.place_order(req)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=ch.user_id, action="copy.deferred_close_place_failed",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={"symbol": ch.symbol, "error": str(exc)[:300]},
+                )
+                continue
+            ch.status = resp.status
+            ch.broker_order_id = resp.broker_order_id
+            ch.order_type = req.order_type
+            ch.quantity = req.quantity
+            ch.limit_price = req.limit_price
+            ch.filled_quantity = resp.filled_quantity
+            ch.filled_avg_price = resp.filled_avg_price
+            ch.submitted_at = resp.submitted_at
+            ch.retry_at = None
+            ch.reject_reason = None
+            audit.record(
+                db, actor_user_id=ch.user_id, action="copy.deferred_close_placed_on_entry_fill",
+                entity_type="order", entity_id=ch.id,
+                metadata={"symbol": ch.symbol, "broker_order_id": resp.broker_order_id, "quantity": str(req.quantity)},
+            )
+            events.publish(ch.user_id, _order_event("order.placed", ch))
+        db.commit()
+
+
+def cancel_deferred_closes_for_entry(entry: Order) -> None:
+    """A subscriber ENTRY died (CANCELED / REJECTED / EXPIRED) without filling — so
+    any close we DEFERRED behind it has nothing to sell. Mark those deferred
+    closes CANCELED. Own session; NO-OP when nothing is deferred."""
+    if entry.is_closing or entry.parent_order_id is None:
+        return
+    sub_id, acct_id = entry.user_id, entry.broker_account_id
+    it_type, sym = entry.instrument_type, entry.symbol
+    exp, strike, right = entry.option_expiry, entry.option_strike, entry.option_right
+    with SessionLocal() as db:
+        deferred = list(db.execute(
+            _deferred_close_query(sub_id, acct_id, it_type, sym, exp, strike, right)
+        ).scalars().all())
+        if not deferred:
+            return
+        now = datetime.now(timezone.utc)
+        for ch in deferred:
+            ch.status = OrderStatus.CANCELED
+            ch.closed_at = now
+            ch.retry_at = None
+            ch.reject_reason = "Your entry never filled, so there was nothing to close."[:480]
+            audit.record(
+                db, actor_user_id=ch.user_id, action="copy.deferred_close_cancelled_entry_died",
+                entity_type="order", entity_id=ch.id, metadata={"symbol": ch.symbol},
+            )
+            events.publish(ch.user_id, _order_event("order.cancelled", ch))
         db.commit()
 
 
@@ -1527,20 +1744,47 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # rather than shrinking the close to zero here.
             if is_closing_effective and scaled > 0:
                 if closeable < scaled:
-                    audit.record(
-                        db,
-                        actor_user_id=sub.user_id,
-                        action="copy.close_clamped",
-                        entity_type="order",
-                        entity_id=trader_order.id,
-                        metadata={
-                            "requested_qty": str(scaled),
-                            "held_qty": str(closeable),
-                            "symbol": trader_order.symbol,
-                            "broker_account_id": str(acct.id),
-                        },
-                    )
-                    scaled = closeable
+                    # Clamping a close to what the subscriber holds is correct for
+                    # a real partial. BUT shrinking it to ZERO is usually the
+                    # FILL-SYNC RACE: the subscriber's entry filled at the broker
+                    # (e.g. a fast buy→sell, or a pre-market fill) and just hasn't
+                    # synced to our filled_quantity yet, so _closeable_quantity
+                    # reads 0. If a same-contract ENTRY is still working, DON'T
+                    # drop the close — leave `scaled` as-is and let placement
+                    # re-check the LIVE broker position and defer until the fill
+                    # lands (_place_mirror_with_conflict_resolve). This is exactly
+                    # the case that skipped a subscriber's NVDA close in prod while
+                    # another subscriber (whose fill had synced) went through.
+                    if closeable <= 0 and _has_working_entry_for_contract(
+                        db, sub.user_id, trader_order
+                    ):
+                        audit.record(
+                            db,
+                            actor_user_id=sub.user_id,
+                            action="copy.close_entry_pending_no_clamp",
+                            entity_type="order",
+                            entity_id=trader_order.id,
+                            metadata={
+                                "requested_qty": str(scaled),
+                                "symbol": trader_order.symbol,
+                                "broker_account_id": str(acct.id),
+                            },
+                        )
+                    else:
+                        audit.record(
+                            db,
+                            actor_user_id=sub.user_id,
+                            action="copy.close_clamped",
+                            entity_type="order",
+                            entity_id=trader_order.id,
+                            metadata={
+                                "requested_qty": str(scaled),
+                                "held_qty": str(closeable),
+                                "symbol": trader_order.symbol,
+                                "broker_account_id": str(acct.id),
+                            },
+                        )
+                        scaled = closeable
             if scaled <= 0:
                 audit.record(
                     db,
@@ -1830,6 +2074,40 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
             child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.cancelled", child))
+        elif isinstance(exc, _DeferUntilEntryFills):
+            # The close can't be placed yet — the subscriber's ENTRY is still
+            # working (pre-market queue / fast scalp). DON'T reject it. Park it as
+            # RETRY_PENDING with NO broker order; fire_deferred_closes_for_entry
+            # places it the moment the entry fills. retry_at is a far-out safety
+            # net so the retry-scheduler eventually cleans it up if that fill event
+            # is ever missed (it will then reject if there's still no position).
+            child.status = OrderStatus.RETRY_PENDING
+            child.broker_order_id = None
+            child.retry_at = datetime.now(timezone.utc) + timedelta(hours=_DEFERRED_CLOSE_TTL_HOURS)
+            child.reject_reason = (
+                "Waiting for your entry to fill before this close can be placed "
+                "(e.g. a pre-market order queued for the open)."
+            )[:480]
+            audit.record(
+                db,
+                actor_user_id=item.subscriber_user_id,
+                action="copy.close_deferred_until_entry_fills",
+                entity_type="order",
+                entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(trader_order.id),
+                    "symbol": child.symbol,
+                    "waiting_on_entry_ids": [str(i) for i in exc.entry_ids],
+                },
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=item.subscriber_user_id,
+                broker_account_id=item.broker_account_id,
+                order_id=child.id,
+                status="deferred_until_entry_fills",
+            ))
+            child.redis_published_at = datetime.now(timezone.utc)
+            events.publish(item.subscriber_user_id, _order_event("order.placed", child))
         else:
             # Broker call failed. Classify the error to decide between:
             #   1. User-fixable (insufficient buying power, after-hours

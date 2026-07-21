@@ -111,6 +111,11 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
     # place we learn a copied TP/SL hit — surface it as an SSE so the positions
     # table can refresh live instead of only on manual reload.
     newly_closed: list[Order] = []
+    # Mirror ENTRIES that just transitioned — used to fire/cancel any close we
+    # deferred behind them (a close that arrived before its entry filled).
+    filled_entries: list[Order] = []
+    dead_entries: list[Order] = []
+    _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
     for order in open_orders:
         try:
             res = adapter.get_order(order.broker_order_id)
@@ -138,6 +143,12 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
             and order.bracket_leg is not None
         ):
             newly_closed.append(order)
+        # Track a mirror ENTRY transition for the deferred-close hook below.
+        if changed and order.parent_order_id is not None and not order.is_closing:
+            if res.status == OrderStatus.FILLED and prev_status != OrderStatus.FILLED:
+                filled_entries.append(order)
+            elif res.status in _TERMINAL and prev_status not in _TERMINAL:
+                dead_entries.append(order)
         if changed:
             refreshed += 1
 
@@ -155,6 +166,21 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
             log.exception(
                 "fills_sync: position.auto_closed publish failed for order=%s", order.id
             )
+
+    # Deferred-close hook (own sessions inside): a subscriber entry that just
+    # FILLED fires any close parked behind it; one that DIED cancels it.
+    if filled_entries or dead_entries:
+        from app.services import copy_engine  # noqa: PLC0415
+        for e in filled_entries:
+            try:
+                copy_engine.fire_deferred_closes_for_entry(e)
+            except Exception:  # noqa: BLE001
+                log.exception("fills_sync: fire deferred closes failed for entry=%s", e.id)
+        for e in dead_entries:
+            try:
+                copy_engine.cancel_deferred_closes_for_entry(e)
+            except Exception:  # noqa: BLE001
+                log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
     return refreshed
 
 

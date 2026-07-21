@@ -1180,3 +1180,17 @@ def _persist_subscriber_fill(
             subscriber_id,
             copy_engine._order_event("order.placed", existing),  # noqa: SLF001
         )
+        # Deferred-close hook: if this mirror is an ENTRY that just changed state,
+        # a close may be parked waiting for it. On FILL → place that close now; on
+        # death (canceled/rejected/expired) → cancel it (nothing left to sell).
+        if status_changed and not existing.is_closing:
+            try:
+                if status_enum == OrderStatus.FILLED:
+                    copy_engine.fire_deferred_closes_for_entry(existing)
+                elif status_enum in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    copy_engine.cancel_deferred_closes_for_entry(existing)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "snaptrade subscriber reconcile: deferred-close hook failed for %s",
+                    existing.id,
+                )
