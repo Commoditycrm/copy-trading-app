@@ -372,6 +372,25 @@ def reconcile_account(
         log.warning("position_reconciler: %s failed: %s", account.id, report.error)
         return report
 
+    # Empty-broker guard. SnapTrade's get_positions() SWALLOWS a stale/404
+    # connection and returns [] instead of raising (observed on QA: 40/43
+    # accounts came back empty because their connections had gone stale). If we
+    # took "empty" to mean "flat", every open position would look divergent and
+    # an apply run would try to CLOSE live positions the broker simply failed to
+    # report. So: broker empty AND we hold something → treat as unreachable, not
+    # flat. Skip the account rather than reconcile against a blank. The cost of a
+    # false skip (a genuinely all-flat account, rare) is nil; the cost of the
+    # opposite is closing real money positions. A working account (e.g. Karthik,
+    # who returns real holdings) never trips this.
+    if not broker and ours:
+        report.error = (
+            f"broker returned no positions but our records show {len(ours)} open "
+            f"contract(s) — treating connection as unreachable, not flat; skipped "
+            f"to avoid closing live positions"
+        )
+        log.warning("position_reconciler: %s empty-broker guard tripped", account.id)
+        return report
+
     from app.services import market_hours  # noqa: PLC0415
     today = market_hours.now_et().date()  # expiry is judged in market time
 
