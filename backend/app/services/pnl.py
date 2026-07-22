@@ -283,16 +283,42 @@ def realized_pnl_by_day(
     both double-counts and scrambles the FIFO. A pure copy-subscriber's real
     trades ARE the mirrors, so this de-duplicates them.
     """
-    # Orders the user owns with any fill recorded. For subscribers we take
-    # mirrors only (see mirrors_only) so listener duplicates don't double-count.
+    # Orders the user owns with any fill recorded.
     conds = [
         Order.user_id == user_id,
         Order.filled_quantity > 0,
         Order.filled_avg_price.isnot(None),
     ]
+    orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
+
     if mirrors_only:
-        conds.append(Order.parent_order_id.isnot(None))
-    orders: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
+        # Subscriber de-duplication, by broker_order_id — NOT "mirrors only".
+        #
+        # The SnapTrade listener re-records a mirror's broker fill as a duplicate
+        # STANDALONE row carrying the SAME broker_order_id — those must not
+        # double-count. But a subscriber ALSO has genuine broker-side fills
+        # (closes they place directly at their broker) that arrive ONLY as
+        # standalone rows, each with its own broker_order_id.
+        #
+        # The old rule "drop every standalone" killed those real closes, leaving
+        # positions open in the FIFO and badly skewing realized P&L (measured on
+        # prod: the mirror-only total was ~5x the de-duplicated value — the
+        # broker vs app P&L gap). Correct rule: drop a standalone ONLY when its
+        # broker_order_id already appears on a mirror (a true duplicate); keep
+        # standalone rows with a unique/absent broker_order_id — they're real.
+        mirror_boids = {
+            o.broker_order_id
+            for o in orders_all
+            if o.parent_order_id is not None and o.broker_order_id
+        }
+        orders: list[Order] = [
+            o for o in orders_all
+            if o.parent_order_id is not None            # a mirror — always keep
+            or not o.broker_order_id                    # no id to dedupe on — keep
+            or o.broker_order_id not in mirror_boids     # unique broker-side fill
+        ]
+    else:
+        orders = orders_all
 
     # All Fill rows for those orders (one query, then bucket).
     order_ids = [o.id for o in orders]
