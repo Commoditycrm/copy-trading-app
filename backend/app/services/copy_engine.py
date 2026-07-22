@@ -342,6 +342,46 @@ def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderReq
     return replace(req, order_type=OrderType.LIMIT, limit_price=limit, stop_price=None)
 
 
+def _market_type_refused(msg: str) -> bool:
+    """True when a broker rejected a MARKET order because it won't take that
+    ORDER TYPE right now (a trading halt, or an illiquid stock) — not the trade
+    itself. The message says "please place a limit order instead"; a LIMIT is
+    accepted and rests/fills when trading resumes."""
+    m = msg.lower()
+    return (
+        "does not support market" in m
+        or "limited liquidity" in m
+        or "trading halt" in m
+        or "place a limit order" in m
+        or "halted" in m
+    )
+
+
+def _retry_stock_market_as_limit(item: "_PendingMirror", req: BrokerOrderRequest) -> BrokerOrderResult | None:
+    """A copied STOCK MARKET order was refused (halt / illiquid). Retry ONCE as a
+    marketable LIMIT priced just through the last trade (BUY a touch up, SELL a
+    touch down) so it fills the instant trading resumes. Returns the result on
+    success, or None if we can't price it (caller then re-raises the original)."""
+    if req.instrument_type != InstrumentType.STOCK or req.order_type != OrderType.MARKET:
+        return None
+    if not hasattr(item.adapter, "get_stock_latest_price"):
+        return None
+    try:
+        last = item.adapter.get_stock_latest_price(req.symbol)
+    except Exception:  # noqa: BLE001
+        last = None
+    if not last or last <= 0:
+        return None
+    buf = Decimal("1.01") if req.side == OrderSide.BUY else Decimal("0.99")
+    limit = (last * buf).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if limit <= 0:
+        return None
+    retry = replace(req, order_type=OrderType.LIMIT, limit_price=limit, stop_price=None)
+    item.request = retry
+    log.info("mirror %s market refused (halt/illiquid) — retrying as LIMIT %s", req.symbol, limit)
+    return item.adapter.place_order(retry)
+
+
 def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderResult:
     """Place the mirror order. If a CLOSE is rejected because another working
     order on the subscriber's account blocks it (wash trade / uncovered /
@@ -451,6 +491,17 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                     return item.adapter.place_order(req)
                 except Exception as exc2:  # noqa: BLE001
                     exc = exc2  # fall through to conflict handling with new error
+        # Broker refused the MARKET order TYPE — a trading halt or an illiquid
+        # stock ("please place a limit order instead"), not the trade. Applies to
+        # BOTH a forced entry and a forced close, so handle it before the
+        # close-only conflict logic. Retry once as a marketable limit.
+        if _market_type_refused(str(exc)):
+            try:
+                retried = _retry_stock_market_as_limit(item, req)
+            except Exception as exc2:  # noqa: BLE001
+                raise exc2 from exc
+            if retried is not None:
+                return retried
         if not (req.is_closing and is_order_conflict_error(exc)):
             raise
 

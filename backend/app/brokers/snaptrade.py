@@ -102,6 +102,28 @@ _MLEG_TYPE_OUT = {
 }
 
 
+# Option premium tick sizes enforced by the exchanges (and validated by the
+# brokerages behind SnapTrade, e.g. Webull, error code 1119): a premium under
+# $3 must be in $0.05 increments, $3 and above in $0.10 increments. This is a
+# BROKER constraint, so we enforce it here as the single chokepoint for every
+# option order — no matter how the caller computed the price (a copied mirror
+# that inherits a penny-quoted trader price, a re-anchored bracket exit, etc.).
+_OPT_NICKEL = Decimal("0.05")
+_OPT_DIME = Decimal("0.10")
+_OPT_DIME_MIN = Decimal("3.00")
+
+
+def _round_option_price_to_tick(price: Decimal) -> Decimal:
+    """Snap an option premium to the nearest exchange-legal tick (nickel below
+    $3, dime at/above $3). Rounding to the NEAREST valid tick keeps the drift
+    under half a tick, and a legal tick is always accepted — so this only ever
+    moves a price the broker would have rejected outright."""
+    tick = _OPT_DIME if price >= _OPT_DIME_MIN else _OPT_NICKEL
+    snapped = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+    # A price like $2.98 snaps to $3.00, which is a legal dime — still fine.
+    return snapped.quantize(Decimal("0.01"))
+
+
 def _option_action(side: OrderSide, is_closing: bool) -> str:
     """(side, open/close) → SnapTrade single-leg option action enum."""
     if side == OrderSide.BUY:
@@ -671,10 +693,12 @@ class SnapTradeAdapter(BrokerAdapter):
             "legs":          [leg],
         }
         # SnapTrade's mleg endpoint requires prices as strings, not numbers.
+        # Snap to a legal option tick first (nickel <$3, dime >=$3) so a copied
+        # or computed price can't be rejected for a bad increment (code 1119).
         if req.limit_price is not None:
-            kwargs["limit_price"] = f"{req.limit_price}"
+            kwargs["limit_price"] = f"{_round_option_price_to_tick(req.limit_price)}"
         if req.stop_price is not None:
-            kwargs["stop_price"] = f"{req.stop_price}"
+            kwargs["stop_price"] = f"{_round_option_price_to_tick(req.stop_price)}"
 
         try:
             resp = self._c().trading.place_mleg_order(**kwargs)
