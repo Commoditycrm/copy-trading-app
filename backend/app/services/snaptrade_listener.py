@@ -1120,12 +1120,20 @@ def _persist_subscriber_fill(
 
     status_enum = SNAP_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
     with SessionLocal() as db:
+        # Match the subscriber's row for this broker order. Prefer a MIRROR row
+        # (parent set) — the normal case — but fall back to a STANDALONE row when
+        # that's the only one carrying this broker_order_id. The broker-side close
+        # sometimes lands ONLY as a standalone: the mirror close was rejected
+        # before it earned a broker id, and SnapTrade later reports that
+        # standalone EXECUTED. Restricting to mirrors made us miss it, so the real
+        # close stayed CANCELED forever and its realized P&L was never booked
+        # (the broker-vs-app daily mismatch). parent_order_id.is_(None) sorts
+        # mirrors first (False < True).
         existing = db.execute(
             select(Order)
             .where(Order.broker_order_id == broker_order_id)
             .where(Order.user_id == subscriber_id)
-            .where(Order.parent_order_id.is_not(None))
-            .order_by(Order.created_at)
+            .order_by(Order.parent_order_id.is_(None), Order.created_at)
             .limit(1)
         ).scalars().first()
         if existing is None:
@@ -1133,6 +1141,16 @@ def _persist_subscriber_fill(
         # Already terminal + unchanged → nothing to do (don't re-publish a
         # settled order on every sweep).
         if existing.status == status_enum and existing.status in _TERMINAL_STATUSES:
+            return
+        # Never let a stale/garbled snapshot DOWNGRADE a real fill. Once a row is
+        # FILLED with quantity, the broker execution is final; only a genuine
+        # broker EXECUTED upgrades a CANCELED/REJECTED row. This is the fix's core
+        # invariant: broker truth wins, but only in the safe direction.
+        if (
+            existing.status == OrderStatus.FILLED
+            and (existing.filled_quantity or 0) > 0
+            and status_enum != OrderStatus.FILLED
+        ):
             return
 
         changed = False
