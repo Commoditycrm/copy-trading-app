@@ -31,6 +31,7 @@ before any money-adjacent write.
 """
 from __future__ import annotations
 
+import enum
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -75,11 +76,67 @@ class ContractKey:
         return f"{self.symbol} {s}{r} {self.option_expiry}"
 
 
+class DivergenceClass(str, enum.Enum):
+    """How the write path should treat a divergence. Only AUTO is safe to
+    correct automatically — see the write-path scope. Everything else is
+    surfaced for a human because we can't derive its realized P&L on our own."""
+    # Option past expiry, broker flat for the contract, no offsetting share
+    # position → expired worthless. Close price is unambiguously 0. Auto-fixable.
+    AUTO_EXPIRED_WORTHLESS = "auto_expired_worthless"
+    # Option past expiry, broker flat, BUT an offsetting share position exists →
+    # likely exercised/assigned. Settles into stock at the strike, not 0.
+    FLAG_ASSIGNMENT = "flag_assignment"
+    # Anything else: a still-tradeable instrument whose net is wrong (missed
+    # close / phantom fill on a live symbol, e.g. CPHI). Correct price unknowable
+    # from our side — needs the broker's trade history.
+    FLAG_LIVE_DRIFT = "flag_live_drift"
+
+
+def _has_offsetting_share(
+    contract: ContractKey, broker_positions: dict[ContractKey, Decimal]
+) -> bool:
+    """True when the broker holds a non-zero STOCK position in the option's
+    underlying — the fingerprint of an exercise/assignment settling into shares.
+    Conservative: any offsetting stock blocks the worthless assumption."""
+    for key, qty in broker_positions.items():
+        if (
+            key.instrument_type == InstrumentType.STOCK
+            and key.symbol == contract.symbol
+            and qty != 0
+        ):
+            return True
+    return False
+
+
+def classify_divergence(
+    contract: ContractKey,
+    our_net: Decimal,
+    broker_net: Decimal,
+    broker_positions: dict[ContractKey, Decimal],
+    today: date,
+) -> DivergenceClass:
+    """Label a divergence for the write path. Deliberately narrow: AUTO only for
+    the case we can price with certainty (expired worthless option); everything
+    else flags."""
+    if (
+        contract.instrument_type == InstrumentType.OPTION
+        and contract.option_expiry is not None
+        and contract.option_expiry < today          # genuinely past expiry
+        and broker_net == 0                          # broker dropped the contract
+        and our_net != 0                             # we still carry it
+    ):
+        if _has_offsetting_share(contract, broker_positions):
+            return DivergenceClass.FLAG_ASSIGNMENT
+        return DivergenceClass.AUTO_EXPIRED_WORTHLESS
+    return DivergenceClass.FLAG_LIVE_DRIFT
+
+
 @dataclass
 class Divergence:
     contract: ContractKey
     our_net: Decimal      # signed: + long, - short (filled buys - sells)
     broker_net: Decimal   # signed, from get_positions()
+    classification: DivergenceClass = DivergenceClass.FLAG_LIVE_DRIFT
     @property
     def delta(self) -> Decimal:
         return self.our_net - self.broker_net
@@ -180,11 +237,17 @@ def reconcile_account(
         log.warning("position_reconciler: %s failed: %s", account.id, report.error)
         return report
 
+    from app.services import market_hours  # noqa: PLC0415
+    today = market_hours.now_et().date()  # expiry is judged in market time
+
     for key in sorted(set(ours) | set(broker), key=lambda k: k.label()):
         o = ours.get(key, Decimal(0))
         b = broker.get(key, Decimal(0))
         if o != b:
-            report.divergences.append(Divergence(contract=key, our_net=o, broker_net=b))
+            report.divergences.append(Divergence(
+                contract=key, our_net=o, broker_net=b,
+                classification=classify_divergence(key, o, b, broker, today),
+            ))
 
     if not dry_run:
         # The corrective write is intentionally not built yet. Reporting first

@@ -144,18 +144,29 @@ def reconcile_positions_dry_run(
                     "our_net": str(d.our_net),
                     "broker_net": str(d.broker_net),
                     "delta": str(d.delta),
+                    "classification": d.classification.value,
                 }
                 for d in r.divergences
             ],
         }
 
     ser = [_ser(r) for r in reports]
+    all_divs = [d for r in ser for d in r["divergences"]]
+
+    def _count(cls: str) -> int:
+        return sum(1 for d in all_divs if d["classification"] == cls)
+
     return {
         "dry_run": True,
         "accounts_checked": len(ser),
         "accounts_in_sync": sum(1 for r in ser if r["in_sync"]),
         "accounts_diverged": sum(1 for r in ser if r["divergences"]),
-        "total_diverging_contracts": sum(len(r["divergences"]) for r in ser),
+        "total_diverging_contracts": len(all_divs),
+        # Per-class breakdown — the number the write path will act on (auto) vs
+        # the number a human must review (the two flags).
+        "auto_fixable": _count("auto_expired_worthless"),
+        "flag_assignment": _count("flag_assignment"),
+        "flag_live_drift": _count("flag_live_drift"),
         "reports": ser,
     }
 
