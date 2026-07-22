@@ -611,12 +611,66 @@ export default function TradesPage() {
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;
-                const st = STATUS_STYLE[o.status] ?? STATUS_DEFAULT;
+                // Event-log display: once an order has (partially) filled, its OWN
+                // row is frozen to the placement state ("submitted") and the fill is
+                // shown as a separate row ABOVE. The real o.status still drives the
+                // Cancel button, the status tabs + counts, and sorting.
+                const placementStatus = (o.status === "filled" || o.status === "partially_filled")
+                  ? "submitted"
+                  : o.status;
+                const st = STATUS_STYLE[placementStatus] ?? STATUS_DEFAULT;
                 const fillTs = lastFillTs(o);
                 const submittedTs = o.submitted_at ?? o.created_at;
                 const exp = o.instrument_type === "option" ? fmtExpiresIn(o.option_expiry) : null;
+                // Fill rows, rendered ABOVE the order row (newest event on top).
+                // Alpaca provides discrete fill records; SnapTrade/Webull has no
+                // per-execution feed, so we derive ONE fill row from the order's own
+                // filled qty + avg price — both brokers show fills, and nothing is
+                // written to the DB (no P&L/engine impact).
+                const fillEntries = (o.fills && o.fills.length > 0
+                  ? o.fills.map((f, i) => ({ key: `${o.id}-fill-${i}`, quantity: f.quantity, price: f.price, at: f.filled_at as string | null }))
+                  : (Number(o.filled_quantity) > 0 && o.filled_avg_price
+                      ? [{ key: `${o.id}-fill-agg`, quantity: o.filled_quantity, price: o.filled_avg_price, at: (fillTs ?? o.closed_at) as string | null }]
+                      : [])
+                ).map(f => {
+                  const fillNotional = Number(f.quantity) * Number(f.price);
+                  const dash = <span style={{ color: "var(--faint)" }}>—</span>;
+                  return (
+                    <tr key={f.key} style={{ background: "var(--panel-2)" }}>
+                      <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>
+                        <span className="inline-flex items-center gap-1.5 pl-4">
+                          <span style={{ color: "var(--faint)" }}>↳</span>
+                          {orderSymbolLabel(o)}
+                        </span>
+                      </td>
+                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.quantity, 0)}</td>
+                      <td className="px-5 py-2.5">
+                        <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent", opacity: 0.75 }}>
+                          {o.side}
+                        </span>
+                      </td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5">
+                        <span className="chip uppercase tracking-wider font-medium whitespace-nowrap" style={{ background: "var(--good-soft)", color: "var(--good)", borderColor: "transparent" }}>
+                          fill
+                        </span>
+                      </td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.price, 2)}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fillNotional ? fmt(String(fillNotional)) : dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{f.at ? fmtDateTimeMs(f.at, "America/New_York") : dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
+                    </tr>
+                  );
+                });
                 return (
                   <Fragment key={o.id}>
+                    {fillEntries}
                     <tr
                       className="border-t transition-colors hover:bg-[var(--panel-2)]"
                       style={{
@@ -696,7 +750,7 @@ export default function TradesPage() {
                           className="chip uppercase tracking-wider font-medium whitespace-nowrap"
                           style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
                         >
-                          {o.status}{o.parent_order_id ? " · copy" : ""}
+                          {placementStatus}{o.parent_order_id ? " · copy" : ""}
                         </span>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
