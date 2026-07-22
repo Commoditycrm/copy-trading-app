@@ -71,7 +71,11 @@ _CANCELLABLE = (
 # Stocks always penny; options $0.01 under $3, $0.05 at/above $3.
 _PENNY = Decimal("0.01")
 _NICKEL = Decimal("0.05")
-_OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+_DIME = Decimal("0.10")
+# Option exchange minimum increments the broker will accept for ANY option:
+# premium < $3 → $0.05, premium >= $3 → $0.10. (The old nickel/penny values were
+# the penny-pilot subset and get rejected on a non-penny-pilot ≥$3 contract.)
+_OPTION_DIME_THRESHOLD = Decimal("3.00")
 
 
 def _round_limit_for_close(
@@ -92,8 +96,8 @@ def _round_limit_for_close(
     else:
         mode = ROUND_HALF_UP
 
-    if instrument_type == InstrumentType.OPTION and price >= _OPTION_NICKEL_THRESHOLD:
-        tick = _NICKEL
+    if instrument_type == InstrumentType.OPTION:
+        tick = _DIME if price >= _OPTION_DIME_THRESHOLD else _NICKEL
     else:
         tick = _PENNY
     return (price / tick).quantize(Decimal("1"), rounding=mode) * tick

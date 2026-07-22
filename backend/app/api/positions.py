@@ -378,6 +378,23 @@ def _option_close_limit(adapter, pos: BrokerPosition, side: OrderSide) -> Decima
     return Decimal("0.01")
 
 
+def _market_order_type_refused(msg: str) -> bool:
+    """True when a broker rejected a MARKET order because it won't accept that
+    ORDER TYPE right now — not the trade itself. Covers an illiquid/limited-
+    liquidity contract AND a trading halt ("market order rejected due to trading
+    halt … please place a limit order instead"). In every case the broker WILL
+    take a LIMIT, so the close should retry as a limit (which rests and fills
+    when trading resumes) instead of failing outright."""
+    m = msg.lower()
+    return (
+        "does not support market" in m
+        or "limited liquidity" in m
+        or "trading halt" in m
+        or "place a limit order" in m
+        or "halted" in m
+    )
+
+
 def _close_account_positions_sync(
     sub_id: uuid.UUID,
     acct_id: uuid.UUID,
@@ -485,11 +502,7 @@ def _close_account_positions_sync(
                 # illiquid contract. Retry ONCE as a plain LIMIT (options are
                 # already limit, so this covers an illiquid stock) at the mark
                 # price, so the close rests instead of failing outright.
-                retriable = (
-                    close_type == OrderType.MARKET
-                    and ("does not support market" in emsg.lower()
-                         or "limited liquidity" in emsg.lower())
-                )
+                retriable = close_type == OrderType.MARKET and _market_order_type_refused(emsg)
                 retry_px = pos.current_price if (pos.current_price and pos.current_price > 0) else None
                 if retriable and retry_px is not None:
                     try:
@@ -594,6 +607,22 @@ def close_position(
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
 
-    return _place_trader_order(
-        db, user, new_payload, acct.id, background, request, resolve_wash_trade=True,
-    )
+    try:
+        return _place_trader_order(
+            db, user, new_payload, acct.id, background, request, resolve_wash_trade=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Safety net: the broker refused the MARKET order TYPE (illiquid, or a
+        # trading halt — "please place a limit order instead"), not the trade.
+        # Retry ONCE as a LIMIT at the mark so the close rests and fills when
+        # trading resumes. Options already close as LIMIT, so this only bites a
+        # halted/illiquid stock.
+        retry_px = pos.current_price if (pos.current_price and pos.current_price > 0) else None
+        if close_type == OrderType.MARKET and retry_px and _market_order_type_refused(str(exc)):
+            retry_payload = new_payload.model_copy(
+                update={"order_type": OrderType.LIMIT, "limit_price": retry_px}
+            )
+            return _place_trader_order(
+                db, user, retry_payload, acct.id, background, request, resolve_wash_trade=True,
+            )
+        raise
