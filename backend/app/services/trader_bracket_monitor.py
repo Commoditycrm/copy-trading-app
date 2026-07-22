@@ -77,10 +77,18 @@ _ALIVE_STATUSES = (
     OrderStatus.PARTIALLY_FILLED,
 )
 
-# Option ticks — same rules as bracket_emulator + position_enforcer.
+# Option ticks. Exchange minimum increments the broker will accept for ANY
+# option (penny-pilot names may allow finer, but a coarser price is always
+# valid, so rounding to these is universally accepted):
+#   * premium  < $3.00 → $0.05 (nickel)
+#   * premium >= $3.00 → $0.10 (dime)
+# The old logic used nickel/penny (the penny-pilot subset), which Webull rejects
+# on a non-penny-pilot ≥$3 contract: "orders with a premium of $3 or more must be
+# entered in 0.10 increments" (e.g. a 3.55 SELL limit was refused).
 _PENNY = Decimal("0.01")
 _NICKEL = Decimal("0.05")
-_OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+_DIME = Decimal("0.10")
+_OPTION_DIME_THRESHOLD = Decimal("3.00")
 
 # Post-fill cooldown — matches position_enforcer. Wide option spreads
 # show -spread% unrealized P&L the moment you fill; the price-side
@@ -95,7 +103,7 @@ def _round_close_limit(price: Decimal, side: OrderSide) -> Decimal:
     direction that makes the limit MORE likely to fill (don't shave
     fills in the wrong direction)."""
     mode = ROUND_DOWN if side == OrderSide.SELL else ROUND_UP
-    tick = _NICKEL if price >= _OPTION_NICKEL_THRESHOLD else _PENNY
+    tick = _DIME if price >= _OPTION_DIME_THRESHOLD else _NICKEL
     return (price / tick).quantize(Decimal("1"), rounding=mode) * tick
 
 

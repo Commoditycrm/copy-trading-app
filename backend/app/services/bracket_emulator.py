@@ -49,7 +49,11 @@ log = logging.getLogger(__name__)
 # >= $3 options, an off-grid rejection. Stocks are always penny-tick.
 _PENNY = Decimal("0.01")
 _NICKEL = Decimal("0.05")
-_OPTION_NICKEL_THRESHOLD = Decimal("3.00")
+_DIME = Decimal("0.10")
+# Option exchange minimum increments the broker accepts for ANY option:
+# premium < $3 → $0.05, premium >= $3 → $0.10. (Old nickel/penny values were the
+# penny-pilot subset — rejected on a non-penny-pilot ≥$3 contract.)
+_OPTION_DIME_THRESHOLD = Decimal("3.00")
 
 
 def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) -> Decimal:
@@ -66,8 +70,8 @@ def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) ->
         the stop trips on price drop, so rounding up keeps the trigger
         at or slightly tighter than the user asked for.
 
-    Stocks always tick at $0.01; options tick at $0.01 below $3 and
-    $0.05 at $3 and above."""
+    Stocks always tick at $0.01; options tick at $0.05 below $3 and
+    $0.10 at $3 and above."""
     if leg == "tp":
         mode = ROUND_DOWN
     elif leg == "sl":
@@ -75,8 +79,8 @@ def _round_to_tick(price: Decimal, instrument_type: InstrumentType, leg: str) ->
     else:
         mode = ROUND_HALF_UP
 
-    if instrument_type == InstrumentType.OPTION and price >= _OPTION_NICKEL_THRESHOLD:
-        tick = _NICKEL
+    if instrument_type == InstrumentType.OPTION:
+        tick = _DIME if price >= _OPTION_DIME_THRESHOLD else _NICKEL
     else:
         tick = _PENNY
     # Quantize to the tick: divide → round → multiply.
@@ -100,8 +104,8 @@ def _reanchor_exit_price(
     raw = anchor * (1 + direction * pct / 100)
     rounded = _round_to_tick(raw, instrument_type, leg)
     tick = (
-        _NICKEL
-        if instrument_type == InstrumentType.OPTION and anchor >= _OPTION_NICKEL_THRESHOLD
+        (_DIME if anchor >= _OPTION_DIME_THRESHOLD else _NICKEL)
+        if instrument_type == InstrumentType.OPTION
         else _PENNY
     )
     if direction > 0 and rounded <= anchor:
