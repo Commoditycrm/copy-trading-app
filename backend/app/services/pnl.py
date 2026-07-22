@@ -260,6 +260,37 @@ def today_realized_pnl_bulk(
     return result
 
 
+def dedupe_subscriber_orders(orders_all: list[Order]) -> list[Order]:
+    """Drop the SnapTrade listener's duplicate STANDALONE rows, keeping every
+    real fill exactly once.
+
+    The listener re-records a mirror's broker fill as a standalone row carrying
+    the SAME broker_order_id — those must not double-count. But a subscriber
+    also has genuine broker-side fills (closes placed directly at their broker,
+    and reconnect-orphaned rows whose broker_account went NULL) that arrive ONLY
+    as standalone rows, each with its own broker_order_id. Rule: drop a
+    standalone only when its broker_order_id already appears on a mirror (a true
+    duplicate); keep standalone rows with a unique/absent broker_order_id.
+
+    This is the single source of truth for "which orders are the subscriber's
+    real trades" — realized_pnl_by_day and the position reconciler both call it
+    so their views can never disagree (that disagreement was the false-phantom
+    bug: the reconciler counted raw fills and saw positions the P&L FIFO had
+    already closed).
+    """
+    mirror_boids = {
+        o.broker_order_id
+        for o in orders_all
+        if o.parent_order_id is not None and o.broker_order_id
+    }
+    return [
+        o for o in orders_all
+        if o.parent_order_id is not None            # a mirror — always keep
+        or not o.broker_order_id                    # no id to dedupe on — keep
+        or o.broker_order_id not in mirror_boids     # unique broker-side fill
+    ]
+
+
 def realized_pnl_by_day(
     db: Session,
     user_id: uuid.UUID,
@@ -293,30 +324,10 @@ def realized_pnl_by_day(
 
     if mirrors_only:
         # Subscriber de-duplication, by broker_order_id — NOT "mirrors only".
-        #
-        # The SnapTrade listener re-records a mirror's broker fill as a duplicate
-        # STANDALONE row carrying the SAME broker_order_id — those must not
-        # double-count. But a subscriber ALSO has genuine broker-side fills
-        # (closes they place directly at their broker) that arrive ONLY as
-        # standalone rows, each with its own broker_order_id.
-        #
-        # The old rule "drop every standalone" killed those real closes, leaving
-        # positions open in the FIFO and badly skewing realized P&L (measured on
-        # prod: the mirror-only total was ~5x the de-duplicated value — the
-        # broker vs app P&L gap). Correct rule: drop a standalone ONLY when its
-        # broker_order_id already appears on a mirror (a true duplicate); keep
-        # standalone rows with a unique/absent broker_order_id — they're real.
-        mirror_boids = {
-            o.broker_order_id
-            for o in orders_all
-            if o.parent_order_id is not None and o.broker_order_id
-        }
-        orders: list[Order] = [
-            o for o in orders_all
-            if o.parent_order_id is not None            # a mirror — always keep
-            or not o.broker_order_id                    # no id to dedupe on — keep
-            or o.broker_order_id not in mirror_boids     # unique broker-side fill
-        ]
+        # See dedupe_subscriber_orders for the full rationale. The old rule
+        # "drop every standalone" killed the subscriber's real broker-side
+        # closes, leaving positions open in the FIFO and skewing realized P&L.
+        orders: list[Order] = dedupe_subscriber_orders(orders_all)
     else:
         orders = orders_all
 

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -288,43 +288,51 @@ class AccountReconcileReport:
 
 
 def order_derived_positions(
-    db: Session, broker_account_id: uuid.UUID
+    db: Session, account: BrokerAccount
 ) -> dict[ContractKey, Decimal]:
-    """Net FILLED position per contract for one broker account, from our order
-    records. Signed: filled BUY qty − filled SELL qty. This is what the derived
-    P&L history believes the account holds.
+    """Net FILLED position per contract, from our order records — the net the
+    realized-P&L FIFO actually walks. Signed: filled BUY qty − filled SELL qty.
 
-    Counts ALL filled orders on the account (not mirrors-only): what actually
-    hit the broker is the sum of every fill, which is exactly what get_positions
-    reflects. If standalone listener duplicates inflate this, that inflation IS
-    part of the drift we want the report to surface.
+    Two things this MUST match, or the reconciler reports phantom divergences:
+
+    1. De-dup with dedupe_subscriber_orders — the SAME dedupe realized_pnl_by_day
+       uses. Counting raw fills was the false-phantom bug: the SnapTrade
+       listener re-records a mirror's fill as a duplicate standalone row, so a
+       closed position (mirror buy + standalone-dup sell, or vice versa) netted
+       to a nonzero phantom here while the P&L FIFO had already closed it.
+       (Observed on Karthik: AMZN 250C / META 640P reported as −5 / −1 open when
+       they were flat.)
+
+    2. Include reconnect-orphaned rows (broker_account_id NULL). When a broker is
+       disconnected the Order.broker_account_id is SET NULL (audit-trail
+       preservation), so filtering strictly by account.id dropped the closing
+       legs of positions opened before a reconnect — resurrecting closed lots as
+       phantoms. We scope to this user's rows on THIS account or orphaned.
     """
-    rows = db.execute(
-        select(
-            Order.symbol,
-            Order.instrument_type,
-            Order.option_expiry,
-            Order.option_strike,
-            Order.option_right,
-            Order.side,
-            func.coalesce(func.sum(Order.filled_quantity), 0),
-        )
-        .where(
-            Order.broker_account_id == broker_account_id,
-            Order.status == OrderStatus.FILLED,
-            Order.filled_quantity > 0,
-        )
-        .group_by(
-            Order.symbol, Order.instrument_type, Order.option_expiry,
-            Order.option_strike, Order.option_right, Order.side,
-        )
-    ).all()
+    from app.services.pnl import dedupe_subscriber_orders  # noqa: PLC0415
+
+    orders_all = list(
+        db.execute(
+            select(Order).where(
+                Order.user_id == account.user_id,
+                or_(
+                    Order.broker_account_id == account.id,
+                    Order.broker_account_id.is_(None),
+                ),
+                Order.status == OrderStatus.FILLED,
+                Order.filled_quantity > 0,
+            )
+        ).scalars()
+    )
 
     net: dict[ContractKey, Decimal] = {}
-    for symbol, itype, expiry, strike, right, side, qty in rows:
-        key = ContractKey(symbol, itype, expiry, strike, right)
-        signed = Decimal(str(qty)) if side == OrderSide.BUY else -Decimal(str(qty))
-        net[key] = net.get(key, Decimal(0)) + signed
+    for o in dedupe_subscriber_orders(orders_all):
+        key = ContractKey(
+            o.symbol, o.instrument_type, o.option_expiry,
+            o.option_strike, o.option_right,
+        )
+        q = Decimal(o.filled_quantity)
+        net[key] = net.get(key, Decimal(0)) + (q if o.side == OrderSide.BUY else -q)
     # Drop contracts that net to flat — they're not divergences, they're closed.
     return {k: v for k, v in net.items() if v != 0}
 
@@ -365,7 +373,7 @@ def reconcile_account(
         broker=account.broker.value if account.broker else "?",
     )
     try:
-        ours = order_derived_positions(db, account.id)
+        ours = order_derived_positions(db, account)
         broker = _broker_positions(account)
     except Exception as exc:  # noqa: BLE001
         report.error = f"{type(exc).__name__}: {exc}"[:300]
