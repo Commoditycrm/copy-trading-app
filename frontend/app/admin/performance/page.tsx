@@ -20,6 +20,7 @@ interface Fanout {
   side: string;
   quantity: string;
   instrument_type: string;
+  order_type: string;
   expected_price: string | null;
   filled_avg_price: string | null;
   trader_submitted_at: string | null;
@@ -54,6 +55,17 @@ function ms(v: number | null) {
   else if (v < 60_000) text = `${(Math.floor(v / 10) / 100).toFixed(2)}s`;
   else { const ts = Math.floor(v / 1000); text = `${Math.floor(ts / 60)}m ${String(ts % 60).padStart(2, "0")}s`; }
   return <span style={{ color, fontFamily: "monospace" }}>{text}</span>;
+}
+
+// Raw order-type enum → display label for the Order Type column.
+function orderTypeLabel(t: string): string {
+  switch (t) {
+    case "market": return "Market";
+    case "limit": return "Limit";
+    case "stop": return "Stop";
+    case "stop_limit": return "Stop Limit";
+    default: return t || "—";
+  }
 }
 
 function fmt(iso: string | null) {
@@ -197,6 +209,11 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           </span>
         </td>
 
+        {/* Order type — Market / Limit / Stop */}
+        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)" }}>
+          {orderTypeLabel(fanout.order_type)}
+        </td>
+
         {/* Expected (limit) vs filled price */}
         <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>
         <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>
@@ -259,7 +276,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={22} className="px-4 py-2.5">
+          <td colSpan={23} className="px-4 py-2.5">
             {/* Shared with the trader Performance view so admins see the exact
                 same per-subscriber columns — no second copy to keep in sync. */}
             <SubscriberBreakdown mirrors={fanout.children} />
@@ -450,6 +467,7 @@ export default function AdminPerformancePage() {
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <PerfTh label="Trade"            colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PerfTh label="Type"             colKey="instrument"  sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PlainTh label="Order Type" />
                 <PlainTh label="Expected Price" />
                 <PlainTh label="Filled Price" />
                 <PerfTh label="Trader"           colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />

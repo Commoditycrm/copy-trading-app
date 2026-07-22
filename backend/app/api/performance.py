@@ -176,6 +176,7 @@ def _serialize_fanout(
         "side": parent.side.value,
         "quantity": str(parent.quantity),
         "instrument_type": parent.instrument_type.value,
+        "order_type": parent.order_type.value,
         # Expected = the trader's limit price (NULL for market orders); filled =
         # the broker's average fill price. Surfaced side-by-side so the table can
         # show slippage.
