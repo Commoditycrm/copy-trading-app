@@ -741,6 +741,7 @@ def _fanout_export_columns() -> list[excel_export.Column]:
         C("Symbol", p("symbol"), 12),
         C("Side", lambda r: (r[0].get("side") or "").upper(), 8),
         C("Type", p("instrument_type"), 9),
+        C("Order Type", lambda r: (r[0].get("order_type") or "").replace("_", " ").title(), 11),
         C("Trade Qty", lambda r: _num(r[0].get("quantity")), 11, M),
         C("Expected Price", lambda r: _num(r[0].get("expected_price")), 13, M),
         C("Filled Price", lambda r: _num(r[0].get("filled_avg_price")), 13, M),

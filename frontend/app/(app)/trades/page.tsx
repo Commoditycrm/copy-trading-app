@@ -84,6 +84,17 @@ function expectedPrice(o: Order): string | null {
   return null;
 }
 
+/** Human label for the order type shown in the Order History table. */
+function orderTypeLabel(t: Order["order_type"]): string {
+  switch (t) {
+    case "market": return "Market";
+    case "limit": return "Limit";
+    case "stop": return "Stop";
+    case "stop_limit": return "Stop Limit";
+    default: return t;
+  }
+}
+
 /** Latest fill timestamp for an order (or closed_at fallback for filled). */
 function lastFillTs(o: Order): string | null {
   const lastFillAt = o.fills?.length
@@ -466,7 +477,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 14;
+  const COLSPAN = 15;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -552,6 +563,7 @@ export default function TradesPage() {
                 <Th label="Side" />
                 <Th label="Actions" />
                 <Th label="Status" sortKey="status" />
+                <Th label="Order Type" />
                 <Th label="Expected price" />
                 <Th label="Filled price" />
                 <Th label="TP" />
@@ -686,6 +698,9 @@ export default function TradesPage() {
                         >
                           {o.status}{o.parent_order_id ? " · copy" : ""}
                         </span>
+                      </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
+                        {orderTypeLabel(o.order_type)}
                       </td>
                       <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>
