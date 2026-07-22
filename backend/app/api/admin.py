@@ -103,17 +103,26 @@ class CleanupIn(BaseModel):
 
 # ─── Position reconciliation (dry-run) ────────────────────────────────────────
 
-@router.get("/positions/reconcile")
-def reconcile_positions_dry_run(
-    _: User = Depends(require_admin),
+@router.post("/positions/reconcile")
+def reconcile_positions(
+    admin: User = Depends(require_admin),
     user_id: uuid.UUID | None = Query(
         default=None, description="Limit to one subscriber; omit for all SnapTrade subscribers."
     ),
+    apply: bool = Query(
+        default=False,
+        description="DEFAULT FALSE = dry-run (writes nothing, shows proposed closes). "
+                    "true = write the expired-worthless closes for auto-fixable divergences.",
+    ),
 ) -> dict:
-    """DRY-RUN report of where each subscriber's order-derived net position
-    disagrees with the broker's actual holdings. Writes nothing — surfaces the
-    P&L-corruption blast radius (missing broker-side closes). See
-    services/position_reconciler.py.
+    """Reconcile subscriber order-derived positions against the broker's actual
+    holdings. Classifies each divergence; for auto-fixable ones (expired
+    worthless options) it can write a synthetic closing order so realized P&L
+    stops running over a phantom lot.
+
+    apply=false (default): dry-run — writes nothing, returns the proposed closes.
+    apply=true: writes + audits the auto closes only. Flags are never written.
+    See services/position_reconciler.py.
     """
     from app.services import position_reconciler as pr  # noqa: PLC0415
 
@@ -127,9 +136,17 @@ def reconcile_positions_dry_run(
                     BrokerAccount.connection_status == "connected",
                 )
             ).scalars().all()
-            reports = [pr.reconcile_account(db, a, dry_run=True) for a in accts]
+            reports = [pr.reconcile_account(db, a, apply=apply) for a in accts]
+            if apply:
+                db.commit()
     else:
-        reports = pr.reconcile_all_subscribers(dry_run=True)
+        reports = pr.reconcile_all_subscribers(apply=apply)
+
+    if apply:
+        log.warning(
+            "admin %s ran position reconcile apply=true (user_id=%s)",
+            admin.email, user_id,
+        )
 
     def _ser(r: "pr.AccountReconcileReport") -> dict:
         return {
@@ -145,6 +162,20 @@ def reconcile_positions_dry_run(
                     "broker_net": str(d.broker_net),
                     "delta": str(d.delta),
                     "classification": d.classification.value,
+                    "proposed_close": (
+                        {
+                            "side": d.proposed_close.side.value,
+                            "quantity": str(d.proposed_close.quantity),
+                            "price": str(d.proposed_close.price),
+                            "reason": d.proposed_close.reason,
+                            # None in dry-run; the written order id after apply.
+                            "written_order_id": (
+                                str(d.proposed_close.written_order_id)
+                                if d.proposed_close.written_order_id else None
+                            ),
+                        }
+                        if d.proposed_close else None
+                    ),
                 }
                 for d in r.divergences
             ],
@@ -156,17 +187,21 @@ def reconcile_positions_dry_run(
     def _count(cls: str) -> int:
         return sum(1 for d in all_divs if d["classification"] == cls)
 
+    written = sum(
+        1 for d in all_divs
+        if d["proposed_close"] and d["proposed_close"]["written_order_id"]
+    )
     return {
-        "dry_run": True,
+        "applied": apply,
         "accounts_checked": len(ser),
         "accounts_in_sync": sum(1 for r in ser if r["in_sync"]),
         "accounts_diverged": sum(1 for r in ser if r["divergences"]),
         "total_diverging_contracts": len(all_divs),
-        # Per-class breakdown — the number the write path will act on (auto) vs
-        # the number a human must review (the two flags).
+        # Per-class breakdown — auto = what an apply run writes; flags need a human.
         "auto_fixable": _count("auto_expired_worthless"),
         "flag_assignment": _count("flag_assignment"),
         "flag_live_drift": _count("flag_live_drift"),
+        "closes_written": written,  # 0 unless apply=true
         "reports": ser,
     }
 
