@@ -101,6 +101,65 @@ class CleanupIn(BaseModel):
     trader_email: Optional[str] = None
 
 
+# ─── Position reconciliation (dry-run) ────────────────────────────────────────
+
+@router.get("/positions/reconcile")
+def reconcile_positions_dry_run(
+    _: User = Depends(require_admin),
+    user_id: uuid.UUID | None = Query(
+        default=None, description="Limit to one subscriber; omit for all SnapTrade subscribers."
+    ),
+) -> dict:
+    """DRY-RUN report of where each subscriber's order-derived net position
+    disagrees with the broker's actual holdings. Writes nothing — surfaces the
+    P&L-corruption blast radius (missing broker-side closes). See
+    services/position_reconciler.py.
+    """
+    from app.services import position_reconciler as pr  # noqa: PLC0415
+
+    if user_id is not None:
+        from app.database import SessionLocal  # noqa: PLC0415
+        with SessionLocal() as db:
+            accts = db.execute(
+                select(BrokerAccount).where(
+                    BrokerAccount.user_id == user_id,
+                    BrokerAccount.broker == BrokerName.SNAPTRADE,
+                    BrokerAccount.connection_status == "connected",
+                )
+            ).scalars().all()
+            reports = [pr.reconcile_account(db, a, dry_run=True) for a in accts]
+    else:
+        reports = pr.reconcile_all_subscribers(dry_run=True)
+
+    def _ser(r: "pr.AccountReconcileReport") -> dict:
+        return {
+            "user_email": r.user_email,
+            "broker_account_id": str(r.broker_account_id),
+            "broker": r.broker,
+            "in_sync": r.in_sync,
+            "error": r.error,
+            "divergences": [
+                {
+                    "contract": d.contract.label(),
+                    "our_net": str(d.our_net),
+                    "broker_net": str(d.broker_net),
+                    "delta": str(d.delta),
+                }
+                for d in r.divergences
+            ],
+        }
+
+    ser = [_ser(r) for r in reports]
+    return {
+        "dry_run": True,
+        "accounts_checked": len(ser),
+        "accounts_in_sync": sum(1 for r in ser if r["in_sync"]),
+        "accounts_diverged": sum(1 for r in ser if r["divergences"]),
+        "total_diverging_contracts": sum(len(r["divergences"]) for r in ser),
+        "reports": ser,
+    }
+
+
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
