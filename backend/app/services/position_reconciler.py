@@ -35,7 +35,7 @@ import enum
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -43,9 +43,17 @@ from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OptionRight
+from app.models.order import (
+    InstrumentType, Order, OrderSide, OrderStatus, OrderType, OptionRight,
+)
 from app.models.user import User, UserRole
+from app.services import audit
 from app.services.crypto import decrypt_json
+
+# Marks synthetic reconciliation rows in broker_order_id. Every row this module
+# writes carries it, so they're queryable and a bad run is undone by deleting
+# tagged rows — there's no broker side effect to unwind.
+RECONCILE_TAG = "RECONCILE:"
 
 log = logging.getLogger(__name__)
 
@@ -132,14 +140,138 @@ def classify_divergence(
 
 
 @dataclass
+class ProposedClose:
+    """The synthetic closing order the write path would insert for an
+    auto-fixable divergence. Populated for AUTO divergences even in dry-run, so
+    a caller can diff exactly what an apply=True run would write."""
+    side: OrderSide           # opposite of our net
+    quantity: Decimal         # abs(our_net)
+    price: Decimal            # 0 for expired-worthless
+    parent_order_id: uuid.UUID
+    reason: str
+    written_order_id: uuid.UUID | None = None  # set only after an apply write
+
+
+@dataclass
 class Divergence:
     contract: ContractKey
     our_net: Decimal      # signed: + long, - short (filled buys - sells)
     broker_net: Decimal   # signed, from get_positions()
     classification: DivergenceClass = DivergenceClass.FLAG_LIVE_DRIFT
+    proposed_close: ProposedClose | None = None
     @property
     def delta(self) -> Decimal:
         return self.our_net - self.broker_net
+
+
+def _same_contract(contract: ContractKey):
+    """SQLAlchemy predicate tuple matching one exact contract on Order rows."""
+    return (
+        Order.symbol == contract.symbol,
+        Order.instrument_type == contract.instrument_type,
+        Order.option_expiry.is_not_distinct_from(contract.option_expiry),
+        Order.option_strike.is_not_distinct_from(contract.option_strike),
+        Order.option_right.is_not_distinct_from(contract.option_right),
+    )
+
+
+def _representative_parent(
+    db: Session, broker_account_id: uuid.UUID, contract: ContractKey
+) -> uuid.UUID | None:
+    """A parent_order_id from an existing mirror order on this contract, so the
+    synthetic close lands in the SAME mirrors_only FIFO timeline the realized-P&L
+    view walks. None if there's no mirror to attach to — then we can't safely
+    write a subscriber close and must flag instead of auto-fixing."""
+    return db.execute(
+        select(Order.parent_order_id)
+        .where(
+            Order.broker_account_id == broker_account_id,
+            *_same_contract(contract),
+            Order.parent_order_id.is_not(None),
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _expiry_fill_time(contract: ContractKey) -> datetime:
+    """When to date the synthetic close. Use the option's expiry at the US close
+    (16:00 ET → UTC) so the realized P&L lands on the day the option actually
+    expired, not the day we happened to reconcile."""
+    from app.services import market_hours  # noqa: PLC0415
+    exp = contract.option_expiry or market_hours.now_et().date()
+    et_dt = datetime.combine(exp, time(16, 0), tzinfo=market_hours.ET)
+    return et_dt.astimezone(timezone.utc)
+
+
+def _build_proposed_close(
+    db: Session, broker_account_id: uuid.UUID, div: Divergence
+) -> ProposedClose | None:
+    """The synthetic close for an auto-fixable divergence, or None if we can't
+    attach it to a mirror (in which case the caller downgrades to a flag)."""
+    parent = _representative_parent(db, broker_account_id, div.contract)
+    if parent is None:
+        return None
+    # Close in the direction that flattens our net: short (net<0) → BUY back;
+    # long (net>0) → SELL. Quantity is the phantom amount.
+    side = OrderSide.BUY if div.our_net < 0 else OrderSide.SELL
+    return ProposedClose(
+        side=side,
+        quantity=abs(div.our_net),
+        price=Decimal(0),  # expired worthless
+        parent_order_id=parent,
+        reason="expired worthless",
+    )
+
+
+def _write_close(db: Session, account: BrokerAccount, div: Divergence) -> uuid.UUID:
+    """Insert the synthetic closing order + audit it. Caller owns the txn/commit.
+    NEVER calls the broker — this is bookkeeping only."""
+    pc = div.proposed_close
+    assert pc is not None
+    c = div.contract
+    fill_at = _expiry_fill_time(c)
+    order = Order(
+        user_id=account.user_id,
+        broker_account_id=account.id,
+        parent_order_id=pc.parent_order_id,
+        instrument_type=c.instrument_type,
+        symbol=c.symbol,
+        option_expiry=c.option_expiry,
+        option_strike=c.option_strike,
+        option_right=c.option_right,
+        side=pc.side,
+        order_type=OrderType.MARKET,
+        quantity=pc.quantity,
+        filled_quantity=pc.quantity,
+        filled_avg_price=pc.price,
+        status=OrderStatus.FILLED,
+        is_closing=True,
+        submitted_at=fill_at,
+        closed_at=fill_at,
+        broker_order_id=f"{RECONCILE_TAG}{uuid.uuid4()}",
+        reject_reason=f"position reconcile: {pc.reason}",
+    )
+    db.add(order)
+    db.flush()  # assign order.id for the audit + return
+    pc.written_order_id = order.id
+    audit.record(
+        db,
+        actor_user_id=account.user_id,
+        action="position.reconciled",
+        entity_type="order",
+        entity_id=order.id,
+        metadata={
+            "contract": c.label(),
+            "our_net": str(div.our_net),
+            "broker_net": str(div.broker_net),
+            "close_side": pc.side.value,
+            "close_qty": str(pc.quantity),
+            "close_price": str(pc.price),
+            "basis": pc.reason,
+            "broker_account_id": str(account.id),
+        },
+    )
+    return order.id
 
 
 @dataclass
@@ -213,15 +345,18 @@ def _broker_positions(account: BrokerAccount) -> dict[ContractKey, Decimal]:
 
 
 def reconcile_account(
-    db: Session, account: BrokerAccount, *, dry_run: bool = True
+    db: Session, account: BrokerAccount, *, apply: bool = False
 ) -> AccountReconcileReport:
     """Compare one account's order-derived net against the broker's actual
-    holdings and report every contract where they disagree.
+    holdings, classify each divergence, and attach the proposed synthetic close
+    for the auto-fixable ones.
 
-    dry_run=True (the only supported mode today): writes nothing.
-    dry_run=False: NOT YET IMPLEMENTED — the correction path (recording the
-    missing closes, audited) is a deliberate follow-up. It raises so nobody
-    accidentally mutates money data before that path is designed and reviewed.
+    apply=False (default): writes NOTHING. Every auto divergence still gets its
+    ``proposed_close`` populated, so a caller can diff exactly what an apply run
+    would do. This is the safe default.
+
+    apply=True: writes the synthetic closes for AUTO_EXPIRED_WORTHLESS
+    divergences only (flags are never written) and audits each. Caller commits.
     """
     user = db.get(User, account.user_id)
     report = AccountReconcileReport(
@@ -243,29 +378,40 @@ def reconcile_account(
     for key in sorted(set(ours) | set(broker), key=lambda k: k.label()):
         o = ours.get(key, Decimal(0))
         b = broker.get(key, Decimal(0))
-        if o != b:
-            report.divergences.append(Divergence(
-                contract=key, our_net=o, broker_net=b,
-                classification=classify_divergence(key, o, b, broker, today),
-            ))
-
-    if not dry_run:
-        # The corrective write is intentionally not built yet. Reporting first
-        # (see module docstring). When implemented it must: record a reconciling
-        # adjustment so the derived net matches the broker, NEVER place a real
-        # broker order, and audit every change (action="position.reconciled").
-        raise NotImplementedError(
-            "position_reconciler write path not implemented — dry_run only. "
-            "The correction step is a separate, audited change."
+        if o == b:
+            continue
+        div = Divergence(
+            contract=key, our_net=o, broker_net=b,
+            classification=classify_divergence(key, o, b, broker, today),
         )
+        if div.classification == DivergenceClass.AUTO_EXPIRED_WORTHLESS:
+            div.proposed_close = _build_proposed_close(db, account.id, div)
+            if div.proposed_close is None:
+                # No mirror to attach the close to — can't safely write a
+                # subscriber close. Downgrade to a flag rather than fabricate.
+                div.classification = DivergenceClass.FLAG_LIVE_DRIFT
+        report.divergences.append(div)
+
+    if apply:
+        for div in report.divergences:
+            if (
+                div.classification == DivergenceClass.AUTO_EXPIRED_WORTHLESS
+                and div.proposed_close is not None
+            ):
+                _write_close(db, account, div)
+        db.flush()
     return report
 
 
-def reconcile_all_subscribers(*, dry_run: bool = True) -> list[AccountReconcileReport]:
-    """Dry-run the reconciler across every connected SnapTrade subscriber
-    account. SnapTrade is the drift source (polled, misses closes); direct
-    brokers report fills reliably and don't accumulate this way, so they're out
-    of scope until proven otherwise."""
+def reconcile_all_subscribers(*, apply: bool = False) -> list[AccountReconcileReport]:
+    """Run the reconciler across every connected SnapTrade subscriber account.
+    SnapTrade is the drift source (polled, misses closes); direct brokers report
+    fills reliably and don't accumulate this way, so they're out of scope until
+    proven otherwise.
+
+    apply=False (default) writes nothing. apply=True commits PER ACCOUNT — a
+    write failure on one subscriber never half-writes another (each account is
+    its own transaction boundary)."""
     from app.database import SessionLocal  # noqa: PLC0415
     out: list[AccountReconcileReport] = []
     with SessionLocal() as db:
@@ -279,5 +425,10 @@ def reconcile_all_subscribers(*, dry_run: bool = True) -> list[AccountReconcileR
             )
         ).scalars().all()
         for acct in accounts:
-            out.append(reconcile_account(db, acct, dry_run=dry_run))
+            report = reconcile_account(db, acct, apply=apply)
+            if apply and report.error is None:
+                db.commit()   # per-account boundary
+            elif apply:
+                db.rollback()  # this account errored — don't carry a partial txn
+            out.append(report)
     return out
