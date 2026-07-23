@@ -1141,6 +1141,54 @@ class SnapTradeAdapter(BrokerAdapter):
             return list(body.get("orders") or [])
         return list(body)
 
+    def get_account_activities(
+        self, start_date: str, end_date: str
+    ) -> list[Any]:
+        """Complete trade/transaction activity for [start_date, end_date]
+        (YYYY-MM-DD), paginated — the authoritative, broker-direct source for
+        realized P&L.
+
+        Unlike ``list_recent_activities`` (get_user_account_orders, capped at
+        ~100 recent orders / a few days), this returns the FULL broker history
+        for the range, so realized P&L computed from it does not drift when our
+        DB misses a fill. Uses the account-scoped
+        ``account_information.get_account_activities`` — the older top-level
+        ``transactions_and_reporting.get_activities`` is deprecated (410) and
+        ``get_reporting_custom_range`` is entitlement-gated (403) for our keys.
+
+        Each activity carries: ``type`` (BUY / SELL / OPTIONEXERCISE / …),
+        ``units`` (signed — SELL is negative), ``price``, ``amount``,
+        ``trade_date``, and ``option_symbol`` (OCC ticker). Returns the raw
+        activity dicts; the caller parses + FIFOs them.
+        """
+        out: list[Any] = []
+        offset, page = 0, 1000
+        while True:
+            try:
+                resp = self._c().account_information.get_account_activities(
+                    user_id=self._user_id,
+                    user_secret=self._user_secret,
+                    account_id=self._account_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    offset=offset,
+                    limit=page,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("snaptrade get_account_activities failed")
+                break
+            body = getattr(resp, "body", resp) or {}
+            data = body.get("data") if isinstance(body, dict) else body
+            if not data:
+                break
+            out.extend(data)
+            pagination = body.get("pagination") if isinstance(body, dict) else None
+            total = (pagination or {}).get("total", len(out))
+            offset += len(data)
+            if offset >= total or len(data) < page:
+                break
+        return out
+
     def _order_to_result(self, o: Any) -> BrokerOrderResult:
         raw_status = str(_attr(o, "status", default="")).upper()
         sym_obj = _attr(o, "symbol", default={})
