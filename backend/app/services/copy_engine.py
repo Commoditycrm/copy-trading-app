@@ -300,6 +300,34 @@ def _has_working_entry_for_contract(db: Session, user_id: uuid.UUID, order: Orde
     ).first() is not None
 
 
+def _has_filled_entry_for_contract(db: Session, user_id: uuid.UUID, order: Order) -> bool:
+    """True if the subscriber has a same-contract ENTRY (opposite side of this
+    close) whose STATUS is FILLED/PARTIALLY_FILLED — i.e. the broker HAS filled it
+    — even if its ``filled_quantity`` hasn't synced into our numbers yet.
+
+    This is the companion to [[_has_working_entry_for_contract]] for a subtler
+    fill-sync race we hit in prod on Webull/SnapTrade: the entry reached FILLED in
+    our DB but its filled_quantity was still 0 (SnapTrade's order feed reports the
+    status ahead of the quantity), so ``_closeable_quantity`` read 0 and the close
+    was wrongly skipped even though the broker held the position. A rejected entry
+    (e.g. Alpaca can't trade an index option) is NOT filled, so this stays False
+    and genuine 'never acquired' closes are still cleanly skipped."""
+    entry_side = OrderSide.BUY if order.side == OrderSide.SELL else OrderSide.SELL
+    return db.execute(
+        select(Order.id).where(
+            Order.user_id == user_id,
+            Order.symbol == order.symbol,
+            Order.instrument_type == order.instrument_type,
+            Order.option_expiry.is_not_distinct_from(order.option_expiry),
+            Order.option_strike.is_not_distinct_from(order.option_strike),
+            Order.option_right.is_not_distinct_from(order.option_right),
+            Order.side == entry_side,
+            Order.is_closing.is_(False),
+            Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+        ).limit(1)
+    ).first() is not None
+
+
 def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
     """Rewrite a CLOSE order so it fills IMMEDIATELY — so a subscriber always
     exits when the trader does. A copied LIMIT close routinely rests unfilled
@@ -1592,6 +1620,17 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         and market_hours.is_same_day_expiry(trader_order.option_expiry)
     )
 
+    # Reliable "the trader is CLOSING" signal, computed once for the whole fanout
+    # from the TRADER's OWN held position (their fills sync promptly via the
+    # trader listener, unlike a subscriber's which can lag on SnapTrade). Used
+    # below so a subscriber's close isn't wrongly skipped when our view of THEIR
+    # position is briefly stale: if the trader is reducing a real position, any
+    # subscriber who mirror-holds it should attempt the close too, and let the
+    # broker be the final arbiter (it fills if held, safely rejects if flat).
+    trader_closing = bool(trader_order.is_closing) or _closeable_quantity(
+        db, trader_order.user_id, trader_order, subtract_reserved=False,
+    ) > 0
+
     for sub in subs:
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
@@ -1800,15 +1839,32 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     # FILL-SYNC RACE: the subscriber's entry filled at the broker
                     # (e.g. a fast buy→sell, or a pre-market fill) and just hasn't
                     # synced to our filled_quantity yet, so _closeable_quantity
-                    # reads 0. If a same-contract ENTRY is still working, DON'T
-                    # drop the close — leave `scaled` as-is and let placement
-                    # re-check the LIVE broker position and defer until the fill
-                    # lands (_place_mirror_with_conflict_resolve). This is exactly
-                    # the case that skipped a subscriber's NVDA close in prod while
-                    # another subscriber (whose fill had synced) went through.
-                    if closeable <= 0 and _has_working_entry_for_contract(
+                    # reads 0. Two shapes of this race, both of which must NOT drop
+                    # the close (leave `scaled` as-is; placement re-checks the LIVE
+                    # broker position and defers/closes accordingly):
+                    #   1. a same-contract ENTRY is still WORKING — the fill is on
+                    #      its way (pre-market BUY, or a fast scalp where SELL beat
+                    #      BUY). Skipped a subscriber's NVDA close in prod.
+                    #   2. the entry reached FILLED but its filled_quantity hasn't
+                    #      synced (SnapTrade reports status ahead of quantity), AND
+                    #      the TRADER is genuinely closing — so the broker DOES hold
+                    #      it, our count just lags. Skipped a subscriber's NDXP close
+                    #      on Webull while the trader had already exited.
+                    # A rejected entry (e.g. Alpaca can't trade an index option) is
+                    # neither working nor filled, so a genuine 'never acquired'
+                    # close is still cleanly skipped below.
+                    entry_landing = _has_working_entry_for_contract(
                         db, sub.user_id, trader_order
-                    ):
+                    )
+                    entry_filled_unsynced = trader_closing and _has_filled_entry_for_contract(
+                        db, sub.user_id, trader_order
+                    )
+                    if closeable <= 0 and (entry_landing or entry_filled_unsynced):
+                        # We KNOW this is a close (working/filled entry + trader
+                        # exiting), so force close semantics — SnapTrade needs
+                        # SELL_TO_CLOSE, and it makes the broker safely reject
+                        # rather than open a short if we're somehow already flat.
+                        is_closing_effective = True
                         audit.record(
                             db,
                             actor_user_id=sub.user_id,
@@ -1819,6 +1875,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                                 "requested_qty": str(scaled),
                                 "symbol": trader_order.symbol,
                                 "broker_account_id": str(acct.id),
+                                "reason": "entry_filled_unsynced" if entry_filled_unsynced and not entry_landing else "entry_working",
                             },
                         )
                     else:
