@@ -119,6 +119,8 @@ def _serialize_child(
         # the parent row exposes, so per-subscriber slippage is visible too.
         "expected_price": str(child.limit_price) if child.limit_price is not None else None,
         "filled_avg_price": str(child.filled_avg_price) if child.filled_avg_price is not None else None,
+        # When this mirror actually filled (closed_at is stamped on FILLED).
+        "filled_at": child.closed_at.isoformat() if (child.closed_at and child.status == OrderStatus.FILLED) else None,
         "broker_order_id": child.broker_order_id,
         "submitted_at": accepted_at.isoformat() if accepted_at else None,
         "created_at": child.created_at.isoformat() if child.created_at else None,
@@ -177,11 +179,18 @@ def _serialize_fanout(
         "quantity": str(parent.quantity),
         "instrument_type": parent.instrument_type.value,
         "order_type": parent.order_type.value,
+        # Option contract parts, so the admin table can render the same full
+        # descriptor as the trader panel ("SPXW C $7510 22 Jul 26").
+        "option_expiry": parent.option_expiry.isoformat() if parent.option_expiry else None,
+        "option_strike": str(parent.option_strike) if parent.option_strike is not None else None,
+        "option_right": parent.option_right.value if parent.option_right else None,
         # Expected = the trader's limit price (NULL for market orders); filled =
         # the broker's average fill price. Surfaced side-by-side so the table can
         # show slippage.
         "expected_price": str(parent.limit_price) if parent.limit_price is not None else None,
         "filled_avg_price": str(parent.filled_avg_price) if parent.filled_avg_price is not None else None,
+        # When the trader's order actually filled (closed_at is stamped on FILLED).
+        "filled_at": parent.closed_at.isoformat() if (parent.closed_at and parent.status == OrderStatus.FILLED) else None,
         "broker_accepted_at": parent.submitted_at.isoformat() if parent.submitted_at else None,
         "detected_at": parent.created_at.isoformat() if parent.created_at else None,
         "fanout_completed_at": last_accept_at.isoformat() if last_accept_at else None,

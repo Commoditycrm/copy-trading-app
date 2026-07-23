@@ -33,6 +33,7 @@ export interface FanoutChild {
   // The mirror's own expected (limit) vs actual fill price.
   expected_price: string | null;
   filled_avg_price: string | null;
+  filled_at: string | null;
   broker_order_id: string | null;
   submitted_at: string | null;
   created_at: string | null;
@@ -913,6 +914,7 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                     ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
                                     ["Expected Price", "This mirror's limit price. Blank for market orders (no expected price)."],
                                     ["Filled Price", "The subscriber's broker average fill price for this mirror. Compare with Expected Price to gauge their slippage."],
+                                    ["Filled At", "When this subscriber's mirror actually filled."],
                                     ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING).", "created_at"],
                                     ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line.", "subscriber_picked_at"],
                                     ["Submitted to Broker", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker.", "subscriber_accepted_at"],
@@ -1019,6 +1021,13 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                         style={{ color: c.filled_avg_price ? "var(--text)" : "var(--muted)" }}
                                       >
                                         {c.filled_avg_price ?? "—"}
+                                      </td>
+                                      {/* Filled At — when this subscriber's mirror actually filled */}
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: c.filled_at ? "var(--text)" : "var(--muted)" }}
+                                      >
+                                        {fmtClock(c.filled_at)}
                                       </td>
                                       <td
                                         className="px-2 py-2 tabular-nums whitespace-nowrap"
