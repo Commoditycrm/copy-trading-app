@@ -38,6 +38,11 @@ class BrokerOrderRequest:
     # Open vs. close intent. Stock adapters (Alpaca) ignore it; SnapTrade's
     # options API needs it to pick BUY_TO_OPEN/SELL_TO_CLOSE etc.
     is_closing: bool = False
+    # Route this order to the pre/post-market session. Alpaca ONLY fills
+    # pre/post-market when this is True AND the order is a LIMIT (a plain
+    # market order can't trade in extended hours). Ignored by brokers that
+    # trade extended hours natively (Webull via SnapTrade).
+    extended_hours: bool = False
     # Bracket-order exit legs attached to the parent entry. When either is
     # set on a market/limit entry, adapters that support bracket orders
     # (Alpaca) route through OrderClass.BRACKET; adapters that don't

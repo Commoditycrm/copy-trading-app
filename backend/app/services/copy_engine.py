@@ -328,6 +328,36 @@ def _has_filled_entry_for_contract(db: Session, user_id: uuid.UUID, order: Order
     ).first() is not None
 
 
+def _marketable_stock_limit(adapter: Any, req: BrokerOrderRequest) -> Decimal | None:
+    """Price a marketable LIMIT for a stock — through the last trade so it fills
+    like a market order (BUY a touch up, SELL a touch down). Returns None if no
+    price is available."""
+    if not hasattr(adapter, "get_stock_latest_price"):
+        return None
+    try:
+        last = adapter.get_stock_latest_price(req.symbol)
+    except Exception:  # noqa: BLE001
+        last = None
+    if not last or last <= 0:
+        return None
+    buf = Decimal("1.01") if req.side == OrderSide.BUY else Decimal("0.99")
+    limit = (last * buf).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return limit if limit > 0 else None
+
+
+def _alpaca_extended_hours(adapter: Any) -> bool:
+    """True when this is an Alpaca adapter AND we're in pre/post-market right now
+    — the case where a plain MARKET order can't fill and we must route an
+    extended-hours LIMIT instead. Webull (via SnapTrade) trades extended hours
+    natively, so it stays False there."""
+    try:
+        from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+        from app.services import market_hours  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(adapter, AlpacaAdapter) and market_hours.in_extended_hours()
+
+
 def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
     """Rewrite a CLOSE order so it fills IMMEDIATELY — so a subscriber always
     exits when the trader does. A copied LIMIT close routinely rests unfilled
@@ -344,6 +374,21 @@ def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderReq
     Only ever called for closes (is_closing=True); entries are never touched.
     """
     if req.instrument_type == InstrumentType.STOCK:
+        # Pre/post-market on Alpaca a plain MARKET order can't fill — Alpaca only
+        # trades extended hours as a LIMIT + extended_hours=True. This is exactly
+        # the EHGO case: the trader (Webull) filled pre-market but the subscriber's
+        # forced-MARKET mirror sat queued on Alpaca until 09:30, and a SELL on top
+        # of that stuck BUY was wash-trade-rejected. Route a marketable extended-
+        # hours limit so it fills now. Regular hours (and Webull, which trades
+        # extended hours natively) keep MARKET.
+        if _alpaca_extended_hours(adapter):
+            px = _marketable_stock_limit(adapter, req)
+            if px is not None:
+                return replace(
+                    req, order_type=OrderType.LIMIT, limit_price=px,
+                    stop_price=None, extended_hours=True,
+                )
+            # Couldn't price it — fall through to MARKET (no worse than before).
         return replace(req, order_type=OrderType.MARKET, limit_price=None, stop_price=None)
 
     # ── OPTION: marketable limit ──
@@ -503,6 +548,22 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
             # order's own direction (BUY → ask), so it works for entries as well.
             req = _to_immediate_close(item.adapter, req)
             item.request = req
+    # Non-forced entry pre/post-market on Alpaca: a plain limit won't trade in
+    # extended hours unless flagged, so a resting pre-market mirror would sit
+    # unfilled until 09:30 (the other half of the EHGO problem). Flag it so it
+    # can fill now, matching the trader (who trades extended hours). Stocks only;
+    # skip if already flagged or a bracket is attached (Alpaca forbids
+    # extended_hours with brackets).
+    if (
+        req.instrument_type == InstrumentType.STOCK
+        and req.order_type == OrderType.LIMIT
+        and not req.extended_hours
+        and req.take_profit_price is None
+        and req.stop_loss_price is None
+        and _alpaca_extended_hours(item.adapter)
+    ):
+        req = replace(req, extended_hours=True)
+        item.request = req
     try:
         return item.adapter.place_order(req)
     except Exception as exc:  # noqa: BLE001

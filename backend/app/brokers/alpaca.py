@@ -206,6 +206,12 @@ class AlpacaAdapter(BrokerAdapter):
                 common["stop_loss"] = StopLossRequest(
                     stop_price=float(req.stop_loss_price)
                 )
+        # Pre/post-market routing. Alpaca ONLY trades extended hours as a plain
+        # LIMIT with extended_hours=True — never a market or bracket order — so
+        # we set it only for a plain limit. Callers convert market→marketable
+        # limit before extended hours (see copy_engine._to_immediate_close).
+        if req.extended_hours and req.order_type == OrderType.LIMIT and not is_advanced:
+            common["extended_hours"] = True
         if req.order_type == OrderType.MARKET:
             order_req = MarketOrderRequest(**common)
         elif req.order_type == OrderType.LIMIT:
