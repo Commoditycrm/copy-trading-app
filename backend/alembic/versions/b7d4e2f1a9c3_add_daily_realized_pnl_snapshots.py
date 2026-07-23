@@ -1,20 +1,20 @@
-"""add daily_realized_pnl_snapshots + merge the two open heads
+"""add daily_realized_pnl_snapshots
 
-Creates the durable per-user, per-day realized-P&L table the Calendar reads
-(see models/daily_realized_pnl_snapshot.py). Also merges the two previously
-divergent alembic heads (6f2b9c4e1a70 SMS categories, d4e5f6a7b8c9 copy-trader
-bracket) so `alembic upgrade head` is unambiguous again.
+Durable per-user, per-day realized-P&L table the Calendar reads
+(see models/daily_realized_pnl_snapshot.py). Single-parent migration off the
+current head 6f2b9c4e1a70 — the DB is already there, so `alembic upgrade head`
+applies only this.
 
-Revision ID: f1a2b3c4d5e6
-Revises: 6f2b9c4e1a70, d4e5f6a7b8c9
+Revision ID: b7d4e2f1a9c3
+Revises: 6f2b9c4e1a70
 Create Date: 2026-07-23
 """
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID
 
-revision = "f1a2b3c4d5e6"
-down_revision = ("6f2b9c4e1a70", "d4e5f6a7b8c9")
+revision = "b7d4e2f1a9c3"
+down_revision = "6f2b9c4e1a70"
 branch_labels = None
 depends_on = None
 
