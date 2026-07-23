@@ -23,26 +23,20 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "subscriber_settings",
-        sa.Column(
-            "copy_trader_bracket",
-            sa.Boolean(),
-            nullable=False,
-            server_default="false",
-        ),
+    # Idempotent adds: on prod/QA these columns were already created out-of-band
+    # while alembic stayed at the prior head, so a plain add_column would fail
+    # ("column already exists") and block every subsequent migration. IF NOT
+    # EXISTS makes this safe on both an already-patched DB (skips) and a fresh
+    # one (adds), so the history can finally advance past this revision.
+    op.execute(
+        "ALTER TABLE subscriber_settings "
+        "ADD COLUMN IF NOT EXISTS copy_trader_bracket BOOLEAN NOT NULL DEFAULT false"
     )
-    op.add_column(
-        "orders",
-        sa.Column("take_profit_pct", sa.Numeric(9, 4), nullable=True),
-    )
-    op.add_column(
-        "orders",
-        sa.Column("stop_loss_pct", sa.Numeric(9, 4), nullable=True),
-    )
+    op.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS take_profit_pct NUMERIC(9, 4)")
+    op.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS stop_loss_pct NUMERIC(9, 4)")
 
 
 def downgrade() -> None:
-    op.drop_column("orders", "stop_loss_pct")
-    op.drop_column("orders", "take_profit_pct")
-    op.drop_column("subscriber_settings", "copy_trader_bracket")
+    op.execute("ALTER TABLE orders DROP COLUMN IF EXISTS stop_loss_pct")
+    op.execute("ALTER TABLE orders DROP COLUMN IF EXISTS take_profit_pct")
+    op.execute("ALTER TABLE subscriber_settings DROP COLUMN IF EXISTS copy_trader_bracket")
