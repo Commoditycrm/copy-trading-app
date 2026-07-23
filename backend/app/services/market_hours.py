@@ -20,6 +20,15 @@ ET = ZoneInfo("America/New_York")
 MARKET_CLOSE = time(16, 0)
 EOD_WINDOW_START = time(15, 45)
 
+# Regular US equity session and the extended-hours windows around it. Alpaca
+# only fills orders pre/post-market when they're routed as extended-hours
+# LIMITs (a plain market order can't trade then) — so any layer placing an
+# Alpaca order in these windows must flag it. Pre-market 04:00–09:30 ET,
+# post-market 16:00–20:00 ET.
+REGULAR_OPEN = time(9, 30)
+PREMARKET_START = time(4, 0)
+POSTMARKET_END = time(20, 0)
+
 
 def now_et() -> datetime:
     """Current wall-clock in US Eastern (DST-aware)."""
@@ -40,6 +49,23 @@ def in_eod_close_window(dt_et: datetime | None = None) -> bool:
     refuse new same-day-expiry orders."""
     dt = dt_et or now_et()
     return is_trading_weekday(dt) and EOD_WINDOW_START <= dt.time() < MARKET_CLOSE
+
+
+def in_regular_session(dt_et: datetime | None = None) -> bool:
+    """True during the regular US cash session (09:30–16:00 ET) on a weekday."""
+    dt = dt_et or now_et()
+    return is_trading_weekday(dt) and REGULAR_OPEN <= dt.time() < MARKET_CLOSE
+
+
+def in_extended_hours(dt_et: datetime | None = None) -> bool:
+    """True during pre-market (04:00–09:30 ET) or post-market (16:00–20:00 ET)
+    on a weekday — the windows where an Alpaca order must be routed as an
+    extended-hours LIMIT to fill (a plain market order won't trade)."""
+    dt = dt_et or now_et()
+    if not is_trading_weekday(dt):
+        return False
+    t = dt.time()
+    return (PREMARKET_START <= t < REGULAR_OPEN) or (MARKET_CLOSE <= t < POSTMARKET_END)
 
 
 def is_same_day_expiry(option_expiry: date | None, dt_et: datetime | None = None) -> bool:
