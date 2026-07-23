@@ -1086,6 +1086,57 @@ def _reconcile_subscriber_fills_once() -> None:
             )
 
 
+def _contract_key(symbol, instrument_type, option_expiry, option_strike, option_right):
+    """Stable per-contract identity shared by broker positions and our orders."""
+    if instrument_type == InstrumentType.OPTION:
+        return (symbol, instrument_type, option_expiry, option_strike, option_right)
+    return (symbol, instrument_type, None, None, None)
+
+
+def _broker_net_map(adapter: SnapTradeAdapter) -> tuple[dict, bool]:
+    """Live net position per contract from the broker, plus a `reachable` flag.
+
+    reachable=False means we must NOT recover any close this sweep. get_positions()
+    swallows a stale/404 connection and returns [] instead of raising, so an empty
+    result is ambiguous — genuinely flat, or a dead connection. Treating "empty"
+    as "flat" is what let the reverted fix book closes against a blank broker. So
+    we only trust a NON-empty read; empty → unreachable → recoveries wait for a
+    sweep that actually sees holdings. Conservative, but it can't invent closes."""
+    try:
+        positions = adapter.get_positions()
+    except Exception:  # noqa: BLE001
+        return {}, False
+    net: dict = {}
+    for p in positions:
+        key = _contract_key(
+            p.symbol, p.instrument_type, p.option_expiry, p.option_strike, p.option_right
+        )
+        net[key] = net.get(key, Decimal(0)) + Decimal(str(p.quantity))
+    return net, bool(positions)
+
+
+def _derived_contract_net(db, subscriber_id: uuid.UUID, key) -> Decimal:
+    """Our current deduped FILLED net for one contract — the same view the
+    realized-P&L FIFO walks (dedupe_subscriber_orders). Used to check whether a
+    recovery would move us toward the broker or overshoot into a phantom short."""
+    from app.services.pnl import dedupe_subscriber_orders  # noqa: PLC0415
+    rows = list(db.execute(
+        select(Order).where(
+            Order.user_id == subscriber_id,
+            Order.status == OrderStatus.FILLED,
+            Order.filled_quantity > 0,
+        )
+    ).scalars())
+    net = Decimal(0)
+    for o in dedupe_subscriber_orders(rows):
+        if _contract_key(o.symbol, o.instrument_type, o.option_expiry,
+                         o.option_strike, o.option_right) != key:
+            continue
+        q = Decimal(o.filled_quantity)
+        net += q if o.side == OrderSide.BUY else -q
+    return net
+
+
 def _reconcile_one_subscriber_account(
     subscriber_id: uuid.UUID, broker_account_id: uuid.UUID
 ) -> None:
@@ -1096,13 +1147,18 @@ def _reconcile_one_subscriber_account(
     orders = adapter.list_recent_activities()
     if not orders:
         return
+    # Broker's live net per contract — the guardrail the recovery path checks
+    # against so a recovered close can never push our net PAST what the broker
+    # actually holds (the phantom-short regression).
+    broker_net, broker_reachable = _broker_net_map(adapter)
     for o in orders:
         broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
         if not broker_order_id:
             continue
         status_str = str(_attr(o, "status", default="")).upper()
         _persist_subscriber_fill(
-            subscriber_id, broker_account_id, broker_order_id, status_str, o
+            subscriber_id, broker_account_id, broker_order_id, status_str, o,
+            broker_net, broker_reachable,
         )
 
 
@@ -1112,20 +1168,32 @@ def _persist_subscriber_fill(
     broker_order_id: str,
     status_str: str,
     order_obj: Any,
+    broker_net: dict | None = None,
+    broker_reachable: bool = False,
 ) -> None:
-    """Update one subscriber mirror order from a SnapTrade order snapshot.
-    Matches by (broker_order_id, user_id, parent_order_id NOT NULL) so it only
-    ever touches mirror rows — never the trader's own orders. No fanout."""
+    """Update one subscriber order from a SnapTrade snapshot. No fanout.
+
+    Normal path: match the mirror row by broker_order_id and sync its status/fill.
+
+    Recovery path (broker-net-aware): the broker sometimes reports a close
+    EXECUTED that we have as CANCELED (the mirror close was rejected before it
+    got a broker id; the real fill surfaced on a standalone row). Recovering it
+    fixes realized P&L — BUT only if it moves our net TOWARD the broker's actual
+    position. Blindly trusting every EXECUTED (the reverted fix) recovered a sell
+    with no matching buy → phantom short. So a recovery applies only when it
+    doesn't overshoot the broker's net, and never when the broker is unreachable."""
     from app.brokers.snaptrade import _STATUS_IN as SNAP_STATUS_IN
 
     status_enum = SNAP_STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
     with SessionLocal() as db:
+        # Prefer a mirror row; fall back to a standalone carrying this
+        # broker_order_id (the recovery case). parent_order_id.is_(None) sorts
+        # mirrors first (False < True).
         existing = db.execute(
             select(Order)
             .where(Order.broker_order_id == broker_order_id)
             .where(Order.user_id == subscriber_id)
-            .where(Order.parent_order_id.is_not(None))
-            .order_by(Order.created_at)
+            .order_by(Order.parent_order_id.is_(None), Order.created_at)
             .limit(1)
         ).scalars().first()
         if existing is None:
@@ -1133,6 +1201,40 @@ def _persist_subscriber_fill(
         # Already terminal + unchanged → nothing to do (don't re-publish a
         # settled order on every sweep).
         if existing.status == status_enum and existing.status in _TERMINAL_STATUSES:
+            return
+
+        # ── Recovery guard ──────────────────────────────────────────────────
+        # A recovery = flipping a CANCELED/REJECTED row (fill 0) to FILLED.
+        is_recovery = (
+            existing.status in (OrderStatus.CANCELED, OrderStatus.REJECTED)
+            and (existing.filled_quantity or 0) == 0
+            and status_enum == OrderStatus.FILLED
+        )
+        if is_recovery:
+            fq = _to_dec(_attr(order_obj, "filled_units", "filled_quantity")) or Decimal(0)
+            if not broker_reachable or fq <= 0:
+                return  # never recover against a blank/unreachable broker
+            key = _contract_key(
+                existing.symbol, existing.instrument_type, existing.option_expiry,
+                existing.option_strike, existing.option_right,
+            )
+            cur = _derived_contract_net(db, subscriber_id, key)
+            tgt = (broker_net or {}).get(key, Decimal(0))
+            signed = fq if existing.side == OrderSide.BUY else -fq
+            new = cur + signed
+            # Apply ONLY if it moves strictly toward the broker net without
+            # overshooting. SELL: cur must be > tgt and stay >= tgt. BUY: cur
+            # must be < tgt and stay <= tgt. Otherwise skip (leave it canceled).
+            moves_toward = abs(new - tgt) < abs(cur - tgt)
+            no_overshoot = (new >= tgt) if signed < 0 else (new <= tgt)
+            if not (moves_toward and no_overshoot):
+                return
+        # Never let a stale snapshot DOWNGRADE a real fill.
+        if (
+            existing.status == OrderStatus.FILLED
+            and (existing.filled_quantity or 0) > 0
+            and status_enum != OrderStatus.FILLED
+        ):
             return
 
         changed = False
