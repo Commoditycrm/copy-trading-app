@@ -29,6 +29,7 @@ from app.schemas.order import (
 from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
+from app.services.broker_pnl import realized_by_day_from_broker
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -1744,6 +1745,34 @@ def calendar_pnl(
     # P&L isn't double-counted. See realized_pnl_by_day(mirrors_only=...).
     target = db.get(User, target_user_id)
     mirrors_only = target is not None and target.role == UserRole.SUBSCRIBER
+
+    # Direct-from-broker: for a SnapTrade subscriber, compute realized P&L from
+    # the broker's OWN complete trade activity (get_account_activities) instead
+    # of our DB — which drifts whenever the listener misses a close. Falls back
+    # to the DB computation on any broker/API error so the calendar never breaks.
+    if mirrors_only:
+        from app.models.broker_account import BrokerName  # noqa: PLC0415
+        acct = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == target_user_id,
+                BrokerAccount.broker == BrokerName.SNAPTRADE,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars().first()
+        if acct is not None:
+            try:
+                adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+                daily = realized_by_day_from_broker(adapter, from_, to, tz_name=tz)
+                return [
+                    DailyPnL(day=d, realized_pnl=p, trade_count=n)
+                    for d, (p, n) in sorted(daily.items())
+                ]
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).exception(
+                    "calendar_pnl: broker-direct failed for %s; falling back to DB",
+                    target_user_id,
+                )
+
     daily = realized_pnl_by_day(
         db, target_user_id, start=from_, end=to, tz_name=tz, mirrors_only=mirrors_only
     )
