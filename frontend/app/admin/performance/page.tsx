@@ -21,8 +21,12 @@ interface Fanout {
   quantity: string;
   instrument_type: string;
   order_type: string;
+  option_expiry: string | null;
+  option_strike: string | null;
+  option_right: string | null;
   expected_price: string | null;
   filled_avg_price: string | null;
+  filled_at: string | null;
   trader_submitted_at: string | null;
   broker_accepted_at: string | null;
   socket_received_at: string | null;
@@ -55,6 +59,24 @@ function ms(v: number | null) {
   else if (v < 60_000) text = `${(Math.floor(v / 10) / 100).toFixed(2)}s`;
   else { const ts = Math.floor(v / 1000); text = `${Math.floor(ts / 60)}m ${String(ts % 60).padStart(2, "0")}s`; }
   return <span style={{ color, fontFamily: "monospace" }}>{text}</span>;
+}
+
+// Short option expiry, matching the trader panel ("22 Jul 26").
+function optionExpiryShort(isoDate: string): string {
+  const d = new Date(isoDate.length === 10 ? isoDate + "T00:00:00Z" : isoDate);
+  if (Number.isNaN(d.getTime())) return isoDate;
+  const mon = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+  return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+// Full contract descriptor for the Trade column — same style as the trader
+// panel: stock → "META"; option → "SPXW C $7510 22 Jul 26".
+function fanoutSymbolLabel(f: Fanout): string {
+  if (f.instrument_type !== "option") return f.symbol.toUpperCase();
+  const cp = f.option_right === "call" ? "C" : f.option_right === "put" ? "P" : "";
+  const strike = f.option_strike != null && f.option_strike !== "" ? `$${Number(f.option_strike)}` : "";
+  const exp = f.option_expiry ? optionExpiryShort(f.option_expiry) : "";
+  return [f.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
 }
 
 // Raw order-type enum → display label for the Order Type column.
@@ -124,7 +146,7 @@ function PerfTh({
   return (
     <th
       onClick={() => onSort(colKey)}
-      className="px-3 py-3 text-left text-xs font-semibold cursor-pointer select-none"
+      className="px-3 py-3 text-left text-xs font-semibold cursor-pointer select-none whitespace-nowrap"
       style={{ color: active ? "var(--text-2)" : "var(--muted)" }}
       title={`Sort by ${label}`}
     >
@@ -193,19 +215,19 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
         style={{ borderBottom: "1px solid var(--border)" }}
         title="Click to see per-subscriber breakdown"
       >
-        <td className="px-3 py-2.5">
+        <td className="px-3 py-2.5 whitespace-nowrap">
           <span style={{ marginRight: 6, color: "var(--muted)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
-          <span className="font-semibold">{fanout.symbol}</span>
-          <span className="ml-2 text-xs" style={{ color: fanout.side === "buy" ? "#22c55e" : "#ef4444" }}>
-            {fanout.side.toUpperCase()}
-          </span>
-          <span className="ml-1 text-xs" style={{ color: "var(--muted)" }}>×{fanout.quantity}</span>
+          <span className="font-semibold">{fanoutSymbolLabel(fanout)}</span>
         </td>
 
-        {/* Instrument type */}
+        {/* Qty — Number() strips the trailing zeros from the Numeric(18,6)
+            string ("3.000000" → "3"), while keeping real fractions ("2.5"). */}
+        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--text-2)" }}>{Number(fanout.quantity)}</td>
+
+        {/* Side — buy (green) / sell (red) */}
         <td className="px-3 py-2.5">
-          <span className="text-xs px-2 py-0.5 rounded-full capitalize" style={{ background: "var(--panel-2)", color: "var(--text-2)" }}>
-            {fanout.instrument_type}
+          <span className="text-xs font-semibold uppercase" style={{ color: fanout.side === "buy" ? "#22c55e" : "#ef4444" }}>
+            {fanout.side}
           </span>
         </td>
 
@@ -217,6 +239,8 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
         {/* Expected (limit) vs filled price */}
         <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>
         <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>
+        {/* Filled At — when the trader's order actually filled */}
+        <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtClock(fanout.filled_at)}</td>
 
         {/* Trader */}
         <td className="px-3 py-2.5 text-xs" style={{ color: "var(--text-2)" }}>
@@ -276,7 +300,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={23} className="px-4 py-2.5">
+          <td colSpan={25} className="px-4 py-2.5">
             {/* Shared with the trader Performance view so admins see the exact
                 same per-subscriber columns — no second copy to keep in sync. */}
             <SubscriberBreakdown mirrors={fanout.children} />
@@ -466,10 +490,12 @@ export default function AdminPerformancePage() {
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 <PerfTh label="Trade"            colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PerfTh label="Type"             colKey="instrument"  sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <PlainTh label="Qty" />
+                <PlainTh label="Side" />
                 <PlainTh label="Order Type" />
                 <PlainTh label="Expected Price" />
                 <PlainTh label="Filled Price" />
+                <PlainTh label="Filled At" />
                 <PerfTh label="Trader"           colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <PlainTh label="Date" />
                 <PlainTh label="Trader Submitted At" />
