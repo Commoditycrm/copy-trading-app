@@ -29,7 +29,7 @@ from app.schemas.order import (
 from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
-from app.services.broker_pnl import realized_by_day_from_broker
+from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -1746,37 +1746,30 @@ def calendar_pnl(
     target = db.get(User, target_user_id)
     mirrors_only = target is not None and target.role == UserRole.SUBSCRIBER
 
-    # Direct-from-broker: for a SnapTrade subscriber, compute realized P&L from
-    # the broker's OWN complete trade activity (get_account_activities) instead
-    # of our DB — which drifts whenever the listener misses a close. Falls back
-    # to the DB computation on any broker/API error so the calendar never breaks.
-    if mirrors_only:
-        from app.models.broker_account import BrokerName  # noqa: PLC0415
-        acct = db.execute(
-            select(BrokerAccount).where(
-                BrokerAccount.user_id == target_user_id,
-                BrokerAccount.broker == BrokerName.SNAPTRADE,
-                BrokerAccount.connection_status == "connected",
-            )
-        ).scalars().first()
-        if acct is not None:
-            try:
-                adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-                daily = realized_by_day_from_broker(adapter, from_, to, tz_name=tz)
-                return [
-                    DailyPnL(day=d, realized_pnl=p, trade_count=n)
-                    for d, (p, n) in sorted(daily.items())
-                ]
-            except Exception:  # noqa: BLE001
-                logging.getLogger(__name__).exception(
-                    "calendar_pnl: broker-direct failed for %s; falling back to DB",
-                    target_user_id,
-                )
-
-    daily = realized_pnl_by_day(
+    # Base: the DB-derived realized P&L (spans every broker the user ever traded
+    # on, since all their orders live in our DB). This is the fallback for any
+    # day not yet frozen into a snapshot.
+    db_daily = realized_pnl_by_day(
         db, target_user_id, start=from_, end=to, tz_name=tz, mirrors_only=mirrors_only
     )
-    return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(daily.items())]
+
+    # Overlay the frozen daily snapshots (pnl_snapshot job — computed off the
+    # broker's own complete feed, so they're correct where the DB drifts, and
+    # they persist across broker changes because they're keyed by (user, day)).
+    # Snapshot wins on any day it exists; the DB value covers the rest.
+    snaps = {
+        s.day: (s.realized_pnl, s.trade_count)
+        for s in db.execute(
+            select(DailyRealizedPnlSnapshot).where(
+                DailyRealizedPnlSnapshot.user_id == target_user_id,
+                DailyRealizedPnlSnapshot.day >= from_,
+                DailyRealizedPnlSnapshot.day <= to,
+            )
+        ).scalars()
+    }
+    merged = dict(db_daily)
+    merged.update(snaps)
+    return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(merged.items())]
 
 
 @router.post("/trades/sync-fills")

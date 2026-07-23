@@ -45,6 +45,10 @@ async def start_all_listeners() -> None:
     await trade_listener.start_all_listeners()
     await snaptrade_listener.start_all_listeners()
     await ibkr_listener.start_all_listeners()
+    # Daily realized-P&L snapshot job — freezes each user's per-day P&L from the
+    # broker feed so the Calendar reads correct, broker-change-durable values.
+    from app.services import pnl_snapshot  # noqa: PLC0415
+    pnl_snapshot.start_pnl_snapshot_job()
 
 
 async def stop_all_listeners() -> None:
@@ -52,6 +56,8 @@ async def stop_all_listeners() -> None:
     await trade_listener.stop_all_listeners()
     await snaptrade_listener.stop_all_listeners()
     await ibkr_listener.stop_all_listeners()
+    from app.services import pnl_snapshot  # noqa: PLC0415
+    await pnl_snapshot.stop_pnl_snapshot_job()
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
