@@ -260,6 +260,7 @@ def _has_active_policies(s: SubscriberSettings) -> bool:
         s.daily_profit_limit is not None,
         s.daily_loss_limit_pct is not None,
         s.daily_profit_limit_pct is not None,
+        s.daily_profit_target_pct is not None,
         s.max_account_pct_per_day is not None,
         s.auto_liquidation_limit is not None,
         s.position_tp_pct is not None,
@@ -300,6 +301,11 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                 return ("subscriber", False)
             return ("subscriber", _has_active_policies(s))
         if u.role == UserRole.TRADER:
+            # A trader with a daily profit target set needs the broker call
+            # (for live equity) every tick, same as a subscriber policy.
+            ts = db.get(SubscriberSettings, user_id)
+            if ts is not None and ts.daily_profit_target_pct is not None:
+                return ("trader", True)
             # Skip-idle for the trader monitor: only worth a broker
             # call if there's at least one filled option entry with
             # an SL price still possibly open. The monitor itself
@@ -450,6 +456,13 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
         enforce_trader_option_sl,
     )
 
+    # Daily profit target first, in its OWN session — a crash here must not
+    # abort the option-SL monitor below (and vice-versa).
+    try:
+        _enforce_trader_profit_target(acct)
+    except Exception:  # noqa: BLE001
+        log.exception("pnl_poller: trader profit-target failed for account %s", acct.id)
+
     pending_events: list[dict[str, Any]] = []
     notifications_to_send: list[dict[str, Any]] = []
 
@@ -507,6 +520,160 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
                         acct.user_id,
                     )
             db.commit()
+
+    for evt in pending_events:
+        _events.publish(acct.user_id, evt)
+
+
+def _clear_profit_target_guard_if_new_day(s: SubscriberSettings, now_utc: datetime) -> None:
+    """Re-arm the daily profit target on a new UTC day by clearing the
+    once-per-day guard. Independent of the copy-pause auto-resume."""
+    ph = s.profit_target_hit_at
+    if ph is None:
+        return
+    if ph.tzinfo is None:
+        ph = ph.replace(tzinfo=timezone.utc)
+    if ph.astimezone(timezone.utc).date() < now_utc.date():
+        s.profit_target_hit_at = None
+
+
+def _enforce_profit_target(
+    db: Session,
+    s: SubscriberSettings,
+    acct: BrokerAccount,
+    *,
+    equity: Decimal,
+    todays_pl: Decimal,
+    beginning_day_balance: Decimal | None,
+    now_utc: datetime,
+    cascade_fanout: bool,
+    pending_events: list[dict[str, Any]],
+) -> bool:
+    """Daily PROFIT TARGET (account-value based). Fires when live equity reaches
+    ``beginning_day_balance * (1 + pct/100)`` — i.e. ``todays_pl`` (which includes
+    UNREALIZED gains) ≥ ``beginning_day_balance * pct/100``. On the FIRST hit of
+    the day it flattens the account ONCE to book the gain, stamps
+    ``profit_target_hit_at`` (the once-per-day guard so re-entries aren't instantly
+    re-liquidated), and — unlike every other kill switch — LEAVES ``copy_enabled``
+    untouched so normal copy can re-enter on the next signal.
+
+    ``cascade_fanout=True`` (trader) mirrors the closes to subscribers via copy.
+    Returns True if it fired. Caller must have cleared the guard for a new day
+    (via _clear_profit_target_guard_if_new_day) before calling."""
+    if (
+        s.daily_profit_target_pct is None
+        or beginning_day_balance is None
+        or beginning_day_balance <= 0
+        or s.profit_target_hit_at is not None  # already booked today
+    ):
+        return False
+
+    target_profit = beginning_day_balance * s.daily_profit_target_pct / Decimal(100)
+    if todays_pl < target_profit:
+        return False
+
+    # HIT. Stamp the guard FIRST so a concurrent/next tick can't double-fire or
+    # loop-liquidate while equity stays above target. copy_enabled stays as-is.
+    s.profit_target_hit_at = now_utc
+    target_value = beginning_day_balance + target_profit
+
+    from app.api.positions import _close_account_positions_sync  # noqa: PLC0415
+    try:
+        summary = _close_account_positions_sync(
+            s.user_id, acct.id, s.following_trader_id or s.user_id, None,
+            None, option_marketable_limit=True, cascade_fanout=cascade_fanout,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("pnl_poller: profit-target liquidation crashed for user=%s", s.user_id)
+        summary = {"closed": [], "failed": [{"error": "crashed"}]}
+    closed_n = len(summary.get("closed", []))
+    failed = summary.get("failed", [])
+
+    audit.record(
+        db, actor_user_id=s.user_id,
+        action="copy.profit_target_liquidated",
+        entity_type="subscriber_settings", entity_id=s.user_id,
+        metadata={
+            "source": "pnl_poller",
+            "broker": acct.broker.value,
+            "cascade_fanout": cascade_fanout,
+            "daily_profit_target_pct": str(s.daily_profit_target_pct),
+            "beginning_day_balance": str(beginning_day_balance),
+            "target_value": str(target_value),
+            "target_profit": str(target_profit),
+            "equity": str(equity),
+            "todays_pl": str(todays_pl),
+            "closed": closed_n,
+            "failed": failed,
+        },
+    )
+    pending_events.append({
+        "type": "copy.profit_target_hit",
+        "daily_profit_target_pct": str(s.daily_profit_target_pct),
+        "beginning_day_balance": str(beginning_day_balance),
+        "target_value": str(target_value),
+        "target_profit": str(target_profit),
+        "equity": str(equity),
+        "closed": closed_n,
+    })
+    try:
+        from app.services import notifications as notif_svc  # noqa: PLC0415
+        msg = (
+            f"Daily profit target hit — account value reached ${equity} "
+            f"(target ${target_value}: +{s.daily_profit_target_pct}% of yesterday's "
+            f"${beginning_day_balance}). Closed {closed_n} position(s) to book "
+            f"~${target_profit}. Copy trading stays ON and can re-enter on the next signal."
+        )
+        if failed:
+            msg += f" NOTE: {len(failed)} position(s) failed to close — please review."
+        notif_svc.create_notification(
+            db, user_id=s.user_id, type="copy.profit_target_hit",
+            message=msg, metadata={"closed": closed_n, "failed": failed, "equity": str(equity)},
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("pnl_poller: profit-target notification failed for user=%s", s.user_id)
+    return True
+
+
+def _enforce_trader_profit_target(acct: BrokerAccount) -> None:
+    """Trader-side daily profit target. Same rule as a subscriber's, but the
+    liquidation cascades to subscribers via copy fanout (cascade_fanout=True), so
+    everyone following the trader exits when the trader books the day's gain.
+    Isolated in its own session + event flush so it never disturbs the trader
+    option-SL monitor that shares this tick."""
+    from app.services import events as _events  # noqa: PLC0415
+
+    state = _fetch_pnl_snapshot(acct)
+    if state is None:
+        return
+    equity = state.get("equity")
+    todays_pl = state.get("todays_pl")
+    if equity is None or todays_pl is None:
+        return
+
+    pending_events: list[dict[str, Any]] = []
+    with SessionLocal() as db:
+        s = db.get(SubscriberSettings, acct.user_id)
+        if s is None or s.daily_profit_target_pct is None:
+            return
+        now_utc = datetime.now(timezone.utc)
+        beginning_day_balance = state.get("beginning_day_balance")
+        if beginning_day_balance is None and equity is not None:
+            try:
+                from app.services.day_start_equity import get_or_record  # noqa: PLC0415
+                beginning_day_balance = get_or_record(db, acct.id, equity)
+                todays_pl = equity - beginning_day_balance
+            except Exception:  # noqa: BLE001
+                log.exception("pnl_poller: trader day-start snapshot failed for %s", acct.id)
+
+        _clear_profit_target_guard_if_new_day(s, now_utc)
+        _enforce_profit_target(
+            db, s, acct,
+            equity=equity, todays_pl=todays_pl,
+            beginning_day_balance=beginning_day_balance,
+            now_utc=now_utc, cascade_fanout=True, pending_events=pending_events,
+        )
+        db.commit()
 
     for evt in pending_events:
         _events.publish(acct.user_id, evt)
@@ -639,6 +806,18 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "pnl_poller: day-start snapshot failed for account %s",
                     acct.id,
                 )
+
+        # ── Daily PROFIT TARGET (account-value based; liquidate + book) ───
+        # Runs BEFORE the pause/limit kill switches: it books the day's gain by
+        # flattening once, then leaves copy ON so the account can re-enter. The
+        # guard re-arms on a new UTC day.
+        _clear_profit_target_guard_if_new_day(s, now_utc)
+        _enforce_profit_target(
+            db, s, acct,
+            equity=equity, todays_pl=todays_pl,
+            beginning_day_balance=beginning_day_balance,
+            now_utc=now_utc, cascade_fanout=False, pending_events=pending_events,
+        )
 
         # ── Pct-of-day-start-balance TRADING-VALUE cap ───────────────────
         # Tracks today's cumulative filled trade notional (capital

@@ -16,6 +16,7 @@ from app.schemas.settings import (
     DailyLossLimitPctIn,
     DailyProfitLimitIn,
     DailyProfitLimitPctIn,
+    DailyProfitTargetPctIn,
     FollowTraderIn,
     MaxAccountPctIn,
     MaxPerContractIn,
@@ -71,6 +72,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         auto_liquidated_at=s.auto_liquidated_at,
         daily_loss_limit_pct=s.daily_loss_limit_pct,
         daily_profit_limit_pct=s.daily_profit_limit_pct,
+        daily_profit_target_pct=s.daily_profit_target_pct,
+        profit_target_hit_at=s.profit_target_hit_at,
         position_tp_pct=s.position_tp_pct,
         position_sl_pct=s.position_sl_pct,
         copy_trader_bracket=s.copy_trader_bracket,
@@ -111,6 +114,7 @@ def reset_subscriber_settings(
     s.daily_profit_limit = None
     s.daily_loss_limit_pct = None
     s.daily_profit_limit_pct = None
+    s.daily_profit_target_pct = None
     s.auto_liquidation_limit = None
     s.max_per_contract = None
     s.max_account_pct_per_day = None
@@ -260,6 +264,41 @@ def set_daily_profit_limit_pct(
         metadata={
             "old": str(old) if old is not None else None,
             "new": str(payload.daily_profit_limit_pct) if payload.daily_profit_limit_pct is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/daily-profit-target-pct", response_model=SubscriberSettingsOut)
+def set_daily_profit_target_pct(
+    payload: DailyProfitTargetPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Daily PROFIT TARGET as % of the previous day's account value. When live
+    equity (incl. unrealized) reaches beginning_day_balance*(1+pct/100), the
+    poller flattens the book ONCE to book the gain and leaves copy ON. 0 < pct
+    <= 100. Pass null to disable."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_profit_target_pct
+    s.daily_profit_target_pct = payload.daily_profit_target_pct
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.daily_profit_target_pct_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.daily_profit_target_pct) if payload.daily_profit_target_pct is not None else None,
         },
         ip_address=client_ip(request),
     )

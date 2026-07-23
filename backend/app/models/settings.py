@@ -88,6 +88,27 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(5, 2), nullable=True,
     )
 
+    # Daily PROFIT TARGET (percent of the previous day's account value, i.e. the
+    # broker's beginning-day balance). Distinct from daily_profit_limit_pct:
+    #   * daily_profit_limit_pct  → PAUSES copy (sticky until next UTC day).
+    #   * daily_profit_target_pct → LIQUIDATES all open positions ONCE to BOOK
+    #     the day's gain, then LEAVES COPY ON. It fires when live equity reaches
+    #     beginning_day_balance * (1 + pct/100) — an ACCOUNT-VALUE target that
+    #     INCLUDES unrealized gains. After firing it does NOT re-liquidate for
+    #     the rest of the day (see profit_target_hit_at), so normal copy can
+    #     re-enter the same names when the trader re-signals. NULL = off.
+    daily_profit_target_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(5, 2), nullable=True,
+    )
+    # UTC timestamp the profit target last fired. The once-per-day guard: while
+    # this is set to TODAY's UTC date, the poller won't liquidate again (so a
+    # re-entry isn't instantly flattened while equity is still above target).
+    # Auto-cleared on the first poller tick of the next UTC day, exactly like
+    # pnl_auto_paused_at — the target re-arms each day off the new baseline.
+    profit_target_hit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
     # When the pnl_poller observes broker-reported equity <= this value,
     # everything on the subscriber's broker is closed at market AND

@@ -402,8 +402,14 @@ def _close_account_positions_sync(
     client_ip_str: str | None,
     position_filter: "Callable[[BrokerPosition], bool] | None" = None,
     option_marketable_limit: bool = False,
+    cascade_fanout: bool = False,
 ) -> dict:
     """Synchronous worker for one (subscriber, broker_account) pair.
+
+    ``cascade_fanout`` (default False = self-only, the subscriber/EOD behavior):
+    when True, the closes are placed WITH copy fanout (skip_fanout=False) so they
+    mirror to the owner's subscribers — used when a TRADER's daily profit target
+    liquidates their book and the exit should cascade to everyone copying them.
 
     Opens its OWN DB session — must never share the request-scoped
     session across threads. Returns ``{"closed": [...], "failed": [...]}``
@@ -485,7 +491,7 @@ def _close_account_positions_sync(
             try:
                 order = _place_trader_order(
                     db_local, sub_user, payload, acct.id, bg, request=req_shim,  # type: ignore[arg-type]
-                    skip_fanout=True, resolve_wash_trade=True,
+                    skip_fanout=not cascade_fanout, resolve_wash_trade=True,
                 )
                 closed.append({
                     "subscriber_user_id": str(sub_id),
@@ -511,7 +517,7 @@ def _close_account_positions_sync(
                         })
                         order = _place_trader_order(
                             db_local, sub_user, retry_payload, acct.id, bg, request=req_shim,  # type: ignore[arg-type]
-                            skip_fanout=True, resolve_wash_trade=True,
+                            skip_fanout=not cascade_fanout, resolve_wash_trade=True,
                         )
                         closed.append({
                             "subscriber_user_id": str(sub_id),

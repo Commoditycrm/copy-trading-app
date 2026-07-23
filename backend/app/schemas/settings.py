@@ -26,6 +26,13 @@ class SubscriberSettingsOut(BaseModel):
     # switch when today's realized P&L breaches it.
     daily_loss_limit_pct: Decimal | None = None
     daily_profit_limit_pct: Decimal | None = None
+    # Daily PROFIT TARGET as a percent of the previous day's account value.
+    # When live equity (incl. unrealized) reaches beginning_day_balance*(1+pct/100)
+    # the poller flattens the book ONCE to book the gain and LEAVES copy ON (it
+    # can re-enter on the next signal). Distinct from daily_profit_limit_pct,
+    # which pauses copy. profit_target_hit_at is the once-per-day guard.
+    daily_profit_target_pct: Decimal | None = None
+    profit_target_hit_at: datetime | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
     # UI-only — persisted but never enforced server-side.
     max_per_contract: Decimal | None = None
@@ -139,6 +146,15 @@ class DailyProfitLimitPctIn(BaseModel):
     a percentage of beginning-day balance. Pass null to disable."""
 
     daily_profit_limit_pct: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class DailyProfitTargetPctIn(BaseModel):
+    """Daily PROFIT TARGET as a percent of the previous day's account value.
+    When live equity hits beginning_day_balance*(1+pct/100) the book is
+    liquidated ONCE to book the gain; copy stays ON. 0 < pct <= 100. Pass
+    null to disable."""
+
+    daily_profit_target_pct: Decimal | None = Field(default=None, gt=0, le=100)
 
 
 class PositionTpPctIn(BaseModel):

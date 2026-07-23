@@ -195,6 +195,10 @@ export interface SubscriberSettings {
    *  USD columns above are legacy. */
   daily_loss_limit_pct: string | null;
   daily_profit_limit_pct: string | null;
+  /** Daily profit TARGET as % of yesterday's account value. On hit the book is
+   *  liquidated once to book the gain; copy stays ON. */
+  daily_profit_target_pct: string | null;
+  profit_target_hit_at: string | null;
   todays_realized_pnl: string | null;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */

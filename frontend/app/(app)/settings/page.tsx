@@ -98,6 +98,8 @@ export default function SettingsPage() {
   const [limitBusy, setLimitBusy] = useState(false);
   const [profitInput, setProfitInput] = useState("");
   const [profitBusy, setProfitBusy] = useState(false);
+  const [profitTargetInput, setProfitTargetInput] = useState("");
+  const [profitTargetBusy, setProfitTargetBusy] = useState(false);
   // Max-per-contract is UI-only — no Today/Headroom readouts. Persisted
   // so the value survives refresh.
   const [maxContractInput, setMaxContractInput] = useState("");
@@ -158,6 +160,7 @@ export default function SettingsPage() {
         // if the user hasn't set a pct yet (smooth transition).
         setLimitInput(s.daily_loss_limit_pct ?? "");
         setProfitInput(s.daily_profit_limit_pct ?? "");
+        setProfitTargetInput(s.daily_profit_target_pct ?? "");
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxPctInput(s.max_account_pct_per_day ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
@@ -447,6 +450,23 @@ export default function SettingsPage() {
       setProfitBusy(false);
     }
   }
+  async function saveProfitTarget() {
+    setProfitTargetBusy(true);
+    try {
+      const trimmed = profitTargetInput.trim();
+      const body = { daily_profit_target_pct: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-target-pct", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setProfitTargetInput(s.daily_profit_target_pct ?? "");
+      notify.success(s.daily_profit_target_pct ? `Daily profit target set to ${s.daily_profit_target_pct}%` : "Daily profit target cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not update daily profit target");
+    } finally {
+      setProfitTargetBusy(false);
+    }
+  }
   async function saveMaxContract() {
     setMaxContractBusy(true);
     try {
@@ -686,6 +706,16 @@ export default function SettingsPage() {
     : null;
   const profitLimit = profitPctDollars;
   const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
+  // Profit-TARGET mirror (liquidate + book once, keeps copy ON). Threshold is a
+  // % of the day-start (previous day's close) account value, compared against
+  // today's total P&L incl. unrealized.
+  const profitTargetPctNum = sub?.daily_profit_target_pct ? Number(sub.daily_profit_target_pct) : null;
+  const profitTargetDollars = (profitTargetPctNum !== null && _baseEarly !== null && _baseEarly > 0)
+    ? (_baseEarly * profitTargetPctNum / 100)
+    : null;
+  const profitTargetHeadroom = profitTargetDollars !== null ? Math.max(0, profitTargetDollars - Math.max(0, todaysPnL)) : null;
+  const profitTargetPct = profitTargetDollars !== null && profitTargetDollars > 0
+    ? Math.min(100, Math.max(0, (Math.max(0, todaysPnL) / profitTargetDollars) * 100)) : 0;
   // Max-% derived values — pulled up here so the table row can read
   // them. balance × pct/100 = the dollar threshold; today's trading
   // value (from the SSE tick) is the metric compared against it.
@@ -973,6 +1003,26 @@ export default function SettingsPage() {
                 headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
                 headroomColor={(profitHeadroom ?? 1) > 0 ? "var(--text)" : "var(--bad)"}
                 pctConsumed={profitPct}
+              />
+              <LimitRow
+                accent="#16a34a"
+                icon={<IconTrendUp />}
+                title="Daily profit target"
+                subtitle="When your account value reaches this % above yesterday's close, all positions are closed once to book the gain. Copy stays ON and re-enters on the next signal."
+                todayLabel="Today P&L"
+                todayValue={fmt(String(todaysPnL))}
+                todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
+                inputPrefix="%"
+                input={profitTargetInput}
+                onInput={setProfitTargetInput}
+                busy={profitTargetBusy}
+                onSave={saveProfitTarget}
+                current={sub.daily_profit_target_pct}
+                hasLimit={profitTargetDollars !== null}
+                thresholdUsdDisplay={profitTargetDollars === null ? "—" : fmt(String(profitTargetDollars))}
+                headroomDisplay={profitTargetDollars === null ? "—" : fmt(String(profitTargetHeadroom))}
+                headroomColor={(profitTargetHeadroom ?? 1) > 0 ? "var(--text)" : "var(--good)"}
+                pctConsumed={profitTargetPct}
               />
               <LimitRow
                 accent="#f59e0b"
