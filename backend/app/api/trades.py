@@ -31,7 +31,7 @@ from app.services import audit, copy_engine, events, excel_export, fills_sync, t
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
-from app.services.pnl import realized_pnl_by_day, realized_pnl_by_order
+from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
 
