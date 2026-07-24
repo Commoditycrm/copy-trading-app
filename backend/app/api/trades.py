@@ -26,6 +26,7 @@ from app.schemas.order import (
     TradeScopeStats,
     TradeStatsOut,
 )
+from app.schemas.pagination import Page
 from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
@@ -115,6 +116,72 @@ def list_trades(
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
     return list(db.execute(q).scalars())
+
+
+# Server-side sortable columns for the paginated table. Computed ones (notional,
+# expires) use expressions so sorting works across the WHOLE result set, not just
+# the page. Mirrors SortKey in frontend/app/(app)/trades/page.tsx.
+_TRADES_SORT = {
+    "symbol": Order.symbol,
+    "quantity": Order.quantity,
+    "status": Order.status,
+    "submitted": func.coalesce(Order.submitted_at, Order.created_at),
+    # No per-fill timestamp column; closed_at is when a FILLED order settled.
+    "filled": func.coalesce(Order.closed_at, Order.submitted_at, Order.created_at),
+    "notional": (
+        func.coalesce(Order.filled_quantity, 0)
+        * func.coalesce(Order.filled_avg_price, 0)
+        * case((Order.instrument_type == InstrumentType.OPTION, 100), else_=1)
+    ),
+    "expires": Order.option_expiry,
+}
+
+
+@router.get("/trades/page", response_model=Page[OrderOut])
+def list_trades_page(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+    status_tab: str = Query(default="all", alias="status", description="Status tab"),
+    search: str | None = Query(default=None, description="Symbol substring"),
+    sort: str = Query(default="submitted"),
+    dir: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Page[Order]:
+    """Server-side paginated Order History. Same filters as the export
+    (status tab / symbol search / bracket-leg exclusion) via trade_filters, plus
+    sort + limit/offset, and a total count of ALL matching rows for the pager."""
+    base = select(Order).where(Order.user_id == user.id)
+    if from_:
+        base = base.where(
+            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+        )
+    if to:
+        base = base.where(
+            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+        )
+    base = trade_filters.exclude_dead_bracket_legs(base)
+    base = trade_filters.apply_status_tab(base, status_tab)
+    base = trade_filters.apply_symbol_search(base, search)
+
+    total = db.execute(
+        select(func.count()).select_from(base.subquery())
+    ).scalar_one()
+
+    col = _TRADES_SORT.get(sort, _TRADES_SORT["submitted"])
+    ordering = col.asc() if dir == "asc" else col.desc()
+    rows = list(
+        db.execute(
+            base.options(selectinload(Order.fills))
+            # id tiebreaker → stable order across pages when the sort key ties.
+            .order_by(ordering, Order.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).scalars()
+    )
+    return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/trades/export")
@@ -277,6 +344,9 @@ def trades_stats(
     mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
     filled_cond = Order.status == OrderStatus.FILLED
     working_cond = Order.status.in_(_WORKING_STATUSES)
+    # "cancelled" tab groups canceled + expired (didn't fill, not rejected).
+    cancelled_cond = Order.status.in_((OrderStatus.CANCELED, OrderStatus.EXPIRED))
+    rejected_cond = Order.status == OrderStatus.REJECTED
 
     # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
     # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
@@ -292,12 +362,16 @@ def trades_stats(
             func.count().filter(all_cond).label("all_total"),
             func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
             func.count().filter(and_(all_cond, working_cond)).label("all_working"),
+            func.count().filter(and_(all_cond, cancelled_cond)).label("all_cancelled"),
+            func.count().filter(and_(all_cond, rejected_cond)).label("all_rejected"),
             func.coalesce(
                 func.sum(case((all_cond, notional_expr), else_=0)), 0
             ).label("all_notional"),
             func.count().filter(mine_cond).label("mine_total"),
             func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
             func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
+            func.count().filter(and_(mine_cond, cancelled_cond)).label("mine_cancelled"),
+            func.count().filter(and_(mine_cond, rejected_cond)).label("mine_rejected"),
             func.coalesce(
                 func.sum(case((mine_cond, notional_expr), else_=0)), 0
             ).label("mine_notional"),
@@ -324,12 +398,16 @@ def trades_stats(
             total=row.all_total,
             filled=row.all_filled,
             working=row.all_working,
+            cancelled=row.all_cancelled,
+            rejected=row.all_rejected,
             notional=row.all_notional,
         ),
         mine=TradeScopeStats(
             total=row.mine_total,
             filled=row.mine_filled,
             working=row.mine_working,
+            cancelled=row.mine_cancelled,
+            rejected=row.mine_rejected,
             notional=row.mine_notional,
         ),
     )
