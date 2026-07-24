@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
@@ -137,6 +138,31 @@ def _acct_from_dict(d: dict[str, Any]) -> CachedBrokerAccount:
         connection_status=d["connection_status"],
         encrypted_credentials=d["encrypted_credentials"],
     )
+
+
+# ── short-TTL aggregate cache (counts / summaries) ────────────────────────
+
+
+def cached_json(key: str, ttl: int, compute: Callable[[], Any]) -> Any:
+    """Read-through JSON cache for cheap aggregate endpoints whose values
+    tolerate a few seconds of staleness — role/status counts, header summaries.
+    Serves the cached snapshot when fresh, else runs ``compute`` and stores it.
+    Any Redis error falls through to ``compute`` — Redis is never on the
+    critical path. ``compute`` must return JSON-serializable data (Decimal/UUID
+    are coerced via ``default=str``)."""
+    r = get_sync_redis()
+    try:
+        raw = r.get(key)
+        if raw:
+            return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        log.warning("cached_json get failed for %s", key)
+    result = compute()
+    try:
+        r.setex(key, ttl, json.dumps(result, default=str))
+    except Exception:  # noqa: BLE001
+        log.warning("cached_json setex failed for %s", key)
+    return result
 
 
 # ── subscribers cache ─────────────────────────────────────────────────────

@@ -325,13 +325,18 @@ def user_counts(
     _: User = Depends(require_admin),
 ) -> dict[str, int]:
     """Per-role user counts (excluding load-test users) for the admin filter
-    chips — computed in the DB so they reflect every user, not just a page."""
-    base = select(func.count(User.id)).where(User.email.notilike("fake-load-test-%"))
-    total = db.execute(base).scalar_one()
-    out = {"total": total}
-    for r in (UserRole.TRADER, UserRole.SUBSCRIBER, UserRole.ADMIN):
-        out[r.value] = db.execute(base.where(User.role == r)).scalar_one()
-    return out
+    chips — computed in the DB so they reflect every user, not just a page.
+    Short-TTL cached: the chip badges tolerate a few seconds' lag."""
+    from app.services import cache as cache_svc  # noqa: PLC0415
+
+    def _compute() -> dict[str, int]:
+        base = select(func.count(User.id)).where(User.email.notilike("fake-load-test-%"))
+        out = {"total": db.execute(base).scalar_one()}
+        for r in (UserRole.TRADER, UserRole.SUBSCRIBER, UserRole.ADMIN):
+            out[r.value] = db.execute(base.where(User.role == r)).scalar_one()
+        return out
+
+    return cache_svc.cached_json("stats:user_counts", 20, _compute)
 
 
 @router.patch("/users/{user_id}/activate")

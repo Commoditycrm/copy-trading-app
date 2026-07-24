@@ -353,78 +353,84 @@ def trades_stats(
     # was OFF (fanned_out=False). So a copy-off order shows under BOTH; a
     # copy-on order shows only under All. Non-traders have no tabs → both
     # scopes are all their orders.
-    is_trader = user.role == UserRole.TRADER
-    all_cond = true()
-    mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
-    filled_cond = Order.status == OrderStatus.FILLED
-    working_cond = Order.status.in_(_WORKING_STATUSES)
-    # "cancelled" tab groups canceled + expired (didn't fill, not rejected).
-    cancelled_cond = Order.status.in_((OrderStatus.CANCELED, OrderStatus.EXPIRED))
-    rejected_cond = Order.status == OrderStatus.REJECTED
+    from app.services import cache  # noqa: PLC0415
 
-    # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
-    # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
-    mult = case((Order.instrument_type == InstrumentType.OPTION, 100), else_=1)
-    notional_expr = (
-        func.coalesce(Order.filled_quantity, 0)
-        * func.coalesce(Order.filled_avg_price, 0)
-        * mult
-    )
+    def _compute() -> dict:
+        is_trader = user.role == UserRole.TRADER
+        all_cond = true()
+        mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
+        filled_cond = Order.status == OrderStatus.FILLED
+        working_cond = Order.status.in_(_WORKING_STATUSES)
+        # "cancelled" tab groups canceled + expired (didn't fill, not rejected).
+        cancelled_cond = Order.status.in_((OrderStatus.CANCELED, OrderStatus.EXPIRED))
+        rejected_cond = Order.status == OrderStatus.REJECTED
 
-    row = db.execute(
-        select(
-            func.count().filter(all_cond).label("all_total"),
-            func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
-            func.count().filter(and_(all_cond, working_cond)).label("all_working"),
-            func.count().filter(and_(all_cond, cancelled_cond)).label("all_cancelled"),
-            func.count().filter(and_(all_cond, rejected_cond)).label("all_rejected"),
-            func.coalesce(
-                func.sum(case((all_cond, notional_expr), else_=0)), 0
-            ).label("all_notional"),
-            func.count().filter(mine_cond).label("mine_total"),
-            func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
-            func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
-            func.count().filter(and_(mine_cond, cancelled_cond)).label("mine_cancelled"),
-            func.count().filter(and_(mine_cond, rejected_cond)).label("mine_rejected"),
-            func.coalesce(
-                func.sum(case((mine_cond, notional_expr), else_=0)), 0
-            ).label("mine_notional"),
+        # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
+        # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
+        mult = case((Order.instrument_type == InstrumentType.OPTION, 100), else_=1)
+        notional_expr = (
+            func.coalesce(Order.filled_quantity, 0)
+            * func.coalesce(Order.filled_avg_price, 0)
+            * mult
         )
-        .where(Order.user_id == user.id)
-        # Mirror the order-history table's visibility rule: a bracket exit leg
-        # (TP/SL) only belongs in history once it actually filled (the real
-        # close). Resting / cancelled / rejected legs are auto-placed
-        # protective orders, not trades the user placed — excluding them keeps
-        # the summary counts honest and in lockstep with the rows shown.
-        .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
-        .where(
-            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
-            if from_ else True
-        )
-        .where(
-            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
-            if to else True
-        )
-    ).one()
 
-    return TradeStatsOut(
-        all=TradeScopeStats(
-            total=row.all_total,
-            filled=row.all_filled,
-            working=row.all_working,
-            cancelled=row.all_cancelled,
-            rejected=row.all_rejected,
-            notional=row.all_notional,
-        ),
-        mine=TradeScopeStats(
-            total=row.mine_total,
-            filled=row.mine_filled,
-            working=row.mine_working,
-            cancelled=row.mine_cancelled,
-            rejected=row.mine_rejected,
-            notional=row.mine_notional,
-        ),
-    )
+        row = db.execute(
+            select(
+                func.count().filter(all_cond).label("all_total"),
+                func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
+                func.count().filter(and_(all_cond, working_cond)).label("all_working"),
+                func.count().filter(and_(all_cond, cancelled_cond)).label("all_cancelled"),
+                func.count().filter(and_(all_cond, rejected_cond)).label("all_rejected"),
+                func.coalesce(
+                    func.sum(case((all_cond, notional_expr), else_=0)), 0
+                ).label("all_notional"),
+                func.count().filter(mine_cond).label("mine_total"),
+                func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
+                func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
+                func.count().filter(and_(mine_cond, cancelled_cond)).label("mine_cancelled"),
+                func.count().filter(and_(mine_cond, rejected_cond)).label("mine_rejected"),
+                func.coalesce(
+                    func.sum(case((mine_cond, notional_expr), else_=0)), 0
+                ).label("mine_notional"),
+            )
+            .where(Order.user_id == user.id)
+            # Mirror the order-history table's visibility rule: a bracket exit leg
+            # (TP/SL) only belongs in history once it actually filled (the real
+            # close). Resting / cancelled / rejected legs are auto-placed
+            # protective orders, not trades the user placed — excluding them keeps
+            # the summary counts honest and in lockstep with the rows shown.
+            .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
+            .where(
+                Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+                if from_ else True
+            )
+            .where(
+                Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+                if to else True
+            )
+        ).one()
+
+        return TradeStatsOut(
+            all=TradeScopeStats(
+                total=row.all_total,
+                filled=row.all_filled,
+                working=row.all_working,
+                cancelled=row.all_cancelled,
+                rejected=row.all_rejected,
+                notional=row.all_notional,
+            ),
+            mine=TradeScopeStats(
+                total=row.mine_total,
+                filled=row.mine_filled,
+                working=row.mine_working,
+                cancelled=row.mine_cancelled,
+                rejected=row.mine_rejected,
+                notional=row.mine_notional,
+            ),
+        ).model_dump(mode="json")
+
+    key = f"stats:trades:{user.id}:{from_}:{to}"
+    return TradeStatsOut.model_validate(cache.cached_json(key, 15, _compute))
 
 
 @router.get("/trades/{order_id}", response_model=OrderOut)

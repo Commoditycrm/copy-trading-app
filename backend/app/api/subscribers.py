@@ -80,19 +80,23 @@ def subscriber_stats(
 ) -> dict[str, int]:
     """Cheap header counts (no per-subscriber P&L) — total / copy-active /
     with a connected broker — so the summary reflects EVERY follower, not the
-    page shown."""
+    page shown. Short-TTL cached: header badges tolerate a few seconds' lag."""
     where = SubscriberSettings.following_trader_id == trader.id
-    total = db.execute(select(func.count()).where(where)).scalar_one()
-    active = db.execute(
-        select(func.count()).where(where, SubscriberSettings.copy_enabled.is_(True))
-    ).scalar_one()
-    sub_ids = select(SubscriberSettings.user_id).where(where)
-    with_broker = db.execute(
-        select(func.count(func.distinct(BrokerAccount.user_id))).where(
-            BrokerAccount.user_id.in_(sub_ids)
-        )
-    ).scalar_one()
-    return {"total": total, "active": active, "with_broker": with_broker}
+
+    def _compute() -> dict[str, int]:
+        total = db.execute(select(func.count()).where(where)).scalar_one()
+        active = db.execute(
+            select(func.count()).where(where, SubscriberSettings.copy_enabled.is_(True))
+        ).scalar_one()
+        sub_ids = select(SubscriberSettings.user_id).where(where)
+        with_broker = db.execute(
+            select(func.count(func.distinct(BrokerAccount.user_id))).where(
+                BrokerAccount.user_id.in_(sub_ids)
+            )
+        ).scalar_one()
+        return {"total": total, "active": active, "with_broker": with_broker}
+
+    return cache.cached_json(f"stats:subs:{trader.id}", 20, _compute)
 
 
 def _bulk_state(db: Session, trader_id) -> BulkCopyStateOut:

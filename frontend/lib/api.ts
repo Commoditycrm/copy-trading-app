@@ -11,6 +11,9 @@ export function setTokens(access: string, refresh: string) {
 export function clearTokens() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(REFRESH_KEY);
+  // Drop any stale-while-revalidate snapshots so a signed-out user's cached
+  // dashboard/data can't flash before the next user's fetch resolves.
+  import("./swrCache").then((m) => m.clearSnapshots()).catch(() => {});
 }
 
 export function getAccessToken(): string | null {

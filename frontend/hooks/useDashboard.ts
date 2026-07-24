@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import type {
   BrokerAccount,
   DailyPnL,
@@ -47,11 +48,19 @@ function isoDay(d: Date): string {
  * their copy settings. All sub-fetches degrade gracefully (a failing broker or
  * P&L call doesn't blank the whole page).
  */
+const DASH_KEY = "dashboard";
+
 export function useDashboard(): DashboardData {
-  const [data, setData] = useState<DashboardData>(EMPTY);
+  // Stale-while-revalidate: paint the last snapshot instantly on return
+  // navigation (loading:false), then revalidate below. Cleared on logout.
+  const [data, setData] = useState<DashboardData>(() => {
+    const snap = getSnapshot<DashboardData>(DASH_KEY);
+    return snap ? { ...snap, loading: false, error: null } : EMPTY;
+  });
 
   useEffect(() => {
     let cancelled = false;
+    const hadSnapshot = getSnapshot<DashboardData>(DASH_KEY) !== undefined;
 
     (async () => {
       try {
@@ -87,7 +96,7 @@ export function useDashboard(): DashboardData {
         }
 
         if (cancelled) return;
-        setData({
+        const fresh: DashboardData = {
           user,
           positions,
           orders,
@@ -97,10 +106,16 @@ export function useDashboard(): DashboardData {
           subSettings,
           loading: false,
           error: null,
-        });
+        };
+        setSnapshot(DASH_KEY, fresh);
+        setData(fresh);
       } catch {
         if (!cancelled) {
-          setData((d) => ({ ...d, loading: false, error: "Could not load dashboard data." }));
+          // Keep showing the last good snapshot on a transient failure instead
+          // of blanking to an error card; only surface the error on a cold load.
+          setData((d) => hadSnapshot
+            ? { ...d, loading: false }
+            : { ...d, loading: false, error: "Could not load dashboard data." });
         }
       }
     })();
