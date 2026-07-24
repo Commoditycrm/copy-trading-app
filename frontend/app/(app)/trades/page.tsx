@@ -187,18 +187,11 @@ export default function TradesPage() {
   }, [tab, debouncedSearch, sort, limit, offset, fromParam, toParam]);
 
   // Fetch the current page from the server (filters/sort/paging all server-side).
-  // SSE reconciles refetch constantly; only touch state when the page actually
-  // changed, otherwise the table re-renders and blinks while you're reading it.
-  const lastPageSigRef = useRef<string | null>(null);
   const loadPage = useCallback(async () => {
     try {
       const page = await api<{ items: Order[]; total: number }>(tradesEndpoint());
-      const sig = JSON.stringify(page);
-      if (sig !== lastPageSigRef.current) {
-        lastPageSigRef.current = sig;
-        setOrders(page.items);
-        setTotal(page.total);
-      }
+      setOrders(page.items);
+      setTotal(page.total);
     } catch { /* tolerate — keep the last page on a transient error */ }
   }, [tradesEndpoint]);
 
@@ -222,7 +215,6 @@ export default function TradesPage() {
   // DB-aggregate totals, same date filter as the list. Fetched alongside
   // the rows and refreshed whenever orders change (SSE / reconcile) so the
   // summary stays live without being bound to the fetched page size.
-  const lastStatsSigRef = useRef<string | null>(null);
   const loadStats = useCallback(async () => {
     const q = new URLSearchParams();
     if (fromParam) q.set("from", fromParam);
@@ -234,11 +226,7 @@ export default function TradesPage() {
     const suffix = q.toString();
     try {
       const s = await api<TradeStats>(`/api/trades/stats${suffix ? `?${suffix}` : ""}`);
-      const sig = JSON.stringify(s);
-      if (sig !== lastStatsSigRef.current) {
-        lastStatsSigRef.current = sig;
-        setStats(s);
-      }
+      setStats(s);
     } catch { /* tolerate — summary falls back to local counts */ }
   }, [fromParam, toParam]);
 
