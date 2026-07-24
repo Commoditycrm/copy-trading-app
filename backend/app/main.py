@@ -198,6 +198,18 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start pnl_poller")
 
+        # Daily realized-P&L snapshot sweep (broker-direct values the Calendar
+        # reads). Started INDEPENDENTLY here — it also runs at the tail of
+        # start_all_listeners(), but that path is skipped whenever a broker
+        # listener throws during startup (the except above swallows it), which
+        # silently left the Calendar on the approximate DB fallback for new days.
+        # start_pnl_snapshot_job is idempotent, so double-starting is a no-op.
+        try:
+            from app.services import pnl_snapshot
+            pnl_snapshot.start_pnl_snapshot_job()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start pnl_snapshot job")
+
         # End-of-day safety net: at 15:55 ET, market-close every subscriber's
         # SAME-DAY-EXPIRY option positions so a trader who forgets to flatten
         # 0DTE contracts doesn't strand subscribers holding them into expiry.

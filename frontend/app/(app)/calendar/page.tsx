@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Info } from "lucide-react";
 import { api } from "@/lib/api";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
@@ -123,7 +123,22 @@ export default function CalendarPage() {
       <div className="card p-4 mb-4 flex items-center justify-between gap-3 flex-wrap" style={{ borderRadius: 10 }}>
         <div className="flex items-center gap-5">
           <div>
-            <div className="text-[11px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>Month total</div>
+            <div className="text-[11px] uppercase tracking-wider flex items-center gap-1" style={{ color: "var(--muted)" }}>
+              Month total
+              <span
+                className="inline-grid place-items-center cursor-help"
+                title={
+                  "Realized P&L — profit/loss from trades you've CLOSED (bought and sold), net of fees.\n\n" +
+                  "This can differ from your broker app's daily figure, which also includes the UNREALIZED " +
+                  "(paper) gain or loss on positions you're still holding at the end of the day. " +
+                  "On days you close everything, the two match; on days you hold overnight, they differ until " +
+                  "the position is closed — then it's counted here. Same money, counted when the trade is done."
+                }
+                aria-label="What does this number mean?"
+              >
+                <Info size={12} />
+              </span>
+            </div>
             <div className="num num-lg" style={{ color: monthTotal > 0 ? "var(--good)" : monthTotal < 0 ? "var(--bad)" : "var(--text)" }}>
               {fmtSignedUsd(monthTotal)}
             </div>
