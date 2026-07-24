@@ -6,6 +6,7 @@ import type {
   BrokerAccount,
   DailyPnL,
   Order,
+  Page,
   Position,
   SubscriberSettings,
   SubscriberSummary,
@@ -74,9 +75,11 @@ export function useDashboard(): DashboardData {
         let subscribers: SubscriberSummary[] = [];
         let subSettings: SubscriberSettings | null = null;
         if (user.role === "trader") {
-          subscribers = await api<SubscriberSummary[]>("/api/subscribers").catch(
-            () => [] as SubscriberSummary[]
-          );
+          // /api/subscribers is paginated now — unwrap .items. High limit so the
+          // active/total counts cover the whole roster, not just one page.
+          subscribers = await api<Page<SubscriberSummary>>("/api/subscribers?limit=1000")
+            .then((p) => p.items)
+            .catch(() => [] as SubscriberSummary[]);
         } else if (user.role === "subscriber") {
           subSettings = await api<SubscriberSettings>("/api/settings/subscriber").catch(
             () => null

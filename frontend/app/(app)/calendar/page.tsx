@@ -8,7 +8,7 @@ import { api } from "@/lib/api";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
+import type { DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -66,7 +66,7 @@ export default function CalendarPage() {
         setUser(u);
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
-          api<SubscriberSummary[]>("/api/subscribers").then((rows) => { if (!cancelled) setSubs(rows); });
+          api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => { if (!cancelled) setSubs(p.items); });
         }
         // Sync our own fills — refreshes the data the calendar reads from.
         setSyncing(true);

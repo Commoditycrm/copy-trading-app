@@ -1,3 +1,11 @@
+/** Server-side pagination envelope — mirrors the backend Page[T]. */
+export interface Page<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export type Role = "trader" | "subscriber" | "admin";
 
 export interface User {
