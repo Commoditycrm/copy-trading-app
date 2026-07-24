@@ -20,6 +20,7 @@ GET  /api/admin/performance/fanouts    All fanouts across all traders (admin vie
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.services import excel_export
+from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
 
@@ -209,11 +211,26 @@ def reconcile_positions(
 
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
+_STATS_CACHE_KEY = "admin:stats"
+_STATS_CACHE_TTL = 20  # seconds — dashboard counts don't need to be to-the-second
+
+
 @router.get("/stats")
 def get_stats(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> dict:
+    # Short-TTL Redis cache: these 7 aggregate counts are hit on every admin
+    # dashboard load / poll. Serve a cached snapshot when fresh; recompute at
+    # most every _STATS_CACHE_TTL seconds. Degrades to a direct query on any
+    # Redis error.
+    try:
+        cached = get_sync_redis().get(_STATS_CACHE_KEY)
+        if cached:
+            return json.loads(cached)
+    except Exception:  # noqa: BLE001
+        pass
+
     total_users  = db.execute(select(func.count(User.id))).scalar_one()
     traders      = db.execute(select(func.count(User.id)).where(User.role == UserRole.TRADER)).scalar_one()
     subscribers  = db.execute(select(func.count(User.id)).where(User.role == UserRole.SUBSCRIBER)).scalar_one()
@@ -232,7 +249,7 @@ def get_stats(
         )
     ).scalar_one()
 
-    return {
+    result = {
         "total_users":   total_users,
         "traders":       traders,
         "subscribers":   subscribers,
@@ -241,6 +258,11 @@ def get_stats(
         "trades_today":  trades_today,
         "fake_test_subs": fake_subs,
     }
+    try:
+        get_sync_redis().setex(_STATS_CACHE_KEY, _STATS_CACHE_TTL, json.dumps(result))
+    except Exception:  # noqa: BLE001
+        pass
+    return result
 
 
 # ─── User management ──────────────────────────────────────────────────────────
