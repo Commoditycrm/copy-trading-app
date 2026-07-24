@@ -1149,12 +1149,21 @@ export function PerformanceView({
   const [loading, setLoading] = useState(() => getSnapshot<FanoutResponse>(perfKey) === undefined);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Signature of the last rendered payload. The 5s poll re-fetches constantly,
+  // but the data rarely changes — only re-render (and re-run row animations)
+  // when it actually differs, otherwise the table visibly blinks every tick.
+  const lastSigRef = useRef<string | null>(null);
+  if (lastSigRef.current === null && data) lastSigRef.current = JSON.stringify(data);
 
   async function load() {
     try {
       const res = await api<FanoutResponse>(endpoint);
-      setData(res);
-      setSnapshot(perfKey, res);
+      const sig = JSON.stringify(res);
+      if (sig !== lastSigRef.current) {
+        lastSigRef.current = sig;
+        setData(res);
+        setSnapshot(perfKey, res);
+      }
     } catch {
       // Silent — leave whatever's on screen
     } finally {
