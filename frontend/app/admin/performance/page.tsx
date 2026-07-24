@@ -337,15 +337,25 @@ export default function AdminPerformancePage() {
     else { setSortKey(k); setSortDir("asc"); }
   }
 
-  async function load(lim = limit) {
-    setLoading(true);
+  // Signature of the last rendered payload — SnapTrade-mirrored trades emit
+  // order events in ~5s poll batches, each firing a background reload; only
+  // touch state when the data actually changed so the table doesn't blink.
+  const lastSigRef = useRef<string | null>(null);
+  async function load(lim = limit, opts?: { background?: boolean }) {
+    // Background (SSE-driven) reloads must NOT flip `loading` — that drops the
+    // whole table to the "Loading…" state and back on every order event.
+    if (!opts?.background) setLoading(true);
     try {
       const d = await api<PerfData>(`/api/admin/performance/fanouts?limit=${lim}`);
-      setData(d);
+      const sig = JSON.stringify(d);
+      if (sig !== lastSigRef.current) {
+        lastSigRef.current = sig;
+        setData(d);
+      }
     } catch (e) {
-      notify.fromError(e, "Could not load performance data");
+      if (!opts?.background) notify.fromError(e, "Could not load performance data");
     } finally {
-      setLoading(false);
+      if (!opts?.background) setLoading(false);
     }
   }
 
@@ -353,12 +363,12 @@ export default function AdminPerformancePage() {
 
   // Live updates: refetch (debounced) on any order.* event so new fanouts
   // appear as trades happen — admins now receive platform-wide order events
-  // via the global admin SSE channel.
+  // via the global admin SSE channel. Background reload: no loading flash.
   const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEventStream((evt) => {
     if (!evt.type.startsWith("order.")) return;
     if (reloadTimer.current) clearTimeout(reloadTimer.current);
-    reloadTimer.current = setTimeout(() => load(), 1000);
+    reloadTimer.current = setTimeout(() => load(limit, { background: true }), 1000);
   });
   useEffect(() => () => { if (reloadTimer.current) clearTimeout(reloadTimer.current); }, []);
 
