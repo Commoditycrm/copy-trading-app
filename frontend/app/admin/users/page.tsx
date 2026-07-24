@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import Pagination from "@/components/Pagination";
 import { notify } from "@/lib/toast";
 
 interface AdminUser {
@@ -70,28 +71,58 @@ export default function AdminUsersPage() {
   const [filter, setFilter]   = useState<"all" | "trader" | "subscriber" | "admin">("all");
   const [status, setStatus]   = useState<"all" | "active" | "inactive">("all");
   const [search, setSearch]   = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("created_at");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [busy, setBusy]       = useState<string | null>(null); // user id being actioned
-  // Inline edit for trader business name. Holds {userId, draft} while
-  // a row is being edited; null means no edit in progress. Centralised
-  // so only one row can be edited at a time — clicking a different row
-  // resets the previous draft.
   const [editingBiz, setEditingBiz] = useState<{ id: string; draft: string } | null>(null);
 
-  async function load() {
+  // Server-side pagination + DB-computed role-chip counts.
+  const [total, setTotal]   = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [limit]             = useState(50);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+
+  const usersEndpoint = useCallback(() => {
+    const q = new URLSearchParams();
+    q.set("limit", String(limit));
+    q.set("offset", String(offset));
+    if (filter !== "all") q.set("role", filter);
+    if (status !== "all") q.set("status", status);
+    if (debouncedSearch.trim()) q.set("search", debouncedSearch.trim());
+    q.set("sort", sortKey);
+    q.set("dir", sortDir);
+    return `/api/admin/users?${q.toString()}`;
+  }, [filter, status, debouncedSearch, sortKey, sortDir, limit, offset]);
+
+  const loadPage = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api<AdminUser[]>("/api/admin/users");
-      setUsers(data);
+      const page = await api<{ items: AdminUser[]; total: number }>(usersEndpoint());
+      setUsers(page.items);
+      setTotal(page.total);
     } catch (e) {
       notify.fromError(e, "Could not load users");
     } finally {
       setLoading(false);
     }
-  }
+  }, [usersEndpoint]);
 
-  useEffect(() => { load(); }, []);
+  const loadCounts = useCallback(async () => {
+    try { setCounts(await api<Record<string, number>>("/api/admin/users/counts")); }
+    catch { /* chips fall back to 0 */ }
+  }, []);
+
+  // Refresh button + post-mutation refetch.
+  const load = useCallback(async () => { await loadPage(); loadCounts(); }, [loadPage, loadCounts]);
+
+  useEffect(() => { loadPage(); }, [loadPage]);
+  useEffect(() => { loadCounts(); }, [loadCounts]);
+  // Debounce search → refetch, and jump to page 1.
+  useEffect(() => {
+    const t = setTimeout(() => { setDebouncedSearch(search); setOffset(0); }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
   async function toggleActive(user: AdminUser) {
     setBusy(user.id);
@@ -149,6 +180,7 @@ export default function AdminUsersPage() {
       setUsers(us =>
         us.map(u => u.id === user.id ? { ...u, role: newRole } : u)
       );
+      loadCounts();  // role counts shifted
     } catch (e) {
       notify.fromError(e, "Could not change role");
     } finally {
@@ -156,41 +188,18 @@ export default function AdminUsersPage() {
     }
   }
 
+  // Sorting is server-side; changing it jumps back to page 1.
   function toggleSort(k: SortKey) {
+    setOffset(0);
     if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
     else { setSortKey(k); setSortDir("asc"); }
   }
 
-  const filtered = users.filter(u => {
-    const matchRole   = filter === "all" || u.role === filter;
-    const matchStatus = status === "all" || (status === "active" ? u.is_active : !u.is_active);
-    const matchSearch = !search ||
-      u.email.toLowerCase().includes(search.toLowerCase()) ||
-      (u.display_name ?? "").toLowerCase().includes(search.toLowerCase());
-    return matchRole && matchStatus && matchSearch;
-  });
-
-  // Exclude fake load-test users from this view — they clutter the list
-  // and are managed on the Load Test page.
-  const isFake = (email: string) => email.startsWith("fake-load-test-");
-  const realUsers = filtered.filter(u => !isFake(u.email)).sort((a, b) => {
-    const dir = sortDir === "asc" ? 1 : -1;
-    switch (sortKey) {
-      case "email":         return a.email.localeCompare(b.email) * dir;
-      case "role":          return a.role.localeCompare(b.role) * dir;
-      case "business_name": return (a.business_name ?? "").localeCompare(b.business_name ?? "") * dir;
-      case "status":        return (Number(a.is_active) - Number(b.is_active)) * dir;
-      case "created_at":    return (new Date(a.created_at).getTime() - new Date(b.created_at).getTime()) * dir;
-      default:              return 0;
-    }
-  });
-  const fakeCount = users.filter(u => isFake(u.email)).length;
-  // Role-chip counts must also exclude the fake test users — otherwise
-  // "Subscribers (66)" includes 50 fake rows that the table hides, which
-  // makes the chips out of sync with what an admin actually sees below.
-  const realByRole = (r: string) =>
-    users.filter(u => !isFake(u.email) && u.role === r).length;
-  const realTotal = users.length - fakeCount;
+  // Rows ARE the server page (role/status/search/sort + fake-user exclusion all
+  // server-side). Chip counts come from the DB counts endpoint.
+  const realUsers = users;
+  const realByRole = (r: string) => counts[r] ?? 0;
+  const realTotal = counts.total ?? 0;
 
   return (
     <div className="space-y-5">
@@ -198,10 +207,7 @@ export default function AdminUsersPage() {
         <div>
           <h2 className="text-xl font-bold">Users</h2>
           <p className="text-sm mt-0.5" style={{ color: "var(--muted)" }}>
-            {users.length} total · {fakeCount} fake test users hidden
-            {fakeCount > 0 && (
-              <> · <a href="/admin/load-test" className="underline" style={{ color: "#facc15" }}>manage on Load Test page</a></>
-            )}
+            {realTotal.toLocaleString()} users · load-test users hidden (<a href="/admin/load-test" className="underline" style={{ color: "#facc15" }}>manage</a>)
           </p>
         </div>
         <button
@@ -235,7 +241,7 @@ export default function AdminUsersPage() {
           {(["all", "trader", "subscriber", "admin"] as const).map(r => (
             <button
               key={r}
-              onClick={() => setFilter(r)}
+              onClick={() => { setFilter(r); setOffset(0); }}
               className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
               style={{
                 background: filter === r ? "var(--accent)" : "var(--panel-2)",
@@ -253,7 +259,7 @@ export default function AdminUsersPage() {
           {(["all", "active", "inactive"] as const).map(s => (
             <button
               key={s}
-              onClick={() => setStatus(s)}
+              onClick={() => { setStatus(s); setOffset(0); }}
               className="text-xs px-3 py-1 rounded-full capitalize font-medium transition-colors"
               style={{
                 background: status === s ? "var(--accent)" : "var(--panel-2)",
@@ -457,6 +463,9 @@ export default function AdminUsersPage() {
             </tbody>
           </table>
         </div>
+      )}
+      {!loading && total > 0 && (
+        <Pagination total={total} limit={limit} offset={offset} onChange={setOffset} />
       )}
     </div>
   );

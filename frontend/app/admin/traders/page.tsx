@@ -24,9 +24,10 @@ export default function AdminTradersPage() {
   useEffect(() => {
     (async () => {
       try {
-        const data = await api<AdminUser[]>("/api/admin/users");
-        // Traders only; drop fake load-test rows (managed on the Load Test page).
-        setTraders(data.filter(u => u.role === "trader" && !u.email.startsWith("fake-load-test-")));
+        // Server filters to traders + excludes load-test users. High limit keeps
+        // this (small) trader list on one page for the client-side search box.
+        const page = await api<{ items: AdminUser[] }>("/api/admin/users?role=trader&limit=200");
+        setTraders(page.items);
       } catch (e) {
         notify.fromError(e, "Could not load traders");
       } finally {

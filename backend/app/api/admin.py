@@ -28,7 +28,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
@@ -37,6 +37,7 @@ from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
+from app.schemas.pagination import Page
 from app.services import excel_export
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
@@ -244,14 +245,71 @@ def get_stats(
 
 # ─── User management ──────────────────────────────────────────────────────────
 
-@router.get("/users", response_model=list[UserOut])
+_USERS_SORT = {
+    "email": User.email,
+    "role": User.role,
+    "display_name": User.display_name,
+    "business_name": User.business_name,
+    "status": User.is_active,
+    "created_at": User.created_at,
+}
+
+
+@router.get("/users", response_model=Page[UserOut])
 def list_users(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
-) -> list[User]:
-    return list(
-        db.execute(select(User).order_by(User.created_at.desc())).scalars()
+    role: str | None = Query(default=None, description="trader|subscriber|admin"),
+    status_filter: str | None = Query(default=None, alias="status", description="active|inactive"),
+    search: str | None = Query(default=None, description="email / name substring"),
+    sort: str = Query(default="created_at"),
+    dir: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Page[UserOut]:
+    """Server-side paginated user list with role/status filters, name search,
+    sort and a total count. Replaces the previously unbounded full-table fetch."""
+    # Load-test users are managed on the Load Test page and are noise here.
+    base = select(User).where(User.email.notilike("fake-load-test-%"))
+    if role in ("trader", "subscriber", "admin"):
+        base = base.where(User.role == UserRole(role))
+    if status_filter == "active":
+        base = base.where(User.is_active.is_(True))
+    elif status_filter == "inactive":
+        base = base.where(User.is_active.is_(False))
+    term = (search or "").strip()
+    if term:
+        like = f"%{term}%"
+        base = base.where(or_(
+            User.email.ilike(like),
+            User.display_name.ilike(like),
+            User.business_name.ilike(like),
+        ))
+
+    total = db.execute(select(func.count()).select_from(base.subquery())).scalar_one()
+    col = _USERS_SORT.get(sort, User.created_at)
+    ordering = col.asc() if dir == "asc" else col.desc()
+    rows = list(
+        db.execute(
+            base.order_by(ordering, User.id.desc()).limit(limit).offset(offset)
+        ).scalars()
     )
+    return Page(items=rows, total=total, limit=limit, offset=offset)
+
+
+@router.get("/users/counts")
+def user_counts(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict[str, int]:
+    """Per-role user counts (excluding load-test users) for the admin filter
+    chips — computed in the DB so they reflect every user, not just a page."""
+    base = select(func.count(User.id)).where(User.email.notilike("fake-load-test-%"))
+    total = db.execute(base).scalar_one()
+    out = {"total": total}
+    for r in (UserRole.TRADER, UserRole.SUBSCRIBER, UserRole.ADMIN):
+        out[r.value] = db.execute(base.where(User.role == r)).scalar_one()
+    return out
 
 
 @router.patch("/users/{user_id}/activate")
