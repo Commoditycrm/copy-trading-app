@@ -149,7 +149,7 @@ def list_trades_page(
     dir: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-) -> Page[Order]:
+) -> Page[OrderOut]:
     """Server-side paginated Order History. Same filters as the export
     (status tab / symbol search / bracket-leg exclusion) via trade_filters, plus
     sort + limit/offset, and a total count of ALL matching rows for the pager."""
