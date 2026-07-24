@@ -2,6 +2,7 @@
 
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import Pagination from "@/components/Pagination";
 import { notify } from "@/lib/toast";
 
 interface Rejection {
@@ -128,6 +129,10 @@ export default function AdminRejectedPage() {
   const [sortKey, setSortKey] = useState<RejSortKey>("created_at");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Client-side pagination over the filtered set (this table is bounded/capped,
+  // and its many filters + broker/role chips need the full set in memory).
+  const [offset, setOffset] = useState(0);
+  const PAGE_SIZE = 25;
 
   function toggleRow(id: string) {
     setExpanded(prev => {
@@ -198,6 +203,10 @@ export default function AdminRejectedPage() {
   }, [rows, role, statusFilter, broker, delivery, search, sortKey, sortDir]);
 
   const countByRole = (r: string) => rows.filter(x => x.user_role === r).length;
+
+  // Reset to page 1 whenever a filter/sort changes; slice the filtered set.
+  useEffect(() => { setOffset(0); }, [role, statusFilter, broker, delivery, search, sortKey, sortDir]);
+  const pageRows = filtered.slice(offset, offset + PAGE_SIZE);
 
   return (
     <div className="space-y-5">
@@ -325,9 +334,9 @@ export default function AdminRejectedPage() {
                   </td>
                 </tr>
               ) : (
-                filtered.map((r, i) => {
+                pageRows.map((r, i) => {
                   const open = expanded.has(r.order_id);
-                  const border = i < filtered.length - 1 ? "1px solid var(--border)" : "none";
+                  const border = i < pageRows.length - 1 ? "1px solid var(--border)" : "none";
                   return (
                   <Fragment key={r.order_id}>
                   <tr
@@ -418,6 +427,9 @@ export default function AdminRejectedPage() {
             </tbody>
           </table>
         </div>
+      )}
+      {filtered.length > PAGE_SIZE && (
+        <Pagination total={filtered.length} limit={PAGE_SIZE} offset={offset} onChange={setOffset} />
       )}
     </div>
   );
