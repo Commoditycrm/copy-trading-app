@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
@@ -14,14 +14,13 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
+import Pagination from "@/components/Pagination";
 import type { Order, OrderStatus, Position, TradeStats, User } from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
-// "Working" = still live at the broker: the open lifecycle plus retry_pending
-// (queued for a copy retry). These are the only orders a Cancel makes sense for.
-const WORKING_STATUSES: OrderStatus[] = [...OPEN_STATUSES, "retry_pending"];
 
-// Webull-style status tabs. Each maps to a set of order statuses.
+// Webull-style status tabs. Filtering is server-side now (trade_filters); the
+// tab key is passed straight to /api/trades/page as ?status=.
 type StatusTab = "all" | "working" | "filled" | "cancelled" | "rejected";
 const STATUS_TABS: { key: StatusTab; label: string }[] = [
   { key: "all", label: "All" },
@@ -30,17 +29,6 @@ const STATUS_TABS: { key: StatusTab; label: string }[] = [
   { key: "cancelled", label: "Cancelled" },
   { key: "rejected", label: "Rejected" },
 ];
-function matchesStatusTab(status: OrderStatus, tab: StatusTab): boolean {
-  switch (tab) {
-    case "all": return true;
-    case "working": return WORKING_STATUSES.includes(status);
-    case "filled": return status === "filled";
-    // Expired orders never filled and are no longer working — group them with
-    // cancelled (Webull lumps "didn't fill, not rejected" together here).
-    case "cancelled": return status === "canceled" || status === "expired";
-    case "rejected": return status === "rejected";
-  }
-}
 
 function fmt(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined) return "—";
@@ -138,24 +126,6 @@ const STATUS_DEFAULT = { bg: "var(--accent-glow)", color: "var(--accent)" };
 // ── Sorting ─────────────────────────────────────────────────────────────────
 type SortKey = "symbol" | "quantity" | "notional" | "status" | "submitted" | "filled" | "expires";
 
-function sortValue(o: Order, key: SortKey): number | string {
-  switch (key) {
-    case "symbol": return o.symbol.toUpperCase();
-    case "quantity": return Number(o.quantity) || 0;
-    case "notional": return notionalFor(o);
-    case "status": return o.status;
-    case "submitted": return new Date(o.submitted_at ?? o.created_at).getTime() || 0;
-    case "filled": { const t = lastFillTs(o); return t ? new Date(t).getTime() : 0; }
-    case "expires": { const d = expiresDays(o.option_expiry); return d === null ? Number.POSITIVE_INFINITY : d; }
-  }
-}
-
-// How many orders to load into the Order History window. Matches the
-// backend's hard cap (GET /api/trades — limit le=1000), so the tab count
-// stays accurate up to 1000 orders instead of pinning at the old default
-// of 200 (which made a freshly-placed order briefly show 201 then snap
-// back to 200 once the reconcile refetch trimmed the window).
-const PAGE_LIMIT = 1000;
 
 export default function TradesPage() {
   const searchParams = useSearchParams();
@@ -174,9 +144,16 @@ export default function TradesPage() {
   const [user, setUser] = useState<User | null>(null);
   const [tab, setTab] = useState<StatusTab>("all");
 
-  // Presentational only.
   const [search, setSearch] = useState("");
+  // Debounced copy of `search` — drives the server refetch so we don't hit the
+  // API on every keystroke. `search` stays bound to the input for instant echo.
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
+
+  // Server-side pagination state.
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [limit, setLimit] = useState(50);
 
   const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
   const [closePrices, setClosePrices] = useState<Record<string, string>>({});
@@ -188,15 +165,28 @@ export default function TradesPage() {
   // "/api/trades", which both capped at 200 and dropped the from/to filter.
   const tradesEndpoint = useCallback(() => {
     const q = new URLSearchParams();
-    q.set("limit", String(PAGE_LIMIT));
+    q.set("limit", String(limit));
+    q.set("offset", String(offset));
+    if (tab !== "all") q.set("status", tab);
+    if (debouncedSearch.trim()) q.set("search", debouncedSearch.trim());
+    if (sort) { q.set("sort", sort.key); q.set("dir", sort.dir); }
     if (fromParam) q.set("from", fromParam);
     if (toParam) {
       const t = new Date(toParam + "T00:00:00Z");
       t.setUTCDate(t.getUTCDate() + 1);
       q.set("to", t.toISOString().slice(0, 10));
     }
-    return `/api/trades?${q.toString()}`;
-  }, [fromParam, toParam]);
+    return `/api/trades/page?${q.toString()}`;
+  }, [tab, debouncedSearch, sort, limit, offset, fromParam, toParam]);
+
+  // Fetch the current page from the server (filters/sort/paging all server-side).
+  const loadPage = useCallback(async () => {
+    try {
+      const page = await api<{ items: Order[]; total: number }>(tradesEndpoint());
+      setOrders(page.items);
+      setTotal(page.total);
+    } catch { /* tolerate — keep the last page on a transient error */ }
+  }, [tradesEndpoint]);
 
   // Same date window as tradesEndpoint(), PLUS the tab and search that this
   // page normally applies in the browser — the export is built server-side, so
@@ -233,34 +223,46 @@ export default function TradesPage() {
     } catch { /* tolerate — summary falls back to local counts */ }
   }, [fromParam, toParam]);
 
+  // Setup: user, a one-time fills sync, positions, and the DB summary. Runs on
+  // mount and whenever the date filter changes — NOT on every page/tab/sort
+  // change (that's the page-load effect below).
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      // Fetch the user FIRST (fast) so the All/My tabs render immediately
-      // while the slower sync-fills + order fetch run behind the table
-      // skeleton. Previously this was bundled into the Promise.all below,
-      // so the tabs only appeared once the (slow) order load finished.
       try {
         const u = await api<User>("/api/auth/me");
         if (!cancelled) setUser(u);
       } catch { /* tolerate — tabs are trader-only, fall back to none */ }
-
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
-      const [o, p] = await Promise.all([
-        api<Order[]>(tradesEndpoint()),
-        api<Position[]>("/api/positions").catch(() => [] as Position[]),
-        loadStats(),
-      ]);
-      if (!cancelled) {
-        setOrders(o);
-        setPositions(p);
-        setLoading(false);
-      }
+      const p = await api<Position[]>("/api/positions").catch(() => [] as Position[]);
+      if (!cancelled) setPositions(p);
+      loadStats();
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromParam, toParam]);
+
+  // Page load: refetch whenever the query (tab / search / sort / page / date)
+  // changes. All filtering, sorting and paging is server-side now.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      await loadPage();
+      if (!cancelled) setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [loadPage]);
+
+  // Debounce the search box → server refetch, and jump back to page 1.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedSearch(search);
+      setOffset(0);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
   useEventStream((evt) => {
     if (
@@ -273,70 +275,23 @@ export default function TradesPage() {
       return;
     }
     const incoming = evt.order;
-    setOrders((cur) => {
-      const idx = cur.findIndex((o) => o.id === incoming.id);
-      const merged: Order = {
-        id: incoming.id,
-        parent_order_id: incoming.parent_order_id,
-        broker_account_id: incoming.broker_account_id,
-        instrument_type: incoming.instrument_type as Order["instrument_type"],
-        symbol: incoming.symbol,
-        side: incoming.side as Order["side"],
-        order_type: incoming.order_type as Order["order_type"],
-        quantity: incoming.quantity,
-        // Prefer the event's terms (so a broker-side MODIFY shows the new
-        // limit/stop immediately), falling back to the existing row when the
-        // event omits them. `?? undefined` guards older payloads that lack
-        // the field entirely (undefined) vs a real null clear.
-        limit_price: incoming.limit_price !== undefined
-          ? incoming.limit_price : (idx >= 0 ? cur[idx].limit_price : null),
-        stop_price: incoming.stop_price !== undefined
-          ? incoming.stop_price : (idx >= 0 ? cur[idx].stop_price : null),
-        take_profit_price: idx >= 0 ? cur[idx].take_profit_price : null,
-        stop_loss_price: idx >= 0 ? cur[idx].stop_loss_price : null,
-        option_expiry: incoming.option_expiry !== undefined
-          ? incoming.option_expiry : (idx >= 0 ? cur[idx].option_expiry : null),
-        option_strike: incoming.option_strike !== undefined
-          ? incoming.option_strike : (idx >= 0 ? cur[idx].option_strike : null),
-        option_right: incoming.option_right !== undefined
-          ? incoming.option_right : (idx >= 0 ? cur[idx].option_right : null),
-        status: incoming.status as Order["status"],
-        broker_order_id: incoming.broker_order_id,
-        filled_quantity: incoming.filled_quantity,
-        filled_avg_price: incoming.filled_avg_price,
-        submitted_at: idx >= 0 ? cur[idx].submitted_at : null,
-        closed_at: idx >= 0 ? cur[idx].closed_at : null,
-        reject_reason: incoming.reject_reason,
-        created_at: incoming.created_at ?? new Date().toISOString(),
-        fills: idx >= 0 ? cur[idx].fills : [],
-      };
-      const next = idx >= 0
-        ? [...cur.slice(0, idx), merged, ...cur.slice(idx + 1)]
-        // Brand-new order: prepend, but keep the list within the same
-        // window the reconcile refetch will settle on, so the count
-        // doesn't briefly overshoot (e.g. 200 → 201 → 200).
-        : [merged, ...cur].slice(0, PAGE_LIMIT);
-      return next;
-    });
+    // Flash the affected row (it'll be on the current page after the refetch,
+    // if it belongs there under the active filters/sort).
     setFlashId(incoming.id);
     setTimeout(() => setFlashId((f) => (f === incoming.id ? null : f)), 2000);
 
-    // Counts changed (new order, or a status transition) — refresh the
-    // DB totals. Fire-and-forget; cheap aggregate query.
-    loadStats();
-
-    const terminal = incoming.status === "filled" || incoming.status === "canceled" || incoming.status === "rejected";
-    if (!terminal) {
-      if (reconcileTimer.current) clearTimeout(reconcileTimer.current);
-      reconcileTimer.current = setTimeout(async () => {
-        try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* ignore */ }
-        try {
-          const fresh = await api<Order[]>(tradesEndpoint());
-          setOrders(fresh);
-          loadStats();
-        } catch { /* ignore */ }
-      }, 1500);
-    }
+    // Paging is server-side, so we don't mutate an in-memory list — we debounce
+    // a refetch of the CURRENT page + the DB counts. Debouncing collapses a
+    // burst of copy events (a fanout) into a single round-trip.
+    if (reconcileTimer.current) clearTimeout(reconcileTimer.current);
+    reconcileTimer.current = setTimeout(async () => {
+      const terminal = incoming.status === "filled" || incoming.status === "canceled" || incoming.status === "rejected";
+      // A still-working order may have a fill the activities feed hasn't
+      // surfaced yet — nudge a sync before refetching so the row lands settled.
+      if (!terminal) { try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* ignore */ } }
+      await loadPage();
+      loadStats();
+    }, 800);
   });
 
   useEffect(() => {
@@ -347,7 +302,8 @@ export default function TradesPage() {
     setActingFor({ id, kind: "cancel" });
     try {
       const updated = await api<Order>(`/api/trades/${id}/cancel`, { method: "POST" });
-      setOrders(cur => cur.map(o => o.id === id ? updated : o));
+      await loadPage();
+      loadStats();
       notify.success(`Order canceled: ${updated.symbol}`);
     } catch (e) {
       notify.fromError(e, "cancel failed");
@@ -373,7 +329,8 @@ export default function TradesPage() {
       const newOrder = await api<Order>(`/api/trades/${id}/close`, {
         method: "POST", body: JSON.stringify(body),
       });
-      setOrders(cur => [newOrder, ...cur]);
+      await loadPage();
+      loadStats();
       if (type === "limit") setClosePrices(p => ({ ...p, [id]: "" }));
       notify.success(`Close placed: ${newOrder.side.toUpperCase()} ${newOrder.symbol} (${type})`);
       api<Position[]>("/api/positions").then(setPositions).catch(() => {});
@@ -384,74 +341,31 @@ export default function TradesPage() {
     }
   }
 
-  // Base set shared by the tab counts and the visible rows. We show bracket
-  // exit legs (SL/TP) while they're WORKING or FILLED — so a trader who placed
-  // a bracket (e.g. on Webull) sees all three orders — and only hide legs that
-  // ended DEAD (canceled/rejected/expired), which are just noise next to the
-  // entry that already displays their prices in its TP/SL columns.
-  const baseOrders = useMemo(
-    () => orders.filter(o => !(
-      o.bracket_parent_id &&
-      (o.status === "canceled" || o.status === "rejected" || o.status === "expired")
-    )),
-    [orders],
-  );
+  // Rows ARE the server page — bracket-leg exclusion, status tab, symbol search
+  // and sort all happen server-side now (/api/trades/page + trade_filters).
+  const rows = orders;
 
-  // Per-tab counts for the tab badges, derived from the loaded window.
-  const tabCounts = useMemo(() => {
-    const c: Record<StatusTab, number> = { all: baseOrders.length, working: 0, filled: 0, cancelled: 0, rejected: 0 };
-    for (const o of baseOrders) {
-      if (WORKING_STATUSES.includes(o.status)) c.working++;
-      else if (o.status === "filled") c.filled++;
-      else if (o.status === "canceled" || o.status === "expired") c.cancelled++;
-      else if (o.status === "rejected") c.rejected++;
-    }
-    return c;
-  }, [baseOrders]);
-
-  // Rows for the active status tab.
-  const visibleOrders = useMemo(
-    () => baseOrders.filter(o => matchesStatusTab(o.status, tab)),
-    [baseOrders, tab],
-  );
-
-  // search → sort (presentational)
-  const rows = useMemo(() => {
-    const q = search.trim().toUpperCase();
-    const bySearch = q ? visibleOrders.filter(o => o.symbol.toUpperCase().includes(q)) : visibleOrders;
-    if (!sort) return bySearch;
-    const arr = [...bySearch];
-    arr.sort((a, b) => {
-      const va = sortValue(a, sort.key);
-      const vb = sortValue(b, sort.key);
-      const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
-      return sort.dir === "asc" ? cmp : -cmp;
-    });
-    return arr;
-  }, [visibleOrders, search, sort]);
-
-  const summary = useMemo(() => {
-    let filled = 0, working = 0, notional = 0;
-    for (const o of baseOrders) {
-      if (o.status === "filled") filled++;
-      if (OPEN_STATUSES.includes(o.status)) working++;
-      notional += notionalFor(o);
-    }
-    return { total: baseOrders.length, filled, working, notional };
-  }, [baseOrders]);
-
-  // Summary tiles are GLOBAL (across all orders, all statuses) — independent of
-  // the active status tab. Prefer DB-computed totals; fall back to the local
-  // page-derived counts only until the first stats response lands.
-  const scopeStats = stats ? stats.all : null;
+  // Tab badges + summary tiles come from the DB aggregate (every matching row,
+  // not just this page), so they stay stable as you flip pages. Zeros until the
+  // first stats load lands.
+  const s = stats?.all ?? null;
+  const tabCounts: Record<StatusTab, number> = {
+    all: s ? s.total : 0,
+    working: s ? s.working : 0,
+    filled: s ? s.filled : 0,
+    cancelled: s ? s.cancelled : 0,
+    rejected: s ? s.rejected : 0,
+  };
   const view = {
-    total: scopeStats ? scopeStats.total : summary.total,
-    filled: scopeStats ? scopeStats.filled : summary.filled,
-    working: scopeStats ? scopeStats.working : summary.working,
-    notional: scopeStats ? Number(scopeStats.notional) : summary.notional,
+    total: s ? s.total : 0,
+    filled: s ? s.filled : 0,
+    working: s ? s.working : 0,
+    notional: s ? Number(s.notional) : 0,
   };
 
+  // Sorting is server-side; changing it jumps back to page 1 and refetches.
   function toggleSort(key: SortKey) {
+    setOffset(0);
     setSort(prev => {
       if (!prev || prev.key !== key) return { key, dir: "asc" };
       if (prev.dir === "asc") return { key, dir: "desc" };
@@ -514,7 +428,7 @@ export default function TradesPage() {
               <button
                 key={key}
                 type="button"
-                onClick={() => setTab(key)}
+                onClick={() => { setTab(key); setOffset(0); }}
                 className="px-3 py-1.5 text-xs font-medium rounded-full transition-colors focus-ring"
                 style={{
                   border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
@@ -589,7 +503,7 @@ export default function TradesPage() {
                     <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
                       <Inbox size={28} />
                       <div className="text-sm" style={{ color: "var(--text)" }}>
-                        {orders.length === 0 ? "No trades yet" : search ? `No orders match “${search}”` : "No orders in this view"}
+                        {debouncedSearch ? `No orders match “${debouncedSearch}”` : (tab !== "all" || fromParam) ? "No orders in this view" : "No trades yet"}
                       </div>
                       <div className="text-xs">Orders appear here as you place or mirror them.</div>
                     </div>
@@ -838,6 +752,19 @@ export default function TradesPage() {
             </tbody>
           </table>
         </div>
+        {!loading && total > 0 && (
+          <div className="px-4 py-2" style={{ borderTop: "1px solid var(--border)" }}>
+            <Pagination
+              total={total}
+              limit={limit}
+              offset={offset}
+              onChange={setOffset}
+              pageSizeOptions={[25, 50, 100, 200]}
+              onLimitChange={(n) => { setLimit(n); setOffset(0); }}
+              disabled={loading}
+            />
+          </div>
+        )}
       </div>
     </div>
   );

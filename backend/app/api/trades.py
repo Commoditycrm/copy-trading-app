@@ -344,6 +344,9 @@ def trades_stats(
     mine_cond = Order.fanned_out_to_subscribers.is_(False) if is_trader else true()
     filled_cond = Order.status == OrderStatus.FILLED
     working_cond = Order.status.in_(_WORKING_STATUSES)
+    # "cancelled" tab groups canceled + expired (didn't fill, not rejected).
+    cancelled_cond = Order.status.in_((OrderStatus.CANCELED, OrderStatus.EXPIRED))
+    rejected_cond = Order.status == OrderStatus.REJECTED
 
     # Notional = filled_qty × filled_avg_price, ×100 for options. Unfilled
     # rows contribute 0 (filled_quantity is 0 / filled_avg_price is NULL).
@@ -359,12 +362,16 @@ def trades_stats(
             func.count().filter(all_cond).label("all_total"),
             func.count().filter(and_(all_cond, filled_cond)).label("all_filled"),
             func.count().filter(and_(all_cond, working_cond)).label("all_working"),
+            func.count().filter(and_(all_cond, cancelled_cond)).label("all_cancelled"),
+            func.count().filter(and_(all_cond, rejected_cond)).label("all_rejected"),
             func.coalesce(
                 func.sum(case((all_cond, notional_expr), else_=0)), 0
             ).label("all_notional"),
             func.count().filter(mine_cond).label("mine_total"),
             func.count().filter(and_(mine_cond, filled_cond)).label("mine_filled"),
             func.count().filter(and_(mine_cond, working_cond)).label("mine_working"),
+            func.count().filter(and_(mine_cond, cancelled_cond)).label("mine_cancelled"),
+            func.count().filter(and_(mine_cond, rejected_cond)).label("mine_rejected"),
             func.coalesce(
                 func.sum(case((mine_cond, notional_expr), else_=0)), 0
             ).label("mine_notional"),
@@ -391,12 +398,16 @@ def trades_stats(
             total=row.all_total,
             filled=row.all_filled,
             working=row.all_working,
+            cancelled=row.all_cancelled,
+            rejected=row.all_rejected,
             notional=row.all_notional,
         ),
         mine=TradeScopeStats(
             total=row.mine_total,
             filled=row.mine_filled,
             working=row.mine_working,
+            cancelled=row.mine_cancelled,
+            rejected=row.mine_rejected,
             notional=row.mine_notional,
         ),
     )

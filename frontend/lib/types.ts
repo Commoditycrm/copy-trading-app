@@ -165,6 +165,8 @@ export interface TradeScopeStats {
   total: number;
   filled: number;
   working: number;
+  cancelled: number;
+  rejected: number;
   notional: string;   // Decimal as string
 }
 

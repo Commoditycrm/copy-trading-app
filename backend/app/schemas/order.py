@@ -137,6 +137,10 @@ class TradeScopeStats(BaseModel):
     total: int
     filled: int
     working: int
+    # For the status-tab badges. "cancelled" groups canceled+expired (didn't
+    # fill, not rejected) to mirror the Trades page tab.
+    cancelled: int = 0
+    rejected: int = 0
     notional: Decimal
 
 
