@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { motion } from "framer-motion";
 import { Check, Lock, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
@@ -242,8 +243,12 @@ function fmtRelative(iso: string | null): string {
   return `${Math.floor(ms / 86_400_000)}d ago`;
 }
 
+const BROKERS_KEY = "brokers:accounts";
+
 export default function BrokersPage() {
-  const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
+  // Paint the last connected-brokers list instantly on return nav; load()
+  // revalidates + refreshes balances. Cleared on logout.
+  const [accounts, setAccounts] = useState<BrokerAccount[]>(() => getSnapshot<BrokerAccount[]>(BROKERS_KEY) ?? []);
 
   // Which broker the user has chosen to connect. Defaults to alpaca to
   // preserve the previous behaviour for existing users.
@@ -284,8 +289,8 @@ export default function BrokersPage() {
   // the page briefly renders its empty-state picker (because `accounts`
   // starts as []) and then jumps to show the connected card once the
   // API responds. Holding back the body during the initial fetch keeps
-  // the layout stable.
-  const [loading, setLoading] = useState(true);
+  // the layout stable. Skipped when a snapshot already seeded `accounts`.
+  const [loading, setLoading] = useState(() => getSnapshot<BrokerAccount[]>(BROKERS_KEY) === undefined);
 
   // Disconnect confirmation — holds the account id pending removal (or
   // null when the modal is closed) + a busy flag for the in-flight DELETE.
@@ -301,6 +306,7 @@ export default function BrokersPage() {
     try {
       const accts = await api<BrokerAccount[]>("/api/brokers");
       setAccounts(accts);
+      setSnapshot(BROKERS_KEY, accts);
       // Pull live balances immediately on entry, so opening (or being
       // redirected to) the page shows fresh numbers right away instead of the
       // cached snapshot + a 30s wait for the first poll tick. Silent = no

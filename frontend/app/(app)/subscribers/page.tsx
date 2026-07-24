@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Search, Trash2, Users, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import Pagination from "@/components/Pagination";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
@@ -10,9 +11,19 @@ import { FollowRequestsPanel } from "@/components/FollowRequestsPanel";
 import { fmtSignedUsd } from "@/lib/format";
 import type { SubscriberSummary } from "@/lib/types";
 
+type SubsLanding = {
+  rows: SubscriberSummary[];
+  total: number;
+  stats: { total: number; active: number; with_broker: number };
+};
+const SUBS_KEY = "subscribers:landing";
+
 export default function SubscribersPage() {
-  const [rows, setRows] = useState<SubscriberSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Seed the default (page-0, no-search) landing view from the last snapshot so
+  // return nav paints instantly; load() revalidates. Cleared on logout.
+  const _snap = getSnapshot<SubsLanding>(SUBS_KEY);
+  const [rows, setRows] = useState<SubscriberSummary[]>(_snap?.rows ?? []);
+  const [loading, setLoading] = useState(_snap === undefined);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState<{ ids: string[]; label: string } | null>(null);
   const [removing, setRemoving] = useState(false);
@@ -22,11 +33,11 @@ export default function SubscribersPage() {
   const [autoApprove, setAutoApprove] = useState<boolean | null>(null);
 
   // Server-side pagination + DB-computed header stats.
-  const [total, setTotal] = useState(0);
+  const [total, setTotal] = useState(_snap?.total ?? 0);
   const [offset, setOffset] = useState(0);
   const [limit] = useState(50);
   const [stats, setStats] = useState<{ total: number; active: number; with_broker: number }>(
-    { total: 0, active: 0, with_broker: 0 },
+    _snap?.stats ?? { total: 0, active: 0, with_broker: 0 },
   );
 
   const load = useCallback(async () => {
@@ -48,6 +59,13 @@ export default function SubscribersPage() {
   }, [limit, offset, debouncedSearch]);
 
   useEffect(() => { load(); }, [load]);
+  // Persist only the default landing view (page 0, no search) as the return-nav
+  // snapshot — never a filtered/paged state.
+  useEffect(() => {
+    if (!loading && offset === 0 && !debouncedSearch.trim()) {
+      setSnapshot<SubsLanding>(SUBS_KEY, { rows, total, stats });
+    }
+  }, [rows, total, stats, loading, offset, debouncedSearch]);
   // Debounce search → server refetch, jump to page 1.
   useEffect(() => {
     const t = setTimeout(() => { setDebouncedSearch(search); setOffset(0); }, 300);

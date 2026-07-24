@@ -14,6 +14,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
@@ -1140,8 +1141,12 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
 export function PerformanceView({
   endpoint = "/api/performance/fanouts?limit=50",
 }: { endpoint?: string } = {}) {
-  const [data, setData] = useState<FanoutResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Keyed by endpoint — the trader view and the admin per-trader view share
+  // this component but show different fanouts, so they must not share a
+  // snapshot. Paints last data instantly on return; load() revalidates.
+  const perfKey = `perf:${endpoint}`;
+  const [data, setData] = useState<FanoutResponse | null>(() => getSnapshot<FanoutResponse>(perfKey) ?? null);
+  const [loading, setLoading] = useState(() => getSnapshot<FanoutResponse>(perfKey) === undefined);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const reloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -1149,6 +1154,7 @@ export function PerformanceView({
     try {
       const res = await api<FanoutResponse>(endpoint);
       setData(res);
+      setSnapshot(perfKey, res);
     } catch {
       // Silent — leave whatever's on screen
     } finally {

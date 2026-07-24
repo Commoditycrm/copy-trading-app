@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
 import { PositionIcon, orderKind } from "@/components/PositionIcon";
 import { fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
@@ -127,21 +128,27 @@ const STATUS_DEFAULT = { bg: "var(--accent-glow)", color: "var(--accent)" };
 type SortKey = "symbol" | "quantity" | "notional" | "status" | "submitted" | "filled" | "expires";
 
 
+type TradesLanding = { orders: Order[]; positions: Position[]; stats: TradeStats | null };
+const TRADES_KEY = "trades:landing";
+
 export default function TradesPage() {
   const searchParams = useSearchParams();
   // Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filter (used by Calendar drill-in).
   const fromParam = searchParams?.get("from") ?? null;
   const toParam = searchParams?.get("to") ?? null;
 
-  const [orders, setOrders] = useState<Order[]>([]);
-  const [positions, setPositions] = useState<Position[]>([]);
+  // Seed the default landing (All tab, page 0, no search/sort/date filter) from
+  // the last snapshot so return nav paints instantly; effects revalidate.
+  const _tradesSnap = getSnapshot<TradesLanding>(TRADES_KEY);
+  const [orders, setOrders] = useState<Order[]>(_tradesSnap?.orders ?? []);
+  const [positions, setPositions] = useState<Position[]>(_tradesSnap?.positions ?? []);
   // DB-computed order totals (GET /api/trades/stats) — drives the summary
   // tiles + tab badges so they reflect EVERY matching order, not just the
   // fetched window. null until first load (we fall back to local counts).
-  const [stats, setStats] = useState<TradeStats | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState<TradeStats | null>(_tradesSnap?.stats ?? null);
+  const [loading, setLoading] = useState(_tradesSnap === undefined);
   const [flashId, setFlashId] = useState<string | null>(null);
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<User | null>(() => getSnapshot<User>(USER_SNAPSHOT_KEY) ?? null);
   const [tab, setTab] = useState<StatusTab>("all");
 
   const [search, setSearch] = useState("");
@@ -231,7 +238,7 @@ export default function TradesPage() {
     (async () => {
       try {
         const u = await api<User>("/api/auth/me");
-        if (!cancelled) setUser(u);
+        if (!cancelled) { setUser(u); setSnapshot(USER_SNAPSHOT_KEY, u); }
       } catch { /* tolerate — tabs are trader-only, fall back to none */ }
       try { await api("/api/trades/sync-fills", { method: "POST" }); } catch { /* non-blocking */ }
       if (cancelled) return;
@@ -245,15 +252,27 @@ export default function TradesPage() {
 
   // Page load: refetch whenever the query (tab / search / sort / page / date)
   // changes. All filtering, sorting and paging is server-side now.
+  // On the very first mount, if a snapshot already painted the page, skip the
+  // skeleton and revalidate silently; later query changes still show loading.
+  const seededRef = useRef(_tradesSnap !== undefined);
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
+    if (seededRef.current) seededRef.current = false;
+    else setLoading(true);
     (async () => {
       await loadPage();
       if (!cancelled) setLoading(false);
     })();
     return () => { cancelled = true; };
   }, [loadPage]);
+
+  // Persist only the default landing view (All tab, page 0, no search/sort/date)
+  // as the return-nav snapshot — never a filtered/paged state.
+  useEffect(() => {
+    const isDefault = tab === "all" && offset === 0 && !debouncedSearch.trim()
+      && !sort && !fromParam && !toParam;
+    if (isDefault && !loading) setSnapshot<TradesLanding>(TRADES_KEY, { orders, positions, stats });
+  }, [orders, positions, stats, tab, offset, debouncedSearch, sort, fromParam, toParam, loading]);
 
   // Debounce the search box → server refetch, and jump back to page 1.
   useEffect(() => {

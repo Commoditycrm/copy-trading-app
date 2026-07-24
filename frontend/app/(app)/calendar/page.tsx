@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
@@ -26,17 +27,24 @@ function browserTz(): string {
   return "America/New_York";
 }
 
+// Snapshot keys — the grid caches only the default view (self, current month).
+const CAL_KEY = "calendar:landing";
+const CAL_SUBS_KEY = "calendar:subs";
+
 export default function CalendarPage() {
   const router = useRouter();
   const [cursor, setCursor] = useState(() => startOfMonth(new Date()));
-  const [data, setData] = useState<DailyPnL[]>([]);
+  // Seed the current-month self-view grid + roster from the last snapshot so
+  // return nav skips the centered loader; the effects below revalidate.
+  const _calSnap = getSnapshot<DailyPnL[]>(CAL_KEY);
+  const [data, setData] = useState<DailyPnL[]>(_calSnap ?? []);
   const [loading, setLoading] = useState(true);
   // Tracks whether the FIRST month's P&L fetch has completed. Subsequent
   // month switches show the small inline loader without remounting the
   // whole grid; only the initial mount surfaces the centered loading.
-  const [firstLoadDone, setFirstLoadDone] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
-  const [subs, setSubs] = useState<SubscriberSummary[]>([]);
+  const [firstLoadDone, setFirstLoadDone] = useState(_calSnap !== undefined);
+  const [user, setUser] = useState<User | null>(() => getSnapshot<User>(USER_SNAPSHOT_KEY) ?? null);
+  const [subs, setSubs] = useState<SubscriberSummary[]>(() => getSnapshot<SubscriberSummary[]>(CAL_SUBS_KEY) ?? []);
   // The "viewing" user — defaults to self. Trader can pick a subscriber.
   const [viewingUserId, setViewingUserId] = useState<string | null>(null);
   // Sync status — auto-sync fills on mount.
@@ -49,7 +57,14 @@ export default function CalendarPage() {
     setLoading(true);
     const qs = viewingUserId ? `&user_id=${viewingUserId}` : "";
     api<DailyPnL[]>(`/api/calendar/pnl?from=${range.from}&to=${range.to}&tz=${encodeURIComponent(browserTz())}${qs}`)
-      .then(setData)
+      .then((rows) => {
+        setData(rows);
+        // Cache only the default landing (self view, current month) — never a
+        // subscriber's view or a scrolled-to month.
+        if (!viewingUserId && range.from === iso(startOfMonth(new Date()))) {
+          setSnapshot(CAL_KEY, rows);
+        }
+      })
       .finally(() => {
         setLoading(false);
         setFirstLoadDone(true);
@@ -64,9 +79,12 @@ export default function CalendarPage() {
         const u = await api<User>("/api/auth/me");
         if (cancelled) return;
         setUser(u);
+        setSnapshot(USER_SNAPSHOT_KEY, u);
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
-          api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => { if (!cancelled) setSubs(p.items); });
+          api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => {
+            if (!cancelled) { setSubs(p.items); setSnapshot(CAL_SUBS_KEY, p.items); }
+          });
         }
         // Sync our own fills — refreshes the data the calendar reads from.
         setSyncing(true);

@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef,
 import { motion } from "framer-motion";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -12,6 +13,9 @@ import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
 import type { Order, Position } from "@/lib/types";
+
+type PosSnap = { positions: Position[]; orders: Order[] };
+const POS_KEY = "positions:table";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined || n === "") return "—";
@@ -99,9 +103,11 @@ export interface OpenPositionsTableHandle {
 
 export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string; fillHeight?: boolean }>(
   function OpenPositionsTable({ className, fillHeight }, ref) {
-    const [positions, setPositions] = useState<Position[]>([]);
-    const [orders, setOrders] = useState<Order[]>([]);
-    const [loading, setLoading] = useState(true);
+    // Stale-while-revalidate: paint the last positions/orders instantly on
+    // return nav, then refresh() below revalidates. Cleared on logout.
+    const [positions, setPositions] = useState<Position[]>(() => getSnapshot<PosSnap>(POS_KEY)?.positions ?? []);
+    const [orders, setOrders] = useState<Order[]>(() => getSnapshot<PosSnap>(POS_KEY)?.orders ?? []);
+    const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
     // Per-row close size as a percentage of the held quantity. Defaults to 100%.
@@ -132,6 +138,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         ]);
         setPositions(pos);
         setOrders(ords);
+        setSnapshot<PosSnap>(POS_KEY, { positions: pos, orders: ords });
       } catch (e) {
         notify.fromError(e, "failed to load positions");
       } finally {

@@ -11,6 +11,10 @@
  */
 const store = new Map<string, unknown>();
 
+/** Shared key for the current user (/api/auth/me) — several tabs gate their
+ *  first paint on it, so caching it once makes every subsequent tab instant. */
+export const USER_SNAPSHOT_KEY = "auth:user";
+
 export function getSnapshot<T>(key: string): T | undefined {
   return store.get(key) as T | undefined;
 }
