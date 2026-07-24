@@ -117,6 +117,10 @@ class OrderOut(BaseModel):
     reject_reason: str | None
     created_at: datetime
     fanned_out_to_subscribers: bool = False
+    # Realized P&L this (closing) order produced, FIFO-attributed. None for
+    # opening orders / anything that realized nothing. Populated by the trades
+    # endpoints from pnl.realized_pnl_by_order; not a DB column.
+    realized_pnl: Decimal | None = None
     fills: list[FillOut] = []
 
     model_config = {"from_attributes": True}

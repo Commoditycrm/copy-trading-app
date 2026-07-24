@@ -31,7 +31,7 @@ from app.services import audit, copy_engine, events, excel_export, fills_sync, t
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
-from app.services.pnl import realized_pnl_by_day
+from app.services.pnl import realized_pnl_by_day, realized_pnl_by_order
 
 router = APIRouter(prefix="/api", tags=["trades"])
 
@@ -91,6 +91,17 @@ def _filled_notional(o: Order):
     return o.filled_quantity * o.filled_avg_price * mult
 
 
+def _attach_realized_pnl(db: Session, user: User, orders: list[Order]) -> None:
+    """Set the transient .realized_pnl on each CLOSING order so OrderOut carries
+    per-trade P&L. Cheap-ish: one FIFO walk over the user's history."""
+    if not orders:
+        return
+    mirrors_only = user.role == UserRole.SUBSCRIBER
+    by_order = realized_pnl_by_order(db, user.id, mirrors_only=mirrors_only)
+    for o in orders:
+        o.realized_pnl = by_order.get(o.id)
+
+
 @router.get("/trades", response_model=list[OrderOut])
 def list_trades(
     db: Session = Depends(get_db),
@@ -115,7 +126,9 @@ def list_trades(
         q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
     if to:
         q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
-    return list(db.execute(q).scalars())
+    orders = list(db.execute(q).scalars())
+    _attach_realized_pnl(db, user, orders)
+    return orders
 
 
 # Server-side sortable columns for the paginated table. Computed ones (notional,
@@ -181,6 +194,7 @@ def list_trades_page(
             .offset(offset)
         ).scalars()
     )
+    _attach_realized_pnl(db, user, rows)
     return Page(items=rows, total=total, limit=limit, offset=offset)
 
 

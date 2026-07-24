@@ -408,3 +408,76 @@ def realized_pnl_by_day(
                 open_lots[key].append(_Lot(qty=-qty, price=price))
 
     return dict(daily)
+
+
+def realized_pnl_by_order(
+    db: Session, user_id: uuid.UUID, mirrors_only: bool = False,
+) -> dict[uuid.UUID, Decimal]:
+    """Realized P&L attributed to each CLOSING order — the order whose fill
+    reduced/closed a position — using the SAME FIFO as realized_pnl_by_day.
+
+    Opening orders never appear (they realize nothing until closed). Lets the UI
+    show a per-trade P&L. Walks the user's whole history so cost basis is right,
+    then returns only orders that produced a non-zero realized amount.
+    """
+    conds = [
+        Order.user_id == user_id,
+        Order.filled_quantity > 0,
+        Order.filled_avg_price.isnot(None),
+    ]
+    orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
+    orders = dedupe_subscriber_orders(orders_all) if mirrors_only else orders_all
+
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    if order_ids:
+        for f in db.execute(select(Fill).where(Fill.order_id.in_(order_ids))).scalars():
+            fills_by_order[f.order_id].append(f)
+
+    timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []
+    for o in orders:
+        fs = fills_by_order.get(o.id)
+        if fs:
+            for f in fs:
+                timeline.append((f.filled_at, f.quantity, f.price, o))
+        else:
+            when = o.closed_at or o.submitted_at or o.created_at
+            timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
+    timeline.sort(key=lambda e: e[0])
+
+    open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
+    by_order: dict[uuid.UUID, Decimal] = defaultdict(Decimal)
+    for _when, fill_qty, fill_price, order in timeline:
+        key = _instrument_key(order)
+        unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+        qty, price = fill_qty, fill_price
+        if order.side == OrderSide.BUY:
+            if open_lots[key] and open_lots[key][0].qty < 0:  # cover shorts
+                while qty > 0 and open_lots[key] and open_lots[key][0].qty < 0:
+                    lot = open_lots[key][0]
+                    take = min(qty, -lot.qty)
+                    by_order[order.id] += (lot.price - price) * take * unit
+                    lot.qty += take
+                    qty -= take
+                    if lot.qty == 0:
+                        open_lots[key].popleft()
+                if qty > 0:
+                    open_lots[key].append(_Lot(qty=qty, price=price))
+            else:
+                open_lots[key].append(_Lot(qty=qty, price=price))
+        else:  # SELL — close longs
+            if open_lots[key] and open_lots[key][0].qty > 0:
+                while qty > 0 and open_lots[key] and open_lots[key][0].qty > 0:
+                    lot = open_lots[key][0]
+                    take = min(qty, lot.qty)
+                    by_order[order.id] += (price - lot.price) * take * unit
+                    lot.qty -= take
+                    qty -= take
+                    if lot.qty == 0:
+                        open_lots[key].popleft()
+                if qty > 0:
+                    open_lots[key].append(_Lot(qty=-qty, price=price))
+            else:
+                open_lots[key].append(_Lot(qty=-qty, price=price))
+
+    return {oid: p for oid, p in by_order.items() if p != 0}

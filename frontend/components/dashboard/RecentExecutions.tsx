@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { ArrowDownRight, ArrowUpRight, ChevronRight, Inbox } from "lucide-react";
 import Link from "next/link";
 import type { Order } from "@/lib/types";
-import { fmtDateTime, fmtUsd, fmtNum } from "@/lib/format";
+import { fmtDateTime, fmtUsd, fmtNum, fmtSignedUsd } from "@/lib/format";
 
 const STATUS_TONE: Record<string, { color: string; bg: string }> = {
   filled: { color: "var(--good)", bg: "var(--good-soft)" },
@@ -93,12 +93,22 @@ export function RecentExecutions({ orders }: { orders: Order[] }) {
                 </div>
 
                 <div className="text-right shrink-0">
-                  <span
-                    className="chip"
-                    style={{ background: tone.bg, color: tone.color, borderColor: "transparent", textTransform: "capitalize" }}
-                  >
-                    {prettyStatus(o.status)}
-                  </span>
+                  {o.realized_pnl != null && Number(o.realized_pnl) !== 0 ? (
+                    <div
+                      className="text-sm font-semibold num"
+                      style={{ color: Number(o.realized_pnl) >= 0 ? "var(--good)" : "var(--bad)" }}
+                      title="Realized P&L on this trade"
+                    >
+                      {fmtSignedUsd(Number(o.realized_pnl))}
+                    </div>
+                  ) : (
+                    <span
+                      className="chip"
+                      style={{ background: tone.bg, color: tone.color, borderColor: "transparent", textTransform: "capitalize" }}
+                    >
+                      {prettyStatus(o.status)}
+                    </span>
+                  )}
                   <div className="text-[10px] mt-1" style={{ color: "var(--faint)" }}>
                     {fmtDateTime(o.created_at)}
                   </div>

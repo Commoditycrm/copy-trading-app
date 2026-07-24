@@ -134,6 +134,9 @@ export interface Order {
    *  False for subscribers' orders, trader orders placed while copy was
    *  paused, and trader orders placed with the "Just me" scope. */
   fanned_out_to_subscribers?: boolean;
+  /** Realized P&L this closing order produced (FIFO). Null for opening orders
+   *  or anything that realized nothing. Decimal as string. */
+  realized_pnl?: string | null;
   fills: Fill[];
 }
 
