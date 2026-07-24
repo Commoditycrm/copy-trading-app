@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 import { ExportButton } from "@/components/ExportButton";
 import { SubscriberPill, SubscriberBreakdown, type FanoutChild } from "@/components/performance/PerformanceView";
 
@@ -349,6 +350,17 @@ export default function AdminPerformancePage() {
   }
 
   useEffect(() => { load(); }, []);
+
+  // Live updates: refetch (debounced) on any order.* event so new fanouts
+  // appear as trades happen — admins now receive platform-wide order events
+  // via the global admin SSE channel.
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEventStream((evt) => {
+    if (!evt.type.startsWith("order.")) return;
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    reloadTimer.current = setTimeout(() => load(), 1000);
+  });
+  useEffect(() => () => { if (reloadTimer.current) clearTimeout(reloadTimer.current); }, []);
 
   // Null lags/times sort as -1 so missing values sink to the bottom on
   // a descending sort (where the interesting rows are).

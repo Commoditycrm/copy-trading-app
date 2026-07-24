@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.security import decode_token
 from app.database import SessionLocal
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.services import events
 
 router = APIRouter(prefix="/api", tags=["events"])
@@ -38,11 +38,14 @@ async def stream(request: Request, token: str = Query(...)):
         user = db.get(User, user_id)
         if not user or not user.is_active:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="user_inactive")
+        # Admins also listen on the global admin channel — that's what carries
+        # platform-wide order events into the admin panel in real time.
+        is_admin = user.role == UserRole.ADMIN
 
     async def gen():
         # Initial hello so the client knows the stream is alive.
         yield f": connected user={user_id}\n\n"
-        feed = events.subscribe(user_id)
+        feed = events.subscribe(user_id, include_admin=is_admin)
         feed_iter = feed.__aiter__()
         next_event_task = asyncio.create_task(feed_iter.__anext__())
         try:

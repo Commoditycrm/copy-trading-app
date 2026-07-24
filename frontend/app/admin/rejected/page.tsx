@@ -1,9 +1,10 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import Pagination from "@/components/Pagination";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 
 interface Rejection {
   order_id: string;
@@ -162,6 +163,17 @@ export default function AdminRejectedPage() {
     }
   }
   useEffect(() => { load(); }, []);
+
+  // Live updates: a rejection is an order.* event (copy_failed / retry) — refetch
+  // debounced so new failures appear without a manual refresh. Admins receive
+  // platform-wide order events via the global admin SSE channel.
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEventStream((evt) => {
+    if (!evt.type.startsWith("order.")) return;
+    if (reloadTimer.current) clearTimeout(reloadTimer.current);
+    reloadTimer.current = setTimeout(() => load(), 1200);
+  });
+  useEffect(() => () => { if (reloadTimer.current) clearTimeout(reloadTimer.current); }, []);
 
   // Brokers present in the current result set — drives the broker filter chips.
   const brokers = useMemo(
