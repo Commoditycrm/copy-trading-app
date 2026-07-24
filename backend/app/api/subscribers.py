@@ -3,8 +3,8 @@ import uuid
 from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import delete, func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, require_trader
@@ -13,6 +13,7 @@ from app.models.broker_account import BrokerAccount
 from app.models.follow_request import FollowRequest
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User
+from app.schemas.pagination import Page
 from app.schemas.settings import (
     BulkCopyStateOut,
     BulkCopyToggleIn,
@@ -26,16 +27,29 @@ from app.services.pnl import realized_pnl_by_day
 router = APIRouter(prefix="/api/subscribers", tags=["subscribers"])
 
 
-@router.get("", response_model=list[SubscriberSummary])
+@router.get("", response_model=Page[SubscriberSummary])
 def list_subscribers(
-    db: Session = Depends(get_db), trader: User = Depends(require_trader)
-) -> list[SubscriberSummary]:
-    rows = db.execute(
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+    search: str | None = Query(default=None, description="email / name substring"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Page[SubscriberSummary]:
+    """Server-side paginated subscriber list. The per-subscriber broker count +
+    30-day realized P&L (an N+1 that was previously run for EVERY follower) now
+    runs only for the page being shown."""
+    base = (
         select(User, SubscriberSettings)
         .join(SubscriberSettings, SubscriberSettings.user_id == User.id)
         .where(SubscriberSettings.following_trader_id == trader.id)
-        .order_by(User.email)
-    ).all()
+    )
+    term = (search or "").strip()
+    if term:
+        like = f"%{term}%"
+        base = base.where(or_(User.email.ilike(like), User.display_name.ilike(like)))
+
+    total = db.execute(select(func.count()).select_from(base.subquery())).scalar_one()
+    rows = db.execute(base.order_by(User.email).limit(limit).offset(offset)).all()
 
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=30)
@@ -57,7 +71,28 @@ def list_subscribers(
                 realized_pnl_30d=pnl_30d,
             )
         )
-    return out
+    return Page(items=out, total=total, limit=limit, offset=offset)
+
+
+@router.get("/stats")
+def subscriber_stats(
+    db: Session = Depends(get_db), trader: User = Depends(require_trader)
+) -> dict[str, int]:
+    """Cheap header counts (no per-subscriber P&L) — total / copy-active /
+    with a connected broker — so the summary reflects EVERY follower, not the
+    page shown."""
+    where = SubscriberSettings.following_trader_id == trader.id
+    total = db.execute(select(func.count()).where(where)).scalar_one()
+    active = db.execute(
+        select(func.count()).where(where, SubscriberSettings.copy_enabled.is_(True))
+    ).scalar_one()
+    sub_ids = select(SubscriberSettings.user_id).where(where)
+    with_broker = db.execute(
+        select(func.count(func.distinct(BrokerAccount.user_id))).where(
+            BrokerAccount.user_id.in_(sub_ids)
+        )
+    ).scalar_one()
+    return {"total": total, "active": active, "with_broker": with_broker}
 
 
 def _bulk_state(db: Session, trader_id) -> BulkCopyStateOut:

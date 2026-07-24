@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Search, Trash2, Users, X } from "lucide-react";
 import { api } from "@/lib/api";
+import Pagination from "@/components/Pagination";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import { FollowRequestsPanel } from "@/components/FollowRequestsPanel";
@@ -16,15 +17,42 @@ export default function SubscribersPage() {
   const [confirming, setConfirming] = useState<{ ids: string[]; label: string } | null>(null);
   const [removing, setRemoving] = useState(false);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   // Follow policy: null until loaded, then true = auto-allow, false = require approval.
   const [autoApprove, setAutoApprove] = useState<boolean | null>(null);
 
-  async function load() {
-    try { setRows(await api<SubscriberSummary[]>("/api/subscribers")); }
-    catch (e) { notify.fromError(e, "Could not load subscribers"); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { load(); }, []);
+  // Server-side pagination + DB-computed header stats.
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [limit] = useState(50);
+  const [stats, setStats] = useState<{ total: number; active: number; with_broker: number }>(
+    { total: 0, active: 0, with_broker: 0 },
+  );
+
+  const load = useCallback(async () => {
+    const q = new URLSearchParams();
+    q.set("limit", String(limit));
+    q.set("offset", String(offset));
+    if (debouncedSearch.trim()) q.set("search", debouncedSearch.trim());
+    try {
+      const page = await api<{ items: SubscriberSummary[]; total: number }>(`/api/subscribers?${q.toString()}`);
+      setRows(page.items);
+      setTotal(page.total);
+      api<{ total: number; active: number; with_broker: number }>("/api/subscribers/stats")
+        .then(setStats).catch(() => {});
+    } catch (e) {
+      notify.fromError(e, "Could not load subscribers");
+    } finally {
+      setLoading(false);
+    }
+  }, [limit, offset, debouncedSearch]);
+
+  useEffect(() => { load(); }, [load]);
+  // Debounce search → server refetch, jump to page 1.
+  useEffect(() => {
+    const t = setTimeout(() => { setDebouncedSearch(search); setOffset(0); }, 300);
+    return () => clearTimeout(t);
+  }, [search]);
 
   // Load the trader's current follow policy for the dropdown.
   useEffect(() => {
@@ -60,15 +88,8 @@ export default function SubscribersPage() {
     });
   }, [rows]);
 
-  // Presentational filter (by name / email).
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter(r =>
-      r.email.toLowerCase().includes(q) ||
-      (r.display_name ?? "").toLowerCase().includes(q)
-    );
-  }, [rows, search]);
+  // Rows ARE the server page (search is server-side now).
+  const filtered = rows;
 
   const allSelected = filtered.length > 0 && filtered.every(r => selected.has(r.user_id));
   const someSelected = selected.size > 0 && !allSelected;
@@ -127,9 +148,9 @@ export default function SubscribersPage() {
     }
   }
 
-  const total = rows.length;
-  const active = rows.filter(r => r.copy_enabled).length;
-  const withBroker = rows.filter(r => r.broker_count > 0).length;
+  // Header counts are global (all subscribers) from the DB stats endpoint.
+  const active = stats.active;
+  const withBroker = stats.with_broker;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -150,9 +171,9 @@ export default function SubscribersPage() {
           </div>
         ) : (
           <div className="flex items-center gap-2 self-end pb-0.5">
-            <Stat label="Total" value={total} />
+            <Stat label="Total" value={stats.total} />
             <Stat label="Copy ON" value={active} tone="good" />
-            <Stat label="Broker connected" value={withBroker} tone={withBroker === total && total > 0 ? "good" : "neutral"} />
+            <Stat label="Broker connected" value={withBroker} tone={withBroker === stats.total && stats.total > 0 ? "good" : "neutral"} />
           </div>
         )}
 
@@ -292,6 +313,9 @@ export default function SubscribersPage() {
             </tbody>
           </table>
         </div>
+        {!loading && total > 0 && (
+          <Pagination total={total} limit={limit} offset={offset} onChange={setOffset} />
+        )}
       </div>
 
       <ConfirmModal
