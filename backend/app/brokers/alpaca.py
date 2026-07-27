@@ -366,6 +366,49 @@ class AlpacaAdapter(BrokerAdapter):
             return list(resp["data"]) if isinstance(resp["data"], list) else []
         return list(resp) if isinstance(resp, list) else []
 
+    def marked_pnl_by_day(
+        self, start: date, end: date, tz_name: str | None = None
+    ) -> dict[date, tuple[Decimal, int]]:
+        """Daily MARKED P&L (realized + unrealized) from Alpaca's portfolio-history
+        endpoint — the exact number Alpaca's own app shows on its calendar.
+
+        Alpaca's ``profit_loss`` series is already per-day and cash-flow-adjusted
+        (a deposit/withdrawal shows $0, not the cash moved), verified to equal the
+        day-over-day equity change. So we bucket it straight to the ET day. This
+        is the broker-direct source for Alpaca accounts, the mirror of
+        ``broker_pnl.realized_by_day_from_broker`` for SnapTrade — except it's
+        MARKED, not realized-only, because Alpaca exposes the marked series and
+        SnapTrade/Webull does not.
+
+        Returns {day: (marked_pnl, count)} for every market day in [start, end].
+        ``count`` is 1 on any day with a P&L data point (the endpoint gives no
+        fill count — it's only used for the calendar's "N trades" label).
+        """
+        from app.services.pnl import _tz_or_market  # local import — avoid cycle
+        tz = _tz_or_market(tz_name)
+        # date_start/date_end + 1D timeframe → one point per market day. Raise on
+        # failure so the snapshot job falls back to the DB rather than freezing a
+        # blank calendar.
+        raw = self._c().get(
+            "/account/portfolio/history",
+            {
+                "date_start": start.isoformat(),
+                "date_end": end.isoformat(),
+                "timeframe": "1D",
+                "extended_hours": "true",
+            },
+        )
+        ts = raw.get("timestamp", []) or []
+        pl = raw.get("profit_loss", []) or []
+        out: dict[date, tuple[Decimal, int]] = {}
+        for i, t in enumerate(ts):
+            if i >= len(pl) or pl[i] is None:
+                continue
+            day = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(tz).date()
+            if start <= day <= end:
+                out[day] = (Decimal(str(pl[i])), 1)
+        return out
+
     def list_option_contracts(
         self,
         underlying: str,

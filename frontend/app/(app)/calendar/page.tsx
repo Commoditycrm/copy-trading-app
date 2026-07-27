@@ -9,7 +9,7 @@ import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
+import type { BrokerAccount, DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -45,6 +45,9 @@ export default function CalendarPage() {
   const [firstLoadDone, setFirstLoadDone] = useState(_calSnap !== undefined);
   const [user, setUser] = useState<User | null>(() => getSnapshot<User>(USER_SNAPSHOT_KEY) ?? null);
   const [subs, setSubs] = useState<SubscriberSummary[]>(() => getSnapshot<SubscriberSummary[]>(CAL_SUBS_KEY) ?? []);
+  // Broker drives the P&L tooltip: Alpaca calendars are MARKED (match the app),
+  // Webull/SnapTrade are REALIZED-only (differ from the app by unrealized).
+  const [brokers, setBrokers] = useState<BrokerAccount[]>([]);
   // The "viewing" user — defaults to self. Trader can pick a subscriber.
   const [viewingUserId, setViewingUserId] = useState<string | null>(null);
   // Sync status — auto-sync fills on mount.
@@ -80,6 +83,8 @@ export default function CalendarPage() {
         if (cancelled) return;
         setUser(u);
         setSnapshot(USER_SNAPSHOT_KEY, u);
+        // Broker(s) for the P&L-source tooltip — best-effort, non-blocking.
+        api<BrokerAccount[]>("/api/brokers").then((b) => { if (!cancelled) setBrokers(b); }).catch(() => {});
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
           api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => {
@@ -125,6 +130,20 @@ export default function CalendarPage() {
   const maxAbs = Math.max(...data.map(d => Math.abs(Number(d.realized_pnl))), 1);
   const todayKey = iso(new Date());
 
+  // P&L source depends on the broker. Alpaca exposes a marked portfolio-history
+  // series (matches the app); SnapTrade/Webull only exposes realized trades, so
+  // our number omits the unrealized P&L the Webull app folds in.
+  const pnlTooltip = useMemo(() => {
+    const kinds = new Set(brokers.map((b) => b.broker));
+    if (kinds.has("snaptrade") || kinds.has("webull")) {
+      return "Realized P&L — profit/loss from trades you've CLOSED, net of fees. This can be LESS than your Webull app's daily figure, which also includes UNREALIZED (open-position) gain/loss. SnapTrade doesn't expose Webull's marked P&L, so we show realized only — the two match on days you close everything, and differ on days you hold overnight.";
+    }
+    if (kinds.has("alpaca")) {
+      return "Marked daily P&L — includes both realized (closed trades) and unrealized (open-position) P&L, taken from Alpaca directly. This matches your Alpaca app's daily figure.";
+    }
+    return "Realized P&L — profit/loss from trades you've CLOSED (bought and sold), net of fees. On days you hold positions overnight it can differ from your broker app, which also marks open positions to market.";
+  }, [brokers]);
+
   // What we display in the heading — "Your P&L" or "<sub> · P&L"
   const viewingLabel = useMemo(() => {
     if (!viewingUserId || !user) return "P&L Calendar";
@@ -145,13 +164,7 @@ export default function CalendarPage() {
               Month total
               <span
                 className="inline-grid place-items-center cursor-help"
-                title={
-                  "Realized P&L — profit/loss from trades you've CLOSED (bought and sold), net of fees.\n\n" +
-                  "This can differ from your broker app's daily figure, which also includes the UNREALIZED " +
-                  "(paper) gain or loss on positions you're still holding at the end of the day. " +
-                  "On days you close everything, the two match; on days you hold overnight, they differ until " +
-                  "the position is closed — then it's counted here. Same money, counted when the trade is done."
-                }
+                title={pnlTooltip}
                 aria-label="What does this number mean?"
               >
                 <Info size={12} />

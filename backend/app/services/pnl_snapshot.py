@@ -45,12 +45,22 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
     """Compute broker-direct realized P&L for [start, end] for ONE account and
     upsert per-day rows keyed by (user_id, day). Returns rows written.
 
-    Only brokers that expose a complete activity feed (get_account_activities)
-    are handled here; others keep using the DB calc via the calendar fallback."""
+    Two broker-direct sources, picked by capability:
+      * SnapTrade exposes a complete trade-activity feed → REALIZED P&L, FIFO'd
+        (``realized_by_day_from_broker``). SnapTrade does not expose marked
+        equity, so realized is the best we can do there.
+      * Alpaca exposes a marked portfolio-history series → MARKED P&L (realized +
+        unrealized), which matches Alpaca's own app calendar exactly.
+    Brokers with neither keep using the DB calc via the calendar fallback."""
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-    if not hasattr(adapter, "get_account_activities"):
+    if hasattr(adapter, "get_account_activities"):
+        daily = realized_by_day_from_broker(adapter, start, end)
+        source = "broker_activities"
+    elif hasattr(adapter, "marked_pnl_by_day"):
+        daily = adapter.marked_pnl_by_day(start, end)
+        source = "portfolio_history"
+    else:
         return 0
-    daily = realized_by_day_from_broker(adapter, start, end)
     broker = acct.broker.value if acct.broker else None
     written = 0
     for day, (pnl, count) in daily.items():
@@ -59,14 +69,14 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
             .values(
                 user_id=acct.user_id, day=day,
                 realized_pnl=Decimal(pnl), trade_count=int(count),
-                broker_account_id=acct.id, broker=broker, source="broker_activities",
+                broker_account_id=acct.id, broker=broker, source=source,
             )
             .on_conflict_do_update(
                 constraint="uq_daily_realized_pnl_user_day",
                 set_=dict(
                     realized_pnl=Decimal(pnl), trade_count=int(count),
                     broker_account_id=acct.id, broker=broker,
-                    source="broker_activities", computed_at=market_hours.now_et(),
+                    source=source, computed_at=market_hours.now_et(),
                 ),
             )
         )
@@ -76,15 +86,16 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
 
 
 def run_snapshot_sweep(window_days: int = SNAPSHOT_WINDOW_DAYS) -> int:
-    """One pass over every connected SnapTrade account. Per-account session +
-    commit so one bad account can't roll back the rest. Returns rows written."""
+    """One pass over every connected broker-direct account (SnapTrade → realized,
+    Alpaca → marked). Per-account session + commit so one bad account can't roll
+    back the rest. Returns rows written."""
     end = market_hours.now_et().date()
     start = end - timedelta(days=window_days)
     with SessionLocal() as db:
         account_ids = [
             a.id for a in db.execute(
                 select(BrokerAccount).where(
-                    BrokerAccount.broker == BrokerName.SNAPTRADE,
+                    BrokerAccount.broker.in_((BrokerName.SNAPTRADE, BrokerName.ALPACA)),
                     BrokerAccount.connection_status == "connected",
                 )
             ).scalars()
