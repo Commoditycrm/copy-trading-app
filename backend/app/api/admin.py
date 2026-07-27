@@ -820,7 +820,7 @@ def _fanout_export_columns() -> list[excel_export.Column]:
         # Keys are _serialize_fanout's, plus trader_email/trader_display_name
         # which admin_list_fanouts injects afterwards. Note the parent carries
         # no status of its own — the fanout's health is subscribers.errors.
-        C("Trade Time (UTC)", lambda r: _ts(r[0].get("trader_submitted_at") or r[0].get("detected_at")), 19, D),
+        C("Trade Time (ET)", lambda r: _ts(r[0].get("trader_submitted_at") or r[0].get("detected_at")), 19, D),
         C("Trader", p("trader_display_name"), 20),
         C("Trader Email", p("trader_email"), 26),
         C("Symbol", p("symbol"), 12),
@@ -923,7 +923,7 @@ def admin_export_fanouts(
         rows=rows,
         sheet_title="Fanouts",
         meta=(
-            ("Exported (UTC)", now.replace(tzinfo=None)),
+            ("Exported (ET)", now),
             ("Exported by", admin.email),
             ("Trader filter", str(trader_id) if trader_id else "(all traders)"),
             ("Broker filter", broker or "(all brokers)"),

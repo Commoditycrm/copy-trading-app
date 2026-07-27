@@ -20,15 +20,18 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.dimensions import ColumnDimension, DimensionHolder
 
-# Excel has no timezone concept — a tz-aware datetime raises on write. We
-# normalise everything to UTC and say so in the header, rather than writing
-# local times that silently mean different things per reader.
+# Excel has no timezone concept — a tz-aware datetime raises on write. We render
+# every timestamp in US market time (Eastern, DST-aware) and say "(ET)" in the
+# header — the clock traders work in and the one the broker apps show — rather
+# than UTC, which reads an hour(s) off from the trade times they remember.
+_ET = ZoneInfo("America/New_York")
 _DATETIME_FMT = "yyyy-mm-dd hh:mm:ss"
 _DATE_FMT = "yyyy-mm-dd"
 _MONEY_FMT = "#,##0.00######"      # keeps option premiums / fractional shares
@@ -67,11 +70,13 @@ def _clean(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, datetime):
-        # openpyxl raises on tz-aware datetimes. Convert to UTC, then drop
-        # the tzinfo — every timestamp we export is UTC by convention.
-        if value.tzinfo is not None:
-            value = value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
+        # openpyxl raises on tz-aware datetimes. Render in Eastern (market time)
+        # and drop the tzinfo — every timestamp we export is ET by convention.
+        # A naive value is a UTC timestamp from the DB (timestamptz round-trips
+        # naive in some paths), so stamp UTC before converting.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(_ET).replace(tzinfo=None)
     if isinstance(value, (date, Decimal, int, float, bool)):
         return value
     return str(value)
