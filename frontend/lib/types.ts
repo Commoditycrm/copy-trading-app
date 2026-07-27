@@ -257,6 +257,12 @@ export interface SubscriberSettings {
    *  TP/SL above. Mutually exclusive with position_tp_pct / position_sl_pct
    *  enforcement — see backend position_enforcer. */
   copy_trader_bracket: boolean;
+  /** Per-subscriber end-of-day 0DTE auto-close (opt-in, off by default). When
+   *  enabled, this subscriber's same-day-expiry option positions are
+   *  market-closed in the final `eod_autoclose_minutes` (1–30) before the US
+   *  close, and new same-day-expiry option mirrors are refused in that window. */
+  eod_autoclose_enabled: boolean;
+  eod_autoclose_minutes: number;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

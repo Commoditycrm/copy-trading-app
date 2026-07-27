@@ -65,6 +65,12 @@ class SubscriberSettingsOut(BaseModel):
     # model for the precedence rules.
     symbol_exclusion_list: list[str] = []
     symbol_inclusion_list: list[str] = []
+    # Per-subscriber end-of-day 0DTE auto-close (opt-in, OFF by default). When
+    # enabled, the worker flattens this subscriber's same-day-expiry option
+    # positions in the final ``eod_autoclose_minutes`` (1–30) before the US
+    # close, and new same-day-expiry option mirrors are refused in that window.
+    eod_autoclose_enabled: bool = False
+    eod_autoclose_minutes: int = 15
 
     @field_validator("retry_interval_open", "retry_interval_close", mode="before")
     @classmethod
@@ -178,6 +184,16 @@ class CopyTraderBracketIn(BaseModel):
     TP/SL %. The two are mutually exclusive."""
 
     copy_trader_bracket: bool
+
+
+class EodAutocloseIn(BaseModel):
+    """Per-subscriber end-of-day 0DTE auto-close. Either field may be omitted —
+    only the supplied one is updated. ``minutes`` is how many minutes before the
+    US close (16:00 ET) to flatten same-day-expiry options and stop opening new
+    ones; clamped server-side to 1–30."""
+
+    enabled: bool | None = None
+    minutes: int | None = Field(default=None, ge=1, le=30)
 
 
 class RetryIntervalIn(BaseModel):
