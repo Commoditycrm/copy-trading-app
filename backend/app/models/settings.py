@@ -210,5 +210,19 @@ class SubscriberSettings(Base, TimestampMixin):
         JSONB, default=list, server_default="[]", nullable=False,
     )
 
+    # Per-subscriber end-of-day auto-close of SAME-DAY-EXPIRY (0DTE) OPTION
+    # positions. When enabled, the worker market-closes this subscriber's 0DTE
+    # option positions in the final ``eod_autoclose_minutes`` before the 16:00
+    # ET close, AND copy_engine refuses NEW same-day-expiry option mirrors for
+    # that same per-subscriber window. OFF by default (opt-in) so existing
+    # subscribers' behaviour is unchanged after the migration. ``minutes`` is
+    # clamped to 1..30 (see market_hours.clamp_eod_minutes).
+    eod_autoclose_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+    eod_autoclose_minutes: Mapped[int] = mapped_column(
+        Integer, default=15, server_default="15", nullable=False,
+    )
+
     user = relationship("User", back_populates="subscriber_settings", foreign_keys=[user_id])
     following_trader = relationship("User", foreign_keys=[following_trader_id])

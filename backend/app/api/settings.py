@@ -12,6 +12,7 @@ from app.models.user import User, UserRole
 from app.schemas.settings import (
     AutoLiquidationLimitIn,
     CopyTraderBracketIn,
+    EodAutocloseIn,
     DailyLossLimitIn,
     DailyLossLimitPctIn,
     DailyProfitLimitIn,
@@ -74,6 +75,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         position_tp_pct=s.position_tp_pct,
         position_sl_pct=s.position_sl_pct,
         copy_trader_bracket=s.copy_trader_bracket,
+        eod_autoclose_enabled=s.eod_autoclose_enabled,
+        eod_autoclose_minutes=s.eod_autoclose_minutes,
     )
 
 
@@ -117,6 +120,8 @@ def reset_subscriber_settings(
     s.position_tp_pct = None
     s.position_sl_pct = None
     s.copy_trader_bracket = False
+    s.eod_autoclose_enabled = False
+    s.eod_autoclose_minutes = 15
     s.retry_interval_open = RetryInterval.NEVER
     s.retry_interval_close = RetryInterval.NEVER
     s.retry_max_attempts = 1
@@ -473,6 +478,44 @@ def set_copy_trader_bracket(
         entity_type="subscriber_settings",
         entity_id=user.id,
         metadata={"old": bool(old), "new": bool(payload.copy_trader_bracket)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/eod-autoclose", response_model=SubscriberSettingsOut)
+def set_eod_autoclose(
+    payload: EodAutocloseIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Per-subscriber end-of-day 0DTE auto-close: toggle on/off and set how many
+    minutes before the US close (1–30) to flatten same-day-expiry options and
+    stop opening new ones. Cache-busts so the fanout lockout + the worker sweep
+    see changes immediately."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = {"enabled": bool(s.eod_autoclose_enabled), "minutes": int(s.eod_autoclose_minutes)}
+    if payload.enabled is not None:
+        s.eod_autoclose_enabled = payload.enabled
+    if payload.minutes is not None:
+        s.eod_autoclose_minutes = max(1, min(30, int(payload.minutes)))
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.eod_autoclose_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": old,
+            "new": {"enabled": bool(s.eod_autoclose_enabled), "minutes": int(s.eod_autoclose_minutes)},
+        },
         ip_address=client_ip(request),
     )
     db.commit()

@@ -121,6 +121,7 @@ export default function SettingsPage() {
   const [posSlInput, setPosSlInput] = useState("");
   const [posSlBusy, setPosSlBusy] = useState(false);
   const [copyBracketBusy, setCopyBracketBusy] = useState(false);
+  const [eodBusy, setEodBusy] = useState(false);
   // Reset-to-defaults confirm modal + in-flight flag.
   const [resetOpen, setResetOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
@@ -563,6 +564,29 @@ export default function SettingsPage() {
       setCopyBracketBusy(false);
     }
   }
+  async function setEodAutoclose(next: { enabled?: boolean; minutes?: number }) {
+    setEodBusy(true);
+    try {
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/eod-autoclose",
+        { method: "PATCH", body: JSON.stringify(next) },
+      );
+      setSub(s);
+      if (next.enabled !== undefined) {
+        notify.success(
+          next.enabled
+            ? "0DTE auto-close on — expiring options will be flattened before the close"
+            : "0DTE auto-close off",
+        );
+      } else {
+        notify.success("Auto-close timing updated");
+      }
+    } catch (e) {
+      notify.fromError(e, "Could not update 0DTE auto-close");
+    } finally {
+      setEodBusy(false);
+    }
+  }
   async function resetSettings() {
     setResetBusy(true);
     try {
@@ -880,6 +904,19 @@ export default function SettingsPage() {
                 enabled={sub.copy_trader_bracket}
                 busy={copyBracketBusy}
                 onToggle={() => setCopyTraderBracket(!sub.copy_trader_bracket)}
+              />
+
+              {/* End-of-day 0DTE auto-close — opt-in. When on, this
+                  subscriber's same-day-expiry option positions are
+                  market-closed in the last N (1–30) minutes before the
+                  16:00 ET close, and new 0DTE mirrors are refused then. */}
+              <EodAutocloseRow
+                key={sub.eod_autoclose_minutes}
+                enabled={sub.eod_autoclose_enabled}
+                minutes={sub.eod_autoclose_minutes}
+                busy={eodBusy}
+                onToggle={() => setEodAutoclose({ enabled: !sub.eod_autoclose_enabled })}
+                onSaveMinutes={(m) => setEodAutoclose({ minutes: m })}
               />
 
               {/* Individual Position (TP/SL) — surfaced FIRST so the
@@ -1769,6 +1806,109 @@ function CopyTraderBracketRow({
           }}
         />
       </button>
+    </div>
+  );
+}
+
+function EodAutocloseRow({
+  enabled, minutes, busy, onToggle, onSaveMinutes,
+}: {
+  enabled: boolean;
+  minutes: number;
+  busy: boolean;
+  onToggle: () => void;
+  onSaveMinutes: (m: number) => void;
+}) {
+  const ACCENT = "#6366f1";
+  const [mins, setMins] = useState(String(minutes));
+  const parsed = Math.max(1, Math.min(30, parseInt(mins || "0", 10) || 0));
+  const dirty = mins.trim() !== "" && parsed !== minutes;
+  return (
+    <div
+      className="relative rounded-xl border overflow-hidden p-3 pl-4"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.005) 60%, rgba(0,0,0,0.15) 100%)",
+        borderColor: enabled ? `${ACCENT}66` : "var(--border)",
+        boxShadow:
+          "inset 0 1px 0 rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.2)",
+      }}
+    >
+      <div
+        aria-hidden
+        className="absolute left-0 top-0 bottom-0 w-1"
+        style={{ background: enabled ? ACCENT : "var(--border)" }}
+      />
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold leading-tight">
+            Auto-close expiring (0DTE) options before close
+          </div>
+          <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+            {enabled
+              ? `Your same-day-expiry option positions are market-closed in the last ${minutes} min before the 16:00 ET close, and new 0DTE mirrors are refused in that window.`
+              : "Off — same-day-expiry options are left to expire on their own. Turn on to auto-flatten them before the close."}
+          </div>
+        </div>
+        {/* Switch */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          disabled={busy}
+          onClick={onToggle}
+          className="relative shrink-0 rounded-full transition-colors"
+          style={{
+            width: 44,
+            height: 24,
+            background: enabled ? ACCENT : "var(--border)",
+            opacity: busy ? 0.6 : 1,
+            cursor: busy ? "default" : "pointer",
+          }}
+          title={enabled ? "Turn off 0DTE auto-close" : "Turn on 0DTE auto-close"}
+        >
+          <span
+            className="absolute top-0.5 rounded-full bg-white transition-all"
+            style={{
+              width: 20,
+              height: 20,
+              left: enabled ? 22 : 2,
+              boxShadow: "0 1px 2px rgba(0,0,0,0.35)",
+            }}
+          />
+        </button>
+      </div>
+      {enabled && (
+        <div className="mt-3 flex items-center gap-2">
+          <label className="text-[11px]" style={{ color: "var(--muted)" }}>
+            Minutes before close
+          </label>
+          <input
+            type="number"
+            min={1}
+            max={30}
+            value={mins}
+            disabled={busy}
+            onChange={(e) => setMins(e.target.value)}
+            className="w-16 rounded-md border px-2 py-1 text-sm bg-transparent"
+            style={{ borderColor: "var(--border)" }}
+          />
+          <button
+            type="button"
+            disabled={busy || !dirty}
+            onClick={() => onSaveMinutes(parsed)}
+            className="rounded-md px-2.5 py-1 text-xs font-semibold text-white transition-colors"
+            style={{
+              background: dirty ? ACCENT : "var(--border)",
+              opacity: busy ? 0.6 : 1,
+              cursor: busy || !dirty ? "default" : "pointer",
+            }}
+          >
+            Save
+          </button>
+          <span className="text-[11px]" style={{ color: "var(--muted)" }}>(1–30)</span>
+        </div>
+      )}
     </div>
   );
 }

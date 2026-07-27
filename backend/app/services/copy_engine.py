@@ -1668,18 +1668,19 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # vs absolute-price copy; see _trader_bracket_for_copy.
     copy_use_pct, copy_tp_val, copy_sl_val = _trader_bracket_for_copy(trader_order)
 
-    # End-of-day lockout (order-level, so computed once). In the last 15 minutes
-    # before the US close we do NOT mirror SAME-DAY-EXPIRY option orders to
-    # subscribers — the eod_autoclose sweep is flattening those very contracts at
-    # 15:45, so letting a fresh 0DTE mirror through would just re-strand the
-    # subscriber (or, for a close, no-op against a position we already flattened).
-    # Later-expiry options and all stocks pass through untouched.
-    eod_locked = (
+    # End-of-day lockout — PER-SUBSCRIBER (each has their own opt-in toggle and
+    # 1–30 min window). Compute the order-level part once; the per-subscriber
+    # enabled/window check happens in the loop below. We refuse a subscriber's
+    # NEW same-day-expiry option mirror inside THEIR window because eod_autoclose
+    # is flattening those very contracts then — letting a fresh 0DTE mirror
+    # through would re-strand them (or no-op a close against an already-flattened
+    # position). Later-expiry options and all stocks pass through untouched.
+    eod_candidate = (
         get_settings().eod_autoclose_enabled
         and trader_order.instrument_type == InstrumentType.OPTION
-        and market_hours.in_eod_close_window()
         and market_hours.is_same_day_expiry(trader_order.option_expiry)
     )
+    eod_now = market_hours.now_et() if eod_candidate else None
 
     # Reliable "the trader is CLOSING" signal, computed once for the whole fanout
     # from the TRADER's OWN held position (their fills sync promptly via the
@@ -1701,9 +1702,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # platform-overhead floor, not a queue-position artifact.
         subscriber_picked_at = datetime.now(timezone.utc)
 
-        # EOD lockout: refuse new same-day-expiry option mirrors in the final 15
-        # minutes before the US close (see eod_locked above).
-        if eod_locked:
+        # EOD lockout: refuse this subscriber's new same-day-expiry option mirror
+        # only if THEY opted in and we're inside THEIR window (see eod_candidate).
+        if (
+            eod_candidate
+            and getattr(sub, "eod_autoclose_enabled", False)
+            and market_hours.in_eod_close_window(
+                eod_now, minutes=getattr(sub, "eod_autoclose_minutes", 15)
+            )
+        ):
             audit.record(
                 db,
                 actor_user_id=sub.user_id,

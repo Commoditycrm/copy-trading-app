@@ -36,17 +36,18 @@ from app.services import market_hours
 
 log = logging.getLogger(__name__)
 
-# The loop wakes this often; the actual sweep still fires only once per day.
-_CHECK_INTERVAL_S = 30
+# The loop wakes this often; each subscriber is still swept only once per day.
+# Kept short so a 1–2 minute per-subscriber window still gets several ticks.
+_CHECK_INTERVAL_S = 15
 # Match the trader-initiated bulk-exit's concurrency/timeout so we don't burst
 # SnapTrade into 429s.
 _BULK_CONCURRENCY = 4
 _PER_ACCOUNT_TIMEOUT_S = 60.0
 
-# ET date we last swept, so the sweep runs ONCE even though the loop ticks every
-# 30s across the whole 15-minute window. Process-local — a worker restart inside
-# the window resets it, which just re-runs the (idempotent) sweep.
-_last_swept: date | None = None
+# Per-subscriber ET date last swept, so each subscriber is flattened ONCE even
+# though the loop ticks repeatedly across their window. Process-local — a worker
+# restart inside a window just re-runs the (idempotent) sweep for that sub.
+_last_swept: dict[uuid.UUID, date] = {}
 
 
 async def run_loop(shutdown_check=None) -> None:
@@ -65,31 +66,37 @@ async def run_loop(shutdown_check=None) -> None:
 
 
 async def _tick() -> None:
-    global _last_swept
     if not get_settings().eod_autoclose_enabled:
-        return
+        return  # global master kill-switch (per-subscriber opt-in layers under it)
     now = market_hours.now_et()
-    if not market_hours.in_eod_close_window(now):
+    if not market_hours.is_trading_weekday(now):
         return
     today = now.date()
-    if _last_swept == today:
-        return  # already swept in this window today
-    _last_swept = today
+
+    # Per-subscriber: each opted-in subscriber has their OWN window
+    # (eod_autoclose_minutes before 16:00 ET). Collect the accounts whose
+    # subscriber's window is open now and who haven't been swept yet today.
+    due = _due_pairs(now, today)
+    if not due:
+        return
+    swept_subs = {sub_id for sub_id, _, _ in due}
+    for sub_id in swept_subs:
+        _last_swept[sub_id] = today
     log.warning(
-        "eod_autoclose: entering close window at %s ET — flattening subscriber "
-        "same-day-expiry (%s) option positions",
-        now.isoformat(), today,
+        "eod_autoclose: window open for %d subscriber(s) at %s ET — flattening "
+        "their same-day-expiry (%s) option positions",
+        len(swept_subs), now.isoformat(), today,
     )
-    await _sweep_same_day_expiry(today)
+    await _sweep_pairs(due, today)
 
 
-async def _sweep_same_day_expiry(today: date) -> None:
-    """Close every subscriber's same-day-expiry option positions, concurrently
-    across accounts (bounded), reusing the trader bulk-exit's per-account
-    worker with a filter that keeps only 0DTE options."""
-    pairs = _subscriber_account_pairs()
+async def _sweep_pairs(
+    pairs: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]], today: date
+) -> None:
+    """Close the given (subscriber, account, trader) triples' same-day-expiry
+    option positions, concurrently across accounts (bounded), reusing the trader
+    bulk-exit's per-account worker with a filter that keeps only 0DTE options."""
     if not pairs:
-        log.info("eod_autoclose: no connected subscriber accounts to sweep")
         return
 
     # Lazy import avoids an api<->service import cycle at module load
@@ -133,19 +140,34 @@ async def _sweep_same_day_expiry(today: date) -> None:
     )
 
 
-def _subscriber_account_pairs() -> list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]]:
+def _due_pairs(
+    now: "datetime", today: date
+) -> list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]]:
     """(subscriber_user_id, broker_account_id, following_trader_id) for every
-    CONNECTED account of every user that follows a trader. A subscriber is any
-    user with SubscriberSettings.following_trader_id set — copy_enabled state is
-    intentionally ignored: even a paused subscriber must be flattened out of
-    expiring contracts they already hold."""
+    CONNECTED account of every OPTED-IN subscriber whose personal EOD window is
+    open right now and who hasn't been swept yet today.
+
+    Qualifies when: follows a trader, eod_autoclose_enabled is True, and ``now``
+    is within their [close − eod_autoclose_minutes, close) window. copy_enabled/
+    paused state is intentionally ignored — even a paused subscriber must be
+    flattened out of expiring contracts they already hold."""
     with SessionLocal() as db:
         rows = db.execute(
-            select(SubscriberSettings.user_id, SubscriberSettings.following_trader_id)
-            .where(SubscriberSettings.following_trader_id.isnot(None))
+            select(
+                SubscriberSettings.user_id,
+                SubscriberSettings.following_trader_id,
+                SubscriberSettings.eod_autoclose_minutes,
+            ).where(
+                SubscriberSettings.following_trader_id.isnot(None),
+                SubscriberSettings.eod_autoclose_enabled.is_(True),
+            )
         ).all()
         pairs: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = []
-        for sub_id, trader_id in rows:
+        for sub_id, trader_id, minutes in rows:
+            if _last_swept.get(sub_id) == today:
+                continue  # already flattened this subscriber today
+            if not market_hours.in_eod_close_window(now, minutes=minutes):
+                continue  # not inside THIS subscriber's window yet
             acct_ids = db.execute(
                 select(BrokerAccount.id).where(
                     BrokerAccount.user_id == sub_id,
