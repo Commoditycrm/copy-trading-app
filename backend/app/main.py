@@ -221,6 +221,17 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start eod_autoclose loop")
 
+        # Close reconciler: flattens positions a subscriber still holds but the
+        # trader has exited (a copied close that got canceled/blocked and never
+        # re-placed — the LVWR/SPXW stranded-position class). Gated by
+        # close_reconcile_enabled (default off); dry-run (log-only) until
+        # close_reconcile_apply is turned on. See services/close_reconciler.py.
+        try:
+            from app.services import close_reconciler
+            _spawn_background(close_reconciler.run_loop(shutdown_check=shutdown_event.is_set))
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start close_reconciler loop")
+
         # Alpaca subscriber mirror-fill reconciler — the Alpaca twin of the
         # SnapTrade subscriber reconciler. Alpaca subscriber accounts have no
         # real-time listener, so without this a mirror that fills there can stay
