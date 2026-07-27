@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # worker restart (the web/worker split can't start a task cross-process).
     # Only used when run_background_workers=true.
     listener_reconcile_interval_s: float = 15.0
+    # Close reconciler — flattens positions a subscriber still holds but the
+    # trader has EXITED (a copied close that got canceled/blocked and never
+    # re-placed). Ships DRY-RUN first, like position_reconciler:
+    #   close_reconcile_enabled  → master switch for the whole loop (default off)
+    #   close_reconcile_apply    → False = only LOG what it WOULD close;
+    #                              True  = actually place the flatten orders.
+    # Validate the dry-run log on prod before flipping apply on.
+    close_reconcile_enabled: bool = False
+    close_reconcile_apply: bool = False
+    close_reconcile_interval_s: float = 30.0
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300
