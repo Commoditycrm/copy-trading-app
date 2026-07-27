@@ -168,6 +168,8 @@ export interface DailyPnL {
   day: string;
   realized_pnl: string;
   trade_count: number;
+  /** Daily return %, broker-reported (Alpaca only). null when unavailable. */
+  pct?: string | null;
 }
 
 /** One scope's order-history totals, computed in the DB (GET

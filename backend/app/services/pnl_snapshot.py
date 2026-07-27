@@ -63,18 +63,22 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         return 0
     broker = acct.broker.value if acct.broker else None
     written = 0
-    for day, (pnl, count) in daily.items():
+    for day, vals in daily.items():
+        # SnapTrade yields (pnl, count); Alpaca yields (pnl, count, pct). The
+        # daily-return % only exists for Alpaca (portfolio-history); NULL else.
+        pnl, count = vals[0], vals[1]
+        pct = vals[2] if len(vals) > 2 else None
         stmt = (
             pg_insert(DailyRealizedPnlSnapshot)
             .values(
                 user_id=acct.user_id, day=day,
-                realized_pnl=Decimal(pnl), trade_count=int(count),
+                realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
                 broker_account_id=acct.id, broker=broker, source=source,
             )
             .on_conflict_do_update(
                 constraint="uq_daily_realized_pnl_user_day",
                 set_=dict(
-                    realized_pnl=Decimal(pnl), trade_count=int(count),
+                    realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
                     broker_account_id=acct.id, broker=broker,
                     source=source, computed_at=market_hours.now_et(),
                 ),

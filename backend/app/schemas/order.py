@@ -130,6 +130,9 @@ class DailyPnL(BaseModel):
     day: date
     realized_pnl: Decimal
     trade_count: int
+    # Daily return %, broker-reported (Alpaca only — SnapTrade exposes no marked
+    # equity). None when unavailable; the Calendar shows it only when present.
+    pct: Decimal | None = None
 
 
 class TradeScopeStats(BaseModel):

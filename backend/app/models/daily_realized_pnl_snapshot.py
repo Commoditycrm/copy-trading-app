@@ -60,6 +60,10 @@ class DailyRealizedPnlSnapshot(Base):
     day: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Daily return %, broker-reported (Alpaca portfolio-history profit_loss_pct).
+    # NULL for SnapTrade/Webull — SnapTrade doesn't expose marked equity, so we
+    # can't compute a % that matches the app; the Calendar hides it there.
+    pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
 
     # Which broker/account sourced this day (reference only — SET NULL so the
     # snapshot outlives a broker disconnect, which is the whole point).

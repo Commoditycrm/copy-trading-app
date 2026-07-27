@@ -368,7 +368,7 @@ class AlpacaAdapter(BrokerAdapter):
 
     def marked_pnl_by_day(
         self, start: date, end: date, tz_name: str | None = None
-    ) -> dict[date, tuple[Decimal, int]]:
+    ) -> dict[date, tuple[Decimal, int, Decimal | None]]:
         """Daily MARKED P&L (realized + unrealized) from Alpaca's portfolio-history
         endpoint — the exact number Alpaca's own app shows on its calendar.
 
@@ -380,9 +380,12 @@ class AlpacaAdapter(BrokerAdapter):
         MARKED, not realized-only, because Alpaca exposes the marked series and
         SnapTrade/Webull does not.
 
-        Returns {day: (marked_pnl, count)} for every market day in [start, end].
-        ``count`` is 1 on any day with a P&L data point (the endpoint gives no
-        fill count — it's only used for the calendar's "N trades" label).
+        Returns {day: (marked_pnl, count, pct)} for every market day in
+        [start, end]. ``count`` is 1 on any day with a P&L data point (the
+        endpoint gives no fill count — only used for the calendar's "N trades"
+        label). ``pct`` is the day's return as a PERCENT (Alpaca's
+        ``profit_loss_pct`` fraction × 100, e.g. 0.1009 → 10.09), the same figure
+        the app shows next to the dollar amount; None if not reported that day.
         """
         from app.services.pnl import _tz_or_market  # local import — avoid cycle
         tz = _tz_or_market(tz_name)
@@ -400,13 +403,20 @@ class AlpacaAdapter(BrokerAdapter):
         )
         ts = raw.get("timestamp", []) or []
         pl = raw.get("profit_loss", []) or []
-        out: dict[date, tuple[Decimal, int]] = {}
+        plp = raw.get("profit_loss_pct", []) or []
+        out: dict[date, tuple[Decimal, int, Decimal | None]] = {}
         for i, t in enumerate(ts):
             if i >= len(pl) or pl[i] is None:
                 continue
             day = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(tz).date()
             if start <= day <= end:
-                out[day] = (Decimal(str(pl[i])), 1)
+                pnl_val = Decimal(str(pl[i]))
+                pct = None
+                if i < len(plp) and plp[i] is not None:
+                    pct = Decimal(str(plp[i])) * 100  # fraction → percent
+                # count is only for the "Trading days" stat — 1 on a day that
+                # actually moved, 0 on a flat day.
+                out[day] = (pnl_val, 1 if pnl_val != 0 else 0, pct)
         return out
 
     def list_option_contracts(

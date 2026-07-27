@@ -1904,7 +1904,7 @@ def calendar_pnl(
     # they persist across broker changes because they're keyed by (user, day)).
     # Snapshot wins on any day it exists; the DB value covers the rest.
     snaps = {
-        s.day: (s.realized_pnl, s.trade_count)
+        s.day: (s.realized_pnl, s.trade_count, s.pct)
         for s in db.execute(
             select(DailyRealizedPnlSnapshot).where(
                 DailyRealizedPnlSnapshot.user_id == target_user_id,
@@ -1913,9 +1913,13 @@ def calendar_pnl(
             )
         ).scalars()
     }
-    merged = dict(db_daily)
+    # DB-derived days carry no %; snapshot days (Alpaca) do. Snapshot wins.
+    merged: dict[date, tuple] = {d: (p, n, None) for d, (p, n) in db_daily.items()}
     merged.update(snaps)
-    return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(merged.items())]
+    return [
+        DailyPnL(day=d, realized_pnl=v[0], trade_count=v[1], pct=v[2])
+        for d, v in sorted(merged.items())
+    ]
 
 
 @router.post("/trades/sync-fills")

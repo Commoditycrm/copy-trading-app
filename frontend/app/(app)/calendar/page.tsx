@@ -254,9 +254,18 @@ export default function CalendarPage() {
                   <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
                     {fmtSignedUsd(pnl)}
                   </div>
-                  <div className="text-[11px]" style={{ color: "var(--text-2)" }}>
-                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
-                  </div>
+                  {/* Alpaca reports a daily return % (matches its app); show it
+                      in place of the trade count. Webull/SnapTrade has no % —
+                      fall back to the trade count there. */}
+                  {day.pct != null ? (
+                    <div className="text-[11px] num" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
+                      {Number(day.pct) >= 0 ? "+" : ""}{Number(day.pct).toFixed(2)}%
+                    </div>
+                  ) : (
+                    <div className="text-[11px]" style={{ color: "var(--text-2)" }}>
+                      {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
+                    </div>
+                  )}
                 </>
               )}
             </motion.button>
