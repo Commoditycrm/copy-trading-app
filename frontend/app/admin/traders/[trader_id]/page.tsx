@@ -1,8 +1,9 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
+import { api } from "@/lib/api";
 import { PerformanceView } from "@/components/performance/PerformanceView";
 import { ExportButton } from "@/components/ExportButton";
 
@@ -14,6 +15,16 @@ function Inner() {
   const [tradeExportLimit, setTradeExportLimit] = useState("all");
   const tradesExportPath = `/api/trades/export?user_id=${traderId}`
     + (tradeExportLimit !== "all" ? `&limit=${tradeExportLimit}` : "");
+  // Total exportable trades for this trader — shown in the "All (N)" option.
+  const [tradeTotal, setTradeTotal] = useState<number | null>(null);
+  useEffect(() => {
+    if (!traderId) return;
+    let cancelled = false;
+    api<{ count: number }>(`/api/trades/export/count?user_id=${traderId}`)
+      .then((r) => { if (!cancelled) setTradeTotal(r.count); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [traderId]);
 
   return (
     <div className="space-y-4">
@@ -45,7 +56,7 @@ function Inner() {
             <option value="500">500</option>
             <option value="1000">1,000</option>
             <option value="5000">5,000</option>
-            <option value="all">All</option>
+            <option value="all">All{tradeTotal !== null ? ` (${tradeTotal.toLocaleString()})` : ""}</option>
           </select>
           <ExportButton
             path={tradesExportPath}
