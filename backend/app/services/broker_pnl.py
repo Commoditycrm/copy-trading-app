@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict, deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -104,6 +104,24 @@ def realized_by_day_from_broker(
         # only record P&L for days inside [start, end].
         _apply(lots, key, mag, price, mult, is_buy, daily,
                day if start <= day <= end else None)
+
+    # The broker feed is AUTHORITATIVE for every day from the account's first
+    # activity onward: a day with no realized close genuinely realized $0 for
+    # this broker. Record that $0 explicitly (instead of leaving a gap) so the
+    # calendar doesn't fall back to our drift-prone DB value and leak a phantom
+    # on a flat day — e.g. a mis-recorded close showing -$105 on a day the broker
+    # never closed anything. Bounded to [first_activity, end] so we don't stamp
+    # $0 over dates that predate the account. (Safe today: every user is
+    # single-broker; a future multi-broker user would need per-broker snapshot
+    # keying so one broker's flat day can't zero another's P&L.)
+    if events:
+        first_day = min(e[0].astimezone(bucket_tz).date() for e in events)
+        d = max(first_day, start)
+        one_day = timedelta(days=1)
+        while d <= end:
+            if d not in daily:
+                daily[d] = (Decimal(0), 0)
+            d += one_day
 
     return dict(daily)
 
