@@ -209,6 +209,13 @@ def export_trades(
     # this function into an AttributeError.
     status_tab: str = Query(default="all", alias="status", description="Trades-page status tab"),
     search: str | None = Query(default=None, description="Symbol substring"),
+    # How many rows the user asked for (most-recent-first). Omit / null = all
+    # matching rows, still bounded by ROW_CAP. Lets the Trades page offer a
+    # "download 50 / 100 / 500 / All" chooser.
+    limit: int | None = Query(
+        default=None, ge=1, le=excel_export.ROW_CAP,
+        description="Max rows to export, most recent first. Omit for all.",
+    ),
     user_id: uuid.UUID | None = Query(
         default=None,
         description="ADMIN ONLY — export this user's orders instead of your own.",
@@ -251,10 +258,16 @@ def export_trades(
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
+    # User-chosen row count — the query is already newest-first, so this fetches
+    # the latest N. Done in SQL so we don't load the whole history to slice it.
+    if limit is not None:
+        q = q.limit(limit)
 
     orders = list(db.execute(q).scalars())
     now = datetime.now(timezone.utc)
-    truncated = len(orders) > excel_export.ROW_CAP
+    # Only the "export everything" path can hit ROW_CAP; an explicit limit is
+    # already bounded (le=ROW_CAP) so it's never a silent truncation.
+    truncated = limit is None and len(orders) > excel_export.ROW_CAP
     orders = orders[:excel_export.ROW_CAP]
 
     # actor = who clicked, entity = whose data left the building. They differ on
@@ -264,6 +277,7 @@ def export_trades(
         action="trades.exported_other" if target.id != user.id else "trades.exported",
         entity_type="user", entity_id=target.id,
         metadata={"rows": len(orders), "status": status_tab, "search": search,
+                  "requested_limit": limit,
                   "from": str(from_) if from_ else None, "to": str(to) if to else None,
                   "subject_email": target.email if target.id != user.id else None},
     )
@@ -297,6 +311,7 @@ def export_trades(
             ("From", from_ or "(all time)"),
             ("To", to or "(all time)"),
             ("Rows", len(orders)),
+            ("Requested", "all" if limit is None else f"latest {limit:,}"),
             ("Truncated", f"YES — capped at {excel_export.ROW_CAP:,} rows"
              if truncated else "no"),
         ),

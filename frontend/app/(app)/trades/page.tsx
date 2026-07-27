@@ -156,6 +156,8 @@ export default function TradesPage() {
   // API on every keystroke. `search` stays bound to the input for instant echo.
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
+  // How many rows the Export downloads — "all" or a specific count (latest N).
+  const [exportLimit, setExportLimit] = useState<string>("all");
 
   // Server-side pagination state.
   const [total, setTotal] = useState(0);
@@ -209,8 +211,9 @@ export default function TradesPage() {
     }
     if (tab !== "all") q.set("status", tab);
     if (search.trim()) q.set("search", search.trim());
+    if (exportLimit !== "all") q.set("limit", exportLimit);
     return `/api/trades/export?${q.toString()}`;
-  }, [fromParam, toParam, tab, search]);
+  }, [fromParam, toParam, tab, search, exportLimit]);
 
   // DB-aggregate totals, same date filter as the list. Fetched alongside
   // the rows and refreshed whenever orders change (SSE / reconcile) so the
@@ -480,8 +483,23 @@ export default function TradesPage() {
               </button>
             )}
           </div>
-          {/* Exports EVERY row matching these filters, not just the loaded
-              window — see /api/trades/export. */}
+          {/* How many rows to export (latest N), or All. Applies the current
+              tab/search/date filters — see /api/trades/export. */}
+          <select
+            value={exportLimit}
+            onChange={(e) => setExportLimit(e.target.value)}
+            className="py-1.5 px-2 text-sm rounded-token"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            aria-label="How many trades to export"
+            title="How many trades to download"
+          >
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="500">500</option>
+            <option value="1000">1,000</option>
+            <option value="5000">5,000</option>
+            <option value="all">All</option>
+          </select>
           <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-trades.xlsx" />
         </div>
       </div>
