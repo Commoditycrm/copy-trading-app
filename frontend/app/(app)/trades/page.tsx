@@ -498,7 +498,7 @@ export default function TradesPage() {
             <option value="500">500</option>
             <option value="1000">1,000</option>
             <option value="5000">5,000</option>
-            <option value="all">All</option>
+            <option value="all">All ({total.toLocaleString()})</option>
           </select>
           <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-trades.xlsx" />
         </div>
