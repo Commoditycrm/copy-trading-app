@@ -448,6 +448,39 @@ def trades_stats(
     return TradeStatsOut.model_validate(cache.cached_json(key, 15, _compute))
 
 
+@router.get("/trades/export/count")
+def export_trades_count(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+    status_tab: str = Query(default="all", alias="status"),
+    search: str | None = Query(default=None),
+    user_id: uuid.UUID | None = Query(default=None),
+) -> dict:
+    """How many rows /trades/export would return for these filters — powers the
+    'All (N)' hint next to the export chooser. Same auth (admin-only for another
+    user's data) and same filters as the export, so the number always matches."""
+    target = user
+    if user_id is not None and user_id != user.id:
+        if user.role != UserRole.ADMIN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="admin_only")
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    q = select(Order.id).where(Order.user_id == target.id)
+    if from_:
+        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
+    if to:
+        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
+    q = trade_filters.exclude_dead_bracket_legs(q)
+    q = trade_filters.apply_status_tab(q, status_tab)
+    q = trade_filters.apply_symbol_search(q, search)
+    count = db.execute(select(func.count()).select_from(q.subquery())).scalar_one()
+    return {"count": count}
+
+
 @router.get("/trades/{order_id}", response_model=OrderOut)
 def get_trade(
     order_id: uuid.UUID,
