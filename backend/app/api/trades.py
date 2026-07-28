@@ -4,6 +4,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import ROUND_DOWN
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
@@ -34,6 +35,11 @@ from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.services.pnl import realized_pnl_by_day, realized_pnl_by_order
 
 router = APIRouter(prefix="/api", tags=["trades"])
+
+# Date-range filters (from/to) are interpreted as MARKET days (ET, DST-aware) so
+# a picked date means the same calendar day the Calendar and the timestamp
+# columns show — not a UTC day that starts at 8pm ET the evening before.
+_ET = ZoneInfo("America/New_York")
 
 
 def _instrument_label(o: Order) -> str:
@@ -126,9 +132,9 @@ def list_trades(
         .limit(limit)
     )
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
     return orders
@@ -172,11 +178,11 @@ def list_trades_page(
     base = select(Order).where(Order.user_id == user.id)
     if from_:
         base = base.where(
-            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
         )
     if to:
         base = base.where(
-            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
         )
     base = trade_filters.exclude_dead_bracket_legs(base)
     base = trade_filters.apply_status_tab(base, status_tab)
@@ -255,9 +261,9 @@ def export_trades(
         .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
     )
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
@@ -422,11 +428,11 @@ def trades_stats(
             # the summary counts honest and in lockstep with the rows shown.
             .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
             .where(
-                Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc)
+                Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
                 if from_ else True
             )
             .where(
-                Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc)
+                Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
                 if to else True
             )
         ).one()
@@ -477,9 +483,9 @@ def export_trades_count(
 
     q = select(Order.id).where(Order.user_id == target.id)
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=timezone.utc))
+        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
