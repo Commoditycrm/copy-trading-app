@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { fmtSignedUsd } from "@/lib/format";
+import { SearchableSelect, type SelectOption } from "@/components/SearchableSelect";
 
 interface DailyRow {
   day: string;
@@ -61,6 +62,14 @@ export default function AdminDailyPnlPage() {
     ]).then(([t, s]) => setUsers([...t.items, ...s.items]));
   }, []);
 
+  // Searchable options — All users, then traders, then subscribers, each with a
+  // role hint so duplicate display names stay distinguishable.
+  const userOptions: SelectOption[] = useMemo(() => {
+    const mk = (role: string, label: string) =>
+      users.filter((u) => u.role === role).map((u) => ({ value: u.id, label: `${u.display_name || u.email} · ${label}` }));
+    return [{ value: "", label: "All users" }, ...mk("trader", "Trader"), ...mk("subscriber", "Subscriber")];
+  }, [users]);
+
   const grand = rows.reduce(
     (a, r) => ({ t: a.t + Number(r.trader_pnl), s: a.s + Number(r.subscriber_pnl), all: a.all + Number(r.total) }),
     { t: 0, s: 0, all: 0 },
@@ -80,26 +89,14 @@ export default function AdminDailyPnlPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <select
+          <SearchableSelect
             value={userId}
-            onChange={(e) => setUserId(e.target.value)}
-            className="text-sm px-2.5 py-1.5 rounded-lg max-w-[220px]"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
-            aria-label="Filter by user"
-            title="Show one trader/subscriber, or all"
-          >
-            <option value="">All users</option>
-            <optgroup label="Traders">
-              {users.filter((u) => u.role === "trader").map((u) => (
-                <option key={u.id} value={u.id}>{u.display_name || u.email}</option>
-              ))}
-            </optgroup>
-            <optgroup label="Subscribers">
-              {users.filter((u) => u.role === "subscriber").map((u) => (
-                <option key={u.id} value={u.id}>{u.display_name || u.email}</option>
-              ))}
-            </optgroup>
-          </select>
+            options={userOptions}
+            onChange={setUserId}
+            placeholder="Search trader / subscriber…"
+            className="w-[240px]"
+            style={{ height: 34 }}
+          />
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
             className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="From date" title="From (blank = all time)" />
           <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
