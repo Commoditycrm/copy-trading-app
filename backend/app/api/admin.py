@@ -23,17 +23,18 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.models.broker_account import BrokerAccount, BrokerName
+from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
@@ -337,6 +338,51 @@ def user_counts(
         return out
 
     return cache_svc.cached_json("stats:user_counts", 20, _compute)
+
+
+@router.get("/daily-pnl")
+def admin_daily_pnl(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+) -> list[dict]:
+    """Per-day total P&L across ALL users, split trader vs subscriber, from the
+    broker-direct daily snapshots (daily_realized_pnl_snapshots). Note: Webull
+    rows are realized, Alpaca rows are marked — this is each broker's own daily
+    figure summed, not a single consistent basis. Newest day first."""
+    s = DailyRealizedPnlSnapshot
+    q = (
+        select(
+            s.day,
+            func.coalesce(
+                func.sum(case((User.role == UserRole.TRADER, s.realized_pnl), else_=0)), 0
+            ).label("trader"),
+            func.coalesce(
+                func.sum(case((User.role == UserRole.SUBSCRIBER, s.realized_pnl), else_=0)), 0
+            ).label("subscriber"),
+            func.coalesce(func.sum(s.realized_pnl), 0).label("total"),
+            func.count(func.distinct(s.user_id)).label("users"),
+        )
+        .join(User, User.id == s.user_id)
+        .group_by(s.day)
+        .order_by(s.day.desc())
+    )
+    if from_:
+        q = q.where(s.day >= from_)
+    if to:
+        q = q.where(s.day <= to)
+    rows = db.execute(q).all()
+    return [
+        {
+            "day": r.day.isoformat(),
+            "trader_pnl": str(r.trader),
+            "subscriber_pnl": str(r.subscriber),
+            "total": str(r.total),
+            "users": r.users,
+        }
+        for r in rows
+    ]
 
 
 @router.patch("/users/{user_id}/activate")
