@@ -72,6 +72,9 @@ def trade_export_columns() -> list[excel_export.Column]:
         # Notional is the number people actually want and the one they'd get
         # wrong by hand: options are per-contract, so 100x the share price.
         C("Filled Notional", _filled_notional, 15, M),
+        # Realized P&L this closing trade booked (FIFO). Blank on opening orders
+        # and anything that closed nothing. Attached in list/export handlers.
+        C("Realized P&L", lambda o: getattr(o, "realized_pnl", None), 13, M),
         C("Take Profit", lambda o: o.take_profit_price, 12, M),
         C("Stop Loss", lambda o: o.stop_loss_price, 12, M),
         C("Copied Trade", lambda o: "yes" if o.parent_order_id else "no", 12),
@@ -264,6 +267,9 @@ def export_trades(
         q = q.limit(limit)
 
     orders = list(db.execute(q).scalars())
+    # Per-trade realized P&L (FIFO) so the export carries the same "Realized P&L"
+    # the Trades page shows on each closing row.
+    _attach_realized_pnl(db, target, orders)
     now = datetime.now(timezone.utc)
     # Only the "export everything" path can hit ROW_CAP; an explicit limit is
     # already bounded (le=ROW_CAP) so it's never a silent truncation.

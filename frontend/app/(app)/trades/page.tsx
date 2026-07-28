@@ -9,7 +9,7 @@ import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
 import { PositionIcon, orderKind } from "@/components/PositionIcon";
-import { fmtDateTimeMs, fmtDuration, fmtUsd } from "@/lib/format";
+import { fmtDateTimeMs, fmtDuration, fmtSignedUsd, fmtUsd } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -413,7 +413,7 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 15;
+  const COLSPAN = 16;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -520,6 +520,7 @@ export default function TradesPage() {
                 <Th label="TP" />
                 <Th label="SL" />
                 <Th label="Notional" sortKey="notional" />
+                <Th label="Realized P&L" />
                 <Th label="Submitted at" sortKey="submitted" />
                 <Th label="Filled at" sortKey="filled" />
                 <Th label="Time Taken to Filled" />
@@ -612,6 +613,7 @@ export default function TradesPage() {
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fillNotional ? fmt(String(fillNotional)) : dash}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{f.at ? fmtDateTimeMs(f.at, "America/New_York") : dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
@@ -769,6 +771,13 @@ export default function TradesPage() {
                       })()}
                       <td className="px-5 py-3.5 num">
                         {notionalFor(o) ? fmt(String(notionalFor(o))) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                      <td className="px-5 py-3.5 num">
+                        {o.realized_pnl != null && Number(o.realized_pnl) !== 0 ? (
+                          <span style={{ color: Number(o.realized_pnl) >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
+                            {fmtSignedUsd(Number(o.realized_pnl))}
+                          </span>
+                        ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                         {fmtDateTimeMs(submittedTs, "America/New_York")}
