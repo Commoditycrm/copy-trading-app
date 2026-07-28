@@ -44,9 +44,13 @@ SNAPSHOT_INTERVAL_S = 3600.0
 # SnapTrade's Webull activity feed can surface a day or two behind the broker, so
 # `realized_by_day_from_broker` stamps a freshly traded day as $0 (no closes seen
 # yet) and that $0 masks the real trades on the calendar. Within this many days of
-# the sweep end we trust our own filled-order P&L on such a gap day; past it the
-# broker feed is authoritative again (a $0 day is a genuine flat day), which keeps
-# the phantom-leak guard intact. Covers a T+1/T+2 lag across a weekend.
+# the sweep end we trust our own filled-order P&L on such a gap day and freeze it
+# as a durable `db_fallback_lag` row (see the conditional upsert below): once
+# written, a later sweep's broker $0 can't revert it — only a real broker close
+# replaces it. The window bounds which days we'll ever fill from the DB (older
+# flat days stay broker-authoritative, preserving the phantom-leak guard), while
+# durability means a day the feed never delivers stays correct rather than
+# blinking back to $0 once it ages out.
 LAG_FALLBACK_DAYS = 4
 
 
@@ -80,22 +84,32 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         pnl, count = vals[0], vals[1]
         pct = vals[2] if len(vals) > 2 else None
         source = source_by_day.get(day, "broker_activities")
-        stmt = (
-            pg_insert(DailyRealizedPnlSnapshot)
-            .values(
-                user_id=acct.user_id, day=day,
-                realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
-                broker_account_id=acct.id, broker=broker, source=source,
-            )
-            .on_conflict_do_update(
-                constraint="uq_daily_realized_pnl_user_day",
-                set_=dict(
-                    realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
-                    broker_account_id=acct.id, broker=broker,
-                    source=source, computed_at=market_hours.now_et(),
-                ),
-            )
+        set_ = dict(
+            realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
+            broker_account_id=acct.id, broker=broker,
+            source=source, computed_at=market_hours.now_et(),
         )
+        stmt = pg_insert(DailyRealizedPnlSnapshot).values(
+            user_id=acct.user_id, day=day,
+            realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
+            broker_account_id=acct.id, broker=broker, source=source,
+        )
+        # A $0 from the broker feed is either a genuinely flat day or one the feed
+        # hasn't surfaced yet. Never let it overwrite a durable db_fallback_lag row
+        # (a day we filled from our own fills because the feed was silent) — only a
+        # real broker close (count > 0) may replace that fallback. Every other
+        # write — real broker values, Alpaca marked, or the fallback itself —
+        # upserts unconditionally.
+        broker_silence = source == "broker_activities" and pnl == 0 and count == 0
+        if broker_silence:
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_daily_realized_pnl_user_day", set_=set_,
+                where=DailyRealizedPnlSnapshot.source != "db_fallback_lag",
+            )
+        else:
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_daily_realized_pnl_user_day", set_=set_,
+            )
         db.execute(stmt)
         written += 1
     return written
