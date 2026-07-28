@@ -7,9 +7,17 @@
  */
 
 // US trading app: render every timestamp in US Eastern. The IANA zone
-// "America/New_York" auto-handles EST (winter) vs EDT (summer). Centralised
-// here so the whole app is consistent.
+// "America/New_York" auto-handles the actual offset (UTC-5 winter / UTC-4
+// summer) so times stay correct and match the broker apps. Centralised here so
+// the whole app is consistent.
 export const APP_TZ = "America/New_York";
+
+// Product decision: always LABEL Eastern time as "EST" (users say "EST" for
+// Eastern regardless of season). The underlying time is still DST-aware — we
+// only rewrite the abbreviation the formatter appends, never the clock value.
+function _labelEST(s: string): string {
+  return s.replace(/\bEDT\b/g, "EST");
+}
 
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   month: "short",
@@ -34,7 +42,7 @@ export function fmtDateTime(input: string | number | Date | null | undefined): s
   if (!input) return "—";
   const d = input instanceof Date ? input : new Date(input);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("en-US", DATETIME_OPTS);
+  return _labelEST(d.toLocaleString("en-US", DATETIME_OPTS));
 }
 
 /** Full timestamp with milliseconds — e.g. "May 15, 2026, 01:30:00.842 AM".
@@ -58,7 +66,7 @@ export function fmtDateTimeMs(
   // We compute ms from the underlying UTC instant; the zone only shifts the
   // display, not the absolute ms count.
   const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return base.replace(/(\d{2}:\d{2}:\d{2})( ?[AP]M)?/, `$1.${ms}$2`);
+  return _labelEST(base.replace(/(\d{2}:\d{2}:\d{2})( ?[AP]M)?/, `$1.${ms}$2`));
 }
 
 /** Human-readable duration between two timestamps — e.g. "342ms", "1.2s",

@@ -63,7 +63,7 @@ def trade_export_columns() -> list[excel_export.Column]:
     C = excel_export.Column
     M, D = "#,##0.00######", "yyyy-mm-dd hh:mm:ss"
     return [
-        C("Placed At (ET)", lambda o: o.submitted_at or o.created_at, 19, D),
+        C("Placed At (EST)", lambda o: o.submitted_at or o.created_at, 19, D),
         C("Instrument", _instrument_label, 26),
         C("Symbol", lambda o: o.symbol.upper(), 12),
         C("Type", lambda o: o.instrument_type.value, 10),
@@ -87,7 +87,7 @@ def trade_export_columns() -> list[excel_export.Column]:
         C("Sent To Subscribers", lambda o: "yes" if o.fanned_out_to_subscribers else "no", 17),
         C("Reject Reason", lambda o: o.reject_reason, 40),
         C("Broker Order ID", lambda o: o.broker_order_id, 26),
-        C("Closed At (ET)", lambda o: o.closed_at, 19, D),
+        C("Closed At (EST)", lambda o: o.closed_at, 19, D),
         C("Order ID", lambda o: str(o.id), 36),
     ]
 
@@ -132,9 +132,9 @@ def list_trades(
         .limit(limit)
     )
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
     return orders
@@ -178,11 +178,11 @@ def list_trades_page(
     base = select(Order).where(Order.user_id == user.id)
     if from_:
         base = base.where(
-            Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
+            func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
         )
     if to:
         base = base.where(
-            Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
+            func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
         )
     base = trade_filters.exclude_dead_bracket_legs(base)
     base = trade_filters.apply_status_tab(base, status_tab)
@@ -261,9 +261,9 @@ def export_trades(
         .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
     )
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
@@ -312,7 +312,7 @@ def export_trades(
         # Record the filters IN the file — otherwise a filtered export is
         # indistinguishable from a full dump once it's been emailed around.
         meta=(
-            ("Exported (ET)", now),
+            ("Exported (EST)", now),
             # Whose trades these are — not who clicked. On an admin export those
             # differ, and mislabelling the file is how someone ends up reading
             # one trader's history as another's.
@@ -428,11 +428,11 @@ def trades_stats(
             # the summary counts honest and in lockstep with the rows shown.
             .where(or_(Order.bracket_parent_id.is_(None), filled_cond))
             .where(
-                Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
+                func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET)
                 if from_ else True
             )
             .where(
-                Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
+                func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
                 if to else True
             )
         ).one()
@@ -483,9 +483,9 @@ def export_trades_count(
 
     q = select(Order.id).where(Order.user_id == target.id)
     if from_:
-        q = q.where(Order.created_at >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
-        q = q.where(Order.created_at < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+        q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
