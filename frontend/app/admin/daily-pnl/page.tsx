@@ -47,9 +47,9 @@ export default function AdminDailyPnlPage() {
       setLoading(false);
     }
   }
-  // Reload on mount and whenever the user picker changes (auto-apply). Dates
-  // still use the Apply button since they're usually set as a pair.
-  useEffect(() => { load(); }, [userId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Auto-apply: reload on mount and whenever ANY filter (user / from / to)
+  // changes — no Apply click needed.
+  useEffect(() => { load(); }, [userId, from, to]); // eslint-disable-line react-hooks/exhaustive-deps
   // Users for the picker — traders + subscribers (admins excluded), by role.
   useEffect(() => {
     api<{ items: UserRow[] }>("/api/admin/users?limit=1000")
@@ -97,11 +97,20 @@ export default function AdminDailyPnlPage() {
             </optgroup>
           </select>
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
-            className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="From date" />
+            className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="From date" title="From (blank = all time)" />
           <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
           <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
-            className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="To date" />
-          <button onClick={load} className="text-sm px-3 py-1.5 rounded-lg" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Apply</button>
+            className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="To date" title="To (blank = all time)" />
+          {(userId || from || to) && (
+            <button
+              onClick={() => { setUserId(""); setFrom(""); setTo(""); }}
+              className="text-sm px-3 py-1.5 rounded-lg"
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+              title="Reset to all users, all time"
+            >
+              Clear
+            </button>
+          )}
         </div>
       </div>
 
@@ -121,7 +130,9 @@ export default function AdminDailyPnlPage() {
               {loading ? (
                 <tr><td colSpan={5} className="px-4 py-10 text-center" style={{ color: "var(--muted)" }}>Loading…</td></tr>
               ) : rows.length === 0 ? (
-                <tr><td colSpan={5} className="px-4 py-10 text-center" style={{ color: "var(--muted)" }}>No P&L data in range.</td></tr>
+                <tr><td colSpan={5} className="px-4 py-10 text-center" style={{ color: "var(--muted)" }}>
+                  No P&L data for this selection.{(from || to) ? " The date range may be empty (future/no-trade days) — clear the dates for all time." : ""}
+                </td></tr>
               ) : (
                 <>
                   <tr style={{ background: "var(--panel-2)", borderBottom: "1px solid var(--border)" }}>
