@@ -29,6 +29,7 @@ export interface FanoutChild {
   subscriber_name: string | null;
   broker_name: string | null;
   status: string;
+  order_type: string;
   quantity: string;
   filled_quantity: string;
   // The mirror's own expected (limit) vs actual fill price.
@@ -58,6 +59,8 @@ interface FanoutRow {
   side: string;
   quantity: string;
   instrument_type: string;
+  order_type: string;
+  status: string;
   expected_price: string | null;
   filled_avg_price: string | null;
   broker_accepted_at: string | null;
@@ -911,6 +914,7 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                   {([
                                     ["Subscriber", "The subscriber whose account this mirror was placed on."],
                                     ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
+                                    ["Order Type", "The mirror order's type — Market / Limit / Stop / Stop Limit."],
                                     ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
                                     ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
                                     ["Expected Price", "This mirror's limit price. Blank for market orders (no expected price)."],
@@ -1005,6 +1009,9 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                         >
                                           {c.status}
                                         </span>
+                                      </td>
+                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--muted)", textTransform: "capitalize" }}>
+                                        {(c.order_type || "").replace(/_/g, " ") || "—"}
                                       </td>
                                       <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
                                       <td
@@ -1376,6 +1383,7 @@ export function PerformanceView({
                 ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
                 ["Expected Price", "The trader's limit price. Blank for market orders (no expected price)."],
                 ["Filled Price", "The broker's average fill price for this order. Compare with Expected Price to gauge slippage."],
+                ["Status", "The trader's order status — filled / rejected / working / canceled / etc."],
                 ["Date", "Calendar date of the trade (US Eastern). The timestamp columns show time-of-day only."],
                 ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
                 ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
@@ -1414,7 +1422,7 @@ export function PerformanceView({
           <tbody>
             {loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={21} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={22} className="px-3 py-10 text-center" style={{ color: "var(--muted)" }}>
                   <span className="inline-flex items-center gap-2">
                     <Spinner />
                     <span>Loading fanouts…</span>
@@ -1424,7 +1432,7 @@ export function PerformanceView({
             )}
             {!loading && fanouts.length === 0 && (
               <tr>
-                <td colSpan={21} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
+                <td colSpan={22} className="px-3 align-middle text-center" style={{ color: "var(--muted)" }}>
                   <div className="flex items-center justify-center min-h-[240px]">
                     No fanouts yet. Place a trade to see latency metrics here.
                   </div>
@@ -1466,6 +1474,9 @@ export function PerformanceView({
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtQty(f.quantity)}</td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtPrice(f.expected_price)}</td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums">{fmtPrice(f.filled_avg_price)}</td>
+                    <td className="px-2 md:px-3 py-2 md:py-3 whitespace-nowrap" style={{ color: "var(--muted)", textTransform: "capitalize" }}>
+                      {(f.status || "").replace(/_/g, " ") || "—"}
+                    </td>
                     <td className="px-2 md:px-3 py-2 md:py-3 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
                       {fmtDate(f.broker_accepted_at ?? f.detected_at)}
                     </td>
@@ -1534,7 +1545,7 @@ export function PerformanceView({
                   {/* ── Per-subscriber expansion ──────────────────────── */}
                   {isOpen && (
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
-                      <td colSpan={21} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
+                      <td colSpan={22} className="px-0 py-0" style={{ background: "var(--panel-2)" }}>
                         <div className="px-4 py-2.5">
                           <SubscriberBreakdown mirrors={f.children} />
                         </div>

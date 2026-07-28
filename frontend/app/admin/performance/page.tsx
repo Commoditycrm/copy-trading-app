@@ -22,6 +22,7 @@ interface Fanout {
   quantity: string;
   instrument_type: string;
   order_type: string;
+  status: string;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: string | null;
@@ -237,6 +238,11 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
           {orderTypeLabel(fanout.order_type)}
         </td>
 
+        {/* Trader's order status */}
+        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)", textTransform: "capitalize" }}>
+          {(fanout.status || "").replace(/_/g, " ") || "—"}
+        </td>
+
         {/* Expected (limit) vs filled price */}
         <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>
         <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>
@@ -301,7 +307,7 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={25} className="px-4 py-2.5">
+          <td colSpan={26} className="px-4 py-2.5">
             {/* Shared with the trader Performance view so admins see the exact
                 same per-subscriber columns — no second copy to keep in sync. */}
             <SubscriberBreakdown mirrors={fanout.children} />
@@ -515,6 +521,7 @@ export default function AdminPerformancePage() {
                 <PlainTh label="Qty" />
                 <PlainTh label="Side" />
                 <PlainTh label="Order Type" />
+                <PlainTh label="Status" />
                 <PlainTh label="Expected Price" />
                 <PlainTh label="Filled Price" />
                 <PlainTh label="Filled At" />

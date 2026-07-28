@@ -113,6 +113,7 @@ def _serialize_child(
         "subscriber_name": subscriber.display_name if subscriber else None,
         "broker_name": broker_name,
         "status": child.status.value,
+        "order_type": child.order_type.value,
         "quantity": str(child.quantity),
         "filled_quantity": str(child.filled_quantity or 0),
         # The mirror's OWN expected (limit) vs actual fill price — the same pair
@@ -179,6 +180,7 @@ def _serialize_fanout(
         "quantity": str(parent.quantity),
         "instrument_type": parent.instrument_type.value,
         "order_type": parent.order_type.value,
+        "status": parent.status.value,
         # Option contract parts, so the admin table can render the same full
         # descriptor as the trader panel ("SPXW C $7510 22 Jul 26").
         "option_expiry": parent.option_expiry.isoformat() if parent.option_expiry else None,
