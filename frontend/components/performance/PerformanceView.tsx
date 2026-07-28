@@ -913,10 +913,10 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                       indicator that cycles unsorted → asc → desc → unsorted. */}
                                   {([
                                     ["Subscriber", "The subscriber whose account this mirror was placed on."],
-                                    ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
-                                    ["Order Type", "The mirror order's type — Market / Limit / Stop / Stop Limit."],
                                     ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
                                     ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
+                                    ["Order Type", "The mirror order's type — Market / Limit / Stop / Stop Limit."],
+                                    ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
                                     ["Expected Price", "This mirror's limit price. Blank for market orders (no expected price)."],
                                     ["Filled Price", "The subscriber's broker average fill price for this mirror. Compare with Expected Price to gauge their slippage."],
                                     ["Filled At", "When this subscriber's mirror actually filled."],
@@ -976,6 +976,16 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                       style={{ borderTop: "1px solid var(--border)", verticalAlign: "top" }}
                                     >
                                       <td className="px-2 py-2 whitespace-nowrap">{displayName}</td>
+                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
+                                      <td
+                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
+                                        style={{ color: Number(c.filled_quantity) > 0 ? "var(--text)" : "var(--muted)" }}
+                                      >
+                                        {fmtQty(c.filled_quantity)}
+                                      </td>
+                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--muted)", textTransform: "capitalize" }}>
+                                        {(c.order_type || "").replace(/_/g, " ") || "—"}
+                                      </td>
                                       <td className="px-2 py-2 whitespace-nowrap">
                                         <span
                                           className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium"
@@ -1009,16 +1019,6 @@ export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
                                         >
                                           {c.status}
                                         </span>
-                                      </td>
-                                      <td className="px-2 py-2 whitespace-nowrap" style={{ color: "var(--muted)", textTransform: "capitalize" }}>
-                                        {(c.order_type || "").replace(/_/g, " ") || "—"}
-                                      </td>
-                                      <td className="px-2 py-2 tabular-nums whitespace-nowrap">{fmtQty(c.quantity)}</td>
-                                      <td
-                                        className="px-2 py-2 tabular-nums whitespace-nowrap"
-                                        style={{ color: Number(c.filled_quantity) > 0 ? "var(--text)" : "var(--muted)" }}
-                                      >
-                                        {fmtQty(c.filled_quantity)}
                                       </td>
                                       {/* Mirror's own expected (limit) vs filled price */}
                                       <td className="px-2 py-2 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
