@@ -47,7 +47,9 @@ export default function AdminDailyPnlPage() {
       setLoading(false);
     }
   }
-  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Reload on mount and whenever the user picker changes (auto-apply). Dates
+  // still use the Apply button since they're usually set as a pair.
+  useEffect(() => { load(); }, [userId]); // eslint-disable-line react-hooks/exhaustive-deps
   // Users for the picker — traders + subscribers (admins excluded), by role.
   useEffect(() => {
     api<{ items: UserRow[] }>("/api/admin/users?limit=1000")
