@@ -346,6 +346,9 @@ def admin_daily_pnl(
     _: User = Depends(require_admin),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
+    role: str | None = Query(
+        default=None, description="trader|subscriber — all users of that role (ignored if user_id set)."
+    ),
     user_id: uuid.UUID | None = Query(
         default=None, description="Limit to one user (trader or subscriber); omit for all."
     ),
@@ -378,6 +381,8 @@ def admin_daily_pnl(
         q = q.where(s.day <= to)
     if user_id is not None:
         q = q.where(s.user_id == user_id)
+    elif role in ("trader", "subscriber"):
+        q = q.where(User.role == UserRole(role))
     rows = db.execute(q).all()
     return [
         {

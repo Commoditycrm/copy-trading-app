@@ -30,7 +30,8 @@ export default function AdminDailyPnlPage() {
   const [loading, setLoading] = useState(true);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
-  const [userId, setUserId] = useState("");            // "" = all users
+  const [role, setRole] = useState("");                // "" | "trader" | "subscriber"
+  const [userId, setUserId] = useState("");            // "" = whole role / all
   const [users, setUsers] = useState<UserRow[]>([]);
 
   async function load() {
@@ -40,6 +41,7 @@ export default function AdminDailyPnlPage() {
       if (from) q.set("from", from);
       if (to) q.set("to", to);
       if (userId) q.set("user_id", userId);
+      else if (role) q.set("role", role);
       const qs = q.toString();
       setRows(await api<DailyRow[]>(`/api/admin/daily-pnl${qs ? `?${qs}` : ""}`));
     } catch (e) {
@@ -50,7 +52,7 @@ export default function AdminDailyPnlPage() {
   }
   // Auto-apply: reload on mount and whenever ANY filter (user / from / to)
   // changes — no Apply click needed.
-  useEffect(() => { load(); }, [userId, from, to]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load(); }, [role, userId, from, to]); // eslint-disable-line react-hooks/exhaustive-deps
   // Users for the picker — traders + subscribers (admins excluded). The users
   // endpoint caps limit at 200, so fetch traders and subscribers separately
   // (each well under the cap) and merge, rather than one over-limit call that
@@ -62,13 +64,13 @@ export default function AdminDailyPnlPage() {
     ]).then(([t, s]) => setUsers([...t.items, ...s.items]));
   }, []);
 
-  // Searchable options — All users, then traders, then subscribers, each with a
-  // role hint so duplicate display names stay distinguishable.
+  // Name options for the CURRENT role (the Role dropdown narrows the pool).
+  // First entry = no specific person → the whole role / all.
   const userOptions: SelectOption[] = useMemo(() => {
-    const mk = (role: string, label: string) =>
-      users.filter((u) => u.role === role).map((u) => ({ value: u.id, label: `${u.display_name || u.email} · ${label}` }));
-    return [{ value: "", label: "All users" }, ...mk("trader", "Trader"), ...mk("subscriber", "Subscriber")];
-  }, [users]);
+    const pool = role ? users.filter((u) => u.role === role) : users;
+    const first = role === "trader" ? "All traders" : role === "subscriber" ? "All subscribers" : "Anyone";
+    return [{ value: "", label: first }, ...pool.map((u) => ({ value: u.id, label: u.display_name || u.email }))];
+  }, [users, role]);
 
   const grand = rows.reduce(
     (a, r) => ({ t: a.t + Number(r.trader_pnl), s: a.s + Number(r.subscriber_pnl), all: a.all + Number(r.total) }),
@@ -89,12 +91,26 @@ export default function AdminDailyPnlPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          {/* Role dropdown — picks the group; resets any specific-name pick. */}
+          <select
+            value={role}
+            onChange={(e) => { setRole(e.target.value); setUserId(""); }}
+            className="text-sm px-2.5 py-1.5 rounded-lg"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            aria-label="Role"
+            title="All / Traders / Subscribers"
+          >
+            <option value="">All users</option>
+            <option value="trader">Traders</option>
+            <option value="subscriber">Subscribers</option>
+          </select>
+          {/* Name box — searchable, scoped to the chosen role. */}
           <SearchableSelect
             value={userId}
             options={userOptions}
             onChange={setUserId}
-            placeholder="Search trader / subscriber…"
-            className="w-[240px]"
+            placeholder="Search name…"
+            className="w-[200px]"
             style={{ height: 34 }}
           />
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
@@ -102,9 +118,9 @@ export default function AdminDailyPnlPage() {
           <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
           <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
             className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="To date" title="To (blank = all time)" />
-          {(userId || from || to) && (
+          {(role || userId || from || to) && (
             <button
-              onClick={() => { setUserId(""); setFrom(""); setTo(""); }}
+              onClick={() => { setRole(""); setUserId(""); setFrom(""); setTo(""); }}
               className="text-sm px-3 py-1.5 rounded-lg"
               style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
               title="Reset to all users, all time"
