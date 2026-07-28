@@ -50,11 +50,15 @@ export default function AdminDailyPnlPage() {
   // Auto-apply: reload on mount and whenever ANY filter (user / from / to)
   // changes — no Apply click needed.
   useEffect(() => { load(); }, [userId, from, to]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Users for the picker — traders + subscribers (admins excluded), by role.
+  // Users for the picker — traders + subscribers (admins excluded). The users
+  // endpoint caps limit at 200, so fetch traders and subscribers separately
+  // (each well under the cap) and merge, rather than one over-limit call that
+  // 422s and leaves the dropdown empty.
   useEffect(() => {
-    api<{ items: UserRow[] }>("/api/admin/users?limit=1000")
-      .then((p) => setUsers(p.items.filter((u) => u.role !== "admin")))
-      .catch(() => {});
+    Promise.all([
+      api<{ items: UserRow[] }>("/api/admin/users?role=trader&limit=200").catch(() => ({ items: [] as UserRow[] })),
+      api<{ items: UserRow[] }>("/api/admin/users?role=subscriber&limit=200").catch(() => ({ items: [] as UserRow[] })),
+    ]).then(([t, s]) => setUsers([...t.items, ...s.items]));
   }, []);
 
   const grand = rows.reduce(
