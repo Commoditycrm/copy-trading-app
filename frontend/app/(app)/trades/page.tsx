@@ -158,6 +158,10 @@ export default function TradesPage() {
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
   // How many rows the Export downloads — "all" or a specific count (latest N).
   const [exportLimit, setExportLimit] = useState<string>("all");
+  // Export-only date range (independent of the on-screen table). Seeded from any
+  // ?from/?to the page was opened with (e.g. a Calendar drill-in).
+  const [exportFrom, setExportFrom] = useState<string>(fromParam ?? "");
+  const [exportTo, setExportTo] = useState<string>(toParam ?? "");
 
   // Server-side pagination state.
   const [total, setTotal] = useState(0);
@@ -203,9 +207,11 @@ export default function TradesPage() {
   // No `limit` on purpose: the table shows a window, the export is everything.
   const exportEndpoint = useCallback(() => {
     const q = new URLSearchParams();
-    if (fromParam) q.set("from", fromParam);
-    if (toParam) {
-      const t = new Date(toParam + "T00:00:00Z");
+    if (exportFrom) q.set("from", exportFrom);
+    if (exportTo) {
+      // `to` is exclusive server-side; bump a day so the picked end date is
+      // included.
+      const t = new Date(exportTo + "T00:00:00Z");
       t.setUTCDate(t.getUTCDate() + 1);
       q.set("to", t.toISOString().slice(0, 10));
     }
@@ -213,7 +219,7 @@ export default function TradesPage() {
     if (search.trim()) q.set("search", search.trim());
     if (exportLimit !== "all") q.set("limit", exportLimit);
     return `/api/trades/export?${q.toString()}`;
-  }, [fromParam, toParam, tab, search, exportLimit]);
+  }, [exportFrom, exportTo, tab, search, exportLimit]);
 
   // DB-aggregate totals, same date filter as the list. Fetched alongside
   // the rows and refreshed whenever orders change (SSE / reconcile) so the
@@ -483,6 +489,26 @@ export default function TradesPage() {
               </button>
             )}
           </div>
+          {/* Export date range (ET). Independent of the on-screen table. */}
+          <input
+            type="date"
+            value={exportFrom}
+            onChange={(e) => setExportFrom(e.target.value)}
+            className="py-1.5 px-2 text-sm rounded-token"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            aria-label="Export from date"
+            title="Export from (leave blank = all time)"
+          />
+          <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
+          <input
+            type="date"
+            value={exportTo}
+            onChange={(e) => setExportTo(e.target.value)}
+            className="py-1.5 px-2 text-sm rounded-token"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            aria-label="Export to date"
+            title="Export to (leave blank = all time)"
+          />
           {/* How many rows to export (latest N), or All. Applies the current
               tab/search/date filters — see /api/trades/export. */}
           <select

@@ -1,10 +1,12 @@
 "use client";
 
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowDownRight, ArrowUpRight, ChevronRight, Inbox } from "lucide-react";
 import Link from "next/link";
 import type { Order } from "@/lib/types";
 import { fmtDateTime, fmtUsd, fmtNum, fmtSignedUsd } from "@/lib/format";
+import { ExportButton } from "@/components/ExportButton";
 
 const STATUS_TONE: Record<string, { color: string; bg: string }> = {
   filled: { color: "var(--good)", bg: "var(--good-soft)" },
@@ -25,9 +27,27 @@ function prettyStatus(s: string) {
 export function RecentExecutions({ orders }: { orders: Order[] }) {
   const rows = orders.slice(0, 7);
 
+  // Day-wise / date-range download of the full trade history (not just the 7
+  // shown). Reuses the trades export; blank dates = all time.
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const exportPath = (() => {
+    const q = new URLSearchParams();
+    if (from) q.set("from", from);
+    if (to) {
+      const t = new Date(to + "T00:00:00Z");
+      t.setUTCDate(t.getUTCDate() + 1);   // `to` is exclusive server-side
+      q.set("to", t.toISOString().slice(0, 10));
+    }
+    return `/api/trades/export?${q.toString()}`;
+  })();
+
+  const dateInput = "text-[11px] px-1.5 py-1 rounded-token";
+  const dateStyle = { background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" } as const;
+
   return (
     <div className="card p-5">
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
         <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>
           Recent executions
         </h3>
@@ -38,6 +58,15 @@ export function RecentExecutions({ orders }: { orders: Order[] }) {
         >
           Order history <ChevronRight size={13} />
         </Link>
+      </div>
+      {/* Download trades by day / date range — the card only lists the latest 7. */}
+      <div className="flex items-center gap-1.5 mb-4 flex-wrap">
+        <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
+          className={dateInput} style={dateStyle} aria-label="Export from date" title="From (blank = all time)" />
+        <span className="text-[11px]" style={{ color: "var(--muted)" }}>–</span>
+        <input type="date" value={to} onChange={(e) => setTo(e.target.value)}
+          className={dateInput} style={dateStyle} aria-label="Export to date" title="To (blank = all time)" />
+        <ExportButton path={exportPath} label="Download" fallbackName="kopyya-trades.xlsx" />
       </div>
 
       {rows.length === 0 ? (
