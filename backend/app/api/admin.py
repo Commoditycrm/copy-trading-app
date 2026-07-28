@@ -346,11 +346,15 @@ def admin_daily_pnl(
     _: User = Depends(require_admin),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
+    user_id: uuid.UUID | None = Query(
+        default=None, description="Limit to one user (trader or subscriber); omit for all."
+    ),
 ) -> list[dict]:
     """Per-day total P&L across ALL users, split trader vs subscriber, from the
-    broker-direct daily snapshots (daily_realized_pnl_snapshots). Note: Webull
-    rows are realized, Alpaca rows are marked — this is each broker's own daily
-    figure summed, not a single consistent basis. Newest day first."""
+    broker-direct daily snapshots (daily_realized_pnl_snapshots). Pass ?user_id=
+    to scope to a single trader/subscriber. Note: Webull rows are realized,
+    Alpaca rows are marked — this is each broker's own daily figure summed, not
+    a single consistent basis. Newest day first."""
     s = DailyRealizedPnlSnapshot
     q = (
         select(
@@ -372,6 +376,8 @@ def admin_daily_pnl(
         q = q.where(s.day >= from_)
     if to:
         q = q.where(s.day <= to)
+    if user_id is not None:
+        q = q.where(s.user_id == user_id)
     rows = db.execute(q).all()
     return [
         {

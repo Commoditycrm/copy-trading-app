@@ -13,6 +13,8 @@ interface DailyRow {
   users: number;
 }
 
+interface UserRow { id: string; email: string; role: string; display_name: string | null; }
+
 function Money({ v }: { v: string }) {
   const n = Number(v);
   return (
@@ -27,6 +29,8 @@ export default function AdminDailyPnlPage() {
   const [loading, setLoading] = useState(true);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  const [userId, setUserId] = useState("");            // "" = all users
+  const [users, setUsers] = useState<UserRow[]>([]);
 
   async function load() {
     setLoading(true);
@@ -34,6 +38,7 @@ export default function AdminDailyPnlPage() {
       const q = new URLSearchParams();
       if (from) q.set("from", from);
       if (to) q.set("to", to);
+      if (userId) q.set("user_id", userId);
       const qs = q.toString();
       setRows(await api<DailyRow[]>(`/api/admin/daily-pnl${qs ? `?${qs}` : ""}`));
     } catch (e) {
@@ -43,6 +48,12 @@ export default function AdminDailyPnlPage() {
     }
   }
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Users for the picker — traders + subscribers (admins excluded), by role.
+  useEffect(() => {
+    api<{ items: UserRow[] }>("/api/admin/users?limit=1000")
+      .then((p) => setUsers(p.items.filter((u) => u.role !== "admin")))
+      .catch(() => {});
+  }, []);
 
   const grand = rows.reduce(
     (a, r) => ({ t: a.t + Number(r.trader_pnl), s: a.s + Number(r.subscriber_pnl), all: a.all + Number(r.total) }),
@@ -62,7 +73,27 @@ export default function AdminDailyPnlPage() {
             Webull is realized, Alpaca is marked — each broker's own daily figure.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <select
+            value={userId}
+            onChange={(e) => setUserId(e.target.value)}
+            className="text-sm px-2.5 py-1.5 rounded-lg max-w-[220px]"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            aria-label="Filter by user"
+            title="Show one trader/subscriber, or all"
+          >
+            <option value="">All users</option>
+            <optgroup label="Traders">
+              {users.filter((u) => u.role === "trader").map((u) => (
+                <option key={u.id} value={u.id}>{u.display_name || u.email}</option>
+              ))}
+            </optgroup>
+            <optgroup label="Subscribers">
+              {users.filter((u) => u.role === "subscriber").map((u) => (
+                <option key={u.id} value={u.id}>{u.display_name || u.email}</option>
+              ))}
+            </optgroup>
+          </select>
           <input type="date" value={from} onChange={(e) => setFrom(e.target.value)}
             className="text-sm px-2.5 py-1.5 rounded-lg" style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }} aria-label="From date" />
           <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
