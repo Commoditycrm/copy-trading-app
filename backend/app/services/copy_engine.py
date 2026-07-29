@@ -962,6 +962,66 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
+# Re-place retry budget for the cancel+place FALLBACK (brokers without an atomic
+# in-place replace). After cancelling the old order the broker can lag in
+# releasing the shares it reserved, rejecting the immediate re-place with
+# "insufficient qty" — so we wait briefly and retry. ~4 × 0.6s ≈ up to 1.8s.
+_MODIFY_PLACE_ATTEMPTS = 4
+_MODIFY_PLACE_BACKOFF_S = 0.6
+
+
+def _modify_place_one(item: "tuple[Order, Any, BrokerOrderRequest, uuid.UUID]"):
+    """Re-price ONE subscriber mirror (worker-thread step of the modify fanout).
+
+    Prefers an ATOMIC in-place replace where the broker supports it (Alpaca): it
+    changes price/qty without releasing the position's share reservation, so a
+    rapid re-price can't race the release — the cancel+replace bug that lost
+    subscriber sells on STKH (2026-07-28), where the just-cancelled order still
+    showed the shares as held_for_orders and the immediate re-place was rejected.
+    Atomic contract: on FAILURE the original order is left working untouched, so
+    Phase 3 keeps the old mirror rather than strand the subscriber.
+
+    Falls back to cancel+place for brokers with no in-place replace (SnapTrade /
+    IBKR), retrying the PLACE briefly if the broker hasn't released the shares yet
+    ("insufficient qty" / held_for_orders); without the retry the re-place is lost
+    and the subscriber has no order mid-re-price.
+
+    Returns ``(old_id, new_id, BrokerOrderResult | None, err_sentinel | None)``.
+    Pure over its args (no DB), so it's safe in the thread pool and unit-testable.
+    """
+    old_ch, ad, rq, new_id = item
+    if getattr(ad, "supports_replace", False):
+        try:
+            return old_ch.id, new_id, ad.replace_order(old_ch.broker_order_id, rq), None
+        except Exception as exc:  # noqa: BLE001
+            return old_ch.id, new_id, None, f"replace_failed: {exc}"[:300]
+    try:
+        cancelled = ad.cancel_order(old_ch.broker_order_id)
+    except Exception as exc:  # noqa: BLE001
+        return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+    # A False here means the broker had nothing to cancel — the order is already
+    # terminal, and the overwhelmingly likely reason is that it FILLED. Placing the
+    # replacement now would double the position (prod doubled a META entry exactly
+    # this way — SnapTrade's cancel returned 1070 while its feed still showed the
+    # mirror working), so bail. The cancel result is the only signal reflecting the
+    # broker's ACTUAL state at this moment.
+    if cancelled is False:
+        return old_ch.id, new_id, None, "cancel_noop_already_terminal"
+    # Only a conflict error (share-release lag) is worth waiting on; anything else
+    # (e.g. a bad price) will just fail again, so break out immediately.
+    last_exc: BaseException | None = None
+    for attempt in range(_MODIFY_PLACE_ATTEMPTS):
+        try:
+            return old_ch.id, new_id, ad.place_order(rq), None
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if is_order_conflict_error(exc) and attempt < _MODIFY_PLACE_ATTEMPTS - 1:
+                time.sleep(_MODIFY_PLACE_BACKOFF_S)
+                continue
+            break
+    return old_ch.id, new_id, None, f"place_failed: {last_exc}"[:300]
+
+
 def cancel_and_replace_mirrors_for_modify(
     old_trader_order_id: uuid.UUID, new_trader_order_id: uuid.UUID
 ) -> None:
@@ -1057,31 +1117,11 @@ def cancel_and_replace_mirrors_for_modify(
         if not plan:
             return
 
-        # Phase 2 (thread pool): cancel the old mirror, then place the new one.
-        def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
-            old_ch, ad, rq, new_id = item
-            try:
-                cancelled = ad.cancel_order(old_ch.broker_order_id)
-            except Exception as exc:  # noqa: BLE001
-                return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
-            # A False here means the broker had nothing to cancel — the order is
-            # already terminal, and the overwhelmingly likely reason is that it
-            # FILLED. Placing the replacement now would double the position, so
-            # bail. This is not hypothetical: prod doubled a subscriber's META
-            # entry exactly this way. SnapTrade returns 1070 ("failed to cancel")
-            # while its own order feed still shows the mirror as working — its
-            # data lagged the real fill by ~42s — so neither our DB nor a
-            # get_order re-check could see the truth. The cancel result is the
-            # only signal that reflects the broker's ACTUAL state at this moment.
-            if cancelled is False:
-                return old_ch.id, new_id, None, "cancel_noop_already_terminal"
-            try:
-                return old_ch.id, new_id, ad.place_order(rq), None
-            except Exception as exc:  # noqa: BLE001
-                return old_ch.id, new_id, None, f"place_failed: {exc}"[:300]
-
+        # Phase 2 (thread pool): re-price each mirror — atomic in-place replace
+        # where supported, else cancel+place with a share-release retry (see
+        # _modify_place_one).
         with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
-            results = list(pool.map(_cancel_then_place, plan))
+            results = list(pool.map(_modify_place_one, plan))
 
         # Phase 3 (session thread): apply.
         req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
@@ -1111,7 +1151,20 @@ def cancel_and_replace_mirrors_for_modify(
                     metadata={"parent_order_id": str(old_trader_order_id), "broker_order_id": old_ch.broker_order_id, "error": err},
                 )
                 continue
-            # Cancel succeeded — the old mirror is gone at the broker.
+            if err is not None and err.startswith("replace_failed"):
+                # Atomic in-place replace failed → the ORIGINAL order is untouched
+                # and still working at its OLD terms. Do NOT mark it canceled: the
+                # subscriber keeps a live order (just at the stale price), which is
+                # strictly better than losing it. fills_sync / the next modify
+                # settles it.
+                audit.record(
+                    db, actor_user_id=old_ch.user_id, action="order.mirror_replace_failed_kept_old",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(old_trader_order_id), "broker_order_id": old_ch.broker_order_id, "error": err},
+                )
+                continue
+            # Cancel succeeded (or atomic replace succeeded) — the old mirror is
+            # gone at the broker (replaced/canceled); a NEW row carries the result.
             old_ch.status = OrderStatus.CANCELED
             old_ch.closed_at = datetime.now(timezone.utc)
             events.publish(old_ch.user_id, _order_event("order.cancelled", old_ch))

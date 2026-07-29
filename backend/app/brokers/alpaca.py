@@ -25,6 +25,7 @@ from alpaca.trading.requests import (
     GetOptionContractsRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    ReplaceOrderRequest,
     StopLimitOrderRequest,
     StopLossRequest,
     StopOrderRequest,
@@ -273,6 +274,38 @@ class AlpacaAdapter(BrokerAdapter):
         for why the distinction matters."""
         self._c().cancel_order_by_id(broker_order_id)
         return True
+
+    # Alpaca supports an atomic in-place order replace (PATCH /v2/orders/{id}) —
+    # so the copy-engine modify path re-prices in place instead of cancel+place,
+    # avoiding the share-reservation release race that lost subscriber sells on a
+    # rapid re-price (STKH, 2026-07-28). See base.replace_order.
+    supports_replace = True
+
+    def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
+        """Atomic price/qty change in place. Alpaca returns a NEW order id for the
+        replacement and terminates the old one; on failure the original order is
+        left working untouched. Never releases the position's share reservation —
+        the whole reason to prefer this over cancel+place for a re-price. Only the
+        changed fields (qty / limit / stop) are sent; the rest carry over."""
+        qty = (
+            int(req.quantity)
+            if req.instrument_type == InstrumentType.OPTION
+            else float(req.quantity)
+        )
+        data = ReplaceOrderRequest(
+            qty=qty,
+            limit_price=float(req.limit_price) if req.limit_price is not None else None,
+            stop_price=float(req.stop_price) if req.stop_price is not None else None,
+            client_order_id=req.client_order_id,
+        )
+        resp = self._c().replace_order_by_id(broker_order_id, data)
+        return BrokerOrderResult(
+            broker_order_id=str(resp.id),
+            status=_STATUS_IN.get(resp.status, OrderStatus.SUBMITTED),
+            submitted_at=resp.submitted_at or datetime.now(timezone.utc),
+            filled_quantity=Decimal(str(resp.filled_qty or 0)),
+            filled_avg_price=Decimal(str(resp.filled_avg_price)) if resp.filled_avg_price else None,
+        )
 
     # ── positions ─────────────────────────────────────────────────────────
 
