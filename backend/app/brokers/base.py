@@ -135,6 +135,27 @@ class BrokerAdapter(ABC):
         unknown."""
         raise NotImplementedError
 
+    # Whether this adapter can modify a working order's price/quantity IN PLACE
+    # (an atomic broker-side replace) rather than cancel-then-place. In-place
+    # replace never releases the position's share reservation, so a rapid
+    # re-price can't race the release — the Alpaca cancel+replace failure seen on
+    # prod (STKH, 2026-07-28): the cancelled order still showed the shares as
+    # held_for_orders, so the immediate re-place was rejected "insufficient qty".
+    # Adapters that support it set this True and implement replace_order; the
+    # copy-engine modify path checks the flag and falls back to cancel+place.
+    supports_replace: bool = False
+
+    def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
+        """Modify a WORKING order's price/quantity in place, atomically, returning
+        the resulting (replacement) order. Only defined for adapters with
+        ``supports_replace = True`` — the caller checks the flag first.
+
+        Atomic contract: on FAILURE the ORIGINAL order is left untouched (still
+        working at its old terms), so a failed replace never strands the
+        subscriber without an order. On success the broker may return a NEW order
+        id for the replacement (Alpaca does)."""
+        raise NotImplementedError
+
     def get_positions(self) -> list[BrokerPosition]:
         """List currently held positions at this broker account."""
         raise NotImplementedError
