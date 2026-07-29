@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -40,7 +40,8 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
-from app.services import excel_export
+from app.services import excel_export, market_hours
+from app.services.pnl import realized_pnl_by_day
 from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
@@ -340,6 +341,11 @@ def user_counts(
     return cache_svc.cached_json("stats:user_counts", 20, _compute)
 
 
+# Only the last few days can lack a snapshot (older days are frozen by the hourly
+# sweep), so the live fill-in for the admin Daily P&L never walks further back.
+LIVE_FILLIN_DAYS = 3
+
+
 @router.get("/daily-pnl")
 def admin_daily_pnl(
     db: Session = Depends(get_db),
@@ -353,46 +359,87 @@ def admin_daily_pnl(
         default=None, description="Limit to one user (trader or subscriber); omit for all."
     ),
 ) -> list[dict]:
-    """Per-day total P&L across ALL users, split trader vs subscriber, from the
-    broker-direct daily snapshots (daily_realized_pnl_snapshots). Pass ?user_id=
-    to scope to a single trader/subscriber. Note: Webull rows are realized,
-    Alpaca rows are marked — this is each broker's own daily figure summed, not
-    a single consistent basis. Newest day first."""
+    """Per-day total P&L across ALL users, split trader vs subscriber. Past days
+    come from the broker-direct daily snapshots (daily_realized_pnl_snapshots);
+    RECENT days a snapshot hasn't covered yet (today's in-progress session, or an
+    Alpaca day the broker hasn't finalized) are filled live from our own fills so
+    today's activity shows immediately instead of waiting for the post-close
+    sweep. Pass ?user_id= to scope to one trader/subscriber. Note: Webull
+    snapshots are realized, Alpaca are marked, and the live fill-in is realized —
+    each broker's own daily figure summed, not a single consistent basis. Newest
+    day first."""
     s = DailyRealizedPnlSnapshot
-    q = (
-        select(
-            s.day,
-            func.coalesce(
-                func.sum(case((User.role == UserRole.TRADER, s.realized_pnl), else_=0)), 0
-            ).label("trader"),
-            func.coalesce(
-                func.sum(case((User.role == UserRole.SUBSCRIBER, s.realized_pnl), else_=0)), 0
-            ).label("subscriber"),
-            func.coalesce(func.sum(s.realized_pnl), 0).label("total"),
-            func.count(func.distinct(s.user_id)).label("users"),
-        )
+    # 1) Snapshot rows (per user-day, so we know exactly which days are covered
+    #    and never double-count when we add the live fill-in below).
+    snap_q = (
+        select(s.user_id, s.day, s.realized_pnl, User.role)
         .join(User, User.id == s.user_id)
-        .group_by(s.day)
-        .order_by(s.day.desc())
     )
     if from_:
-        q = q.where(s.day >= from_)
+        snap_q = snap_q.where(s.day >= from_)
     if to:
-        q = q.where(s.day <= to)
+        snap_q = snap_q.where(s.day <= to)
     if user_id is not None:
-        q = q.where(s.user_id == user_id)
+        snap_q = snap_q.where(s.user_id == user_id)
     elif role in ("trader", "subscriber"):
-        q = q.where(User.role == UserRole(role))
-    rows = db.execute(q).all()
+        snap_q = snap_q.where(User.role == UserRole(role))
+
+    days: dict[date, dict] = {}
+    covered: set[tuple[uuid.UUID, date]] = set()
+
+    def _bucket(day: date) -> dict:
+        return days.setdefault(day, {"trader": Decimal(0), "subscriber": Decimal(0), "users": set()})
+
+    for uid, day, pnl, urole in db.execute(snap_q):
+        covered.add((uid, day))
+        b = _bucket(day)
+        if urole == UserRole.TRADER:
+            b["trader"] += pnl
+        elif urole == UserRole.SUBSCRIBER:
+            b["subscriber"] += pnl
+        b["users"].add(uid)
+
+    # 2) Live fill-in for recent days with no snapshot yet. Only the last few days
+    #    can lack a snapshot (older days are frozen), so bound the DB walk to that
+    #    window. Same source the calendar uses for its current-day value, so the
+    #    two views agree.
+    today = market_hours.now_et().date()
+    live_start = today - timedelta(days=LIVE_FILLIN_DAYS)
+    if from_:
+        live_start = max(live_start, from_)
+    live_end = today if to is None else min(today, to)
+    if live_end >= live_start:
+        urole_q = select(User.id, User.role).where(
+            User.role.in_((UserRole.TRADER, UserRole.SUBSCRIBER))
+        )
+        if user_id is not None:
+            urole_q = urole_q.where(User.id == user_id)
+        elif role in ("trader", "subscriber"):
+            urole_q = urole_q.where(User.role == UserRole(role))
+        for uid, urole in db.execute(urole_q):
+            daily = realized_pnl_by_day(
+                db, uid, start=live_start, end=live_end,
+                mirrors_only=(urole == UserRole.SUBSCRIBER),
+            )
+            for day, (pnl, _cnt) in daily.items():
+                if pnl == 0 or (uid, day) in covered:
+                    continue  # already frozen in a snapshot, or nothing to add
+                b = _bucket(day)
+                if urole == UserRole.TRADER:
+                    b["trader"] += Decimal(pnl)
+                else:
+                    b["subscriber"] += Decimal(pnl)
+                b["users"].add(uid)
+
     return [
         {
-            "day": r.day.isoformat(),
-            "trader_pnl": str(r.trader),
-            "subscriber_pnl": str(r.subscriber),
-            "total": str(r.total),
-            "users": r.users,
+            "day": day.isoformat(),
+            "trader_pnl": str(days[day]["trader"]),
+            "subscriber_pnl": str(days[day]["subscriber"]),
+            "total": str(days[day]["trader"] + days[day]["subscriber"]),
+            "users": len(days[day]["users"]),
         }
-        for r in rows
+        for day in sorted(days, reverse=True)
     ]
 
 
