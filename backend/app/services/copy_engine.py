@@ -188,6 +188,21 @@ class _DeferUntilEntryFills(Exception):
         self.entry_ids = entry_ids
 
 
+class _KeptProtectiveStop(Exception):
+    """Raised inside ``_place_mirror_with_conflict_resolve`` when a NON-stop mirror
+    close (a resting take-profit LIMIT) collides with the subscriber's existing
+    working STOP-loss on the same position. On Alpaca a position's shares back only
+    ONE resting sell, so the two can't coexist — and the naive conflict-resolver
+    would cancel the blocker, which is the STOP, silently removing downside
+    protection (observed on prod STKH, 2026-07-28). Instead we KEEP the stop and
+    skip this order. The subscriber still exits when the trader's take-profit fills
+    (fill-driven close). ``kept_stop_ids`` are the protective stop rows left working."""
+
+    def __init__(self, kept_stop_ids: list[uuid.UUID]):
+        super().__init__("kept protective stop-loss; conflicting take-profit not placed")
+        self.kept_stop_ids = kept_stop_ids
+
+
 # How long a deferred close waits before the retry-scheduler gives up on it (a
 # safety net if the entry-fill event is ever missed). Comfortably spans
 # pre-market → close so a 09:30 fill always fires the event-driven path first.
@@ -203,6 +218,13 @@ _WORKING_ORDER_STATUSES = (
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
 )
+
+# Order types that rest as a PROTECTIVE stop-loss. On Alpaca a position's shares
+# back only ONE resting sell, so a trader who rests BOTH a stop-loss and a
+# take-profit on the same position collides — and the conflict-resolve path must
+# not sacrifice the stop (downside protection) to place the take-profit. See
+# _KeptProtectiveStop / _working_protective_stop_ids.
+_PROTECTIVE_STOP_TYPES = (OrderType.STOP, OrderType.STOP_LIMIT)
 
 
 def _cancel_subscriber_conflicts(item: "_PendingMirror") -> list[uuid.UUID]:
@@ -276,6 +298,42 @@ def _working_entry_order_ids(item: "_PendingMirror") -> list[uuid.UUID]:
             )
         ).scalars().all()
     return list(rows)
+
+
+def _working_protective_stop_ids(
+    item: "_PendingMirror", db: Session | None = None
+) -> list[uuid.UUID]:
+    """IDs of the subscriber's still-WORKING protective STOP orders (stop-loss)
+    for the SAME contract as this mirror, excluding the order being placed.
+
+    Used to avoid cancelling a stop-loss to place a conflicting take-profit: on
+    Alpaca a position's shares back only ONE resting sell, so a trader resting
+    BOTH collides — and the STOP (downside protection) must win. Read-only; opens
+    its own session on the worker-thread call path (``db`` None) or uses the
+    caller's session when passed (tests)."""
+    req = item.request
+
+    def _q(sess: Session) -> list[uuid.UUID]:
+        return list(sess.execute(
+            select(Order.id).where(
+                Order.user_id == item.subscriber_user_id,
+                Order.broker_account_id == item.broker_account_id,
+                Order.instrument_type == req.instrument_type,
+                Order.symbol == req.symbol,
+                Order.option_expiry.is_not_distinct_from(req.option_expiry),
+                Order.option_strike.is_not_distinct_from(req.option_strike),
+                Order.option_right.is_not_distinct_from(req.option_right),
+                Order.order_type.in_(_PROTECTIVE_STOP_TYPES),
+                Order.status.in_(_WORKING_ORDER_STATUSES),
+                Order.broker_order_id.isnot(None),
+                Order.id != item.child_order_id,
+            )
+        ).scalars().all())
+
+    if db is not None:
+        return _q(db)
+    with SessionLocal() as own:
+        return _q(own)
 
 
 def _has_working_entry_for_contract(db: Session, user_id: uuid.UUID, order: Order) -> bool:
@@ -593,6 +651,21 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                 return retried
         if not (req.is_closing and is_order_conflict_error(exc)):
             raise
+
+        # Guard: never cancel a protective STOP to place a conflicting take-profit.
+        # A trader who rests BOTH a stop-loss and a take-profit on the same position
+        # (a manual OCO) collides on Alpaca, where a position's shares back only ONE
+        # resting sell. The conflict-resolve below would cancel the blocker — and
+        # that blocker is the STOP, silently removing downside protection (prod STKH
+        # 2026-07-28). So when THIS mirror is a non-forced resting LIMIT and a working
+        # stop-loss already guards the position, KEEP the stop and skip this order;
+        # the subscriber still exits when the trader's take-profit fills. A genuine
+        # exit (trader_filled → forced market/marketable close) is unaffected, and a
+        # stop-vs-stop modify (req is itself a STOP) also proceeds normally below.
+        if not item.trader_filled and req.order_type == OrderType.LIMIT:
+            kept = _working_protective_stop_ids(item)
+            if kept:
+                raise _KeptProtectiveStop(kept)
 
         # Re-clamp to the broker's LIVE held quantity (source of truth). Fixes
         # the fill-sync-lag case where our DB thought the subscriber held more
@@ -2284,6 +2357,39 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
             child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.placed", child))
+        elif isinstance(exc, _KeptProtectiveStop):
+            # A take-profit LIMIT collided with the subscriber's working stop-loss on
+            # the same position (Alpaca backs only ONE resting sell per position). We
+            # KEPT the stop (downside protection) and did NOT place this take-profit;
+            # the subscriber still exits when the trader's TP fills (fill-driven
+            # close). Record as CANCELED with a clear reason — never a scary reject.
+            child.status = OrderStatus.CANCELED
+            child.reject_reason = (
+                "Kept your stop-loss — your broker allows only one resting exit "
+                "order per position, so this take-profit wasn't placed. You'll still "
+                "exit when the trader's take-profit fills."
+            )[:480]
+            child.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db,
+                actor_user_id=item.subscriber_user_id,
+                action="copy.close_skipped_kept_stop",
+                entity_type="order",
+                entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(trader_order.id),
+                    "symbol": child.symbol,
+                    "kept_stop_ids": [str(i) for i in exc.kept_stop_ids],
+                },
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=item.subscriber_user_id,
+                broker_account_id=item.broker_account_id,
+                order_id=child.id,
+                status="skipped_kept_protective_stop",
+            ))
+            child.redis_published_at = datetime.now(timezone.utc)
+            events.publish(item.subscriber_user_id, _order_event("order.cancelled", child))
         else:
             # Broker call failed. Classify the error to decide between:
             #   1. User-fixable (insufficient buying power, after-hours
