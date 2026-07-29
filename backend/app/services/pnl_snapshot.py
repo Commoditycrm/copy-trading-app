@@ -122,18 +122,26 @@ def _fill_lagging_gap_days(
     """Backfill recent days SnapTrade's feed hasn't surfaced yet from our own
     filled orders, mutating `daily`/`source_by_day` in place.
 
-    A day is filled from the DB only when all hold: it's within
-    LAG_FALLBACK_DAYS of `end` (the feed's catch-up grace period), the broker
-    feed recorded no close there (count 0 — a pure gap), and our own orders did
-    realize a non-zero amount that day. Days the broker already reported stay
-    broker-authoritative, so correct feed values and the phantom guard on older
-    flat days are untouched; once the feed catches up, the next sweep overwrites
-    the fallback with the broker's own number."""
+    A day is filled from the DB only when all hold: the account belongs to a
+    TRADER, it's within LAG_FALLBACK_DAYS of `end` (the feed's catch-up grace
+    period), the broker feed recorded no close there (count 0 — a pure gap), and
+    our own orders did realize a non-zero amount that day. Days the broker already
+    reported stay broker-authoritative, so correct feed values and the phantom
+    guard on older flat days are untouched; once the feed catches up, the next
+    sweep overwrites the fallback with the broker's own number.
+
+    Traders only: a trader places directly at their broker, so our filled-order
+    records are trustworthy on a day the feed hasn't surfaced yet (the broker
+    later confirmed such a day to the cent). A subscriber's mirror fills get
+    re-recorded and can drift a close onto the wrong ET day, resurfacing the very
+    phantom Fix A kills — e.g. a close the broker realized on Jul 24 mis-dated to
+    Jul 25. Subscribers therefore stay broker-authoritative (no DB fallback)."""
     user = db.get(User, acct.user_id)
-    mirrors_only = user is not None and user.role == UserRole.SUBSCRIBER
+    if user is None or user.role != UserRole.TRADER:
+        return
     win_start = end - timedelta(days=LAG_FALLBACK_DAYS - 1)
     db_daily = realized_pnl_by_day(
-        db, acct.user_id, start=win_start, end=end, mirrors_only=mirrors_only
+        db, acct.user_id, start=win_start, end=end, mirrors_only=False
     )
     for day, (dpnl, dcnt) in db_daily.items():
         if dpnl == 0 and dcnt == 0:
