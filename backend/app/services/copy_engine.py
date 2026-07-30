@@ -148,6 +148,11 @@ class _PendingMirror:
     # working we mirror their limit as-is so the subscriber rests a cancellable
     # order — and Part B sweeps it to market if the trader's close later fills.
     trader_filled: bool = False
+    # The trader's own fill price (filled_avg_price) when trader_filled — used to
+    # anchor an extended-hours marketable LIMIT to where the trader actually
+    # traded, since our own quote can diverge from the trader's venue pre-market
+    # (see _to_immediate_close / _ext_hours_limit_price). None when not filled.
+    trader_fill_price: Decimal | None = None
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -416,40 +421,24 @@ def _alpaca_extended_hours(adapter: Any) -> bool:
     return isinstance(adapter, AlpacaAdapter) and market_hours.in_extended_hours()
 
 
-def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
-    """Rewrite a CLOSE order so it fills IMMEDIATELY — so a subscriber always
-    exits when the trader does. A copied LIMIT close routinely rests unfilled
-    (the price moves during copy latency), leaving the subscriber stuck in a
-    position the trader already left. This forces the exit:
+def _alpaca_regular_session(adapter: Any) -> bool:
+    """True when this is an Alpaca adapter AND we're in the regular US session —
+    the window where a plain option MARKET order is accepted and fills at the
+    market (options trade RTH-only). Outside it we price a marketable limit."""
+    try:
+        from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
+        from app.services import market_hours  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(adapter, AlpacaAdapter) and market_hours.in_regular_session()
 
-      * STOCK  → MARKET order (fills at the current market).
-      * OPTION → a MARKETABLE LIMIT at the current bid (SELL) / ask (BUY).
-        Alpaca rejects option MARKET orders ("no available quote", 40310000),
-        so we price a limit through the market instead — it fills like a market
-        order. If the quote can't be read, we leave the order unchanged (no
-        worse than today) rather than guess a bad price.
 
-    Only ever called for closes (is_closing=True); entries are never touched.
-    """
-    if req.instrument_type == InstrumentType.STOCK:
-        # Pre/post-market on Alpaca a plain MARKET order can't fill — Alpaca only
-        # trades extended hours as a LIMIT + extended_hours=True. This is exactly
-        # the EHGO case: the trader (Webull) filled pre-market but the subscriber's
-        # forced-MARKET mirror sat queued on Alpaca until 09:30, and a SELL on top
-        # of that stuck BUY was wash-trade-rejected. Route a marketable extended-
-        # hours limit so it fills now. Regular hours (and Webull, which trades
-        # extended hours natively) keep MARKET.
-        if _alpaca_extended_hours(adapter):
-            px = _marketable_stock_limit(adapter, req)
-            if px is not None:
-                return replace(
-                    req, order_type=OrderType.LIMIT, limit_price=px,
-                    stop_price=None, extended_hours=True,
-                )
-            # Couldn't price it — fall through to MARKET (no worse than before).
-        return replace(req, order_type=OrderType.MARKET, limit_price=None, stop_price=None)
-
-    # ── OPTION: marketable limit ──
+def _marketable_option_limit(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderRequest:
+    """Rewrite an option order as a MARKETABLE LIMIT priced through the book (SELL
+    → bid, BUY → ask) so it fills immediately. Returns the order unchanged when no
+    usable quote is available (no worse than not rewriting). Used for non-Alpaca
+    brokers, and as the fallback when an Alpaca option MARKET order is refused for
+    lack of a quotable NBBO."""
     if not (req.option_expiry and req.option_strike and req.option_right):
         return req
     if not hasattr(adapter, "get_option_latest_quote"):
@@ -471,6 +460,86 @@ def _to_immediate_close(adapter: Any, req: BrokerOrderRequest) -> BrokerOrderReq
     from app.services.trader_bracket_monitor import _round_close_limit  # noqa: PLC0415
     limit = _round_close_limit(px, req.side)  # rounds to a valid, fill-friendly option tick
     return replace(req, order_type=OrderType.LIMIT, limit_price=limit, stop_price=None)
+
+
+def _option_market_no_quote(msg: str) -> bool:
+    """True when a broker refused an option MARKET order because it had no
+    quotable price ("no available quote" / no NBBO) — retryable as a marketable
+    LIMIT. Deliberately narrow: other 40310000 errors (insufficient qty, not
+    fractionable, uncovered) are handled elsewhere and must NOT trigger this."""
+    m = msg.lower()
+    return "no available quote" in m or "no quote available" in m or "no nbbo" in m
+
+
+def _ext_hours_limit_price(
+    adapter: Any, req: BrokerOrderRequest, trader_ref_price: "Decimal | None"
+) -> "Decimal | None":
+    """Price an Alpaca extended-hours (pre/post-market) LIMIT. Prefer the TRADER's
+    fill price as the anchor — a BUY bids it × (1 + cap), a SELL offers it × (1 −
+    cap) — so the limit is marketable relative to where the trader actually traded,
+    not our own last-trade quote, which can diverge wildly pre-market on thin names
+    (prod STFS 2026-07-29: our quote ~3.09 vs the trader's 4.95 fill). The cap also
+    bounds the chase. Falls back to the local marketable-limit when we have no
+    trader anchor (e.g. the trader's order isn't filled yet). None if unpriceable."""
+    if trader_ref_price is not None and trader_ref_price > 0:
+        cap = Decimal(str(get_settings().mirror_ext_hours_slippage_pct)) / Decimal("100")
+        buf = (Decimal("1") + cap) if req.side == OrderSide.BUY else (Decimal("1") - cap)
+        px = (trader_ref_price * buf).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if px > 0:
+            return px
+    return _marketable_stock_limit(adapter, req)
+
+
+def _to_immediate_close(
+    adapter: Any, req: BrokerOrderRequest, trader_ref_price: "Decimal | None" = None
+) -> BrokerOrderRequest:
+    """Rewrite a CLOSE (or forced ENTRY) so it fills IMMEDIATELY — so a subscriber
+    always exits/enters when the trader does. A copied LIMIT routinely rests
+    unfilled (the price moves during copy latency), leaving the subscriber stuck.
+    This forces it:
+
+      * STOCK  → MARKET in regular hours. In extended hours Alpaca is LIMIT-only,
+        so a marketable LIMIT anchored to ``trader_ref_price`` (the trader's fill)
+        when known, else our last-trade quote — see _ext_hours_limit_price.
+      * OPTION → MARKET on Alpaca during regular hours (Alpaca DOES accept option
+        market orders in-session, and a market order fills like the trader's — no
+        stale-quote risk). Outside regular hours, or on non-Alpaca brokers, a
+        MARKETABLE LIMIT priced through the book (SELL → bid, BUY → ask). A rare
+        "no available quote" rejection on the Alpaca market order falls back to
+        the marketable limit in the place path (_option_market_no_quote).
+
+    ``trader_ref_price`` is the trader's own fill price; passed only when the
+    trader has filled, and used solely for the extended-hours stock anchor above.
+    Works in either direction (BUY → ask / SELL → bid).
+    """
+    if req.instrument_type == InstrumentType.STOCK:
+        # Pre/post-market on Alpaca a plain MARKET order can't fill — Alpaca only
+        # trades extended hours as a LIMIT + extended_hours=True. This is exactly
+        # the EHGO case: the trader (Webull) filled pre-market but the subscriber's
+        # forced-MARKET mirror sat queued on Alpaca until 09:30, and a SELL on top
+        # of that stuck BUY was wash-trade-rejected. Route a marketable extended-
+        # hours limit so it fills now. Regular hours (and Webull, which trades
+        # extended hours natively) keep MARKET.
+        if _alpaca_extended_hours(adapter):
+            px = _ext_hours_limit_price(adapter, req, trader_ref_price)
+            if px is not None:
+                return replace(
+                    req, order_type=OrderType.LIMIT, limit_price=px,
+                    stop_price=None, extended_hours=True,
+                )
+            # Couldn't price it — fall through to MARKET (no worse than before).
+        return replace(req, order_type=OrderType.MARKET, limit_price=None, stop_price=None)
+
+    # ── OPTION ──
+    # Alpaca accepts option MARKET orders during regular hours, and a market order
+    # fills like the trader's — no stale-quote risk (the marketable-limit route
+    # could rest above a moved/wide quote and never fill: prod NVDA C195 SELL,
+    # 2026-07-29, sat as a $0.55 limit and was cancelled unfilled). Prefer MARKET
+    # there; a rare "no available quote" rejection falls back to the marketable
+    # limit in the place path. Non-Alpaca / outside RTH keeps the marketable limit.
+    if _alpaca_regular_session(adapter):
+        return replace(req, order_type=OrderType.MARKET, limit_price=None, stop_price=None)
+    return _marketable_option_limit(adapter, req)
 
 
 def _market_type_refused(msg: str) -> bool:
@@ -582,7 +651,7 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                         raise _DanglingEntryCancelled(cancelled)
                 # else: not a close and no entry → genuine opening short; fall through.
         if should_close_now:
-            req = _to_immediate_close(item.adapter, req)
+            req = _to_immediate_close(item.adapter, req, item.trader_fill_price)
             if not req.is_closing:
                 # Mark closing so the conflict-resolve + live re-clamp below
                 # treat it as a close too.
@@ -604,7 +673,7 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
             # reach on the subscriber's venue — the "trader filled, subscriber
             # didn't" gap). _to_immediate_close prices through the market in the
             # order's own direction (BUY → ask), so it works for entries as well.
-            req = _to_immediate_close(item.adapter, req)
+            req = _to_immediate_close(item.adapter, req, item.trader_fill_price)
             item.request = req
     # Non-forced entry pre/post-market on Alpaca: a plain limit won't trade in
     # extended hours unless flagged, so a resting pre-market mirror would sit
@@ -649,6 +718,22 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                 raise exc2 from exc
             if retried is not None:
                 return retried
+        # Alpaca refused an option MARKET order for lack of a quotable NBBO ("no
+        # available quote") — a rare quote gap or the near-close options cutoff.
+        # Retry as a marketable LIMIT priced through the book. Applies to a forced
+        # entry and a forced close alike (both route through _to_immediate_close).
+        if (
+            req.instrument_type == InstrumentType.OPTION
+            and req.order_type == OrderType.MARKET
+            and _option_market_no_quote(str(exc))
+        ):
+            limit_req = _marketable_option_limit(item.adapter, req)
+            if limit_req.order_type == OrderType.LIMIT:
+                item.request = limit_req
+                try:
+                    return item.adapter.place_order(limit_req)
+                except Exception as exc2:  # noqa: BLE001
+                    exc = exc2  # fall through to the remaining handling with the new error
         if not (req.is_closing and is_order_conflict_error(exc)):
             raise
 
@@ -1246,6 +1331,11 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
     hook after the trader row is committed."""
     from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
     with SessionLocal() as db:
+        # The trader's own fill price — anchors an extended-hours sweep limit to
+        # where the trader actually traded (see _ext_hours_limit_price), instead of
+        # our own possibly-divergent pre-market quote.
+        _trader = db.get(Order, trader_order_id)
+        trader_ref_price = _trader.filled_avg_price if _trader is not None else None
         children = list(db.execute(
             select(Order).where(
                 Order.parent_order_id == trader_order_id,
@@ -1331,7 +1421,7 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 is_closing=ch.is_closing,
                 client_order_id=str(new_id),
             )
-            req = _to_immediate_close(adapter, req)
+            req = _to_immediate_close(adapter, req, trader_ref_price)
             # Preserve the mirror's own is_closing (set above from ch) — do NOT
             # force it True, or an ENTRY would be sent as a *_TO_CLOSE action.
             if req.client_order_id != str(new_id):
@@ -2224,6 +2314,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 # A working trader order (mirrored via bring_open_orders) stays a
                 # cancellable limit until it fills; Part B forces it then.
                 trader_filled=(trader_order.status == OrderStatus.FILLED),
+                # The trader's own fill price — anchors an extended-hours limit to
+                # where the trader actually traded (see _ext_hours_limit_price).
+                trader_fill_price=trader_order.filled_avg_price,
             ))
 
     # End of Phase 1: one batched flush for every child we just added.
