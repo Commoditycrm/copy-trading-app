@@ -292,10 +292,14 @@ class AlpacaAdapter(BrokerAdapter):
             if req.instrument_type == InstrumentType.OPTION
             else float(req.quantity)
         )
+        # Only send a price leg that's actually set. A STOP order carries
+        # limit_price=0 (not None), and Alpaca's ReplaceOrderRequest rejects a
+        # zero limit ("limit_price must be greater than 0") — which silently blocked
+        # stop-price modifies from propagating. Treat 0 as "unset" for both legs.
         data = ReplaceOrderRequest(
             qty=qty,
-            limit_price=float(req.limit_price) if req.limit_price is not None else None,
-            stop_price=float(req.stop_price) if req.stop_price is not None else None,
+            limit_price=float(req.limit_price) if req.limit_price else None,
+            stop_price=float(req.stop_price) if req.stop_price else None,
             client_order_id=req.client_order_id,
         )
         resp = self._c().replace_order_by_id(broker_order_id, data)

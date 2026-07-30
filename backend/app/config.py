@@ -75,6 +75,15 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # Extended-hours (pre/post-market) mirror pricing. Alpaca is LIMIT-only then,
+    # so a forced entry/close is routed as a marketable limit. When we know the
+    # TRADER's fill price we anchor that limit to it ± this percent (a BUY bids
+    # trader_fill × (1 + pct/100); a SELL offers trader_fill × (1 − pct/100)) —
+    # our own last-trade quote can diverge wildly from the trader's venue on thin
+    # pre-market names, leaving the limit below the market and unfilled (prod STFS
+    # 2026-07-29: our quote ~3.09 vs the trader's 4.95 fill). The percent also caps
+    # how far we chase. REGULAR-hours orders are unaffected — they still go MARKET.
+    mirror_ext_hours_slippage_pct: float = 3.0
     # ── End-of-day subscriber safety auto-close ───────────────────────────
     # At 15:55 ET (5 minutes before the 16:00 US close) the worker market-closes
     # every subscriber's SAME-DAY-EXPIRY (0DTE) option positions, and the fanout
