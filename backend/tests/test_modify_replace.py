@@ -175,6 +175,73 @@ def test_fallback_non_conflict_error_does_not_retry():
     assert resp is None and err.startswith("place_failed")
 
 
+# ── AlpacaAdapter.replace_order builds a valid ReplaceOrderRequest ────────────
+# Regression for the prod bug (NVDA stop, 07-29): a STOP mirror carries
+# limit_price=0, and passing that to Alpaca's ReplaceOrderRequest raised
+# "limit_price must be greater than 0", so stop-price modifies never propagated
+# (they failed safe via order.mirror_replace_failed_kept_old). 0 must be treated
+# as "unset".
+
+class _FakeAlpacaClient:
+    def __init__(self):
+        self.captured = None
+    def replace_order_by_id(self, order_id, order_data):
+        self.captured = order_data
+        class _R:
+            id = "new-alpaca-id"
+            status = "accepted"
+            submitted_at = None
+            filled_qty = "0"
+            filled_avg_price = None
+        return _R()
+
+
+def _alpaca_with_fake():
+    from app.brokers.alpaca import AlpacaAdapter
+    ad = AlpacaAdapter({"api_key": "k", "api_secret": "s", "paper": True})
+    ad._client = _FakeAlpacaClient()  # lazy client — inject a fake, no network
+    return ad
+
+
+def test_replace_stop_order_omits_zero_limit_price():
+    """A stop mirror (limit_price=0, stop_price set) must NOT send limit_price=0
+    to Alpaca — that's the validation error that blocked stop modifies."""
+    ad = _alpaca_with_fake()
+    stop_req = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION,
+        symbol="NVDA",
+        side=OrderSide.SELL,
+        order_type=OrderType.STOP,
+        quantity=Decimal("10"),
+        limit_price=Decimal("0"),        # stop orders carry 0 here, not None
+        stop_price=Decimal("0.45"),
+        is_closing=True,
+    )
+    resp = ad.replace_order("old-id", stop_req)   # must not raise
+    captured = ad._client.captured
+    assert captured.limit_price is None            # zero limit dropped
+    assert float(captured.stop_price) == 0.45      # stop leg preserved
+    assert resp.broker_order_id == "new-alpaca-id"
+
+
+def test_replace_limit_order_keeps_limit_price():
+    """A normal limit mirror still sends its (non-zero) limit_price."""
+    ad = _alpaca_with_fake()
+    limit_req = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION,
+        symbol="NVDA",
+        side=OrderSide.SELL,
+        order_type=OrderType.LIMIT,
+        quantity=Decimal("10"),
+        limit_price=Decimal("0.55"),
+        is_closing=True,
+    )
+    ad.replace_order("old-id", limit_req)
+    captured = ad._client.captured
+    assert float(captured.limit_price) == 0.55
+    assert captured.stop_price is None
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
