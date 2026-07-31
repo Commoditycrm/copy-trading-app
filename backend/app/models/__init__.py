@@ -8,6 +8,7 @@ from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.notification import Notification
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "OrderStatus",
     "OrderType",
     "RetryInterval",
+    "SubscriberFollow",
     "SubscriberSettings",
     "TestResult",
     "TraderSettings",
