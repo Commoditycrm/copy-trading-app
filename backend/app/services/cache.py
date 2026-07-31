@@ -53,6 +53,14 @@ class CachedSubscriber:
     # When True the subscriber copies the trader's per-trade SL/TP. Read in
     # fanout to decide whether to stamp the percent bracket onto the child.
     copy_trader_bracket: bool = False
+    # Per-subscriber end-of-day 0DTE auto-close: opt-in + window (1–30 min). Read
+    # in fanout for the EOD new-order lockout. MUST be cached — without it the
+    # lockout reads getattr(...)=False and silently no-ops, so fresh same-day-expiry
+    # mirrors slip through while the sweep is flattening those very contracts
+    # (prod: sweep closed 0DTE positions but new 0DTE orders were still accepted).
+    # Defaults mirror SubscriberSettings.
+    eod_autoclose_enabled: bool = False
+    eod_autoclose_minutes: int = 15
 
 
 @dataclass(frozen=True)
@@ -99,6 +107,8 @@ def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
         "symbol_exclusion_list": list(s.symbol_exclusion_list or []),
         "symbol_inclusion_list": list(s.symbol_inclusion_list or []),
         "copy_trader_bracket": bool(getattr(s, "copy_trader_bracket", False)),
+        "eod_autoclose_enabled": bool(getattr(s, "eod_autoclose_enabled", False)),
+        "eod_autoclose_minutes": int(getattr(s, "eod_autoclose_minutes", 15) or 15),
     }
 
 
@@ -115,6 +125,8 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         symbol_exclusion_list=tuple(d.get("symbol_exclusion_list") or ()),
         symbol_inclusion_list=tuple(d.get("symbol_inclusion_list") or ()),
         copy_trader_bracket=bool(d.get("copy_trader_bracket", False)),
+        eod_autoclose_enabled=bool(d.get("eod_autoclose_enabled", False)),
+        eod_autoclose_minutes=int(d.get("eod_autoclose_minutes", 15) or 15),
     )
 
 
@@ -209,6 +221,8 @@ async def get_subscribers_for_trader(
             symbol_exclusion_list=tuple(row.symbol_exclusion_list or ()),
             symbol_inclusion_list=tuple(row.symbol_inclusion_list or ()),
             copy_trader_bracket=bool(row.copy_trader_bracket),
+            eod_autoclose_enabled=bool(row.eod_autoclose_enabled),
+            eod_autoclose_minutes=int(row.eod_autoclose_minutes or 15),
         )
         for row in rows
     ]
