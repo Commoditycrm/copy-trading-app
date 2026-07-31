@@ -17,6 +17,7 @@ from app.api.deps import client_ip, require_subscriber, require_trader
 from app.database import get_db
 from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.settings import SubscriberSettings, TraderSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 from app.schemas.follow import FollowRequestCreate, FollowRequestOut
 from app.services import audit, cache, notifications
@@ -206,15 +207,24 @@ def _decide(
     trader_label = _trader_label(user)
 
     # Auto-follow on approval — the subscriber shouldn't need a second click.
-    # Point their follow at this trader (single-valued; overwrites any prior
-    # follow) and bust the fanout caches so copy_engine sees it immediately.
+    # Multi-trader: ADD this trader to the subscriber's follows (idempotent) —
+    # does NOT drop any existing follow. following_trader_id is kept as the
+    # subscriber's PRIMARY trader (first followed), used for the app wordmark and
+    # legacy single-trader lookups. Bust this trader's fanout cache so copy_engine
+    # picks it up immediately.
     if approve:
         ss = db.get(SubscriberSettings, fr.subscriber_id)
         if ss is not None:
-            prev_trader = ss.following_trader_id
-            ss.following_trader_id = user.id
-            if prev_trader and prev_trader != user.id:
-                cache.invalidate_subscribers_for_trader(prev_trader)
+            existing = db.execute(
+                select(SubscriberFollow).where(
+                    SubscriberFollow.subscriber_id == fr.subscriber_id,
+                    SubscriberFollow.trader_id == user.id,
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                db.add(SubscriberFollow(subscriber_id=fr.subscriber_id, trader_id=user.id))
+            if ss.following_trader_id is None:
+                ss.following_trader_id = user.id
             cache.invalidate_subscribers_for_trader(user.id)
 
     notifications.create_notification(

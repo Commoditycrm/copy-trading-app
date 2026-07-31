@@ -1,13 +1,14 @@
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user, require_subscriber, require_trader
 from app.database import get_db
 from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 from app.schemas.settings import (
     AutoLiquidationLimitIn,
@@ -144,7 +145,7 @@ def reset_subscriber_settings(
     # Bust the fanout cache so copy_engine picks up the wiped multiplier /
     # filters on the next mirror instead of a stale snapshot.
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -180,7 +181,7 @@ def set_daily_profit_limit(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -213,7 +214,7 @@ def set_daily_loss_limit(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -248,7 +249,7 @@ def set_daily_loss_limit_pct(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -283,7 +284,7 @@ def set_daily_profit_limit_pct(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -351,7 +352,7 @@ def set_max_account_pct(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -429,7 +430,7 @@ def set_auto_liquidation_limit(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -469,7 +470,7 @@ def set_position_tp_pct(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -503,7 +504,7 @@ def set_position_sl_pct(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -534,7 +535,7 @@ def set_copy_trader_bracket(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -572,7 +573,7 @@ def set_eod_autoclose(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -688,7 +689,7 @@ def set_symbol_filter(
     # filter on the very next fanout (otherwise it could keep using a
     # stale snapshot for a few seconds).
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -733,7 +734,7 @@ def toggle_copy(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return s
 
 
@@ -761,7 +762,7 @@ def set_own_multiplier(
     db.commit()
     db.refresh(s)
     if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+        cache.invalidate_subscribers_for_follower(db, s.user_id)
     return s
 
 
@@ -794,8 +795,28 @@ def follow_trader(
             ).scalar_one_or_none()
             if approved is None:
                 raise HTTPException(403, "follow_not_approved")
-    old_trader_id = s.following_trader_id
-    s.following_trader_id = payload.trader_id
+    if payload.trader_id is not None:
+        # Multi-trader: ADD this trader to the subscriber's follows (idempotent);
+        # does NOT drop any existing follow. following_trader_id is the PRIMARY
+        # (first follow) — used for the app wordmark / legacy lookups.
+        existing = db.execute(
+            select(SubscriberFollow).where(
+                SubscriberFollow.subscriber_id == user.id,
+                SubscriberFollow.trader_id == payload.trader_id,
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(SubscriberFollow(subscriber_id=user.id, trader_id=payload.trader_id))
+        if s.following_trader_id is None:
+            s.following_trader_id = payload.trader_id
+        invalidated = [payload.trader_id]
+    else:
+        # trader_id = None → unfollow EVERYONE (clear all follows + primary).
+        invalidated = list(db.execute(
+            select(SubscriberFollow.trader_id).where(SubscriberFollow.subscriber_id == user.id)
+        ).scalars())
+        db.execute(delete(SubscriberFollow).where(SubscriberFollow.subscriber_id == user.id))
+        s.following_trader_id = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -807,10 +828,48 @@ def follow_trader(
     )
     db.commit()
     db.refresh(s)
-    if old_trader_id:
-        cache.invalidate_subscribers_for_trader(old_trader_id)
-    if payload.trader_id:
-        cache.invalidate_subscribers_for_trader(payload.trader_id)
+    for tid in invalidated:
+        cache.invalidate_subscribers_for_trader(tid)
+    return s
+
+
+@router.post("/subscriber/unfollow", response_model=SubscriberSettingsOut)
+def unfollow_trader(
+    payload: FollowTraderIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettings:
+    """Unfollow ONE specific trader (multi-trader). Removes that follow row; if it
+    was the subscriber's primary (following_trader_id), repoint the primary to any
+    remaining follow, else clear it. No-op if not following that trader."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    if payload.trader_id is None:
+        raise HTTPException(422, "trader_id_required")
+    db.execute(delete(SubscriberFollow).where(
+        SubscriberFollow.subscriber_id == user.id,
+        SubscriberFollow.trader_id == payload.trader_id,
+    ))
+    if s.following_trader_id == payload.trader_id:
+        s.following_trader_id = db.execute(
+            select(SubscriberFollow.trader_id)
+            .where(SubscriberFollow.subscriber_id == user.id)
+            .limit(1)
+        ).scalar_one_or_none()
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.unfollowed_trader",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={"trader_id": str(payload.trader_id)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    cache.invalidate_subscribers_for_trader(payload.trader_id)
     return s
 
 

@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.settings import SubscriberSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.services.redis_client import get_async_redis, get_sync_redis
 
 log = logging.getLogger(__name__)
@@ -199,10 +200,15 @@ async def get_subscribers_for_trader(
         except Exception:  # noqa: BLE001
             log.exception("corrupt cache entry %s — refetching", key)
 
+    # Multi-trader: a subscriber mirrors this trader if they have a
+    # subscriber_follows row for them (they can follow many at once). copy_enabled
+    # is the subscriber's single GLOBAL on/off switch, applied to every follow.
     rows = (
         db.execute(
-            select(SubscriberSettings).where(
-                SubscriberSettings.following_trader_id == trader_id,
+            select(SubscriberSettings)
+            .join(SubscriberFollow, SubscriberFollow.subscriber_id == SubscriberSettings.user_id)
+            .where(
+                SubscriberFollow.trader_id == trader_id,
                 SubscriberSettings.copy_enabled.is_(True),
             )
         )
@@ -212,7 +218,9 @@ async def get_subscribers_for_trader(
     cached = [
         CachedSubscriber(
             user_id=row.user_id,
-            following_trader_id=row.following_trader_id,
+            # In THIS fanout's context the subscriber is following `trader_id`
+            # (they may also follow others). Cached per-trader under _k_subs.
+            following_trader_id=trader_id,
             copy_enabled=row.copy_enabled,
             multiplier=row.multiplier,
             daily_loss_limit=row.daily_loss_limit,
@@ -240,6 +248,25 @@ def invalidate_subscribers_for_trader(trader_id: uuid.UUID) -> None:
         get_sync_redis().delete(_k_subs(trader_id))
     except Exception:  # noqa: BLE001
         log.warning("redis delete failed for subs:%s", trader_id)
+
+
+def invalidate_subscribers_for_follower(db: Session, subscriber_id: uuid.UUID) -> None:
+    """Bust the fanout cache for EVERY trader this subscriber follows. Call after a
+    subscriber changes a GLOBAL copy setting (copy on/off, multiplier, filters,
+    limits) — one change affects their slice of all those traders' cached lists, so
+    invalidating only the primary would leave secondary follows stale for the TTL.
+    Multi-trader companion to invalidate_subscribers_for_trader."""
+    try:
+        trader_ids = db.execute(
+            select(SubscriberFollow.trader_id).where(
+                SubscriberFollow.subscriber_id == subscriber_id
+            )
+        ).scalars().all()
+    except Exception:  # noqa: BLE001
+        log.warning("could not read follows for subscriber %s", subscriber_id)
+        return
+    for tid in trader_ids:
+        invalidate_subscribers_for_trader(tid)
 
 
 # ── broker accounts cache ─────────────────────────────────────────────────
