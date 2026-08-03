@@ -687,6 +687,15 @@ def _enforce_one(acct: BrokerAccount) -> None:
         hit_pct = (
             pct_limit_dollars is not None and todays_trading_value >= pct_limit_dollars
         )
+        # Dollar variant of the daily trading cap — mutually exclusive with
+        # the pct variant (only one column is ever non-NULL). Compares the
+        # same today's-trading-value metric against a FIXED absolute amount
+        # instead of a % of the day-start balance, so it works even when
+        # beginning_day_balance is unavailable.
+        hit_max_usd = (
+            s.max_account_usd_per_day is not None
+            and todays_trading_value >= s.max_account_usd_per_day
+        )
         # Auto-liquidation: a take-profit ceiling on UNREALIZED P&L for
         # the day (today's total mark-to-market gains on still-open
         # positions). Distinct from daily_profit_limit which is a REALIZED
@@ -772,7 +781,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
             except Exception:  # noqa: BLE001
                 log.exception("pnl_poller: notification failed for user=%s", s.user_id)
 
-        if s.copy_enabled and (hit_loss or hit_profit or hit_pct or hit_loss_pct or hit_profit_pct):
+        if s.copy_enabled and (hit_loss or hit_profit or hit_pct or hit_loss_pct or hit_profit_pct or hit_max_usd):
             if hit_loss:
                 reason = "daily_loss_limit"
             elif hit_profit:
@@ -781,8 +790,10 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 reason = "daily_loss_limit_pct"
             elif hit_profit_pct:
                 reason = "daily_profit_limit_pct"
-            else:
+            elif hit_pct:
                 reason = "max_account_pct_per_day"
+            else:
+                reason = "max_account_usd_per_day"
             s.copy_enabled = False
             s.pnl_auto_paused_at = now_utc
             audit.record(
@@ -803,6 +814,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
                     "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
                     "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
+                    "max_account_usd_per_day": str(s.max_account_usd_per_day) if s.max_account_usd_per_day else None,
                     "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
                 },
             )
@@ -820,6 +832,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
                 "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
                 "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
+                "max_account_usd_per_day": str(s.max_account_usd_per_day) if s.max_account_usd_per_day else None,
                 "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
                 "todays_realized_pnl":     str(todays_pl),
                 "todays_trading_value":    str(todays_trading_value),
@@ -855,12 +868,19 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     f"(${profit_pct_dollars}). Copy trading is now OFF; turn it back "
                     f"on when you're ready."
                 )
-            else:  # max_account_pct_per_day
+            elif reason == "max_account_pct_per_day":
                 pause_msg = (
                     f"Daily trading cap reached — today's traded value "
                     f"${todays_trading_value} hit your {s.max_account_pct_per_day}% "
                     f"of-account cap (${pct_limit_dollars}). Copy trading is now OFF; "
                     f"turn it back on when you're ready."
+                )
+            else:  # max_account_usd_per_day
+                pause_msg = (
+                    f"Daily trading cap reached — today's traded value "
+                    f"${todays_trading_value} hit your ${s.max_account_usd_per_day} "
+                    f"daily cap. Copy trading is now OFF; turn it back on when "
+                    f"you're ready."
                 )
             try:
                 from app.services import notifications as notif_svc  # noqa: PLC0415
@@ -963,6 +983,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
             "loss_pct_dollars":        str(loss_pct_dollars) if loss_pct_dollars is not None else None,
             "profit_pct_dollars":      str(profit_pct_dollars) if profit_pct_dollars is not None else None,
             "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
+            "max_account_usd_per_day": str(s.max_account_usd_per_day) if s.max_account_usd_per_day else None,
             "max_per_contract":        str(s.max_per_contract) if s.max_per_contract else None,
             "auto_liquidation_limit":  str(s.auto_liquidation_limit) if s.auto_liquidation_limit else None,
             "position_tp_pct":         str(s.position_tp_pct) if s.position_tp_pct is not None else None,

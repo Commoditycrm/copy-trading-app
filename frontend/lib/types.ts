@@ -234,6 +234,12 @@ export interface SubscriberSettings {
    *  today's filled trade NOTIONAL (USD) crosses
    *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */
   max_account_pct_per_day: string | null;
+  /** Dollar variant of the daily trading cap — mutually exclusive with
+   *  `max_account_pct_per_day`. When today's filled trade NOTIONAL (USD)
+   *  crosses this absolute amount, pnl_poller auto-pauses copy. Exactly
+   *  one of the two is non-null (or both null when the cap is off); the
+   *  UI reads whichever is set to pick the "%" / "$" unit. */
+  max_account_usd_per_day: string | null;
   /** Auto-liquidation floor (USD). When broker-reported equity drops
    *  to/below this value, pnl_poller closes every open position at
    *  market and flips `copy_enabled` to false until the subscriber

@@ -43,6 +43,10 @@ class SubscriberSettingsOut(BaseModel):
     # today's equity from Alpaca; pauses copy if today's P&L breaches the
     # derived dollar threshold.
     max_account_pct_per_day: Decimal | None = None
+    # Dollar variant of the daily trading cap — mutually exclusive with
+    # max_account_pct_per_day. Exactly one is non-NULL (or both NULL when
+    # the cap is off). The UI reads whichever is set to pick the unit.
+    max_account_usd_per_day: Decimal | None = None
     # Account-equity floor that triggers full liquidation + copy disable.
     # When the pnl_poller sees broker equity <= this value, every open
     # position is closed at market and copy_enabled flips to False until
@@ -130,6 +134,16 @@ class MaxAccountPctIn(BaseModel):
     0 < pct <= 100."""
 
     max_account_pct_per_day: Decimal | None = Field(default=None, gt=0, le=100)
+
+
+class MaxAccountUsdIn(BaseModel):
+    """Dollar variant of the daily trading cap. When today's cumulative
+    filled trade NOTIONAL (USD) crosses this absolute amount, pnl_poller
+    auto-pauses copy. Mutually exclusive with max_account_pct_per_day —
+    setting this NULLs the pct column. Pass null to disable. amount > 0
+    (a $0 cap would trip immediately)."""
+
+    max_account_usd_per_day: Decimal | None = Field(default=None, gt=0)
 
 
 class DailyLossLimitPctIn(BaseModel):
