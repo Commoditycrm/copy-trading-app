@@ -19,6 +19,7 @@ from app.schemas.settings import (
     DailyProfitLimitPctIn,
     FollowTraderIn,
     MaxAccountPctIn,
+    MaxAccountUsdIn,
     MaxPerContractIn,
     PositionSlPctIn,
     PositionTpPctIn,
@@ -68,6 +69,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         symbol_inclusion_list=list(s.symbol_inclusion_list or []),
         max_per_contract=s.max_per_contract,
         max_account_pct_per_day=s.max_account_pct_per_day,
+        max_account_usd_per_day=s.max_account_usd_per_day,
         auto_liquidation_limit=s.auto_liquidation_limit,
         auto_liquidated_at=s.auto_liquidated_at,
         daily_loss_limit_pct=s.daily_loss_limit_pct,
@@ -117,6 +119,7 @@ def reset_subscriber_settings(
     s.auto_liquidation_limit = None
     s.max_per_contract = None
     s.max_account_pct_per_day = None
+    s.max_account_usd_per_day = None
     s.position_tp_pct = None
     s.position_sl_pct = None
     s.copy_trader_bracket = False
@@ -159,6 +162,9 @@ def set_daily_profit_limit(
         raise HTTPException(404, "settings_missing")
     old = s.daily_profit_limit
     s.daily_profit_limit = payload.daily_profit_limit
+    # Unit is mutually exclusive — choosing "$" clears the "%" sibling so
+    # pnl_poller only ever sees one non-NULL threshold for this field.
+    s.daily_profit_limit_pct = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -190,6 +196,8 @@ def set_daily_loss_limit(
         raise HTTPException(404, "settings_missing")
     old = s.daily_loss_limit
     s.daily_loss_limit = payload.daily_loss_limit
+    # Unit is mutually exclusive — choosing "$" clears the "%" sibling.
+    s.daily_loss_limit_pct = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -223,6 +231,8 @@ def set_daily_loss_limit_pct(
         raise HTTPException(404, "settings_missing")
     old = s.daily_loss_limit_pct
     s.daily_loss_limit_pct = payload.daily_loss_limit_pct
+    # Unit is mutually exclusive — choosing "%" clears the "$" sibling.
+    s.daily_loss_limit = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -256,6 +266,8 @@ def set_daily_profit_limit_pct(
         raise HTTPException(404, "settings_missing")
     old = s.daily_profit_limit_pct
     s.daily_profit_limit_pct = payload.daily_profit_limit_pct
+    # Unit is mutually exclusive — choosing "%" clears the "$" sibling.
+    s.daily_profit_limit = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -322,6 +334,8 @@ def set_max_account_pct(
         raise HTTPException(404, "settings_missing")
     old = s.max_account_pct_per_day
     s.max_account_pct_per_day = payload.max_account_pct_per_day
+    # Unit is mutually exclusive — choosing "%" clears the "$" sibling.
+    s.max_account_usd_per_day = None
     audit.record(
         db,
         actor_user_id=user.id,
@@ -331,6 +345,43 @@ def set_max_account_pct(
         metadata={
             "old": str(old) if old is not None else None,
             "new": str(payload.max_account_pct_per_day) if payload.max_account_pct_per_day is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/max-account-usd", response_model=SubscriberSettingsOut)
+def set_max_account_usd(
+    payload: MaxAccountUsdIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Dollar variant of the daily trading cap. When today's cumulative
+    filled trade NOTIONAL crosses this absolute amount, pnl_poller
+    auto-pauses copy. Mutually exclusive with max_account_pct_per_day —
+    setting this clears the pct sibling."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.max_account_usd_per_day
+    s.max_account_usd_per_day = payload.max_account_usd_per_day
+    # Unit is mutually exclusive — choosing "$" clears the "%" sibling.
+    s.max_account_pct_per_day = None
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.max_account_usd_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.max_account_usd_per_day) if payload.max_account_usd_per_day is not None else None,
         },
         ip_address=client_ip(request),
     )
