@@ -1045,10 +1045,25 @@ class SnapTradeAdapter(BrokerAdapter):
         #   1. balance.total.amount (broker's mark-to-market total)
         #   2. balance.total_equity from get_user_account_balance
         #      (some SDK versions surface it here)
-        #   3. cash (last-resort fallback — paper accounts often have
-        #      no other signal, and todays_pl will track only realized
-        #      cash movement)
-        equity = total_amount or snap.get("total_equity") or cash
+        #   3. cash + Σ(position market value) — reconstructed MTM total.
+        #      Many SnapTrade brokerages (Webull, paper accounts) report
+        #      ONLY cash, with no mark-to-market total. Using cash alone
+        #      makes today's P&L ignore open positions entirely: a BUY just
+        #      moves value from cash into a position, so cash-based P&L
+        #      swings down on entry and only reflects gains once you CLOSE.
+        #      That silently under-counts unrealized P&L, so a daily
+        #      loss/profit limit set to "total" never sees open-position
+        #      moves. Rebuild the real total from cash + the summed market
+        #      value of every open position (the positions endpoint DOES
+        #      mark to market, even when the balance endpoint doesn't).
+        #   4. cash alone (last resort — positions couldn't be valued).
+        equity = total_amount or snap.get("total_equity")
+        if equity is None:
+            positions_value = self._open_positions_market_value()
+            if cash is not None and positions_value is not None:
+                equity = cash + positions_value
+            else:
+                equity = cash
         if equity is None:
             return None
 
@@ -1061,6 +1076,41 @@ class SnapTradeAdapter(BrokerAdapter):
             "equity":                equity,
             "beginning_day_balance": beginning_day_balance,
         }
+
+    def _open_positions_market_value(self) -> Decimal | None:
+        """Total mark-to-market value of every open position (stocks +
+        options), used to reconstruct a true equity when the broker's
+        balance endpoint reports cash only.
+
+        Returns None if positions can't be fetched OR none of them carry a
+        usable value — so ``get_pnl_snapshot`` can fall back to cash-only
+        rather than reporting an equity that omits real holdings. An empty
+        account (no positions) legitimately returns 0."""
+        try:
+            positions = self.get_positions()
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "snaptrade _open_positions_market_value: get_positions failed",
+                exc_info=True,
+            )
+            return None
+        total = Decimal(0)
+        valued = False
+        for p in positions:
+            mv = p.market_value
+            if mv is None and p.current_price is not None:
+                # Fall back to price × qty (× 100 for the OCC contract
+                # multiplier on options) when the broker omitted market_value.
+                mult = Decimal(100) if p.instrument_type == InstrumentType.OPTION else Decimal(1)
+                mv = p.current_price * p.quantity * mult
+            if mv is not None:
+                total += mv
+                valued = True
+        # Positions exist but none could be valued → don't trust the sum;
+        # signal None so the caller stays cash-only rather than understating.
+        if positions and not valued:
+            return None
+        return total
 
     def get_balance_snapshot(self) -> dict[str, Any]:
         """Pull cash/buying_power/total from SnapTrade.
