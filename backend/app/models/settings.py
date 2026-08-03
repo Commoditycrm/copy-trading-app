@@ -175,6 +175,19 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(5, 2), nullable=True,
     )
 
+    # DOLLAR variant of the daily trading cap — mutually exclusive with
+    # ``max_account_pct_per_day``. The user picks a unit in the UI: "%"
+    # writes ``max_account_pct_per_day`` (and NULLs this column), "$"
+    # writes this column (and NULLs the pct one). When today's cumulative
+    # filled trade NOTIONAL crosses this absolute dollar amount, copy is
+    # auto-paused by pnl_poller — same trip path as the pct variant, but
+    # the threshold is a fixed dollar value rather than derived from the
+    # day-start balance. Numeric(20,2) so it can hold real account-scale
+    # dollar figures. NULL = this unit not in use.
+    max_account_usd_per_day: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+
     # Retry policy for transient broker errors. Two separate intervals so a
     # subscriber can be aggressive about closing positions (late close hurts
     # P&L) and conservative about opening (late open is usually fine — skip

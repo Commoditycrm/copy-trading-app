@@ -78,6 +78,19 @@ function writeTickCache(patch: Partial<TickCache>) {
   } catch { /* quota / disabled storage — silent */ }
 }
 
+/** Unit a daily limit is expressed in: "%" of the day-start balance
+ *  (server derives the dollar threshold each tick) or "$" absolute. */
+type LimitUnit = "%" | "$";
+
+/** Given the two mutually-exclusive columns for a limit (dollar, percent),
+ *  pick the active unit + the raw string to seed the input with. The
+ *  dollar column wins when set; otherwise percent; default "%" when both
+ *  are null. */
+function pickUnit(usd: string | null, pct: string | null): { unit: LimitUnit; value: string } {
+  if (usd !== null && usd !== "") return { unit: "$", value: usd };
+  return { unit: "%", value: pct ?? "" };
+}
+
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
@@ -98,6 +111,13 @@ export default function SettingsPage() {
   const [limitBusy, setLimitBusy] = useState(false);
   const [profitInput, setProfitInput] = useState("");
   const [profitBusy, setProfitBusy] = useState(false);
+  // Unit toggle ("%" of day-start balance vs absolute "$") for the three
+  // daily limits. The two columns per field are mutually exclusive
+  // server-side; we seed the unit from whichever one is set on load
+  // (see syncLimitInputs) and default to "%" when neither is.
+  const [lossUnit, setLossUnit] = useState<LimitUnit>("%");
+  const [profitUnit, setProfitUnit] = useState<LimitUnit>("%");
+  const [maxUnit, setMaxUnit] = useState<LimitUnit>("%");
   // Max-per-contract is UI-only — no Today/Headroom readouts. Persisted
   // so the value survives refresh.
   const [maxContractInput, setMaxContractInput] = useState("");
@@ -147,6 +167,38 @@ export default function SettingsPage() {
     () => readTickCache().todays_trading_value,
   );
 
+  // Seed the three daily-limit inputs AND their unit toggles from a fresh
+  // settings row. Called on load, after reset, and after each save so the
+  // "%"/"$" toggle always reflects the persisted (mutually-exclusive) column.
+  function syncLimitInputs(s: SubscriberSettings) {
+    const loss = pickUnit(s.daily_loss_limit, s.daily_loss_limit_pct);
+    setLossUnit(loss.unit);
+    setLimitInput(loss.value);
+    const profit = pickUnit(s.daily_profit_limit, s.daily_profit_limit_pct);
+    setProfitUnit(profit.unit);
+    setProfitInput(profit.value);
+    const max = pickUnit(s.max_account_usd_per_day, s.max_account_pct_per_day);
+    setMaxUnit(max.unit);
+    setMaxPctInput(max.value);
+  }
+
+  // Switching a row's unit reseeds its input from the STORED value for the
+  // newly-selected unit (empty if none) — so a "5" typed as percent never
+  // silently reappears as "$5". The sibling column is null under our
+  // mutual-exclusion rule, so switching to the unused unit clears the box.
+  function changeLossUnit(u: LimitUnit) {
+    setLossUnit(u);
+    setLimitInput((u === "$" ? sub?.daily_loss_limit : sub?.daily_loss_limit_pct) ?? "");
+  }
+  function changeProfitUnit(u: LimitUnit) {
+    setProfitUnit(u);
+    setProfitInput((u === "$" ? sub?.daily_profit_limit : sub?.daily_profit_limit_pct) ?? "");
+  }
+  function changeMaxUnit(u: LimitUnit) {
+    setMaxUnit(u);
+    setMaxPctInput((u === "$" ? sub?.max_account_usd_per_day : sub?.max_account_pct_per_day) ?? "");
+  }
+
   useEffect(() => {
     (async () => {
       const u = await api<User>("/api/auth/me");
@@ -155,12 +207,10 @@ export default function SettingsPage() {
         const s = await api<SubscriberSettings>("/api/settings/subscriber");
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
-        // The UI now uses the % variants; fall back to legacy USD only
-        // if the user hasn't set a pct yet (smooth transition).
-        setLimitInput(s.daily_loss_limit_pct ?? "");
-        setProfitInput(s.daily_profit_limit_pct ?? "");
+        // Each daily limit can be "%" or "$" — seed the unit + input from
+        // whichever column is set (dollar wins, else percent, else "%").
+        syncLimitInputs(s);
         setMaxContractInput(s.max_per_contract ?? "");
-        setMaxPctInput(s.max_account_pct_per_day ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setPosTpInput(s.position_tp_pct ?? "");
         setPosSlInput(s.position_sl_pct ?? "");
@@ -230,6 +280,8 @@ export default function SettingsPage() {
         msg = `Copy trading auto-paused — today's profit ($${e.todays_realized_pnl}) hit your daily profit limit ($${e.daily_profit_limit}).`;
       } else if (reason === "max_account_pct_per_day") {
         msg = `Copy trading auto-paused — today's trading ($${e.todays_trading_value}) hit ${e.max_account_pct_per_day}% of your day-start balance.`;
+      } else if (reason === "max_account_usd_per_day") {
+        msg = `Copy trading auto-paused — today's trading ($${e.todays_trading_value}) hit your $${e.max_account_usd_per_day} daily cap.`;
       } else {
         msg = `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily loss limit ($${e.daily_loss_limit}).`;
       }
@@ -306,6 +358,7 @@ export default function SettingsPage() {
         daily_profit_limit_pct: e.daily_profit_limit_pct ?? null,
         max_per_contract: e.max_per_contract ?? null,
         max_account_pct_per_day: e.max_account_pct_per_day ?? null,
+        max_account_usd_per_day: e.max_account_usd_per_day ?? null,
         auto_liquidation_limit: e.auto_liquidation_limit ?? null,
         position_tp_pct: e.position_tp_pct ?? null,
         position_sl_pct: e.position_sl_pct ?? null,
@@ -418,13 +471,22 @@ export default function SettingsPage() {
     setLimitBusy(true);
     try {
       const trimmed = limitInput.trim();
-      const body = { daily_loss_limit_pct: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-loss-limit-pct", {
+      const val = trimmed === "" ? null : trimmed;
+      // Route to the "%" or "$" endpoint based on the row's unit toggle.
+      // Each backend endpoint NULLs the sibling column so only one unit
+      // is ever persisted.
+      const [url, body] = lossUnit === "$"
+        ? ["/api/settings/subscriber/daily-loss-limit", { daily_loss_limit: val }]
+        : ["/api/settings/subscriber/daily-loss-limit-pct", { daily_loss_limit_pct: val }];
+      const s = await api<SubscriberSettings>(url, {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setLimitInput(s.daily_loss_limit_pct ?? "");
-      notify.success(s.daily_loss_limit_pct ? `Daily loss limit set to ${s.daily_loss_limit_pct}%` : "Daily loss limit cleared");
+      syncLimitInputs(s);
+      const saved = lossUnit === "$" ? s.daily_loss_limit : s.daily_loss_limit_pct;
+      const suffix = lossUnit === "$" ? "" : "%";
+      const prefix = lossUnit === "$" ? "$" : "";
+      notify.success(saved ? `Daily loss limit set to ${prefix}${saved}${suffix}` : "Daily loss limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily loss limit");
     } finally {
@@ -435,13 +497,19 @@ export default function SettingsPage() {
     setProfitBusy(true);
     try {
       const trimmed = profitInput.trim();
-      const body = { daily_profit_limit_pct: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/daily-profit-limit-pct", {
+      const val = trimmed === "" ? null : trimmed;
+      const [url, body] = profitUnit === "$"
+        ? ["/api/settings/subscriber/daily-profit-limit", { daily_profit_limit: val }]
+        : ["/api/settings/subscriber/daily-profit-limit-pct", { daily_profit_limit_pct: val }];
+      const s = await api<SubscriberSettings>(url, {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setProfitInput(s.daily_profit_limit_pct ?? "");
-      notify.success(s.daily_profit_limit_pct ? `Daily profit limit set to ${s.daily_profit_limit_pct}%` : "Daily profit limit cleared");
+      syncLimitInputs(s);
+      const saved = profitUnit === "$" ? s.daily_profit_limit : s.daily_profit_limit_pct;
+      const suffix = profitUnit === "$" ? "" : "%";
+      const prefix = profitUnit === "$" ? "$" : "";
+      notify.success(saved ? `Daily profit limit set to ${prefix}${saved}${suffix}` : "Daily profit limit cleared");
     } catch (e) {
       notify.fromError(e, "Could not update daily profit limit");
     } finally {
@@ -469,15 +537,21 @@ export default function SettingsPage() {
     setMaxPctBusy(true);
     try {
       const trimmed = maxPctInput.trim();
-      const body = { max_account_pct_per_day: trimmed === "" ? null : trimmed };
-      const s = await api<SubscriberSettings>("/api/settings/subscriber/max-account-pct", {
+      const val = trimmed === "" ? null : trimmed;
+      const [url, body] = maxUnit === "$"
+        ? ["/api/settings/subscriber/max-account-usd", { max_account_usd_per_day: val }]
+        : ["/api/settings/subscriber/max-account-pct", { max_account_pct_per_day: val }];
+      const s = await api<SubscriberSettings>(url, {
         method: "PATCH", body: JSON.stringify(body),
       });
       setSub(s);
-      setMaxPctInput(s.max_account_pct_per_day ?? "");
-      notify.success(s.max_account_pct_per_day ? `Max ${s.max_account_pct_per_day}% per day set` : "Max % per day cleared");
+      syncLimitInputs(s);
+      const savedMsg = maxUnit === "$"
+        ? (s.max_account_usd_per_day ? `Max $${s.max_account_usd_per_day} per day set` : "Daily cap cleared")
+        : (s.max_account_pct_per_day ? `Max ${s.max_account_pct_per_day}% per day set` : "Daily cap cleared");
+      notify.success(savedMsg);
     } catch (e) {
-      notify.fromError(e, "Could not update max % per day");
+      notify.fromError(e, "Could not update daily trading cap");
     } finally {
       setMaxPctBusy(false);
     }
@@ -596,10 +670,8 @@ export default function SettingsPage() {
       // same mapping as the initial load so the fields don't keep showing
       // the pre-reset text.
       setMultInput(parseFloat(s.multiplier).toString());
-      setLimitInput(s.daily_loss_limit_pct ?? "");
-      setProfitInput(s.daily_profit_limit_pct ?? "");
+      syncLimitInputs(s);
       setMaxContractInput(s.max_per_contract ?? "");
-      setMaxPctInput(s.max_account_pct_per_day ?? "");
       setAutoLiqInput(s.auto_liquidation_limit ?? "");
       setPosTpInput(s.position_tp_pct ?? "");
       setPosSlInput(s.position_sl_pct ?? "");
@@ -686,38 +758,35 @@ export default function SettingsPage() {
   };
 
   const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
-  // Daily loss limit is now a PERCENTAGE of the broker's beginning-day
-  // balance. Derive the dollar threshold from baseNum * pct / 100, then
-  // headroom is "dollars of loss capacity left" (max(0, threshold − loss)).
-  const lossPctNum = sub?.daily_loss_limit_pct ? Number(sub.daily_loss_limit_pct) : null;
-  // Only count the LOSS portion against the loss-limit headroom — see
-  // pre-existing comment on max(0,-pnl) clamp.
-  // We need baseNum below — let it hoist via the maxPct block which
-  // defines it; for the loss/profit blocks we re-derive here.
+  // Each daily limit can be expressed as a "%" of the day-start balance OR
+  // an absolute "$". The two columns are mutually exclusive, so the dollar
+  // threshold is: the USD column when set, else balance × pct / 100. That
+  // single derived dollar value drives the USD / Headroom / Used readouts
+  // regardless of which unit the user picked.
   const _baseEarly = beginningDayBalance ? Number(beginningDayBalance) : null;
-  const lossPctDollars = (lossPctNum !== null && _baseEarly !== null && _baseEarly > 0)
-    ? (_baseEarly * lossPctNum / 100)
-    : null;
+  const dollarThreshold = (usd: string | null, pct: string | null): number | null => {
+    if (usd !== null && usd !== "") {
+      const n = Number(usd);
+      return Number.isFinite(n) ? n : null;
+    }
+    const p = pct ? Number(pct) : null;
+    return (p !== null && _baseEarly !== null && _baseEarly > 0) ? (_baseEarly * p / 100) : null;
+  };
   // Keep `limit` name so JSX below doesn't have to change everywhere —
-  // it now holds the derived dollar threshold instead of the raw USD value.
-  const limit = lossPctDollars;
+  // it holds the derived dollar threshold, whichever unit was set.
+  const limit = dollarThreshold(sub?.daily_loss_limit ?? null, sub?.daily_loss_limit_pct ?? null);
   const headroom = limit !== null ? Math.max(0, limit - Math.max(0, -todaysPnL)) : null;
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
   // Profit-limit mirror.
-  const profitPctNum = sub?.daily_profit_limit_pct ? Number(sub.daily_profit_limit_pct) : null;
-  const profitPctDollars = (profitPctNum !== null && _baseEarly !== null && _baseEarly > 0)
-    ? (_baseEarly * profitPctNum / 100)
-    : null;
-  const profitLimit = profitPctDollars;
+  const profitLimit = dollarThreshold(sub?.daily_profit_limit ?? null, sub?.daily_profit_limit_pct ?? null);
   const profitHeadroom = profitLimit !== null ? Math.max(0, profitLimit - Math.max(0, todaysPnL)) : null;
-  // Max-% derived values — pulled up here so the table row can read
-  // them. balance × pct/100 = the dollar threshold; today's trading
-  // value (from the SSE tick) is the metric compared against it.
-  const maxPctNum = sub?.max_account_pct_per_day ? Number(sub.max_account_pct_per_day) : null;
-  const baseNum = beginningDayBalance ? Number(beginningDayBalance) : null;
+  // Max-cap derived values — pulled up here so the table row can read
+  // them. Threshold is the "$" column when set, else balance × pct/100;
+  // today's trading value (from the SSE tick) is the metric compared
+  // against it.
   const tvNum = todaysTradingValue ? Number(todaysTradingValue) : 0;
-  const maxPctLimitDollars = (maxPctNum && baseNum && baseNum > 0)
-    ? (baseNum * maxPctNum / 100) : null;
+  const maxPctLimitDollars = dollarThreshold(
+    sub?.max_account_usd_per_day ?? null, sub?.max_account_pct_per_day ?? null);
   const maxPctHeadroom = maxPctLimitDollars !== null
     ? Math.max(0, maxPctLimitDollars - tvNum) : null;
   const maxPctConsumed = (maxPctLimitDollars && maxPctLimitDollars > 0)
@@ -975,16 +1044,19 @@ export default function SettingsPage() {
                 accent="#ef4444"
                 icon={<IconTrendDown />}
                 title="Daily loss limit"
-                subtitle="Pause copy when today's loss reaches this % of your day-start balance."
+                subtitle={lossUnit === "$"
+                  ? "Pause copy when today's loss reaches this dollar amount."
+                  : "Pause copy when today's loss reaches this % of your day-start balance."}
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="%"
+                unit={lossUnit}
+                onUnitChange={changeLossUnit}
                 input={limitInput}
                 onInput={setLimitInput}
                 busy={limitBusy}
                 onSave={saveLimit}
-                current={sub.daily_loss_limit_pct}
+                current={lossUnit === "$" ? sub.daily_loss_limit : sub.daily_loss_limit_pct}
                 hasLimit={limit !== null}
                 thresholdUsdDisplay={limit === null ? "—" : fmt(String(limit))}
                 headroomDisplay={limit === null ? "—" : fmt(String(headroom))}
@@ -995,16 +1067,19 @@ export default function SettingsPage() {
                 accent="#22c55e"
                 icon={<IconTrendUp />}
                 title="Daily profit limit"
-                subtitle="Pause copy when today's profit reaches this % of your day-start balance."
+                subtitle={profitUnit === "$"
+                  ? "Pause copy when today's profit reaches this dollar amount."
+                  : "Pause copy when today's profit reaches this % of your day-start balance."}
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
-                inputPrefix="%"
+                unit={profitUnit}
+                onUnitChange={changeProfitUnit}
                 input={profitInput}
                 onInput={setProfitInput}
                 busy={profitBusy}
                 onSave={saveProfit}
-                current={sub.daily_profit_limit_pct}
+                current={profitUnit === "$" ? sub.daily_profit_limit : sub.daily_profit_limit_pct}
                 hasLimit={profitLimit !== null}
                 thresholdUsdDisplay={profitLimit === null ? "—" : fmt(String(profitLimit))}
                 headroomDisplay={profitLimit === null ? "—" : fmt(String(profitHeadroom))}
@@ -1014,16 +1089,19 @@ export default function SettingsPage() {
               <LimitRow
                 accent="#f59e0b"
                 icon={<IconPercent />}
-                title="Max % of account per day"
-                subtitle="Pause when today's trading value reaches this % of the day's starting balance."
+                title="Max account per day"
+                subtitle={maxUnit === "$"
+                  ? "Pause when today's trading value reaches this dollar amount."
+                  : "Pause when today's trading value reaches this % of the day's starting balance."}
                 todayLabel="Day-Start"
                 todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
-                inputPrefix="%"
+                unit={maxUnit}
+                onUnitChange={changeMaxUnit}
                 input={maxPctInput}
                 onInput={setMaxPctInput}
                 busy={maxPctBusy}
                 onSave={saveMaxPct}
-                current={sub.max_account_pct_per_day}
+                current={maxUnit === "$" ? sub.max_account_usd_per_day : sub.max_account_pct_per_day}
                 hasLimit={maxPctLimitDollars !== null}
                 thresholdUsdDisplay={maxPctLimitDollars === null ? "—" : fmt(String(maxPctLimitDollars))}
                 headroomDisplay={maxPctLimitDollars === null ? "—" : fmt(String(maxPctHeadroom))}
@@ -1492,7 +1570,7 @@ function Stat({ label, value, color }: { label: string; value: string; color?: s
 function LimitRow({
   accent, icon, title, subtitle,
   todayLabel, todayValue, todayColor,
-  inputPrefix, input, onInput, busy, onSave, current,
+  inputPrefix, unit, onUnitChange, input, onInput, busy, onSave, current,
   hasLimit, thresholdHint,
   thresholdUsdDisplay,
   headroomDisplay, headroomColor,
@@ -1506,7 +1584,13 @@ function LimitRow({
   todayLabel: string;
   todayValue: string;
   todayColor?: string;
-  inputPrefix: string;
+  /** Static unit prefix for rows without a unit toggle (e.g. the USD-only
+   *  Max-per-contract row). Ignored when `unit`/`onUnitChange` are given. */
+  inputPrefix?: string;
+  /** When provided (with onUnitChange), the prefix becomes an interactive
+   *  "%" / "$" segmented toggle and drives the input's step/max. */
+  unit?: LimitUnit;
+  onUnitChange?: (u: LimitUnit) => void;
   input: string;
   onInput: (v: string) => void;
   busy: boolean;
@@ -1538,6 +1622,11 @@ function LimitRow({
     : barPct >= 100 ? "var(--bad)"
       : barPct >= 75 ? "#f59e0b"
         : accent;
+  // The active unit drives both the prefix display and the input's
+  // numeric bounds. Toggle rows use `unit`; static rows use `inputPrefix`.
+  const hasToggle = unit !== undefined && onUnitChange !== undefined;
+  const effPrefix = unit ?? inputPrefix ?? "%";
+  const isPct = effPrefix === "%";
 
   return (
     <div
@@ -1603,17 +1692,45 @@ function LimitRow({
                   background: "rgba(0,0,0,0.25)",
                 }}
               >
-                <span
-                  className="px-2.5 py-2 text-[10px] font-semibold border-r tabular-nums self-stretch inline-flex items-center"
-                  style={{ color: "var(--muted)", borderColor: "var(--border)" }}
-                >
-                  {inputPrefix}
-                </span>
+                {hasToggle ? (
+                  <div
+                    className="flex self-stretch border-r"
+                    style={{ borderColor: "var(--border)" }}
+                    role="group"
+                    aria-label="Limit unit"
+                  >
+                    {(["%", "$"] as LimitUnit[]).map((u) => {
+                      const active = effPrefix === u;
+                      return (
+                        <button
+                          key={u}
+                          type="button"
+                          onClick={() => onUnitChange!(u)}
+                          aria-pressed={active}
+                          className="px-2.5 py-2 text-[10px] font-semibold tabular-nums inline-flex items-center transition-colors"
+                          style={{
+                            color: active ? "var(--text)" : "var(--muted)",
+                            background: active ? `${accent}26` : "transparent",
+                          }}
+                        >
+                          {u}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <span
+                    className="px-2.5 py-2 text-[10px] font-semibold border-r tabular-nums self-stretch inline-flex items-center"
+                    style={{ color: "var(--muted)", borderColor: "var(--border)" }}
+                  >
+                    {effPrefix}
+                  </span>
+                )}
                 <input
                   type="number"
-                  step={inputPrefix === "%" ? 0.5 : 0.01}
+                  step={isPct ? 0.5 : 0.01}
                   min={0}
-                  max={inputPrefix === "%" ? 100 : undefined}
+                  max={isPct ? 100 : undefined}
                   placeholder="no limit"
                   className="flex-1 w-full px-2 py-2 text-xs tabular-nums"
                   style={{
