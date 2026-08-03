@@ -1909,7 +1909,35 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         db, trader_order.user_id, trader_order, subtract_reserved=False,
     ) > 0
 
-    for sub in subs:
+    # ── Close-through-pause: mirror the trader's EXITS to PAUSED subscribers ──
+    # A subscriber with copy_enabled=False (manual off OR daily-limit
+    # auto-pause) is normally absent from `subs` entirely — the cache query
+    # only returns active subscribers. That strands them holding a position
+    # after the trader has already exited. So when the trader is CLOSING,
+    # pull their still-following-but-paused subscribers back in, flagged
+    # close-only: the per-sub loop below skips every entry path for them and
+    # lets ONLY closes of positions they actually hold through (the existing
+    # _closeable_quantity clamp zeroes out anything they don't hold, so this
+    # can never place a naked sell). New entries stay blocked while paused.
+    # Gated on `trader_closing` so the common entry path pays nothing.
+    paused_close_subs: list = []
+    if trader_closing:
+        paused_rows = db.execute(
+            select(SubscriberSettings).where(
+                SubscriberSettings.following_trader_id == trader.id,
+                SubscriberSettings.copy_enabled.is_(False),
+            )
+        ).scalars().all()
+        for row in paused_rows:
+            # Non-mapped marker read via getattr(..., False) in the loop.
+            row._close_only = True
+        paused_close_subs = list(paused_rows)
+
+    for sub in [*subs, *paused_close_subs]:
+        # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
+        # gate (EOD lockout, daily kill switch, symbol filters) and, in the
+        # per-account block, refuse anything that isn't a real close.
+        is_close_only = getattr(sub, "_close_only", False)
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
         # below. Captured here (not inside the inner per-account loop) so it
@@ -1920,8 +1948,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
 
         # EOD lockout: refuse this subscriber's new same-day-expiry option mirror
         # only if THEY opted in and we're inside THEIR window (see eod_candidate).
+        # Skipped for close-only (paused) subs — a close must never be blocked.
         if (
-            eod_candidate
+            not is_close_only
+            and eod_candidate
             and getattr(sub, "eod_autoclose_enabled", False)
             and market_hours.in_eod_close_window(
                 eod_now, minutes=getattr(sub, "eod_autoclose_minutes", 15)
@@ -1949,7 +1979,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # Daily P&L kill switches (check BEFORE placing). Loss + profit
         # share the same auto-pause path — both stamp pnl_auto_paused_at
         # as an audit marker. Re-enable is MANUAL ONLY (Settings UI).
-        if sub.daily_loss_limit is not None or sub.daily_profit_limit is not None:
+        # Skipped for close-only subs — they're ALREADY paused; re-running
+        # the kill switch would just re-stamp, and we're only letting their
+        # exits through anyway.
+        if not is_close_only and (sub.daily_loss_limit is not None or sub.daily_profit_limit is not None):
             todays_pnl = pnl_by_user.get(sub.user_id, Decimal(0))
             hit_loss = (
                 sub.daily_loss_limit is not None
@@ -2004,9 +2037,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # sides — _normalize_symbols enforces uppercase storage, but
         # trader_order.symbol can come from broker callbacks where casing
         # is unpredictable.
+        # Skipped for close-only subs — an exit must fire even for a symbol
+        # the subscriber has filtered out of NEW entries.
         trade_symbol = (trader_order.symbol or "").upper()
-        excl = sub.symbol_exclusion_list or ()
-        incl = sub.symbol_inclusion_list or ()
+        excl = () if is_close_only else (sub.symbol_exclusion_list or ())
+        incl = () if is_close_only else (sub.symbol_inclusion_list or ())
         if excl and trade_symbol in {s.upper() for s in excl}:
             audit.record(
                 db,
@@ -2041,9 +2076,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             continue
 
         # Hybrid: dict lookup when pre-batched, per-iter cache call otherwise.
+        # Close-only (paused) subs are NOT in the pre-batched dict (that was
+        # built from the active `subs` list), so always resolve them via the
+        # per-sub cache call.
         sub_accounts = (
             accts_by_user.get(sub.user_id, [])
-            if use_batch
+            if (use_batch and not is_close_only)
             else await cache.get_broker_accounts(db, sub.user_id)
         )
         if not sub_accounts:
@@ -2110,6 +2148,18 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 db, sub.user_id, trader_order, subtract_reserved=False,
             )
             is_closing_effective = bool(trader_order.is_closing) or closeable > 0
+
+            # Close-only (paused) subscriber: admit ONLY genuine closes. An
+            # entry (is_closing_effective False) is dropped here so a paused
+            # subscriber never opens a new position; their exits still flow.
+            if is_close_only and not is_closing_effective:
+                results.append(FanoutResult(
+                    subscriber_user_id=sub.user_id,
+                    broker_account_id=acct.id,
+                    order_id=None,
+                    status="skipped_paused_entry",
+                ))
+                continue
 
             # Defense-in-depth: never mirror a CLOSE larger than the subscriber
             # actually holds. Clamp to the raw held position (not minus reserved):

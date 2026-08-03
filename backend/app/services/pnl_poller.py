@@ -137,6 +137,45 @@ def _interval_for_broker(broker: BrokerName) -> float:
 # deleted accounts hang around but are harmless — just stale keys.
 _next_due_at: dict[uuid.UUID, float] = {}
 
+# Last-known-good P&L snapshot per broker account. When a live
+# ``_fetch_pnl_snapshot`` call fails (SnapTrade 429/404/timeout, a broker
+# hiccup — see the prod report of a daily limit that never tripped because
+# every tick's balance fetch was failing), we DON'T want to silently skip
+# the daily loss/profit kill switches for that tick. Instead we fall back
+# to the most recent successful snapshot (if it's fresh enough) so the
+# limits keep enforcing on the last-known total P&L. Bounded by one entry
+# per account; stale entries for deleted accounts are harmless.
+_LAST_SNAPSHOT: dict[uuid.UUID, tuple[datetime, dict[str, Any]]] = {}
+
+# How stale a cached snapshot may be and still be used for enforcement.
+# The poller re-polls each account roughly every 60s, so this tolerates
+# ~10 consecutive failed fetches before we give up and skip the tick.
+# Older than this and the data is too unreliable to auto-pause on.
+_SNAPSHOT_STALE_LIMIT_S = 600.0
+
+
+def _snapshot_or_last_known(
+    acct_id: uuid.UUID, state: dict[str, Any] | None, now: datetime,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return the snapshot to enforce with, plus a ``degraded`` flag.
+
+    * Live fetch succeeded → cache it and return it (degraded=False).
+    * Live fetch failed but a cached snapshot is fresh (<= stale limit) →
+      return the cached one (degraded=True) so the daily kill switches
+      still enforce through a transient broker outage.
+    * Live fetch failed and no fresh cache → return (None, False); the
+      caller skips the tick as before.
+    """
+    if state is not None:
+        _LAST_SNAPSHOT[acct_id] = (now, state)
+        return state, False
+    cached = _LAST_SNAPSHOT.get(acct_id)
+    if cached is not None:
+        cached_at, cached_state = cached
+        if (now - cached_at).total_seconds() <= _SNAPSHOT_STALE_LIMIT_S:
+            return cached_state, True
+    return None, False
+
 # Brokers the poller knows how to fetch from. Adding a broker is:
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
 # is listed here, and (c) the broker has an entry in
@@ -529,6 +568,20 @@ def _enforce_one(acct: BrokerAccount) -> None:
     # up front and only open the session for the fast enforcement writes.
     state = _fetch_pnl_snapshot(acct)
 
+    # Resilience: a failed live fetch must NOT silently disable the daily
+    # kill switches for this account (the prod bug — a subscriber's profit
+    # limit never tripped because the balance call kept failing). Cache the
+    # last good snapshot and, on failure, enforce against it while it's
+    # fresh. ``degraded`` is only for gating auto-liquidation + telemetry —
+    # the daily kill-switch math is otherwise identical.
+    state, degraded = _snapshot_or_last_known(acct.id, state, datetime.now(timezone.utc))
+    if degraded:
+        log.warning(
+            "pnl_poller: live snapshot failed for account %s — enforcing daily "
+            "limits against last-known snapshot (auto-liquidation skipped)",
+            acct.id,
+        )
+
     with SessionLocal() as db:
         s = db.get(SubscriberSettings, acct.user_id)
         if s is None:
@@ -719,6 +772,12 @@ def _enforce_one(acct: BrokerAccount) -> None:
             and s.auto_liquidation_limit > 0
             and unrealized_pl is not None
             and unrealized_pl >= s.auto_liquidation_limit
+            # NEVER liquidate on a stale/last-known snapshot — flattening the
+            # whole account at market off ~minutes-old prices is unsafe. A
+            # reversible copy PAUSE tolerates staleness; a market liquidation
+            # does not. When the live fetch failed we only pause, and let a
+            # fresh tick make the liquidation call.
+            and not degraded
         )
 
         if s.copy_enabled and hit_liquidation:
