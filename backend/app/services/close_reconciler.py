@@ -49,7 +49,7 @@ from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order
-from app.models.settings import SubscriberSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.services import market_hours
 from app.services.crypto import decrypt_json
 
@@ -129,12 +129,16 @@ async def _tick() -> None:
 
 
 def _active_pairs() -> list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]]:
-    """(subscriber_id, connected_account_id, following_trader_id) for every
-    subscriber that follows a trader."""
+    """(subscriber_id, connected_account_id, trader_id) for every
+    (subscriber, followed-trader) relationship.
+
+    Multi-trader: reads ``subscriber_follows`` so a subscriber who follows
+    several traders is reconciled against EACH of them (not only their primary
+    ``following_trader_id``). A subscriber following N traders yields N × (their
+    connected accounts) rows."""
     with SessionLocal() as db:
         rows = db.execute(
-            select(SubscriberSettings.user_id, SubscriberSettings.following_trader_id)
-            .where(SubscriberSettings.following_trader_id.isnot(None))
+            select(SubscriberFollow.subscriber_id, SubscriberFollow.trader_id)
         ).all()
         out: list[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = []
         for sub_id, trader_id in rows:

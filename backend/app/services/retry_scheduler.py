@@ -49,7 +49,7 @@ from app.models.notification import Notification  # noqa: F401  — ORM registra
 from app.models.order import Order, OrderStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User
-from app.services import audit, events
+from app.services import audit, events, follows
 from app.services.copy_engine import _order_event, _RETRY_INTERVAL_MINUTES
 from app.services.crypto import decrypt_json
 from app.services.notifications import create_notification
@@ -125,7 +125,10 @@ def _passes_gates(db: Session, child: Order, trader_order: Order) -> str | None:
     sub_settings = db.get(SubscriberSettings, child.user_id)
     if sub_settings is None or not sub_settings.copy_enabled:
         return "copy_disabled"
-    if sub_settings.following_trader_id != trader_order.user_id:
+    # Multi-trader: the subscriber may follow this order's trader as a SECONDARY
+    # (their primary following_trader_id points elsewhere). Check actual follow
+    # membership, not the primary — else a legitimate retry is wrongly dropped.
+    if not follows.is_following(db, child.user_id, trader_order.user_id):
         return "no_longer_following"
 
     # Subscriber may have changed retry_interval to "never" while the

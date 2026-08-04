@@ -16,7 +16,6 @@ from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
-from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import (
     BracketUpdateIn,
@@ -28,7 +27,15 @@ from app.schemas.order import (
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
-from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
+from app.services import (
+    audit,
+    copy_engine,
+    events,
+    excel_export,
+    fills_sync,
+    follows,
+    trade_filters,
+)
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
@@ -111,6 +118,29 @@ def _attach_realized_pnl(db: Session, user: User, orders: list[Order]) -> None:
         o.realized_pnl = by_order.get(o.id)
 
 
+def _attach_source_trader_names(db: Session, orders: list[Order]) -> None:
+    """Set the transient .source_trader_name on each order so OrderOut can label
+    which trader an order came from — the multi-trader "whose order is this?"
+    tag. One batched User lookup over the distinct source_trader_ids on the page.
+    """
+    if not orders:
+        return
+    ids = {o.source_trader_id for o in orders if o.source_trader_id is not None}
+    if not ids:
+        return
+    rows = db.execute(
+        select(User.id, User.business_name, User.display_name, User.email).where(
+            User.id.in_(ids)
+        )
+    ).all()
+    name_by_id = {
+        uid: (business or display or email)
+        for uid, business, display, email in rows
+    }
+    for o in orders:
+        o.source_trader_name = name_by_id.get(o.source_trader_id)
+
+
 @router.get("/trades", response_model=list[OrderOut])
 def list_trades(
     db: Session = Depends(get_db),
@@ -137,6 +167,7 @@ def list_trades(
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
+    _attach_source_trader_names(db, orders)
     return orders
 
 
@@ -204,6 +235,7 @@ def list_trades_page(
         ).scalars()
     )
     _attach_realized_pnl(db, user, rows)
+    _attach_source_trader_names(db, rows)
     return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
@@ -504,6 +536,7 @@ def get_trade(
     ).scalar_one_or_none()
     if not order or order.user_id != user.id:
         raise HTTPException(404, "not_found")
+    _attach_source_trader_names(db, [order])
     return order
 
 
@@ -870,6 +903,9 @@ def _place_trader_order(
     order = Order(
         user_id=trader.id,
         broker_account_id=acct.id,
+        # A self-placed order is attributed to its own placer (the trader), so
+        # every order carries a source-trader tag uniformly.
+        source_trader_id=trader.id,
         instrument_type=payload.instrument_type,
         symbol=payload.symbol.upper(),
         option_expiry=payload.option_expiry,
@@ -1352,11 +1388,9 @@ async def cancel_all_subscribers_open_orders(
     """
     import asyncio  # noqa: PLC0415
 
-    sub_ids = list(db.execute(
-        select(SubscriberSettings.user_id).where(
-            SubscriberSettings.following_trader_id == user.id
-        )
-    ).scalars())
+    # Multi-trader: every subscriber who follows this trader (primary or
+    # secondary), via subscriber_follows.
+    sub_ids = list(follows.subscriber_ids_following(db, user.id))
     if not sub_ids:
         return {"queued_count": 0, "message": "No subscribers."}
 
@@ -1880,8 +1914,9 @@ def calendar_pnl(
     if user_id is not None and user_id != user.id:
         if user.role != UserRole.TRADER:
             raise HTTPException(403, "trader_only")
-        sub = db.get(SubscriberSettings, user_id)
-        if not sub or sub.following_trader_id != user.id:
+        # Multi-trader: the target must FOLLOW this trader (primary or
+        # secondary) for the trader to view their P&L.
+        if not follows.is_following(db, user_id, user.id):
             raise HTTPException(404, "not_a_subscriber")
         target_user_id = user_id
 

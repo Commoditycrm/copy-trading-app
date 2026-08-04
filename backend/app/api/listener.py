@@ -20,7 +20,7 @@ from app.api.deps import current_user
 from app.database import get_db
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
-from app.services import listener_state
+from app.services import follows, listener_state
 
 
 router = APIRouter(prefix="/api/listener", tags=["listener"])
@@ -49,7 +49,9 @@ def listener_status(
     """Return the listener status the caller cares about.
 
     - Trader: their own listener (their Alpaca account).
-    - Subscriber: the listener of the trader they follow (if any).
+    - Subscriber: the listener status of EVERY trader they follow, in
+      ``traders`` (multi-trader). The top-level fields mirror the PRIMARY
+      trader for backward compatibility with the single-trader status pill.
     """
     if user.role == UserRole.TRADER:
         return {
@@ -59,7 +61,8 @@ def listener_status(
         }
 
     sub = db.get(SubscriberSettings, user.id)
-    if sub is None or sub.following_trader_id is None:
+    trader_ids = follows.trader_ids_followed_by(db, user.id)
+    if not trader_ids:
         return {
             "trader_id": None,
             "viewer": "subscriber",
@@ -67,10 +70,26 @@ def listener_status(
             "last_event_at": None,
             "state_changed_at": None,
             "last_error": None,
+            "traders": [],
         }
-    status = listener_state.get_status(sub.following_trader_id)
+
+    # One status per followed trader. Order the primary first so the top-level
+    # (compat) fields describe it.
+    primary = sub.following_trader_id if sub else None
+    ordered = ([primary] if primary in trader_ids else []) + [
+        t for t in trader_ids if t != primary
+    ]
+    per_trader = [
+        {"trader_id": str(tid), **_serialize(listener_state.get_status(tid))}
+        for tid in ordered
+    ]
+    head = per_trader[0]
     return {
-        "trader_id": str(sub.following_trader_id),
+        "trader_id": head["trader_id"],
         "viewer": "subscriber",
-        **_serialize(status),
+        "state": head["state"],
+        "last_event_at": head["last_event_at"],
+        "state_changed_at": head["state_changed_at"],
+        "last_error": head["last_error"],
+        "traders": per_trader,
     }

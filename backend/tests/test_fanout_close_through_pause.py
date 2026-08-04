@@ -34,6 +34,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.settings import SubscriberSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 
 
@@ -122,6 +123,9 @@ def run():
         db.flush()
 
         # Both subscribers follow the trader with copy DISABLED (paused).
+        # Multi-trader: the follow relationship lives in subscriber_follows (the
+        # source of truth the fanout's paused-select joins) — following_trader_id
+        # is just the legacy primary marker.
         for u in (sub_holds, sub_flat):
             db.add(SubscriberSettings(
                 user_id=u.id,
@@ -129,6 +133,7 @@ def run():
                 copy_enabled=False,
                 multiplier=Decimal("1.000"),
             ))
+            db.add(SubscriberFollow(subscriber_id=u.id, trader_id=trader.id))
         acct_holds = _mk_acct(db, sub_holds.id)
         acct_flat = _mk_acct(db, sub_flat.id)
 

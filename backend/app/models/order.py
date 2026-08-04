@@ -77,6 +77,23 @@ class Order(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
+    # The trader who ORIGINATED this order's signal — denormalized so any order
+    # can be attributed to a trader without walking parent_order_id → parent.
+    # This is the "which trader does this order belong to" tag that multi-trader
+    # following needs: a subscriber who follows several traders gets mirrors from
+    # each, and each mirror carries the originating trader's id here.
+    #   • trader's own order  → their own user_id (self)
+    #   • subscriber mirror   → the followed trader (parent.user_id)
+    #   • subscriber's manual  → self
+    # Nullable + ON DELETE SET NULL for the SAME reason as broker_account_id: we
+    # never want to lose order history when a user is removed.
+    source_trader_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     instrument_type: Mapped[InstrumentType] = mapped_column(
         Enum(InstrumentType, name="instrument_type"), nullable=False
     )
@@ -219,6 +236,10 @@ class Order(Base, TimestampMixin):
         foreign_keys=[parent_order_id],
         backref="children",
     )
+    # Read-only convenience for the originating trader. `foreign_keys` is
+    # mandatory — `orders` has several FKs into `users`/`orders`, so the mapper
+    # can't infer which column to join on.
+    source_trader = relationship("User", foreign_keys=[source_trader_id])
 
 
 class Fill(Base):

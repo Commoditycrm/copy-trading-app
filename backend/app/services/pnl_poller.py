@@ -81,7 +81,7 @@ from app.brokers import adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.settings import SubscriberSettings
-from app.services import audit, cache, events
+from app.services import audit, cache, events, follows
 from app.services.crypto import decrypt_json
 from app.services import pnl
 from app.services.pnl import today_filled_notional
@@ -590,7 +590,10 @@ def _enforce_one(acct: BrokerAccount) -> None:
             return
 
         now_utc = datetime.now(timezone.utc)
-        invalidate_trader_id: uuid.UUID | None = None
+        # Multi-trader: copy_enabled is a GLOBAL switch, so an auto-pause/resume
+        # here affects this subscriber's slice of EVERY trader they follow. Bust
+        # all of their followed traders' fanout caches, not just the primary.
+        invalidate_trader_ids: set[uuid.UUID] = set()
 
         # ── Auto-resume next-UTC-day for daily-limit pauses ──────────────
         # The three daily kill switches (daily_loss_limit,
@@ -616,8 +619,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     entity_type="subscriber_settings", entity_id=s.user_id,
                     metadata={"source": "pnl_poller"},
                 )
-                if s.following_trader_id:
-                    invalidate_trader_id = s.following_trader_id
+                invalidate_trader_ids.update(follows.trader_ids_followed_by(db, s.user_id))
                 pending_events.append({
                     "type": "copy.auto_resumed", "reason": "new_day",
                 })
@@ -657,8 +659,8 @@ def _enforce_one(acct: BrokerAccount) -> None:
             if pending_events:
                 db.commit()
                 _flush(s.user_id, pending_events)
-                if invalidate_trader_id:
-                    _safe_invalidate(invalidate_trader_id)
+                for _tid in invalidate_trader_ids:
+                    _safe_invalidate(_tid)
             return
         todays_pl = state["todays_pl"]
         equity = state["equity"]
@@ -807,7 +809,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 },
             )
             if s.following_trader_id:
-                invalidate_trader_id = s.following_trader_id
+                invalidate_trader_ids.update(follows.trader_ids_followed_by(db, s.user_id))
             pending_events.append({
                 "type": "copy.auto_liquidated",
                 "reason": "auto_liquidation_take_profit",
@@ -878,7 +880,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 },
             )
             if s.following_trader_id:
-                invalidate_trader_id = s.following_trader_id
+                invalidate_trader_ids.update(follows.trader_ids_followed_by(db, s.user_id))
             # Reuses the existing `copy.auto_paused` event shape that the
             # Settings page already listens to (toasts the pause notice).
             pending_events.append({
@@ -1068,8 +1070,8 @@ def _enforce_one(acct: BrokerAccount) -> None:
     # Doing this AFTER the session closes guarantees the transaction is
     # durable — the frontend's refetch on `copy.auto_paused` will read
     # the committed row and the UI toggle reflects the pause instantly.
-    if invalidate_trader_id:
-        _safe_invalidate(invalidate_trader_id)
+    for _tid in invalidate_trader_ids:
+        _safe_invalidate(_tid)
     _flush(user_id_snapshot, pending_events)
     events.publish(user_id_snapshot, tick_payload)
 

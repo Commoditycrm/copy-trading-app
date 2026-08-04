@@ -31,10 +31,10 @@ from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderType
-from app.models.settings import SubscriberSettings
 from app.models.user import User
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import ClosePositionIn, PositionOut
+from app.services import follows
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -227,11 +227,10 @@ async def close_all_subscribers_positions(
     ``order.placed`` SSE event so the relevant subscriber's UI
     refreshes on its own.
     """
-    sub_ids = list(db.execute(
-        select(SubscriberSettings.user_id).where(
-            SubscriberSettings.following_trader_id == user.id
-        )
-    ).scalars())
+    # Multi-trader: reach EVERY subscriber who follows this trader (primary or
+    # secondary), via subscriber_follows — not only those whose legacy primary is
+    # this trader.
+    sub_ids = list(follows.subscriber_ids_following(db, user.id))
     if not sub_ids:
         return {"queued_pairs": 0, "message": "No subscribers."}
 

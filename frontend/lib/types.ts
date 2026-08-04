@@ -105,6 +105,11 @@ export interface Fill {
 export interface Order {
   id: string;
   parent_order_id: string | null;
+  /** The trader who originated this order's signal. For a subscriber following
+   *  MANY traders, this tells which trader each mirrored order came from.
+   *  `source_trader_name` is a display label from the trades endpoints. */
+  source_trader_id?: string | null;
+  source_trader_name?: string | null;
   // Nullable: orders survive when their broker is disconnected. See
   // backend/app/models/order.py for the rationale.
   broker_account_id: string | null;
@@ -193,6 +198,10 @@ export interface TradeStats {
 export interface SubscriberSettings {
   user_id: string;
   following_trader_id: string | null;
+  /** Multi-trader: the FULL set of trader ids this subscriber follows.
+   *  `following_trader_id` above is just the primary (drives the wordmark).
+   *  Powers the multi-follow list in Settings. */
+  followed_trader_ids: string[];
   /** Brand of the trader being followed — surfaced as the app wordmark
    *  in the AppShell so the subscriber sees the trader's app name. Null
    *  when not following anyone, or when following a legacy trader who

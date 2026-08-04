@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.follow_request import FollowRequest
 from app.models.settings import SubscriberSettings, TraderSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User
 from app.schemas.pagination import Page
 from app.schemas.settings import (
@@ -21,7 +22,7 @@ from app.schemas.settings import (
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
-from app.services import audit, cache, notifications
+from app.services import audit, cache, follows, notifications
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api/subscribers", tags=["subscribers"])
@@ -38,10 +39,14 @@ def list_subscribers(
     """Server-side paginated subscriber list. The per-subscriber broker count +
     30-day realized P&L (an N+1 that was previously run for EVERY follower) now
     runs only for the page being shown."""
+    # Multi-trader: a subscriber appears in this trader's roster if they have a
+    # subscriber_follows row for them (primary OR secondary) — the unique
+    # (subscriber, trader) constraint means one row per subscriber here.
     base = (
         select(User, SubscriberSettings)
         .join(SubscriberSettings, SubscriberSettings.user_id == User.id)
-        .where(SubscriberSettings.following_trader_id == trader.id)
+        .join(SubscriberFollow, SubscriberFollow.subscriber_id == User.id)
+        .where(SubscriberFollow.trader_id == trader.id)
     )
     term = (search or "").strip()
     if term:
@@ -81,14 +86,22 @@ def subscriber_stats(
     """Cheap header counts (no per-subscriber P&L) — total / copy-active /
     with a connected broker — so the summary reflects EVERY follower, not the
     page shown. Short-TTL cached: header badges tolerate a few seconds' lag."""
-    where = SubscriberSettings.following_trader_id == trader.id
+    # Multi-trader: everyone who follows this trader (primary or secondary).
+    follower_ids = select(SubscriberFollow.subscriber_id).where(
+        SubscriberFollow.trader_id == trader.id
+    )
 
     def _compute() -> dict[str, int]:
-        total = db.execute(select(func.count()).where(where)).scalar_one()
-        active = db.execute(
-            select(func.count()).where(where, SubscriberSettings.copy_enabled.is_(True))
+        total = db.execute(
+            select(func.count()).select_from(follower_ids.subquery())
         ).scalar_one()
-        sub_ids = select(SubscriberSettings.user_id).where(where)
+        active = db.execute(
+            select(func.count()).where(
+                SubscriberSettings.user_id.in_(follower_ids),
+                SubscriberSettings.copy_enabled.is_(True),
+            )
+        ).scalar_one()
+        sub_ids = follower_ids
         with_broker = db.execute(
             select(func.count(func.distinct(BrokerAccount.user_id))).where(
                 BrokerAccount.user_id.in_(sub_ids)
@@ -101,9 +114,9 @@ def subscriber_stats(
 
 def _bulk_state(db: Session, trader_id) -> BulkCopyStateOut:
     rows = db.execute(
-        select(SubscriberSettings.copy_enabled).where(
-            SubscriberSettings.following_trader_id == trader_id
-        )
+        select(SubscriberSettings.copy_enabled)
+        .join(SubscriberFollow, SubscriberFollow.subscriber_id == SubscriberSettings.user_id)
+        .where(SubscriberFollow.trader_id == trader_id)
     ).all()
     total = len(rows)
     enabled = sum(1 for (e,) in rows if e)
@@ -155,8 +168,12 @@ def set_multiplier(
     trader: User = Depends(require_trader),
 ) -> dict:
     s = db.get(SubscriberSettings, subscriber_id)
-    if not s or s.following_trader_id != trader.id:
+    if not s or not follows.is_following(db, subscriber_id, trader.id):
         raise HTTPException(404, "subscriber_not_found")
+    # NOTE: multiplier is a GLOBAL subscriber setting (one value applied to every
+    # trader they follow). A trader editing it here changes it for this subscriber
+    # across all their follows — a deliberate consequence of the global-settings
+    # model. Any follower of this trader may set it.
     old_multiplier = str(s.multiplier)
     s.multiplier = payload.multiplier
     audit.record(
@@ -180,8 +197,9 @@ def _unfollow(
     db: Session, s: SubscriberSettings, *, trader: User,
     request: Request, via: str,
 ) -> None:
-    """Set following_trader_id=NULL, flip copy_enabled off, and notify the
-    subscriber.
+    """Remove THIS trader's follow relationship with the subscriber and notify
+    them. Multi-trader aware: only the (subscriber, this-trader) follow is
+    dropped — any OTHER traders the subscriber follows are untouched.
 
     The subscriber's account, broker connections, multiplier, P&L history
     and any in-flight mirror orders are preserved — this just stops future
@@ -194,11 +212,31 @@ def _unfollow(
     security reason to log them out, only a need to inform them.
     """
     subscriber_id = s.user_id
-    s.following_trader_id = None
-    # Belt-and-braces: flip the subscriber-side copy flag too so even if
-    # the subscriber re-follows by mistake later, fanout doesn't resume
-    # silently — they have to opt in explicitly.
-    s.copy_enabled = False
+    # Drop only THIS trader's follow row (not every follow).
+    db.execute(
+        delete(SubscriberFollow).where(
+            SubscriberFollow.subscriber_id == subscriber_id,
+            SubscriberFollow.trader_id == trader.id,
+        )
+    )
+    # If this trader was the subscriber's PRIMARY, repoint it to any remaining
+    # follow (else NULL). Powers the app wordmark / legacy lookups.
+    if s.following_trader_id == trader.id:
+        s.following_trader_id = db.execute(
+            select(SubscriberFollow.trader_id)
+            .where(SubscriberFollow.subscriber_id == subscriber_id)
+            .limit(1)
+        ).scalar_one_or_none()
+    # copy_enabled is a GLOBAL switch shared by ALL of this subscriber's follows.
+    # Only turn it off if this was their LAST follow — otherwise we'd silently
+    # stop copying for traders they still follow.
+    remaining = db.execute(
+        select(func.count())
+        .select_from(SubscriberFollow)
+        .where(SubscriberFollow.subscriber_id == subscriber_id)
+    ).scalar_one()
+    if remaining == 0:
+        s.copy_enabled = False
     # Revoke the follow approval. A trader removing a subscriber withdraws
     # permission — the subscriber must send a fresh request (and be approved
     # again) to re-follow, not just click Follow. Deleting the row resets
@@ -257,7 +295,7 @@ def remove_subscriber(
     """Remove (unfollow) a single subscriber. Preserves the subscriber's
     account and history — only the follow relationship is broken."""
     s = db.get(SubscriberSettings, subscriber_id)
-    if not s or s.following_trader_id != trader.id:
+    if not s or not follows.is_following(db, subscriber_id, trader.id):
         raise HTTPException(404, "subscriber_not_found")
     _unfollow(db, s, trader=trader, request=request, via="single")
     db.commit()
@@ -280,9 +318,11 @@ def bulk_remove_subscribers(
     rows that may have shifted on the server in the meantime.
     """
     rows = db.execute(
-        select(SubscriberSettings).where(
+        select(SubscriberSettings)
+        .join(SubscriberFollow, SubscriberFollow.subscriber_id == SubscriberSettings.user_id)
+        .where(
             SubscriberSettings.user_id.in_(payload.subscriber_ids),
-            SubscriberSettings.following_trader_id == trader.id,
+            SubscriberFollow.trader_id == trader.id,
         )
     ).scalars().all()
     for s in rows:

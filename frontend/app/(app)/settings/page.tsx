@@ -381,7 +381,8 @@ export default function SettingsPage() {
     }
   });
 
-  // Subscriber: follow an approved trader, or unfollow (traderId = null).
+  // Subscriber: follow an approved trader (multi-trader — ADDS to the follow
+  // set, keeps existing follows). traderId = null clears ALL follows.
   async function follow(traderId: string | null) {
     setRowBusy(traderId ?? "__unfollow__");
     try {
@@ -390,6 +391,21 @@ export default function SettingsPage() {
       }));
     } catch (e) {
       notify.fromError(e, "Could not update following");
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  // Subscriber: unfollow ONE trader (multi-trader) — leaves any other follows
+  // intact. Distinct from follow(null), which clears everyone.
+  async function unfollowOne(traderId: string) {
+    setRowBusy(traderId);
+    try {
+      setSub(await api<SubscriberSettings>("/api/settings/subscriber/unfollow", {
+        method: "POST", body: JSON.stringify({ trader_id: traderId })
+      }));
+    } catch (e) {
+      notify.fromError(e, "Could not unfollow trader");
     } finally {
       setRowBusy(null);
     }
@@ -871,7 +887,9 @@ export default function SettingsPage() {
               <div>
                 {traders.map((t, idx) => {
                   const req = requestByTraderId.get(t.id);
-                  const isFollowing = sub.following_trader_id === t.id;
+                  // Multi-trader: a subscriber can follow many traders at once —
+                  // read the full follow set, not just the primary.
+                  const isFollowing = (sub.followed_trader_ids ?? []).includes(t.id);
                   const isApproved = approvedTraderIds.has(t.id);
                   const isPending = req?.status === "pending";
                   const isRejected = req?.status === "rejected";
@@ -908,7 +926,7 @@ export default function SettingsPage() {
                           <>
                             <span className="chip chip-good">Following</span>
                             <button
-                              onClick={() => follow(null)}
+                              onClick={() => unfollowOne(t.id)}
                               disabled={busy}
                               className="btn-danger-soft px-3 py-1 text-xs"
                               title="Stop following this trader"

@@ -33,7 +33,7 @@ from app.schemas.settings import (
     TraderToggleIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit, cache
+from app.services import audit, cache, follows
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -54,9 +54,12 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         trader = db.get(User, s.following_trader_id)
         if trader is not None:
             trader_business_name = trader.business_name
+    # Multi-trader: the full follow set (join table is source of truth).
+    followed_trader_ids = follows.trader_ids_followed_by(db, s.user_id)
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
+        followed_trader_ids=followed_trader_ids,
         following_trader_business_name=trader_business_name,
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
@@ -388,8 +391,9 @@ def set_max_account_usd(
     )
     db.commit()
     db.refresh(s)
-    if s.following_trader_id:
-        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    # Global setting change → bust the cache for EVERY followed trader, matching
+    # the other subscriber-setting handlers (not just the primary).
+    cache.invalidate_subscribers_for_follower(db, s.user_id)
     return _to_out(db, s)
 
 
@@ -830,7 +834,9 @@ def follow_trader(
     db.refresh(s)
     for tid in invalidated:
         cache.invalidate_subscribers_for_trader(tid)
-    return s
+    # Return via _to_out so the response carries the fresh followed_trader_ids
+    # (and business name) — the raw ORM row wouldn't include the computed set.
+    return _to_out(db, s)
 
 
 @router.post("/subscriber/unfollow", response_model=SubscriberSettingsOut)
@@ -870,7 +876,8 @@ def unfollow_trader(
     db.commit()
     db.refresh(s)
     cache.invalidate_subscribers_for_trader(payload.trader_id)
-    return s
+    # Return via _to_out so the response carries the fresh followed_trader_ids.
+    return _to_out(db, s)
 
 
 @router.get("/trader", response_model=TraderSettingsOut)

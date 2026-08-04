@@ -230,10 +230,19 @@ def _write_close(db: Session, account: BrokerAccount, div: Divergence) -> uuid.U
     assert pc is not None
     c = div.contract
     fill_at = _expiry_fill_time(c)
+    # Inherit the originating trader from the representative parent (a mirror
+    # points at its trader; a trader's own order points at itself). Fall back to
+    # the account owner if the parent is somehow missing its tag.
+    parent_row = db.get(Order, pc.parent_order_id) if pc.parent_order_id else None
+    source_trader_id = (
+        parent_row.source_trader_id if parent_row and parent_row.source_trader_id
+        else account.user_id
+    )
     order = Order(
         user_id=account.user_id,
         broker_account_id=account.id,
         parent_order_id=pc.parent_order_id,
+        source_trader_id=source_trader_id,
         instrument_type=c.instrument_type,
         symbol=c.symbol,
         option_expiry=c.option_expiry,

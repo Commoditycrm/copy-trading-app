@@ -80,6 +80,12 @@ class FillOut(BaseModel):
 class OrderOut(BaseModel):
     id: uuid.UUID
     parent_order_id: uuid.UUID | None
+    # The trader who originated this order's signal (denormalized on the row).
+    # For a subscriber following MANY traders, this is how the UI tells which
+    # trader each mirrored order came from. `source_trader_name` is a transient
+    # display label populated by the trades endpoints (not a DB column).
+    source_trader_id: uuid.UUID | None = None
+    source_trader_name: str | None = None
     # Nullable: orders survive when their broker is disconnected (SET NULL
     # at the DB level). See models/order.py for the rationale.
     broker_account_id: uuid.UUID | None

@@ -43,6 +43,7 @@ from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 from app.services import audit, cache, events
 from app.services import market_hours
@@ -1269,6 +1270,8 @@ def cancel_and_replace_mirrors_for_modify(
                 user_id=old_ch.user_id,
                 broker_account_id=old_ch.broker_account_id,
                 parent_order_id=new_trader_order_id,
+                # Carry the originating trader forward onto the replacement mirror.
+                source_trader_id=old_ch.source_trader_id,
                 instrument_type=old_ch.instrument_type,
                 symbol=old_ch.symbol,
                 option_expiry=old_ch.option_expiry,
@@ -1518,6 +1521,8 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 user_id=old_ch.user_id,
                 broker_account_id=old_ch.broker_account_id,
                 parent_order_id=trader_order_id,
+                # Carry the originating trader forward onto the replacement mirror.
+                source_trader_id=old_ch.source_trader_id,
                 instrument_type=old_ch.instrument_type,
                 symbol=old_ch.symbol,
                 option_expiry=old_ch.option_expiry,
@@ -1922,9 +1927,19 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # Gated on `trader_closing` so the common entry path pays nothing.
     paused_close_subs: list = []
     if trader_closing:
+        # Multi-trader: pull in paused subscribers who FOLLOW this trader (via
+        # subscriber_follows), primary or secondary — not just those whose
+        # legacy `following_trader_id` happens to be this trader. Otherwise a
+        # paused secondary follower is stranded holding a mirror after the
+        # trader exits.
         paused_rows = db.execute(
-            select(SubscriberSettings).where(
-                SubscriberSettings.following_trader_id == trader.id,
+            select(SubscriberSettings)
+            .join(
+                SubscriberFollow,
+                SubscriberFollow.subscriber_id == SubscriberSettings.user_id,
+            )
+            .where(
+                SubscriberFollow.trader_id == trader.id,
                 SubscriberSettings.copy_enabled.is_(False),
             )
         ).scalars().all()
@@ -2258,6 +2273,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 user_id=sub.user_id,
                 broker_account_id=acct.id,
                 parent_order_id=trader_order.id,
+                # Attribute this mirror to the trader who originated it, so the
+                # subscriber can tell which followed trader it came from.
+                source_trader_id=trader_order.user_id,
                 instrument_type=trader_order.instrument_type,
                 symbol=trader_order.symbol,
                 option_expiry=trader_order.option_expiry,
@@ -2465,6 +2483,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     user_id=item.subscriber_user_id,
                     broker_account_id=item.broker_account_id,
                     parent_order_id=trader_order.id,
+                    source_trader_id=trader_order.user_id,
                     bracket_parent_id=child.id,
                     instrument_type=child.instrument_type,
                     symbol=child.symbol,

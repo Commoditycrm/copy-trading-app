@@ -38,6 +38,7 @@ from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.services import excel_export, market_hours
@@ -558,10 +559,13 @@ def load_test_count(
             )
         ).scalar_one()
         following = db.execute(
-            select(func.count(SubscriberSettings.user_id)).where(
-                SubscriberSettings.user_id.in_(user_ids),
-                SubscriberSettings.copy_enabled.is_(True),
-                SubscriberSettings.following_trader_id.isnot(None),
+            select(func.count(func.distinct(SubscriberFollow.subscriber_id))).where(
+                SubscriberFollow.subscriber_id.in_(user_ids),
+                SubscriberFollow.subscriber_id.in_(
+                    select(SubscriberSettings.user_id).where(
+                        SubscriberSettings.copy_enabled.is_(True)
+                    )
+                ),
             )
         ).scalar_one()
 
@@ -626,6 +630,13 @@ def load_test_seed(
             following_trader_id=trader.id,
             copy_enabled=True,
             multiplier=multiplier,
+        ))
+        # Multi-trader: fanout selects subscribers via subscriber_follows, so the
+        # seed MUST create the follow row too — following_trader_id alone (the
+        # legacy primary) is no longer enough to receive mirrored orders.
+        db.add(SubscriberFollow(
+            subscriber_id=user.id,
+            trader_id=trader.id,
         ))
         db.add(BrokerAccount(
             id=uuid.uuid4(),

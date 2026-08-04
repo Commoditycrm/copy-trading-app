@@ -977,6 +977,9 @@ def _insert_order_from_alpaca(
     order = Order(
         user_id=trader_user_id,
         broker_account_id=broker_account_id,
+        # Root order captured from the broker socket → attributed to its own
+        # owner (the trader). Mirrors are created by copy_engine, not here.
+        source_trader_id=trader_user_id,
         instrument_type=instrument,
         symbol=symbol,
         option_expiry=option_expiry,

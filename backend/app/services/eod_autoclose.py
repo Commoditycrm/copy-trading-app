@@ -25,13 +25,14 @@ import logging
 import uuid
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType
 from app.models.settings import SubscriberSettings
+from app.models.subscriber_follow import SubscriberFollow
 from app.services import market_hours
 
 log = logging.getLogger(__name__)
@@ -150,7 +151,15 @@ def _due_pairs(
     Qualifies when: follows a trader, eod_autoclose_enabled is True, and ``now``
     is within their [close − eod_autoclose_minutes, close) window. copy_enabled/
     paused state is intentionally ignored — even a paused subscriber must be
-    flattened out of expiring contracts they already hold."""
+    flattened out of expiring contracts they already hold.
+
+    Multi-trader: the sweep is ACCOUNT-centric (it flattens every 0DTE option the
+    account holds, regardless of which trader it was mirrored from), so we emit
+    exactly ONE pair per (subscriber, account) — NOT one per followed trader, which
+    would sweep the same account concurrently N times. Qualification is an EXISTS
+    on ``subscriber_follows`` so it doesn't rely on the primary ``following_trader_id``
+    invariant. The trader_id slot carries the primary follow purely for audit and
+    is unused by the close worker."""
     with SessionLocal() as db:
         rows = db.execute(
             select(
@@ -158,7 +167,7 @@ def _due_pairs(
                 SubscriberSettings.following_trader_id,
                 SubscriberSettings.eod_autoclose_minutes,
             ).where(
-                SubscriberSettings.following_trader_id.isnot(None),
+                exists().where(SubscriberFollow.subscriber_id == SubscriberSettings.user_id),
                 SubscriberSettings.eod_autoclose_enabled.is_(True),
             )
         ).all()

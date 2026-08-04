@@ -229,16 +229,11 @@ def _broadcast_state_changed(trader_user_id: uuid.UUID, status: ListenerStatus) 
     }
     # Trader sees their own listener.
     events.publish(trader_user_id, payload)
-    # Subscribers following this trader also see it.
-    from sqlalchemy import select
-
+    # Every subscriber who FOLLOWS this trader (primary or secondary) also sees
+    # it — multi-trader: read subscriber_follows, not the single primary.
     from app.database import SessionLocal
-    from app.models.settings import SubscriberSettings
+    from app.services import follows
 
     with SessionLocal() as db:
-        for sub_id, in db.execute(
-            select(SubscriberSettings.user_id).where(
-                SubscriberSettings.following_trader_id == trader_user_id
-            )
-        ).all():
+        for sub_id in follows.subscriber_ids_following(db, trader_user_id):
             events.publish(sub_id, payload)

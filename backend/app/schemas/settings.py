@@ -9,6 +9,11 @@ from pydantic import BaseModel, Field, field_validator
 class SubscriberSettingsOut(BaseModel):
     user_id: uuid.UUID
     following_trader_id: uuid.UUID | None
+    # Multi-trader: the FULL set of traders this subscriber follows (the join
+    # table is the source of truth). `following_trader_id` above is just the
+    # primary (drives the app wordmark / legacy lookups). Populated by the
+    # settings endpoints so the UI can render the multi-follow list.
+    followed_trader_ids: list[uuid.UUID] = []
     # Brand of the trader being followed — surfaced in the shell so the
     # subscriber sees the trader's app name (not "ARK"). None when not
     # following anyone, or for legacy traders that pre-date business_name.

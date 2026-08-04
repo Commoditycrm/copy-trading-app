@@ -729,7 +729,11 @@ export default function TradesPage() {
                           className="chip uppercase tracking-wider font-medium whitespace-nowrap"
                           style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
                         >
-                          {placementStatus}{o.parent_order_id ? " · copy" : ""}
+                          {/* Multi-trader: a copied (mirror) order shows WHICH
+                              trader it came from when we know the name, so a
+                              subscriber following several traders can tell their
+                              orders apart; falls back to a plain "copy" tag. */}
+                          {placementStatus}{o.parent_order_id ? (o.source_trader_name ? ` · ${o.source_trader_name}` : " · copy") : ""}
                         </span>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
