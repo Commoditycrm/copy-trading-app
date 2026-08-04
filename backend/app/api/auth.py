@@ -320,7 +320,13 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenPair:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid_token")
     if payload.get("type") != "refresh":
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="wrong_token_type")
-    user = db.get(User, uuid.UUID(payload["sub"]))
+    # A validly-signed token can still carry a missing/malformed `sub`; parse it
+    # defensively so that's a 401, not an unhandled 500 (DEF-AUTH-001).
+    try:
+        user_id = uuid.UUID(payload["sub"])
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid_token")
+    user = db.get(User, user_id)
     if not user or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="user_inactive")
     return TokenPair(
