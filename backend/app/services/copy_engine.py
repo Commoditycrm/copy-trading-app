@@ -2597,13 +2597,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             #   3. Anything else → REJECTED with the raw error (pre-retry
             #      behaviour).
             #
-            # TODO(is_closing): detecting open-vs-close requires position-
-            # aware logic this branch doesn't have yet. Always treat as
-            # opening for now (`is_closing=False`, retry_interval_open is
-            # the only knob consulted). Closing-detection is a follow-up.
+            # A close mirror must keep its is_closing flag through the retry so
+            # the scheduler consults the subscriber's CLOSE retry interval, and
+            # so P&L / position tracking still see it as a close. Pick the
+            # interval by the order's own is_closing, matching
+            # retry_scheduler._passes_gates (DEF-COPY-001).
             sub_settings = db.get(SubscriberSettings, item.subscriber_user_id)
             interval = (
-                sub_settings.retry_interval_open
+                (sub_settings.retry_interval_close if child.is_closing
+                 else sub_settings.retry_interval_open)
                 if sub_settings is not None
                 else RetryInterval.NEVER
             )
@@ -2650,7 +2652,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 minutes = _RETRY_INTERVAL_MINUTES[interval]
                 child.status = OrderStatus.RETRY_PENDING
                 child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-                child.is_closing = False  # TODO: close-detection
+                # Preserve child.is_closing — resetting a close mirror to
+                # opening broke its retry interval + P&L basis (DEF-COPY-001).
                 child.reject_reason = "transient broker error, will retry"
                 # Don't set closed_at — order isn't terminal.
                 audit.record(
