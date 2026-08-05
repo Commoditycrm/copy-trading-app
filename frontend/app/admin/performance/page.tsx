@@ -427,6 +427,7 @@ export default function AdminPerformancePage() {
           <input
             type="text"
             placeholder="Filter by symbol or trader…"
+            aria-label="Filter by symbol or trader"
             value={q}
             onChange={e => setQ(e.target.value)}
             className="text-sm px-3 py-1.5 rounded-lg"
@@ -458,6 +459,7 @@ export default function AdminPerformancePage() {
           <select
             value={limit}
             onChange={e => { setLimit(+e.target.value); load(+e.target.value); }}
+            aria-label="Number of rows to show"
             className="text-sm px-3 py-1.5 rounded-lg"
             style={{ background: "rgba(255,255,255,0.06)", border: "1px solid var(--border)", color: "var(--text)" }}
           >

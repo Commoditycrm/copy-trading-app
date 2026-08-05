@@ -739,16 +739,16 @@ export default function BrokersPage() {
             <form onSubmit={connectAlpaca} className="space-y-3">
               <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
-                <input type="text" className="w-full p-2.5" placeholder="Alpaca Paper" value={label} onChange={e => setLabel(e.target.value)} required />
+                <input type="text" className="w-full p-2.5" placeholder="Alpaca Paper" aria-label="Alpaca account label" value={label} onChange={e => setLabel(e.target.value)} required />
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>API key ID</label>
-                  <input type="text" className="w-full p-2.5 font-mono text-sm" placeholder="PKxxxxxxxxxxxxxxxxxx" value={apiKey} onChange={e => setApiKey(e.target.value)} required />
+                  <input type="text" className="w-full p-2.5 font-mono text-sm" placeholder="PKxxxxxxxxxxxxxxxxxx" aria-label="Alpaca API key ID" value={apiKey} onChange={e => setApiKey(e.target.value)} required />
                 </div>
                 <div>
                   <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Secret key</label>
-                  <input type="password" className="w-full p-2.5 font-mono text-sm" placeholder="(shown once at generation)" value={apiSecret} onChange={e => setApiSecret(e.target.value)} required />
+                  <input type="password" className="w-full p-2.5 font-mono text-sm" placeholder="(shown once at generation)" aria-label="Alpaca secret key" value={apiSecret} onChange={e => setApiSecret(e.target.value)} required />
                 </div>
               </div>
               <PaperLiveRadio
@@ -792,6 +792,7 @@ export default function BrokersPage() {
                   type="text"
                   className="w-full p-2.5"
                   placeholder="Webull via SnapTrade"
+                  aria-label="SnapTrade account label"
                   value={stLabel}
                   onChange={e => setStLabel(e.target.value)}
                   required
@@ -805,6 +806,7 @@ export default function BrokersPage() {
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
                   placeholder="WEBULL, ETRADE, TRADIER, … (leave blank to pick on portal)"
+                  aria-label="Pre-select broker slug (optional)"
                   value={stBrokerSlug}
                   onChange={e => setStBrokerSlug(e.target.value.toUpperCase())}
                 />
@@ -852,6 +854,7 @@ export default function BrokersPage() {
                   type="text"
                   className="w-full p-2.5"
                   placeholder="My IBKR account"
+                  aria-label="IBKR account label"
                   value={ibkrLabel}
                   onChange={e => setIbkrLabel(e.target.value)}
                   required
@@ -863,6 +866,7 @@ export default function BrokersPage() {
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
                   placeholder="U1234567"
+                  aria-label="IBKR account ID"
                   value={ibkrAccountId}
                   onChange={e => setIbkrAccountId(e.target.value)}
                   required
@@ -873,6 +877,7 @@ export default function BrokersPage() {
                 <input
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
+                  aria-label="IBKR consumer key"
                   value={ibkrConsumerKey}
                   onChange={e => setIbkrConsumerKey(e.target.value)}
                   required
@@ -884,6 +889,7 @@ export default function BrokersPage() {
                   className="w-full p-2.5 font-mono text-xs"
                   rows={3}
                   placeholder="Paste your consumer signing key (long base64 / PEM)"
+                  aria-label="IBKR signing key"
                   value={ibkrSigningKey}
                   onChange={e => setIbkrSigningKey(e.target.value)}
                   required
@@ -894,6 +900,7 @@ export default function BrokersPage() {
                 <input
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
+                  aria-label="IBKR access token"
                   value={ibkrAccessToken}
                   onChange={e => setIbkrAccessToken(e.target.value)}
                   required
@@ -904,6 +911,7 @@ export default function BrokersPage() {
                 <textarea
                   className="w-full p-2.5 font-mono text-xs"
                   rows={3}
+                  aria-label="IBKR access token secret"
                   value={ibkrAccessTokenSecret}
                   onChange={e => setIbkrAccessTokenSecret(e.target.value)}
                   required

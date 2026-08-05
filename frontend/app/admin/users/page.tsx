@@ -225,6 +225,7 @@ export default function AdminUsersPage() {
         <input
           type="text"
           placeholder="Search email or name…"
+          aria-label="Search users"
           value={search}
           onChange={e => setSearch(e.target.value)}
           className="text-sm px-3 py-1.5 rounded-lg"
@@ -326,6 +327,7 @@ export default function AdminUsersPage() {
                         value={u.role}
                         disabled={busy === u.id || u.role === "admin"}
                         onChange={e => changeRole(u, e.target.value)}
+                        aria-label={`Role for ${u.email}`}
                         className="text-xs rounded-lg px-2 py-1 font-semibold"
                         style={{
                           background: ROLE_COLORS[u.role]?.bg ?? "var(--panel-2)",
@@ -356,6 +358,7 @@ export default function AdminUsersPage() {
                             type="text"
                             value={editingBiz.draft}
                             maxLength={120}
+                            aria-label={`Business name for ${u.email}`}
                             onChange={e => setEditingBiz({ id: u.id, draft: e.target.value })}
                             onKeyDown={e => {
                               if (e.key === "Enter") { e.preventDefault(); saveBusinessName(u); }

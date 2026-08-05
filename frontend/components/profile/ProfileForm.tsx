@@ -78,11 +78,12 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
 
   return (
     <>
-      <label className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: "var(--muted)" }}>
+      <label htmlFor="profile-display-name" className="block text-[10px] uppercase tracking-wider mb-1.5 font-medium" style={{ color: "var(--muted)" }}>
         Display name
       </label>
       <div className="flex items-center gap-2">
         <input
+          id="profile-display-name"
           value={name}
           maxLength={120}
           placeholder="Your name"
@@ -135,13 +136,13 @@ export function ProfileForm({ onUpdated }: { onUpdated?: (u: User) => void } = {
         {emailOpen && (
           <div className="mt-2 space-y-2 rounded-lg p-3" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--border)" }}>
             <input
-              type="email" placeholder="New email address" value={newEmail}
+              type="email" placeholder="New email address" aria-label="New email address" value={newEmail}
               onChange={e => setNewEmail(e.target.value)}
               className="w-full text-sm px-3 py-1.5 rounded-lg"
               style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
             />
             <input
-              type="password" placeholder="Current password" value={pwd}
+              type="password" placeholder="Current password" aria-label="Current password" value={pwd}
               onChange={e => setPwd(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && !sendingEmail) submitEmailChange(); }}
               className="w-full text-sm px-3 py-1.5 rounded-lg"

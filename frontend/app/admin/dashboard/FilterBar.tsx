@@ -99,6 +99,7 @@ export function FilterBar({ filters, onChange }: Props) {
             type="datetime-local"
             value={filters.from}
             onChange={(e) => onChange({ from: e.target.value })}
+            aria-label="Custom range start"
             className="text-sm px-2 py-1.5 rounded-lg"
             style={{ background: "var(--bg-tint)", border: "1px solid var(--border)", color: "var(--text)" }}
           />
@@ -107,6 +108,7 @@ export function FilterBar({ filters, onChange }: Props) {
             type="datetime-local"
             value={filters.to}
             onChange={(e) => onChange({ to: e.target.value })}
+            aria-label="Custom range end"
             className="text-sm px-2 py-1.5 rounded-lg"
             style={{ background: "var(--bg-tint)", border: "1px solid var(--border)", color: "var(--text)" }}
           />

@@ -849,6 +849,7 @@ export default function SettingsPage() {
                   onChange={setMultInput}
                   step={0.1} min={0.1} max={10}
                   className="w-20"
+                  ariaLabel="Copy size multiplier"
                 />
                 <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
                   ×{fmtMultiplier(sub.multiplier)}
@@ -1247,6 +1248,7 @@ export default function SettingsPage() {
                 <SelectInput
                   value={sub.retry_interval_open}
                   onChange={(v) => setRetryInterval("open", v as RetryInterval)}
+                  ariaLabel="Retry interval — opening positions"
                   options={RETRY_OPTIONS.map(o => ({ value: o.value, label: o.label }))}
                 />
               </Field>
@@ -1254,6 +1256,7 @@ export default function SettingsPage() {
                 <SelectInput
                   value={sub.retry_interval_close}
                   onChange={(v) => setRetryInterval("close", v as RetryInterval)}
+                  ariaLabel="Retry interval — closing positions"
                   options={RETRY_OPTIONS.map(o => ({ value: o.value, label: o.label }))}
                 />
               </Field>
@@ -1261,6 +1264,7 @@ export default function SettingsPage() {
                 <SelectInput
                   value={String(sub.retry_max_attempts ?? 1)}
                   onChange={(v) => setRetryMaxAttempts(Number(v))}
+                  ariaLabel="Max retries"
                   options={RETRY_COUNT_OPTIONS}
                 />
               </Field>
@@ -1438,7 +1442,7 @@ function Field({ label, children }: { label: React.ReactNode; children: React.Re
 }
 
 function NumberInput({
-  value, onChange, step, min, max, className = "", placeholder,
+  value, onChange, step, min, max, className = "", placeholder, ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -1447,10 +1451,12 @@ function NumberInput({
   max?: number;
   className?: string;
   placeholder?: string;
+  ariaLabel?: string;
 }) {
   return (
     <input
       type="number" step={step} min={min} max={max} placeholder={placeholder}
+      aria-label={ariaLabel}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className={`px-3 py-2 text-sm rounded-lg bg-transparent border tabular-nums transition-colors focus:outline-none focus:border-[var(--accent)] ${className}`}
@@ -1460,15 +1466,17 @@ function NumberInput({
 }
 
 function SelectInput({
-  value, onChange, options,
+  value, onChange, options, ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  ariaLabel?: string;
 }) {
   return (
     <select
       value={value}
+      aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.value)}
       className="w-full px-3 py-2 text-sm rounded-lg bg-transparent border transition-colors focus:outline-none focus:border-[var(--accent)] cursor-pointer"
       style={{ borderColor: "var(--border)" }}
@@ -1732,6 +1740,7 @@ function LimitRow({
                   min={0}
                   max={isPct ? 100 : undefined}
                   placeholder="no limit"
+                  aria-label={`${title} threshold`}
                   className="flex-1 w-full px-2 py-2 text-xs tabular-nums"
                   style={{
                     border: "none",
@@ -1901,6 +1910,7 @@ function CopyTraderBracketRow({
         type="button"
         role="switch"
         aria-checked={enabled}
+        aria-label="Copy trader's stop-loss and take-profit"
         disabled={busy}
         onClick={onToggle}
         className="relative shrink-0 rounded-full transition-colors"
@@ -1997,10 +2007,11 @@ function EodAutocloseRow({
       </div>
       {enabled && (
         <div className="mt-3 flex items-center gap-2">
-          <label className="text-[11px]" style={{ color: "var(--muted)" }}>
+          <label htmlFor="odte-minutes-before-close" className="text-[11px]" style={{ color: "var(--muted)" }}>
             Minutes before close
           </label>
           <input
+            id="odte-minutes-before-close"
             type="number"
             min={1}
             max={30}
@@ -2166,6 +2177,7 @@ function PercentInputCell({
             step={0.5}
             min={0}
             placeholder="no limit"
+            aria-label={label}
             className="flex-1 w-full px-2 py-2 text-xs tabular-nums"
             style={{
               border: "none",
@@ -2259,6 +2271,7 @@ function FilterPanel({
         symbols={symbols}
         onChange={onChange}
         placeholder={placeholder}
+        ariaLabel={title}
       />
     </div>
   );
@@ -2266,10 +2279,11 @@ function FilterPanel({
 
 /** Chip-style symbol input. Add via Enter or comma. Backspace on empty
  *  input removes the last chip. */
-function ChipInput({ symbols, onChange, placeholder }: {
+function ChipInput({ symbols, onChange, placeholder, ariaLabel }: {
   symbols: string[];
   onChange: (next: string[]) => void;
   placeholder?: string;
+  ariaLabel?: string;
 }) {
   const [draft, setDraft] = useState("");
 
@@ -2343,6 +2357,7 @@ function ChipInput({ symbols, onChange, placeholder }: {
         }}
         onBlur={() => { if (draft.trim()) commit(draft); }}
         placeholder={empty ? placeholder : ""}
+        aria-label={ariaLabel}
         className="flex-1 min-w-[120px] px-1.5 py-1 text-xs"
         style={{
           // Wipe the global input[type="text"] border + background from

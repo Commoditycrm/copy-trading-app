@@ -246,10 +246,11 @@ function FanoutThresholdCard() {
       </div>
 
       <div className="flex items-center gap-2 flex-wrap">
-        <label className="text-xs" style={{ color: "var(--muted)" }}>
+        <label htmlFor="admin-threshold" className="text-xs" style={{ color: "var(--muted)" }}>
           Threshold
         </label>
         <input
+          id="admin-threshold"
           type="number"
           min={1}
           max={10000}

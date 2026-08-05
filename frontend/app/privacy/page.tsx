@@ -130,7 +130,7 @@ export default function PrivacyPage() {
           <p>
             Depending on where you live, you may have additional rights (such as access, correction, deletion, or
             portability). To exercise any of these, contact us at{" "}
-            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)" }}>{SUPPORT_EMAIL}</a>.
+            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)", textDecoration: "underline" }}>{SUPPORT_EMAIL}</a>.
           </p>
         </Section>
 
@@ -166,7 +166,7 @@ export default function PrivacyPage() {
         <Section title="12. Contact us">
           <p>
             Questions about this policy or your data? Email us at{" "}
-            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)" }}>{SUPPORT_EMAIL}</a>.
+            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)", textDecoration: "underline" }}>{SUPPORT_EMAIL}</a>.
           </p>
         </Section>
 

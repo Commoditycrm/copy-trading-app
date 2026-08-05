@@ -696,6 +696,7 @@ export default function TradesPage() {
                                 <input
                                   type="number" step="0.01" min="0.01"
                                   placeholder="Limit"
+                                  aria-label={`Limit price for ${o.symbol?.toUpperCase() ?? "order"}`}
                                   value={closePrices[o.id] ?? ""}
                                   onChange={e => setClosePrices(p => ({ ...p, [o.id]: e.target.value }))}
                                   className="w-20 px-2 py-1 text-xs"

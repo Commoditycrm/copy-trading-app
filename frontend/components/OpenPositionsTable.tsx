@@ -437,7 +437,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         </div>
 
         <div className={`card overflow-hidden ${fillHeight ? "flex flex-col flex-1 min-h-0" : ""}`.trim()} style={{ borderRadius: 10 }}>
-          <div className={`overflow-auto ${fillHeight ? "flex-1 min-h-0" : ""}`.trim()}>
+          <div className={`overflow-auto ${fillHeight ? "flex-1 min-h-0" : ""}`.trim()}
+            role="region" aria-label="Open positions" tabIndex={0}>
             <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
@@ -553,6 +554,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               <input
                                 type="number" step="0.01" min="0.01"
                                 placeholder="Limit"
+                                aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
                                 value={closeLimitPrices[key] ?? ""}
                                 onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
                                 className="w-20 px-2 py-1 text-xs border"

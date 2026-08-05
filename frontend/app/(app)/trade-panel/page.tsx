@@ -609,6 +609,7 @@ export default function TradePanelPage() {
                   height: 42,
                 }}
                 placeholder="AAPL"
+                aria-label="Symbol"
                 value={symbol}
                 onChange={e => setSymbol(e.target.value)}
                 required
@@ -665,6 +666,7 @@ export default function TradePanelPage() {
                       type="number" step="1" min="1"
                       className="w-full px-2.5 text-sm tabular-nums outline-none"
                       style={{ ...inputStyle, height: 34 }}
+                      aria-label="Quantity"
                       value={qty}
                       onChange={e => setQty(e.target.value)}
                       required
@@ -679,6 +681,7 @@ export default function TradePanelPage() {
                         type="date"
                         className="w-full px-2.5 text-sm outline-none"
                         style={{ ...inputStyle, height: 34 }}
+                        aria-label="Expiry date"
                         value={expiry}
                         onChange={e => setExpiry(e.target.value)}
                         required
@@ -703,6 +706,7 @@ export default function TradePanelPage() {
                         className="w-full px-2.5 text-sm tabular-nums outline-none"
                         style={{ ...inputStyle, height: 34 }}
                         placeholder="200"
+                        aria-label="Strike price"
                         value={strike}
                         onChange={e => setStrike(e.target.value)}
                         required
@@ -752,6 +756,7 @@ export default function TradePanelPage() {
                   type="number" step="1" min="1"
                   className="w-full px-2.5 text-sm tabular-nums outline-none"
                   style={{ ...inputStyle, height: 34 }}
+                  aria-label="Quantity"
                   value={qty}
                   onChange={e => setQty(e.target.value)}
                   required
@@ -784,6 +789,7 @@ export default function TradePanelPage() {
                       className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
                       style={inputStyle}
                       placeholder="200.00"
+                      aria-label="Limit price"
                       value={limit}
                       onChange={e => setLimit(e.target.value)}
                     />
@@ -859,6 +865,7 @@ export default function TradePanelPage() {
                           : "var(--border)",
                       }}
                       placeholder="10"
+                      aria-label="Take profit percent"
                       value={takeProfit}
                       onChange={e => setTakeProfit(e.target.value)}
                     />
@@ -882,6 +889,7 @@ export default function TradePanelPage() {
                           : "var(--border)",
                       }}
                       placeholder="5"
+                      aria-label="Stop loss percent"
                       value={stopLoss}
                       onChange={e => setStopLoss(e.target.value)}
                     />

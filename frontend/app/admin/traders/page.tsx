@@ -63,6 +63,7 @@ export default function AdminTradersPage() {
       <input
         type="text"
         placeholder="Search name, business, or email…"
+        aria-label="Search traders"
         value={search}
         onChange={e => setSearch(e.target.value)}
         className="text-sm px-3 py-1.5 rounded-lg"

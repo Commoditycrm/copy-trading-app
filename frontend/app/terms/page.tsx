@@ -192,7 +192,7 @@ export default function TermsPage() {
         <Section title="16. Contact">
           <p>
             Questions about these Terms? Email us at{" "}
-            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)" }}>{SUPPORT_EMAIL}</a>.
+            <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--accent)", textDecoration: "underline" }}>{SUPPORT_EMAIL}</a>.
           </p>
         </Section>
 

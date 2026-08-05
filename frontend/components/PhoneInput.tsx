@@ -163,6 +163,7 @@ export function PhoneInput({
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && filtered[0]) { e.preventDefault(); pick(filtered[0]); } }}
                 placeholder="Search…"
+                aria-label="Search countries"
                 className="w-full text-sm px-2 py-1 rounded-md"
                 style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
               />
@@ -195,6 +196,7 @@ export function PhoneInput({
         type="tel"
         inputMode="tel"
         autoComplete="tel-national"
+        aria-label="Phone number"
         placeholder="98765 43210"
         value={local}
         onChange={(e) => { setLocal(e.target.value); emit(country.dial, e.target.value); }}
