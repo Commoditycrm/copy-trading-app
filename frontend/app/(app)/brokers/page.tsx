@@ -36,9 +36,27 @@ const BROKER_META: Record<BrokerName, {
 // pick Webull from inside the SnapTrade portal.
 const BROKER_ORDER: BrokerName[] = ["alpaca", "snaptrade", "ibkr"];
 
+// Neutral fallback presentation for any broker value not in BROKER_META — e.g.
+// the "fake" QA mock broker, or a broker added server-side before this client
+// map. Without it, BROKER_META[broker] is undefined and reading meta.accent
+// white-screened the whole /brokers page (DEF-UI-001).
+type BrokerMeta = (typeof BROKER_META)[BrokerName];
+
+function brokerMeta(broker: string): BrokerMeta {
+  return (
+    BROKER_META[broker as BrokerName] ?? {
+      name: broker ? broker.charAt(0).toUpperCase() + broker.slice(1) : "Broker",
+      tagline: "",
+      latency: "—",
+      latencyTone: "warn",
+      accent: "#8b93a7",
+    }
+  );
+}
+
 /** Rounded-square avatar with the broker's initial in its brand hue. */
 function BrokerAvatar({ broker, size = 40 }: { broker: BrokerName; size?: number }) {
-  const meta = BROKER_META[broker];
+  const meta = brokerMeta(broker);
   return (
     <div
       className="grid place-items-center font-semibold shrink-0"
@@ -77,7 +95,7 @@ function StatusPill({ status }: { status: BrokerAccount["connection_status"] }) 
 
 /** Latency badge for the picker tiles. */
 function LatencyBadge({ broker }: { broker: BrokerName }) {
-  const meta = BROKER_META[broker];
+  const meta = brokerMeta(broker);
   const tone = meta.latencyTone === "good"
     ? { color: "var(--good)", bg: "var(--good-soft)", bd: "rgba(34,197,94,0.25)" }
     : { color: "var(--warn)", bg: "rgba(255,200,87,0.12)", bd: "rgba(255,200,87,0.30)" };
@@ -573,7 +591,7 @@ export default function BrokersPage() {
 
       {/* ── Connected account(s) ──────────────────────────────────────── */}
       {accounts.map(a => {
-        const meta = BROKER_META[a.broker];
+        const meta = brokerMeta(a.broker);
         return (
           <motion.div
             key={a.id}

@@ -40,6 +40,37 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
+
+import re as _re  # noqa: E402
+
+
+class _RedactAccessTokenFilter(logging.Filter):
+    """Scrub the SSE ``?token=<JWT>`` from uvicorn access-log lines so the
+    short-lived access token is never written to logs in cleartext
+    (DEF-SEC-001). EventSource can't send an Authorization header, so the token
+    has to ride in the query string — but it must not land in the access log.
+    uvicorn passes the request path as the 3rd positional arg of the access
+    record; redact the token value there before the line is formatted."""
+
+    _TOKEN_RE = _re.compile(r"(token=)[^&\s\"']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if (
+            isinstance(args, tuple)
+            and len(args) >= 3
+            and isinstance(args[2], str)
+            and "token=" in args[2]
+        ):
+            scrubbed = list(args)
+            scrubbed[2] = self._TOKEN_RE.sub(r"\1REDACTED", scrubbed[2])
+            record.args = tuple(scrubbed)
+        return True
+
+
+# Attach at import time so it's live before the first request is logged.
+logging.getLogger("uvicorn.access").addFilter(_RedactAccessTokenFilter())
+
 # On-demand thread-stack dump for diagnosing a hung worker (event loop blocked
 # on a lock). `docker compose exec worker kill -USR1 1` prints every thread's
 # Python traceback to stderr (→ container logs) WITHOUT killing the process.
