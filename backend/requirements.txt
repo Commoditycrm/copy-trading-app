@@ -34,6 +34,16 @@ alpaca-py==0.33.0
 # path). Do NOT restore tedchou12/webull until BOTH conditions hold: a
 # vetted/official replacement exists AND the architectural decision in
 # snaptrade_decision.md is explicitly reversed.
+#
+# 2026-08-06: BOTH conditions now met. This is Webull's OFFICIAL OpenAPI SDK
+# (webull-inc/webull-openapi-python-sdk) — a DIFFERENT package from the
+# compromised unofficial `webull==0.6.1` (tedchou12) above. It powers the
+# direct-Webull real-time trade signal (app/brokers/webull.py +
+# services/webull_listener.py), gated behind settings.webull_direct_enabled
+# (default OFF). NOTE: it imports under the same `webull` namespace, so keep
+# this pinned to the OFFICIAL distribution name below — never a bare `webull`.
+# The adapter imports the SDK LAZILY (never at boot), unlike the old file.
+webull-openapi-python-sdk==2.0.16
 # SnapTrade aggregator — official SDK. Used by the SnapTrade adapter and
 # listener; requires SNAPTRADE_CLIENT_ID + SNAPTRADE_CONSUMER_KEY env vars
 # (see app/config.py). Endpoints return clean 503 when unset so dev

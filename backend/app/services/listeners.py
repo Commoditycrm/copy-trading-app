@@ -28,6 +28,7 @@ from app.services import (
     listener_state,
     snaptrade_listener,
     trade_listener,
+    webull_listener,
 )
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     trade_listener.bind_loop(loop)
     snaptrade_listener.bind_loop(loop)
     ibkr_listener.bind_loop(loop)
+    webull_listener.bind_loop(loop)
 
 
 async def start_all_listeners() -> None:
@@ -45,6 +47,7 @@ async def start_all_listeners() -> None:
     await trade_listener.start_all_listeners()
     await snaptrade_listener.start_all_listeners()
     await ibkr_listener.start_all_listeners()
+    await webull_listener.start_all_listeners()  # no-op unless webull_direct_enabled
     # Daily realized-P&L snapshot job — freezes each user's per-day P&L from the
     # broker feed so the Calendar reads correct, broker-change-durable values.
     from app.services import pnl_snapshot  # noqa: PLC0415
@@ -56,6 +59,7 @@ async def stop_all_listeners() -> None:
     await trade_listener.stop_all_listeners()
     await snaptrade_listener.stop_all_listeners()
     await ibkr_listener.stop_all_listeners()
+    await webull_listener.stop_all_listeners()
     from app.services import pnl_snapshot  # noqa: PLC0415
     await pnl_snapshot.stop_pnl_snapshot_job()
 
@@ -94,8 +98,11 @@ def _start_listener_local(trader_user_id: uuid.UUID, broker_account_id: uuid.UUI
         snaptrade_listener.start_listener(trader_user_id, broker_account_id)
     elif acct.broker == BrokerName.IBKR:
         ibkr_listener.start_listener(trader_user_id, broker_account_id)
+    elif acct.broker == BrokerName.WEBULL:
+        # Direct-Webull real-time listener. start_listener() itself no-ops
+        # unless settings.webull_direct_enabled, so this is inert with the flag off.
+        webull_listener.start_listener(trader_user_id, broker_account_id)
     else:
-        # Includes BrokerName.WEBULL (dormant — historical rows only) and
         # BrokerName.FAKE (no live listener needed).
         log.info(
             "listeners.start_listener: no listener for broker %s",
@@ -128,9 +135,23 @@ def _stop_listener_local(trader_user_id: uuid.UUID) -> None:
     trade_listener.stop_listener(trader_user_id)
     snaptrade_listener.stop_listener(trader_user_id)
     ibkr_listener.stop_listener(trader_user_id)
+    webull_listener.stop_listener(trader_user_id)
     # Drop the entry entirely so the SSE pill doesn't keep showing a
     # 'disconnected' state for a broker the user no longer has.
     listener_state.clear(trader_user_id)
+
+
+def _listened_brokers() -> list[BrokerName]:
+    """Brokers that actually run a listener task, for the reconcile desired-set.
+    WEBULL is included ONLY when ``webull_direct_enabled`` is on — its listener
+    no-ops otherwise, and including it unconditionally would make reconcile log a
+    'starting' attempt every tick for any connected Webull account while the flag
+    is off. FAKE never has a listener."""
+    from app.config import get_settings  # noqa: PLC0415
+    brokers = [BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.IBKR]
+    if get_settings().webull_direct_enabled:
+        brokers.append(BrokerName.WEBULL)
+    return brokers
 
 
 def _running_listener_trader_ids() -> set[uuid.UUID]:
@@ -138,7 +159,7 @@ def _running_listener_trader_ids() -> set[uuid.UUID]:
     all backends. Reads each backend's task registry defensively so a backend
     without one just contributes nothing."""
     out: set[uuid.UUID] = set()
-    for mod in (trade_listener, snaptrade_listener, ibkr_listener):
+    for mod in (trade_listener, snaptrade_listener, ibkr_listener, webull_listener):
         tasks = getattr(mod, "_tasks", {})
         for tid, task in list(tasks.items()):
             try:
@@ -179,9 +200,7 @@ def reconcile_once() -> None:
                 User.role == UserRole.TRADER,
                 User.is_active.is_(True),
                 BrokerAccount.connection_status == "connected",
-                BrokerAccount.broker.in_(
-                    [BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.IBKR]
-                ),
+                BrokerAccount.broker.in_(_listened_brokers()),
             )
         ).all()
     for user_id, acct_id in rows:
@@ -253,7 +272,7 @@ def _fetch_desired() -> dict[uuid.UUID, tuple[uuid.UUID, BrokerName]]:
                 User.role == UserRole.TRADER,
                 User.is_active.is_(True),
                 BrokerAccount.connection_status == "connected",
-                BrokerAccount.broker.in_(_LISTENED_BROKERS),
+                BrokerAccount.broker.in_(_listened_brokers()),
             )
         ).all()
     return {user_id: (acct_id, broker) for user_id, acct_id, broker in rows}
@@ -264,6 +283,7 @@ def _has_running_listener(trader_user_id: uuid.UUID) -> bool:
         trade_listener.has_running_listener(trader_user_id)
         or snaptrade_listener.has_running_listener(trader_user_id)
         or ibkr_listener.has_running_listener(trader_user_id)
+        or webull_listener.has_running_listener(trader_user_id)
     )
 
 
@@ -272,6 +292,7 @@ def _running_trader_ids() -> set[uuid.UUID]:
         trade_listener.running_trader_ids()
         | snaptrade_listener.running_trader_ids()
         | ibkr_listener.running_trader_ids()
+        | webull_listener.running_trader_ids()
     )
 
 
