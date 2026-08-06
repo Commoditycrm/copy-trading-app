@@ -167,7 +167,7 @@ export function NotificationBell({
 
       {open && (
         <div
-          role="menu"
+          aria-label="Notifications"
           className="absolute right-0 mt-2 rounded-2xl overflow-hidden z-50 animate-fade-in"
           style={{
             width: "min(360px, calc(100vw - 24px))",

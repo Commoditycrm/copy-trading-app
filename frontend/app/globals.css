@@ -18,7 +18,9 @@
   /* Type */
   --text:         #e7ecf2;          /* off-white, slight cool tint */
   --text-2:       #c1c8d1;
-  --muted:        #6c7682;          /* cool grey */
+  /* a11y (WCAG 1.4.3): was #6c7682 (~4.1:1 on --panel) — failed AA for body
+     text. Lightened same-hue to reach >=4.5:1 on the dark panels/bg. */
+  --muted:        #7c8896;          /* cool grey */
   --faint:        #3a414a;          /* almost-invisible labels */
 
   /* Brand accent — deeper cerulean */
@@ -81,7 +83,9 @@
 
   --text:         #0f172a;
   --text-2:       #334155;
-  --muted:        #64748b;
+  /* a11y (WCAG 1.4.3): was #64748b (~4.4:1 on the tinted --bg) — just under AA.
+     Darkened same-hue to clear >=4.5:1 on both white cards and the off-white bg. */
+  --muted:        #5a6a7d;
   --faint:        #94a3b8;
 
   --accent:       #0a6fa3;

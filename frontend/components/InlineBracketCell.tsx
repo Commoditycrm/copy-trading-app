@@ -263,6 +263,9 @@ export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEd
           step={inPercentMode ? "0.01" : "0.01"}
           min="0.01"
           placeholder={inPercentMode ? "—" : "—"}
+          aria-label={inPercentMode
+            ? `${leg === "tp" ? "Take profit" : "Stop loss"} percent`
+            : `${leg === "tp" ? "Take profit" : "Stop loss"} price`}
           value={draft}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => {
@@ -307,6 +310,7 @@ export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEd
         className="px-1.5 py-0.5 text-[10px] font-medium rounded border"
         style={{ borderColor: "var(--border)", color: "var(--muted)" }}
         title="Cancel (Esc)"
+        aria-label="Cancel edit"
       >
         ✕
       </button>

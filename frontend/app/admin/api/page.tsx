@@ -162,6 +162,7 @@ export default function AdminApiPage() {
               max={state.max}
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              aria-label="Interval in seconds"
               className="flex-1 w-full px-3 py-2 text-sm tabular-nums"
               style={{
                 border: "none",

@@ -244,6 +244,7 @@ export default function AdminRejectedPage() {
         <input
           type="text"
           placeholder="Search user, symbol, or reason…"
+          aria-label="Search rejected orders"
           value={search}
           onChange={e => setSearch(e.target.value)}
           className="text-sm px-3 py-1.5 rounded-lg"

@@ -177,6 +177,7 @@ export function SearchableSelect({
           disabled={disabled}
           readOnly={!searchable || !open}
           placeholder={selected ? "" : placeholder}
+          aria-label={placeholder}
           className="block w-full text-sm outline-none"
           style={{
             padding: "0 30px 0 10px",

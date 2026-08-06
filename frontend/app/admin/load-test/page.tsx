@@ -145,10 +145,11 @@ export default function LoadTestPage() {
         <form onSubmit={handleSeed} className="space-y-4">
           {/* Trader email */}
           <div className="space-y-1">
-            <label className="text-xs font-medium" style={{ color: "var(--text-2)" }}>
+            <label htmlFor="seed-trader-email" className="text-xs font-medium" style={{ color: "var(--text-2)" }}>
               Trader Email
             </label>
             <input
+              id="seed-trader-email"
               type="email"
               required
               placeholder="trader@example.com"
@@ -195,6 +196,7 @@ export default function LoadTestPage() {
                 max={500}
                 value={COUNT_PRESETS.includes(seedCount) ? "" : seedCount}
                 placeholder="Custom…"
+                aria-label="Custom subscriber count"
                 onChange={e => {
                   const v = parseInt(e.target.value, 10);
                   if (!isNaN(v) && v > 0) setSeedCount(v);
@@ -226,6 +228,7 @@ export default function LoadTestPage() {
                 step={0.1}
                 value={multiplier}
                 onChange={e => setMultiplier(parseFloat(e.target.value))}
+                aria-label="Copy multiplier"
                 className="flex-1"
               />
               <span className="text-sm font-mono w-10 text-right" style={{ color: "var(--text)" }}>
@@ -268,10 +271,11 @@ export default function LoadTestPage() {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs font-medium" style={{ color: "var(--text-2)" }}>
+            <label htmlFor="cleanup-trader-email" className="text-xs font-medium" style={{ color: "var(--text-2)" }}>
               Trader Email (optional — to bust Redis cache)
             </label>
             <input
+              id="cleanup-trader-email"
               type="email"
               placeholder="trader@example.com"
               value={cleanupEmail}
