@@ -13,7 +13,19 @@ class AlpacaCredentialsIn(BaseModel):
     paper: bool = True
 
 
-# Direct Webull schemas removed — users connect Webull via SnapTrade.
+class WebullCredentialsIn(BaseModel):
+    """Direct Webull (official OpenAPI) credentials the trader generates in
+    Webull's developer portal (Trading API → Retail Individual → Obtain API
+    Key). ``account_id`` is the Webull account_id (NOT the account number) —
+    the value returned by ``account_v2.get_account_list()``. region is US.
+
+    Stored Fernet-encrypted, exactly like Alpaca keys. Powers the real-time
+    gRPC trade signal; gated behind settings.webull_direct_enabled."""
+
+    app_key: str = Field(min_length=8, max_length=200)
+    app_secret: str = Field(min_length=8, max_length=200)
+    account_id: str = Field(min_length=4, max_length=120)
+    region_id: str = Field(default="us", max_length=8)
 
 
 class IbkrCredentialsIn(BaseModel):
@@ -62,8 +74,9 @@ class ConnectBrokerIn(BaseModel):
     # Exactly one credential block matching `broker` should be populated.
     # SnapTrade has its own two-step flow (start-portal → finish) and
     # doesn't use this generic shape.
-    alpaca: AlpacaCredentialsIn | None = None
-    ibkr:   IbkrCredentialsIn   | None = None
+    alpaca: AlpacaCredentialsIn  | None = None
+    ibkr:   IbkrCredentialsIn    | None = None
+    webull: WebullCredentialsIn  | None = None
 
 
 class BrokerAccountOut(BaseModel):

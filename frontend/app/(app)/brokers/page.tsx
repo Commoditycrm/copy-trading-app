@@ -23,18 +23,19 @@ const BROKER_META: Record<BrokerName, {
   accent: string;
 }> = {
   alpaca:    { name: "Alpaca",    tagline: "Direct API keys",                    latency: "Realtime", latencyTone: "good", accent: "#f5a623" },
-  // Direct Webull integration removed — Webull is connected via SnapTrade.
-  // Kept in the map so old broker_account rows with broker="webull" still
-  // render with a valid avatar/name in the connected-list, but the picker
-  // no longer surfaces it as a connect option.
-  webull:    { name: "Webull",    tagline: "(via SnapTrade)",                    latency: "5–60s",    latencyTone: "warn", accent: "#3b82f6" },
+  // Webull DIRECT via the official OpenAPI SDK — real-time gRPC trade stream.
+  // Requires the trader's Webull API keys (app_key/app_secret/account_id).
+  // Gated server-side by webull_direct_enabled; connect returns a clear 400
+  // when off. Distinct from connecting Webull via the SnapTrade portal.
+  webull:    { name: "Webull",    tagline: "Direct API keys · realtime",         latency: "Realtime", latencyTone: "good", accent: "#3b82f6" },
   snaptrade: { name: "SnapTrade", tagline: "20+ brokers · hosted",               latency: "5–60s",    latencyTone: "warn", accent: "#14b8a6" },
   ibkr:      { name: "IBKR",      tagline: "Interactive Brokers · direct OAuth", latency: "~2–5s",    latencyTone: "good", accent: "#d04a02" },
 };
 
-// Picker order — "webull" excluded; subscribers should click SnapTrade and
-// pick Webull from inside the SnapTrade portal.
-const BROKER_ORDER: BrokerName[] = ["alpaca", "snaptrade", "ibkr"];
+// Picker order. "webull" is direct-API (real-time gRPC); it only connects when
+// the server has webull_direct_enabled on (otherwise the connect call 400s
+// with a clear message).
+const BROKER_ORDER: BrokerName[] = ["alpaca", "webull", "snaptrade", "ibkr"];
 
 // Neutral fallback presentation for any broker value not in BROKER_META — e.g.
 // the "fake" QA mock broker, or a broker added server-side before this client
@@ -271,6 +272,9 @@ export default function BrokersPage() {
   // Which broker the user has chosen to connect. Defaults to alpaca to
   // preserve the previous behaviour for existing users.
   const [chosenBroker, setChosenBroker] = useState<BrokerName>("alpaca");
+  // Whether the server has direct-Webull connect enabled. Hides the Webull
+  // picker option when off (connect would 400). Fetched in load().
+  const [webullEnabled, setWebullEnabled] = useState(false);
 
   // Alpaca form state
   const [label, setLabel] = useState("");
@@ -278,7 +282,12 @@ export default function BrokersPage() {
   const [apiSecret, setApiSecret] = useState("");
   const [paper, setPaper] = useState(false);   // default Live
 
-  // Direct Webull state removed — connect Webull via SnapTrade below.
+  // Direct Webull (official OpenAPI) — the trader's own API keys, stored
+  // encrypted like Alpaca. Powers the real-time gRPC trade signal.
+  const [webullLabel, setWebullLabel] = useState("");
+  const [webullAppKey, setWebullAppKey] = useState("");
+  const [webullAppSecret, setWebullAppSecret] = useState("");
+  const [webullAccountId, setWebullAccountId] = useState("");
 
   // SnapTrade form state — much smaller because the actual auth happens
   // on SnapTrade's hosted portal. We collect a label, optionally a
@@ -325,6 +334,10 @@ export default function BrokersPage() {
       const accts = await api<BrokerAccount[]>("/api/brokers");
       setAccounts(accts);
       setSnapshot(BROKERS_KEY, accts);
+      // Feature flags (best-effort — a failure just leaves Webull hidden).
+      api<{ webull_direct_enabled: boolean }>("/api/brokers/features")
+        .then(f => setWebullEnabled(!!f.webull_direct_enabled))
+        .catch(() => {});
       // Pull live balances immediately on entry, so opening (or being
       // redirected to) the page shows fresh numbers right away instead of the
       // cached snapshot + a 30s wait for the first poll tick. Silent = no
@@ -416,6 +429,7 @@ export default function BrokersPage() {
 
   function resetConnectForms() {
     setLabel(""); setApiKey(""); setApiSecret(""); setPaper(false);
+    setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId("");
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
     setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
@@ -473,7 +487,32 @@ export default function BrokersPage() {
     }
   }
 
-  // Direct Webull connect handlers removed — see SnapTrade flow below.
+  async function connectWebull(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api("/api/brokers", {
+        method: "POST",
+        body: JSON.stringify({
+          broker: "webull",
+          label: webullLabel.trim() || "Webull (direct)",
+          webull: {
+            app_key: webullAppKey.trim(),
+            app_secret: webullAppSecret.trim(),
+            account_id: webullAccountId.trim(),
+            region_id: "us",
+          },
+        }),
+      });
+      resetConnectForms();
+      notify.success("Webull connected — real-time stream starting");
+      await load();
+    } catch (e) {
+      notify.fromError(e, "Webull connect failed");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function startSnaptrade(e: FormEvent) {
     e.preventDefault();
@@ -683,7 +722,7 @@ export default function BrokersPage() {
               brokers (Alpaca / SnapTrade / IBKR) fill the row evenly — no
               empty 4th slot now that direct Webull is gone. */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-            {BROKER_ORDER.map(b => {
+            {BROKER_ORDER.filter(b => b !== "webull" || webullEnabled).map(b => {
               const meta = BROKER_META[b];
               const active = chosenBroker === b;
               return (
@@ -765,9 +804,44 @@ export default function BrokersPage() {
           </>
         )}
 
-        {/* Direct Webull connect form removed — users now connect Webull
-            through SnapTrade. The broker picker no longer offers Webull
-            as a standalone option (see BROKER_ORDER). */}
+        {chosenBroker === "webull" && (
+          <>
+            <div className="flex items-center gap-2.5">
+              <BrokerAvatar broker="webull" size={32} />
+              <h2 className="font-semibold">Connect Webull directly (real-time)</h2>
+            </div>
+            <p className="text-xs" style={{ color: "var(--muted)" }}>
+              From <a href="https://developer.webull.com" target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--accent)" }}>developer.webull.com</a>:
+              {" "}Trading API → Retail Individual → obtain your API key, then paste your
+              {" "}app key, app secret, and account ID below. On first connect, approve the
+              {" "}2FA prompt in your Webull app.
+            </p>
+            <form onSubmit={connectWebull} className="space-y-3">
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
+                <input type="text" className="w-full p-2.5" placeholder="Webull (direct)" aria-label="Webull account label" value={webullLabel} onChange={e => setWebullLabel(e.target.value)} />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>App key</label>
+                  <input type="text" className="w-full p-2.5 font-mono text-sm" placeholder="your Webull app_key" aria-label="Webull app key" value={webullAppKey} onChange={e => setWebullAppKey(e.target.value)} required />
+                </div>
+                <div>
+                  <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>App secret</label>
+                  <input type="password" className="w-full p-2.5 font-mono text-sm" placeholder="your Webull app_secret" aria-label="Webull app secret" value={webullAppSecret} onChange={e => setWebullAppSecret(e.target.value)} required />
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Account ID</label>
+                <input type="text" className="w-full p-2.5 font-mono text-sm" placeholder="Webull account_id (not the account number)" aria-label="Webull account ID" value={webullAccountId} onChange={e => setWebullAccountId(e.target.value)} required />
+              </div>
+              <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
+                <span>Connect</span>
+                {busy && <Spinner />}
+              </button>
+            </form>
+          </>
+        )}
 
         {chosenBroker === "snaptrade" && (
           <>

@@ -14,9 +14,10 @@ class BrokerName(str, enum.Enum):
     """Brokers we directly integrate with. Adding a new one means writing an
     adapter under app/brokers/."""
     ALPACA = "alpaca"
-    # Webull (via the unofficial `webull` Python SDK). Real-time order
-    # updates are *polled* (not socket) every ~2s — the SDK does not expose
-    # a stable MQTT order channel. See app/services/webull_listener.py.
+    # Webull direct via the OFFICIAL OpenAPI SDK (webull-openapi-python-sdk).
+    # Real-time order updates via gRPC trade-event streaming (~0.2s). Gated
+    # behind settings.webull_direct_enabled. See app/brokers/webull.py and
+    # app/services/webull_listener.py.
     WEBULL = "webull"
     # SnapTrade aggregator. User connects through SnapTrade's hosted portal
     # — we never see the underlying broker credentials. Order updates are

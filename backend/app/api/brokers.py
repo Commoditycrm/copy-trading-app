@@ -54,6 +54,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import client_ip, current_user
 from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter
+from app.brokers.webull import WebullAdapter  # lazy SDK import inside its methods
 from app.brokers.ibkr import IBKRAdapter
 from app.brokers import snaptrade as snap
 from app.brokers.snaptrade import SnapTradeAdapter
@@ -88,6 +89,25 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
             if not payload.alpaca:
                 raise HTTPException(422, "alpaca credentials required")
             return payload.alpaca.model_dump()
+        case BrokerName.WEBULL:
+            # Direct Webull (official OpenAPI). Only offered when the flag is
+            # on; the generic connect flow then verifies via WebullAdapter
+            # (adapter_for → verify_connection) before persisting. Keys are
+            # stored Fernet-encrypted, exactly like Alpaca.
+            if not get_settings().webull_direct_enabled:
+                raise HTTPException(
+                    400, "Direct Webull is not enabled on this server "
+                         "(webull_direct_enabled is off).",
+                )
+            if not payload.webull:
+                raise HTTPException(422, "webull credentials required")
+            creds = payload.webull.model_dump()
+            creds["app_key"] = str(creds.get("app_key", "")).strip()
+            creds["app_secret"] = str(creds.get("app_secret", "")).strip()
+            creds["account_id"] = str(creds.get("account_id", "")).strip()
+            creds["region_id"] = (str(creds.get("region_id", "") or "us").strip()) or "us"
+            creds["paper"] = False   # direct real-broker connection, not a paper sim
+            return creds
         case BrokerName.IBKR:
             if not payload.ibkr:
                 raise HTTPException(422, "ibkr credentials required")
@@ -107,17 +127,27 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
 
 
 def _refresh_balance_into(acct: BrokerAccount, creds: dict[str, Any]) -> None:
-    """Best-effort. Errors are recorded into last_error, not raised."""
+    """Best-effort. Errors are recorded into last_error, not raised.
+
+    A transient rate-limit (HTTP 429) is NOT a connection problem — Webull's
+    API rate-limits REST calls and the 30s balance auto-poll can trip it. We
+    keep the last good balance and DON'T surface a scary error for it (and
+    clear any stale one), so a rate-limited refresh doesn't flap the UI."""
     try:
         adapter = adapter_for(acct, creds)
-        if isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter)):
+        if isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter)):
             bal = adapter.get_balance_snapshot()
             acct.cash = bal["cash"]
             acct.buying_power = bal["buying_power"]
             acct.total_equity = bal["total_equity"]
             acct.currency = bal["currency"]
             acct.balance_updated_at = datetime.now(timezone.utc)
+            acct.last_error = None
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "429" in msg or "TOO_MANY_REQUESTS" in msg or "Too many requests" in msg:
+            log.info("balance fetch rate-limited (429) for %s — keeping cached balance", acct.id)
+            return
         acct.last_error = f"balance fetch failed: {str(exc)[:400]}"
 
 
@@ -637,6 +667,15 @@ def connect(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> BrokerAccount:
+    # Direct Webull is a TRADER-only real-time signal source. Subscriber
+    # execution runs through SnapTrade (WebullAdapter.place_order is
+    # intentionally unimplemented), so a subscriber connecting Webull-direct
+    # would break their mirrors. Block it here.
+    if payload.broker == BrokerName.WEBULL and user.role != UserRole.TRADER:
+        raise HTTPException(
+            400, "Direct Webull is for traders only — connect Webull via SnapTrade "
+                 "instead (subscriber mirror execution runs through SnapTrade).",
+        )
     creds = _credentials_for(payload, user.id)
 
     # Enforce one-broker-per-user BEFORE building the new row so the
@@ -705,6 +744,14 @@ def connect(
             log.exception("failed to start listener for new broker")
 
     return acct
+
+
+@router.get("/features")
+def broker_features(user: User = Depends(current_user)) -> dict:
+    """Client-facing broker feature flags for the Brokers page. Lets the picker
+    hide the direct-Webull option when the server has it disabled (connect would
+    otherwise 400)."""
+    return {"webull_direct_enabled": bool(get_settings().webull_direct_enabled)}
 
 
 @router.get("", response_model=list[BrokerAccountOut])
