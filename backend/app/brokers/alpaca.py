@@ -213,6 +213,16 @@ class AlpacaAdapter(BrokerAdapter):
         # limit before extended hours (see copy_engine._to_immediate_close).
         if req.extended_hours and req.order_type == OrderType.LIMIT and not is_advanced:
             common["extended_hours"] = True
+        # A LIMIT/STOP order with its price missing is unplaceable. Guard
+        # explicitly so it fails with a clear, actionable reject reason instead
+        # of a cryptic "float() argument must be ... not 'NoneType'" from the
+        # float() calls below (that message was surfaced to subscribers when a
+        # trader order reached fanout without its limit_price populated).
+        if req.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and req.limit_price is None:
+            raise ValueError(f"{req.order_type.value} order for {req.symbol} is missing a limit price")
+        if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is None:
+            raise ValueError(f"{req.order_type.value} order for {req.symbol} is missing a stop price")
+
         if req.order_type == OrderType.MARKET:
             order_req = MarketOrderRequest(**common)
         elif req.order_type == OrderType.LIMIT:

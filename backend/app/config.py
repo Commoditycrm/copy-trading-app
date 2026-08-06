@@ -56,6 +56,35 @@ class Settings(BaseSettings):
     close_reconcile_enabled: bool = False
     close_reconcile_apply: bool = False
     close_reconcile_interval_s: float = 30.0
+    # ── Direct Webull integration (real-time gRPC trade signal) ──────────
+    # Master switch for the direct-Webull path (adapter + trade-event
+    # listener). Default OFF — when false, WEBULL broker accounts are
+    # inert (no adapter routing, no listener) exactly as today, so nothing
+    # in the existing SnapTrade/Alpaca/IBKR paths changes. Turn on only in
+    # environments where a trader has connected a direct Webull account.
+    webull_direct_enabled: bool = False
+    # Shadow mode: when true, the Webull listener DETECTS + logs the
+    # trader's orders but does NOT fan out to subscribers. Lets us verify
+    # parity against the SnapTrade feed before trusting it with real
+    # mirrors. Set false to enable live fanout from the Webull signal.
+    webull_direct_shadow_mode: bool = True
+    # Poll backstop for the direct-Webull signal. Webull's gRPC trade-event
+    # stream requires a per-app_key push scope that isn't always enabled
+    # (SubscribeSuccess + Pings arrive but no order frames). This poller pulls
+    # the trader's orders from Webull's REST order API on a short interval and
+    # feeds the SAME persist+fanout path (dedup by broker_order_id, so it never
+    # double-fires with the stream). It's the reliable detection path; the gRPC
+    # stream stays as the ~0.2s fast path for when the scope is enabled. Runs
+    # only when webull_direct_enabled is on; respects shadow mode.
+    webull_direct_poll_enabled: bool = True
+    # Base seconds between REST order polls. Webull's "Query Day Orders"
+    # endpoint caps at 10 requests / 30s PER APP ID (≈1 call / 3s), shared
+    # across all accounts under one app_key. We make one call per account per
+    # cycle, so the listener floors this to 3.5s and auto-scales it up by
+    # account count (≈3.3s × accounts) — see webull_listener._safe_poll_interval.
+    # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
+    # 4s also works (7.5 / 30s). Don't go below 3.5s.
+    webull_poll_interval_seconds: float = 5.0
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300

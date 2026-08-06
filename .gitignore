@@ -55,3 +55,8 @@ next-env.d.ts
 # 16220881880 — strip it now and keep stripping it.
 backend/did.bin
 **/did.bin
+
+# Local Webull OpenAPI sandbox/test scaffolding — throwaway scripts, a local
+# .venv, SDK logs, and (critically) plaintext app_key/app_secret + auth tokens
+# used for manual testing. Never commit: it carries live broker credentials.
+webull_sandbox_test/
