@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -120,6 +121,37 @@ def _broker_sem(broker: BrokerName) -> asyncio.Semaphore:
         sem = asyncio.Semaphore(limit)
         _BROKER_SEMAPHORES[key] = sem
     return sem
+
+
+# Threading counterpart of _broker_sem for the SYNC threadpool fanout paths
+# (propagate_modify_to_mirrors / cancel_and_replace_mirrors_for_modify /
+# force_fill_mirrors_to_market). Those run place/cancel/replace in a
+# ThreadPoolExecutor(max_workers=32), which the asyncio Semaphore can't gate —
+# so without this they burst up to 32 concurrent calls per broker and trip
+# SnapTrade's place-order 429. Same per-broker config knob as _broker_sem.
+_BROKER_THREAD_SEMAPHORES: dict[str, threading.Semaphore] = {}
+_BROKER_THREAD_SEM_LOCK = threading.Lock()
+
+
+def _broker_thread_sem(broker_key: str) -> threading.Semaphore:
+    sem = _BROKER_THREAD_SEMAPHORES.get(broker_key)
+    if sem is None:
+        with _BROKER_THREAD_SEM_LOCK:
+            sem = _BROKER_THREAD_SEMAPHORES.get(broker_key)  # re-check under lock
+            if sem is None:
+                limit = getattr(get_settings(), f"broker_concurrency_{broker_key}", 32)
+                sem = threading.Semaphore(limit)
+                _BROKER_THREAD_SEMAPHORES[broker_key] = sem
+    return sem
+
+
+def _throttled_item(fn, item):
+    """Run one per-mirror threadpool task under its broker's concurrency cap so
+    the sync fanout paths don't burst SnapTrade. The adapter is item[1] in every
+    fanout tuple ((child, adapter, req) or (child, adapter, req, new_id))."""
+    ad = item[1]
+    with _broker_thread_sem(getattr(ad, "name", "") or ""):
+        return fn(item)
 
 
 @dataclass
@@ -991,7 +1023,7 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
                 return ch.id, None, f"replace_failed: {exc}"[:300]
 
         with ThreadPoolExecutor(max_workers=min(32, len(pending))) as pool:
-            results = list(pool.map(_replace, pending))
+            results = list(pool.map(lambda it: _throttled_item(_replace, it), pending))
 
         req_by_id = {ch.id: rq for ch, _ad, rq in pending}
         for child_id, resp, err in results:
@@ -1206,7 +1238,7 @@ def cancel_and_replace_mirrors_for_modify(
         # where supported, else cancel+place with a share-release retry (see
         # _modify_place_one).
         with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
-            results = list(pool.map(_modify_place_one, plan))
+            results = list(pool.map(lambda it: _throttled_item(_modify_place_one, it), plan))
 
         # Phase 3 (session thread): apply.
         req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
@@ -1457,7 +1489,7 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 return old_ch.id, new_id, None, f"place_failed: {exc}"[:300]
 
         with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
-            results = list(pool.map(_cancel_then_place, plan))
+            results = list(pool.map(lambda it: _throttled_item(_cancel_then_place, it), plan))
 
         # Phase 3 (session thread): apply.
         req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
