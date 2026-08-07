@@ -29,6 +29,14 @@ COPY . .
 # all runtime writes go to the noexec tmpfs /tmp (HOME=/tmp in compose). Pairs
 # with read_only + cap_drop + no-new-privileges in docker-compose.yml.
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser
+# Durable, writable dir for the Webull OpenAPI token. A named volume is mounted
+# here in docker-compose so the VERIFIED token survives restarts and is shared
+# by backend + worker — so the trader confirms the Open-API 2FA ONCE, not on
+# every restart. Pre-created with appuser ownership so, under the read-only
+# rootfs + non-root user, the SDK can write it (Docker copies this ownership
+# onto the fresh named volume on first mount). Set WEBULL_OPENAPI_TOKEN_DIR to
+# /data/webull_token in backend/.env to use it.
+RUN mkdir -p /data/webull_token && chown -R appuser:appuser /data
 USER appuser
 
 EXPOSE 8000

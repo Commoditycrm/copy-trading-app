@@ -312,15 +312,43 @@ def _map_order_type(s: str | None) -> OrderType:
     return OrderType.MARKET
 
 
+# ── cached REST client (per app_key) ─────────────────────────────────────────
+# CRITICAL: TradeClient.__init__ runs the SDK's token flow (init_token →
+# fetch_token_from_server, a network call to Webull's auth endpoint). Building a
+# fresh client on EVERY poll cycle (every 5s) hammered that endpoint → 429s,
+# repeated 2FA challenges, and eventually a VERIFY_FAILURE_EXCEED_LIMIT lockout
+# that stopped order detection entirely. So we build ONE client per app_key and
+# reuse it across cycles; the token flow then runs once per TTL, not every poll.
+_TRADE_CLIENT_TTL_S = 1800.0  # rebuild every 30 min to refresh auth
+_trade_clients: dict[str, tuple[Any, datetime]] = {}
+_trade_client_lock = threading.Lock()
+
+
 def _webull_trade_client(creds: dict[str, Any]):
     from webull.core.client import ApiClient  # noqa: PLC0415
     from webull.trade.trade_client import TradeClient  # noqa: PLC0415
-    api_client = ApiClient(creds["app_key"], creds["app_secret"], creds.get("region_id", "us"))
-    # Stop the SDK writing ./webull_trade_sdk.log — the container root FS is
-    # read-only (Errno 30). _init_logger skips its file handler when a logger is
-    # already marked set. See app/brokers/webull.py:_suppress_sdk_file_logger.
-    api_client._stream_logger_set = True  # noqa: SLF001
-    return TradeClient(api_client)
+    app_key = creds["app_key"]
+    now = datetime.now(timezone.utc)
+    with _trade_client_lock:
+        cached = _trade_clients.get(app_key)
+        if cached is not None and (now - cached[1]).total_seconds() < _TRADE_CLIENT_TTL_S:
+            return cached[0]
+        api_client = ApiClient(app_key, creds["app_secret"], creds.get("region_id", "us"))
+        # Stop the SDK writing ./webull_trade_sdk.log — the container root FS is
+        # read-only (Errno 30). _init_logger skips its file handler when a logger
+        # is already marked set. See app/brokers/webull.py:_suppress_sdk_file_logger.
+        api_client._stream_logger_set = True  # noqa: SLF001
+        client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+        _trade_clients[app_key] = (client, now)
+        return client
+
+
+def _invalidate_trade_client(creds: dict[str, Any]) -> None:
+    """Drop the cached client so the next call rebuilds it (re-auths). Call only
+    on AUTH failures — NOT on 429s (a 429 means throttled, not bad auth;
+    rebuilding would re-hit the token endpoint and make throttling worse)."""
+    with _trade_client_lock:
+        _trade_clients.pop(creds.get("app_key"), None)
 
 
 def _resolve_option_contract(
@@ -593,8 +621,14 @@ def _list_today_orders(creds: dict[str, Any], account_id: str, page_size: int = 
                         getattr(res, "status_code", "?"), account_id)
             return []
         body = res.json() or {}
-    except Exception:  # noqa: BLE001
-        log.warning("webull-poll: list_today_orders failed for %s", account_id, exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        log.warning("webull-poll: list_today_orders failed for %s: %s", account_id, msg[:160])
+        # A 429/throttle is transient — KEEP the cached client (rebuilding would
+        # re-run the token flow and pile more load on Webull's auth endpoint,
+        # exactly what caused the lockout). Rebuild only on a genuine auth error.
+        if not ("TOO_MANY" in msg or "429" in msg or "throttl" in msg.lower()):
+            _invalidate_trade_client(creds)
         return []
     if isinstance(body, list):
         return [o for o in body if isinstance(o, dict)]
