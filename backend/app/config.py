@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     # BROKER_CONCURRENCY_SNAPTRADE. Without this field the code fell back to the
     # default 32, which is far above SnapTrade's place limit.
     broker_concurrency_snaptrade: int = 3
+    # Copy safety: when a trader's SELL reaches a subscriber who holds NOTHING to
+    # close (and has no working entry), placing it would open a NAKED SHORT.
+    # SnapTrade rejects that naturally ("no matching position"), but Alpaca will
+    # actually short the account. In copy-trading that's almost always an
+    # UNINTENDED short from a missed/mis-synced entry, not a deliberate one — so
+    # by default we SKIP it rather than short the subscriber. Set true only if a
+    # trader deliberately runs short/premium-selling strategies subscribers copy.
+    copy_allow_opening_shorts: bool = False
     # SnapTrade credentials — empty by default so dev environments work
     # without setting them up. The /api/brokers/snaptrade/* endpoints
     # return 503 when these are blank rather than crashing. Get them from

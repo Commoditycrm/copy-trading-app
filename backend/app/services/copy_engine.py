@@ -225,7 +225,13 @@ class _DeferUntilEntryFills(Exception):
         self.entry_ids = entry_ids
 
 
-class _KeptProtectiveStop(Exception):
+class _OpeningShortSkipped(Exception):
+    """Raised inside ``_place_mirror_with_conflict_resolve`` when a trader's SELL
+    reaches a subscriber who holds NOTHING to close (and has no working entry),
+    so placing it would open a NAKED SHORT. Almost always an unintended short
+    from a missed/mis-synced entry — SnapTrade rejects it, but Alpaca would
+    actually short the account (prod: HUIZ shorted two subscribers). We skip it
+    instead. Suppressed only when settings.copy_allow_opening_shorts is true."""
     """Raised inside ``_place_mirror_with_conflict_resolve`` when a NON-stop mirror
     close (a resting take-profit LIMIT) collides with the subscriber's existing
     working STOP-loss on the same position. On Alpaca a position's shares back only
@@ -681,7 +687,17 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                         # mirror skipped. Never place a naked SELL.
                         cancelled = _cancel_subscriber_conflicts(item)
                         raise _DanglingEntryCancelled(cancelled)
-                # else: not a close and no entry → genuine opening short; fall through.
+                elif not get_settings().copy_allow_opening_shorts:
+                    # NOT flagged as a close and no working entry, but the
+                    # subscriber holds nothing — placing this SELL would open a
+                    # NAKED SHORT. SnapTrade rejects it; Alpaca actually shorts
+                    # (prod HUIZ). Since Webull orders always arrive is_closing=
+                    # False, a genuine close of a MISSED entry is indistinguishable
+                    # from a deliberate short — so default to skipping rather than
+                    # shorting the subscriber. Opt in via copy_allow_opening_shorts.
+                    raise _OpeningShortSkipped()
+                # else (copy_allow_opening_shorts=true): deliberate opening short —
+                # fall through and place it.
         if should_close_now:
             req = _to_immediate_close(item.adapter, req, item.trader_fill_price)
             if not req.is_closing:
@@ -2551,6 +2567,33 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ))
             child.redis_published_at = datetime.now(timezone.utc)
             events.publish(item.subscriber_user_id, _order_event("order.cancelled", child))
+        elif isinstance(exc, _OpeningShortSkipped):
+            # Trader's SELL reached a subscriber holding nothing to close → placing
+            # it would open a NAKED SHORT. We declined (copy_allow_opening_shorts
+            # off). Report skipped with a clear reason; the subscriber stays flat.
+            child.status = OrderStatus.REJECTED
+            child.reject_reason = (
+                "Skipped: this sell would open a short position — you hold no "
+                "matching position to close (likely a missed/unsynced entry). "
+                "Not mirrored to avoid an unintended short."
+            )[:480]
+            child.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db,
+                actor_user_id=item.subscriber_user_id,
+                action="copy.skipped_opening_short",
+                entity_type="order",
+                entity_id=child.id,
+                metadata={"parent_order_id": str(trader_order.id), "symbol": child.symbol},
+            )
+            results.append(FanoutResult(
+                subscriber_user_id=item.subscriber_user_id,
+                broker_account_id=item.broker_account_id,
+                order_id=child.id,
+                status="skipped_opening_short",
+            ))
+            child.redis_published_at = datetime.now(timezone.utc)
+            events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
         elif isinstance(exc, _DeferUntilEntryFills):
             # The close can't be placed yet — the subscriber's ENTRY is still
             # working (pre-market queue / fast scalp). DON'T reject it. Park it as
