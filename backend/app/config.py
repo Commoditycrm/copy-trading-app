@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
     broker_concurrency_alpaca: int = 200
+    # SnapTrade throttles order placement HARD (esp. multi-leg/option
+    # `place_mleg_order`) — bursting all subscriber mirrors at once returns
+    # 429 "Request was throttled" and rejects the copies. Cap concurrency low so
+    # the fanout drips into SnapTrade instead of bursting. Override per-env with
+    # BROKER_CONCURRENCY_SNAPTRADE. Without this field the code fell back to the
+    # default 32, which is far above SnapTrade's place limit.
+    broker_concurrency_snaptrade: int = 3
     # SnapTrade credentials — empty by default so dev environments work
     # without setting them up. The /api/brokers/snaptrade/* endpoints
     # return 503 when these are blank rather than crashing. Get them from
