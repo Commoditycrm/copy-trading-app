@@ -137,9 +137,7 @@ def _all_account_ids(creds: dict[str, Any]) -> list[str]:
     to, so we subscribe to ALL of them (the connected one is the fallback if
     the lookup fails). Matches the localhost script that streamed correctly."""
     try:
-        from webull.core.client import ApiClient  # noqa: PLC0415
-        from webull.trade.trade_client import TradeClient  # noqa: PLC0415
-        t = TradeClient(ApiClient(creds["app_key"], creds["app_secret"], creds.get("region_id", "us")))
+        t = _webull_trade_client(creds)  # file logger suppressed inside
         res = t.account_v2.get_account_list()
         if getattr(res, "status_code", None) == 200:
             ids = [str(a.get("account_id")) for a in (res.json() or []) if isinstance(a, dict) and a.get("account_id")]
@@ -304,7 +302,12 @@ def _map_order_type(s: str | None) -> OrderType:
 def _webull_trade_client(creds: dict[str, Any]):
     from webull.core.client import ApiClient  # noqa: PLC0415
     from webull.trade.trade_client import TradeClient  # noqa: PLC0415
-    return TradeClient(ApiClient(creds["app_key"], creds["app_secret"], creds.get("region_id", "us")))
+    api_client = ApiClient(creds["app_key"], creds["app_secret"], creds.get("region_id", "us"))
+    # Stop the SDK writing ./webull_trade_sdk.log — the container root FS is
+    # read-only (Errno 30). _init_logger skips its file handler when a logger is
+    # already marked set. See app/brokers/webull.py:_suppress_sdk_file_logger.
+    api_client._stream_logger_set = True  # noqa: SLF001
+    return TradeClient(api_client)
 
 
 def _resolve_option_contract(

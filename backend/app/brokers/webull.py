@@ -70,6 +70,24 @@ def _first(d: dict, *keys: str) -> Any:
     return None
 
 
+def _suppress_sdk_file_logger(api_client: Any) -> None:
+    """Stop the Webull SDK from creating ``./webull_trade_sdk.log``.
+
+    ``TradeClient.__init__`` calls ``_init_logger`` which attaches a
+    ``TimedRotatingFileHandler`` writing that file in the process CWD — but our
+    hardened container runs with a read-only root filesystem, so the write dies
+    with ``[Errno 30] Read-only file system`` and takes the connect/verify call
+    down with it. ``_init_logger`` only sets up its handlers when BOTH
+    ``_stream_logger_set`` and ``_file_logger_set`` are falsy, so pre-marking one
+    True makes it skip file logging entirely. We use our own logging anyway, and
+    this also avoids the SDK's unbounded log growth + app_key-in-file leak.
+    """
+    try:
+        api_client._stream_logger_set = True  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class WebullAdapter(BrokerAdapter):
     """One instance per Webull BrokerAccount. Credentials held in-memory only."""
 
@@ -88,6 +106,7 @@ class WebullAdapter(BrokerAdapter):
         from webull.trade.trade_client import TradeClient  # noqa: PLC0415
 
         api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
+        _suppress_sdk_file_logger(api_client)
         return TradeClient(api_client)
 
     # ── reads (used by the direct-Webull trader path) ────────────────────
