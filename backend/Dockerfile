@@ -13,6 +13,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Webull's official SDK is installed --no-deps on purpose: its metadata caps
+# `cryptography<43` on Python <3.14, which conflicts with our CVE-pinned
+# cryptography==44.0.1. Its actual runtime deps (grpcio/protobuf/jmespath/
+# cachetools/paho-mqtt/six) are pinned in requirements.txt above and already
+# installed, so --no-deps just adds the SDK itself. See the note in
+# requirements.txt. The SDK only uses cryptography for stable HMAC/RSA signing,
+# so running it against cryptography 44 is safe.
+RUN pip install --no-cache-dir --no-deps webull-openapi-python-sdk==2.0.16
 
 COPY . .
 
