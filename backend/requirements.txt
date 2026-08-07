@@ -43,7 +43,21 @@ alpaca-py==0.33.0
 # (default OFF). NOTE: it imports under the same `webull` namespace, so keep
 # this pinned to the OFFICIAL distribution name below — never a bare `webull`.
 # The adapter imports the SDK LAZILY (never at boot), unlike the old file.
-webull-openapi-python-sdk==2.0.16
+#
+# ⚠️ INSTALLED WITH --no-deps (see backend/Dockerfile), NOT listed as a normal
+# requirement. Reason: SDK 2.0.16 caps `cryptography<43` on Python <3.14, which
+# conflicts with our CVE-pinned `cryptography==44.0.1`. The cap is conservative
+# (the SDK only uses cryptography for stable HMAC/RSA request signing, unchanged
+# 42→44), so we install it --no-deps and pin its OTHER runtime deps below. These
+# are used ONLY by the webull SDK, so pinning them creates no other conflicts.
+# If you bump to Python 3.14, the SDK allows cryptography>=43 and this dance can
+# be removed (put `webull-openapi-python-sdk==2.0.16` back as a normal line).
+grpcio==1.69.0
+protobuf==5.29.6
+jmespath==0.10.0
+cachetools==5.5.2
+paho-mqtt==1.6.1
+six==1.17.0
 # SnapTrade aggregator — official SDK. Used by the SnapTrade adapter and
 # listener; requires SNAPTRADE_CLIENT_ID + SNAPTRADE_CONSUMER_KEY env vars
 # (see app/config.py). Endpoints return clean 503 when unset so dev
