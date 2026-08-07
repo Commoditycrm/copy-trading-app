@@ -24,6 +24,7 @@ this module never requires the SDK to be installed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import uuid
@@ -31,7 +32,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -255,6 +256,18 @@ def _dec(v: Any) -> Decimal | None:
         return None
 
 
+def _advisory_key(trader_user_id: uuid.UUID, broker_order_id: str) -> int:
+    """Stable signed 64-bit key for pg_advisory_xact_lock, derived from
+    (trader, broker_order_id). Two handlers for the SAME broker order hash to
+    the same key and serialize; different orders don't contend. blake2b (not
+    Python's salted hash()) so the value is identical across processes/threads.
+    Matches trade_listener._advisory_key."""
+    digest = hashlib.blake2b(
+        f"{trader_user_id}:{broker_order_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
 def _parse_wb_time(v: Any) -> datetime | None:
     """Parse a Webull timestamp to an aware datetime. Handles both the stream's
     ISO form (``2026-08-06T14:04:46.424+0000``) and the REST form with a space
@@ -382,6 +395,17 @@ def _persist_and_fanout(
     is_option = str(payload.get("category") or "").upper() == "US_OPTION"
 
     with SessionLocal() as db:
+        # Serialize concurrent handling of the SAME broker order so the
+        # check-then-insert below can't race into two parent rows (the
+        # "doubling" bug — two rows, same broker_order_id, ~ms apart). Covers a
+        # brief overlap of two poller generations during a listener restart, or
+        # the poll + stream paths landing together. Held until this transaction
+        # commits; a second handler then sees the committed row and takes the
+        # UPDATE path instead of inserting. Same guard as trade_listener.
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": _advisory_key(trader_user_id, broker_order_id)},
+        )
         # Respect the per-account listener toggles (Auto Pull / Bring open /
         # Bring filled), same as snaptrade_listener.
         acct_gate = db.get(BrokerAccount, broker_account_id)
