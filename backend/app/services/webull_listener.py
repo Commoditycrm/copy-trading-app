@@ -333,11 +333,15 @@ def _webull_trade_client(creds: dict[str, Any]):
         cached = _trade_clients.get(app_key)
         if cached is not None and (now - cached[1]).total_seconds() < _TRADE_CLIENT_TTL_S:
             return cached[0]
+        from app.brokers.webull import set_per_account_token_dir  # noqa: PLC0415
         api_client = ApiClient(app_key, creds["app_secret"], creds.get("region_id", "us"))
         # Stop the SDK writing ./webull_trade_sdk.log — the container root FS is
         # read-only (Errno 30). _init_logger skips its file handler when a logger
         # is already marked set. See app/brokers/webull.py:_suppress_sdk_file_logger.
         api_client._stream_logger_set = True  # noqa: SLF001
+        # Per-app_key token file so multiple traders' Webull accounts don't
+        # collide on the shared token.txt (→ 417 INVALID_TOKEN).
+        set_per_account_token_dir(api_client, app_key)
         client = TradeClient(api_client)   # token flow runs HERE — once per TTL
         _trade_clients[app_key] = (client, now)
         return client
