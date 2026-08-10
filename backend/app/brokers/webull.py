@@ -37,7 +37,9 @@ use direct Webull need it.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -90,6 +92,22 @@ def _suppress_sdk_file_logger(api_client: Any) -> None:
         pass
 
 
+def set_per_account_token_dir(api_client: Any, app_key: str | None) -> None:
+    """Give each app_key its OWN token file so multiple Webull accounts don't
+    collide. The SDK saves the verified token under a FIXED filename
+    (``token.txt``) in one directory — so a second account (different app_key)
+    loads the FIRST account's token → ``417 INVALID_TOKEN``. We point each
+    app_key at its own subdirectory under the (durable) base token dir.
+    ``set_token_dir`` takes priority over the WEBULL_OPENAPI_TOKEN_DIR env var.
+    """
+    base = os.getenv("WEBULL_OPENAPI_TOKEN_DIR", "/data/webull_token")
+    key_hash = hashlib.blake2b((app_key or "").encode(), digest_size=8).hexdigest()
+    try:
+        api_client.set_token_dir(f"{base.rstrip('/')}/{key_hash}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # Cached TradeClient per app_key. TradeClient.__init__ runs the SDK's token
 # flow (Create Token → 2FA). A new adapter is built per request (balance poll
 # every ~30s, connect, close_reconciler), so building a fresh client each time
@@ -127,6 +145,7 @@ class WebullAdapter(BrokerAdapter):
                 return cached[0]
             api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
             _suppress_sdk_file_logger(api_client)
+            set_per_account_token_dir(api_client, self.app_key)  # isolate token per app_key
             client = TradeClient(api_client)   # token flow runs HERE — once per TTL
             _trade_clients[self.app_key] = (client, now)
             return client
