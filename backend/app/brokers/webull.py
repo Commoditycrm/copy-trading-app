@@ -38,6 +38,8 @@ use direct Webull need it.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -88,6 +90,19 @@ def _suppress_sdk_file_logger(api_client: Any) -> None:
         pass
 
 
+# Cached TradeClient per app_key. TradeClient.__init__ runs the SDK's token
+# flow (Create Token → 2FA). A new adapter is built per request (balance poll
+# every ~30s, connect, close_reconciler), so building a fresh client each time
+# re-ran the token flow and — during the pre-verify window — produced a fresh
+# 2FA prompt every ~30s. We reuse ONE client per app_key so the token flow runs
+# once per TTL; once the trader verifies (token → NORMAL, persisted on the
+# shared volume) every path loads that token and never re-prompts. Mirrors
+# services.webull_listener._webull_trade_client.
+_TRADE_CLIENT_TTL_S = 1800.0
+_trade_clients: dict[str, Any] = {}          # app_key -> (client, built_at)
+_trade_client_lock = threading.Lock()
+
+
 class WebullAdapter(BrokerAdapter):
     """One instance per Webull BrokerAccount. Credentials held in-memory only."""
 
@@ -100,14 +115,21 @@ class WebullAdapter(BrokerAdapter):
         self.account_id = credentials.get("account_id")
         self.region_id = credentials.get("region_id", "us")
 
-    # ── client construction (lazy SDK import) ────────────────────────────
+    # ── client construction (lazy SDK import, cached per app_key) ─────────
     def _trade_client(self):
         from webull.core.client import ApiClient          # noqa: PLC0415
         from webull.trade.trade_client import TradeClient  # noqa: PLC0415
 
-        api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
-        _suppress_sdk_file_logger(api_client)
-        return TradeClient(api_client)
+        now = time.monotonic()
+        with _trade_client_lock:
+            cached = _trade_clients.get(self.app_key)
+            if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
+                return cached[0]
+            api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
+            _suppress_sdk_file_logger(api_client)
+            client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+            _trade_clients[self.app_key] = (client, now)
+            return client
 
     # ── reads (used by the direct-Webull trader path) ────────────────────
     def verify_connection(self) -> ConnectionInfo:
