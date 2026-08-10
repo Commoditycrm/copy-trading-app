@@ -232,6 +232,9 @@ class _OpeningShortSkipped(Exception):
     from a missed/mis-synced entry — SnapTrade rejects it, but Alpaca would
     actually short the account (prod: HUIZ shorted two subscribers). We skip it
     instead. Suppressed only when settings.copy_allow_opening_shorts is true."""
+
+
+class _KeptProtectiveStop(Exception):
     """Raised inside ``_place_mirror_with_conflict_resolve`` when a NON-stop mirror
     close (a resting take-profit LIMIT) collides with the subscriber's existing
     working STOP-loss on the same position. On Alpaca a position's shares back only
