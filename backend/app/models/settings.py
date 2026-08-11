@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,6 +42,19 @@ class TraderSettings(Base, TimestampMixin):
     # or approval needed. Surfaced on the trader's Subscribers page as a
     # dropdown, and consulted by settings.follow_trader's approval gate.
     auto_approve_follows: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
+    # ── Discord trade-alert broadcast (Phase 1) ───────────────────────────────
+    # A Discord "Incoming Webhook" URL for the trader's own channel. When set +
+    # discord_alerts_enabled, every FILLED order the trader places is posted as
+    # an ENTERING/CLOSING card (services/discord_alerts) so their subscribers see
+    # it in real time — the Kopyya-native version of the Alertsify feed. Nullable
+    # + default OFF so existing traders are unchanged. The URL is a bearer
+    # secret (anyone with it can post to the channel); it's stored as-is because
+    # it grants no access to Kopyya or the broker, only to that one channel.
+    discord_webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    discord_alerts_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False,
     )
 

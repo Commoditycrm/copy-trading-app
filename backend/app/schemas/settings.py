@@ -92,6 +92,11 @@ class TraderSettingsOut(BaseModel):
     # False = subscribers must request + be approved to follow; True = anyone
     # can follow this trader directly ("auto-allow").
     auto_approve_follows: bool = False
+    # Discord trade-alert broadcast. The URL is a secret, so we DON'T return it
+    # verbatim — only whether one is configured (drives the UI's "connected"
+    # state) plus the enable flag.
+    discord_alerts_enabled: bool = False
+    discord_webhook_configured: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -240,6 +245,26 @@ class TraderToggleIn(BaseModel):
     each PATCH just their field."""
     trading_enabled: bool | None = None
     auto_approve_follows: bool | None = None
+    # Discord trade-alert broadcast. Pass a URL to set it, "" to clear it, or
+    # omit (null) to leave it unchanged.
+    discord_alerts_enabled: bool | None = None
+    discord_webhook_url: str | None = None
+
+    @field_validator("discord_webhook_url")
+    @classmethod
+    def _validate_discord_url(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return v  # None = unchanged, "" = clear
+        v = v.strip()
+        allowed = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")
+        if not v.startswith(allowed):
+            raise ValueError(
+                "Must be a Discord Incoming Webhook URL "
+                "(https://discord.com/api/webhooks/…)"
+            )
+        if len(v) > 500:
+            raise ValueError("Webhook URL too long")
+        return v
 
 
 class SubscriberMultiplierIn(BaseModel):
