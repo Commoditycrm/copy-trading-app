@@ -418,7 +418,7 @@ def _persist_and_fanout(
     """Live path (shadow OFF only): persist the trader's Webull order and hand
     NEW ones to the fanout — mirrors snaptrade_listener._persist_and_fanout
     (dedup by broker_order_id, subscriber-skip, fanout_threadsafe)."""
-    from app.services import audit, broker_filters, copy_engine, events  # noqa: PLC0415
+    from app.services import audit, broker_filters, copy_engine, discord_alerts, events  # noqa: PLC0415
 
     broker_order_id = str(payload.get("order_id") or "").strip()
     if not broker_order_id:
@@ -455,6 +455,13 @@ def _persist_and_fanout(
 
         if existing is not None:
             was_working = existing.status in _WORKING
+            # Did THIS event flip the order to FILLED? Used to fire the Discord
+            # alert exactly once on the fill transition (not on later quiescent
+            # updates for an already-filled order, and not on a restart re-poll).
+            became_filled = (
+                existing.status != OrderStatus.FILLED
+                and status_enum == OrderStatus.FILLED
+            )
 
             # ── Trader MODIFY: still-working terms changed → propagate as a
             # cancel-replace onto the mirrors (only when the event carries the
@@ -517,6 +524,14 @@ def _persist_and_fanout(
                 trader_user_id,
                 copy_engine._order_event("order.placed", existing),  # noqa: SLF001
             )
+
+            # Broadcast the trader's fill to their Discord channel on the
+            # working→filled transition (fire-and-forget; gated + deduped inside).
+            if became_filled and existing.parent_order_id is None:
+                try:
+                    discord_alerts.emit_trader_fill_alert(existing.id)
+                except Exception:  # noqa: BLE001
+                    log.exception("webull-listener discord alert failed for %s", existing.id)
 
             # ── Trader CANCEL → cascade-cancel the subscriber mirrors ──
             if was_working and status_enum == OrderStatus.CANCELED:
@@ -608,6 +623,16 @@ def _persist_and_fanout(
                 copy_engine.fanout(db, order, trader)
                 order.fanned_out_to_subscribers = True
                 db.commit()
+
+        # A first-seen order that is ALREADY filled (the common Webull poll case:
+        # the 5s backstop often picks an order up post-fill) — broadcast it too.
+        # Fire-and-forget; gated + deduped inside. A restart re-poll takes the
+        # UPDATE path above (existing row, no transition), so it can't re-fire.
+        if status_enum == OrderStatus.FILLED:
+            try:
+                discord_alerts.emit_trader_fill_alert(order.id)
+            except Exception:  # noqa: BLE001
+                log.exception("webull-listener discord alert failed for %s", order.id)
 
 
 # ── REST poll backstop ───────────────────────────────────────────────────────

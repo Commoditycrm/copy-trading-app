@@ -95,6 +95,10 @@ export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
   const [trd, setTrd] = useState<TraderSettings | null>(null);
+  // Discord alerts: draft URL input + in-flight flags for save/test.
+  const [discordUrl, setDiscordUrl] = useState("");
+  const [discordBusy, setDiscordBusy] = useState(false);
+  const [discordTesting, setDiscordTesting] = useState(false);
   const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string; business_name?: string | null; auto_approve_follows?: boolean }[]>([]);
   // Follow-request workflow. Subscriber: their own requests (chips + which
   // traders they may follow). Trader: incoming pending requests to action.
@@ -736,6 +740,48 @@ export default function SettingsPage() {
     }));
   }
 
+  // ── Discord trade alerts ────────────────────────────────────────────────
+  async function saveDiscordWebhook() {
+    setDiscordBusy(true);
+    try {
+      const t = await api<TraderSettings>("/api/settings/trader", {
+        method: "PATCH", body: JSON.stringify({ discord_webhook_url: discordUrl.trim() }),
+      });
+      setTrd(t);
+      setDiscordUrl("");
+      notify.success(discordUrl.trim() ? "Webhook saved" : "Webhook cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not save webhook");
+    } finally {
+      setDiscordBusy(false);
+    }
+  }
+
+  async function toggleDiscordAlerts(next: boolean) {
+    const prev = trd;
+    setTrd(trd ? { ...trd, discord_alerts_enabled: next } : trd);
+    try {
+      setTrd(await api<TraderSettings>("/api/settings/trader", {
+        method: "PATCH", body: JSON.stringify({ discord_alerts_enabled: next }),
+      }));
+    } catch (e) {
+      setTrd(prev);
+      notify.fromError(e, next ? "Add a webhook URL first" : "Could not update");
+    }
+  }
+
+  async function sendDiscordTest() {
+    setDiscordTesting(true);
+    try {
+      await api("/api/settings/trader/discord/test", { method: "POST" });
+      notify.success("Test alert sent — check your Discord channel");
+    } catch (e) {
+      notify.fromError(e, "Test failed — check the webhook URL");
+    } finally {
+      setDiscordTesting(false);
+    }
+  }
+
   // Gate the page until BOTH the user identity AND the role-specific
   // settings row have landed — otherwise the subscriber/trader sections
   // briefly render empty while the second fetch is in flight.
@@ -1350,6 +1396,75 @@ export default function SettingsPage() {
             >
               {trd.trading_enabled ? "Turn OFF" : "Turn ON"}
             </button>
+          </div>
+        </Card>
+
+        {/* ── Discord trade alerts ─────────────────────────────────────────
+            Broadcast every fill the trader places to a Discord channel their
+            subscribers watch (ENTERING/CLOSING cards). Off by default. */}
+        <Card
+          icon={<IconBell />}
+          title="Discord trade alerts"
+          hint="Post every trade you place (ENTERING / CLOSING) to a Discord channel your subscribers follow. Paste a channel's Incoming Webhook URL."
+        >
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <Pill
+                dot={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
+                label="Alerts"
+                value={trd.discord_alerts_enabled ? "ON" : "OFF"}
+                valueColor={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
+              />
+              <button
+                onClick={() => toggleDiscordAlerts(!trd.discord_alerts_enabled)}
+                disabled={!trd.discord_webhook_configured && !trd.discord_alerts_enabled}
+                className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+                style={{
+                  background: trd.discord_alerts_enabled ? "var(--bad)" : "var(--good)",
+                  color: "#06121f",
+                  boxShadow: "0 4px 14px -4px rgba(0,0,0,0.4)",
+                }}
+              >
+                {trd.discord_alerts_enabled ? "Turn OFF" : "Turn ON"}
+              </button>
+            </div>
+
+            <div>
+              <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
+                Webhook URL
+                {trd.discord_webhook_configured && (
+                  <span className="ml-2" style={{ color: "var(--good)" }}>● configured</span>
+                )}
+              </label>
+              <div className="mt-1 flex items-center gap-2">
+                <input
+                  type="url"
+                  value={discordUrl}
+                  onChange={(e) => setDiscordUrl(e.target.value)}
+                  placeholder={trd.discord_webhook_configured
+                    ? "Paste a new URL to replace, or clear to remove"
+                    : "https://discord.com/api/webhooks/…"}
+                  className="flex-1 py-2 px-2.5 text-sm rounded-token min-w-0"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+                  aria-label="Discord webhook URL"
+                />
+                <PrimaryButton busy={discordBusy} onClick={saveDiscordWebhook} disabled={discordBusy}>
+                  {discordUrl.trim() ? "Save" : (trd.discord_webhook_configured ? "Clear" : "Save")}
+                </PrimaryButton>
+              </div>
+              <div className="mt-2 flex items-center gap-3">
+                <button
+                  onClick={sendDiscordTest}
+                  disabled={discordTesting || !trd.discord_webhook_configured}
+                  className="btn-ghost px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {discordTesting ? "Sending…" : "Send test alert"}
+                </button>
+                <span className="text-xs" style={{ color: "var(--muted)" }}>
+                  Discord → Server Settings → Integrations → Webhooks → New Webhook → Copy URL
+                </span>
+              </div>
+            </div>
           </div>
         </Card>
         </>

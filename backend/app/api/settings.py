@@ -814,14 +814,26 @@ def follow_trader(
     return s
 
 
+def _trader_out(s: TraderSettings) -> TraderSettingsOut:
+    """Build the trader-settings response — the webhook URL is a secret, so we
+    surface only whether one is configured, never the value itself."""
+    return TraderSettingsOut(
+        user_id=s.user_id,
+        trading_enabled=s.trading_enabled,
+        auto_approve_follows=s.auto_approve_follows,
+        discord_alerts_enabled=s.discord_alerts_enabled,
+        discord_webhook_configured=bool(s.discord_webhook_url),
+    )
+
+
 @router.get("/trader", response_model=TraderSettingsOut)
 def get_trader_settings(
     db: Session = Depends(get_db), user: User = Depends(require_trader)
-) -> TraderSettings:
+) -> TraderSettingsOut:
     s = db.get(TraderSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
-    return s
+    return _trader_out(s)
 
 
 @router.patch("/trader", response_model=TraderSettingsOut)
@@ -830,7 +842,7 @@ def toggle_trading(
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
-) -> TraderSettings:
+) -> TraderSettingsOut:
     s = db.get(TraderSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
@@ -841,6 +853,19 @@ def toggle_trading(
     if payload.auto_approve_follows is not None and payload.auto_approve_follows != s.auto_approve_follows:
         s.auto_approve_follows = payload.auto_approve_follows
         changes["auto_approve_follows"] = payload.auto_approve_follows
+    # Discord webhook: None = unchanged, "" = clear, a URL = set (schema-validated).
+    if payload.discord_webhook_url is not None:
+        new_url = payload.discord_webhook_url or None
+        if new_url != s.discord_webhook_url:
+            s.discord_webhook_url = new_url
+            # Don't log the secret URL — just whether one is now set.
+            changes["discord_webhook_set"] = bool(new_url)
+    if payload.discord_alerts_enabled is not None and payload.discord_alerts_enabled != s.discord_alerts_enabled:
+        # Can't enable alerts with no webhook configured.
+        if payload.discord_alerts_enabled and not (s.discord_webhook_url or payload.discord_webhook_url):
+            raise HTTPException(400, "discord_webhook_required")
+        s.discord_alerts_enabled = payload.discord_alerts_enabled
+        changes["discord_alerts_enabled"] = payload.discord_alerts_enabled
     if changes:
         audit.record(
             db,
@@ -853,7 +878,24 @@ def toggle_trading(
         )
     db.commit()
     db.refresh(s)
-    return s
+    return _trader_out(s)
+
+
+@router.post("/trader/discord/test", response_model=dict)
+def test_discord_webhook(
+    db: Session = Depends(get_db), user: User = Depends(require_trader)
+) -> dict:
+    """Send a one-off 'connected' card to the trader's configured webhook so they
+    can verify it from the Settings page before enabling live alerts."""
+    from app.services import discord_alerts  # noqa: PLC0415
+
+    s = db.get(TraderSettings, user.id)
+    if not s or not s.discord_webhook_url:
+        raise HTTPException(400, "discord_webhook_required")
+    ok = discord_alerts.test_webhook(s.discord_webhook_url)
+    if not ok:
+        raise HTTPException(502, "discord_send_failed")
+    return {"ok": True}
 
 
 @router.get("/traders", response_model=list[dict])

@@ -287,6 +287,11 @@ export interface AppNotification {
 export interface TraderSettings {
   user_id: string;
   trading_enabled: boolean;
+  auto_approve_follows?: boolean;
+  // Discord trade-alert broadcast. The webhook URL is a secret and never
+  // returned — only whether one is configured, plus the enable flag.
+  discord_alerts_enabled?: boolean;
+  discord_webhook_configured?: boolean;
 }
 
 export interface SubscriberSummary {
