@@ -921,6 +921,13 @@ def _apply_event_to_existing(
             log.exception(
                 "alpaca_listener: force-fill mirrors failed for %s", order.id
             )
+        # Broadcast the trader's fill to their Discord channel (fire-and-forget;
+        # gated on the trader's discord settings, off-thread, never blocks).
+        try:
+            from app.services import discord_alerts  # noqa: PLC0415
+            discord_alerts.emit_trader_fill_alert(order.id)
+        except Exception:  # noqa: BLE001
+            log.exception("alpaca_listener: discord alert failed for %s", order.id)
 
     return terms_changed
 
