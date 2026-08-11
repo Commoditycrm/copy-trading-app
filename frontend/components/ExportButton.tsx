@@ -18,12 +18,19 @@ export function ExportButton({
   label = "Export",
   fallbackName = "export.xlsx",
   disabled,
+  variant = "secondary",
+  fullWidth = false,
 }: {
   /** API path incl. query string, e.g. "/api/trades/export?status=filled". */
   path: string;
   label?: string;
   fallbackName?: string;
   disabled?: boolean;
+  /** "secondary" = subtle panel button (default). "primary" = accent-filled,
+   *  for use as the confirming action inside an export popover/modal. */
+  variant?: "primary" | "secondary";
+  /** Stretch to the container width (e.g. a full-width action in a popover). */
+  fullWidth?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
 
@@ -53,16 +60,19 @@ export function ExportButton({
     }
   }
 
+  const primary = variant === "primary";
   return (
     <button
       onClick={run}
       disabled={busy || disabled}
       title="Download the rows matching the current filters as an Excel file"
-      className="text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-medium whitespace-nowrap"
+      className={`rounded-lg inline-flex items-center justify-center gap-1.5 font-medium whitespace-nowrap ${
+        primary ? "text-sm px-3 py-2" : "text-xs px-3 py-1.5"
+      } ${fullWidth ? "w-full" : ""}`}
       style={{
-        background: "var(--panel-2)",
-        border: "1px solid var(--border)",
-        color: "var(--text-2)",
+        background: primary ? "var(--accent)" : "var(--panel-2)",
+        border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`,
+        color: primary ? "var(--accent-ink)" : "var(--text-2)",
         opacity: busy || disabled ? 0.6 : 1,
         cursor: busy || disabled ? "not-allowed" : "pointer",
       }}
