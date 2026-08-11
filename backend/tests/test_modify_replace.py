@@ -175,6 +175,113 @@ def test_fallback_non_conflict_error_does_not_retry():
     assert resp is None and err.startswith("place_failed")
 
 
+# ── #3 replace-chain-pending retry (Alpaca 42210000) ──────────────────────────
+# Prod RDGT 2026-08-10: a close re-priced 3s after the previous re-price hit
+# Alpaca's "order chain not fully replaced" (42210000) — the prior replacement
+# was still settling. With no retry the subscriber kept a STALE sell that never
+# filled while the trader had already exited. The replace path now retries
+# through the transient chain error before falling back to keep-old.
+
+class _ChainPending(Exception):
+    """Alpaca's transient 'previous replacement still settling' rejection."""
+    def __str__(self):
+        return '{"code":42210000,"message":"order chain not fully replaced"}'
+
+
+class _ReplaceChainAdapter:
+    """Atomic-replace broker whose replace_order raises the chain-pending error
+    ``fail_first`` times (chain settling), then succeeds. Never cancels/places."""
+    supports_replace = True
+    def __init__(self, fail_first=0):
+        self.fail_first = fail_first
+        self.replace_calls = 0
+        self.cancelled = False
+        self.placed = False
+    def replace_order(self, broker_order_id, req):
+        self.replace_calls += 1
+        if self.replace_calls <= self.fail_first:
+            raise _ChainPending()
+        return _result()
+    def cancel_order(self, broker_order_id):
+        self.cancelled = True
+        return True
+    def place_order(self, req):
+        self.placed = True
+        return _result()
+
+
+def test_replace_retries_through_chain_pending():
+    """The RDGT bug: replace bounces on 'order chain not fully replaced', the
+    retry (after the chain settles) succeeds → subscriber lands on the new close.
+    Never falls back to cancel/place."""
+    ad = _ReplaceChainAdapter(fail_first=2)
+    _old, _new, resp, err = _run(ad)
+    assert ad.replace_calls == 3          # 2 chain-pending + 1 success
+    assert not ad.cancelled and not ad.placed
+    assert resp is not None and err is None
+
+
+def test_replace_chain_pending_gives_up_keeps_old():
+    """If the chain never settles within budget, report replace_failed so Phase 3
+    keeps the old order (never cancelled) — no worse than before the retry."""
+    ad = _ReplaceChainAdapter(fail_first=99)
+    _old, _new, resp, err = _run(ad)
+    assert ad.replace_calls == ce._MODIFY_PLACE_ATTEMPTS
+    assert not ad.cancelled and not ad.placed
+    assert resp is None and err.startswith("replace_failed")
+
+
+def test_replace_non_chain_error_does_not_retry():
+    """A non-chain replace error (e.g. not replaceable) fails once, no retry
+    storm, and keeps the old order."""
+    class _BadReplace(_ReplaceChainAdapter):
+        def replace_order(self, broker_order_id, req):
+            self.replace_calls += 1
+            raise RuntimeError("422 order not replaceable")
+    ad = _BadReplace()
+    _old, _new, resp, err = _run(ad)
+    assert ad.replace_calls == 1
+    assert resp is None and err.startswith("replace_failed")
+
+
+# ── #4 force-fill cancel+place retry (RDGT srini) ─────────────────────────────
+# The forced market close fired when a trader's working order FILLS. Its
+# cancel+place had NO share-release retry (unlike _modify_place_one), so a single
+# held_for_orders bounce stranded the subscriber long (prod RDGT 2026-08-10,
+# ~2h until a manual close). Now it retries the place, same as the modify path.
+
+def _run_ff(adapter):
+    old = _OldCh()
+    new_id = uuid.uuid4()
+    return ce._force_fill_cancel_then_place((old, adapter, _req(), new_id))
+
+
+def test_force_fill_retries_through_share_release_race():
+    """First place bounces on 'insufficient qty', the retry succeeds → the forced
+    close goes through instead of leaving the subscriber holding."""
+    ad = _CancelPlaceAdapter(fail_first=2)
+    _old, _new, resp, err = _run_ff(ad)
+    assert ad.cancelled and ad.place_calls == 3
+    assert resp is not None and err is None
+
+
+def test_force_fill_bails_when_cancel_is_noop():
+    """cancel returned False (already terminal / likely filled) → never place a
+    replacement (would double the position)."""
+    ad = _CancelPlaceAdapter(cancel_result=False)
+    _old, _new, resp, err = _run_ff(ad)
+    assert ad.place_calls == 0
+    assert resp is None and err == "cancel_noop_already_terminal"
+
+
+def test_force_fill_gives_up_after_budget():
+    """Race never clears within budget → place_failed (not an infinite loop)."""
+    ad = _CancelPlaceAdapter(fail_first=99)
+    _old, _new, resp, err = _run_ff(ad)
+    assert ad.place_calls == ce._MODIFY_PLACE_ATTEMPTS
+    assert resp is None and err.startswith("place_failed")
+
+
 # ── AlpacaAdapter.replace_order builds a valid ReplaceOrderRequest ────────────
 # Regression for the prod bug (NVDA stop, 07-29): a STOP mirror carries
 # limit_price=0, and passing that to Alpaca's ReplaceOrderRequest raised

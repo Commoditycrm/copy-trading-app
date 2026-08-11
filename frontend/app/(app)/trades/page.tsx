@@ -4,7 +4,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
-import { ArrowDown, ArrowUp, ChevronsUpDown, Inbox, Search, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
@@ -162,6 +162,13 @@ export default function TradesPage() {
   // ?from/?to the page was opened with (e.g. a Calendar drill-in).
   const [exportFrom, setExportFrom] = useState<string>(fromParam ?? "");
   const [exportTo, setExportTo] = useState<string>(toParam ?? "");
+  // Export options are collapsed behind a single "Export" button — this toggles
+  // the popover that holds the date range + row-count + download action.
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportRef = useRef<HTMLDivElement | null>(null);
+  // Export is either/or: filter by a DATE RANGE, or grab the latest N ROWS —
+  // never both. Defaults to date range (also what a ?from/?to drill-in wants).
+  const [exportMode, setExportMode] = useState<"range" | "count">("range");
 
   // Server-side pagination state.
   const [total, setTotal] = useState(0);
@@ -171,6 +178,23 @@ export default function TradesPage() {
   const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
   const [closePrices, setClosePrices] = useState<Record<string, string>>({});
   const reconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Close the Export popover on outside-click or Escape.
+  useEffect(() => {
+    if (!exportOpen) return;
+    function onDown(e: MouseEvent) {
+      if (exportRef.current && !exportRef.current.contains(e.target as Node)) setExportOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setExportOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [exportOpen]);
 
   // Single source of truth for the trades URL — used by both the initial
   // load and the post-event reconcile so they fetch the SAME window
@@ -207,19 +231,23 @@ export default function TradesPage() {
   // No `limit` on purpose: the table shows a window, the export is everything.
   const exportEndpoint = useCallback(() => {
     const q = new URLSearchParams();
-    if (exportFrom) q.set("from", exportFrom);
-    if (exportTo) {
-      // `to` is exclusive server-side; bump a day so the picked end date is
-      // included.
-      const t = new Date(exportTo + "T00:00:00Z");
-      t.setUTCDate(t.getUTCDate() + 1);
-      q.set("to", t.toISOString().slice(0, 10));
+    // Either/or: a date range OR a latest-N-rows cap, never both.
+    if (exportMode === "range") {
+      if (exportFrom) q.set("from", exportFrom);
+      if (exportTo) {
+        // `to` is exclusive server-side; bump a day so the picked end date is
+        // included.
+        const t = new Date(exportTo + "T00:00:00Z");
+        t.setUTCDate(t.getUTCDate() + 1);
+        q.set("to", t.toISOString().slice(0, 10));
+      }
+    } else if (exportLimit !== "all") {
+      q.set("limit", exportLimit);
     }
     if (tab !== "all") q.set("status", tab);
     if (search.trim()) q.set("search", search.trim());
-    if (exportLimit !== "all") q.set("limit", exportLimit);
     return `/api/trades/export?${q.toString()}`;
-  }, [exportFrom, exportTo, tab, search, exportLimit]);
+  }, [exportMode, exportFrom, exportTo, tab, search, exportLimit]);
 
   // DB-aggregate totals, same date filter as the list. Fetched alongside
   // the rows and refreshed whenever orders change (SSE / reconcile) so the
@@ -489,44 +517,126 @@ export default function TradesPage() {
               </button>
             )}
           </div>
-          {/* Export date range (ET). Independent of the on-screen table. */}
-          <input
-            type="date"
-            value={exportFrom}
-            onChange={(e) => setExportFrom(e.target.value)}
-            className="py-1.5 px-2 text-sm rounded-token"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
-            aria-label="Export from date"
-            title="Export from (leave blank = all time)"
-          />
-          <span className="text-xs" style={{ color: "var(--muted)" }}>–</span>
-          <input
-            type="date"
-            value={exportTo}
-            onChange={(e) => setExportTo(e.target.value)}
-            className="py-1.5 px-2 text-sm rounded-token"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
-            aria-label="Export to date"
-            title="Export to (leave blank = all time)"
-          />
-          {/* How many rows to export (latest N), or All. Applies the current
-              tab/search/date filters — see /api/trades/export. */}
-          <select
-            value={exportLimit}
-            onChange={(e) => setExportLimit(e.target.value)}
-            className="py-1.5 px-2 text-sm rounded-token"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
-            aria-label="How many trades to export"
-            title="How many trades to download"
-          >
-            <option value="50">50</option>
-            <option value="100">100</option>
-            <option value="500">500</option>
-            <option value="1000">1,000</option>
-            <option value="5000">5,000</option>
-            <option value="all">All ({total.toLocaleString()})</option>
-          </select>
-          <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-trades.xlsx" />
+          {/* Export is collapsed behind one button; clicking it reveals the
+              date range + row-count options and the actual download action.
+              The date range (ET) is independent of the on-screen table. */}
+          <div className="relative" ref={exportRef}>
+            <button
+              type="button"
+              onClick={() => setExportOpen((v) => !v)}
+              aria-haspopup="dialog"
+              aria-expanded={exportOpen}
+              title="Export order history"
+              className="text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-medium whitespace-nowrap focus-ring"
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+            >
+              <Download size={13} aria-hidden />
+              Export
+            </button>
+            {exportOpen && (
+              <div
+                role="dialog"
+                aria-label="Export order history"
+                className="absolute right-0 z-30 mt-2 rounded-token"
+                style={{ background: "var(--panel)", border: "1px solid var(--border)", boxShadow: "var(--shadow-pop)", width: 300 }}
+              >
+                <div className="flex flex-col gap-3.5 p-4">
+                  {/* Header */}
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-[13px] font-semibold m-0" style={{ color: "var(--text)" }}>Export orders</h4>
+                    <button
+                      type="button"
+                      onClick={() => setExportOpen(false)}
+                      aria-label="Close export"
+                      className="focus-ring rounded p-0.5 leading-none"
+                      style={{ color: "var(--muted)" }}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+
+                  {/* Either/or mode toggle — date range OR latest N rows. */}
+                  <div
+                    role="tablist"
+                    aria-label="Export mode"
+                    className="flex gap-0.5 p-0.5 rounded-token"
+                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+                  >
+                    {([["range", "Date range"], ["count", "Latest rows"]] as const).map(([m, lbl]) => {
+                      const active = exportMode === m;
+                      return (
+                        <button
+                          key={m}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          onClick={() => setExportMode(m)}
+                          className="flex-1 text-xs py-1 rounded-token font-medium focus-ring"
+                          style={{
+                            background: active ? "var(--panel)" : "transparent",
+                            color: active ? "var(--text)" : "var(--muted)",
+                            border: `1px solid ${active ? "var(--border)" : "transparent"}`,
+                          }}
+                        >
+                          {lbl}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {exportMode === "range" ? (
+                    <div className="flex items-end gap-2.5">
+                      <label className="flex flex-col gap-1.5 flex-1 min-w-0">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>From</span>
+                        <input
+                          type="date"
+                          value={exportFrom}
+                          onChange={(e) => setExportFrom(e.target.value)}
+                          className="py-2 px-2.5 text-[13px] rounded-token w-full"
+                          style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)", colorScheme: "dark" }}
+                          aria-label="Export from date"
+                          title="Leave blank = all time"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1.5 flex-1 min-w-0">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>To</span>
+                        <input
+                          type="date"
+                          value={exportTo}
+                          onChange={(e) => setExportTo(e.target.value)}
+                          className="py-2 px-2.5 text-[13px] rounded-token w-full"
+                          style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)", colorScheme: "dark" }}
+                          aria-label="Export to date"
+                          title="Leave blank = all time"
+                        />
+                      </label>
+                    </div>
+                  ) : (
+                    // How many rows to export (latest N), or All. Applies the
+                    // current tab/search filters — see /api/trades/export.
+                    <label className="flex flex-col gap-1.5">
+                      <span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>How many</span>
+                      <select
+                        value={exportLimit}
+                        onChange={(e) => setExportLimit(e.target.value)}
+                        className="py-2 px-2.5 text-[13px] rounded-token"
+                        style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)", colorScheme: "dark" }}
+                        aria-label="How many trades to export"
+                      >
+                        <option value="50">Latest 50</option>
+                        <option value="100">Latest 100</option>
+                        <option value="500">Latest 500</option>
+                        <option value="1000">Latest 1,000</option>
+                        <option value="5000">Latest 5,000</option>
+                        <option value="all">All ({total.toLocaleString()})</option>
+                      </select>
+                    </label>
+                  )}
+                  <ExportButton path={exportEndpoint()} label="Export .xlsx" fallbackName="kopyya-trades.xlsx" variant="primary" fullWidth />
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

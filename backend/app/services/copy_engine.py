@@ -49,7 +49,12 @@ from app.services import audit, cache, events
 from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
-from app.services.order_retry import classify_error, is_order_conflict_error, live_closeable_quantity
+from app.services.order_retry import (
+    classify_error,
+    is_order_conflict_error,
+    is_replace_chain_pending_error,
+    live_closeable_quantity,
+)
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
 
 log = logging.getLogger(__name__)
@@ -1127,10 +1132,25 @@ def _modify_place_one(item: "tuple[Order, Any, BrokerOrderRequest, uuid.UUID]"):
     """
     old_ch, ad, rq, new_id = item
     if getattr(ad, "supports_replace", False):
-        try:
-            return old_ch.id, new_id, ad.replace_order(old_ch.broker_order_id, rq), None
-        except Exception as exc:  # noqa: BLE001
-            return old_ch.id, new_id, None, f"replace_failed: {exc}"[:300]
+        # Alpaca models a modify as a replacement CHAIN; a re-replace fired before
+        # the prior replacement has settled fails TRANSIENTLY with 42210000 "order
+        # chain not fully replaced" (prod RDGT 2026-08-10: a close re-priced 3s
+        # after the previous re-price hit this and, with no retry, left the
+        # subscriber holding a STALE-priced sell that never filled while the trader
+        # had already exited). The chain settles in ~1-2s — retry the SAME replace
+        # briefly. On ultimate failure we still return replace_failed, so the
+        # atomic contract holds (original order untouched → Phase 3 keeps it).
+        last_exc: BaseException | None = None
+        for attempt in range(_MODIFY_PLACE_ATTEMPTS):
+            try:
+                return old_ch.id, new_id, ad.replace_order(old_ch.broker_order_id, rq), None
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if is_replace_chain_pending_error(exc) and attempt < _MODIFY_PLACE_ATTEMPTS - 1:
+                    time.sleep(_MODIFY_PLACE_BACKOFF_S)
+                    continue
+                break
+        return old_ch.id, new_id, None, f"replace_failed: {last_exc}"[:300]
     try:
         cancelled = ad.cancel_order(old_ch.broker_order_id)
     except Exception as exc:  # noqa: BLE001
@@ -1359,6 +1379,48 @@ def cancel_and_replace_mirrors_for_modify(
         db.commit()
 
 
+def _force_fill_cancel_then_place(item: "tuple[Order, Any, BrokerOrderRequest, uuid.UUID]"):
+    """Cancel ONE resting mirror then place its forced market/marketable close
+    (worker-thread step of force_fill_mirrors_to_market). Extracted to module
+    level so it's pure over its args (no DB) and unit-testable — mirrors the
+    cancel+place fallback of _modify_place_one.
+
+    Returns ``(old_id, new_id, BrokerOrderResult | None, err_sentinel | None)``.
+    """
+    old_ch, ad, rq, new_id = item
+    try:
+        cancelled = ad.cancel_order(old_ch.broker_order_id)
+    except Exception as exc:  # noqa: BLE001
+        return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+    # A False here means the broker had nothing to cancel — the order is already
+    # terminal, and the overwhelmingly likely reason is that it FILLED. Placing
+    # the replacement now would double the position, so bail. This is not
+    # hypothetical: prod doubled a subscriber's META entry exactly this way.
+    # SnapTrade returns 1070 ("failed to cancel") while its own order feed still
+    # shows the mirror as working — its data lagged the real fill by ~42s — so
+    # neither our DB nor a get_order re-check could see the truth. The cancel
+    # result is the only signal that reflects the broker's ACTUAL state now.
+    if cancelled is False:
+        return old_ch.id, new_id, None, "cancel_noop_already_terminal"
+    # Alpaca's cancel is ASYNC: the just-cancelled limit still holds the shares
+    # (held_for_orders) for a beat, so an immediate re-place is rejected
+    # "insufficient qty available" (prod RDGT 2026-08-10 left a subscriber long —
+    # the forced close failed once and, with NO retry here, was never re-placed).
+    # The reservation frees within ~1s — retry the place briefly, mirroring
+    # _modify_place_one's cancel+place path.
+    last_exc: BaseException | None = None
+    for attempt in range(_MODIFY_PLACE_ATTEMPTS):
+        try:
+            return old_ch.id, new_id, ad.place_order(rq), None
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if is_order_conflict_error(exc) and attempt < _MODIFY_PLACE_ATTEMPTS - 1:
+                time.sleep(_MODIFY_PLACE_BACKOFF_S)
+                continue
+            break
+    return old_ch.id, new_id, None, f"place_failed: {last_exc}"[:300]
+
+
 def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
     """A trader's order just FILLED — sweep any subscriber mirror of it that is
     STILL a resting limit to a market / marketable-limit fill, so the subscriber
@@ -1485,30 +1547,8 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             return
 
         # Phase 2 (thread pool): cancel the resting mirror, then place the close.
-        def _cancel_then_place(item: tuple[Order, Any, BrokerOrderRequest, uuid.UUID]):
-            old_ch, ad, rq, new_id = item
-            try:
-                cancelled = ad.cancel_order(old_ch.broker_order_id)
-            except Exception as exc:  # noqa: BLE001
-                return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
-            # A False here means the broker had nothing to cancel — the order is
-            # already terminal, and the overwhelmingly likely reason is that it
-            # FILLED. Placing the replacement now would double the position, so
-            # bail. This is not hypothetical: prod doubled a subscriber's META
-            # entry exactly this way. SnapTrade returns 1070 ("failed to cancel")
-            # while its own order feed still shows the mirror as working — its
-            # data lagged the real fill by ~42s — so neither our DB nor a
-            # get_order re-check could see the truth. The cancel result is the
-            # only signal that reflects the broker's ACTUAL state at this moment.
-            if cancelled is False:
-                return old_ch.id, new_id, None, "cancel_noop_already_terminal"
-            try:
-                return old_ch.id, new_id, ad.place_order(rq), None
-            except Exception as exc:  # noqa: BLE001
-                return old_ch.id, new_id, None, f"place_failed: {exc}"[:300]
-
         with ThreadPoolExecutor(max_workers=min(32, len(plan))) as pool:
-            results = list(pool.map(lambda it: _throttled_item(_cancel_then_place, it), plan))
+            results = list(pool.map(lambda it: _throttled_item(_force_fill_cancel_then_place, it), plan))
 
         # Phase 3 (session thread): apply.
         req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}

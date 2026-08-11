@@ -102,6 +102,28 @@ def is_order_conflict_error(exc: Exception) -> bool:
     )
 
 
+def is_replace_chain_pending_error(exc: Exception) -> bool:
+    """True when Alpaca refused an atomic order REPLACE because the previous
+    replacement in the same chain hasn't settled yet — a TRANSIENT state that
+    clears on its own within ~1-2s, so the caller should retry the replace.
+
+    Alpaca models a modify as a replacement CHAIN (each replace supersedes the
+    last). Firing a re-replace before the prior one has fully propagated returns
+    code 42210000 "order chain not fully replaced". Prod RDGT 2026-08-10: a
+    subscriber's close was re-priced 3s after the previous re-price, hit this,
+    and — with no retry — was left holding a STALE-priced sell that never filled
+    while the trader had already exited. Distinct from is_order_conflict_error:
+    nothing needs cancelling here, we just wait for the chain to settle and retry
+    the SAME replace. A false positive is harmless — the retry either succeeds or
+    exhausts and falls back to keeping the old order, exactly as before."""
+    m = str(exc).lower()
+    return (
+        "chain not fully replaced" in m
+        or "42210000" in m
+        or "order chain" in m
+    )
+
+
 def live_closeable_quantity(
     adapter: BrokerAdapter, req: BrokerOrderRequest
 ) -> "Decimal | None":
