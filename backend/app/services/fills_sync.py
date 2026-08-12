@@ -379,6 +379,23 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
         existing.add(activity_id)
 
     acct.last_activity_sync_at = datetime.now(timezone.utc)
+
+    # Discord broadcast — sweep this trader's recently-FILLED orders and emit any
+    # that haven't been alerted yet (path-independent backstop: catches fills this
+    # sync — or ANY prior sync/socket drop — completed without a card). Only for a
+    # trader with Discord on. Commit FIRST so the emit threads (own sessions) see
+    # the committed FILLED rows; callers commit right after, so this is a safe
+    # no-op for them. Never let an alert failure break the sync.
+    try:
+        from app.models.settings import TraderSettings  # noqa: PLC0415
+        from app.services import discord_alerts  # noqa: PLC0415
+        _ts = db.get(TraderSettings, acct.user_id)
+        if _ts is not None and _ts.discord_alerts_enabled and _ts.discord_webhook_url:
+            db.commit()
+            discord_alerts.emit_pending_trader_alerts(db, acct.user_id)
+    except Exception:  # noqa: BLE001
+        log.exception("fills_sync: discord alert sweep failed")
+
     return SyncResult(
         fills_added=fills_added,
         orders_added=orders_added,

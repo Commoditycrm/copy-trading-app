@@ -623,16 +623,9 @@ def _persist_and_fanout(
                 copy_engine.fanout(db, order, trader)
                 order.fanned_out_to_subscribers = True
                 db.commit()
-
-        # A first-seen order that is ALREADY filled (the common Webull poll case:
-        # the 5s backstop often picks an order up post-fill) — broadcast it too.
-        # Fire-and-forget; gated + deduped inside. A restart re-poll takes the
-        # UPDATE path above (existing row, no transition), so it can't re-fire.
-        if status_enum == OrderStatus.FILLED:
-            try:
-                discord_alerts.emit_trader_fill_alert(order.id)
-            except Exception:  # noqa: BLE001
-                log.exception("webull-listener discord alert failed for %s", order.id)
+        # NOTE: a first-seen FILLED order is broadcast by copy_engine.fanout_async
+        # (the single detection point for every broker), so we do NOT emit here —
+        # doing so would race a second thread against the same dedup marker.
 
 
 # ── REST poll backstop ───────────────────────────────────────────────────────
