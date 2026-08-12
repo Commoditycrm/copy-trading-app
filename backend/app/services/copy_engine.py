@@ -52,6 +52,7 @@ from app.services.crypto import decrypt_json
 from app.services.order_retry import (
     classify_error,
     is_order_conflict_error,
+    is_rate_limit_error,
     is_replace_chain_pending_error,
     live_closeable_quantity,
 )
@@ -136,6 +137,16 @@ def _broker_sem(broker: BrokerName) -> asyncio.Semaphore:
 # SnapTrade's place-order 429. Same per-broker config knob as _broker_sem.
 _BROKER_THREAD_SEMAPHORES: dict[str, threading.Semaphore] = {}
 _BROKER_THREAD_SEM_LOCK = threading.Lock()
+
+# Inline retry for a broker RATE-LIMIT throttle (SnapTrade 429 "Request was
+# throttled. Expected available in 1 second."). Even under the concurrency cap,
+# SnapTrade still 429s some place_mleg_order calls on a burst; a 429 means the
+# order was NOT placed, so we wait out the throttle and retry — ALWAYS, not only
+# for subscribers who opted into retries — so a 1s throttle can't turn a close
+# into a REJECTED (prod QQQ 2026-08-11 stranded a subscriber long). Backoff grows
+# per attempt to spread the retries and avoid immediately re-throttling.
+_RATE_LIMIT_ATTEMPTS = 4
+_RATE_LIMIT_BACKOFF_S = 1.1
 
 
 def _broker_thread_sem(broker_key: str) -> threading.Semaphore:
@@ -1847,6 +1858,22 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     if trader_order.bracket_parent_id is not None:
         return results
 
+    # Discord broadcast — a trader order that is ALREADY filled at detection
+    # (a market fill, or first-seen-filled by a listener/poll). This is the
+    # single point EVERY trader order flows through (Trade Panel + all
+    # listeners), so it catches the case the per-listener fill-transition hooks
+    # miss: an order that was already FILLED before we ever tracked it (e.g. a
+    # Trade-Panel market order that filled at placement — no working→filled
+    # transition ever fires). Deduped + gated inside; fires even when copy is
+    # paused (the trader still traded). Delayed limit fills are covered by the
+    # listeners' transition hooks.
+    if trader_order.status == OrderStatus.FILLED:
+        try:
+            from app.services import discord_alerts  # noqa: PLC0415
+            discord_alerts.emit_trader_fill_alert(trader_order.id)
+        except Exception:  # noqa: BLE001
+            log.exception("discord alert (fanout) failed for %s", trader_order.id)
+
     # Trader master pause — skip all fanout when set.
     ts = db.get(TraderSettings, trader.id)
     if ts is not None and ts.copy_paused:
@@ -2479,16 +2506,29 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # success and error, so the Performance page can surface the raw
             # broker round-trip ("Broker Response" / broker_call_ms).
             start = time.perf_counter()
-            try:
-                # to_thread keeps the event loop free while the sync SDK does I/O.
-                # For a CLOSE this also auto-resolves order-conflict rejections
-                # (wash trade / uncovered / insufficient qty) by cancelling the
-                # blocking order(s) on the subscriber's account and retrying —
-                # mirroring the direct-close behaviour in api.trades.
-                resp = await asyncio.to_thread(_place_mirror_with_conflict_resolve, item)
-                return item, resp, None, int((time.perf_counter() - start) * 1000)
-            except Exception as exc:  # noqa: BLE001
-                return item, None, exc, int((time.perf_counter() - start) * 1000)
+            last_exc: BaseException | None = None
+            for attempt in range(_RATE_LIMIT_ATTEMPTS):
+                try:
+                    # to_thread keeps the event loop free while the sync SDK does
+                    # I/O. For a CLOSE this also auto-resolves order-conflict
+                    # rejections (wash trade / uncovered / insufficient qty) by
+                    # cancelling the blocking order(s) on the subscriber's account
+                    # and retrying — mirroring the direct-close behaviour in
+                    # api.trades.
+                    resp = await asyncio.to_thread(_place_mirror_with_conflict_resolve, item)
+                    return item, resp, None, int((time.perf_counter() - start) * 1000)
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    # A broker THROTTLE (SnapTrade 429) means nothing was placed —
+                    # wait out the ~1s throttle and retry inline (holding the sem,
+                    # which also eases pressure on the broker). ALWAYS retry these,
+                    # independent of the subscriber's retry setting. Any other error
+                    # falls through to the normal reject/retry-routing below.
+                    if is_rate_limit_error(exc) and attempt < _RATE_LIMIT_ATTEMPTS - 1:
+                        await asyncio.sleep(_RATE_LIMIT_BACKOFF_S * (attempt + 1))
+                        continue
+                    return item, None, exc, int((time.perf_counter() - start) * 1000)
+            return item, None, last_exc, int((time.perf_counter() - start) * 1000)
 
     broker_results: list[tuple[_PendingMirror, BrokerOrderResult | None, BaseException | None, int]]
     if pending:

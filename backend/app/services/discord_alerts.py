@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -232,6 +232,41 @@ def _run(trader_order_id: uuid.UUID) -> None:
             metadata={"sent": ok, "closing": is_closing, "symbol": order.symbol},
         )
         db.commit()
+
+
+def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30) -> None:
+    """Sweep: emit a card for EVERY of this trader's FILLED orders in the recent
+    window that hasn't been alerted yet. Path-independent — it looks at the
+    CURRENT state (filled + no marker), so it catches orders completed by ANY
+    fill path (socket, fanout, fills_sync) and self-heals ones a prior run
+    missed. Idempotent via the per-order marker. Cheap: one indexed SELECT for a
+    single trader. No-op unless the trader has Discord alerts configured.
+
+    ``db`` should reflect COMMITTED order state (call after commit) so each
+    spawned emit thread — which opens its own session — sees the FILLED rows."""
+    ts = db.get(TraderSettings, user_id)
+    if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
+        return
+    since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    oids = db.execute(
+        select(Order.id).where(
+            Order.user_id == user_id,
+            Order.parent_order_id.is_(None),
+            Order.status == OrderStatus.FILLED,
+            Order.created_at > since,
+        )
+    ).scalars().all()
+    if not oids:
+        return
+    marked = set(db.execute(
+        select(AuditLog.entity_id).where(
+            AuditLog.action == _ALERT_SENT_ACTION,
+            AuditLog.entity_id.in_([str(o) for o in oids]),
+        )
+    ).scalars().all())
+    for oid in oids:
+        if str(oid) not in marked:
+            emit_trader_fill_alert(oid)
 
 
 def emit_trader_fill_alert(trader_order_id: uuid.UUID) -> None:
