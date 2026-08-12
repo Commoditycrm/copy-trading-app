@@ -102,6 +102,28 @@ def is_order_conflict_error(exc: Exception) -> bool:
     )
 
 
+def is_rate_limit_error(exc: Exception) -> bool:
+    """True when the broker THROTTLED the request (HTTP 429 / 'Request was
+    throttled'), as opposed to rejecting the order on its merits.
+
+    Safe to retry inline after a short wait: a throttle is refused BEFORE the
+    order is processed, so nothing was placed (unlike a timeout, which might have
+    — never blind-retry those). SnapTrade throttles ``place_mleg_order`` hard even
+    under our per-broker concurrency cap, and the throttle self-clears in ~1s
+    ('Expected available in 1 second'). Prod QQQ 2026-08-11: a subscriber's
+    closing SELL was 429'd and — with no inline retry — went straight to REJECTED,
+    stranding them long until a manual close. We retry the throttle instead."""
+    m = str(exc).lower()
+    return (
+        "request was throttled" in m
+        or "throttled" in m
+        or "too many requests" in m
+        or "rate limit" in m
+        or "'status_code': 429" in m
+        or '"status_code": 429' in m
+    )
+
+
 def is_replace_chain_pending_error(exc: Exception) -> bool:
     """True when Alpaca refused an atomic order REPLACE because the previous
     replacement in the same chain hasn't settled yet — a TRANSIENT state that

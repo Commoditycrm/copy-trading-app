@@ -80,7 +80,7 @@ from sqlalchemy import select
 from app.brokers import adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.settings import SubscriberSettings
+from app.models.settings import SubscriberSettings, TraderSettings
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
 from app.services import pnl
@@ -355,7 +355,12 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                     Order.stop_loss_price.isnot(None),
                 ).limit(1)
             ).scalar_one_or_none() is not None
-            return ("trader", has_setup)
+            # Also tick if Discord trade-alerts are on — the trader tick sweeps
+            # newly-filled orders to the webhook (see _enforce_one_trader), a
+            # periodic backstop to the real-time listener + page-sync emits.
+            _ts = db.get(TraderSettings, user_id)
+            discord_on = bool(_ts and _ts.discord_alerts_enabled and _ts.discord_webhook_url)
+            return ("trader", has_setup or discord_on)
         return ("other", False)
 
 
@@ -488,6 +493,27 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
     from app.services.trader_bracket_monitor import (  # noqa: PLC0415
         enforce_trader_option_sl,
     )
+
+    # Discord: for a Discord-enabled trader, periodically pull their latest fills
+    # and broadcast any new ones — a path-independent backstop so alerts fire
+    # even without the orders page open or a real-time socket event (localhost
+    # --reload, dropped sockets). fills_sync itself sweeps + emits (see its tail),
+    # so this both COMPLETES fills in our DB and posts the cards. Gated to
+    # discord traders (this tick only runs for them), best-effort.
+    try:
+        from app.services import fills_sync as _fills_sync_mod  # noqa: PLC0415
+        with SessionLocal() as _db:
+            # STRICT gate: only do this extra periodic sync for a trader who has
+            # Discord alerts ON. A trader ticked for the option-SL monitor but
+            # WITHOUT Discord must see zero behaviour change here.
+            _ts = _db.get(TraderSettings, acct.user_id)
+            if _ts is not None and _ts.discord_alerts_enabled and _ts.discord_webhook_url:
+                _acct = _db.get(BrokerAccount, acct.id)
+                if _acct is not None:
+                    _fills_sync_mod.sync_account_fills(_db, _acct)
+                    _db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("pnl_poller: discord fills-sync failed for %s", acct.user_id)
 
     pending_events: list[dict[str, Any]] = []
     notifications_to_send: list[dict[str, Any]] = []
