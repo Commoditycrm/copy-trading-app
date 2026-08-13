@@ -19,6 +19,7 @@ wired with a DB fallback.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -27,6 +28,34 @@ from typing import Any
 from app.services.pnl import _tz_or_market  # shared ET/tz bucketing
 
 log = logging.getLogger(__name__)
+
+# SnapTrade throttles get_account_activities under load. Unlike order placement
+# (order_retry.is_rate_limit_error), the snapshot sweep had NO retry here — a 429
+# raised straight out, run_snapshot_sweep skipped the account for that pass, and
+# the user was left with stale/$0 P&L days until a sweep happened to get through
+# (prod nagas09 2026-08-13). Retry the throttle inline with linear backoff; a
+# SnapTrade throttle self-clears in ~1s ("Expected available in 1 second").
+_ACTIVITY_RL_ATTEMPTS = 4
+_ACTIVITY_RL_BACKOFF_S = 1.1
+
+
+def _get_account_activities(adapter: Any, start: date, end: date):
+    # Lazy import to avoid any import cycle with the order path.
+    from app.services.order_retry import is_rate_limit_error
+
+    for attempt in range(_ACTIVITY_RL_ATTEMPTS):
+        try:
+            return adapter.get_account_activities(start.isoformat(), end.isoformat())
+        except Exception as exc:  # noqa: BLE001
+            if is_rate_limit_error(exc) and attempt < _ACTIVITY_RL_ATTEMPTS - 1:
+                log.warning(
+                    "broker_pnl: get_account_activities throttled (attempt %d/%d), backing off",
+                    attempt + 1, _ACTIVITY_RL_ATTEMPTS,
+                )
+                time.sleep(_ACTIVITY_RL_BACKOFF_S * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("unreachable")  # loop always returns or raises
 
 
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -70,7 +99,7 @@ def realized_by_day_from_broker(
     """{day: (realized_pnl, closing_trade_count)} for [start, end], FIFO over the
     broker's own trade activities. Raises on a broker/API failure so the caller
     can fall back to the DB rather than silently returning an empty calendar."""
-    activities = adapter.get_account_activities(start.isoformat(), end.isoformat())
+    activities = _get_account_activities(adapter, start, end)
     bucket_tz = _tz_or_market(tz_name)
 
     # (when, magnitude, price, key, mult, is_buy) — SnapTrade reports SELL units
