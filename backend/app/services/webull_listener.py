@@ -739,9 +739,19 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 account_ids = await asyncio.to_thread(_all_account_ids, creds)
                 interval = _safe_poll_interval(len(account_ids))
 
+            # Space the per-account calls EVENLY across the cycle instead of
+            # bursting them back-to-back. list_today_orders shares a 10-req/30s
+            # PER-APP-ID budget; a burst of N calls followed by one long sleep
+            # puts >10 calls inside some sliding 30s windows, so the LAST account
+            # in the burst 429'd every cycle (prod Gaurav, 3 accounts — the 3rd
+            # 429'd 32×/hr, 2026-08-13). One call every interval/N (≈3.3s) holds
+            # a steady ~9 calls/30s, under the cap. Per-account poll frequency is
+            # unchanged (still once per `interval`), so detection latency is too.
+            gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
                 orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
+                await asyncio.sleep(gap)
 
             # First cycle: record what already exists as the baseline (history)
             # and fan nothing out.
@@ -751,8 +761,7 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 }
                 log.info("webull-poll[%s] primed baseline with %d existing order(s)",
                          trader_user_id, len(_poll_baseline[trader_user_id]))
-                await asyncio.sleep(interval)
-                continue
+                continue  # the per-account gaps already paced this cycle
 
             baseline = _poll_baseline[trader_user_id]
             seen = _poll_status[trader_user_id]
@@ -774,13 +783,17 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                     _on_order_event, trader_user_id, broker_account_id,
                     generation, creds, payload,
                 )
+            # No trailing sleep here — the per-account gaps above already paced
+            # the full cycle (N × gap = interval).
+            continue
         except asyncio.CancelledError:
             log.info("webull-poll[%s] cancelled", trader_user_id)
             raise
         except Exception:  # noqa: BLE001
             log.exception("webull-poll[%s] cycle failed", trader_user_id)
-
-        await asyncio.sleep(interval)
+            # Error before/inside the paced loop: back off a full cycle so a
+            # repeated failure can't hot-loop the endpoint.
+            await asyncio.sleep(interval)
 
 
 # ── event handling ──────────────────────────────────────────────────────────
