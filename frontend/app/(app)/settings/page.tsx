@@ -1135,11 +1135,11 @@ export default function SettingsPage() {
               />
               <LimitRow
                 accent="#f59e0b"
-                icon={<IconPercent />}
-                title="Max account per day"
+                icon={<IconWallet />}
+                title="Max trading budget / day"
                 subtitle={maxUnit === "$"
-                  ? "Pause when today's trading value reaches this dollar amount."
-                  : "Pause when today's trading value reaches this % of the day's starting balance."}
+                  ? "Pauses copy when the total value of today's trades reaches this amount."
+                  : "Pauses copy when the total value of today's trades reaches this % of amount."}
                 todayLabel="Day-Start"
                 todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
                 unit={maxUnit}
@@ -2348,6 +2348,16 @@ function IconPercent() {
       <line x1="19" y1="5" x2="5" y2="19" />
       <circle cx="6.5" cy="6.5" r="2.5" />
       <circle cx="17.5" cy="17.5" r="2.5" />
+    </svg>
+  );
+}
+
+function IconWallet() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
+      <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
+      <path d="M18 12a2 2 0 0 0 0 4h4v-4Z" />
     </svg>
   );
 }
