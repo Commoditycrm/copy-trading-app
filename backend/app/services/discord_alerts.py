@@ -13,9 +13,12 @@ Design
   broken webhook can NEVER delay or fail a fill.
 * Idempotent: dedup'd by an audit marker so the poll+stream double-detection (or
   a re-processed event) can't post the same card twice.
-* Phase 1 scope: entry/close cards WITHOUT realized P&L / hold-time. The CLOSING
-  card shows the exit fill only ("Sold N @ price · Position closed"). The
-  P&L / %-return / "held Xm" line is Phase 2 (needs FIFO round-trip matching).
+* Phase 2 cards: ENTERING (green), TRIMMING (amber — a partial close, with
+  realized P&L, % and "X of Y still open"), and CLOSING (red — full exit, with
+  this leg's P&L + the round-trip TOTAL P&L/%). P&L comes from a long-side FIFO
+  reconstruction of the trader's own fills (``_round_trip_summary``); if it can't
+  be computed the card safely degrades to the basic enter/close form. Hold-time
+  is intentionally omitted.
 
 Only FILLED orders are alerted, and only the trader's OWN orders
 (``parent_order_id IS NULL``) — never a subscriber mirror. Callers fire this
@@ -27,6 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -42,11 +46,14 @@ from app.services import audit
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 8.0
-# Discord embed color bar: green = entering (buy/open), red = closing (exit).
+# Discord embed color bar: green = entering (open), amber = trimming (partial
+# close), red = closing (full exit).
 _COLOR_ENTER = 0x22C55E
+_COLOR_TRIM = 0xF59E0B
 _COLOR_CLOSE = 0xEF4444
 # Audit action used as the once-per-order dedup marker.
 _ALERT_SENT_ACTION = "trader.discord_alert_sent"
+_FOOTER = "Broker-verified · Not financial advice · Kopyya"
 
 
 def _fmt_money(v: Decimal | float | None) -> str:
@@ -88,27 +95,144 @@ def _notional(o: Order) -> Decimal | None:
     return Decimal(str(px)) * Decimal(str(qty)) * mult
 
 
-def build_card(order: Order, is_closing: bool) -> dict:
+def _qty_str(q) -> str:
+    """`1`, `2`, `1.5` — no trailing zeros, integers show plain."""
+    d = Decimal(str(q))
+    return str(int(d)) if d == d.to_integral_value() else f"{d.normalize():f}"
+
+
+def _fmt_signed(v: Decimal | float) -> str:
+    """`+$13`, `-$5`, `+$1,240` — signed dollar with thousands, whole = no cents."""
+    d = Decimal(str(v))
+    sign = "+" if d >= 0 else "-"
+    a = abs(d)
+    body = f"{int(a):,}" if a == a.to_integral_value() else f"{a:,.2f}"
+    return f"{sign}${body}"
+
+
+def _fmt_pct(p: float | None) -> str:
+    """`+5%`, `-3%` — rounded to whole percent, signed. '' if unknown."""
+    if p is None:
+        return ""
+    return f"{'+' if p >= 0 else ''}{p:.0f}%"
+
+
+def _round_trip_summary(db, order: Order) -> dict:
+    """Classify a filled trader order and compute round-trip P&L via FIFO.
+
+    Reconstructs the trader's position in THIS contract from their own filled
+    orders (long-side FIFO — these traders run long options/stocks). Returns a
+    dict describing the card to render:
+
+      {'kind': 'enter'}                       — opened / added
+      {'kind': 'trim', realized, pct,          — sold PART of a long
+                remaining, original}
+      {'kind': 'close', realized, pct,         — sold the LAST of a long
+                total_realized, total_pct}
+
+    ``realized``/``pct`` are for THIS sell; ``total_*`` are cumulative across the
+    whole position (all trims + this close). A sell that doesn't reduce a long
+    (naked short / no position), and any buy, is an 'enter'. Never raises — the
+    caller falls back to a basic card on error."""
+    mult = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+    rows = db.execute(
+        select(Order).where(*_contract_filter(order)).order_by(Order.created_at, Order.id)
+    ).scalars().all()
+
+    lots: deque[list] = deque()      # open long lots: [qty, price]
+    entered = Decimal(0)             # cumulative entry qty for the CURRENT position
+    pos_realized = Decimal(0)        # cumulative realized $ for the current position
+    pos_cost = Decimal(0)            # cost basis of the shares sold this position
+    result: dict = {"kind": "enter"}
+
+    for o in rows:
+        q = o.filled_quantity or o.quantity or Decimal(0)
+        px = o.filled_avg_price
+        is_target = o.id == order.id
+        if q <= 0 or px is None:
+            if is_target:
+                return {"kind": "enter"}
+            continue
+        if o.side == OrderSide.BUY:
+            if not lots:                         # position was flat → new position
+                entered = pos_realized = pos_cost = Decimal(0)
+            lots.append([q, px])
+            entered += q
+            if is_target:
+                result = {"kind": "enter"}
+        else:                                    # SELL — match against long lots
+            rem, rlz, cost = q, Decimal(0), Decimal(0)
+            while rem > 0 and lots:
+                lot = lots[0]
+                take = min(lot[0], rem)
+                rlz += (px - lot[1]) * take * mult
+                cost += lot[1] * take * mult
+                lot[0] -= take
+                rem -= take
+                if lot[0] <= 0:
+                    lots.popleft()
+            if cost == 0:                        # didn't reduce a long → treat as enter
+                if is_target:
+                    result = {"kind": "enter"}
+            else:
+                pos_realized += rlz
+                pos_cost += cost
+                remaining = sum((lot[0] for lot in lots), Decimal(0))
+                if is_target:
+                    if remaining <= 0:
+                        result = {
+                            "kind": "close",
+                            "realized": rlz,
+                            "pct": float(rlz / cost * 100) if cost else None,
+                            "total_realized": pos_realized,
+                            "total_pct": float(pos_realized / pos_cost * 100) if pos_cost else None,
+                        }
+                    else:
+                        result = {
+                            "kind": "trim",
+                            "realized": rlz,
+                            "pct": float(rlz / cost * 100) if cost else None,
+                            "remaining": remaining,
+                            "original": entered,
+                        }
+                if remaining <= 0:               # position closed → reset for next round-trip
+                    entered = pos_realized = pos_cost = Decimal(0)
+        if is_target:
+            break
+    return result
+
+
+def build_card(order: Order, summary: dict | None = None) -> dict:
     """Build the Discord webhook payload (one embed) for a filled trader order.
 
-    Pure — takes a fully-populated Order, returns the JSON body to POST. Phase 1:
-    no P&L / hold-time on the CLOSING card."""
+    ``summary`` comes from ``_round_trip_summary`` and drives the card type:
+    ENTERING (green) / TRIMMING (amber, partial close w/ P&L + "X of Y open") /
+    CLOSING (red, full exit w/ P&L + round-trip total). None → ENTERING."""
     contract = _contract_label(order)
-    qty = order.filled_quantity or order.quantity or Decimal(0)
-    qty_str = f"{qty.normalize():f}" if isinstance(qty, Decimal) else str(qty)
+    qty_str = _qty_str(order.filled_quantity or order.quantity or Decimal(0))
     price = _fmt_money(order.filled_avg_price)
+    verb = "Sold" if order.side == OrderSide.SELL else "Bought"
+    kind = (summary or {}).get("kind", "enter")
     now = datetime.now(timezone.utc)
 
-    if is_closing:
+    if kind == "trim":
+        pnl = _fmt_signed(summary["realized"])
+        pct = f" · {_fmt_pct(summary.get('pct'))}" if summary.get("pct") is not None else ""
+        rem, orig = _qty_str(summary["remaining"]), _qty_str(summary["original"])
+        title = f"🟡 TRIMMING · {contract}"
+        desc = f"{verb} {qty_str} @ {price} · {pnl}{pct}\n{rem} of {orig} still open"
+        color = _COLOR_TRIM
+    elif kind == "close":
+        pnl = _fmt_signed(summary["realized"])
+        pct = f" · {_fmt_pct(summary.get('pct'))}" if summary.get("pct") is not None else ""
+        tot = _fmt_signed(summary["total_realized"])
+        totpct = f" · {_fmt_pct(summary.get('total_pct'))}" if summary.get("total_pct") is not None else ""
         title = f"🔴 CLOSING · {contract}"
-        # "Sold 1 @ $0.87" / "Bought 1 @ $0.87" (a close can be either side).
-        verb = "Sold" if order.side == OrderSide.SELL else "Bought"
-        desc = f"{verb} {qty_str} @ {price}\nPosition closed"
+        desc = f"{verb} {qty_str} @ {price} · {pnl}{pct}\nPosition closed · total {tot}{totpct}"
         color = _COLOR_CLOSE
-    else:
+    else:  # enter
         title = f"🟢 ENTERING · {contract}"
-        notional = _notional(order)
-        desc = f"{qty_str} @ {price} · {_fmt_money(notional)}"
+        desc = f"{qty_str} @ {price} · {_fmt_money(_notional(order))}"
         color = _COLOR_ENTER
 
     return {
@@ -116,7 +240,7 @@ def build_card(order: Order, is_closing: bool) -> dict:
             "title": title,
             "description": desc,
             "color": color,
-            "footer": {"text": "Kopyya · Not financial advice"},
+            "footer": {"text": _FOOTER},
             "timestamp": now.isoformat(),
         }]
     }
@@ -217,11 +341,16 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ).first()
         if already is not None:
             return
-        # Entry vs close — trust an explicit is_closing (SnapTrade) else
-        # reconstruct from the trader's own prior fills (needed for Alpaca, which
-        # always stores is_closing=False).
-        is_closing = _is_closing(db, order)
-        payload = build_card(order, is_closing)
+        # Classify + compute round-trip P&L (ENTERING / TRIMMING / CLOSING).
+        # If the FIFO calc fails for any reason, fall back to the basic
+        # enter/close card (Phase-1 behaviour) so a bad calc can never break the
+        # feed — the card is always at least as good as before.
+        try:
+            summary = _round_trip_summary(db, order)
+        except Exception:  # noqa: BLE001
+            log.warning("discord: round-trip calc failed for %s; basic card", order.id, exc_info=True)
+            summary = {"kind": "close" if _is_closing(db, order) else "enter"}
+        payload = build_card(order, summary)
         ok = send_webhook(ts.discord_webhook_url, payload)
         # Record the marker even on a failed send so a broken webhook can't cause
         # a retry storm across re-detections; a one-off miss is acceptable for a
@@ -229,7 +358,7 @@ def _run(trader_order_id: uuid.UUID) -> None:
         audit.record(
             db, actor_user_id=order.user_id, action=_ALERT_SENT_ACTION,
             entity_type="order", entity_id=order.id,
-            metadata={"sent": ok, "closing": is_closing, "symbol": order.symbol},
+            metadata={"sent": ok, "kind": summary.get("kind"), "symbol": order.symbol},
         )
         db.commit()
 
@@ -290,7 +419,7 @@ def test_webhook(webhook_url: str) -> bool:
             "title": "✅ Kopyya alerts connected",
             "description": "Your trade alerts will post here.",
             "color": _COLOR_ENTER,
-            "footer": {"text": "Kopyya · Not financial advice"},
+            "footer": {"text": _FOOTER},
         }]
     }
     return send_webhook(webhook_url, payload)
