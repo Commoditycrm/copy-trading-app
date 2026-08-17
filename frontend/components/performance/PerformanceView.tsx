@@ -841,8 +841,36 @@ interface ChildSort { field: ChildSortField; dir: SortDir; }
  *  timeline. Exported so the admin performance table renders the SAME columns
  *  as the trader Performance view instead of a parallel copy. Owns its own
  *  sort state, so each open drawer sorts independently. */
-export function SubscriberBreakdown({ mirrors }: { mirrors: FanoutChild[] }) {
+// Statuses that mean a subscriber has a REAL outcome for this fanout (a fill, a
+// partial, or an order still working) — as opposed to a superseded cancel.
+const _REAL_OUTCOME = new Set([
+  "filled", "partially_filled", "submitted", "accepted", "pending", "retry_pending",
+]);
+
+/** Collapse the force-fill double-row. When a trader's WORKING limit fills, the
+ *  engine cancels each subscriber's still-resting limit mirror and inserts a NEW
+ *  market fill in its place — so that subscriber appears TWICE (a superseded
+ *  CANCELED limit + the real FILLED order). Hide the superseded CANCELED row
+ *  whenever the same subscriber ALSO has a real outcome in this fanout, so each
+ *  shows once with their true result. A subscriber whose ONLY row is canceled (a
+ *  genuine miss, e.g. the market-order force-fill failure) is left untouched.
+ *  Pure + view-only — changes nothing in the data, only what's displayed. */
+function collapseSupersededCancels(mirrors: FanoutChild[]): FanoutChild[] {
+  const hasReal = new Set<string>();
+  for (const m of mirrors) {
+    if (_REAL_OUTCOME.has((m.status || "").toLowerCase())) hasReal.add(m.subscriber_user_id);
+  }
+  return mirrors.filter(m => {
+    const s = (m.status || "").toLowerCase();
+    const superseded = (s === "canceled" || s === "cancelled") && hasReal.has(m.subscriber_user_id);
+    return !superseded;
+  });
+}
+
+export function SubscriberBreakdown({ mirrors: rawMirrors }: { mirrors: FanoutChild[] }) {
   const [sort, setSort] = useState<ChildSort | null>(null);
+  // Hide superseded force-fill cancels so each subscriber shows once (see helper).
+  const mirrors = collapseSupersededCancels(rawMirrors);
 
   // unsorted -> asc -> desc -> unsorted, so the reader can get back to
   // chronological order without collapsing the row.
