@@ -1,8 +1,9 @@
-"""Tests for the Discord trade-alert cards (Phase 1).
+"""Tests for the Discord trade-alert cards (Phase 2).
 
-Covers the pure card formatter (ENTERING / CLOSING, stock + option) and the
-entry-vs-close classifier, which must work off the trader's OWN prior fills
-because the Alpaca listener always stores is_closing=False.
+Covers the pure card formatter (ENTERING / TRIMMING / CLOSING), the FIFO
+round-trip P&L reconstruction (``_round_trip_summary``), and the entry-vs-close
+classifier fallback (``_is_closing``), which must work off the trader's OWN
+prior fills because the Alpaca listener always stores is_closing=False.
 """
 import os
 import sys
@@ -77,36 +78,127 @@ def _stock(side, price, qty="200", *, at=_T0, uid=None):
 # ── card formatter ────────────────────────────────────────────────────────────
 
 def test_card_entering_option():
-    e = da.build_card(_opt(OrderSide.BUY, "2.44"), is_closing=False)["embeds"][0]
+    e = da.build_card(_opt(OrderSide.BUY, "2.44"), {"kind": "enter"})["embeds"][0]
     assert e["title"] == "🟢 ENTERING · AMD $465 PUT · 08/10"
     assert e["description"] == "1 @ $2.44 · $244"   # 2.44 × 1 × 100
     assert e["color"] == da._COLOR_ENTER
 
 
-def test_card_closing_option_sell():
-    e = da.build_card(_opt(OrderSide.SELL, "0.87"), is_closing=True)["embeds"][0]
+def test_card_entering_default_summary_none():
+    """No summary → ENTERING (safe default)."""
+    e = da.build_card(_opt(OrderSide.BUY, "2.44"))["embeds"][0]
+    assert e["title"].startswith("🟢 ENTERING")
+
+
+def test_card_trimming_option():
+    s = {"kind": "trim", "realized": Decimal("13"), "pct": 5.0,
+         "remaining": Decimal("1"), "original": Decimal("2")}
+    e = da.build_card(_opt(OrderSide.SELL, "2.85"), s)["embeds"][0]
+    assert e["title"] == "🟡 TRIMMING · AMD $465 PUT · 08/10"
+    assert e["description"] == "Sold 1 @ $2.85 · +$13 · +5%\n1 of 2 still open"
+    assert e["color"] == da._COLOR_TRIM
+
+
+def test_card_closing_option_with_pnl_and_total():
+    s = {"kind": "close", "realized": Decimal("18"), "pct": 7.0,
+         "total_realized": Decimal("31"), "total_pct": 6.0}
+    e = da.build_card(_opt(OrderSide.SELL, "2.90"), s)["embeds"][0]
     assert e["title"] == "🔴 CLOSING · AMD $465 PUT · 08/10"
-    assert e["description"] == "Sold 1 @ $0.87\nPosition closed"
+    assert e["description"] == "Sold 1 @ $2.90 · +$18 · +7%\nPosition closed · total +$31 · +6%"
     assert e["color"] == da._COLOR_CLOSE
 
 
-def test_card_closing_option_buy_to_cover():
-    """A close can be a BUY (covering a short) → 'Bought', not 'Sold'."""
-    e = da.build_card(_opt(OrderSide.BUY, "0.50"), is_closing=True)["embeds"][0]
-    assert e["description"].startswith("Bought 1 @ $0.50")
+def test_card_closing_negative_pnl_signs():
+    s = {"kind": "close", "realized": Decimal("-157"), "pct": -64.0,
+         "total_realized": Decimal("-157"), "total_pct": -64.0}
+    e = da.build_card(_opt(OrderSide.SELL, "0.87"), s)["embeds"][0]
+    assert "Sold 1 @ $0.87 · -$157 · -64%" in e["description"]
+    assert "total -$157 · -64%" in e["description"]
 
 
 def test_card_entering_stock_notional_no_x100():
-    e = da.build_card(_stock(OrderSide.BUY, "1.53"), is_closing=False)["embeds"][0]
+    e = da.build_card(_stock(OrderSide.BUY, "1.53"), {"kind": "enter"})["embeds"][0]
     assert e["title"] == "🟢 ENTERING · RDGT"
     assert e["description"] == "200 @ $1.53 · $306"  # stock: no ×100
 
 
-def test_money_formatting_whole_vs_cents():
+def test_money_and_pnl_formatting():
     assert da._fmt_money(Decimal("465")) == "$465"
     assert da._fmt_money(Decimal("1240")) == "$1,240"
     assert da._fmt_money(Decimal("2.44")) == "$2.44"
     assert da._fmt_money(None) == "—"
+    assert da._fmt_signed(Decimal("13")) == "+$13"
+    assert da._fmt_signed(Decimal("-5")) == "-$5"
+    assert da._fmt_signed(Decimal("1240.50")) == "+$1,240.50"
+    assert da._fmt_pct(5.0) == "+5%"
+    assert da._fmt_pct(-64.0) == "-64%"
+    assert da._fmt_pct(None) == ""
+
+
+# ── FIFO round-trip P&L (_round_trip_summary) ────────────────────────────────
+
+def _rt(side, price, qty, at, uid):
+    return _opt(side, price, qty=str(qty), at=at, uid=uid)
+
+
+def test_round_trip_enter_trim_close():
+    """The image example: BUY 2@2.72 → TRIM 1@2.85 (+$13,+5%,1of2) →
+    CLOSE 1@2.90 (+$18,+7%, total +$31,+6%)."""
+    db = _session(); uid = uuid.uuid4()
+    buy = _rt(OrderSide.BUY, "2.72", 2, _T0, uid)
+    trim = _rt(OrderSide.SELL, "2.85", 1, _T0 + timedelta(minutes=3), uid)
+    close = _rt(OrderSide.SELL, "2.90", 1, _T0 + timedelta(minutes=4), uid)
+    db.add_all([buy, trim, close]); db.flush()
+
+    assert da._round_trip_summary(db, buy) == {"kind": "enter"}
+
+    st = da._round_trip_summary(db, trim)
+    assert st["kind"] == "trim"
+    assert st["realized"] == Decimal("13.00")   # (2.85-2.72)*1*100
+    assert round(st["pct"]) == 5
+    assert st["remaining"] == Decimal("1")
+    assert st["original"] == Decimal("2")
+
+    sc = da._round_trip_summary(db, close)
+    assert sc["kind"] == "close"
+    assert sc["realized"] == Decimal("18.00")   # (2.90-2.72)*1*100
+    assert round(sc["pct"]) == 7
+    assert sc["total_realized"] == Decimal("31.00")  # 13 + 18
+    assert round(sc["total_pct"]) == 6              # 31 / 544
+
+
+def test_round_trip_single_full_close():
+    """A one-shot round-trip: total equals the single leg."""
+    db = _session(); uid = uuid.uuid4()
+    buy = _rt(OrderSide.BUY, "2.00", 1, _T0, uid)
+    sell = _rt(OrderSide.SELL, "3.00", 1, _T0 + timedelta(minutes=5), uid)
+    db.add_all([buy, sell]); db.flush()
+    s = da._round_trip_summary(db, sell)
+    assert s["kind"] == "close"
+    assert s["realized"] == Decimal("100.00")       # (3-2)*1*100
+    assert s["total_realized"] == Decimal("100.00")
+
+
+def test_round_trip_naked_sell_is_enter():
+    """A SELL with no long to reduce is an ENTER (short), not a trim/close."""
+    db = _session(); uid = uuid.uuid4()
+    sell = _rt(OrderSide.SELL, "2.00", 1, _T0, uid)
+    db.add(sell); db.flush()
+    assert da._round_trip_summary(db, sell) == {"kind": "enter"}
+
+
+def test_round_trip_new_position_after_flat():
+    """After a full close, a new BUY starts a FRESH round-trip (total resets)."""
+    db = _session(); uid = uuid.uuid4()
+    b1 = _rt(OrderSide.BUY, "2.00", 1, _T0, uid)
+    s1 = _rt(OrderSide.SELL, "3.00", 1, _T0 + timedelta(minutes=1), uid)   # closes pos 1
+    b2 = _rt(OrderSide.BUY, "4.00", 1, _T0 + timedelta(minutes=2), uid)    # new pos 2
+    s2 = _rt(OrderSide.SELL, "4.50", 1, _T0 + timedelta(minutes=3), uid)   # closes pos 2
+    db.add_all([b1, s1, b2, s2]); db.flush()
+    s = da._round_trip_summary(db, s2)
+    assert s["kind"] == "close"
+    assert s["realized"] == Decimal("50.00")        # (4.5-4)*1*100 — only pos 2
+    assert s["total_realized"] == Decimal("50.00")  # NOT 100+50; reset after flat
 
 
 # ── entry vs close classification (off the trader's own prior fills) ──────────
