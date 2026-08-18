@@ -62,8 +62,12 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
       * SnapTrade exposes a complete trade-activity feed → REALIZED P&L, FIFO'd
         (``realized_by_day_from_broker``). SnapTrade does not expose marked
         equity, so realized is the best we can do there.
-      * Alpaca exposes a marked portfolio-history series → MARKED P&L (realized +
-        unrealized), which matches Alpaca's own app calendar exactly.
+      * Alpaca fills land in our DB in real-time, so we freeze REALIZED P&L from
+        our own fills (``realized_pnl_by_day``) — broker-truth for Alpaca, and
+        the SAME metric the intraday calendar shows, so the daily figure doesn't
+        jump after hours. (Alpaca's marked portfolio-history — realized +
+        unrealized — is intentionally NOT used; copy-trading P&L is closed-trade
+        profit, not a mark-to-market swing on open positions.)
     Brokers with neither keep using the DB calc via the calendar fallback."""
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
     source_by_day: dict[date, str] = {}
@@ -72,8 +76,20 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         source_by_day = {d: "broker_activities" for d in daily}
         _fill_lagging_gap_days(db, acct, end, daily, source_by_day)
     elif hasattr(adapter, "marked_pnl_by_day"):
-        daily = adapter.marked_pnl_by_day(start, end)
-        source_by_day = {d: "portfolio_history" for d in daily}
+        # Alpaca: freeze REALIZED P&L (not marked). Alpaca fills land in our DB
+        # in real-time, so DB realized IS broker-truth realized for Alpaca — and
+        # using it keeps the calendar CONSISTENT (intraday realized == frozen
+        # realized), so the daily figure no longer JUMPS after hours when the
+        # snapshot lands. ``adapter.marked_pnl_by_day`` (realized + UNREALIZED,
+        # matching Alpaca's own app) is deliberately NOT used: for copy-trading,
+        # "P&L" means profit from CLOSED trades, not a mark-to-market swing on
+        # still-open positions. Subscribers count only their mirror orders.
+        _user = db.get(User, acct.user_id)
+        _mirrors = _user is not None and _user.role == UserRole.SUBSCRIBER
+        daily = realized_pnl_by_day(
+            db, acct.user_id, start=start, end=end, mirrors_only=_mirrors
+        )
+        source_by_day = {d: "db_realized" for d in daily}
     else:
         return 0
     broker = acct.broker.value if acct.broker else None
