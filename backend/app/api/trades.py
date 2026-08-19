@@ -3,7 +3,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import ROUND_DOWN
 
@@ -28,7 +28,7 @@ from app.schemas.order import (
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
-from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
+from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
@@ -1925,9 +1925,28 @@ def calendar_pnl(
             )
         ).scalars()
     }
-    # DB-derived days carry no %; snapshot days (Alpaca) do. Snapshot wins.
+    # DB-derived days carry no %; snapshot days (Alpaca) do. Snapshots freeze
+    # SETTLED (past) days only — a snapshot wins there. The CURRENT day stays
+    # LIVE from the DB: the snapshot job only refreshes hourly, so overlaying
+    # today's snapshot would show a STALE intraday figure (e.g. a day frozen at
+    # -$3,420 at the last sweep while trades have since closed to -$3,819). We
+    # already ran sync_user_fills above, so today's db_daily value is fresh.
+    today_et = market_hours.now_et().date()
+    lag_cutoff = today_et - timedelta(days=4)   # SnapTrade surfaces closes ~1-2d late
     merged: dict[date, tuple] = {d: (p, n, None) for d, (p, n) in db_daily.items()}
-    merged.update(snaps)
+    for _d, _v in snaps.items():
+        if _d >= today_et:
+            continue                             # today+ stays live (fresh DB)
+        # A $0 broker snapshot on a RECENT day our DB shows NON-zero is feed LAG
+        # (SnapTrade/Webull surfaces closes a day or two behind), so a day the
+        # subscriber actually traded was frozen as $0. Prefer the live DB value
+        # there. Older days: the feed has had time, so a $0 is genuinely flat and
+        # the broker-truth snapshot wins (preserving the phantom-leak guard).
+        if _v[0] == 0 and _d >= lag_cutoff:
+            _dbv = db_daily.get(_d)
+            if _dbv is not None and _dbv[0] != 0:
+                continue                         # keep live DB over a lagging $0
+        merged[_d] = _v
     return [
         DailyPnL(day=d, realized_pnl=v[0], trade_count=v[1], pct=v[2])
         for d, v in sorted(merged.items())
