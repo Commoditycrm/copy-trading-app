@@ -72,7 +72,7 @@ from app.schemas.broker import (
     StartSnaptradeIn,
     StartSnaptradeOut,
 )
-from app.services import audit, cache, listeners, snaptrade_listener
+from app.services import audit, balance_sync, cache, listeners, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
 from app.services.redis_client import get_sync_redis
 
@@ -127,28 +127,11 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
 
 
 def _refresh_balance_into(acct: BrokerAccount, creds: dict[str, Any]) -> None:
-    """Best-effort. Errors are recorded into last_error, not raised.
-
-    A transient rate-limit (HTTP 429) is NOT a connection problem — Webull's
-    API rate-limits REST calls and the 30s balance auto-poll can trip it. We
-    keep the last good balance and DON'T surface a scary error for it (and
-    clear any stale one), so a rate-limited refresh doesn't flap the UI."""
-    try:
-        adapter = adapter_for(acct, creds)
-        if isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter)):
-            bal = adapter.get_balance_snapshot()
-            acct.cash = bal["cash"]
-            acct.buying_power = bal["buying_power"]
-            acct.total_equity = bal["total_equity"]
-            acct.currency = bal["currency"]
-            acct.balance_updated_at = datetime.now(timezone.utc)
-            acct.last_error = None
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        if "429" in msg or "TOO_MANY_REQUESTS" in msg or "Too many requests" in msg:
-            log.info("balance fetch rate-limited (429) for %s — keeping cached balance", acct.id)
-            return
-        acct.last_error = f"balance fetch failed: {str(exc)[:400]}"
+    """Best-effort balance refresh onto ``acct``. Delegates to the single source
+    of truth in ``services.balance_sync`` — the background sweep and the inline
+    stale-refresh on list_my_brokers all go through the same logic (a 429 keeps
+    the cached balance; other errors land in last_error)."""
+    balance_sync.refresh_account_balance(acct, creds)
 
 
 # ── SnapTrade connect-session helpers ───────────────────────────────────────
@@ -754,14 +737,42 @@ def broker_features(user: User = Depends(current_user)) -> dict:
     return {"webull_direct_enabled": bool(get_settings().webull_direct_enabled)}
 
 
+# A balance older than this is refreshed inline when the account list is read,
+# so the Dashboard (which reads this list) shows a current figure without a
+# broker call on every load. The Brokers page still force-refreshes via
+# /refresh-balance, and the background sweep (balance_sync) covers idle accounts.
+_BALANCE_STALE_S = 120
+
+
 @router.get("", response_model=list[BrokerAccountOut])
 def list_my_brokers(
     db: Session = Depends(get_db), user: User = Depends(current_user)
 ) -> list[BrokerAccount]:
-    return list(db.execute(
+    accts = list(db.execute(
         select(BrokerAccount).where(BrokerAccount.user_id == user.id)
         .order_by(BrokerAccount.created_at.desc())
     ).scalars())
+    # Part A: refresh any connected account whose balance is stale so the
+    # Dashboard shows current equity. Throttled by balance_updated_at (frequent
+    # loads don't hammer the broker; a 429 keeps the cached value). Best-effort —
+    # a refresh failure never fails the list.
+    now = datetime.now(timezone.utc)
+    dirty = False
+    for acct in accts:
+        if acct.connection_status != "connected":
+            continue
+        age = (now - acct.balance_updated_at).total_seconds() if acct.balance_updated_at else None
+        if age is None or age > _BALANCE_STALE_S:
+            try:
+                balance_sync.refresh_account_balance(
+                    acct, decrypt_json(acct.encrypted_credentials)
+                )
+                dirty = True
+            except Exception:  # noqa: BLE001
+                pass  # refresh is best-effort; never block the list
+    if dirty:
+        db.commit()
+    return accts
 
 
 @router.post("/{account_id}/refresh-balance", response_model=BrokerAccountOut)
