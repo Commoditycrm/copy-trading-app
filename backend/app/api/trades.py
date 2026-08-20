@@ -1897,15 +1897,20 @@ def _today_marked_cell(
 def _live_alpaca_marked_today(
     db: Session, user_id: uuid.UUID, today_et: date,
 ) -> tuple[Decimal, Decimal | None] | None:
-    """Today's LIVE marked P&L (realized + unrealized change) for the user's
-    connected direct-Alpaca account(s), from Alpaca's portfolio-history — the
-    exact figure Alpaca's own app shows for today, ticking with the market.
+    """Today's LIVE marked P&L (realized + unrealized) for the user's connected
+    direct-Alpaca account(s) — the figure Alpaca's own app shows for today,
+    ticking with the market.
 
-    Returns (marked_pnl, pct) or None when the user has no connected Alpaca
+    Source is ``get_pnl_snapshot()['todays_pl']`` (equity − day-start), NOT
+    portfolio-history: Alpaca's portfolio-history (1D) does NOT include the
+    CURRENT intraday day, so it always returns None for today (that was the bug
+    where today showed realized-only). ``todays_pl`` is the same live source the
+    pnl_poller enforces daily limits on.
+
+    Returns (marked_pnl, None) or None when the user has no connected Alpaca
     account or every live fetch fails (today then stays realized-only). Sums
-    marked across multiple Alpaca accounts; pct is only meaningful for a single
-    account, so it's dropped when more than one contributes. A per-account
-    failure is swallowed so a broker hiccup can never blank the calendar.
+    across multiple Alpaca accounts. A per-account failure is swallowed so a
+    broker hiccup can never blank the calendar.
     """
     accts = db.execute(
         select(BrokerAccount).where(
@@ -1916,32 +1921,27 @@ def _live_alpaca_marked_today(
     ).scalars().all()
     if not accts:
         return None
-    # Fetch a few days back so a single-day portfolio-history range can't come
-    # back empty; we keep only today's point.
-    start = today_et - timedelta(days=4)
     total = Decimal(0)
-    pct: Decimal | None = None
     n_got = 0
     for acct in accts:
         try:
             adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-            daily = adapter.marked_pnl_by_day(start, today_et)
+            snap = adapter.get_pnl_snapshot()
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "calendar: live marked fetch failed for acct %s", acct.id,
                 exc_info=True,
             )
             continue
-        row = daily.get(today_et)
-        if row is not None:
-            total += Decimal(row[0])
-            pct = row[2]
+        tp = snap.get("todays_pl") if snap else None
+        if tp is not None:
+            total += Decimal(str(tp))
             n_got += 1
     if n_got == 0:
         return None
-    if n_got > 1:
-        pct = None   # can't sum per-account return %s meaningfully
-    return (total, pct)
+    # pct (daily return %) isn't reliably available intraday without a day-start
+    # baseline, so leave it out — the calendar shows the dollar figure.
+    return (total, None)
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
@@ -2096,6 +2096,20 @@ def calendar_pnl(
                 and any(pd < today_et for pd in eod_by_day)
             ):
                 today_unreal = marked[today_et] - realized_by_day.get(today_et, Decimal(0))
+
+        # Today's LIVE-ish marked from the poller (equity − day-start = realized +
+        # unrealized), refreshed ~every 60s. Overrides the eod-reconstruction for
+        # today: it needs no prior-day baseline, so today shows marked IMMEDIATELY
+        # (no forward-only wait) and ~60s fresh. Only present for subs the poller
+        # actually polls; otherwise today falls back to the reconstruction above.
+        if from_ <= today_et <= to:
+            from app.services import cache  # noqa: PLC0415
+            lm = cache.get_today_marked(target_user_id, today_et)
+            if lm is not None:
+                realized_today = Decimal(db_daily.get(today_et, (Decimal(0), 0))[0])
+                cnt = merged.get(today_et, (Decimal(0), 0, None))[1]
+                merged[today_et] = (lm, cnt, None)
+                today_unreal = lm - realized_today
 
     out: list[DailyPnL] = []
     for d, v in sorted(merged.items()):

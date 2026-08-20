@@ -83,18 +83,29 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         # MARKED daily P&L for this broker (no marked-history series of its own).
         eod_today = _sum_positions_unrealized(adapter)
     elif hasattr(adapter, "marked_pnl_by_day"):
-        # Alpaca: freeze MARKED P&L (realized + unrealized) from portfolio-
-        # history — the exact per-day figure Alpaca's own app shows — but
-        # FORWARD-ONLY. We (re)write ONLY today's row; settled past days are
-        # never rewritten, so historical calendar values stay EXACTLY as they
-        # already are (no backfill, no retroactive change). Each day locks at
-        # its end-of-day marked as it passes through "today" — the last
-        # post-close sweep captures the settled figure, and from the next day on
-        # it's untouched. Days from before this shipped keep their existing
-        # realized-only snapshot. The calendar shows today LIVE-marked from the
-        # same portfolio-history series, so there's no after-hours jump.
-        full = adapter.marked_pnl_by_day(start, end)
-        daily = {end: full[end]} if end in full else {}
+        # Alpaca: freeze MARKED P&L (realized + unrealized), the exact figure
+        # Alpaca's own app shows — FORWARD-ONLY. We (re)write ONLY today's row;
+        # settled past days are never rewritten, so historical calendar values
+        # stay EXACTLY as they are (no backfill, no retroactive change). Each day
+        # locks at its end-of-day marked as it passes through "today" — the last
+        # post-close sweep captures the settled figure.
+        #
+        # Source is get_pnl_snapshot()['todays_pl'] (equity vs day-start), NOT
+        # portfolio-history: Alpaca's portfolio-history (1D) does NOT include the
+        # CURRENT intraday day, so it can never provide today's marked. This is
+        # the SAME live source the calendar shows for today and the poller
+        # enforces daily limits on, so there's no after-hours jump.
+        daily = {}
+        try:
+            _snap = adapter.get_pnl_snapshot()
+            _tp = _snap.get("todays_pl") if _snap else None
+            if _tp is not None:
+                daily = {end: (Decimal(str(_tp)), 0, None)}
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "pnl_snapshot: get_pnl_snapshot failed for acct %s", acct.id,
+                exc_info=True,
+            )
         source_by_day = {d: "marked" for d in daily}
     else:
         return 0
