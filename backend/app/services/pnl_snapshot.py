@@ -62,34 +62,40 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
       * SnapTrade exposes a complete trade-activity feed → REALIZED P&L, FIFO'd
         (``realized_by_day_from_broker``). SnapTrade does not expose marked
         equity, so realized is the best we can do there.
-      * Alpaca fills land in our DB in real-time, so we freeze REALIZED P&L from
-        our own fills (``realized_pnl_by_day``) — broker-truth for Alpaca, and
-        the SAME metric the intraday calendar shows, so the daily figure doesn't
-        jump after hours. (Alpaca's marked portfolio-history — realized +
-        unrealized — is intentionally NOT used; copy-trading P&L is closed-trade
-        profit, not a mark-to-market swing on open positions.)
+      * Alpaca exposes a marked portfolio-history series, so we freeze MARKED
+        P&L (``marked_pnl_by_day`` — realized + unrealized), the exact per-day
+        figure Alpaca's own app shows — FORWARD-ONLY: only today's row is
+        written, so settled past days are never rewritten and historical
+        calendar values are preserved. Each day locks at its END-OF-DAY marked
+        as it passes through "today", so an overnight position's gain lands on
+        the day it accrued and the next day shows only its incremental change.
+        The calendar shows the SAME metric live for today, so a settled day
+        doesn't jump when the snapshot lands.
     Brokers with neither keep using the DB calc via the calendar fallback."""
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
     source_by_day: dict[date, str] = {}
+    eod_today: Decimal | None = None
     if hasattr(adapter, "get_account_activities"):
         daily = realized_by_day_from_broker(adapter, start, end)
         source_by_day = {d: "broker_activities" for d in daily}
         _fill_lagging_gap_days(db, acct, end, daily, source_by_day)
+        # Capture today's total unrealized so the Calendar can reconstruct
+        # MARKED daily P&L for this broker (no marked-history series of its own).
+        eod_today = _sum_positions_unrealized(adapter)
     elif hasattr(adapter, "marked_pnl_by_day"):
-        # Alpaca: freeze REALIZED P&L (not marked). Alpaca fills land in our DB
-        # in real-time, so DB realized IS broker-truth realized for Alpaca — and
-        # using it keeps the calendar CONSISTENT (intraday realized == frozen
-        # realized), so the daily figure no longer JUMPS after hours when the
-        # snapshot lands. ``adapter.marked_pnl_by_day`` (realized + UNREALIZED,
-        # matching Alpaca's own app) is deliberately NOT used: for copy-trading,
-        # "P&L" means profit from CLOSED trades, not a mark-to-market swing on
-        # still-open positions. Subscribers count only their mirror orders.
-        _user = db.get(User, acct.user_id)
-        _mirrors = _user is not None and _user.role == UserRole.SUBSCRIBER
-        daily = realized_pnl_by_day(
-            db, acct.user_id, start=start, end=end, mirrors_only=_mirrors
-        )
-        source_by_day = {d: "db_realized" for d in daily}
+        # Alpaca: freeze MARKED P&L (realized + unrealized) from portfolio-
+        # history — the exact per-day figure Alpaca's own app shows — but
+        # FORWARD-ONLY. We (re)write ONLY today's row; settled past days are
+        # never rewritten, so historical calendar values stay EXACTLY as they
+        # already are (no backfill, no retroactive change). Each day locks at
+        # its end-of-day marked as it passes through "today" — the last
+        # post-close sweep captures the settled figure, and from the next day on
+        # it's untouched. Days from before this shipped keep their existing
+        # realized-only snapshot. The calendar shows today LIVE-marked from the
+        # same portfolio-history series, so there's no after-hours jump.
+        full = adapter.marked_pnl_by_day(start, end)
+        daily = {end: full[end]} if end in full else {}
+        source_by_day = {d: "marked" for d in daily}
     else:
         return 0
     broker = acct.broker.value if acct.broker else None
@@ -128,7 +134,50 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
             )
         db.execute(stmt)
         written += 1
+
+    # Stamp today's END-OF-DAY unrealized onto today's row (created above if it
+    # had activity, inserted fresh otherwise). Past rows keep the value captured
+    # when they were "today" — only a real broker close (the loop above) touches
+    # their realized figure. This is the second half of the marked series the
+    # Calendar reconstructs.
+    if eod_today is not None:
+        _upsert_today_eod(db, acct, end, eod_today)
     return written
+
+
+def _sum_positions_unrealized(adapter) -> Decimal | None:
+    """Total unrealized P&L across the account's open positions right now, or
+    None if the positions fetch fails (the day's marked stays realized-only
+    rather than freezing a wrong number). Options carry a derived unrealized;
+    stocks carry the broker's open_pnl. Positions with no unrealized are
+    skipped."""
+    try:
+        positions = adapter.get_positions()
+    except Exception:  # noqa: BLE001
+        log.warning("pnl_snapshot: get_positions failed for EOD unrealized capture", exc_info=True)
+        return None
+    total = Decimal(0)
+    for p in positions:
+        if getattr(p, "unrealized_pnl", None) is not None:
+            total += p.unrealized_pnl
+    return total
+
+
+def _upsert_today_eod(db: Session, acct: BrokerAccount, day: date, eod: Decimal) -> None:
+    """Write ``eod_unrealized`` onto (user, day). On conflict update ONLY that
+    column (+ computed_at) so we never disturb the day's realized figure; on
+    insert (no row for a flat, no-trade day) create a realized-$0 row that
+    carries the capture."""
+    stmt = pg_insert(DailyRealizedPnlSnapshot).values(
+        user_id=acct.user_id, day=day,
+        realized_pnl=Decimal(0), trade_count=0, pct=None,
+        broker_account_id=acct.id, broker=(acct.broker.value if acct.broker else None),
+        source="broker_activities", eod_unrealized=eod,
+    ).on_conflict_do_update(
+        constraint="uq_daily_realized_pnl_user_day",
+        set_={"eod_unrealized": eod, "computed_at": market_hours.now_et()},
+    )
+    db.execute(stmt)
 
 
 def _fill_lagging_gap_days(

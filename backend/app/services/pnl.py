@@ -56,6 +56,49 @@ def _instrument_key(o: Order) -> tuple:
     return ("STK", o.symbol)
 
 
+def reconstruct_marked_series(
+    days: list[date],
+    realized_by_day: dict[date, Decimal],
+    eod_unreal_by_day: dict[date, Decimal],
+) -> dict[date, Decimal]:
+    """Reconstruct MARKED daily P&L (realized + unrealized change) for brokers
+    that expose no marked-history series (SnapTrade/Webull), from our own
+    end-of-day unrealized captures.
+
+    For each day D in ``days``::
+
+        marked(D) = realized(D) + (eod(D) − eod(prev))
+
+    where ``prev`` is the most recent EARLIER day that has a captured EOD
+    unrealized value (markets skip weekends/holidays, so we diff against the
+    last capture, not the literal calendar day). A day missing its own EOD
+    capture, or with no earlier capture to diff against, falls back to
+    realized-only — that's the forward-only property: days before we began
+    capturing EOD unrealized stay realized-only, and true marked kicks in once
+    two consecutive captures exist.
+
+    ``eod_unreal_by_day`` should include some lookback beyond ``days`` so the
+    first requested day can diff against a prior capture. The construction
+    telescopes: summed over a position's whole life the Δunrealized terms
+    cancel, so the marked total equals the realized total — no double-count.
+    """
+    eod_days = sorted(eod_unreal_by_day)
+    out: dict[date, Decimal] = {}
+    for d in days:
+        r = Decimal(realized_by_day.get(d, Decimal(0)))
+        ed = eod_unreal_by_day.get(d)
+        if ed is None:
+            out[d] = r
+            continue
+        prev = None
+        for pd in reversed(eod_days):
+            if pd < d:
+                prev = pd
+                break
+        out[d] = r if prev is None else r + (Decimal(ed) - Decimal(eod_unreal_by_day[prev]))
+    return out
+
+
 def _tz_or_market(tz_name: str | None) -> "ZoneInfo | timezone":
     """Resolve the bucketing timezone. Falls back to the market timezone if
     the caller didn't supply one or the name is unknown."""
