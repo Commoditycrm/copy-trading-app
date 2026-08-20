@@ -128,11 +128,21 @@ class OrderOut(BaseModel):
 
 class DailyPnL(BaseModel):
     day: date
+    # For SETTLED days this is locked realized P&L. For TODAY (direct Alpaca)
+    # it's realized-so-far PLUS live unrealized on still-open positions — a
+    # single combined figure that ticks with the market. See `unrealized_pnl`.
     realized_pnl: Decimal
     trade_count: int
     # Daily return %, broker-reported (Alpaca only — SnapTrade exposes no marked
     # equity). None when unavailable; the Calendar shows it only when present.
     pct: Decimal | None = None
+    # The live unrealized (open-position mark-to-market) component folded into
+    # `realized_pnl` for TODAY only; None on settled days. Surfaced so the UI
+    # can show the realized/unrealized split. Direct-Alpaca for now.
+    unrealized_pnl: Decimal | None = None
+    # True on the current day when `realized_pnl` includes live unrealized — the
+    # figure moves with the market and is NOT a settled number.
+    live: bool = False
 
 
 class TradeScopeStats(BaseModel):

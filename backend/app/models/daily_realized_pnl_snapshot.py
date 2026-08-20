@@ -72,8 +72,18 @@ class DailyRealizedPnlSnapshot(Base):
         nullable=True,
     )
     broker: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    # "broker_activities" (computed from the broker feed) or "db_fallback".
+    # "broker_activities" (computed from the broker feed), "db_fallback_lag",
+    # "db_realized", or "marked" (Alpaca portfolio-history).
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="broker_activities")
+
+    # Total unrealized P&L across the account's OPEN positions, captured at
+    # (approximately) this day's close by the hourly snapshot sweep. Only
+    # written on the current day each pass; a past day keeps the value captured
+    # when it was "today". NULL on days we never captured (e.g. before this
+    # feature shipped, or Alpaca — which uses its own marked-history series).
+    # The Calendar reconstructs SnapTrade/Webull MARKED daily P&L from these:
+    #   marked(D) = realized(D) + (eod_unrealized(D) − eod_unrealized(prev day)).
+    eod_unrealized: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
 
     computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(),
