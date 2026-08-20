@@ -218,6 +218,15 @@ _USER_FIXABLE_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Broker doesn't recognize that contract/symbol."),
     (re.compile(r"insufficient.*buying.power|insufficient.*funds", re.I),
      "Insufficient buying power on this account."),
+    # Broker account-level restriction: the account can ONLY close option
+    # positions, not open new ones (Webull/SnapTrade "Liquidation Only"). MUST
+    # come before the generic "no position" rule below — the restriction text
+    # ("...will NOT be able to open new option POSITIONs...") otherwise trips the
+    # greedy `no.*position` match and gets mislabeled "no position to close".
+    (re.compile(r"liquidat(?:e|es|ed|ing|ion)|option trading restriction|can only.*close.*exist", re.I),
+     "Your broker has restricted this account to CLOSING option positions only "
+     "(a \"Liquidation Only\" restriction) — new option positions can't be "
+     "opened. Contact your broker to lift the restriction."),
     (re.compile(r"position.*not.*found|no.*position", re.I),
      "No matching position to close on this account."),
     # SnapTrade returns 403/Forbidden when an authorization is type='read'
