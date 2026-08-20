@@ -719,6 +719,18 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     acct.id,
                 )
 
+        # Stash today's marked P&L (equity − day-start = realized + unrealized)
+        # so the Calendar can show a ~60s-fresh "today" for SnapTrade (which has
+        # no cheap per-request live source). Only when we have a real day-start
+        # baseline — otherwise todays_pl may be a failed-fetch 0, which would
+        # wrongly blank today. Best-effort; never blocks the tick.
+        if todays_pl is not None and beginning_day_balance is not None:
+            try:
+                from app.services import market_hours as _mh  # noqa: PLC0415
+                cache.set_today_marked(s.user_id, _mh.now_et().date(), todays_pl)
+            except Exception:  # noqa: BLE001
+                pass
+
         # ── Pct-of-day-start-balance TRADING-VALUE cap ───────────────────
         # Tracks today's cumulative filled trade notional (capital
         # deployed, not P&L). When today's trading USD crosses

@@ -307,3 +307,43 @@ def _decrypted_creds_cache(broker_account_id: str, encrypted_blob: str) -> dict:
 
 def decrypt_creds_cached(account_id: uuid.UUID, encrypted_blob: str) -> dict:
     return _decrypted_creds_cache(str(account_id), encrypted_blob)
+
+
+# ── Calendar live "today" marked P&L ──────────────────────────────────────────
+# The pnl_poller computes each polled account's today P&L (equity − day-start =
+# realized + unrealized) every ~60s. It stashes it here so the Calendar can show
+# a ~60s-fresh "today" for brokers that have NO cheap per-request live source
+# (SnapTrade — a live fetch on every calendar load would burn its rate budget).
+# Alpaca keeps its own live get_pnl_snapshot path; this is the SnapTrade feed.
+# Keyed per user (single-account subs; a multi-account user's last-polled account
+# wins). Short TTL so a stale value can't linger if the poller stops.
+_CAL_MARKED_TTL_S = 600
+
+
+def set_today_marked(user_id: uuid.UUID, day, marked) -> None:
+    """Stash today's marked P&L for the Calendar. Best-effort — swallows errors
+    so it can never break a poller tick."""
+    try:
+        r = get_sync_redis()
+        r.setex(
+            f"cal:marked:{user_id}", _CAL_MARKED_TTL_S,
+            json.dumps({"day": day.isoformat(), "marked": str(marked)}),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def get_today_marked(user_id: uuid.UUID, today) -> "Decimal | None":
+    """Read the poller-stashed marked P&L for `today`; None if absent, expired,
+    or stamped for a different day (stale across the midnight boundary)."""
+    try:
+        r = get_sync_redis()
+        raw = r.get(f"cal:marked:{user_id}")
+        if not raw:
+            return None
+        d = json.loads(raw)
+        if d.get("day") != today.isoformat():
+            return None
+        return Decimal(str(d["marked"]))
+    except Exception:  # noqa: BLE001
+        return None
