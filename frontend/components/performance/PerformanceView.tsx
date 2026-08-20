@@ -858,13 +858,37 @@ const _REAL_OUTCOME = new Set([
 function collapseSupersededCancels(mirrors: FanoutChild[]): FanoutChild[] {
   const hasReal = new Set<string>();
   for (const m of mirrors) {
-    if (_REAL_OUTCOME.has((m.status || "").toLowerCase())) hasReal.add(m.subscriber_user_id);
+    // A row that actually filled shares is a real outcome even if its final
+    // status is "canceled" (a partial fill whose remainder was canceled).
+    if (_REAL_OUTCOME.has((m.status || "").toLowerCase()) || Number(m.filled_quantity || 0) > 0)
+      hasReal.add(m.subscriber_user_id);
   }
   return mirrors.filter(m => {
     const s = (m.status || "").toLowerCase();
-    const superseded = (s === "canceled" || s === "cancelled") && hasReal.has(m.subscriber_user_id);
+    // Never hide a canceled row that itself filled shares — it's a real partial.
+    const superseded = (s === "canceled" || s === "cancelled")
+      && Number(m.filled_quantity || 0) === 0
+      && hasReal.has(m.subscriber_user_id);
     return !superseded;
   });
+}
+
+/** Status badge label + colors for a subscriber mirror row. A partial fill that
+ *  was later canceled/expired (status says canceled, but shares filled) reads as
+ *  "partially filled" and is colored like a fill, not a plain cancel. */
+function childStatusBadge(
+  c: { status: string; filled_quantity: string; quantity: string },
+): { label: string; bg: string; fg: string; border: string } {
+  const st = (c.status || "").toLowerCase();
+  const filled = Number(c.filled_quantity || 0);
+  const total = Number(c.quantity || 0);
+  const partial = filled > 0 && filled < total
+    && (st === "canceled" || st === "cancelled" || st === "expired");
+  if (st === "rejected") return { label: "rejected", bg: "rgba(239,68,68,0.15)", fg: "var(--bad)", border: "rgba(239,68,68,0.3)" };
+  if (st === "filled") return { label: "filled", bg: "rgba(34,197,94,0.15)", fg: "var(--good)", border: "rgba(34,197,94,0.3)" };
+  if (partial) return { label: "partially filled", bg: "rgba(34,197,94,0.12)", fg: "var(--good)", border: "rgba(34,197,94,0.3)" };
+  if (st === "pending") return { label: "pending", bg: "rgba(234,179,8,0.15)", fg: "var(--warn)", border: "rgba(234,179,8,0.3)" };
+  return { label: c.status, bg: "rgba(148,163,184,0.15)", fg: "var(--text-2)", border: "rgba(148,163,184,0.3)" };
 }
 
 export function SubscriberBreakdown({ mirrors: rawMirrors }: { mirrors: FanoutChild[] }) {
@@ -1015,38 +1039,17 @@ export function SubscriberBreakdown({ mirrors: rawMirrors }: { mirrors: FanoutCh
                                         {(c.order_type || "").replace(/_/g, " ") || "—"}
                                       </td>
                                       <td className="px-2 py-2 whitespace-nowrap">
-                                        <span
-                                          className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium"
-                                          style={{
-                                            background:
-                                              c.status === "rejected"
-                                                ? "rgba(239,68,68,0.15)"
-                                                : c.status === "filled"
-                                                ? "rgba(34,197,94,0.15)"
-                                                : c.status === "pending"
-                                                ? "rgba(234,179,8,0.15)"
-                                                : "rgba(148,163,184,0.15)",
-                                            color:
-                                              c.status === "rejected"
-                                                ? "var(--bad)"
-                                                : c.status === "filled"
-                                                ? "var(--good)"
-                                                : c.status === "pending"
-                                                ? "var(--warn)"
-                                                : "var(--text-2)",
-                                            border: "1px solid",
-                                            borderColor:
-                                              c.status === "rejected"
-                                                ? "rgba(239,68,68,0.3)"
-                                                : c.status === "filled"
-                                                ? "rgba(34,197,94,0.3)"
-                                                : c.status === "pending"
-                                                ? "rgba(234,179,8,0.3)"
-                                                : "rgba(148,163,184,0.3)",
-                                          }}
-                                        >
-                                          {c.status}
-                                        </span>
+                                        {(() => {
+                                          const b = childStatusBadge(c);
+                                          return (
+                                            <span
+                                              className="inline-block px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-medium"
+                                              style={{ background: b.bg, color: b.fg, border: "1px solid", borderColor: b.border }}
+                                            >
+                                              {b.label}
+                                            </span>
+                                          );
+                                        })()}
                                       </td>
                                       {/* Mirror's own expected (limit) vs filled price */}
                                       <td className="px-2 py-2 tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>

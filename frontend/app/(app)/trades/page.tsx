@@ -117,6 +117,9 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } |
 
 const STATUS_STYLE: Record<string, { bg: string; color: string }> = {
   filled: { bg: "var(--good-soft)", color: "var(--good)" },
+  // A partial fill whose remainder was canceled — shares DID fill, so color it
+  // like a fill (green), not a muted cancel.
+  partially_filled: { bg: "var(--good-soft)", color: "var(--good)" },
   rejected: { bg: "var(--bad-soft)", color: "var(--bad)" },
   canceled: { bg: "var(--panel-2)", color: "var(--muted)" },
   expired: { bg: "var(--panel-2)", color: "var(--muted)" },
@@ -703,9 +706,17 @@ export default function TradesPage() {
                 // row is frozen to the placement state ("submitted") and the fill is
                 // shown as a separate row ABOVE. The real o.status still drives the
                 // Cancel button, the status tabs + counts, and sorting.
+                // An order that partially filled then had its remainder CANCELED
+                // (e.g. a trading halt) has status "canceled" but real fills — show
+                // it as "partially filled", not a plain cancel.
+                const isPartialClosed = filledQty > 0 && filledQty < orderQty
+                  && (o.status === "canceled" || o.status === "expired");
                 const placementStatus = (o.status === "filled" || o.status === "partially_filled")
                   ? "submitted"
+                  : isPartialClosed
+                  ? "partially_filled"
                   : o.status;
+                const statusLabel = placementStatus.replace(/_/g, " ");
                 const st = STATUS_STYLE[placementStatus] ?? STATUS_DEFAULT;
                 const fillTs = lastFillTs(o);
                 const submittedTs = o.submitted_at ?? o.created_at;
@@ -840,7 +851,7 @@ export default function TradesPage() {
                           className="chip uppercase tracking-wider font-medium whitespace-nowrap"
                           style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
                         >
-                          {placementStatus}{o.parent_order_id ? " · copy" : ""}
+                          {statusLabel}{o.parent_order_id ? " · copy" : ""}
                         </span>
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
