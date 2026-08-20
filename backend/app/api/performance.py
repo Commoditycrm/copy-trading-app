@@ -27,7 +27,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import require_trader
 from app.database import get_db
@@ -106,6 +106,16 @@ def _serialize_child(
     sub_accepted = child.subscriber_accepted_at
     broker_accepted = child.broker_accepted_at
     redis_pub = child.redis_published_at
+    # Actual fill time. NOT gated on status == FILLED: an order that PARTIALLY
+    # filled and then had the remainder CANCELED (e.g. a trading halt) has
+    # status 'canceled' but real fills — we still want its fill time. Prefer the
+    # latest actual fill; fall back to closed_at whenever anything filled (covers
+    # a fully-filled order whose per-fill rows haven't synced yet).
+    _fill_times = [f.filled_at for f in (child.fills or []) if f.filled_at]
+    _filled_at = (
+        max(_fill_times) if _fill_times
+        else (child.closed_at if (child.filled_quantity or 0) > 0 else None)
+    )
     return {
         "order_id": str(child.id),
         "subscriber_user_id": str(child.user_id),
@@ -120,8 +130,9 @@ def _serialize_child(
         # the parent row exposes, so per-subscriber slippage is visible too.
         "expected_price": str(child.limit_price) if child.limit_price is not None else None,
         "filled_avg_price": str(child.filled_avg_price) if child.filled_avg_price is not None else None,
-        # When this mirror actually filled (closed_at is stamped on FILLED).
-        "filled_at": child.closed_at.isoformat() if (child.closed_at and child.status == OrderStatus.FILLED) else None,
+        # When this mirror actually filled (from the fills, so a partial fill
+        # that was later canceled still shows its fill time — see above).
+        "filled_at": _filled_at.isoformat() if _filled_at else None,
         "broker_order_id": child.broker_order_id,
         "submitted_at": accepted_at.isoformat() if accepted_at else None,
         "created_at": child.created_at.isoformat() if child.created_at else None,
@@ -268,7 +279,9 @@ def list_fanouts(
     parent_ids = [p.id for p in parents]
     children = list(
         db.execute(
-            select(Order).where(Order.parent_order_id.in_(parent_ids))
+            select(Order)
+            .where(Order.parent_order_id.in_(parent_ids))
+            .options(selectinload(Order.fills))  # for the "Filled At" column
         ).scalars()
     )
     children_by_parent: dict[uuid.UUID, list[Order]] = {pid: [] for pid in parent_ids}

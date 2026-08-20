@@ -30,8 +30,8 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, or_, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db, require_admin
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -975,7 +975,9 @@ def admin_list_fanouts(
     parent_ids = list(parent_by_id)
 
     children = list(db.execute(
-        select(Order).where(Order.parent_order_id.in_(parent_ids))
+        select(Order)
+        .where(Order.parent_order_id.in_(parent_ids))
+        .options(selectinload(Order.fills))  # for the "Filled At" column
     ).scalars())
 
     # Broker accounts for child broker resolution / filtering.
