@@ -1,0 +1,31 @@
+name: Notify QA on push
+
+on:
+  push:
+    branches: [qa-branch] # the team's active branch; add `main` here when you move to it
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-qa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  notify-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch "QA / On App Push" for this commit
+        env:
+          QA_TOKEN: ${{ secrets.QA_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${QA_TOKEN}" ]; then
+            echo "::error::QA_DISPATCH_TOKEN is not set in this repo — cannot notify QA."
+            exit 1
+          fi
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer ${QA_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Commoditycrm/copy-trading-qa/dispatches" \
+            -d "{\"event_type\":\"app-push\",\"client_payload\":{\"sha\":\"${GITHUB_SHA}\",\"ref\":\"${GITHUB_REF_NAME}\",\"actor\":\"${GITHUB_ACTOR}\"}}"
+          echo "Dispatched app-push for ${GITHUB_SHA} → QA / On App Push"
