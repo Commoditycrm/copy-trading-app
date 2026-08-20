@@ -56,8 +56,10 @@ export default function CalendarPage() {
 
   const range = useMemo(() => ({ from: iso(startOfMonth(cursor)), to: iso(endOfMonth(cursor)) }), [cursor]);
 
-  const loadPnL = useCallback(() => {
-    setLoading(true);
+  // `silent` = a background live-refresh (today's cell ticks with the market);
+  // it must NOT toggle the loader or the grid would flash on every poll.
+  const loadPnL = useCallback((silent = false) => {
+    if (!silent) setLoading(true);
     const qs = viewingUserId ? `&user_id=${viewingUserId}` : "";
     api<DailyPnL[]>(`/api/calendar/pnl?from=${range.from}&to=${range.to}&tz=${encodeURIComponent(browserTz())}${qs}`)
       .then((rows) => {
@@ -69,8 +71,10 @@ export default function CalendarPage() {
         }
       })
       .finally(() => {
-        setLoading(false);
-        setFirstLoadDone(true);
+        if (!silent) {
+          setLoading(false);
+          setFirstLoadDone(true);
+        }
       });
   }, [range.from, range.to, viewingUserId]);
 
@@ -110,6 +114,18 @@ export default function CalendarPage() {
 
   useEffect(() => { loadPnL(); }, [loadPnL]);
 
+  // Today's cell is LIVE (realized + open-position unrealized). While the month
+  // in view contains today and the tab is visible, quietly re-fetch every 30s
+  // so the figure ticks with the market without flashing the loader.
+  useEffect(() => {
+    const today = iso(new Date());
+    if (!(range.from <= today && today <= range.to)) return;
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") loadPnL(true);
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [range.from, range.to, loadPnL]);
+
   const byDay = useMemo(() => {
     const m: Record<string, DailyPnL> = {};
     for (const d of data) m[d.day] = d;
@@ -136,10 +152,10 @@ export default function CalendarPage() {
   const pnlTooltip = useMemo(() => {
     const kinds = new Set(brokers.map((b) => b.broker));
     if (kinds.has("snaptrade") || kinds.has("webull")) {
-      return "Realized P&L — profit/loss from trades you've CLOSED, net of fees. This can be LESS than your Webull app's daily figure, which also includes UNREALIZED (open-position) gain/loss. SnapTrade doesn't expose Webull's marked P&L, so we show realized only — the two match on days you close everything, and differ on days you hold overnight.";
+      return "Daily P&L including unrealized (open-position) gain/loss, so it tracks your broker app. Webull/SnapTrade exposes no marked history, so we rebuild it from our own end-of-day snapshots — meaning it works GOING FORWARD: recent days show realized + unrealized, while days from before this feature show realized (closed-trade) profit only. Today updates through the session as your open positions move.";
     }
     if (kinds.has("alpaca")) {
-      return "Marked daily P&L — includes both realized (closed trades) and unrealized (open-position) P&L, taken from Alpaca directly. This matches your Alpaca app's daily figure.";
+      return "Daily P&L that matches your Alpaca app: each day is realized (closed-trade) profit PLUS the unrealized mark-to-market on positions still open at that day's close. Past days are LOCKED and never change. TODAY is LIVE — it moves with the market as your open positions do, then locks at the close; the next day shows only its own change.";
     }
     return "Realized P&L — profit/loss from trades you've CLOSED (bought and sold), net of fees. On days you hold positions overnight it can differ from your broker app, which also marks open positions to market.";
   }, [brokers]);
@@ -224,7 +240,13 @@ export default function CalendarPage() {
               type="button"
               onClick={has ? () => router.push(`/trades?from=${key}&to=${key}`) : undefined}
               disabled={!has}
-              title={has ? `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}` : undefined}
+              title={
+                has
+                  ? day.live
+                    ? `Live · ${fmtSignedUsd(pnl)} total (includes ${fmtSignedUsd(Number(day.unrealized_pnl ?? 0))} unrealized on open positions). Click to view today's trades.`
+                    : `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
+                  : undefined
+              }
               whileHover={has ? { y: -2 } : undefined}
               transition={{ duration: 0.15 }}
               className="h-24 p-2 border flex flex-col text-left"
@@ -246,8 +268,18 @@ export default function CalendarPage() {
               {/* On a filled cell always use --text — even for today, whose
                   --accent (teal) is invisible on the green/red fill. The accent
                   border + ring still marks today, so we don't lose that cue. */}
-              <div className="text-xs font-medium" style={{ color: has ? "var(--text)" : isToday ? "var(--accent)" : "var(--muted)" }}>
-                {d.getDate()}
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-medium" style={{ color: has ? "var(--text)" : isToday ? "var(--accent)" : "var(--muted)" }}>
+                  {d.getDate()}
+                </div>
+                {/* Today's number includes live unrealized on open positions —
+                    flag it so the moving figure reads as live, not settled. */}
+                {day?.live && (
+                  <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide" style={{ color: "var(--text)" }}>
+                    <span className="animate-pulse" style={{ width: 6, height: 6, borderRadius: 9999, background: "var(--accent)", display: "inline-block" }} aria-hidden />
+                    Live
+                  </span>
+                )}
               </div>
               {has && (
                 <>

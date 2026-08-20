@@ -166,10 +166,18 @@ export interface Position {
 
 export interface DailyPnL {
   day: string;
+  /** Settled days: locked realized P&L. Today (direct Alpaca): realized-so-far
+   *  PLUS live unrealized on open positions — one combined, market-live figure. */
   realized_pnl: string;
   trade_count: number;
   /** Daily return %, broker-reported (Alpaca only). null when unavailable. */
   pct?: string | null;
+  /** Live unrealized (open-position) P&L folded into realized_pnl for TODAY
+   *  only; null on settled days. Direct-Alpaca. */
+  unrealized_pnl?: string | null;
+  /** True on today's cell when realized_pnl includes live unrealized — the
+   *  number ticks with the market and is not settled. */
+  live?: boolean;
 }
 
 /** One scope's order-history totals, computed in the DB (GET
