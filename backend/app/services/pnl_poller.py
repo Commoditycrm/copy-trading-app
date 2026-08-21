@@ -893,6 +893,21 @@ def _enforce_one(acct: BrokerAccount) -> None:
                 reason = "max_account_usd_per_day"
             s.copy_enabled = False
             s.pnl_auto_paused_at = now_utc
+            # ── Flatten positions on a daily LOSS/PROFIT limit ────────────────
+            # A P&L limit (loss/profit, $ or %) now turns into a full stop-out:
+            # besides pausing copy, close every open position at market. The
+            # trading-BUDGET caps (max_account_*) still only pause. Gated on
+            # FRESH data — never liquidate on a stale last-known snapshot — and
+            # reuses the auto-liquidation flatten routine.
+            is_pnl_limit = hit_loss or hit_profit or hit_loss_pct or hit_profit_pct
+            liq_summary_dl: dict[str, Any] | None = None
+            if is_pnl_limit and not degraded:
+                try:
+                    from app.services.auto_liquidator import liquidate_subscriber_account  # noqa: PLC0415
+                    liq_summary_dl = liquidate_subscriber_account(db, s.user_id, acct.id)
+                except Exception:  # noqa: BLE001
+                    log.exception("pnl_poller: daily-limit liquidation failed for user=%s", s.user_id)
+                    liq_summary_dl = {"cancelled": 0, "closed": 0, "failures": [{"error": "crashed"}]}
             audit.record(
                 db, actor_user_id=s.user_id,
                 action=f"copy.auto_paused_{reason}",
@@ -913,6 +928,8 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     "max_account_pct_per_day": str(s.max_account_pct_per_day) if s.max_account_pct_per_day else None,
                     "max_account_usd_per_day": str(s.max_account_usd_per_day) if s.max_account_usd_per_day else None,
                     "pct_limit_dollars":       str(pct_limit_dollars) if pct_limit_dollars is not None else None,
+                    "positions_closed":        (liq_summary_dl or {}).get("closed") if liq_summary_dl else None,
+                    "orders_cancelled":        (liq_summary_dl or {}).get("cancelled") if liq_summary_dl else None,
                 },
             )
             if s.following_trader_id:
@@ -978,6 +995,13 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     f"${todays_trading_value} hit your ${s.max_account_usd_per_day} "
                     f"daily cap. Copy trading is now OFF; turn it back on when "
                     f"you're ready."
+                )
+            # If a P&L limit also flattened the account, say so on the notice.
+            if liq_summary_dl and (liq_summary_dl.get("closed") or liq_summary_dl.get("cancelled")):
+                pause_msg += (
+                    f" All open positions were closed at market "
+                    f"({liq_summary_dl.get('closed', 0)} closed, "
+                    f"{liq_summary_dl.get('cancelled', 0)} working order(s) cancelled)."
                 )
             try:
                 from app.services import notifications as notif_svc  # noqa: PLC0415

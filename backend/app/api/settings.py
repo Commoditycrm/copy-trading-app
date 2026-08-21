@@ -294,8 +294,9 @@ def set_max_per_contract(
     db: Session = Depends(get_db),
     user: User = Depends(require_subscriber),
 ) -> SubscriberSettingsOut:
-    """UI-only ceiling — persisted so it survives refresh. NOT enforced
-    server-side; copy_engine doesn't read this column."""
+    """Per-contract dollar ceiling for OPTION entries. Enforced in the copy
+    engine: an opening option mirror whose contract value (premium × 100)
+    exceeds this is skipped. Closing trades always go through."""
     s = db.get(SubscriberSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
@@ -315,6 +316,10 @@ def set_max_per_contract(
     )
     db.commit()
     db.refresh(s)
+    # Bust the fanout cache so the copy engine picks up the new ceiling on the
+    # very next trade instead of after the cache TTL.
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return _to_out(db, s)
 
 
