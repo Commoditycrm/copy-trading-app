@@ -247,6 +247,7 @@ def list_fanouts(
                 Order.user_id == trader.id,
                 Order.parent_order_id.is_(None),
                 Order.fanned_out_to_subscribers.is_(True),
+                Order.hidden_at.is_(None),
                 realtime_fanout_clause(),
             )
             .order_by(Order.created_at.desc())

@@ -26,10 +26,11 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
@@ -40,11 +41,15 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
-from app.services import excel_export, market_hours
+from app.services import audit, excel_export, market_hours
 from app.services.pnl import realized_pnl_by_day
 from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
+
+# Market-session clock for day-bucketing order timestamps — matches the ET
+# boundaries the Order History list and Calendar use (api/trades.py).
+_ET = ZoneInfo("America/New_York")
 
 log = logging.getLogger(__name__)
 
@@ -374,6 +379,7 @@ def admin_daily_pnl(
     snap_q = (
         select(s.user_id, s.day, s.realized_pnl, User.role)
         .join(User, User.id == s.user_id)
+        .where(s.hidden.is_(False))
     )
     if from_:
         snap_q = snap_q.where(s.day >= from_)
@@ -531,6 +537,172 @@ def change_business_name(
     except Exception:  # noqa: BLE001
         log.warning("could not invalidate subscriber cache after rename")
     return {"ok": True, "user_id": str(user_id), "business_name": new_name}
+
+
+# ─── Order-history / P&L soft-delete ─────────────────────────────────────────
+#
+# Admin can hide a user's order history and P&L for a date range (or everything
+# before today). It's a SOFT delete: orders keep their row so the broker
+# re-sync's dedup finds them and won't recreate them — a hard DELETE didn't
+# stick (prod KPneverquits: the trade_listener re-pulled the same orders from
+# Alpaca and 30 of 47 reappeared). The rows just carry hidden_at, and every
+# user- and admin-facing read filters them out. Broker-fed P&L days
+# (Alpaca/SnapTrade marked, computed from the feed rather than our orders) are
+# suppressed via the parallel daily_realized_pnl_snapshots.hidden flag.
+
+class HideOrdersIn(BaseModel):
+    # Both bounds optional. Range is [from, to) on the ET session day, matching
+    # Order History / Calendar bucketing. from_ omitted = from the beginning;
+    # to omitted = up to (not including) today, i.e. "everything before today"
+    # — the default, so live/today activity is never hidden by accident.
+    from_: Optional[date] = Field(default=None, alias="from")
+    to: Optional[date] = None
+
+    model_config = {"populate_by_name": True}
+
+
+def _order_day_expr():
+    # Same day basis as Order History: broker's real time, else our insert time.
+    return func.coalesce(Order.submitted_at, Order.created_at)
+
+
+def _resolve_range(payload: HideOrdersIn) -> tuple[date | None, date]:
+    """(from_, to) with to defaulting to today ET (exclusive)."""
+    to = payload.to or market_hours.now_et().date()
+    return payload.from_, to
+
+
+@router.post("/users/{user_id}/orders/hide")
+def hide_user_orders(
+    user_id: uuid.UUID,
+    payload: HideOrdersIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Hide a user's order history + P&L for [from, to) ET (to defaults to
+    today). Durable — a re-sync won't un-hide. Reversible via .../orders/unhide."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    from_, to = _resolve_range(payload)
+    now = datetime.now(timezone.utc)
+    day_expr = _order_day_expr()
+
+    order_conds = [Order.user_id == user_id, Order.hidden_at.is_(None)]
+    snap_conds = [DailyRealizedPnlSnapshot.user_id == user_id,
+                  DailyRealizedPnlSnapshot.hidden.is_(False)]
+    if from_ is not None:
+        order_conds.append(day_expr >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
+        snap_conds.append(DailyRealizedPnlSnapshot.day >= from_)
+    order_conds.append(day_expr < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+    snap_conds.append(DailyRealizedPnlSnapshot.day < to)
+
+    orders_hidden = db.execute(
+        update(Order).where(*order_conds).values(hidden_at=now, hidden_by=admin.id)
+    ).rowcount
+    snaps_hidden = db.execute(
+        update(DailyRealizedPnlSnapshot).where(*snap_conds).values(hidden=True)
+    ).rowcount
+
+    audit.record(
+        db, actor_user_id=admin.id, action="admin.orders_hidden",
+        entity_type="user", entity_id=user_id,
+        metadata={
+            "from": from_.isoformat() if from_ else None,
+            "to": to.isoformat(),
+            "orders_hidden": orders_hidden,
+            "snapshots_hidden": snaps_hidden,
+        },
+    )
+    db.commit()
+    log.info(
+        "admin hid %s orders + %s snapshot days for %s [%s..%s)",
+        orders_hidden, snaps_hidden, user.email, from_, to,
+    )
+    return {
+        "ok": True, "user_id": str(user_id),
+        "from": from_.isoformat() if from_ else None, "to": to.isoformat(),
+        "orders_hidden": orders_hidden, "snapshots_hidden": snaps_hidden,
+    }
+
+
+@router.post("/users/{user_id}/orders/unhide")
+def unhide_user_orders(
+    user_id: uuid.UUID,
+    payload: HideOrdersIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Reverse a hide. With no from/to, restores EVERYTHING hidden for the user
+    (the plain 'undo'); a range scopes the restore to [from, to)."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    day_expr = _order_day_expr()
+    order_conds = [Order.user_id == user_id, Order.hidden_at.isnot(None)]
+    snap_conds = [DailyRealizedPnlSnapshot.user_id == user_id,
+                  DailyRealizedPnlSnapshot.hidden.is_(True)]
+    if payload.from_ is not None:
+        order_conds.append(day_expr >= datetime.combine(payload.from_, datetime.min.time(), tzinfo=_ET))
+        snap_conds.append(DailyRealizedPnlSnapshot.day >= payload.from_)
+    if payload.to is not None:
+        order_conds.append(day_expr < datetime.combine(payload.to, datetime.min.time(), tzinfo=_ET))
+        snap_conds.append(DailyRealizedPnlSnapshot.day < payload.to)
+
+    orders_shown = db.execute(
+        update(Order).where(*order_conds).values(hidden_at=None, hidden_by=None)
+    ).rowcount
+    snaps_shown = db.execute(
+        update(DailyRealizedPnlSnapshot).where(*snap_conds).values(hidden=False)
+    ).rowcount
+
+    audit.record(
+        db, actor_user_id=admin.id, action="admin.orders_unhidden",
+        entity_type="user", entity_id=user_id,
+        metadata={
+            "from": payload.from_.isoformat() if payload.from_ else None,
+            "to": payload.to.isoformat() if payload.to else None,
+            "orders_unhidden": orders_shown,
+            "snapshots_unhidden": snaps_shown,
+        },
+    )
+    db.commit()
+    log.info(
+        "admin unhid %s orders + %s snapshot days for %s",
+        orders_shown, snaps_shown, user.email,
+    )
+    return {
+        "ok": True, "user_id": str(user_id),
+        "orders_unhidden": orders_shown, "snapshots_unhidden": snaps_shown,
+    }
+
+
+@router.get("/users/{user_id}/orders/hidden-count")
+def hidden_orders_count(
+    user_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """How many of the user's orders / snapshot days are currently hidden — lets
+    the admin UI show an Unhide affordance only when there's something to undo."""
+    orders_hidden = db.execute(
+        select(func.count(Order.id)).where(
+            Order.user_id == user_id, Order.hidden_at.isnot(None)
+        )
+    ).scalar_one()
+    snaps_hidden = db.execute(
+        select(func.count(DailyRealizedPnlSnapshot.id)).where(
+            DailyRealizedPnlSnapshot.user_id == user_id,
+            DailyRealizedPnlSnapshot.hidden.is_(True),
+        )
+    ).scalar_one()
+    return {
+        "user_id": str(user_id),
+        "orders_hidden": int(orders_hidden),
+        "snapshots_hidden": int(snaps_hidden),
+    }
 
 
 # ─── Load-test subscriber management ─────────────────────────────────────────
@@ -745,6 +917,7 @@ def _fanout_window_query(trader_id, from_, to):
     q = select(Order).where(
         Order.parent_order_id.is_(None),
         Order.fanned_out_to_subscribers.is_(True),
+        Order.hidden_at.is_(None),
         realtime_fanout_clause(),
     )
     if trader_id is not None:

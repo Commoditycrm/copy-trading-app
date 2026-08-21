@@ -55,6 +55,14 @@ def apply_symbol_search(q: Select, search: str | None) -> Select:
     return q.where(Order.symbol.ilike(f"%{term}%"))
 
 
+def exclude_hidden(q: Select) -> Select:
+    """Drop admin-soft-deleted orders. hidden_at is set by the admin
+    Hide-order-history action; the row survives so the broker re-sync's
+    dedup finds it and won't recreate it, but it's gone from every user- and
+    admin-facing list. See api/admin.hide_user_orders."""
+    return q.where(Order.hidden_at.is_(None))
+
+
 def exclude_dead_bracket_legs(q: Select) -> Select:
     """Drop bracket-exit legs that never happened.
 
