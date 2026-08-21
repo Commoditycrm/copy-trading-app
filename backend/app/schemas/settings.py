@@ -106,10 +106,12 @@ class SubscriberToggleIn(BaseModel):
 
 
 class SubscriberSelfMultiplierIn(BaseModel):
-    """Subscriber-editable multiplier. Bounded so a misclicked extra zero
-    doesn't 100x someone's exposure."""
+    """Subscriber-editable multiplier. Minimum 1 — a multiplier below 1 can
+    scale an option mirror below a whole contract (e.g. 0.5x on a 1-lot = 0.5
+    contracts), which the broker rejects. Capped at 10 so a misclicked extra
+    zero doesn't blow up exposure."""
 
-    multiplier: Decimal = Field(gt=0, le=10)
+    multiplier: Decimal = Field(ge=1, le=10)
 
 
 class DailyLossLimitIn(BaseModel):
@@ -268,9 +270,10 @@ class TraderToggleIn(BaseModel):
 
 
 class SubscriberMultiplierIn(BaseModel):
-    """Trader-only override of a subscriber's multiplier."""
+    """Trader-only override of a subscriber's multiplier. Minimum 1 (same
+    whole-contract reason as the self-serve path); trader may size up to 100x."""
 
-    multiplier: Decimal = Field(gt=0, le=100)
+    multiplier: Decimal = Field(ge=1, le=100)
 
 
 class SubscriberBulkRemoveIn(BaseModel):
