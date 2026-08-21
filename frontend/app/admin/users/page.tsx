@@ -460,20 +460,24 @@ export default function AdminUsersPage() {
                           >
                             {u.is_active ? "Deactivate" : "Activate"}
                           </button>
-                          <button
-                            disabled={busy === u.id}
-                            onClick={() => setHideFor(u)}
-                            title="Hide this user's order history + P&L"
-                            className="text-xs px-3 py-1 rounded-lg transition-colors"
-                            style={{
-                              background: "var(--panel-2)",
-                              color: "var(--text-2)",
-                              border: "1px solid var(--border)",
-                              cursor: busy === u.id ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            Hide P&L
-                          </button>
+                          {/* Traders only — subscriber P&L is derived from their
+                              copy mirrors, so hiding it there is out of scope. */}
+                          {u.role === "trader" && (
+                            <button
+                              disabled={busy === u.id}
+                              onClick={() => setHideFor(u)}
+                              title="Hide this trader's order history + P&L"
+                              className="text-xs px-3 py-1 rounded-lg transition-colors"
+                              style={{
+                                background: "var(--panel-2)",
+                                color: "var(--text-2)",
+                                border: "1px solid var(--border)",
+                                cursor: busy === u.id ? "not-allowed" : "pointer",
+                              }}
+                            >
+                              Hide P&L
+                            </button>
+                          )}
                         </div>
                       )}
                     </td>
