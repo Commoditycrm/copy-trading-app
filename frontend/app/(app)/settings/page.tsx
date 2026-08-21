@@ -125,6 +125,9 @@ export default function SettingsPage() {
   const [limitBusy, setLimitBusy] = useState(false);
   const [profitInput, setProfitInput] = useState("");
   const [profitBusy, setProfitBusy] = useState(false);
+  // Which daily limit is awaiting the "this will close your positions" warning
+  // confirmation before it actually saves. null = no dialog open.
+  const [confirmLimitKind, setConfirmLimitKind] = useState<"loss" | "profit" | null>(null);
   // Unit toggle ("%" of day-start balance vs absolute "$") for the three
   // daily limits. The two columns per field are mutually exclusive
   // server-side; we seed the unit from whichever one is set on load
@@ -132,8 +135,9 @@ export default function SettingsPage() {
   const [lossUnit, setLossUnit] = useState<LimitUnit>("%");
   const [profitUnit, setProfitUnit] = useState<LimitUnit>("%");
   const [maxUnit, setMaxUnit] = useState<LimitUnit>("%");
-  // Max-per-contract is UI-only — no Today/Headroom readouts. Persisted
-  // so the value survives refresh.
+  // Max-per-contract has no Today/Headroom readouts (it's a per-order gate, not
+  // a running total). Enforced in the copy engine: an option entry whose
+  // contract value exceeds this is skipped.
   const [maxContractInput, setMaxContractInput] = useState("");
   const [maxContractBusy, setMaxContractBusy] = useState(false);
   // Max-account-pct-per-day is enforced server-side by pnl_poller.
@@ -250,10 +254,10 @@ export default function SettingsPage() {
     const refresh = () => {
       if (typeof document !== "undefined" && document.hidden) return;
       if (user.role === "subscriber") {
-        api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
-        api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+        api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => { });
+        api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => { });
       } else if (user.role === "trader") {
-        api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => {});
+        api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => { });
       }
     };
     window.addEventListener("focus", refresh);
@@ -272,12 +276,12 @@ export default function SettingsPage() {
     // subscriber revokes approval → the row must fall back to "Request to
     // follow").
     if (e?.type === "notification.created" && typeof e.notification?.type === "string"
-        && (e.notification.type.startsWith("follow.") || e.notification.type === "trader.unfollowed_you")) {
-      api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => {});
-      api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => {});
+      && (e.notification.type.startsWith("follow.") || e.notification.type === "trader.unfollowed_you")) {
+      api<FollowRequest[]>("/api/follow-requests/incoming").then(setIncoming).catch(() => { });
+      api<FollowRequest[]>("/api/follow-requests/mine").then(setMyRequests).catch(() => { });
       // Approval auto-follows server-side — refetch settings so the "Following"
       // card reflects the new trader without a page refresh.
-      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => { });
       return;
     }
     if (e?.type === "copy.auto_paused") {
@@ -440,7 +444,7 @@ export default function SettingsPage() {
       // stale Cancel, and skip the scary toast if that's what happened.
       const fresh = await api<FollowRequest[]>("/api/follow-requests/mine").catch(() => null);
       if (fresh) setMyRequests(fresh);
-      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => {});
+      api<SubscriberSettings>("/api/settings/subscriber").then(setSub).catch(() => { });
       const stillPending = fresh?.some(r => r.trader_id === traderId && r.status === "pending");
       if (stillPending) notify.fromError(e, "Could not cancel request");
     } finally {
@@ -481,7 +485,13 @@ export default function SettingsPage() {
       setMultBusy(false);
     }
   }
-  async function saveLimit() {
+  // Setting a daily limit now ALSO closes all open positions when it's hit, so
+  // warn before saving a non-empty value. Clearing the limit skips the warning.
+  function saveLimit() {
+    if (limitInput.trim() === "") { void doSaveLimit(); return; }
+    setConfirmLimitKind("loss");
+  }
+  async function doSaveLimit() {
     setLimitBusy(true);
     try {
       const trimmed = limitInput.trim();
@@ -507,7 +517,17 @@ export default function SettingsPage() {
       setLimitBusy(false);
     }
   }
-  async function saveProfit() {
+  function saveProfit() {
+    if (profitInput.trim() === "") { void doSaveProfit(); return; }
+    setConfirmLimitKind("profit");
+  }
+  // Runs the actual save once the warning is confirmed (or when clearing).
+  async function confirmSaveLimit() {
+    if (confirmLimitKind === "loss") await doSaveLimit();
+    else if (confirmLimitKind === "profit") await doSaveProfit();
+    setConfirmLimitKind(null);
+  }
+  async function doSaveProfit() {
     setProfitBusy(true);
     try {
       const trimmed = profitInput.trim();
@@ -895,7 +915,7 @@ export default function SettingsPage() {
           >
             {/* Compact copy-size multiplier — applies to whoever you follow. */}
             <div className="flex items-center justify-between gap-3 pb-3 flex-wrap"
-                 style={{ borderBottom: "1px solid var(--border)" }}>
+              style={{ borderBottom: "1px solid var(--border)" }}>
               <span className="text-xs" style={{ color: "var(--muted)" }}>
                 Copy size multiplier — scales every mirrored order (1×–10×).
                 Option contracts round <strong>down</strong> to a whole number
@@ -948,10 +968,10 @@ export default function SettingsPage() {
                   const label = traderLabel(t);
                   const state = isFollowing ? "Following"
                     : isApproved ? "Approved"
-                    : isPending ? "Requested"
-                    : isRejected ? "Declined"
-                    : t.auto_approve_follows ? "Open to all"
-                    : "Not following";
+                      : isPending ? "Requested"
+                        : isRejected ? "Declined"
+                          : t.auto_approve_follows ? "Open to all"
+                            : "Not following";
                   return (
                     <div
                       key={t.id}
@@ -1086,6 +1106,83 @@ export default function SettingsPage() {
                 />
               </div>
 
+              {/* ── Auto-liquidation — its own surface ───────────────────────
+              Separated from Risk Controls so the trader sees this as a
+              distinct take-profit instrument, not a fifth daily cap. The
+              semantic is different too: it locks in a winning day by
+              CLOSING positions, where the Risk Controls rows just pause
+              new mirror entries. */}
+              <Card
+                icon={<IconTrendUp />}
+                title="Auto-Liquidation (Take-Profit)"
+                hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
+              >
+                <div
+                  className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
+                  style={{
+                    gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
+                    color: "var(--muted)",
+                  }}
+                >
+                  <div>Target</div>
+                  <div>Set</div>
+                  <div>Profit</div>
+                  <div>USD</div>
+                  <div>Headroom</div>
+                  <div className="text-right">Progress</div>
+                </div>
+                {(() => {
+                  const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
+                  const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
+                  // Headroom = how much MORE profit you need before the
+                  // trigger fires. Clamped to 0 so once you've reached the
+                  // limit the cell reads "$0.00" instead of a negative.
+                  const liqHeadroom =
+                    unrealizedNum !== null && liqLimitNum !== null
+                      ? Math.max(0, liqLimitNum - unrealizedNum)
+                      : null;
+                  // Progress bar: unrealized / target, clamped 0–100.
+                  const liqPctConsumed =
+                    unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
+                      ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
+                      : 0;
+                  return (
+                    <LimitRow
+                      accent="#22c55e"
+                      icon={<IconTrendUp />}
+                      title="Auto-liquidation target"
+                      subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
+                      todayLabel="Profit"
+                      todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
+                      todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
+                      inputPrefix="USD"
+                      input={autoLiqInput}
+                      onInput={setAutoLiqInput}
+                      busy={autoLiqBusy}
+                      onSave={saveAutoLiq}
+                      current={sub.auto_liquidation_limit}
+                      hasLimit={liqLimitNum !== null}
+                      thresholdUsdDisplay="—"
+                      headroomDisplay={
+                        liqLimitNum === null
+                          ? "—"
+                          : liqHeadroom !== null
+                            ? fmt(String(liqHeadroom))
+                            : "—"
+                      }
+                      // Headroom text stays neutral — this is a take-profit,
+                      // not a stop-loss, so hitting $0 headroom is *good*.
+                      headroomColor="var(--text)"
+                      pctConsumed={liqPctConsumed}
+                      // Tell LimitRow to keep the progress bar green even at
+                      // 100% — the default treats max-progress as danger
+                      // (red), which is wrong for a take-profit target.
+                      successProgress
+                    />
+                  );
+                })()}
+              </Card>
+
               {/* Desktop column legend for the LimitRow grid below.
                   Hidden on mobile where rows stack their own labels.
                   Lives here (not at the top of the card) because the
@@ -1112,8 +1209,8 @@ export default function SettingsPage() {
                 icon={<IconTrendDown />}
                 title="Daily loss limit"
                 subtitle={lossUnit === "$"
-                  ? "Pause copy when today's loss reaches this dollar amount."
-                  : "Pause copy when today's loss reaches this % of your day-start balance."}
+                  ? "Closes all open positions and pauses copy when today's loss reaches this amount."
+                  : "Closes all open positions and pauses copy when today's loss reaches this % of your day-start balance."}
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
@@ -1135,8 +1232,8 @@ export default function SettingsPage() {
                 icon={<IconTrendUp />}
                 title="Daily profit limit"
                 subtitle={profitUnit === "$"
-                  ? "Pause copy when today's profit reaches this dollar amount."
-                  : "Pause copy when today's profit reaches this % of your day-start balance."}
+                  ? "Closes all open positions and pauses copy when today's profit reaches this amount."
+                  : "Closes all open positions and pauses copy when today's profit reaches this % of your day-start balance."}
                 todayLabel="Today P&L"
                 todayValue={fmt(String(todaysPnL))}
                 todayColor={todaysPnL >= 0 ? "var(--good)" : "var(--bad)"}
@@ -1180,7 +1277,7 @@ export default function SettingsPage() {
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per contract"
-                subtitle="This feature is not available yet."
+                subtitle="Skips copying an OPTION entry when a single contract's value (premium × 100) is above this amount. Options only — closing trades always go through."
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"
@@ -1194,83 +1291,6 @@ export default function SettingsPage() {
                 headroomDisplay="—"
               />
             </div>
-          </Card>
-
-          {/* ── Auto-liquidation — its own surface ───────────────────────
-              Separated from Risk Controls so the trader sees this as a
-              distinct take-profit instrument, not a fifth daily cap. The
-              semantic is different too: it locks in a winning day by
-              CLOSING positions, where the Risk Controls rows just pause
-              new mirror entries. */}
-          <Card
-            icon={<IconTrendUp />}
-            title="Auto-Liquidation (Take-Profit)"
-            hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
-          >
-            <div
-              className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
-              style={{
-                gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
-                color: "var(--muted)",
-              }}
-            >
-              <div>Target</div>
-              <div>Set</div>
-              <div>Profit</div>
-              <div>USD</div>
-              <div>Headroom</div>
-              <div className="text-right">Progress</div>
-            </div>
-            {(() => {
-              const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
-              const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
-              // Headroom = how much MORE profit you need before the
-              // trigger fires. Clamped to 0 so once you've reached the
-              // limit the cell reads "$0.00" instead of a negative.
-              const liqHeadroom =
-                unrealizedNum !== null && liqLimitNum !== null
-                  ? Math.max(0, liqLimitNum - unrealizedNum)
-                  : null;
-              // Progress bar: unrealized / target, clamped 0–100.
-              const liqPctConsumed =
-                unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
-                  ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
-                  : 0;
-              return (
-                <LimitRow
-                  accent="#22c55e"
-                  icon={<IconTrendUp />}
-                  title="Auto-liquidation target"
-                  subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
-                  todayLabel="Profit"
-                  todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
-                  todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
-                  inputPrefix="USD"
-                  input={autoLiqInput}
-                  onInput={setAutoLiqInput}
-                  busy={autoLiqBusy}
-                  onSave={saveAutoLiq}
-                  current={sub.auto_liquidation_limit}
-                  hasLimit={liqLimitNum !== null}
-                  thresholdUsdDisplay="—"
-                  headroomDisplay={
-                    liqLimitNum === null
-                      ? "—"
-                      : liqHeadroom !== null
-                        ? fmt(String(liqHeadroom))
-                        : "—"
-                  }
-                  // Headroom text stays neutral — this is a take-profit,
-                  // not a stop-loss, so hitting $0 headroom is *good*.
-                  headroomColor="var(--text)"
-                  pctConsumed={liqPctConsumed}
-                  // Tell LimitRow to keep the progress bar green even at
-                  // 100% — the default treats max-progress as danger
-                  // (red), which is wrong for a take-profit target.
-                  successProgress
-                />
-              );
-            })()}
           </Card>
 
           {/* ── Symbol filters ─────────────────────────────────────── */}
@@ -1342,151 +1362,151 @@ export default function SettingsPage() {
 
       {user.role === "trader" && trd && (
         <>
-        {/* ── Follow requests ─────────────────────────────────────────
+          {/* ── Follow requests ─────────────────────────────────────────
             Subscribers who asked to copy this trader. Approve grants them
             permission to follow; they're notified by email + in-app. */}
-        <Card
-          icon={<IconUsers />}
-          title="Follow requests"
-          hint="Subscribers requesting to copy your trades. Approve to let them follow you, or decline."
-        >
-          {incoming.length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--muted)" }}>
-              No pending follow requests.
-            </p>
-          ) : (
-            <div className="space-y-2.5">
-              {incoming.map(r => {
-                const busy = decidingId === r.id;
-                return (
-                  <div
-                    key={r.id}
-                    className="flex items-center justify-between gap-3 rounded-lg border p-3"
-                    style={{ borderColor: "var(--border)" }}
-                  >
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium truncate">
-                        {r.subscriber_name || r.subscriber_email || "A subscriber"}
-                      </div>
-                      {r.subscriber_name && r.subscriber_email && (
-                        <div className="text-xs truncate" style={{ color: "var(--muted)" }}>
-                          {r.subscriber_email}
+          <Card
+            icon={<IconUsers />}
+            title="Follow requests"
+            hint="Subscribers requesting to copy your trades. Approve to let them follow you, or decline."
+          >
+            {incoming.length === 0 ? (
+              <p className="text-sm" style={{ color: "var(--muted)" }}>
+                No pending follow requests.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {incoming.map(r => {
+                  const busy = decidingId === r.id;
+                  return (
+                    <div
+                      key={r.id}
+                      className="flex items-center justify-between gap-3 rounded-lg border p-3"
+                      style={{ borderColor: "var(--border)" }}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate">
+                          {r.subscriber_name || r.subscriber_email || "A subscriber"}
                         </div>
-                      )}
+                        {r.subscriber_name && r.subscriber_email && (
+                          <div className="text-xs truncate" style={{ color: "var(--muted)" }}>
+                            {r.subscriber_email}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => decide(r.id, false)}
+                          disabled={busy}
+                          className="btn-ghost px-3 py-1.5 text-xs"
+                        >
+                          Decline
+                        </button>
+                        <PrimaryButton busy={busy} onClick={() => decide(r.id, true)} disabled={busy}>
+                          Approve
+                        </PrimaryButton>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => decide(r.id, false)}
-                        disabled={busy}
-                        className="btn-ghost px-3 py-1.5 text-xs"
-                      >
-                        Decline
-                      </button>
-                      <PrimaryButton busy={busy} onClick={() => decide(r.id, true)} disabled={busy}>
-                        Approve
-                      </PrimaryButton>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </Card>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
 
-        <Card
-          icon={<IconPower />}
-          title="Master trading switch"
-          hint="When OFF, the platform refuses to place new orders (yours and any subscriber mirrors)."
-        >
-          <div className="flex items-center justify-between gap-3">
-            <Pill
-              dot={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
-              label="State"
-              value={trd.trading_enabled ? "ON" : "OFF"}
-              valueColor={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
-            />
-            <button
-              onClick={() => toggleTrading(!trd.trading_enabled)}
-              className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98]"
-              style={{
-                background: trd.trading_enabled ? "var(--bad)" : "var(--good)",
-                color: "#06121f",
-                boxShadow: "0 4px 14px -4px rgba(0,0,0,0.4)",
-              }}
-            >
-              {trd.trading_enabled ? "Turn OFF" : "Turn ON"}
-            </button>
-          </div>
-        </Card>
-
-        {/* ── Discord trade alerts ─────────────────────────────────────────
-            Broadcast every fill the trader places to a Discord channel their
-            subscribers watch (ENTERING/CLOSING cards). Off by default. */}
-        <Card
-          icon={<IconBell />}
-          title="Discord trade alerts"
-          hint="Post every trade you place (ENTERING / CLOSING) to a Discord channel your subscribers follow. Paste a channel's Incoming Webhook URL."
-        >
-          <div className="space-y-3">
+          <Card
+            icon={<IconPower />}
+            title="Master trading switch"
+            hint="When OFF, the platform refuses to place new orders (yours and any subscriber mirrors)."
+          >
             <div className="flex items-center justify-between gap-3">
               <Pill
-                dot={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
-                label="Alerts"
-                value={trd.discord_alerts_enabled ? "ON" : "OFF"}
-                valueColor={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
+                dot={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
+                label="State"
+                value={trd.trading_enabled ? "ON" : "OFF"}
+                valueColor={trd.trading_enabled ? "var(--good)" : "var(--bad)"}
               />
               <button
-                onClick={() => toggleDiscordAlerts(!trd.discord_alerts_enabled)}
-                disabled={!trd.discord_webhook_configured && !trd.discord_alerts_enabled}
-                className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+                onClick={() => toggleTrading(!trd.trading_enabled)}
+                className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98]"
                 style={{
-                  background: trd.discord_alerts_enabled ? "var(--bad)" : "var(--good)",
+                  background: trd.trading_enabled ? "var(--bad)" : "var(--good)",
                   color: "#06121f",
                   boxShadow: "0 4px 14px -4px rgba(0,0,0,0.4)",
                 }}
               >
-                {trd.discord_alerts_enabled ? "Turn OFF" : "Turn ON"}
+                {trd.trading_enabled ? "Turn OFF" : "Turn ON"}
               </button>
             </div>
+          </Card>
 
-            <div>
-              <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
-                Webhook URL
-                {trd.discord_webhook_configured && (
-                  <span className="ml-2" style={{ color: "var(--good)" }}>● configured</span>
-                )}
-              </label>
-              <div className="mt-1 flex items-center gap-2">
-                <input
-                  type="url"
-                  value={discordUrl}
-                  onChange={(e) => setDiscordUrl(e.target.value)}
-                  placeholder={trd.discord_webhook_configured
-                    ? "Paste a new URL to replace, or clear to remove"
-                    : "https://discord.com/api/webhooks/…"}
-                  className="flex-1 py-2 px-2.5 text-sm rounded-token min-w-0"
-                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
-                  aria-label="Discord webhook URL"
+          {/* ── Discord trade alerts ─────────────────────────────────────────
+            Broadcast every fill the trader places to a Discord channel their
+            subscribers watch (ENTERING/CLOSING cards). Off by default. */}
+          <Card
+            icon={<IconBell />}
+            title="Discord trade alerts"
+            hint="Post every trade you place (ENTERING / CLOSING) to a Discord channel your subscribers follow. Paste a channel's Incoming Webhook URL."
+          >
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <Pill
+                  dot={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
+                  label="Alerts"
+                  value={trd.discord_alerts_enabled ? "ON" : "OFF"}
+                  valueColor={trd.discord_alerts_enabled ? "var(--good)" : "var(--muted)"}
                 />
-                <PrimaryButton busy={discordBusy} onClick={saveDiscordWebhook} disabled={discordBusy}>
-                  {discordUrl.trim() ? "Save" : (trd.discord_webhook_configured ? "Clear" : "Save")}
-                </PrimaryButton>
-              </div>
-              <div className="mt-2 flex items-center gap-3">
                 <button
-                  onClick={sendDiscordTest}
-                  disabled={discordTesting || !trd.discord_webhook_configured}
-                  className="btn-ghost px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={() => toggleDiscordAlerts(!trd.discord_alerts_enabled)}
+                  disabled={!trd.discord_webhook_configured && !trd.discord_alerts_enabled}
+                  className="px-4 py-2 text-sm rounded-lg font-medium transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+                  style={{
+                    background: trd.discord_alerts_enabled ? "var(--bad)" : "var(--good)",
+                    color: "#06121f",
+                    boxShadow: "0 4px 14px -4px rgba(0,0,0,0.4)",
+                  }}
                 >
-                  {discordTesting ? "Sending…" : "Send test alert"}
+                  {trd.discord_alerts_enabled ? "Turn OFF" : "Turn ON"}
                 </button>
-                <span className="text-xs" style={{ color: "var(--muted)" }}>
-                  Discord → Server Settings → Integrations → Webhooks → New Webhook → Copy URL
-                </span>
+              </div>
+
+              <div>
+                <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
+                  Webhook URL
+                  {trd.discord_webhook_configured && (
+                    <span className="ml-2" style={{ color: "var(--good)" }}>● configured</span>
+                  )}
+                </label>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    type="url"
+                    value={discordUrl}
+                    onChange={(e) => setDiscordUrl(e.target.value)}
+                    placeholder={trd.discord_webhook_configured
+                      ? "Paste a new URL to replace, or clear to remove"
+                      : "https://discord.com/api/webhooks/…"}
+                    className="flex-1 py-2 px-2.5 text-sm rounded-token min-w-0"
+                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}
+                    aria-label="Discord webhook URL"
+                  />
+                  <PrimaryButton busy={discordBusy} onClick={saveDiscordWebhook} disabled={discordBusy}>
+                    {discordUrl.trim() ? "Save" : (trd.discord_webhook_configured ? "Clear" : "Save")}
+                  </PrimaryButton>
+                </div>
+                <div className="mt-2 flex items-center gap-3">
+                  <button
+                    onClick={sendDiscordTest}
+                    disabled={discordTesting || !trd.discord_webhook_configured}
+                    className="btn-ghost px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {discordTesting ? "Sending…" : "Send test alert"}
+                  </button>
+                  <span className="text-xs" style={{ color: "var(--muted)" }}>
+                    Discord → Server Settings → Integrations → Webhooks → New Webhook → Copy URL
+                  </span>
+                </div>
               </div>
             </div>
-          </div>
-        </Card>
+          </Card>
         </>
       )}
 
@@ -1516,6 +1536,26 @@ export default function SettingsPage() {
         busy={resetBusy}
         onConfirm={resetSettings}
         onCancel={() => { if (!resetBusy) setResetOpen(false); }}
+      />
+
+      <ConfirmModal
+        open={confirmLimitKind !== null}
+        title={confirmLimitKind === "profit" ? "Set daily profit target?" : "Set daily loss limit?"}
+        message={
+          <>
+            Heads up: when this limit is hit, copy trading pauses <strong>and all
+            your open positions are closed at market</strong> to lock in{" "}
+            {confirmLimitKind === "profit" ? "the gain" : "your remaining balance"}.
+            It uses your realized <em>and</em> unrealized P&amp;L for the day, and
+            copy trading auto-resumes the next day.
+          </>
+        }
+        confirmLabel="Set limit"
+        cancelLabel="Cancel"
+        variant="danger"
+        busy={limitBusy || profitBusy}
+        onConfirm={confirmSaveLimit}
+        onCancel={() => { if (!(limitBusy || profitBusy)) setConfirmLimitKind(null); }}
       />
     </div>
   );
