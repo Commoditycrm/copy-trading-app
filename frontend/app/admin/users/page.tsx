@@ -76,6 +76,7 @@ export default function AdminUsersPage() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [busy, setBusy]       = useState<string | null>(null); // user id being actioned
   const [editingBiz, setEditingBiz] = useState<{ id: string; draft: string } | null>(null);
+  const [hideFor, setHideFor] = useState<AdminUser | null>(null); // user in the hide-history modal
 
   // Server-side pagination + DB-computed role-chip counts.
   const [total, setTotal]   = useState(0);
@@ -445,19 +446,35 @@ export default function AdminUsersPage() {
                     {/* Actions */}
                     <td className="px-4 py-3">
                       {u.role !== "admin" && (
-                        <button
-                          disabled={busy === u.id}
-                          onClick={() => toggleActive(u)}
-                          className="text-xs px-3 py-1 rounded-lg transition-colors"
-                          style={{
-                            background: u.is_active ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)",
-                            color:      u.is_active ? "#ef4444"               : "#22c55e",
-                            border:     "1px solid " + (u.is_active ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"),
-                            cursor:     busy === u.id ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {u.is_active ? "Deactivate" : "Activate"}
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => toggleActive(u)}
+                            className="text-xs px-3 py-1 rounded-lg transition-colors"
+                            style={{
+                              background: u.is_active ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)",
+                              color:      u.is_active ? "#ef4444"               : "#22c55e",
+                              border:     "1px solid " + (u.is_active ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"),
+                              cursor:     busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {u.is_active ? "Deactivate" : "Activate"}
+                          </button>
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => setHideFor(u)}
+                            title="Hide this user's order history + P&L"
+                            className="text-xs px-3 py-1 rounded-lg transition-colors"
+                            style={{
+                              background: "var(--panel-2)",
+                              color: "var(--text-2)",
+                              border: "1px solid var(--border)",
+                              cursor: busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            Hide P&L
+                          </button>
+                        </div>
                       )}
                     </td>
                   </tr>
@@ -470,6 +487,182 @@ export default function AdminUsersPage() {
       {!loading && total > 0 && (
         <Pagination total={total} limit={limit} offset={offset} onChange={setOffset} />
       )}
+
+      {hideFor && (
+        <HideHistoryModal
+          user={hideFor}
+          onClose={() => setHideFor(null)}
+          onDone={load}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Hide / unhide a user's order history + P&L ────────────────────────────────
+// Soft-delete: the orders keep their rows so the broker re-sync won't recreate
+// them (a hard delete didn't stick), but they vanish from every history and P&L
+// view. Reversible via Unhide.
+function HideHistoryModal({
+  user, onClose, onDone,
+}: {
+  user: AdminUser;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [mode, setMode] = useState<"before_today" | "range">("before_today");
+  const [from, setFrom] = useState("");
+  const [to, setTo]     = useState("");
+  const [busy, setBusy] = useState(false);
+  const [counts, setCounts] = useState<{ orders_hidden: number; snapshots_hidden: number } | null>(null);
+
+  const refreshCounts = useCallback(async () => {
+    try {
+      setCounts(await api(`/api/admin/users/${user.id}/orders/hidden-count`));
+    } catch { /* non-blocking */ }
+  }, [user.id]);
+  useEffect(() => { refreshCounts(); }, [refreshCounts]);
+
+  async function hide() {
+    // range mode requires a lower bound; the upper is exclusive (empty = today).
+    const body: Record<string, string> = {};
+    if (mode === "range") {
+      if (!from) { notify.error("Pick a start date"); return; }
+      body.from = from;
+      if (to) body.to = to;
+    }
+    setBusy(true);
+    try {
+      const res = await api<{ orders_hidden: number; snapshots_hidden: number }>(
+        `/api/admin/users/${user.id}/orders/hide`,
+        { method: "POST", body: JSON.stringify(body) },
+      );
+      notify.success(`Hid ${res.orders_hidden} orders + ${res.snapshots_hidden} P&L days`);
+      await refreshCounts();
+      onDone();
+    } catch (e) {
+      notify.fromError(e, "Could not hide history");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unhideAll() {
+    setBusy(true);
+    try {
+      const res = await api<{ orders_unhidden: number; snapshots_unhidden: number }>(
+        `/api/admin/users/${user.id}/orders/unhide`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      notify.success(`Restored ${res.orders_unhidden} orders + ${res.snapshots_unhidden} P&L days`);
+      await refreshCounts();
+      onDone();
+    } catch (e) {
+      notify.fromError(e, "Could not unhide history");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const nHidden = (counts?.orders_hidden ?? 0) + (counts?.snapshots_hidden ?? 0);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(0,0,0,0.55)" }}
+      onClick={onClose}
+    >
+      <div
+        className="rounded-xl w-full max-w-md p-5 space-y-4"
+        style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div>
+          <h3 className="text-lg font-bold">Hide order history &amp; P&amp;L</h3>
+          <p className="text-sm mt-0.5" style={{ color: "var(--muted)" }}>
+            {user.email}
+          </p>
+        </div>
+
+        {counts && nHidden > 0 && (
+          <div
+            className="text-xs px-3 py-2 rounded-lg"
+            style={{ background: "rgba(250,204,21,0.08)", color: "#facc15", border: "1px solid rgba(250,204,21,0.2)" }}
+          >
+            Currently hidden: {counts.orders_hidden} orders, {counts.snapshots_hidden} P&amp;L days.
+          </div>
+        )}
+
+        <div className="space-y-2 text-sm">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="radio" checked={mode === "before_today"} onChange={() => setMode("before_today")} />
+            Everything before today
+          </label>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="radio" checked={mode === "range"} onChange={() => setMode("range")} />
+            Date range
+          </label>
+          {mode === "range" && (
+            <div className="flex items-center gap-2 pl-6">
+              <input
+                type="date" value={from} aria-label="From date"
+                onChange={e => setFrom(e.target.value)}
+                className="text-xs px-2 py-1 rounded-lg"
+                style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <span style={{ color: "var(--muted)" }}>→</span>
+              <input
+                type="date" value={to} aria-label="To date (exclusive; empty = today)"
+                onChange={e => setTo(e.target.value)}
+                className="text-xs px-2 py-1 rounded-lg"
+                style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+            </div>
+          )}
+          <p className="text-xs pl-6" style={{ color: "var(--muted)" }}>
+            The end date is exclusive; leave it empty to hide up to today. Hidden rows
+            survive a broker re-sync and stay hidden until you Unhide.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between pt-2">
+          <button
+            disabled={busy || nHidden === 0}
+            onClick={unhideAll}
+            className="text-sm px-3 py-1.5 rounded-lg"
+            style={{
+              background: "rgba(34,197,94,0.10)", color: "#22c55e",
+              border: "1px solid rgba(34,197,94,0.25)",
+              cursor: busy || nHidden === 0 ? "not-allowed" : "pointer",
+              opacity: nHidden === 0 ? 0.5 : 1,
+            }}
+          >
+            Unhide all
+          </button>
+          <div className="flex items-center gap-2">
+            <button
+              disabled={busy}
+              onClick={onClose}
+              className="text-sm px-3 py-1.5 rounded-lg"
+              style={{ background: "var(--panel-2)", color: "var(--text-2)", border: "1px solid var(--border)" }}
+            >
+              Cancel
+            </button>
+            <button
+              disabled={busy}
+              onClick={hide}
+              className="text-sm px-3 py-1.5 rounded-lg font-semibold"
+              style={{
+                background: "rgba(239,68,68,0.12)", color: "#ef4444",
+                border: "1px solid rgba(239,68,68,0.3)",
+                cursor: busy ? "not-allowed" : "pointer",
+              }}
+            >
+              {busy ? "Working…" : "Hide"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

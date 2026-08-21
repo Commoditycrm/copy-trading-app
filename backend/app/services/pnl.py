@@ -134,6 +134,7 @@ def today_filled_notional(
             Order.user_id == user_id,
             Order.filled_quantity > 0,
             Order.filled_avg_price.isnot(None),
+            Order.hidden_at.is_(None),
         )
     ).scalars())
     if not orders:
@@ -208,6 +209,7 @@ def today_realized_pnl_bulk(
             Order.user_id.in_(user_ids),
             Order.filled_quantity > 0,
             Order.filled_avg_price.isnot(None),
+            Order.hidden_at.is_(None),
         )
     ).scalars())
 
@@ -357,11 +359,14 @@ def realized_pnl_by_day(
     both double-counts and scrambles the FIFO. A pure copy-subscriber's real
     trades ARE the mirrors, so this de-duplicates them.
     """
-    # Orders the user owns with any fill recorded.
+    # Orders the user owns with any fill recorded. hidden_at excludes
+    # admin-soft-deleted orders from the FIFO entirely (they don't exist for
+    # P&L purposes) — see api/admin.hide_user_orders.
     conds = [
         Order.user_id == user_id,
         Order.filled_quantity > 0,
         Order.filled_avg_price.isnot(None),
+        Order.hidden_at.is_(None),
     ]
     orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
 
@@ -467,6 +472,7 @@ def realized_pnl_by_order(
         Order.user_id == user_id,
         Order.filled_quantity > 0,
         Order.filled_avg_price.isnot(None),
+        Order.hidden_at.is_(None),
     ]
     orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
     orders = dedupe_subscriber_orders(orders_all) if mirrors_only else orders_all
