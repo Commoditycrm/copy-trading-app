@@ -134,6 +134,7 @@ def list_trades(
         .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
         .limit(limit)
     )
+    q = trade_filters.exclude_hidden(q)
     if from_:
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
@@ -187,6 +188,7 @@ def list_trades_page(
         base = base.where(
             func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET)
         )
+    base = trade_filters.exclude_hidden(base)
     base = trade_filters.exclude_dead_bracket_legs(base)
     base = trade_filters.apply_status_tab(base, status_tab)
     base = trade_filters.apply_symbol_search(base, search)
@@ -267,6 +269,7 @@ def export_trades(
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+    q = trade_filters.exclude_hidden(q)
     q = trade_filters.exclude_dead_bracket_legs(q)
     q = trade_filters.apply_status_tab(q, status_tab)
     q = trade_filters.apply_symbol_search(q, search)
@@ -1871,6 +1874,7 @@ def _load_eod_map(
             DailyRealizedPnlSnapshot.day >= start,
             DailyRealizedPnlSnapshot.day <= end,
             DailyRealizedPnlSnapshot.eod_unrealized.isnot(None),
+            DailyRealizedPnlSnapshot.hidden.is_(False),
         )
     ).all()
     return {d: Decimal(v) for d, v in rows if v is not None}
@@ -2006,6 +2010,7 @@ def calendar_pnl(
                 DailyRealizedPnlSnapshot.user_id == target_user_id,
                 DailyRealizedPnlSnapshot.day >= from_,
                 DailyRealizedPnlSnapshot.day <= to,
+                DailyRealizedPnlSnapshot.hidden.is_(False),
             )
         ).scalars()
     }

@@ -27,7 +27,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    Date, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint, func,
+    Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String,
+    UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -89,3 +90,9 @@ class DailyRealizedPnlSnapshot(Base):
         DateTime(timezone=True), server_default=func.now(),
         onupdate=lambda: datetime.now(timezone.utc), nullable=False,
     )
+
+    # Admin soft-delete for a broker-fed P&L day. Alpaca/SnapTrade P&L comes from
+    # the broker (not our orders), so hiding orders alone can't clear those days
+    # — this flag does. The Calendar/admin P&L filter it out, and the snapshot
+    # sweep's upsert will NOT resurrect a hidden day. See api/admin.hide_user_orders.
+    hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))

@@ -206,6 +206,18 @@ class Order(Base, TimestampMixin):
         Boolean, default=False, nullable=False
     )
 
+    # Admin soft-delete. When set, this order is hidden from order-history and
+    # P&L everywhere, and — crucially — the broker sync/listener will NOT
+    # un-hide it on re-import (a hard DELETE didn't stick: the trade_listener
+    # re-pulled the same orders from Alpaca and recreated them). hidden_by is
+    # the admin who hid it. See api/admin.hide_user_orders.
+    hidden_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    hidden_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
     broker_account = relationship("BrokerAccount", back_populates="orders")
     fills = relationship("Fill", back_populates="order", cascade="all, delete-orphan")
     # `foreign_keys` is required now that there are TWO self-referential
