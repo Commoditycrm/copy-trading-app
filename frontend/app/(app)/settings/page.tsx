@@ -1255,8 +1255,8 @@ export default function SettingsPage() {
                 icon={<IconWallet />}
                 title="Max trading budget / day"
                 subtitle={maxUnit === "$"
-                  ? "Pauses copy when the total value of today's trades reaches this amount."
-                  : "Pauses copy when the total value of today's trades reaches this % of amount."}
+                  ? "Pauses copy once today's total BUY value reaches this amount. Selling doesn't give budget back; resets next day."
+                  : "Pauses copy once today's total BUY value reaches this % of your day-start balance. Selling doesn't give budget back; resets next day."}
                 todayLabel="Day-Start"
                 todayValue={beginningDayBalance !== null ? fmt(beginningDayBalance) : "—"}
                 unit={maxUnit}

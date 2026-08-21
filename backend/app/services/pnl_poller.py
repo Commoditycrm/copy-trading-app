@@ -84,7 +84,7 @@ from app.models.settings import SubscriberSettings, TraderSettings
 from app.services import audit, cache, events
 from app.services.crypto import decrypt_json
 from app.services import pnl
-from app.services.pnl import today_filled_notional
+from app.services.pnl import today_buy_notional
 
 log = logging.getLogger(__name__)
 
@@ -738,7 +738,9 @@ def _enforce_one(acct: BrokerAccount) -> None:
         # day-start balance means the dollar threshold is FIXED for the
         # trading day; if we used live equity, the threshold would drift
         # up on gains and down on losses, which would be confusing.
-        todays_trading_value = today_filled_notional(db, s.user_id)
+        # Cumulative BUY value spent today (sells never reduce it), vs the
+        # daily budget. Spend-based: once buys cross the budget, copy pauses.
+        todays_trading_value = today_buy_notional(db, s.user_id)
 
         pct_limit_dollars: Decimal | None = None
         if (

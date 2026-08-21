@@ -110,21 +110,21 @@ def _tz_or_market(tz_name: str | None) -> "ZoneInfo | timezone":
         return _MARKET_TZ
 
 
-def today_filled_notional(
+def today_buy_notional(
     db: Session, user_id: uuid.UUID, tz_name: str | None = None,
 ) -> Decimal:
-    """Gross USD value of every fill placed today for ``user_id``.
+    """Cumulative USD value of every BUY fill placed today for ``user_id``.
 
     Returns ``sum(abs(filled_qty) * filled_avg_price * multiplier)`` across
-    every order that has any filled quantity recorded with a transaction
-    time in today's market-timezone day. Both BUY and SELL count — this is
-    capital deployed, not net P&L. Options pick up the 100x contract
-    multiplier so the dollar amount reflects actual exposure, matching
-    how an Alpaca/SnapTrade dashboard surfaces it.
+    every BUY order filled in today's market-timezone day. ONLY buys count —
+    this is the cash spent OPENING/adding today. A SELL does NOT reduce it: the
+    daily budget is spend-based, not net turnover, so the running total only
+    ever goes UP within the day (selling never gives budget back). Options pick
+    up the 100x contract multiplier.
 
-    Used by the per-day ``max_account_pct_per_day`` kill switch in
-    ``services.pnl_poller``: when today's trading value crosses
-    ``equity * pct/100``, copy is auto-paused.
+    Used by the per-day ``max_account_usd/pct_per_day`` cap in
+    ``services.pnl_poller``: once today's cumulative buy value crosses the
+    budget, copy is auto-paused for the day (auto-resumes next day).
     """
     tz = _tz_or_market(tz_name)
     today = datetime.now(tz).date()
@@ -132,6 +132,7 @@ def today_filled_notional(
     orders = list(db.execute(
         select(Order).where(
             Order.user_id == user_id,
+            Order.side == OrderSide.BUY,
             Order.filled_quantity > 0,
             Order.filled_avg_price.isnot(None),
             Order.hidden_at.is_(None),
