@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db, require_admin
