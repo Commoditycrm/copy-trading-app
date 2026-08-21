@@ -23,6 +23,16 @@ const RETRY_COUNT_OPTIONS = [1, 2, 3, 4, 5].map(n => ({
   label: n === 1 ? "1 retry" : `${n} retries`,
 }));
 
+// Copy-size multiplier choices: 1× to 10× in 0.5 steps. Minimum is 1 — a
+// multiplier below 1 could scale an option mirror below a whole contract
+// (e.g. 0.5× on a 1-lot = 0.5 contracts), which the broker rejects. Values are
+// exact halves, so their string form is clean ("1", "1.5", … "10").
+const MULTIPLIER_OPTIONS: { value: string; label: string }[] =
+  Array.from({ length: 19 }, (_, i) => {
+    const v = (1 + i * 0.5).toString();
+    return { value: v, label: `×${v}` };
+  });
+
 /** Cross-navigation cache for the pnl.tick payload fields the Risk
  *  Controls panel renders.
  *
@@ -455,8 +465,8 @@ export default function SettingsPage() {
     setMultBusy(true);
     try {
       const n = Number(multInput);
-      if (!Number.isFinite(n) || n <= 0 || n > 10) {
-        throw new ApiError(422, "multiplier must be between 0.1 and 10");
+      if (!Number.isFinite(n) || n < 1 || n > 10) {
+        throw new ApiError(422, "multiplier must be between 1 and 10");
       }
       const rounded = (Math.round(n * 10) / 10).toFixed(1);
       const s = await api<SubscriberSettings>("/api/settings/subscriber/multiplier", {
@@ -887,16 +897,26 @@ export default function SettingsPage() {
             <div className="flex items-center justify-between gap-3 pb-3 flex-wrap"
                  style={{ borderBottom: "1px solid var(--border)" }}>
               <span className="text-xs" style={{ color: "var(--muted)" }}>
-                Copy size multiplier — scales every mirrored order (0.1×–10×).
+                Copy size multiplier — scales every mirrored order (1×–10×).
+                Option contracts round <strong>down</strong> to a whole number
+                (e.g. 3 × 1.5 = 4.5 → 4 contracts).
               </span>
               <div className="flex items-center gap-2">
-                <NumberInput
-                  value={multInput}
-                  onChange={setMultInput}
-                  step={0.1} min={0.1} max={10}
-                  className="w-20"
-                  ariaLabel="Copy size multiplier"
-                />
+                <div className="w-24">
+                  <SelectInput
+                    value={multInput}
+                    onChange={setMultInput}
+                    ariaLabel="Copy size multiplier"
+                    // Grandfather a legacy sub-1 value (e.g. 0.5×) by showing it
+                    // as an extra option so the dropdown reflects the current
+                    // setting; new picks are 1×–10× only.
+                    options={
+                      MULTIPLIER_OPTIONS.some(o => o.value === multInput)
+                        ? MULTIPLIER_OPTIONS
+                        : [{ value: multInput, label: `×${multInput}` }, ...MULTIPLIER_OPTIONS]
+                    }
+                  />
+                </div>
                 <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
                   ×{fmtMultiplier(sub.multiplier)}
                 </span>
