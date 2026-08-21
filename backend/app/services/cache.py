@@ -61,6 +61,10 @@ class CachedSubscriber:
     # Defaults mirror SubscriberSettings.
     eod_autoclose_enabled: bool = False
     eod_autoclose_minutes: int = 15
+    # Per-contract dollar ceiling for OPTION entries (premium × 100). Read in
+    # fanout: an opening option mirror whose contract value exceeds this is
+    # skipped. None = no cap. MUST be cached so the fanout gate sees it.
+    max_per_contract: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
         "copy_trader_bracket": bool(getattr(s, "copy_trader_bracket", False)),
         "eod_autoclose_enabled": bool(getattr(s, "eod_autoclose_enabled", False)),
         "eod_autoclose_minutes": int(getattr(s, "eod_autoclose_minutes", 15) or 15),
+        "max_per_contract": str(s.max_per_contract) if getattr(s, "max_per_contract", None) is not None else None,
     }
 
 
@@ -127,6 +132,7 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         copy_trader_bracket=bool(d.get("copy_trader_bracket", False)),
         eod_autoclose_enabled=bool(d.get("eod_autoclose_enabled", False)),
         eod_autoclose_minutes=int(d.get("eod_autoclose_minutes", 15) or 15),
+        max_per_contract=Decimal(d["max_per_contract"]) if d.get("max_per_contract") is not None else None,
     )
 
 

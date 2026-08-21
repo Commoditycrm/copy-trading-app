@@ -2279,6 +2279,38 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 ))
                 continue
 
+            # ── Max per-contract value gate (OPTION opens only) ──────────────
+            # Skip an OPENING option mirror when a single contract's value
+            # (premium × 100) exceeds the subscriber's max_per_contract ceiling.
+            # A CLOSE always passes (they must be able to exit); stocks have no
+            # per-contract concept, so this is options-only. Priced off the
+            # trader's own premium — no price available → allow (fail-open).
+            _mpc = getattr(sub, "max_per_contract", None)
+            if (
+                not is_closing_effective
+                and _mpc is not None
+                and trader_order.instrument_type == InstrumentType.OPTION
+            ):
+                _px = trader_order.filled_avg_price or trader_order.limit_price
+                if _px is not None and Decimal(_px) * Decimal(100) > Decimal(_mpc):
+                    audit.record(
+                        db, actor_user_id=sub.user_id,
+                        action="copy.skipped_max_per_contract",
+                        entity_type="order", entity_id=trader_order.id,
+                        metadata={
+                            "symbol": trade_symbol,
+                            "per_contract": str(Decimal(_px) * Decimal(100)),
+                            "max_per_contract": str(_mpc),
+                        },
+                    )
+                    results.append(FanoutResult(
+                        subscriber_user_id=sub.user_id,
+                        broker_account_id=acct.id,
+                        order_id=None,
+                        status="skipped_max_per_contract",
+                    ))
+                    continue
+
             # Defense-in-depth: never mirror a CLOSE larger than the subscriber
             # actually holds. Clamp to the raw held position (not minus reserved):
             # if a working order reserves it, the conflict-resolve retry in
