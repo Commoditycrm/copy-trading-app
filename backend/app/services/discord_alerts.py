@@ -344,13 +344,8 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ts = db.get(TraderSettings, order.user_id)
         if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
             return
-        # Copy trading OFF → no alert. When the trader has paused copy
-        # (copy_paused — the same switch the fanout gates on), their fills are
-        # NOT mirrored to subscribers, so broadcasting an ENTERING/CLOSING card
-        # would tell subscribers to follow a trade the system isn't copying.
-        if ts.copy_paused:
-            return
         webhook_url = ts.discord_webhook_url
+        copy_paused = bool(ts.copy_paused)
 
         # Atomically CLAIM this order's alert. Several paths detect the same
         # fill almost simultaneously (SnapTrade/Webull listener + copy_engine
@@ -371,6 +366,21 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ).first()
         if already is not None:
             return  # another path already claimed/sent this order's card
+        # Copy trading OFF at fill time → CLAIM the order (write the marker) but
+        # do NOT send. Deciding each order ONCE, here, is what fixes the QA bug:
+        # a fill that lands while copy is paused wasn't mirrored to subscribers,
+        # so it must never surface a card — and because we leave a marker, later
+        # turning copy back ON can't make the sweep (emit_pending_trader_alerts)
+        # re-alert it as a "new" unhandled order. Only orders that fill while
+        # copy is ON get a card.
+        if copy_paused:
+            audit.record(
+                db, actor_user_id=order.user_id, action=_ALERT_SENT_ACTION,
+                entity_type="order", entity_id=order.id,
+                metadata={"suppressed": "copy_paused", "symbol": order.symbol},
+            )
+            db.commit()
+            return
         # Classify + compute round-trip P&L (ENTERING / TRIMMING / CLOSING).
         # If the FIFO calc fails for any reason, fall back to the basic
         # enter/close card (Phase-1 behaviour) so a bad calc can never break the
@@ -414,8 +424,10 @@ def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30)
     ts = db.get(TraderSettings, user_id)
     if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
         return
-    if ts.copy_paused:  # copy trading off → no alerts (also enforced in _run)
-        return
+    # NOTE: we do NOT early-return when copy is paused. The sweep must still
+    # process paused-period fills so `_run` CLAIMS them (marks suppressed) — that
+    # marker is what prevents them from being re-alerted the moment copy is turned
+    # back on. `_run` makes the send-vs-suppress decision per order.
     since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     oids = db.execute(
         select(Order.id).where(
