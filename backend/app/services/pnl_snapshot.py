@@ -79,9 +79,6 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         daily = realized_by_day_from_broker(adapter, start, end)
         source_by_day = {d: "broker_activities" for d in daily}
         _fill_lagging_gap_days(db, acct, end, daily, source_by_day)
-        # Capture today's total unrealized so the Calendar can reconstruct
-        # MARKED daily P&L for this broker (no marked-history series of its own).
-        eod_today = _sum_positions_unrealized(adapter)
     elif hasattr(adapter, "marked_pnl_by_day"):
         # Alpaca: freeze MARKED P&L (realized + unrealized), the exact figure
         # Alpaca's own app shows — FORWARD-ONLY. We (re)write ONLY today's row;
@@ -146,11 +143,15 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         db.execute(stmt)
         written += 1
 
-    # Stamp today's END-OF-DAY unrealized onto today's row (created above if it
-    # had activity, inserted fresh otherwise). Past rows keep the value captured
-    # when they were "today" — only a real broker close (the loop above) touches
-    # their realized figure. This is the second half of the marked series the
-    # Calendar reconstructs.
+    # Capture today's total unrealized from OPEN POSITIONS — the unrealized half
+    # of the calendar's marked series (pnl.calendar_series). Broker-agnostic (any
+    # adapter that exposes positions, so Alpaca is covered too, not just
+    # SnapTrade) and TRADING-DAYS-ONLY, so weekends / non-sessions never freeze a
+    # carried-forward capture that would paint a stale weekend cell. Stamped onto
+    # today's row (created above if it had activity, inserted fresh otherwise);
+    # past rows keep the value captured when they were "today".
+    if market_hours.is_trading_weekday() and hasattr(adapter, "get_positions"):
+        eod_today = _sum_positions_unrealized(adapter)
     if eod_today is not None:
         _upsert_today_eod(db, acct, end, eod_today)
     return written
