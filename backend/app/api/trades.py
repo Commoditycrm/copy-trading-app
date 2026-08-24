@@ -29,12 +29,11 @@ from app.schemas.order import (
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
-from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters, visibility
+from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
-from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.services.pnl import (
-    realized_pnl_by_day, realized_pnl_by_order, reconstruct_marked_series,
+    calendar_series, realized_pnl_by_order,
 )
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -1862,88 +1861,6 @@ def update_bracket(
     return entry
 
 
-def _load_eod_map(
-    db: Session, user_id: uuid.UUID, start: date, end: date,
-) -> dict[date, Decimal]:
-    """Per-day end-of-day unrealized captures for [start, end] — the second
-    half of the SnapTrade/Webull marked reconstruction. Pass a start well before
-    the visible range so the first shown day can diff against a prior capture."""
-    rows = db.execute(
-        select(DailyRealizedPnlSnapshot.day, DailyRealizedPnlSnapshot.eod_unrealized).where(
-            DailyRealizedPnlSnapshot.user_id == user_id,
-            DailyRealizedPnlSnapshot.day >= start,
-            DailyRealizedPnlSnapshot.day <= end,
-            DailyRealizedPnlSnapshot.eod_unrealized.isnot(None),
-            visibility.snapshot_is_visible(),
-        )
-    ).all()
-    return {d: Decimal(v) for d, v in rows if v is not None}
-
-
-def _today_marked_cell(
-    marked_today: Decimal, realized_today: Decimal, trade_count: int,
-    pct: Decimal | None,
-) -> tuple[tuple[Decimal, int, Decimal | None], Decimal]:
-    """Build today's calendar cell from its LIVE marked P&L.
-
-    ``marked_today`` already includes realized + unrealized, so it REPLACES the
-    day's realized-only figure (it is NOT added on top). Returns the cell tuple
-    (marked, count, pct) and the unrealized component (marked − realized) that
-    the UI surfaces as the live open-position swing.
-    """
-    return (marked_today, trade_count, pct), marked_today - realized_today
-
-
-def _live_alpaca_marked_today(
-    db: Session, user_id: uuid.UUID, today_et: date,
-) -> tuple[Decimal, Decimal | None] | None:
-    """Today's LIVE marked P&L (realized + unrealized) for the user's connected
-    direct-Alpaca account(s) — the figure Alpaca's own app shows for today,
-    ticking with the market.
-
-    Source is ``get_pnl_snapshot()['todays_pl']`` (equity − day-start), NOT
-    portfolio-history: Alpaca's portfolio-history (1D) does NOT include the
-    CURRENT intraday day, so it always returns None for today (that was the bug
-    where today showed realized-only). ``todays_pl`` is the same live source the
-    pnl_poller enforces daily limits on.
-
-    Returns (marked_pnl, None) or None when the user has no connected Alpaca
-    account or every live fetch fails (today then stays realized-only). Sums
-    across multiple Alpaca accounts. A per-account failure is swallowed so a
-    broker hiccup can never blank the calendar.
-    """
-    accts = db.execute(
-        select(BrokerAccount).where(
-            BrokerAccount.user_id == user_id,
-            BrokerAccount.broker == BrokerName.ALPACA,
-            BrokerAccount.connection_status == "connected",
-        )
-    ).scalars().all()
-    if not accts:
-        return None
-    total = Decimal(0)
-    n_got = 0
-    for acct in accts:
-        try:
-            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-            snap = adapter.get_pnl_snapshot()
-        except Exception:  # noqa: BLE001
-            logging.getLogger(__name__).warning(
-                "calendar: live marked fetch failed for acct %s", acct.id,
-                exc_info=True,
-            )
-            continue
-        tp = snap.get("todays_pl") if snap else None
-        if tp is not None:
-            total += Decimal(str(tp))
-            n_got += 1
-    if n_got == 0:
-        return None
-    # pct (daily return %) isn't reliably available intraday without a day-start
-    # baseline, so leave it out — the calendar shows the dollar figure.
-    return (total, None)
-
-
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
 def calendar_pnl(
     db: Session = Depends(get_db),
@@ -1992,134 +1909,29 @@ def calendar_pnl(
     target = db.get(User, target_user_id)
     mirrors_only = target is not None and target.role == UserRole.SUBSCRIBER
 
-    # Base: the DB-derived realized P&L (spans every broker the user ever traded
-    # on, since all their orders live in our DB). This is the fallback for any
-    # day not yet frozen into a snapshot.
-    db_daily = realized_pnl_by_day(
-        db, target_user_id, start=from_, end=to, tz_name=tz, mirrors_only=mirrors_only
+    # Broker-agnostic, single model for EVERY broker: realized straight from
+    # order history (FIFO), unrealized from our own end-of-day position
+    # captures, combined as marked(D) = realized(D) + Δunrealized. No broker
+    # fetch, no per-broker branching, no snapshot overlay — see
+    # pnl.calendar_series. Non-trading days produce no cell.
+    series = calendar_series(
+        db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only
     )
-
-    # Overlay the frozen daily snapshots (pnl_snapshot job — computed off the
-    # broker's own complete feed, so they're correct where the DB drifts, and
-    # they persist across broker changes because they're keyed by (user, day)).
-    # Snapshot wins on any day it exists; the DB value covers the rest.
-    snaps = {
-        s.day: (s.realized_pnl, s.trade_count, s.pct, s.source)
-        for s in db.execute(
-            select(DailyRealizedPnlSnapshot).where(
-                DailyRealizedPnlSnapshot.user_id == target_user_id,
-                DailyRealizedPnlSnapshot.day >= from_,
-                DailyRealizedPnlSnapshot.day <= to,
-                visibility.snapshot_is_visible(),
-            )
-        ).scalars()
-    }
-    # Snapshots freeze SETTLED (past) days only — a snapshot wins there (Alpaca
-    # 'marked' rows carry a daily-return %; SnapTrade feed rows don't). The
-    # CURRENT day is handled below: for Alpaca it's overlaid LIVE (marked), and
-    # for other brokers it stays fresh from the DB. Overlaying today's hourly
-    # snapshot would show a stale intraday figure, so we never do.
-    today_et = market_hours.now_et().date()
-    lag_cutoff = today_et - timedelta(days=4)   # SnapTrade surfaces closes ~1-2d late
-    merged: dict[date, tuple] = {d: (p, n, None) for d, (p, n) in db_daily.items()}
-    for _d, _v in snaps.items():
-        _p, _n, _pct, _src = _v
-        if _d >= today_et:
-            continue                             # today+ handled live below
-        # A $0 broker-FEED snapshot on a RECENT day our DB shows NON-zero is
-        # SnapTrade/Webull feed LAG (closes surface a day or two late), so a day
-        # the subscriber actually traded got frozen as $0 — prefer the live DB
-        # value until the feed catches up. This applies ONLY to broker-feed
-        # (SnapTrade) rows; Alpaca 'marked' snapshots are real-time and
-        # authoritative, so they always win on settled days (a marked $0 there
-        # is a genuine flat/offsetting day, not lag).
-        if _src == "broker_activities" and _p == 0 and _d >= lag_cutoff:
-            _dbv = db_daily.get(_d)
-            if _dbv is not None and _dbv[0] != 0:
-                continue                         # keep live DB over a lagging $0
-        merged[_d] = (_p, _n, _pct)
-
-    # Which brokers is the target on? Drives the marked model per broker.
-    user_brokers = {
-        (b.value if hasattr(b, "value") else b)
-        for b in db.execute(
-            select(BrokerAccount.broker).where(
-                BrokerAccount.user_id == target_user_id,
-                BrokerAccount.connection_status == "connected",
-            )
-        ).scalars()
-    }
-
-    today_unreal: Decimal | None = None
-    if BrokerName.ALPACA.value in user_brokers:
-        # ── Alpaca: full marked model — locked-marked past days (above) + LIVE
-        # marked today (realized + unrealized), the exact figure Alpaca's app
-        # shows for today, ticking with the market. REPLACES today's realized-
-        # only value (marked already contains realized). ──
-        if from_ <= today_et <= to:
-            live = _live_alpaca_marked_today(db, target_user_id, today_et)
-            if live is not None:
-                marked_today, today_pct = live
-                realized_today = Decimal(db_daily.get(today_et, (Decimal(0), 0))[0])
-                trade_count = db_daily.get(today_et, (Decimal(0), 0))[1]
-                merged[today_et], today_unreal = _today_marked_cell(
-                    marked_today, realized_today, trade_count, today_pct,
-                )
-    elif BrokerName.SNAPTRADE.value in user_brokers:
-        # ── SnapTrade/Webull/E*TRADE: no marked-history series, so reconstruct
-        # MARKED from our own end-of-day unrealized captures —
-        #     marked(D) = realized(D) + (eod(D) − eod(prev capture)).
-        # Forward-only: days before we began capturing EOD unrealized stay
-        # realized-only. Today combines LIVE DB realized with the latest
-        # captured unrealized delta (refreshes hourly via the snapshot sweep). ──
-        eod_by_day = _load_eod_map(db, target_user_id, from_ - timedelta(days=21), to)
-        if eod_by_day:
-            day_set = sorted(
-                {d for d in merged if from_ <= d <= to}
-                | {d for d in eod_by_day if from_ <= d <= to}
-            )
-            realized_by_day: dict[date, Decimal] = {}
-            for d in day_set:
-                if d == today_et:
-                    realized_by_day[d] = Decimal(db_daily.get(d, (Decimal(0), 0))[0])
-                else:
-                    realized_by_day[d] = Decimal(merged.get(d, (Decimal(0), 0, None))[0])
-            marked = reconstruct_marked_series(day_set, realized_by_day, eod_by_day)
-            for d in day_set:
-                cnt = merged.get(d, (Decimal(0), 0, None))[1]
-                merged[d] = (marked[d], cnt, None)
-            # Flag today live only when it was genuinely reconstructed (its own
-            # capture plus an earlier one to diff against).
-            if (
-                from_ <= today_et <= to
-                and today_et in eod_by_day
-                and any(pd < today_et for pd in eod_by_day)
-            ):
-                today_unreal = marked[today_et] - realized_by_day.get(today_et, Decimal(0))
-
-        # Today's LIVE-ish marked from the poller (equity − day-start = realized +
-        # unrealized), refreshed ~every 60s. Overrides the eod-reconstruction for
-        # today: it needs no prior-day baseline, so today shows marked IMMEDIATELY
-        # (no forward-only wait) and ~60s fresh. Only present for subs the poller
-        # actually polls; otherwise today falls back to the reconstruction above.
-        if from_ <= today_et <= to:
-            from app.services import cache  # noqa: PLC0415
-            lm = cache.get_today_marked(target_user_id, today_et)
-            if lm is not None:
-                realized_today = Decimal(db_daily.get(today_et, (Decimal(0), 0))[0])
-                cnt = merged.get(today_et, (Decimal(0), 0, None))[1]
-                merged[today_et] = (lm, cnt, None)
-                today_unreal = lm - realized_today
-
-    out: list[DailyPnL] = []
-    for d, v in sorted(merged.items()):
-        is_live = d == today_et and today_unreal is not None
-        out.append(DailyPnL(
-            day=d, realized_pnl=v[0], trade_count=v[1], pct=v[2],
-            unrealized_pnl=today_unreal if is_live else None,
-            live=is_live,
-        ))
-    return out
+    return [
+        DailyPnL(
+            day=c.day,
+            # `realized_pnl` on the wire carries the SHOWN number (realized +
+            # Δunrealized) — the field name predates the marked model; the UI
+            # renders it as the day's P&L. `unrealized_pnl` splits out today's
+            # live open-position swing.
+            realized_pnl=c.marked_pnl,
+            trade_count=c.trade_count,
+            pct=None,
+            unrealized_pnl=c.unrealized_pnl,
+            live=c.live,
+        )
+        for c in sorted(series.values(), key=lambda c: c.day)
+    ]
 
 
 @router.post("/trades/sync-fills")
