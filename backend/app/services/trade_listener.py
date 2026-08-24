@@ -34,7 +34,7 @@ import logging
 import ssl
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -1030,6 +1030,14 @@ def _cascade_cancel_to_mirrors(parent_order_id: uuid.UUID) -> None:
 
 # ── Backfill ────────────────────────────────────────────────────────────────
 
+# The backfill exists to catch up trades MISSED during a brief listener
+# disconnect — not to re-broadcast trades from an earlier session. Any unfanned
+# order whose trade time is older than this is treated as history: marked
+# resolved WITHOUT mirroring. This is the guard that stops a deploy/restart from
+# resurrecting a stale, already-decided trade (e.g. one the trader placed while
+# copy was PAUSED yesterday) and fanning it out day-late.
+_BACKFILL_MAX_AGE = timedelta(minutes=15)
+
 
 def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     """Sync — runs in a thread. Pulls Alpaca activities for this trader's
@@ -1085,9 +1093,21 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
             return
 
         acct = db.get(BrokerAccount, broker_account_id)
+        now = datetime.now(timezone.utc)
         fanned = 0
         skipped_historical = 0
+        skipped_stale = 0
         for o in unfanned:
+            # Staleness guard — never re-fan a trade older than the catch-up
+            # window. It's history (e.g. placed while copy was paused, or from a
+            # prior session): mark resolved WITHOUT mirroring so a restart can't
+            # place day-late mirrors. Live trades fan out within seconds, so this
+            # only ever affects the backfill path.
+            when = o.trader_submitted_at or o.submitted_at or o.created_at
+            if when is not None and (now - when) > _BACKFILL_MAX_AGE:
+                o.fanned_out_to_subscribers = True
+                skipped_stale += 1
+                continue
             # Replay guard — orders placed before we started watching this
             # broker are history; mark them resolved without mirroring.
             if copy_engine.order_predates_connection(acct, o.trader_submitted_at or o.submitted_at):
@@ -1105,10 +1125,11 @@ def _run_backfill(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> No
                 log.exception(
                     "listener backfill fanout failed for order %s", o.id
                 )
-        if skipped_historical:
+        if skipped_historical or skipped_stale:
             log.info(
-                "listener[%s] backfill skipped %d historical orders (pre-connection)",
-                trader_user_id, skipped_historical,
+                "listener[%s] backfill skipped %d historical (pre-connection) + "
+                "%d stale (older than %s) orders",
+                trader_user_id, skipped_historical, skipped_stale, _BACKFILL_MAX_AGE,
             )
         try:
             db.commit()

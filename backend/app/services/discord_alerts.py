@@ -27,6 +27,7 @@ from the same "a trader order just filled" signal that drives
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import uuid
@@ -35,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.database import SessionLocal
 from app.models.audit_log import AuditLog
@@ -54,6 +55,17 @@ _COLOR_CLOSE = 0xEF4444
 # Audit action used as the once-per-order dedup marker.
 _ALERT_SENT_ACTION = "trader.discord_alert_sent"
 _FOOTER = "Broker-verified · Not financial advice · Kopyya"
+
+
+def _alert_lock_key(order_id: uuid.UUID) -> int:
+    """Stable signed 64-bit key for ``pg_advisory_xact_lock``, derived from the
+    order id. Every detection path that races to alert the SAME order (listener
+    + copy_engine fanout + fills_sync poll — possibly in different processes)
+    hashes to one key and serializes on the lock, so only the first writes the
+    dedup marker. blake2b (not Python's salted ``hash()``) so the value is
+    identical across processes."""
+    digest = hashlib.blake2b(f"discord_alert:{order_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
 
 
 def _fmt_money(v: Decimal | float | None) -> str:
@@ -322,7 +334,7 @@ def send_webhook(webhook_url: str, payload: dict) -> bool:
 
 
 def _run(trader_order_id: uuid.UUID) -> None:
-    """Load, gate, dedup, format, send — all on the worker thread."""
+    """Load, gate, claim, format, send — all on the worker thread."""
     with SessionLocal() as db:
         order = db.get(Order, trader_order_id)
         if order is None or order.parent_order_id is not None:
@@ -332,7 +344,25 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ts = db.get(TraderSettings, order.user_id)
         if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
             return
-        # Dedup: skip if we already alerted this order (poll+stream / re-process).
+        # Copy trading OFF → no alert. When the trader has paused copy
+        # (copy_paused — the same switch the fanout gates on), their fills are
+        # NOT mirrored to subscribers, so broadcasting an ENTERING/CLOSING card
+        # would tell subscribers to follow a trade the system isn't copying.
+        if ts.copy_paused:
+            return
+        webhook_url = ts.discord_webhook_url
+
+        # Atomically CLAIM this order's alert. Several paths detect the same
+        # fill almost simultaneously (SnapTrade/Webull listener + copy_engine
+        # fanout + fills_sync poll), each on its own daemon thread — and the
+        # bare "SELECT marker? then send then write marker" is a check-then-act
+        # race: two threads both see no marker, both send → duplicate card
+        # (the bug we saw on the Friday TSLA order). Serialize on a per-order
+        # advisory lock, re-check the marker inside it, then write the marker
+        # and COMMIT *before* the HTTP send. The commit releases the lock, so
+        # the loser wakes, sees the marker, and bails — and we never hold a DB
+        # connection across the webhook call.
+        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _alert_lock_key(order.id)})
         already = db.execute(
             select(AuditLog.id).where(
                 AuditLog.action == _ALERT_SENT_ACTION,
@@ -340,7 +370,7 @@ def _run(trader_order_id: uuid.UUID) -> None:
             ).limit(1)
         ).first()
         if already is not None:
-            return
+            return  # another path already claimed/sent this order's card
         # Classify + compute round-trip P&L (ENTERING / TRIMMING / CLOSING).
         # If the FIFO calc fails for any reason, fall back to the basic
         # enter/close card (Phase-1 behaviour) so a bad calc can never break the
@@ -351,16 +381,24 @@ def _run(trader_order_id: uuid.UUID) -> None:
             log.warning("discord: round-trip calc failed for %s; basic card", order.id, exc_info=True)
             summary = {"kind": "close" if _is_closing(db, order) else "enter"}
         payload = build_card(order, summary)
-        ok = send_webhook(ts.discord_webhook_url, payload)
-        # Record the marker even on a failed send so a broken webhook can't cause
-        # a retry storm across re-detections; a one-off miss is acceptable for a
-        # best-effort feed.
+        # Write the dedup marker as the CLAIM (before sending) and commit to
+        # release the advisory lock. A broken/slow webhook can then never cause
+        # a duplicate; the trade-off is that a crash in the tiny window between
+        # this commit and the send below drops one card — acceptable for a
+        # best-effort feed (the same window a failed send already couldn't retry).
         audit.record(
             db, actor_user_id=order.user_id, action=_ALERT_SENT_ACTION,
             entity_type="order", entity_id=order.id,
-            metadata={"sent": ok, "kind": summary.get("kind"), "symbol": order.symbol},
+            metadata={"kind": summary.get("kind"), "symbol": order.symbol},
         )
         db.commit()
+
+    # Send OUTSIDE the lock/transaction — best-effort.
+    if not send_webhook(webhook_url, payload):
+        log.warning(
+            "discord: webhook send failed for order=%s (marker already recorded, won't retry)",
+            trader_order_id,
+        )
 
 
 def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30) -> None:
@@ -375,6 +413,8 @@ def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30)
     spawned emit thread — which opens its own session — sees the FILLED rows."""
     ts = db.get(TraderSettings, user_id)
     if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
+        return
+    if ts.copy_paused:  # copy trading off → no alerts (also enforced in _run)
         return
     since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     oids = db.execute(
