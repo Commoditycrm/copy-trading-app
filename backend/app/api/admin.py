@@ -41,7 +41,7 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
-from app.services import audit, excel_export, market_hours
+from app.services import audit, excel_export, market_hours, visibility
 from app.services.pnl import realized_pnl_by_day
 from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
@@ -379,7 +379,7 @@ def admin_daily_pnl(
     snap_q = (
         select(s.user_id, s.day, s.realized_pnl, User.role)
         .join(User, User.id == s.user_id)
-        .where(s.hidden.is_(False))
+        .where(visibility.snapshot_is_visible())
     )
     if from_:
         snap_q = snap_q.where(s.day >= from_)
@@ -589,9 +589,9 @@ def hide_user_orders(
     now = datetime.now(timezone.utc)
     day_expr = _order_day_expr()
 
-    order_conds = [Order.user_id == user_id, Order.hidden_at.is_(None)]
+    order_conds = [Order.user_id == user_id, visibility.order_is_visible()]
     snap_conds = [DailyRealizedPnlSnapshot.user_id == user_id,
-                  DailyRealizedPnlSnapshot.hidden.is_(False)]
+                  visibility.snapshot_is_visible()]
     if from_ is not None:
         order_conds.append(day_expr >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
         snap_conds.append(DailyRealizedPnlSnapshot.day >= from_)
@@ -917,7 +917,7 @@ def _fanout_window_query(trader_id, from_, to):
     q = select(Order).where(
         Order.parent_order_id.is_(None),
         Order.fanned_out_to_subscribers.is_(True),
-        Order.hidden_at.is_(None),
+        visibility.order_is_visible(),
         realtime_fanout_clause(),
     )
     if trader_id is not None:

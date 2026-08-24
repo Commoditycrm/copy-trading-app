@@ -29,7 +29,7 @@ from app.schemas.order import (
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
-from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters
+from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters, visibility
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
@@ -1874,7 +1874,7 @@ def _load_eod_map(
             DailyRealizedPnlSnapshot.day >= start,
             DailyRealizedPnlSnapshot.day <= end,
             DailyRealizedPnlSnapshot.eod_unrealized.isnot(None),
-            DailyRealizedPnlSnapshot.hidden.is_(False),
+            visibility.snapshot_is_visible(),
         )
     ).all()
     return {d: Decimal(v) for d, v in rows if v is not None}
@@ -2010,7 +2010,7 @@ def calendar_pnl(
                 DailyRealizedPnlSnapshot.user_id == target_user_id,
                 DailyRealizedPnlSnapshot.day >= from_,
                 DailyRealizedPnlSnapshot.day <= to,
-                DailyRealizedPnlSnapshot.hidden.is_(False),
+                visibility.snapshot_is_visible(),
             )
         ).scalars()
     }

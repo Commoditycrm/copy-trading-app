@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.order import Fill, InstrumentType, Order, OrderSide
+from app.services import visibility
 
 try:
     _MARKET_TZ = ZoneInfo("America/New_York")
@@ -135,7 +136,7 @@ def today_buy_notional(
             Order.side == OrderSide.BUY,
             Order.filled_quantity > 0,
             Order.filled_avg_price.isnot(None),
-            Order.hidden_at.is_(None),
+            visibility.order_is_visible(),
         )
     ).scalars())
     if not orders:
@@ -210,7 +211,7 @@ def today_realized_pnl_bulk(
             Order.user_id.in_(user_ids),
             Order.filled_quantity > 0,
             Order.filled_avg_price.isnot(None),
-            Order.hidden_at.is_(None),
+            visibility.order_is_visible(),
         )
     ).scalars())
 
@@ -367,7 +368,7 @@ def realized_pnl_by_day(
         Order.user_id == user_id,
         Order.filled_quantity > 0,
         Order.filled_avg_price.isnot(None),
-        Order.hidden_at.is_(None),
+        visibility.order_is_visible(),
     ]
     orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
 
@@ -473,7 +474,7 @@ def realized_pnl_by_order(
         Order.user_id == user_id,
         Order.filled_quantity > 0,
         Order.filled_avg_price.isnot(None),
-        Order.hidden_at.is_(None),
+        visibility.order_is_visible(),
     ]
     orders_all: list[Order] = list(db.execute(select(Order).where(*conds)).scalars())
     orders = dedupe_subscriber_orders(orders_all) if mirrors_only else orders_all
