@@ -1864,8 +1864,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # listeners), so it catches the case the per-listener fill-transition hooks
     # miss: an order that was already FILLED before we ever tracked it (e.g. a
     # Trade-Panel market order that filled at placement — no working→filled
-    # transition ever fires). Deduped + gated inside; fires even when copy is
-    # paused (the trader still traded). Delayed limit fills are covered by the
+    # transition ever fires). Deduped + gated inside — including a copy_paused
+    # gate, so no card is broadcast while the trader's copy trading is OFF (the
+    # trades aren't being mirrored). Delayed limit fills are covered by the
     # listeners' transition hooks.
     if trader_order.status == OrderStatus.FILLED:
         try:
