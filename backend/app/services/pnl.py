@@ -14,13 +14,14 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.order import Fill, InstrumentType, Order, OrderSide
 from app.services import visibility
 
@@ -532,3 +533,125 @@ def realized_pnl_by_order(
                 open_lots[key].append(_Lot(qty=-qty, price=price))
 
     return {oid: p for oid, p in by_order.items() if p != 0}
+
+
+# ── Broker-agnostic calendar P&L (realized from order history + unrealized from
+#    our own position captures) ──────────────────────────────────────────────
+# One model for EVERY broker. Realized comes straight from our order history
+# (realized_pnl_by_day — FIFO over fills), never from a broker feed/snapshot.
+# Unrealized comes from the end-of-day position captures we already record
+# (DailyRealizedPnlSnapshot.eod_unrealized). The two combine as the same
+# telescoping marked series the calendar used before:
+#     marked(D) = realized(D) + (eod(D) − eod(prev capture))
+# Summed over a position's life the Δunrealized terms cancel, so the marked
+# total equals the realized total — no double-count. This replaces the old
+# per-broker branching, the broker-activity realized snapshot, and the Alpaca
+# portfolio-history path.
+
+# Lookback beyond the visible range so the first shown day can diff its EOD
+# unrealized against an earlier capture (markets skip weekends/holidays, so we
+# diff against the last capture, not the literal prior day).
+_EOD_LOOKBACK_DAYS = 21
+
+
+@dataclass
+class CalendarDay:
+    """One calendar cell. ``marked_pnl`` is the number shown (realized +
+    Δunrealized). ``realized_pnl`` is the realized-only component. For TODAY,
+    ``unrealized_pnl`` surfaces the open-position swing (marked − realized) and
+    ``live`` is True; both are None/False on settled days."""
+
+    day: date
+    marked_pnl: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal | None
+    trade_count: int
+    live: bool
+
+
+def load_eod_unrealized(
+    db: Session, user_id: uuid.UUID, start: date, end: date,
+) -> dict[date, Decimal]:
+    """Per-day end-of-day unrealized captures for [start, end] — the unrealized
+    half of the marked reconstruction. Honors the soft-delete visibility filter.
+    Pass a start well before the visible range so the first shown day can diff
+    against a prior capture."""
+    rows = db.execute(
+        select(
+            DailyRealizedPnlSnapshot.day,
+            DailyRealizedPnlSnapshot.eod_unrealized,
+        ).where(
+            DailyRealizedPnlSnapshot.user_id == user_id,
+            DailyRealizedPnlSnapshot.day >= start,
+            DailyRealizedPnlSnapshot.day <= end,
+            DailyRealizedPnlSnapshot.eod_unrealized.isnot(None),
+            visibility.snapshot_is_visible(),
+        )
+    ).all()
+    return {d: Decimal(v) for d, v in rows if v is not None}
+
+
+def calendar_series(
+    db: Session,
+    user_id: uuid.UUID,
+    from_: date,
+    to: date,
+    tz_name: str | None = None,
+    mirrors_only: bool = False,
+) -> dict[date, CalendarDay]:
+    """Clean, broker-agnostic daily P&L for the calendar.
+
+    Realized straight from order history (FIFO), unrealized straight from our
+    end-of-day position captures, combined as
+    ``marked(D) = realized(D) + (eod(D) − eod(prev capture))``. Pure DB — no
+    broker calls, no per-broker branching, no snapshot overlay. Today uses the
+    same model with its latest capture and is flagged ``live``. Days with
+    NEITHER realized activity NOR an eod capture are omitted, so non-trading
+    days (weekends/holidays) never produce a cell."""
+    realized = realized_pnl_by_day(
+        db, user_id, start=from_, end=to, tz_name=tz_name, mirrors_only=mirrors_only
+    )
+    realized_by_day = {d: Decimal(p) for d, (p, _c) in realized.items()}
+    counts = {d: c for d, (_p, c) in realized.items()}
+
+    eod = load_eod_unrealized(
+        db, user_id, from_ - timedelta(days=_EOD_LOOKBACK_DAYS), to
+    )
+
+    tz = _tz_or_market(tz_name)
+    today = datetime.now(tz).date()
+
+    # Weekends never hold a US options/equities session — drop them so a stale
+    # carried EOD capture (or a mis-bucketed fill) can't paint a weekend cell.
+    # Holidays aren't excluded (no calendar here), but they'll just show $0.
+    days = sorted(
+        d for d in (
+            {d for d in realized_by_day if from_ <= d <= to}
+            | {d for d in eod if from_ <= d <= to}
+        )
+        if d.weekday() < 5
+    )
+    marked = reconstruct_marked_series(days, realized_by_day, eod)
+
+    out: dict[date, CalendarDay] = {}
+    for d in days:
+        r = realized_by_day.get(d, Decimal(0))
+        m = marked[d]
+        # Surface the open-position swing (and flag live) only for TODAY, and
+        # only when it was genuinely reconstructed — today has its own eod
+        # capture AND an earlier one to diff against — otherwise m == r and
+        # there's nothing live to show (forward-only property).
+        is_live = (
+            d == today
+            and d in eod
+            and any(pd < d for pd in eod)
+        )
+        out[d] = CalendarDay(
+            day=d,
+            marked_pnl=m,
+            realized_pnl=r,
+            unrealized_pnl=(m - r) if is_live else None,
+            trade_count=counts.get(d, 0),
+            live=is_live,
+        )
+    return out
