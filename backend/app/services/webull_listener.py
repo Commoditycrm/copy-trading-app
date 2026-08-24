@@ -201,6 +201,25 @@ def _build_stoppable_client(creds: dict[str, Any]):
                 except Exception:  # noqa: BLE001
                     pass
 
+        def _build_request(self, app_key, app_secret, accounts):  # noqa: D401 — override
+            # Webull Support (ticket, 2026-08): the ONLY supported subscribeType
+            # is 1. The bundled SDK hardcodes 7 (with a now-stale "1 2 4 allowed"
+            # comment); the gRPC endpoint rejects that, so NO trade events ever
+            # arrive. Rebuild the request with subscribeType=1 — everything else
+            # mirrors the SDK's _build_request (sign → metadata), minus its debug
+            # prints. Ref: developer.webull.com/apis/docs/reference/custom/subscribe-trade-events
+            import time as _time  # noqa: PLC0415
+            import webull.trade.events.events_pb2 as _pb  # noqa: PLC0415
+            from webull.core.auth.algorithm import sha_hmac256_new  # noqa: PLC0415
+            from webull.trade.events.signature_composer import calc_signature  # noqa: PLC0415
+            request = _pb.SubscribeRequest(
+                subscribeType=1,
+                timestamp=int(_time.time() * 1000),  # millis
+                accounts=accounts,
+            )
+            _sig, metadata = calc_signature(app_key, app_secret, request, sha_hmac256_new)
+            return request, metadata
+
         def do_subscribe(self, accounts):  # noqa: D401 — override
             target = f"{self._host}:{self._port}"
             if self._tls_enable:
