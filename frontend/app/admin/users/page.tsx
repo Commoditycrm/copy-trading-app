@@ -514,7 +514,6 @@ function HideHistoryModal({
   onClose: () => void;
   onDone: () => void;
 }) {
-  const [mode, setMode] = useState<"before_today" | "range">("before_today");
   const [from, setFrom] = useState("");
   const [to, setTo]     = useState("");
   const [busy, setBusy] = useState(false);
@@ -528,13 +527,14 @@ function HideHistoryModal({
   useEffect(() => { refreshCounts(); }, [refreshCounts]);
 
   async function hide() {
-    // range mode requires a lower bound; the upper is exclusive (empty = today).
-    const body: Record<string, string> = {};
-    if (mode === "range") {
-      if (!from) { notify.error("Pick a start date"); return; }
-      body.from = from;
-      if (to) body.to = to;
-    }
+    // End date required; start optional (empty = from the beginning). The API's
+    // `to` is exclusive, so send the day AFTER the picked end date to make the
+    // selected end day inclusive ("hide up to and including this date").
+    if (!to) { notify.error("Pick an end date"); return; }
+    const end = new Date(`${to}T00:00:00Z`);
+    end.setUTCDate(end.getUTCDate() + 1);
+    const body: Record<string, string> = { to: end.toISOString().slice(0, 10) };
+    if (from) body.from = from;
     setBusy(true);
     try {
       const res = await api<{ orders_hidden: number; snapshots_hidden: number }>(
@@ -597,35 +597,32 @@ function HideHistoryModal({
           </div>
         )}
 
-        <div className="space-y-2 text-sm">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input type="radio" checked={mode === "before_today"} onChange={() => setMode("before_today")} />
-            Everything before today
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input type="radio" checked={mode === "range"} onChange={() => setMode("range")} />
-            Date range
-          </label>
-          {mode === "range" && (
-            <div className="flex items-center gap-2 pl-6">
+        <div className="space-y-3 text-sm">
+          <div className="flex items-end gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: "var(--muted)" }}>Start date (optional)</span>
               <input
-                type="date" value={from} aria-label="From date"
+                type="date" value={from} aria-label="Start date (optional; empty = from the beginning)"
                 onChange={e => setFrom(e.target.value)}
                 className="text-xs px-2 py-1 rounded-lg"
                 style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", color: "var(--text)" }}
               />
-              <span style={{ color: "var(--muted)" }}>→</span>
+            </label>
+            <span className="pb-1.5" style={{ color: "var(--muted)" }}>→</span>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs" style={{ color: "var(--muted)" }}>End date</span>
               <input
-                type="date" value={to} aria-label="To date (exclusive; empty = today)"
+                type="date" value={to} aria-label="End date (inclusive)"
                 onChange={e => setTo(e.target.value)}
                 className="text-xs px-2 py-1 rounded-lg"
                 style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", color: "var(--text)" }}
               />
-            </div>
-          )}
-          <p className="text-xs pl-6" style={{ color: "var(--muted)" }}>
-            The end date is exclusive; leave it empty to hide up to today. Hidden rows
-            survive a broker re-sync and stay hidden until you Unhide.
+            </label>
+          </div>
+          <p className="text-xs" style={{ color: "var(--muted)" }}>
+            Hides everything up to and including the end date. Leave the start empty
+            to hide from the beginning. Hidden rows survive a broker re-sync and stay
+            hidden until you Unhide.
           </p>
         </div>
 
