@@ -56,11 +56,11 @@ def apply_symbol_search(q: Select, search: str | None) -> Select:
 
 
 def exclude_hidden(q: Select) -> Select:
-    """Drop admin-soft-deleted orders. hidden_at is set by the admin
-    Hide-order-history action; the row survives so the broker re-sync's
-    dedup finds it and won't recreate it, but it's gone from every user- and
-    admin-facing list. See api/admin.hide_user_orders."""
-    return q.where(Order.hidden_at.is_(None))
+    """Drop admin-soft-deleted orders. Delegates to the single source of truth
+    in services.visibility so every read path shares one predicate. See
+    api/admin.hide_user_orders."""
+    from app.services import visibility  # noqa: PLC0415  (avoid import cycle)
+    return visibility.visible_orders(q)
 
 
 def exclude_dead_bracket_legs(q: Select) -> Select:

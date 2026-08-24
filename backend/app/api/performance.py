@@ -34,6 +34,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
 from app.models.user import User
+from app.services import visibility
 from app.services.broker_names import heal_snaptrade_brokerage_names
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
@@ -258,7 +259,7 @@ def list_fanouts(
                 Order.user_id == trader.id,
                 Order.parent_order_id.is_(None),
                 Order.fanned_out_to_subscribers.is_(True),
-                Order.hidden_at.is_(None),
+                visibility.order_is_visible(),
                 realtime_fanout_clause(),
             )
             .order_by(Order.created_at.desc())
