@@ -30,6 +30,7 @@ from alpaca.trading.requests import (
     StopLossRequest,
     StopOrderRequest,
     TakeProfitRequest,
+    TrailingStopOrderRequest,
 )
 
 from app.brokers.base import (
@@ -222,6 +223,16 @@ class AlpacaAdapter(BrokerAdapter):
             raise ValueError(f"{req.order_type.value} order for {req.symbol} is missing a limit price")
         if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is None:
             raise ValueError(f"{req.order_type.value} order for {req.symbol} is missing a stop price")
+        if req.order_type == OrderType.TRAILING_STOP:
+            # Alpaca offers trailing stops on EQUITIES only — the options API
+            # rejects them. Guard here so the close flow's capability check
+            # (which also screens by instrument) is backed up at the boundary.
+            if req.instrument_type == InstrumentType.OPTION:
+                raise ValueError("Alpaca does not support trailing stop on options")
+            if (req.trail_percent is None) == (req.trail_price is None):
+                raise ValueError(
+                    f"trailing stop for {req.symbol} needs exactly one of trail_percent / trail_price"
+                )
 
         if req.order_type == OrderType.MARKET:
             order_req = MarketOrderRequest(**common)
@@ -235,6 +246,12 @@ class AlpacaAdapter(BrokerAdapter):
                 limit_price=float(req.limit_price),
                 stop_price=float(req.stop_price),
             )
+        elif req.order_type == OrderType.TRAILING_STOP:
+            trail_kw = (
+                {"trail_percent": float(req.trail_percent)} if req.trail_percent is not None
+                else {"trail_price": float(req.trail_price)}
+            )
+            order_req = TrailingStopOrderRequest(**common, **trail_kw)
         else:
             raise ValueError(f"unsupported order_type {req.order_type}")
 
@@ -290,6 +307,11 @@ class AlpacaAdapter(BrokerAdapter):
     # avoiding the share-reservation release race that lost subscriber sells on a
     # rapid re-price (STKH, 2026-07-28). See base.replace_order.
     supports_replace = True
+
+    # Alpaca natively supports trailing-stop orders on equities (the options API
+    # rejects them — place_order guards that). The Sell-All close flow uses this
+    # to place a trailing stop on stock positions where possible.
+    supports_trailing_stop = True
 
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Atomic price/qty change in place. Alpaca returns a NEW order id for the
