@@ -243,3 +243,60 @@ def test_is_closing_ignores_other_contracts():
     sell = _opt(OrderSide.SELL, "0.87", at=_T0 + timedelta(minutes=5), uid=uid)
     db.add_all([other, sell]); db.flush()
     assert da._is_closing(db, sell) is False        # no matching long → entering
+
+
+# ── copy-paused-at-trade-time (the lag-edge suppression) ────────────────────
+
+def _audit_session() -> Session:
+    """In-memory DB with just the audit_logs table (for _copy_paused_at).
+
+    Built with raw DDL (TEXT columns) because the model's JSONB column can't be
+    rendered by the SQLite compiler. Insert/query still go through the ORM so
+    UUID/datetime binding stays consistent between write and read."""
+    eng = create_engine("sqlite:///:memory:")
+    with eng.begin() as c:
+        c.exec_driver_sql(
+            "CREATE TABLE audit_logs ("
+            "id TEXT PRIMARY KEY, actor_user_id TEXT, action TEXT, "
+            "entity_type TEXT, entity_id TEXT, metadata_json TEXT, "
+            "ip_address TEXT, created_at TEXT)"
+        )
+    return Session(eng)
+
+
+def _toggle(db, trader, action, hh, mm, ss):
+    from app.models.audit_log import AuditLog
+    db.add(AuditLog(
+        id=uuid.uuid4(), actor_user_id=trader, action=action,
+        created_at=datetime(2026, 8, 24, hh, mm, ss, tzinfo=timezone.utc),
+    ))
+
+
+def _at(hh, mm, ss):
+    return datetime(2026, 8, 24, hh, mm, ss, tzinfo=timezone.utc)
+
+
+def test_copy_paused_at_reconstructs_state_by_trade_time():
+    """Alert suppression keys off the copy state AT THE TRADE TIME, not detection
+    time. Prod 2026-08-24: SNDK filled 14:52:04 during a pause, surfaced 14:52:19
+    after resume, and wrongly alerted. Pause 14:51:00, resume 14:52:14."""
+    db = _audit_session()
+    trader = uuid.uuid4()
+    _toggle(db, trader, "trader.copy_paused", 14, 51, 0)
+    _toggle(db, trader, "trader.copy_resumed", 14, 52, 14)
+    db.commit()
+
+    # Copy ON (before any toggle) → not suppressed → ALERTS.
+    assert da._copy_paused_at(db, trader, _at(14, 50, 0)) is False
+    # Copy OFF: a fill during the pause → suppressed, even if detected later.
+    assert da._copy_paused_at(db, trader, _at(14, 52, 4)) is True
+    # Copy back ON: a trade whose time is AFTER resume → alerts normally.
+    assert da._copy_paused_at(db, trader, _at(14, 52, 20)) is False
+    # Unknown trade time → don't over-suppress.
+    assert da._copy_paused_at(db, trader, None) is False
+
+
+def test_copy_paused_at_no_toggles_means_on():
+    """A trader who never paused → copy on by default → never suppressed."""
+    db = _audit_session()
+    assert da._copy_paused_at(db, uuid.uuid4(), _at(15, 0, 0)) is False
