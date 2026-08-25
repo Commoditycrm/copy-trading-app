@@ -29,7 +29,7 @@ from app.schemas.order import (
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
-from app.services import audit, copy_engine, events, excel_export, fills_sync, trade_filters
+from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import (
@@ -1861,6 +1861,44 @@ def update_bracket(
     return entry
 
 
+def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
+    """Summed CURRENT open-position unrealized P&L across the user's connected
+    accounts, fetched LIVE — the only broker call the calendar makes, done once
+    per page load. This is the ``live_today_unrealized`` the calendar resets
+    today's swing against the prior close with.
+
+    Returns None when the user has no connected account or every fetch fails —
+    today then falls back to its latest EOD capture. A per-account failure is
+    swallowed so one broker hiccup can't blank the calendar. Broker-agnostic:
+    any adapter whose positions carry ``unrealized_pnl`` (Alpaca open_pnl,
+    SnapTrade open_pnl, options included)."""
+    accts = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user_id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().all()
+    if not accts:
+        return None
+    total = Decimal(0)
+    n_got = 0
+    for acct in accts:
+        try:
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+            positions = adapter.get_positions()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "calendar: live positions fetch failed for acct %s", acct.id, exc_info=True,
+            )
+            continue
+        for p in positions:
+            u = getattr(p, "unrealized_pnl", None)
+            if u is not None:
+                total += Decimal(str(u))
+        n_got += 1
+    return total if n_got else None
+
+
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
 def calendar_pnl(
     db: Session = Depends(get_db),
@@ -1909,13 +1947,17 @@ def calendar_pnl(
     target = db.get(User, target_user_id)
     mirrors_only = target is not None and target.role == UserRole.SUBSCRIBER
 
-    # Broker-agnostic, single model for EVERY broker: realized straight from
-    # order history (FIFO), unrealized from our own end-of-day position
-    # captures, combined as marked(D) = realized(D) + Δunrealized. No broker
-    # fetch, no per-broker branching, no snapshot overlay — see
-    # pnl.calendar_series. Non-trading days produce no cell.
+    # Daily P&L, broker-agnostic: realized from order history (FIFO) + that
+    # day's unrealized SWING (reset from the prior close, not from entry). Past
+    # days come from our EOD captures; TODAY reflects the CURRENT price — we
+    # fetch the live open-position unrealized here (once, on page load) and the
+    # series resets it against yesterday's close. See pnl.calendar_series.
+    live_unreal_today: Decimal | None = None
+    if from_ <= market_hours.now_et().date() <= to:
+        live_unreal_today = _live_unrealized_today(db, target_user_id)
     series = calendar_series(
-        db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only
+        db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
+        live_today_unrealized=live_unreal_today,
     )
     return [
         DailyPnL(
