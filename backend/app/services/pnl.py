@@ -591,6 +591,27 @@ def load_eod_unrealized(
     return {d: Decimal(v) for d, v in rows if v is not None}
 
 
+def today_live_cell(
+    realized_today: Decimal,
+    live_unrealized: Decimal,
+    prior_close_eod: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """TODAY's cell under the overnight-reset rule.
+
+    Today's unrealized is measured from the PRIOR CLOSE — yesterday's captured
+    end-of-day unrealized (``prior_close_eod``) — NOT from the position's entry.
+    So a position carried overnight starts today's swing at zero; only the move
+    that happened TODAY counts. A position OPENED today diffs against the prior
+    (flat) capture ≈ 0, so it shows its full entry→now move.
+
+        day_unrealized = live_unrealized − prior_close_eod
+        marked         = realized_today + day_unrealized
+
+    Returns ``(marked, day_unrealized)``."""
+    day_unrealized = Decimal(live_unrealized) - Decimal(prior_close_eod)
+    return Decimal(realized_today) + day_unrealized, day_unrealized
+
+
 def calendar_series(
     db: Session,
     user_id: uuid.UUID,
@@ -598,16 +619,26 @@ def calendar_series(
     to: date,
     tz_name: str | None = None,
     mirrors_only: bool = False,
+    live_today_unrealized: Decimal | None = None,
 ) -> dict[date, CalendarDay]:
-    """Clean, broker-agnostic daily P&L for the calendar.
+    """Daily P&L for the calendar, broker-agnostic.
 
-    Realized straight from order history (FIFO), unrealized straight from our
-    end-of-day position captures, combined as
-    ``marked(D) = realized(D) + (eod(D) − eod(prev capture))``. Pure DB — no
-    broker calls, no per-broker branching, no snapshot overlay. Today uses the
-    same model with its latest capture and is flagged ``live``. Days with
-    NEITHER realized activity NOR an eod capture are omitted, so non-trading
-    days (weekends/holidays) never produce a cell."""
+    Each cell answers "how much did I make/lose THAT day": realized (FIFO over
+    order history) + that day's UNREALIZED SWING — the change in open-position
+    mark since the prior close, NOT the cumulative move from entry. So a position
+    carried overnight locks yesterday's swing into yesterday and starts today's
+    from zero.
+
+    * Past days use our end-of-day unrealized captures via
+      ``reconstruct_marked_series``: ``marked(D) = realized(D) + (eod(D) − eod(prev))``.
+    * TODAY, when the caller passes ``live_today_unrealized`` (the current summed
+      open-position unrealized, fetched at page-load), shows
+      ``realized(today) + (live − prior close)`` so the in-progress day reflects
+      the CURRENT price, reset from yesterday. If it's not supplied (broker
+      unavailable), today falls back to its latest EOD capture.
+
+    Pure DB except for the single live figure the caller passes in. Weekends
+    never produce a cell."""
     realized = realized_pnl_by_day(
         db, user_id, start=from_, end=to, tz_name=tz_name, mirrors_only=mirrors_only
     )
@@ -621,37 +652,44 @@ def calendar_series(
     tz = _tz_or_market(tz_name)
     today = datetime.now(tz).date()
 
-    # Weekends never hold a US options/equities session — drop them so a stale
-    # carried EOD capture (or a mis-bucketed fill) can't paint a weekend cell.
-    # Holidays aren't excluded (no calendar here), but they'll just show $0.
-    days = sorted(
-        d for d in (
-            {d for d in realized_by_day if from_ <= d <= to}
-            | {d for d in eod if from_ <= d <= to}
-        )
-        if d.weekday() < 5
+    # Prior-close baseline for today: most recent captured EOD strictly before
+    # today (markets skip weekends, so it's the last *session's* close).
+    prior_close_eod: Decimal | None = None
+    for pd in sorted((d for d in eod if d < today), reverse=True):
+        prior_close_eod = eod[pd]
+        break
+
+    # Weekends never hold a US session — drop them so a stale carried EOD capture
+    # (or a mis-bucketed fill) can't paint a weekend cell.
+    days = {
+        d for d in (set(realized_by_day) | set(eod))
+        if from_ <= d <= to and d.weekday() < 5
+    }
+    # TODAY is live when the caller supplied the current unrealized AND we have a
+    # prior close to reset the day's swing from.
+    today_live = (
+        live_today_unrealized is not None
+        and from_ <= today <= to
+        and today.weekday() < 5
+        and prior_close_eod is not None
     )
-    marked = reconstruct_marked_series(days, realized_by_day, eod)
+    if today_live:
+        days.add(today)
+
+    ordered = sorted(days)
+    marked = reconstruct_marked_series(ordered, realized_by_day, eod)
 
     out: dict[date, CalendarDay] = {}
-    for d in days:
+    for d in ordered:
         r = realized_by_day.get(d, Decimal(0))
-        m = marked[d]
-        # Surface the open-position swing (and flag live) only for TODAY, and
-        # only when it was genuinely reconstructed — today has its own eod
-        # capture AND an earlier one to diff against — otherwise m == r and
-        # there's nothing live to show (forward-only property).
-        is_live = (
-            d == today
-            and d in eod
-            and any(pd < d for pd in eod)
-        )
-        out[d] = CalendarDay(
-            day=d,
-            marked_pnl=m,
-            realized_pnl=r,
-            unrealized_pnl=(m - r) if is_live else None,
-            trade_count=counts.get(d, 0),
-            live=is_live,
-        )
+        if d == today and today_live:
+            m, day_unreal = today_live_cell(r, live_today_unrealized, prior_close_eod)
+            out[d] = CalendarDay(d, m, r, day_unreal, counts.get(d, 0), True)
+        elif d == today and d in eod and prior_close_eod is not None:
+            # No live value (broker down), but today has its own EOD capture and
+            # a prior close → fall back to the captured swing, still flagged live.
+            m = marked[d]
+            out[d] = CalendarDay(d, m, r, m - r, counts.get(d, 0), True)
+        else:
+            out[d] = CalendarDay(d, marked.get(d, r), r, None, counts.get(d, 0), False)
     return out

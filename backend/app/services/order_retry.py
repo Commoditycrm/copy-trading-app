@@ -218,6 +218,30 @@ _USER_FIXABLE_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Broker doesn't recognize that contract/symbol."),
     (re.compile(r"insufficient.*buying.power|insufficient.*funds", re.I),
      "Insufficient buying power on this account."),
+    # SnapTrade/Webull outside-hours rejection (code 1119): "You cannot place
+    # orders at this moment. Available trading hours are: 9:30 a.m.- 4:00 p.m.
+    # ET." Different wording from Alpaca's "market order ... after hours" above,
+    # so it needs its own pattern or it falls through to a raw dump.
+    (re.compile(r"available trading hours|cannot place orders at this moment|outside.*regular.*(session|hours)", re.I),
+     "Outside market hours — the broker only accepts this order during the "
+     "regular session (9:30–16:00 ET)."),
+    # Hard-to-borrow / short-sale not allowed (Alpaca 40310000 "cannot be sold
+    # short: no locates for account/symbol").
+    (re.compile(r"sold short|no locates|hard.?to.?borrow|short.sale.*not.*allow", re.I),
+     "This stock can't be sold short on your account (no shares available to "
+     "borrow)."),
+    # Account not approved for the order type — spreads / uncovered (naked)
+    # options (Alpaca 40310000 "account not eligible to trade spreads or
+    # uncovered contracts").
+    (re.compile(r"not eligible to trade|not approved.*(option|spread|uncovered)", re.I),
+     "Your broker account isn't approved for this order type (e.g. multi-leg "
+     "spreads or uncovered options). Raise your options level with the broker."),
+    # Contract too close to expiry to OPEN a new position (Alpaca 42210000
+    # "contract ... expires soon, unable to open new positions"). Placed after
+    # the plain "expired option" rule so a truly-expired contract still wins.
+    (re.compile(r"expires? soon.*(unable|cannot).*open|too close to expir", re.I),
+     "This contract is too close to expiry for the broker to open a new "
+     "position in it."),
     # Broker account-level restriction: the account can ONLY close option
     # positions, not open new ones (Webull/SnapTrade "Liquidation Only"). MUST
     # come before the generic "no position" rule below — the restriction text
@@ -284,6 +308,33 @@ def classify_error(exc: BaseException) -> _Classification:
             return _Classification(transient=True, clean_message=None)
 
     return _Classification(transient=False, clean_message=None)
+
+
+def clean_broker_error(raw: str | None) -> str:
+    """Tidy a RAW broker error for display when no friendly pattern matched.
+
+    Two prod problems this fixes: (1) some rejects stored the whole SDK
+    exception — ``... HTTP response headers: HTTPHeaderDict({...})`` — a wall of
+    noise; (2) some stored NOTHING (``exc`` was None) → a blank reject reason.
+    We pull out the meaningful ``message``/``detail`` when present, cut the
+    header/traceback noise, cap the length, and NEVER return blank."""
+    if not raw or not raw.strip():
+        return "Broker rejected the order (no reason provided)."
+    s = raw
+    for marker in ("HTTP response headers:", "HTTPHeaderDict(", "\nTraceback"):
+        i = s.find(marker)
+        if i != -1:
+            s = s[:i]
+    picked = (
+        re.search(r'"message"\s*:\s*"([^"]+)"', s)
+        or re.search(r"'message'\s*:\s*'([^']+)'", s)
+        or re.search(r'"detail"\s*:\s*"([^"]+)"', s)
+        or re.search(r"'detail'\s*:\s*'([^']+)'", s)
+    )
+    if picked:
+        s = picked.group(1)
+    s = s.strip().rstrip(":").strip()
+    return s[:300] or "Broker rejected the order."
 
 
 # ── Recovery wrapper ────────────────────────────────────────────────────────

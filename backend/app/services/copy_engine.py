@@ -51,6 +51,7 @@ from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
 from app.services.order_retry import (
     classify_error,
+    clean_broker_error,
     is_order_conflict_error,
     is_rate_limit_error,
     is_replace_chain_pending_error,
@@ -2875,10 +2876,14 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 )
 
             else:
-                # Either unknown error, transient but retries disabled,
-                # or no classifier verdict. Fall back to original behaviour.
+                # Either unknown error, transient but retries disabled, or no
+                # classifier verdict. Store a TIDIED reason — never the raw SDK
+                # exception with its HTTP-header dump, and never blank (exc was
+                # None) — so the user sees a real sentence. The raw string is
+                # preserved verbatim in the audit metadata for debugging.
+                clean = clean_broker_error(err)
                 child.status = OrderStatus.REJECTED
-                child.reject_reason = err
+                child.reject_reason = clean[:480]
                 child.closed_at = datetime.now(timezone.utc)
                 audit.record(
                     db,
@@ -2893,7 +2898,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     broker_account_id=item.broker_account_id,
                     order_id=child.id,
                     status="error",
-                    detail=err[:200] if err else None,
+                    detail=clean[:200],
                 ))
                 child.redis_published_at = datetime.now(timezone.utc)
                 events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
