@@ -665,13 +665,18 @@ def calendar_series(
         d for d in (set(realized_by_day) | set(eod))
         if from_ <= d <= to and d.weekday() < 5
     }
-    # TODAY is live when the caller supplied the current unrealized AND we have a
-    # prior close to reset the day's swing from.
+    # TODAY is live whenever the caller supplied the current unrealized. If we
+    # have a prior close we reset the day's swing against it; if we DON'T (no
+    # capture yet — deploy day, or none recorded for this account), we reset
+    # against ZERO so today still shows the full current open-position P&L
+    # instead of dropping it to $0 (prod 2026-08-25: an account −$9,879 open but
+    # showing $0 because it had no prior capture). No double-count: with no prior
+    # capture, past days showed no unrealized, so this figure was never
+    # attributed anywhere; once today's EOD is captured, tomorrow resets off it.
     today_live = (
         live_today_unrealized is not None
         and from_ <= today <= to
         and today.weekday() < 5
-        and prior_close_eod is not None
     )
     if today_live:
         days.add(today)
@@ -683,7 +688,8 @@ def calendar_series(
     for d in ordered:
         r = realized_by_day.get(d, Decimal(0))
         if d == today and today_live:
-            m, day_unreal = today_live_cell(r, live_today_unrealized, prior_close_eod)
+            baseline = prior_close_eod if prior_close_eod is not None else Decimal(0)
+            m, day_unreal = today_live_cell(r, live_today_unrealized, baseline)
             out[d] = CalendarDay(d, m, r, day_unreal, counts.get(d, 0), True)
         elif d == today and d in eod and prior_close_eod is not None:
             # No live value (broker down), but today has its own EOD capture and
