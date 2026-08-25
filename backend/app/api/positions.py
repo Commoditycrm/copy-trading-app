@@ -35,6 +35,7 @@ from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import ClosePositionIn, PositionOut
+from app.services import trailing_stop_close
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -155,6 +156,10 @@ def close_all_positions(
         default=True,
         description="When false, suppress the trader→subscriber fanout. Only the caller's own positions are closed. No-op semantic when caller is a subscriber.",
     ),
+    trail_percent: Decimal | None = Query(
+        default=None, gt=0, le=100,
+        description="Sell-All trailing-stop variation. When set, stock positions on brokers that support trailing stops are closed with a TRAILING_STOP at this trail %; options and unsupported brokers fall back to the normal market/limit close.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -163,6 +168,9 @@ def close_all_positions(
     normally fans out to subscribers; pass `include_subscribers=false` to
     close only the trader's own positions without propagating. Per-position
     failures don't abort the rest — we return a per-position result list.
+
+    ``trail_percent`` enables the trailing-stop variation of Sell-All (see the
+    per-position logic below and services.trailing_stop_close).
     """
     accts = db.execute(
         select(BrokerAccount).where(
@@ -198,9 +206,20 @@ def close_all_positions(
             # limited-liquidity contracts). See _option_close_limit.
             close_type = OrderType.MARKET
             close_limit: Decimal | None = None
-            if pos.instrument_type == InstrumentType.OPTION:
+            close_trail: Decimal | None = None
+            close_method = "market"
+            if (
+                trail_percent is not None
+                and trailing_stop_close.trailing_stop_supported(adapter, pos)
+            ):
+                # Sell-All trailing-stop variation, where the broker supports it.
+                close_type = OrderType.TRAILING_STOP
+                close_trail = trail_percent
+                close_method = "trailing_stop"
+            elif pos.instrument_type == InstrumentType.OPTION:
                 close_type = OrderType.LIMIT
                 close_limit = _option_close_limit(adapter, pos, reverse_side)
+                close_method = "limit"
             payload = PlaceOrderIn(
                 instrument_type=pos.instrument_type,
                 symbol=pos.symbol,
@@ -209,6 +228,7 @@ def close_all_positions(
                 quantity=qty,
                 limit_price=close_limit,
                 stop_price=None,
+                trail_percent=close_trail,
                 option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
                 option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
@@ -224,6 +244,7 @@ def close_all_positions(
                     "qty": str(qty),
                     "side": reverse_side.value,
                     "order_id": str(order.id),
+                    "method": close_method,
                 })
             except Exception as exc:  # noqa: BLE001
                 failed.append({

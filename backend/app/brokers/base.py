@@ -49,6 +49,11 @@ class BrokerOrderRequest:
     # support brackets fall through to a plain order and log a warning.
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
+    # Trailing-stop trail (order_type == TRAILING_STOP). Exactly one is set:
+    # trail_percent (e.g. Decimal("5") = 5%) OR trail_price (a fixed dollar
+    # trail). Only meaningful for adapters with supports_trailing_stop = True.
+    trail_percent: Decimal | None = None
+    trail_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,14 @@ class BrokerAdapter(ABC):
     # Adapters that support it set this True and implement replace_order; the
     # copy-engine modify path checks the flag and falls back to cancel+place.
     supports_replace: bool = False
+
+    # Whether this adapter can place a native TRAILING_STOP order. The Sell-All /
+    # close flow checks this per position: when True (and the instrument is
+    # eligible — most brokers offer trailing stops on stocks only), it closes the
+    # position with a trailing stop; when False it falls back to a plain
+    # market/limit close. See services.trailing_stop_close. Default False so a
+    # broker that hasn't implemented it is never handed a trailing stop.
+    supports_trailing_stop: bool = False
 
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Modify a WORKING order's price/quantity in place, atomically, returning

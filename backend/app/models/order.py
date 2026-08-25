@@ -20,6 +20,11 @@ class OrderType(str, enum.Enum):
     LIMIT = "limit"
     STOP = "stop"
     STOP_LIMIT = "stop_limit"
+    # Trailing stop: the stop follows the price in the favourable direction by a
+    # fixed trail (percent OR dollar amount) and fires when it reverses by the
+    # trail. Only placed on brokers that support it natively (see
+    # BrokerAdapter.supports_trailing_stop) — currently Alpaca stocks only.
+    TRAILING_STOP = "trailing_stop"
 
 
 class OrderStatus(str, enum.Enum):
@@ -94,6 +99,13 @@ class Order(Base, TimestampMixin):
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+
+    # Trailing-stop parameters (order_type == TRAILING_STOP). Exactly one is set:
+    # trail_percent (e.g. 5.00 = trail 5% behind the peak) OR trail_price (a fixed
+    # dollar trail). NULL on every other order type. The broker maintains the
+    # trailing stop server-side; we only record what we asked for.
+    trail_percent: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+    trail_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
 
     # Bracket-order legs attached to a parent entry. Both NULL = plain
     # order; both set = bracket (Alpaca OrderClass.BRACKET on supported
