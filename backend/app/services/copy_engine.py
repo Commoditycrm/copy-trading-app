@@ -2053,6 +2053,29 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             row._close_only = True
         paused_close_subs = list(paused_rows)
 
+    # Fresh per-contract caps, read straight from the DB — NOT the cached
+    # subscriber list. A just-set max_per_contract can lag in the fanout cache
+    # (invalidation race / a concurrent read repopulating the key with the
+    # pre-cap value) by up to the cache TTL, which let over-cap OPTION opens slip
+    # through in QA (2026-08-24: cap set, 28s later an over-cap open still filled).
+    # A risk cap must apply on the very NEXT trade, so for option orders we
+    # authoritatively fetch every relevant cap once here and the gate reads this
+    # map instead of the cached subscriber. One cheap indexed local query, only
+    # for options.
+    _fresh_caps: dict[uuid.UUID, Decimal] = {}
+    if trader_order.instrument_type == InstrumentType.OPTION:
+        _cap_ids = [s.user_id for s in (*subs, *paused_close_subs)]
+        if _cap_ids:
+            for _uid, _cap in db.execute(
+                select(
+                    SubscriberSettings.user_id, SubscriberSettings.max_per_contract,
+                ).where(
+                    SubscriberSettings.user_id.in_(_cap_ids),
+                    SubscriberSettings.max_per_contract.isnot(None),
+                )
+            ).all():
+                _fresh_caps[_uid] = _cap
+
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
         # gate (EOD lockout, daily kill switch, symbol filters) and, in the
@@ -2287,7 +2310,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # A CLOSE always passes (they must be able to exit); stocks have no
             # per-contract concept, so this is options-only. Priced off the
             # trader's own premium — no price available → allow (fail-open).
-            _mpc = getattr(sub, "max_per_contract", None)
+            # Read from the FRESH DB map (see _fresh_caps above), never the
+            # cached subscriber, so a just-set cap can't be missed.
+            _mpc = _fresh_caps.get(sub.user_id)
             if (
                 not is_closing_effective
                 and _mpc is not None
