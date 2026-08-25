@@ -16,6 +16,11 @@ class PlaceOrderIn(BaseModel):
     limit_price: Decimal | None = Field(default=None, gt=0)
     stop_price: Decimal | None = Field(default=None, gt=0)
 
+    # Trailing-stop trail (order_type == TRAILING_STOP). Exactly one is set:
+    # trail_percent (e.g. 5 = trail 5%) OR trail_price (a fixed dollar trail).
+    trail_percent: Decimal | None = Field(default=None, gt=0, le=100)
+    trail_price: Decimal | None = Field(default=None, gt=0)
+
     # Bracket legs. Optional but at least one must be set for the order
     # to be routed as a bracket. Alpaca requires BOTH on a real bracket;
     # if only one is provided we still attach it (oto/oco semantics may
@@ -37,6 +42,13 @@ class PlaceOrderIn(BaseModel):
             raise ValueError("limit_price required for limit/stop_limit orders")
         if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and self.stop_price is None:
             raise ValueError("stop_price required for stop/stop_limit orders")
+        # Trailing stop needs exactly one trail; trail fields are meaningless
+        # on any other order type.
+        if self.order_type == OrderType.TRAILING_STOP:
+            if (self.trail_percent is None) == (self.trail_price is None):
+                raise ValueError("trailing stop needs exactly one of trail_percent / trail_price")
+        elif self.trail_percent is not None or self.trail_price is not None:
+            raise ValueError("trail_percent / trail_price only valid on trailing_stop orders")
         # Bracket sanity checks. Brackets attach exit legs to the parent
         # entry, so they only make sense on the entry types Alpaca accepts
         # (market / limit). Stop / stop-limit entries are themselves
@@ -90,6 +102,8 @@ class OrderOut(BaseModel):
     quantity: Decimal
     limit_price: Decimal | None
     stop_price: Decimal | None
+    trail_percent: Decimal | None = None
+    trail_price: Decimal | None = None
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
     # Copied-bracket INTENT, as a positive percent distance from entry. Set on
