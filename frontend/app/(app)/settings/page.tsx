@@ -833,7 +833,16 @@ export default function SettingsPage() {
     return Number.isFinite(n) ? n.toString() : v;
   };
 
-  const todaysPnL = sub ? Number(sub.todays_realized_pnl ?? "0") : 0;
+  // TOTAL today's P&L = realized + unrealized. The daily loss/profit limits
+  // are enforced server-side on the MARKED total (equity − day-start, which
+  // includes open-position unrealized), so the row's TODAY value, colour,
+  // headroom and progress must all reflect the same total — not realized alone
+  // — or the reading understates how close you are to tripping the limit.
+  // `unrealizedPl` is the SSE-fed mark-to-market (null until the first tick →
+  // treated as 0, i.e. realized-only, until it arrives).
+  const todaysPnL = sub
+    ? Number(sub.todays_realized_pnl ?? "0") + Number(unrealizedPl ?? "0")
+    : 0;
   // Each daily limit can be expressed as a "%" of the day-start balance OR
   // an absolute "$". The two columns are mutually exclusive, so the dollar
   // threshold is: the USD column when set, else balance × pct / 100. That
