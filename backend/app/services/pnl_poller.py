@@ -300,6 +300,7 @@ def _has_active_policies(s: SubscriberSettings) -> bool:
         s.daily_loss_limit_pct is not None,
         s.daily_profit_limit_pct is not None,
         s.max_account_pct_per_day is not None,
+        s.max_account_usd_per_day is not None,
         s.auto_liquidation_limit is not None,
         s.position_tp_pct is not None,
         s.position_sl_pct is not None,
