@@ -23,15 +23,20 @@ const RETRY_COUNT_OPTIONS = [1, 2, 3, 4, 5].map(n => ({
   label: n === 1 ? "1 retry" : `${n} retries`,
 }));
 
-// Copy-size multiplier choices: 1× to 10× in 0.5 steps. Minimum is 1 — a
-// multiplier below 1 could scale an option mirror below a whole contract
-// (e.g. 0.5× on a 1-lot = 0.5 contracts), which the broker rejects. Values are
-// exact halves, so their string form is clean ("1", "1.5", … "10").
-const MULTIPLIER_OPTIONS: { value: string; label: string }[] =
-  Array.from({ length: 19 }, (_, i) => {
+// Copy-size multiplier choices: 0.25 and 0.5, then 1× to 10× in 0.5 steps.
+// NOTE on the sub-1 values (0.25 / 0.5): option quantities round DOWN to whole
+// contracts, so a fraction that scales below 1 lot is skipped — e.g. 0.5× on a
+// 1-contract trade = 0.5 → 0 → not mirrored. They only place when the scaled
+// qty rounds to ≥1 (bigger trades: 0.5× on 2 lots = 1; 0.25× on 4 lots = 1) or
+// on fractional-capable stock. Offered per request despite that caveat.
+const MULTIPLIER_OPTIONS: { value: string; label: string }[] = [
+  { value: "0.25", label: "×0.25" },
+  { value: "0.5", label: "×0.5" },
+  ...Array.from({ length: 19 }, (_, i) => {
     const v = (1 + i * 0.5).toString();
     return { value: v, label: `×${v}` };
-  });
+  }),
+];
 
 /** Cross-navigation cache for the pnl.tick payload fields the Risk
  *  Controls panel renders.
