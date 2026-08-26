@@ -474,10 +474,12 @@ export default function SettingsPage() {
     setMultBusy(true);
     try {
       const n = Number(multInput);
-      if (!Number.isFinite(n) || n < 1 || n > 10) {
-        throw new ApiError(422, "multiplier must be between 1 and 10");
+      if (!Number.isFinite(n) || n < 0.25 || n > 10) {
+        throw new ApiError(422, "multiplier must be between 0.25 and 10");
       }
-      const rounded = (Math.round(n * 10) / 10).toFixed(1);
+      // Round to 2 decimals so fractional picks (0.25, 0.5) survive; a 1-decimal
+      // round would turn 0.25 into 0.3 and the backend would reject it.
+      const rounded = (Math.round(n * 100) / 100).toFixed(2);
       const s = await api<SubscriberSettings>("/api/settings/subscriber/multiplier", {
         method: "PATCH", body: JSON.stringify({ multiplier: rounded }),
       });
@@ -1120,83 +1122,6 @@ export default function SettingsPage() {
                 />
               </div>
 
-              {/* ── Auto-liquidation — its own surface ───────────────────────
-              Separated from Risk Controls so the trader sees this as a
-              distinct take-profit instrument, not a fifth daily cap. The
-              semantic is different too: it locks in a winning day by
-              CLOSING positions, where the Risk Controls rows just pause
-              new mirror entries. */}
-              <Card
-                icon={<IconTrendUp />}
-                title="Auto-Liquidation (Take-Profit)"
-                hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
-              >
-                <div
-                  className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
-                  style={{
-                    gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
-                    color: "var(--muted)",
-                  }}
-                >
-                  <div>Target</div>
-                  <div>Set</div>
-                  <div>Profit</div>
-                  <div>USD</div>
-                  <div>Headroom</div>
-                  <div className="text-right">Progress</div>
-                </div>
-                {(() => {
-                  const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
-                  const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
-                  // Headroom = how much MORE profit you need before the
-                  // trigger fires. Clamped to 0 so once you've reached the
-                  // limit the cell reads "$0.00" instead of a negative.
-                  const liqHeadroom =
-                    unrealizedNum !== null && liqLimitNum !== null
-                      ? Math.max(0, liqLimitNum - unrealizedNum)
-                      : null;
-                  // Progress bar: unrealized / target, clamped 0–100.
-                  const liqPctConsumed =
-                    unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
-                      ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
-                      : 0;
-                  return (
-                    <LimitRow
-                      accent="#22c55e"
-                      icon={<IconTrendUp />}
-                      title="Auto-liquidation target"
-                      subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
-                      todayLabel="Profit"
-                      todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
-                      todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
-                      inputPrefix="USD"
-                      input={autoLiqInput}
-                      onInput={setAutoLiqInput}
-                      busy={autoLiqBusy}
-                      onSave={saveAutoLiq}
-                      current={sub.auto_liquidation_limit}
-                      hasLimit={liqLimitNum !== null}
-                      thresholdUsdDisplay="—"
-                      headroomDisplay={
-                        liqLimitNum === null
-                          ? "—"
-                          : liqHeadroom !== null
-                            ? fmt(String(liqHeadroom))
-                            : "—"
-                      }
-                      // Headroom text stays neutral — this is a take-profit,
-                      // not a stop-loss, so hitting $0 headroom is *good*.
-                      headroomColor="var(--text)"
-                      pctConsumed={liqPctConsumed}
-                      // Tell LimitRow to keep the progress bar green even at
-                      // 100% — the default treats max-progress as danger
-                      // (red), which is wrong for a take-profit target.
-                      successProgress
-                    />
-                  );
-                })()}
-              </Card>
-
               {/* Desktop column legend for the LimitRow grid below.
                   Hidden on mobile where rows stack their own labels.
                   Lives here (not at the top of the card) because the
@@ -1306,6 +1231,84 @@ export default function SettingsPage() {
               />
             </div>
           </Card>
+
+               {/* ── Auto-liquidation — its own surface ───────────────────────
+              Separated from Risk Controls so the trader sees this as a
+              distinct take-profit instrument, not a fifth daily cap. The
+              semantic is different too: it locks in a winning day by
+              CLOSING positions, where the Risk Controls rows just pause
+              new mirror entries. */}
+              <Card
+                icon={<IconTrendUp />}
+                title="Auto-Liquidation (Take-Profit)"
+                hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
+              >
+                <div
+                  className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
+                  style={{
+                    gridTemplateColumns: "1.5fr 1.3fr 0.8fr 0.9fr 0.9fr 0.5fr",
+                    color: "var(--muted)",
+                  }}
+                >
+                  <div>Target</div>
+                  <div>Set</div>
+                  <div>Profit</div>
+                  <div>USD</div>
+                  <div>Headroom</div>
+                  <div className="text-right">Progress</div>
+                </div>
+                {(() => {
+                  const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
+                  const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
+                  // Headroom = how much MORE profit you need before the
+                  // trigger fires. Clamped to 0 so once you've reached the
+                  // limit the cell reads "$0.00" instead of a negative.
+                  const liqHeadroom =
+                    unrealizedNum !== null && liqLimitNum !== null
+                      ? Math.max(0, liqLimitNum - unrealizedNum)
+                      : null;
+                  // Progress bar: unrealized / target, clamped 0–100.
+                  const liqPctConsumed =
+                    unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
+                      ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
+                      : 0;
+                  return (
+                    <LimitRow
+                      accent="#22c55e"
+                      icon={<IconTrendUp />}
+                      title="Auto-liquidation target"
+                      subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
+                      todayLabel="Profit"
+                      todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
+                      todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
+                      inputPrefix="USD"
+                      input={autoLiqInput}
+                      onInput={setAutoLiqInput}
+                      busy={autoLiqBusy}
+                      onSave={saveAutoLiq}
+                      current={sub.auto_liquidation_limit}
+                      hasLimit={liqLimitNum !== null}
+                      thresholdUsdDisplay="—"
+                      headroomDisplay={
+                        liqLimitNum === null
+                          ? "—"
+                          : liqHeadroom !== null
+                            ? fmt(String(liqHeadroom))
+                            : "—"
+                      }
+                      // Headroom text stays neutral — this is a take-profit,
+                      // not a stop-loss, so hitting $0 headroom is *good*.
+                      headroomColor="var(--text)"
+                      pctConsumed={liqPctConsumed}
+                      // Tell LimitRow to keep the progress bar green even at
+                      // 100% — the default treats max-progress as danger
+                      // (red), which is wrong for a take-profit target.
+                      successProgress
+                    />
+                  );
+                })()}
+              </Card>
+
 
           {/* ── Symbol filters ─────────────────────────────────────── */}
           <Card
