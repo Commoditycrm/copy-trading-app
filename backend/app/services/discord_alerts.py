@@ -392,21 +392,23 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ).first()
         if already is not None:
             return  # another path already claimed/sent this order's card
-        # Copy trading OFF at fill time → CLAIM the order (write the marker) but
-        # do NOT send. Deciding each order ONCE, here, is what fixes the QA bug:
-        # a fill that lands while copy is paused wasn't mirrored to subscribers,
-        # so it must never surface a card — and because we leave a marker, later
-        # turning copy back ON can't make the sweep (emit_pending_trader_alerts)
-        # re-alert it as a "new" unhandled order. Only orders that fill while
-        # copy is ON get a card.
-        if copy_paused:
+        # Copy trading OFF at trade time → suppress OPENS only. Alerts mirror
+        # execution: while paused, a trader's OPEN is NOT copied to subscribers
+        # so it must never surface a card — but a trader's CLOSE IS still mirrored
+        # (copy_engine closes subscribers' held positions even while paused), so
+        # its card must still go out. So we suppress here only when paused AND
+        # this is NOT a close. Claiming the marker (below) also stops the resume
+        # sweep from re-alerting a suppressed open as "new".
+        if copy_paused and not _is_closing(db, order):
             audit.record(
                 db, actor_user_id=order.user_id, action=_ALERT_SENT_ACTION,
                 entity_type="order", entity_id=order.id,
-                metadata={"suppressed": "copy_paused", "symbol": order.symbol},
+                metadata={"suppressed": "copy_paused_open", "symbol": order.symbol},
             )
             db.commit()
             return
+        # (A CLOSE while paused falls through here and alerts normally — it was
+        #  copied to subscribers, so its card should go out.)
         # Classify + compute round-trip P&L (ENTERING / TRIMMING / CLOSING).
         # If the FIFO calc fails for any reason, fall back to the basic
         # enter/close card (Phase-1 behaviour) so a bad calc can never break the
