@@ -929,42 +929,70 @@ export default function SettingsPage() {
             title="Traders"
             hint="Request to follow a trader, then mirror their trades. Approved requests start following automatically — turn on copy trading to begin mirroring."
           >
-            {/* Compact copy-size multiplier — applies to whoever you follow. */}
-            <div className="flex items-center justify-between gap-3 pb-3 flex-wrap"
-              style={{ borderBottom: "1px solid var(--border)" }}>
-              <span className="text-xs" style={{ color: "var(--muted)" }}>
-                Copy size multiplier — scales every mirrored order (1×–10×).
-                Option contracts round <strong>down</strong> to a whole number
-                (e.g. 3 × 1.5 = 4.5 → 4 contracts).
-              </span>
-              <div className="flex items-center gap-2">
-                <div className="w-24">
-                  <SelectInput
-                    value={multInput}
-                    onChange={setMultInput}
-                    ariaLabel="Copy size multiplier"
-                    // Grandfather a legacy sub-1 value (e.g. 0.5×) by showing it
-                    // as an extra option so the dropdown reflects the current
-                    // setting; new picks are 1×–10× only.
-                    options={
-                      MULTIPLIER_OPTIONS.some(o => o.value === multInput)
-                        ? MULTIPLIER_OPTIONS
-                        : [{ value: multInput, label: `×${multInput}` }, ...MULTIPLIER_OPTIONS]
-                    }
-                  />
-                </div>
-                <span className="text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                  ×{fmtMultiplier(sub.multiplier)}
-                </span>
-                <PrimaryButton
-                  busy={multBusy}
-                  onClick={saveMultiplier}
-                  disabled={multBusy || parseFloat(multInput) === parseFloat(sub.multiplier)}
+            {/* Copy-size multiplier — applies to whoever you follow. A slick
+                inline panel: live value badge on the left, picker + save right. */}
+            {(() => {
+              const isDirty = parseFloat(multInput) !== parseFloat(sub.multiplier);
+              return (
+                <div
+                  className="rounded-xl border p-3 mb-4 flex items-center gap-3 flex-wrap"
+                  style={{
+                    borderColor: "var(--border)",
+                    background: "linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01))",
+                  }}
                 >
-                  Save
-                </PrimaryButton>
-              </div>
-            </div>
+                  {/* Live active value — prominent accent badge */}
+                  <div
+                    className="flex items-center justify-center h-9 min-w-9 px-2.5 rounded-xl shrink-0 tabular-nums box-border"
+                    style={{
+                      background: "var(--accent-glow)",
+                      border: "1px solid var(--accent)",
+                      color: "var(--accent-2)",
+                    }}
+                  >
+                    <span className="text-sm font-bold leading-none">×{fmtMultiplier(sub.multiplier)}</span>
+                  </div>
+
+                  {/* Label + hint */}
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold leading-tight" style={{ color: "var(--text)" }}>
+                      Copy size multiplier
+                    </div>
+                    <p className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+                      Scales every mirrored order. Option contracts round{" "}
+                      <strong>down</strong> to a whole number (3 × 1.5 = 4.5 → 4).
+                    </p>
+                  </div>
+
+                  {/* Picker + save */}
+                  <div className="flex items-center gap-2 shrink-0">
+                    <div className="w-[5.5rem]">
+                      <SelectInput
+                        value={multInput}
+                        onChange={setMultInput}
+                        className="h-9 py-0"
+                        ariaLabel="Copy size multiplier"
+                        // Grandfather a value not in the list by showing it as an
+                        // extra option so the dropdown reflects the current setting.
+                        options={
+                          MULTIPLIER_OPTIONS.some(o => o.value === multInput)
+                            ? MULTIPLIER_OPTIONS
+                            : [{ value: multInput, label: `×${multInput}` }, ...MULTIPLIER_OPTIONS]
+                        }
+                      />
+                    </div>
+                    <PrimaryButton
+                      busy={multBusy}
+                      onClick={saveMultiplier}
+                      disabled={multBusy || !isDirty}
+                      className="h-8 py-0"
+                    >
+                      Save
+                    </PrimaryButton>
+                  </div>
+                </div>
+              );
+            })()}
 
             {traders.length === 0 ? (
               <p className="text-sm mt-3" style={{ color: "var(--muted)" }}>
@@ -1658,23 +1686,36 @@ function NumberInput({
 }
 
 function SelectInput({
-  value, onChange, options, ariaLabel,
+  value, onChange, options, ariaLabel, className = "",
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
   ariaLabel?: string;
+  className?: string;
 }) {
   return (
-    <select
-      value={value}
-      aria-label={ariaLabel}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full px-3 py-2 text-sm rounded-lg bg-transparent border transition-colors focus:outline-none focus:border-[var(--accent)] cursor-pointer"
-      style={{ borderColor: "var(--border)" }}
-    >
-      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-    </select>
+    <div className="relative">
+      <select
+        value={value}
+        aria-label={ariaLabel}
+        onChange={(e) => onChange(e.target.value)}
+        className={`w-full pl-3 pr-8 py-2 text-sm rounded-lg bg-transparent border transition-colors focus:outline-none focus:border-[var(--accent)] cursor-pointer appearance-none ${className}`}
+        style={{ borderColor: "var(--border)", WebkitAppearance: "none", MozAppearance: "none" }}
+      >
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+      {/* Custom chevron — the native arrow sits inconsistently across browsers,
+          so we hide it (appearance:none) and pin our own for even alignment. */}
+      <svg
+        aria-hidden="true"
+        viewBox="0 0 20 20" fill="none"
+        className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4"
+        style={{ color: "var(--muted)" }}
+      >
+        <path d="M6 8l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </div>
   );
 }
 
