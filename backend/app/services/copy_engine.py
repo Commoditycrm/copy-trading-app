@@ -1876,9 +1876,35 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         except Exception:  # noqa: BLE001
             log.exception("discord alert (fanout) failed for %s", trader_order.id)
 
-    # Trader master pause — skip all fanout when set.
+    # Trader master pause. We DON'T skip the whole fanout here anymore: while
+    # paused, the trader's OPENS are dropped (no new entries for anyone), but
+    # their CLOSES must still flow to subscribers — otherwise a sub is left
+    # holding a position the trader has already exited (prod: trader paused
+    # copy, then closed his positions, subs stayed long). The actual gate is
+    # applied once we know whether this order is a close (`trader_closing`) —
+    # see the `trader_paused and not trader_closing` return below; and
+    # `is_close_only` is OR'd with `trader_paused` so every holder's exit
+    # mirrors close-only.
     ts = db.get(TraderSettings, trader.id)
-    if ts is not None and ts.copy_paused:
+    trader_paused = ts is not None and ts.copy_paused
+
+    # Reliable "the trader is CLOSING" signal — from the TRADER's OWN held
+    # position (their fills sync promptly via the trader listener, unlike a
+    # subscriber's which can lag on SnapTrade). Computed here (early) so a paused
+    # OPEN can short-circuit BEFORE any Phase-1 side effects (the daily
+    # auto-resume sweep, subs fetch), keeping the paused-open path byte-for-byte
+    # as it was before this change. Reused throughout the fanout below.
+    trader_closing = bool(trader_order.is_closing) or _closeable_quantity(
+        db, trader_order.user_id, trader_order, subtract_reserved=False,
+    ) > 0
+    # Trader master pause: while paused we drop OPENS (no new entries for anyone)
+    # but STILL mirror CLOSES so a subscriber isn't left holding a position the
+    # trader has exited. Paused + OPENING → skip the whole fanout here (exactly
+    # as before). Paused + CLOSING → fall through and run close-only for everyone
+    # (is_close_only is OR'd with trader_paused below; the _closeable_quantity
+    # clamp zeroes out anyone who doesn't hold it, so it can never open a naked
+    # position).
+    if trader_paused and not trader_closing:
         return results
 
     # ── Phase 1: build child orders + skip records ─────────────────────────
@@ -2018,16 +2044,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     )
     eod_now = market_hours.now_et() if eod_candidate else None
 
-    # Reliable "the trader is CLOSING" signal, computed once for the whole fanout
-    # from the TRADER's OWN held position (their fills sync promptly via the
-    # trader listener, unlike a subscriber's which can lag on SnapTrade). Used
-    # below so a subscriber's close isn't wrongly skipped when our view of THEIR
-    # position is briefly stale: if the trader is reducing a real position, any
-    # subscriber who mirror-holds it should attempt the close too, and let the
-    # broker be the final arbiter (it fills if held, safely rejects if flat).
-    trader_closing = bool(trader_order.is_closing) or _closeable_quantity(
-        db, trader_order.user_id, trader_order, subtract_reserved=False,
-    ) > 0
+    # `trader_closing` and the trader-master-pause short-circuit were computed
+    # ABOVE (right after the ts fetch) so a paused OPEN skips the fanout before
+    # any Phase-1 side effects; trader_closing is reused here.
 
     # ── Close-through-pause: mirror the trader's EXITS to PAUSED subscribers ──
     # A subscriber with copy_enabled=False (manual off OR daily-limit
@@ -2080,7 +2099,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
         # gate (EOD lockout, daily kill switch, symbol filters) and, in the
         # per-account block, refuse anything that isn't a real close.
-        is_close_only = getattr(sub, "_close_only", False)
+        is_close_only = getattr(sub, "_close_only", False) or trader_paused
         # Lifecycle: the moment the engine picks this subscriber up for
         # processing. Applied to every child Order created in this iteration
         # below. Captured here (not inside the inner per-account loop) so it
