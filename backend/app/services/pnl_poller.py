@@ -107,6 +107,10 @@ POLL_INTERVAL_S = 1.0
 _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     BrokerName.ALPACA: 10.0,
     BrokerName.SNAPTRADE: 60.0,
+    # Direct Webull authenticates with each subscriber's OWN app_key, so its
+    # quota is per-account (not a shared platform pool like SnapTrade) — safe to
+    # poll at the Alpaca-like 10s cadence with no concurrency semaphore.
+    BrokerName.WEBULL: 10.0,
 }
 
 
@@ -180,7 +184,7 @@ def _snapshot_or_last_known(
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
 # is listed here, and (c) the broker has an entry in
 # ``_INTERVAL_BY_BROKER``.
-_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE)
+_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.WEBULL)
 
 # Concurrency gate for SnapTrade. Even with skip-idle and 60s cadence,
 # if 30+ subscribers all become due in the same tick they would burst
@@ -419,14 +423,23 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
         s = db.get(SubscriberSettings, acct.user_id)
         if s is None or not getattr(s, "copy_trader_bracket", False):
             return
-        # Refresh mirror + exit-leg statuses (Alpaca; no-op for other brokers)
-        # so the reconcile below sees FILLED entries.
+        # Refresh mirror + exit-leg statuses so the reconcile below sees FILLED
+        # entries. sync_account_fills is Alpaca-only; for a direct-Webull
+        # subscriber account use the broker-agnostic order-status refresh (the
+        # same helper the Webull subscriber reconciler runs), so copied bracket
+        # exits fire on Webull too.
         try:
-            _fills_sync.sync_account_fills(db, acct)
+            if acct.broker == BrokerName.WEBULL:
+                from app.brokers import adapter_for as _adapter_for  # noqa: PLC0415
+                from app.services.crypto import decrypt_json as _decrypt_json  # noqa: PLC0415
+                _wb_adapter = _adapter_for(acct, _decrypt_json(acct.encrypted_credentials))
+                _fills_sync._refresh_open_orders(db, acct, _wb_adapter)
+            else:
+                _fills_sync.sync_account_fills(db, acct)
             db.commit()
         except Exception:  # noqa: BLE001
             db.rollback()
-            log.exception("pnl_poller: fills_sync (copy-bracket) failed for %s", acct.id)
+            log.exception("pnl_poller: fills refresh (copy-bracket) failed for %s", acct.id)
         try:
             reconcile_copy_brackets(db, acct.id)
         except Exception:  # noqa: BLE001

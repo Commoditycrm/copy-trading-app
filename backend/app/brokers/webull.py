@@ -40,10 +40,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from app.brokers.base import (
@@ -53,9 +55,43 @@ from app.brokers.base import (
     BrokerPosition,
     ConnectionInfo,
 )
-from app.models.order import InstrumentType
+from app.models.order import (
+    InstrumentType,
+    OptionRight,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 
 log = logging.getLogger(__name__)
+
+# Webull order_status → our OrderStatus. The SDK's canonical set is
+# SUBMITTED / PARTIAL_FILLED / FILLED / CANCELLED / FAILED (trade/common/
+# order_status.py); the extra keys are defensive against REST/stream variants
+# (matches services.webull_listener._WEBULL_STATUS).
+_STATUS_MAP: dict[str, OrderStatus] = {
+    "SUBMITTED": OrderStatus.SUBMITTED,
+    "PENDING": OrderStatus.SUBMITTED,
+    "PENDING_SUBMIT": OrderStatus.SUBMITTED,
+    "WORKING": OrderStatus.ACCEPTED,
+    "ACCEPTED": OrderStatus.ACCEPTED,
+    "QUEUED": OrderStatus.ACCEPTED,
+    "PARTIAL_FILLED": OrderStatus.PARTIALLY_FILLED,
+    "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+    "FILLED": OrderStatus.FILLED,
+    "CANCELLED": OrderStatus.CANCELED,
+    "CANCELED": OrderStatus.CANCELED,
+    "FAILED": OrderStatus.REJECTED,
+    "REJECTED": OrderStatus.REJECTED,
+    "EXPIRED": OrderStatus.EXPIRED,
+}
+
+_TERMINAL_STATUSES = frozenset({
+    OrderStatus.FILLED,
+    OrderStatus.CANCELED,
+    OrderStatus.REJECTED,
+    OrderStatus.EXPIRED,
+})
 
 
 def _dec(v: Any) -> Decimal | None:
@@ -92,6 +128,38 @@ def _suppress_sdk_file_logger(api_client: Any) -> None:
         pass
 
 
+def _is_writable_dir(path: str) -> bool:
+    """True if ``path`` exists (or can be created) and is writable."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return os.access(path, os.W_OK)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_token_base() -> str:
+    """The base dir the SDK persists Webull tokens under. Prefers
+    WEBULL_OPENAPI_TOKEN_DIR (default ``/data/webull_token`` — a durable volume
+    in the prod container), but falls back to a writable temp dir when that base
+    can't be written. Without the fallback, running direct Webull OUTSIDE the
+    container (localhost / bare metal, where ``/data`` is on the read-only root)
+    dies with ``ERROR_STORAGE_TOKEN [Errno 30] Read-only file system: '/data'``
+    the moment the SDK tries to store a token. Prod is unaffected — ``/data`` is
+    writable there, so the configured base is used as-is.
+    """
+    base = os.getenv("WEBULL_OPENAPI_TOKEN_DIR", "/data/webull_token")
+    if _is_writable_dir(base):
+        return base
+    fallback = os.path.join(tempfile.gettempdir(), "webull_token")
+    log.warning(
+        "webull token dir %r is not writable; falling back to %r. Set "
+        "WEBULL_OPENAPI_TOKEN_DIR to a durable writable path (a mounted volume) "
+        "in production so tokens survive restarts.",
+        base, fallback,
+    )
+    return fallback
+
+
 def set_per_account_token_dir(api_client: Any, app_key: str | None) -> None:
     """Give each app_key its OWN token file so multiple Webull accounts don't
     collide. The SDK saves the verified token under a FIXED filename
@@ -100,10 +168,17 @@ def set_per_account_token_dir(api_client: Any, app_key: str | None) -> None:
     app_key at its own subdirectory under the (durable) base token dir.
     ``set_token_dir`` takes priority over the WEBULL_OPENAPI_TOKEN_DIR env var.
     """
-    base = os.getenv("WEBULL_OPENAPI_TOKEN_DIR", "/data/webull_token")
+    base = _resolve_token_base()
     key_hash = hashlib.blake2b((app_key or "").encode(), digest_size=8).hexdigest()
+    target = f"{base.rstrip('/')}/{key_hash}"
+    # Pre-create the per-key dir so the SDK's write lands in an existing,
+    # writable directory (some SDK versions don't makedirs before writing).
     try:
-        api_client.set_token_dir(f"{base.rstrip('/')}/{key_hash}")
+        os.makedirs(target, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        api_client.set_token_dir(target)
     except Exception:  # noqa: BLE001
         pass
 
@@ -252,18 +327,256 @@ class WebullAdapter(BrokerAdapter):
             log.warning("webull get_pnl_snapshot failed", exc_info=True)
             return None
 
-    # ── writes — NOT wired for direct Webull (subscribers use SnapTrade) ──
+    # ── writes — subscriber mirror execution on direct Webull ────────────
+    # Order identity: Webull's cancel / replace / get_order_detail all key on
+    # the CALLER-generated client_order_id (NOT the broker order_id), so we use
+    # our Order row's UUID (stripped to Webull's 32-char max) as the
+    # client_order_id AND return it as broker_order_id. Reusing the same
+    # client_order_id across retries of one logical order is Webull's only
+    # idempotency guard against double-placement.
+    _ORDER_TYPE_MAP = {
+        OrderType.MARKET: "MARKET",
+        OrderType.LIMIT: "LIMIT",
+        OrderType.STOP: "STOP_LOSS",
+        OrderType.STOP_LIMIT: "STOP_LOSS_LIMIT",
+    }
+
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
-        raise NotImplementedError(
-            "Direct-Webull order placement is not enabled — subscriber orders "
-            "execute via SnapTrade. Webull-direct is read/stream only for now."
+        if not self.account_id:
+            raise RuntimeError("webull place_order: no account_id configured")
+        trade = self._trade_client()
+        coid = self._client_order_id(req)
+        if req.instrument_type == InstrumentType.OPTION:
+            resp = trade.order_v2.place_option(
+                self.account_id, [self._build_option_order(req, coid)]
+            )
+        else:
+            resp = trade.order_v3.place_order(
+                self.account_id, [self._build_stock_order(req, coid)]
+            )
+        self._raise_for_status(resp, "place_order")
+        # The place response returns only {client_order_id, order_id} — no fill
+        # yet. Report SUBMITTED; the subscriber reconciler polls get_order for
+        # the fill (exactly like the SnapTrade subscriber path).
+        return BrokerOrderResult(
+            broker_order_id=coid,
+            status=OrderStatus.SUBMITTED,
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=Decimal(0),
+            filled_avg_price=None,
         )
 
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
-        raise NotImplementedError(
-            "Direct-Webull get_order is not wired — the trade-event stream "
-            "drives order state for the direct-Webull trader signal."
+        """Order status/fill for a mirror we placed. ``broker_order_id`` is the
+        client_order_id we generated at placement (see place_order)."""
+        trade = self._trade_client()
+        detail = self._fetch_detail(trade, broker_order_id)
+        if detail is None:
+            raise RuntimeError(
+                f"webull get_order_detail failed for {broker_order_id}"
+            )
+        _body, _is_opt, status, filled_qty, filled_px = detail
+        return BrokerOrderResult(
+            broker_order_id=broker_order_id,
+            status=status,
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=filled_qty,
+            filled_avg_price=filled_px,
         )
+
+    def cancel_order(self, broker_order_id: str) -> bool:
+        """Cancel a working mirror. True = we cancelled a live order; False =
+        the broker reports it already terminal (filled/cancelled) — nothing to
+        cancel. Raises only when the order's state can't be resolved."""
+        trade = self._trade_client()
+        detail = self._fetch_detail(trade, broker_order_id)
+        if detail is not None:
+            _body, is_option, status, _q, _p = detail
+            if status in _TERMINAL_STATUSES:
+                return False
+            resp = (
+                trade.order_v2.cancel_option(self.account_id, broker_order_id)
+                if is_option
+                else trade.order_v3.cancel_order(self.account_id, broker_order_id)
+            )
+            if getattr(resp, "status_code", None) == 200:
+                return True
+            # Non-200: it may have filled/cancelled between the read and here.
+            again = self._fetch_detail(trade, broker_order_id)
+            if again is not None and again[2] in _TERMINAL_STATUSES:
+                return False
+            raise RuntimeError(f"webull cancel failed: {self._error_text(resp)}")
+        # Couldn't read the order → instrument type unknown. Try both cancel
+        # endpoints (a no-op on the wrong one); raise only if neither takes.
+        for _do_cancel in (
+            lambda: trade.order_v3.cancel_order(self.account_id, broker_order_id),
+            lambda: trade.order_v2.cancel_option(self.account_id, broker_order_id),
+        ):
+            try:
+                resp = _do_cancel()
+            except Exception:  # noqa: BLE001
+                continue
+            if getattr(resp, "status_code", None) == 200:
+                return True
+        raise RuntimeError(
+            f"webull cancel failed: order {broker_order_id} not found / not cancellable"
+        )
+
+    # ── order-build + response helpers ───────────────────────────────────
+    @staticmethod
+    def _client_order_id(req: BrokerOrderRequest) -> str:
+        # Our Order UUID (dashes stripped → 32 hex) is stable per logical order,
+        # so retries reuse it — Webull's idempotency key. Fall back to a fresh
+        # uuid only when the caller supplied none.
+        raw = req.client_order_id or uuid.uuid4().hex
+        return raw.replace("-", "")[:32]
+
+    @staticmethod
+    def _fmt_qty(q: Decimal | Any) -> str:
+        d = Decimal(str(q))
+        if d == d.to_integral_value():
+            return str(int(d))
+        return format(d.normalize(), "f")
+
+    @staticmethod
+    def _fmt_price(p: Decimal | Any) -> str:
+        d = Decimal(str(p))
+        # Webull price precision: 2 decimals for >= $1, 4 decimals for < $1.
+        step = Decimal("0.01") if abs(d) >= 1 else Decimal("0.0001")
+        return str(d.quantize(step, rounding=ROUND_HALF_UP))
+
+    @staticmethod
+    def _session(req: BrokerOrderRequest) -> str:
+        # support_trading_session: CORE = regular hours only; ALL = include
+        # pre/post-market. A MARKET order must be CORE (extended hours is
+        # limit-only). Options are RTH-only and carry no session field.
+        if req.order_type == OrderType.MARKET:
+            return "CORE"
+        return "ALL" if req.extended_hours else "CORE"
+
+    @staticmethod
+    def _position_intent(req: BrokerOrderRequest) -> str:
+        # Open vs close is a distinct field on Webull options — NOT encoded in
+        # side alone. A closing SELL must be SELL_TO_CLOSE (never SELL_TO_OPEN),
+        # or the broker rejects it "no position to close".
+        buy = req.side == OrderSide.BUY
+        if req.is_closing:
+            return "BUY_TO_CLOSE" if buy else "SELL_TO_CLOSE"
+        return "BUY_TO_OPEN" if buy else "SELL_TO_OPEN"
+
+    def _build_stock_order(self, req: BrokerOrderRequest, coid: str) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "client_order_id": coid,
+            "combo_type": "NORMAL",
+            "symbol": req.symbol.upper(),
+            "instrument_type": "STOCK",
+            "market": "US",
+            "side": "BUY" if req.side == OrderSide.BUY else "SELL",
+            "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
+            "quantity": self._fmt_qty(req.quantity),
+            "time_in_force": "DAY",
+            "entrust_type": "QTY",
+            "support_trading_session": self._session(req),
+        }
+        if req.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and req.limit_price is not None:
+            d["limit_price"] = self._fmt_price(req.limit_price)
+        if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is not None:
+            d["stop_price"] = self._fmt_price(req.stop_price)
+        return d
+
+    def _build_option_order(self, req: BrokerOrderRequest, coid: str) -> dict[str, Any]:
+        if not (req.option_expiry and req.option_strike and req.option_right):
+            raise RuntimeError(
+                "webull option order missing contract terms "
+                "(expiry/strike/right required)"
+            )
+        intent = self._position_intent(req)
+        side = "BUY" if req.side == OrderSide.BUY else "SELL"
+        leg: dict[str, Any] = {
+            "side": side,
+            "position_intent": intent,
+            "quantity": self._fmt_qty(req.quantity),
+            "ratio": "1",
+            "instrument_type": "OPTION",
+            "market": "US",
+            "symbol": req.symbol.upper(),
+            "strike_price": self._fmt_price(req.option_strike),
+            "option_expire_date": req.option_expiry.isoformat(),
+            "option_type": "CALL" if req.option_right == OptionRight.CALL else "PUT",
+        }
+        d: dict[str, Any] = {
+            "client_order_id": coid,
+            "combo_type": "NORMAL",
+            "option_strategy": "SINGLE",
+            "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
+            "quantity": self._fmt_qty(req.quantity),
+            "time_in_force": "DAY",
+            "entrust_type": "QTY",
+            "position_intent": intent,
+            "side": side,
+            "legs": [leg],
+        }
+        if req.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and req.limit_price is not None:
+            d["limit_price"] = self._fmt_price(req.limit_price)
+        if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is not None:
+            d["stop_price"] = self._fmt_price(req.stop_price)
+        return d
+
+    def _fetch_detail(self, trade: Any, coid: str):
+        """Query one order by client_order_id. Returns
+        ``(body, is_option, status, filled_qty, filled_px)`` or None if the
+        lookup itself failed (non-200 / no body)."""
+        try:
+            resp = trade.order_v3.get_order_detail(self.account_id, coid)
+        except Exception:  # noqa: BLE001
+            return None
+        if getattr(resp, "status_code", None) != 200:
+            return None
+        body = resp.json() or {}
+        order = body if isinstance(body, dict) else {}
+        legs = (
+            order.get("items") or order.get("legs")
+            or order.get("orders") or order.get("order_legs") or []
+        )
+        leg = legs[0] if legs and isinstance(legs[0], dict) else order
+        cat = str(
+            _first(order, "category", "combo_ticker_type")
+            or _first(leg, "category", "instrument_type") or ""
+        ).upper()
+        is_option = "OPTION" in cat
+        status_raw = str(
+            _first(leg, "order_status", "status")
+            or _first(order, "order_status", "status") or ""
+        ).upper()
+        status = _STATUS_MAP.get(status_raw, OrderStatus.SUBMITTED)
+        filled_qty = (
+            _dec(_first(leg, "filled_qty", "filledQty", "cumulative_quantity"))
+            or _dec(_first(order, "filled_qty", "filledQty"))
+            or Decimal(0)
+        )
+        filled_px = (
+            _dec(_first(leg, "filled_price", "avg_fill_price", "filledPrice", "avgFilledPrice"))
+            or _dec(_first(order, "filled_price", "avg_fill_price"))
+        )
+        return order, is_option, status, filled_qty, filled_px
+
+    def _raise_for_status(self, resp: Any, what: str) -> None:
+        if getattr(resp, "status_code", None) != 200:
+            raise RuntimeError(f"webull {what} failed: {self._error_text(resp)}")
+
+    @staticmethod
+    def _error_text(resp: Any) -> str:
+        code = getattr(resp, "status_code", "?")
+        detail = ""
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                detail = str(body.get("msg") or body.get("message") or body.get("code") or body)
+            else:
+                detail = str(body)
+        except Exception:  # noqa: BLE001
+            detail = str(getattr(resp, "text", "") or "")
+        return f"HTTP {code} {detail}".strip()
 
 
 __all__ = ["WebullAdapter"]

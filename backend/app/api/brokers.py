@@ -650,15 +650,12 @@ def connect(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> BrokerAccount:
-    # Direct Webull is a TRADER-only real-time signal source. Subscriber
-    # execution runs through SnapTrade (WebullAdapter.place_order is
-    # intentionally unimplemented), so a subscriber connecting Webull-direct
-    # would break their mirrors. Block it here.
-    if payload.broker == BrokerName.WEBULL and user.role != UserRole.TRADER:
-        raise HTTPException(
-            400, "Direct Webull is for traders only — connect Webull via SnapTrade "
-                 "instead (subscriber mirror execution runs through SnapTrade).",
-        )
+    # Direct Webull is available to BOTH roles: a TRADER uses it as a real-time
+    # fill-signal source (read/stream via webull_listener), and a SUBSCRIBER now
+    # executes their mirror orders on it directly (WebullAdapter implements the
+    # write path; mirror fills sync via services.webull_subscriber_reconciler).
+    # The webull_direct_enabled server flag still gates it for everyone inside
+    # _credentials_for below, so this stays fully inert with the flag off.
     creds = _credentials_for(payload, user.id)
 
     # Enforce one-broker-per-user BEFORE building the new row so the
