@@ -10,6 +10,7 @@ import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
 import { CopyDiscordPromptModal } from "@/components/CopyDiscordPromptModal";
+import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { NotificationBell } from "@/components/NotificationBell";
 import { ProfileModal } from "@/components/profile/ProfileModal";
@@ -415,6 +416,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return () => clearInterval(id);
   }, [user]);
 
+  // Keep the sidebar's Discord state in sync when it's changed from the Settings
+  // page (so the copy-toggle prompt's hint stays accurate without a refresh).
+  useEffect(() => onDiscordChanged((d) => setTraderDiscord(d)), []);
+
   async function toggleSubscriberCopy() {
     if (!subCopy) return;
     const next = !subCopy.copy_enabled;
@@ -460,6 +465,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             method: "PATCH", body: JSON.stringify({ discord_alerts_enabled: discordTarget }),
           });
           setTraderDiscord({
+            enabled: !!t.discord_alerts_enabled,
+            configured: !!t.discord_webhook_configured,
+          });
+          // Broadcast so the Settings page's Discord toggle updates live.
+          emitDiscordChanged({
             enabled: !!t.discord_alerts_enabled,
             configured: !!t.discord_webhook_configured,
           });
