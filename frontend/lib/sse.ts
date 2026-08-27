@@ -36,7 +36,7 @@ export interface NotificationEventPayload {
 }
 
 export interface ListenerStatus {
-  state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader";
+  state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader" | "no_broker";
   last_event_at: string | null;
   state_changed_at: string | null;
   last_error: string | null;

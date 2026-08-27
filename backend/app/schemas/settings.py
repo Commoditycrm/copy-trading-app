@@ -13,6 +13,14 @@ class SubscriberSettingsOut(BaseModel):
     # subscriber sees the trader's app name (not "ARK"). None when not
     # following anyone, or for legacy traders that pre-date business_name.
     following_trader_business_name: str | None = None
+    # The followed trader's LIVE copy-trading status, from the subscriber's POV:
+    # True  = the trader is broadcasting (master trading switch on AND not paused)
+    # False = the trader has paused copy trading / disabled trading (new entries
+    #         won't mirror to the subscriber; existing exits still flow)
+    # None  = not following anyone.
+    # Lets a subscriber see "my trader paused" instead of silently getting no
+    # trades. Reflects TraderSettings.copy_paused / trading_enabled.
+    following_trader_copy_active: bool | None = None
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None

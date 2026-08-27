@@ -40,6 +40,31 @@ log = logging.getLogger(__name__)
 # How often the worker refreshes every connected account's balance.
 BALANCE_SYNC_INTERVAL_S = 900.0  # 15 min
 
+# Sentinel prefix on last_error that marks a CREDENTIALS/AUTH failure (revoked
+# key, expired SnapTrade connection, bad token) as opposed to a transient broker
+# hiccup. The listener-status endpoint reads this prefix to surface a real
+# "Broker offline" pill for the account owner. We deliberately DON'T flip
+# connection_status — pnl_poller / fill reconcilers / fanout all filter on
+# connection_status=="connected", so a false auth-classification there would
+# silently pause a subscriber's copying. Display-only is the safe blast radius.
+AUTH_ERR_PREFIX = "credentials_invalid:"
+
+# High-precision markers of a genuine auth/credentials failure. Kept tight so a
+# transient timeout / 5xx never masquerades as revoked creds. The " 401"/"401 "
+# forms (vs a bare "401") avoid matching stray digits inside an unrelated error.
+_AUTH_ERR_MARKERS = (
+    "unauthorized", "forbidden", "invalid_token", "invalid token",
+    "invalid api key", "invalid api secret", "invalid key",
+    "signature", "revoked", "authentication", "reconnect",
+    "connection disabled", "connection is disabled",
+    " 401", "401 ", " 403", "403 ",
+)
+
+
+def _is_auth_error(msg: str) -> bool:
+    m = msg.lower()
+    return any(k in m for k in _AUTH_ERR_MARKERS)
+
 
 def refresh_account_balance(acct: BrokerAccount, creds: dict[str, Any]) -> bool:
     """Pull the broker's balance snapshot and write it onto ``acct`` in place.
@@ -47,7 +72,10 @@ def refresh_account_balance(acct: BrokerAccount, creds: dict[str, Any]) -> bool:
 
     Best-effort: a transient rate-limit (HTTP 429) is NOT a connection problem,
     so we keep the last good balance and don't surface a scary error (returns
-    False). Any other failure is recorded to ``last_error``."""
+    False). A genuine CREDENTIALS failure is tagged with ``AUTH_ERR_PREFIX`` on
+    ``last_error`` (drives the "Broker offline" pill); any other failure is
+    recorded plainly. A success clears ``last_error``, so the offline state
+    self-heals once the broker is reachable again."""
     try:
         adapter = adapter_for(acct, creds)
         if not isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter)):
@@ -65,7 +93,10 @@ def refresh_account_balance(acct: BrokerAccount, creds: dict[str, Any]) -> bool:
         if "429" in msg or "TOO_MANY_REQUESTS" in msg or "Too many requests" in msg:
             log.info("balance_sync: rate-limited (429) for %s — keeping cached balance", acct.id)
             return False
-        acct.last_error = f"balance fetch failed: {str(exc)[:400]}"
+        if _is_auth_error(msg):
+            acct.last_error = f"{AUTH_ERR_PREFIX} {str(exc)[:380]}"
+        else:
+            acct.last_error = f"balance fetch failed: {str(exc)[:380]}"
         return False
 
 
