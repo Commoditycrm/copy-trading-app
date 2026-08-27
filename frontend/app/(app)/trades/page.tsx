@@ -38,6 +38,16 @@ function fmt(n: string | null | undefined, dp = 2): string {
   return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
+/** Share/contract quantity: whole numbers show clean (3, 150), fractional shows
+ *  its real value (1.5, 0.25) with trailing zeros trimmed — NEVER rounded to a
+ *  whole number, which made a 1.5-share copy display as "2". */
+function fmtQty(n: string | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  const v = Number(n);
+  if (!Number.isFinite(v)) return String(n);
+  return v.toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
 /** Notional value of fills. For options multiply by 100 (contract multiplier). */
 function notionalFor(order: Order): number {
   if (!order.filled_quantity || !order.filled_avg_price) return 0;
@@ -742,7 +752,7 @@ export default function TradesPage() {
                           {orderSymbolLabel(o)}
                         </span>
                       </td>
-                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.quantity, 0)}</td>
+                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmtQty(f.quantity)}</td>
                       <td className="px-5 py-2.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent", opacity: 0.75 }}>
                           {o.side}
@@ -785,7 +795,7 @@ export default function TradesPage() {
                           {orderSymbolLabel(o)}
                         </span>
                       </td>
-                      <td className="px-5 py-3.5 num">{fmt(o.quantity, 0)}</td>
+                      <td className="px-5 py-3.5 num">{fmtQty(o.quantity)}</td>
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
                           {o.side}
