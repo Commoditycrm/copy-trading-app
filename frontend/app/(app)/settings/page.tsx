@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
@@ -249,6 +250,13 @@ export default function SettingsPage() {
       }
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
+
+  // Live-sync the Discord toggle when it's flipped from the sidebar copy-toggle
+  // prompt (same tab, different component) — so the ON/OFF here updates without
+  // a page refresh.
+  useEffect(() => onDiscordChanged((d) => setTrd((prev) => prev ? {
+    ...prev, discord_alerts_enabled: d.enabled, discord_webhook_configured: d.configured,
+  } : prev)), []);
 
   // Keep the subscriber's follow state fresh even if a live SSE push is
   // missed (e.g. the trader approved in another tab): refetch /mine + settings
@@ -785,6 +793,9 @@ export default function SettingsPage() {
         method: "PATCH", body: JSON.stringify({ discord_webhook_url: discordUrl.trim() }),
       });
       setTrd(t);
+      emitDiscordChanged({
+        enabled: !!t.discord_alerts_enabled, configured: !!t.discord_webhook_configured,
+      });
       setDiscordUrl("");
       notify.success(discordUrl.trim() ? "Webhook saved" : "Webhook cleared");
     } catch (e) {
@@ -798,9 +809,13 @@ export default function SettingsPage() {
     const prev = trd;
     setTrd(trd ? { ...trd, discord_alerts_enabled: next } : trd);
     try {
-      setTrd(await api<TraderSettings>("/api/settings/trader", {
+      const t = await api<TraderSettings>("/api/settings/trader", {
         method: "PATCH", body: JSON.stringify({ discord_alerts_enabled: next }),
-      }));
+      });
+      setTrd(t);
+      emitDiscordChanged({
+        enabled: !!t.discord_alerts_enabled, configured: !!t.discord_webhook_configured,
+      });
     } catch (e) {
       setTrd(prev);
       notify.fromError(e, next ? "Add a webhook URL first" : "Could not update");
