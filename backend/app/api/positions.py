@@ -17,7 +17,7 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -30,11 +30,13 @@ from app.brokers import adapter_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
-from app.models.order import InstrumentType, Order, OrderSide, OrderType
+from datetime import date
+from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import ClosePositionIn, PositionOut
+from app.models.sell_all_snapshot import SellAllSnapshot
 from app.services import trailing_stop_close
 from app.services.crypto import decrypt_json
 
@@ -181,6 +183,9 @@ def close_all_positions(
 
     closed: list[dict] = []
     failed: list[dict] = []
+    # Snapshot the positions we're about to flatten so the user can Re-Enter
+    # them later (Sell-All snapshot + re-entry). Saved once, after the sweep.
+    snapshot_positions: list[dict] = []
     skip_fanout = not include_subscribers
 
     for acct in accts:
@@ -201,6 +206,16 @@ def close_all_positions(
                 continue
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
+            # Record what we held (signed qty + exit price) for Re-Enter.
+            snapshot_positions.append({
+                "symbol": pos.symbol,
+                "instrument_type": pos.instrument_type.value,
+                "quantity": str(pos.quantity),
+                "price": str(pos.current_price) if pos.current_price is not None else None,
+                "option_expiry": pos.option_expiry.isoformat() if pos.option_expiry else None,
+                "option_strike": str(pos.option_strike) if pos.option_strike is not None else None,
+                "option_right": pos.option_right.value if pos.option_right else None,
+            })
             # Stocks close at MARKET; OPTIONS always as a LIMIT — both brokers
             # refuse option market orders (Alpaca always; Webull on
             # limited-liquidity contracts). See _option_close_limit.
@@ -253,7 +268,114 @@ def close_all_positions(
                     "error": str(exc)[:300],
                 })
 
-    return {"closed": closed, "failed": failed, "closed_count": len(closed), "failed_count": len(failed)}
+    snapshot_id = None
+    if snapshot_positions:
+        snap = SellAllSnapshot(user_id=user.id, positions=snapshot_positions)
+        db.add(snap)
+        db.commit()
+        snapshot_id = str(snap.id)
+
+    return {
+        "closed": closed, "failed": failed,
+        "closed_count": len(closed), "failed_count": len(failed),
+        "snapshot_id": snapshot_id, "snapshot_count": len(snapshot_positions),
+    }
+
+
+@router.get("/snapshots/latest")
+def latest_sell_all_snapshot(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """The user's most recent Sell-All snapshot (what they can Re-Enter), or
+    null if they haven't done a Sell-All yet."""
+    snap = db.execute(
+        select(SellAllSnapshot)
+        .where(SellAllSnapshot.user_id == user.id)
+        .order_by(SellAllSnapshot.created_at.desc())
+        .limit(1)
+    ).scalars().first()
+    if not snap:
+        return {"snapshot": None}
+    return {"snapshot": {
+        "id": str(snap.id),
+        "created_at": snap.created_at.isoformat(),
+        "positions": snap.positions,
+    }}
+
+
+@router.post("/re-enter")
+def re_enter_from_snapshot(
+    request: Request,
+    background: BackgroundTasks,
+    discount_percent: Decimal | None = Query(
+        default=None, ge=0, le=100,
+        description="Re-buy each position this % BELOW its exit price (a resting LIMIT). Omit / 0 = market buy now.",
+    ),
+    snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Re-open the positions from a Sell-All snapshot. Long positions re-buy,
+    short positions re-sell, same quantities. With ``discount_percent`` a stock
+    re-buy rests as a LIMIT that % below the exit price ('buy the dip')."""
+    q = select(SellAllSnapshot).where(SellAllSnapshot.user_id == user.id)
+    q = q.where(SellAllSnapshot.id == snapshot_id) if snapshot_id else q.order_by(SellAllSnapshot.created_at.desc())
+    snap = db.execute(q.limit(1)).scalars().first()
+    if not snap or not snap.positions:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="no_snapshot")
+
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no_connected_broker")
+
+    disc = Decimal(discount_percent) if discount_percent is not None else Decimal(0)
+    placed: list[dict] = []
+    failed: list[dict] = []
+    for p in snap.positions:
+        try:
+            qty = Decimal(p["quantity"])
+            side = OrderSide.BUY if qty > 0 else OrderSide.SELL
+            it = InstrumentType(p["instrument_type"])
+            price = Decimal(p["price"]) if p.get("price") else None
+            # Discount only applies to a stock RE-BUY with a known exit price.
+            use_limit = disc > 0 and price is not None and side == OrderSide.BUY and it == InstrumentType.STOCK
+            limit_price = (price * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01")) if use_limit else None
+            payload = PlaceOrderIn(
+                instrument_type=it,
+                symbol=p["symbol"],
+                side=side,
+                order_type=OrderType.LIMIT if use_limit else OrderType.MARKET,
+                quantity=abs(qty),
+                limit_price=limit_price,
+                option_expiry=date.fromisoformat(p["option_expiry"]) if p.get("option_expiry") else None,
+                option_strike=Decimal(p["option_strike"]) if p.get("option_strike") else None,
+                option_right=OptionRight(p["option_right"]) if p.get("option_right") else None,
+            )
+            order = _place_trader_order(
+                db, user, payload, acct.id, background, request,
+                skip_fanout=True, resolve_wash_trade=False,
+            )
+            placed.append({
+                "symbol": p["symbol"], "side": side.value, "qty": str(abs(qty)),
+                "order_type": payload.order_type.value,
+                "limit_price": str(limit_price) if limit_price is not None else None,
+                "order_id": str(order.id),
+            })
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"symbol": p.get("symbol"), "error": str(exc)[:300]})
+
+    return {
+        "placed": placed, "failed": failed,
+        "placed_count": len(placed), "failed_count": len(failed),
+        "discount_percent": str(discount_percent) if discount_percent is not None else None,
+        "snapshot_id": str(snap.id),
+    }
 
 
 @router.post("/close-all-subscribers")
