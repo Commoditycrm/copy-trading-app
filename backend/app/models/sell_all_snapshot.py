@@ -7,7 +7,7 @@ per Sell-All; ``positions`` is a JSON list of the closed positions.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,7 +24,11 @@ class SellAllSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
+    # One ACTIVE snapshot per user at a time: a new Sell-All supersedes the
+    # prior (sets it active=False). The card shows only the active one; older
+    # ones are kept (not deleted) so Re-Entry badges on their orders survive.
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"), index=True)
     # List of {symbol, instrument_type, quantity (signed), price, option_expiry,
-    # option_strike, option_right}. Quantity keeps its sign so Re-Enter can
-    # rebuild the same direction (long -> BUY, short -> SELL).
+    # option_strike, option_right, reentry_order_id}. Quantity keeps its sign so
+    # Re-Enter can rebuild the same direction (long -> BUY, short -> SELL).
     positions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
