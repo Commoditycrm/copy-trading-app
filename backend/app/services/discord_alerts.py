@@ -441,6 +441,57 @@ def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30)
             emit_trader_fill_alert(oid)
 
 
+def suppress_pending_trader_alerts(db, user_id: uuid.UUID, window_hours: int = 6) -> int:
+    """Claim the backlog of a trader's recently-FILLED orders — write the
+    once-per-order sent-marker WITHOUT sending — so trades taken while Discord
+    alerts were OFF are not retroactively pushed when alerts are turned back ON.
+
+    The problem: markers are only written when an alert is sent, so trades made
+    with alerts OFF accumulate unmarked; the moment alerts flip ON, the
+    ``emit_pending_trader_alerts`` sweep finds that whole unmarked backlog (their
+    trade time is recent) and blasts every card at once (prod: a trader who
+    toggled copy+alerts off, traded, then back on, saw all the off-period trades
+    fire). Called on the OFF→ON transition BEFORE the caller commits, so any
+    later sweep sees the markers and skips; a concurrent sweep is also safe
+    because ``_run`` re-checks the marker inside its per-order advisory lock.
+
+    Bounded to the recent window the sweep can actually reach (its 30-min
+    trade-time window, plus margin) so only sweep-eligible fills are claimed —
+    older off-period trades fall outside the sweep window anyway. Returns the
+    number of markers written. Only NEW fills (after this point) will alert."""
+    ts = db.get(TraderSettings, user_id)
+    if ts is None or not ts.discord_alerts_enabled:
+        return 0
+    since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    trade_time = func.coalesce(Order.closed_at, Order.submitted_at, Order.created_at)
+    oids = db.execute(
+        select(Order.id).where(
+            Order.user_id == user_id,
+            Order.parent_order_id.is_(None),
+            Order.status == OrderStatus.FILLED,
+            trade_time > since,
+        )
+    ).scalars().all()
+    if not oids:
+        return 0
+    marked = set(db.execute(
+        select(AuditLog.entity_id).where(
+            AuditLog.action == _ALERT_SENT_ACTION,
+            AuditLog.entity_id.in_([str(o) for o in oids]),
+        )
+    ).scalars().all())
+    written = 0
+    for oid in oids:
+        if str(oid) not in marked:
+            audit.record(
+                db, actor_user_id=user_id, action=_ALERT_SENT_ACTION,
+                entity_type="order", entity_id=oid,
+                metadata={"suppressed_on_enable": True},
+            )
+            written += 1
+    return written
+
+
 def emit_trader_fill_alert(trader_order_id: uuid.UUID) -> None:
     """Fire-and-forget a Discord card for a trader's just-FILLED order.
 
