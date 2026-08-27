@@ -32,7 +32,7 @@ from app.schemas.settings import (
     TraderToggleIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit, cache
+from app.services import audit, cache, market_hours
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -41,9 +41,11 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
     """Build the response payload from a SubscriberSettings ORM row.
 
     Centralised so adding a new column doesn't require touching every
-    PATCH endpoint that returns this shape. ``todays_realized_pnl`` is
-    computed from the fills table here — the live tick from pnl_poller
-    pushes the same number via SSE for the panel's live refresh."""
+    PATCH endpoint that returns this shape. ``todays_realized_pnl`` carries
+    today's MARKED P&L (realized + unrealized) — the same equity-based number
+    the daily loss/profit limit is enforced on and the live pnl.tick pushes —
+    from the poller's cached snapshot, falling back to realized-only (fills
+    FIFO) when no marked snapshot is available yet."""
     # The followed trader's business_name is surfaced to subscribers so
     # the AppShell can show the trader's brand instead of the default
     # "ARK" wordmark. Cheap one-row lookup via PK — no join needed since
@@ -53,6 +55,12 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         trader = db.get(User, s.following_trader_id)
         if trader is not None:
             trader_business_name = trader.business_name
+    # Prefer the poller-stashed MARKED P&L (realized + unrealized) so the initial
+    # load matches the live pnl.tick and the limit enforcement. Fall back to
+    # realized-only when the poller hasn't stashed a marked snapshot for today
+    # (e.g. hasn't ticked yet, or the broker has no cheap equity snapshot).
+    _marked = cache.get_today_marked(s.user_id, market_hours.now_et().date())
+    todays_pnl = _marked if _marked is not None else today_realized_pnl(db, s.user_id)
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
@@ -61,7 +69,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         daily_profit_limit=s.daily_profit_limit,
-        todays_realized_pnl=today_realized_pnl(db, s.user_id),
+        todays_realized_pnl=todays_pnl,
         retry_interval_open=s.retry_interval_open.value,
         retry_interval_close=s.retry_interval_close.value,
         retry_max_attempts=s.retry_max_attempts,
