@@ -113,6 +113,25 @@ def _attach_realized_pnl(db: Session, user: User, orders: list[Order]) -> None:
         o.realized_pnl = by_order.get(o.id)
 
 
+def _attach_reentry_flag(db: Session, user: User, orders: list[Order]) -> None:
+    """Mark the transient .is_reentry on orders that were placed by a Sell-All
+    Re-Enter. Source of truth is the snapshot rows (each item stores the
+    reentry_order_id of the buy-back it placed) — no column on Order needed."""
+    if not orders:
+        return
+    from app.models.sell_all_snapshot import SellAllSnapshot  # noqa: PLC0415
+    reentry_ids: set = set()
+    for snap in db.execute(
+        select(SellAllSnapshot.positions).where(SellAllSnapshot.user_id == user.id)
+    ).scalars():
+        for p in (snap or []):
+            oid = p.get("reentry_order_id")
+            if oid:
+                reentry_ids.add(str(oid))
+    for o in orders:
+        o.is_reentry = str(o.id) in reentry_ids
+
+
 @router.get("/trades", response_model=list[OrderOut])
 def list_trades(
     db: Session = Depends(get_db),
@@ -140,6 +159,7 @@ def list_trades(
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
+    _attach_reentry_flag(db, user, orders)
     return orders
 
 
@@ -208,6 +228,7 @@ def list_trades_page(
         ).scalars()
     )
     _attach_realized_pnl(db, user, rows)
+    _attach_reentry_flag(db, user, rows)
     return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
@@ -281,6 +302,7 @@ def export_trades(
     # Per-trade realized P&L (FIFO) so the export carries the same "Realized P&L"
     # the Trades page shows on each closing row.
     _attach_realized_pnl(db, target, orders)
+    _attach_reentry_flag(db, target, orders)
     now = datetime.now(timezone.utc)
     # Only the "export everything" path can hit ROW_CAP; an explicit limit is
     # already bounded (le=ROW_CAP) so it's never a silent truncation.
