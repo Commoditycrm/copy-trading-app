@@ -7,6 +7,7 @@ from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.notification import Notification
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
+from app.models.sell_all_snapshot import SellAllSnapshot
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 
@@ -28,6 +29,7 @@ __all__ = [
     "OrderStatus",
     "OrderType",
     "RetryInterval",
+    "SellAllSnapshot",
     "SubscriberSettings",
     "TestResult",
     "TraderSettings",
