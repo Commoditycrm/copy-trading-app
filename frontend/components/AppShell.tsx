@@ -7,8 +7,9 @@ import { api, ApiError, clearTokens, getAccessToken, resendVerification } from "
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
-import type { SubscriberSettings, User } from "@/lib/types";
+import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { CopyDiscordPromptModal } from "@/components/CopyDiscordPromptModal";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { NotificationBell } from "@/components/NotificationBell";
 import { ProfileModal } from "@/components/profile/ProfileModal";
@@ -267,6 +268,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // unloaded so we can hide the toggle until we know the state.
   const [bulkCopy, setBulkCopy] = useState<BulkCopyState | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Trader's Discord-alert state — so the copy toggle can offer to flip alerts
+  // too. `configured` = a webhook is set (required before alerts can be enabled).
+  const [traderDiscord, setTraderDiscord] = useState<{ enabled: boolean; configured: boolean } | null>(null);
+  // Pending copy toggle awaiting the "also flip Discord?" prompt. null = closed.
+  const [copyPrompt, setCopyPrompt] = useState<{ next: boolean; discordTarget: boolean } | null>(null);
   // Subscriber-only personal copy switch (same UX, different endpoint).
   const [subCopy, setSubCopy] = useState<SubscriberSettings | null>(null);
   const [subCopyBusy, setSubCopyBusy] = useState(false);
@@ -375,6 +381,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         }
         if (u.role === "trader") {
           api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+          api<TraderSettings>("/api/settings/trader")
+            .then((t) => setTraderDiscord({
+              enabled: !!t.discord_alerts_enabled,
+              configured: !!t.discord_webhook_configured,
+            }))
+            .catch(() => {});
         } else {
           api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
         }
@@ -420,26 +432,63 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }
   }
 
-  async function toggleBulkCopy() {
+  // Trader clicked the sidebar copy switch. `enabled` in the payload means
+  // "fanout enabled" — resume when currently paused, pause when currently
+  // running. Before applying, offer to flip Discord alerts the same way:
+  //   pausing  + alerts ON              → prompt "also turn alerts OFF?"
+  //   resuming + alerts OFF + webhook   → prompt "also turn alerts ON?"
+  // Anything else (alerts already in the target state, or resume with no
+  // webhook to enable) skips the prompt and just toggles copy.
+  function requestToggleBulkCopy() {
     if (!bulkCopy) return;
-    // Toggle master pause. `enabled` in the payload means "fanout enabled" —
-    // resume when currently paused, pause when currently running.
     const next = bulkCopy.paused;
+    const d = traderDiscord;
+    let discordTarget: boolean | null = null;
+    if (d) {
+      if (!next && d.enabled) discordTarget = false;                  // pausing → offer OFF
+      else if (next && !d.enabled && d.configured) discordTarget = true;  // resuming → offer ON
+    }
+    if (discordTarget === null) {
+      void applyBulkCopy(next, null);   // nothing sensible to prompt → just toggle copy
+      return;
+    }
+    setCopyPrompt({ next, discordTarget });
+  }
+
+  // Apply the copy toggle, and — when discordTarget is non-null — flip Discord
+  // alerts to that value too. A Discord failure never blocks the copy change.
+  async function applyBulkCopy(next: boolean, discordTarget: boolean | null) {
     setBulkBusy(true);
     try {
       const res = await api<BulkCopyState>("/api/subscribers/copy-state", {
         method: "PATCH", body: JSON.stringify({ enabled: next }),
       });
       setBulkCopy(res);
+      let discordMsg = "";
+      if (discordTarget !== null) {
+        try {
+          const t = await api<TraderSettings>("/api/settings/trader", {
+            method: "PATCH", body: JSON.stringify({ discord_alerts_enabled: discordTarget }),
+          });
+          setTraderDiscord({
+            enabled: !!t.discord_alerts_enabled,
+            configured: !!t.discord_webhook_configured,
+          });
+          discordMsg = discordTarget ? " · Discord alerts on" : " · Discord alerts off";
+        } catch (e) {
+          notify.fromError(e, "Copy updated, but Discord alerts didn't change");
+        }
+      }
       notify.success(
-        next
+        (next
           ? "Copy trading resumed for subscribers"
-          : "Copy trading paused — subscribers will not receive new trades"
+          : "Copy trading paused — subscribers will not receive new trades") + discordMsg
       );
     } catch (e) {
       notify.fromError(e, "Could not update copy trading");
     } finally {
       setBulkBusy(false);
+      setCopyPrompt(null);
     }
   }
 
@@ -627,7 +676,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               on={!bulkCopy.paused}
               busy={bulkBusy}
               collapsed={navCollapsed}
-              onToggle={toggleBulkCopy}
+              onToggle={requestToggleBulkCopy}
               title={!bulkCopy.paused ? "Pause copy trading" : "Resume copy trading"}
             />
           )}
@@ -720,6 +769,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             </button>
           </div>
         </header>
+
+        {copyPrompt && (
+          <CopyDiscordPromptModal
+            open
+            busy={bulkBusy}
+            title={copyPrompt.next ? "Resume copy trading?" : "Pause copy trading?"}
+            message={
+              copyPrompt.next
+                ? "You're resuming copy trading. Do you also want to turn your Discord trade alerts back ON?"
+                : "You're pausing copy trading. Do you also want to turn your Discord trade alerts OFF?"
+            }
+            alsoLabel={copyPrompt.next ? "Yes — turn alerts on" : "Yes — turn alerts off"}
+            copyOnlyLabel={copyPrompt.next ? "No — just resume copy" : "No — just pause copy"}
+            onAlso={() => applyBulkCopy(copyPrompt.next, copyPrompt.discordTarget)}
+            onCopyOnly={() => applyBulkCopy(copyPrompt.next, null)}
+            onCancel={() => setCopyPrompt(null)}
+          />
+        )}
 
         <ProfileModal
           open={profileOpen}
