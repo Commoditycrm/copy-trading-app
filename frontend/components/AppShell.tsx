@@ -772,24 +772,29 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {copyPrompt && (
           <CopyDiscordPromptModal
             open
+            turningOn={copyPrompt.next}
             busy={bulkBusy}
             title={copyPrompt.next ? "Resume copy trading?" : "Pause copy trading?"}
             message={
               copyPrompt.next ? (
                 <>
-                  You&apos;re resuming copy trading. Do you also want to turn your Discord trade alerts back ON?
+                  You&apos;re turning copy trading back on. Want to turn your{" "}
+                  <strong style={{ color: "var(--text)" }}>Discord trade alerts</strong> on too?
                   {traderDiscord && !traderDiscord.configured && (
-                    <span className="block mt-2" style={{ color: "var(--muted)" }}>
-                      Note: set a Discord webhook in Settings first — alerts can&apos;t turn on without one.
+                    <span className="block mt-2 text-xs" style={{ color: "var(--muted)" }}>
+                      Add a Discord webhook in Settings first — alerts can&apos;t turn on without one.
                     </span>
                   )}
                 </>
               ) : (
-                "You're pausing copy trading. Do you also want to turn your Discord trade alerts OFF?"
+                <>
+                  You&apos;re pausing copy trading. Want to turn your{" "}
+                  <strong style={{ color: "var(--text)" }}>Discord trade alerts</strong> off too?
+                </>
               )
             }
-            alsoLabel={copyPrompt.next ? "Yes — turn alerts on" : "Yes — turn alerts off"}
-            copyOnlyLabel={copyPrompt.next ? "No — just resume copy" : "No — just pause copy"}
+            alsoLabel={copyPrompt.next ? "Turn alerts on" : "Turn alerts off"}
+            copyOnlyLabel={copyPrompt.next ? "Just resume" : "Just pause"}
             onAlso={() => applyBulkCopy(copyPrompt.next, copyPrompt.discordTarget)}
             onCopyOnly={() => applyBulkCopy(copyPrompt.next, null)}
             onCancel={() => setCopyPrompt(null)}
