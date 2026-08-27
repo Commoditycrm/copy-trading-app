@@ -51,10 +51,18 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
     # "ARK" wordmark. Cheap one-row lookup via PK — no join needed since
     # we already have the FK.
     trader_business_name: str | None = None
+    # The followed trader's live copy-trading status, surfaced so the subscriber
+    # can see whether their trader is actively broadcasting or has paused (else a
+    # paused trader just looks like "no trades" with no explanation). Active =
+    # master trading switch ON and NOT paused; a missing settings row means
+    # defaults (enabled, not paused) → active. None when not following anyone.
+    trader_copy_active: bool | None = None
     if s.following_trader_id:
         trader = db.get(User, s.following_trader_id)
         if trader is not None:
             trader_business_name = trader.business_name
+        _ts = db.get(TraderSettings, s.following_trader_id)
+        trader_copy_active = _ts is None or (_ts.trading_enabled and not _ts.copy_paused)
     # Prefer the poller-stashed MARKED P&L (realized + unrealized) so the initial
     # load matches the live pnl.tick and the limit enforcement. Fall back to
     # realized-only when the poller hasn't stashed a marked snapshot for today
@@ -65,6 +73,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
         following_trader_business_name=trader_business_name,
+        following_trader_copy_active=trader_copy_active,
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,

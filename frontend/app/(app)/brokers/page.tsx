@@ -7,6 +7,7 @@ import { Check, Lock, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import { notify } from "@/lib/toast";
+import { emitBrokerChanged } from "@/lib/traderSync";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
@@ -334,6 +335,10 @@ export default function BrokersPage() {
       const accts = await api<BrokerAccount[]>("/api/brokers");
       setAccounts(accts);
       setSnapshot(BROKERS_KEY, accts);
+      // Nudge the navbar broker-status pill to re-pull now (it otherwise waits
+      // for its 30s poll), so a just-connected/disconnected broker reflects
+      // immediately instead of looking stuck until refresh.
+      emitBrokerChanged();
       // Feature flags (best-effort — a failure just leaves Webull hidden).
       api<{ webull_direct_enabled: boolean }>("/api/brokers/features")
         .then(f => setWebullEnabled(!!f.webull_direct_enabled))
