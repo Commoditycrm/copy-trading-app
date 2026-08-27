@@ -83,7 +83,7 @@ export function CopyDiscordPromptModal({
           aria-label="Close"
           disabled={busy}
           onClick={onCancel}
-          className="absolute right-3 top-3 grid place-items-center rounded-md p-1.5 transition-colors disabled:opacity-40"
+          className="absolute right-3 top-3 grid place-items-center rounded-md px-1.5 h-10 transition-colors disabled:opacity-40"
           style={{ color: "var(--muted)" }}
           onMouseEnter={(e) => { e.currentTarget.style.background = "var(--hover, rgba(127,127,127,0.12))"; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
@@ -117,7 +117,7 @@ export function CopyDiscordPromptModal({
             type="button"
             disabled={busy}
             onClick={onAlso}
-            className="px-4 py-2.5 text-sm font-medium inline-flex items-center justify-center gap-2 transition-opacity disabled:opacity-60"
+            className="px-4 h-10 text-sm font-medium inline-flex items-center justify-center gap-2 transition-opacity disabled:opacity-60"
             style={{ background: BLURPLE, color: "#fff", border: "1px solid transparent", borderRadius: "var(--r-sm)" }}
           >
             {busy ? <Spinner /> : <Icon size={15} />}
