@@ -31,7 +31,7 @@ from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from datetime import date
-from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderType
+from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
@@ -282,13 +282,41 @@ def close_all_positions(
     }
 
 
+# A re-entry order that's still live (don't re-place — avoids double-buying).
+_REENTRY_WORKING = {
+    OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED, OrderStatus.RETRY_PENDING,
+}
+
+
+def _reentry_status(db: Session, item: dict) -> str:
+    """Per-item re-entry state:
+      'filled'  — the buy-back filled; the position is back.
+      'working' — a buy-back is resting (waiting to fill).
+      'pending' — never re-entered, or the last attempt canceled/expired/
+                  rejected — so it still NEEDS a (re-)entry.
+    This is what makes Re-Enter fill-aware: only 'pending' items get placed."""
+    oid = item.get("reentry_order_id")
+    if not oid:
+        return "pending"
+    o = db.get(Order, uuid.UUID(oid))
+    if o is None:
+        return "pending"
+    if o.status == OrderStatus.FILLED:
+        return "filled"
+    if o.status in _REENTRY_WORKING:
+        return "working"
+    return "pending"  # canceled / expired / rejected → re-enter is allowed again
+
+
 @router.get("/snapshots/latest")
 def latest_sell_all_snapshot(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
-    """The user's most recent Sell-All snapshot (what they can Re-Enter), or
-    null if they haven't done a Sell-All yet."""
+    """The user's most recent Sell-All snapshot, each position annotated with its
+    live re-entry status (filled / working / pending) plus a summary count. Null
+    if they haven't done a Sell-All yet."""
     snap = db.execute(
         select(SellAllSnapshot)
         .where(SellAllSnapshot.user_id == user.id)
@@ -297,10 +325,27 @@ def latest_sell_all_snapshot(
     ).scalars().first()
     if not snap:
         return {"snapshot": None}
+    positions = []
+    for p in snap.positions:
+        st = _reentry_status(db, p)
+        positions.append({
+            "symbol": p["symbol"],
+            "instrument_type": p["instrument_type"],
+            "quantity": p["quantity"],
+            "price": p.get("price"),
+            "reentry_status": st,
+        })
+    summary = {
+        "total": len(positions),
+        "filled": sum(1 for x in positions if x["reentry_status"] == "filled"),
+        "working": sum(1 for x in positions if x["reentry_status"] == "working"),
+        "pending": sum(1 for x in positions if x["reentry_status"] == "pending"),
+    }
     return {"snapshot": {
         "id": str(snap.id),
         "created_at": snap.created_at.isoformat(),
-        "positions": snap.positions,
+        "positions": positions,
+        "summary": summary,
     }}
 
 
@@ -316,9 +361,11 @@ def re_enter_from_snapshot(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
-    """Re-open the positions from a Sell-All snapshot. Long positions re-buy,
+    """Re-open the positions from a Sell-All snapshot, FILL-AWARE: only items not
+    already back (or with a resting order) get a new buy. Long positions re-buy,
     short positions re-sell, same quantities. With ``discount_percent`` a stock
-    re-buy rests as a LIMIT that % below the exit price ('buy the dip')."""
+    re-buy rests as a LIMIT that % below the exit price ('buy the dip'). Safe to
+    click repeatedly — filled/working items are skipped, so no double-buying."""
     q = select(SellAllSnapshot).where(SellAllSnapshot.user_id == user.id)
     q = q.where(SellAllSnapshot.id == snapshot_id) if snapshot_id else q.order_by(SellAllSnapshot.created_at.desc())
     snap = db.execute(q.limit(1)).scalars().first()
@@ -336,8 +383,16 @@ def re_enter_from_snapshot(
 
     disc = Decimal(discount_percent) if discount_percent is not None else Decimal(0)
     placed: list[dict] = []
+    skipped: list[dict] = []
     failed: list[dict] = []
+    new_positions: list[dict] = []
     for p in snap.positions:
+        st = _reentry_status(db, p)
+        if st in ("filled", "working"):
+            # Already back, or a buy-back is resting — don't place again.
+            skipped.append({"symbol": p["symbol"], "reason": st})
+            new_positions.append(p)
+            continue
         try:
             qty = Decimal(p["quantity"])
             side = OrderSide.BUY if qty > 0 else OrderSide.SELL
@@ -367,12 +422,20 @@ def re_enter_from_snapshot(
                 "limit_price": str(limit_price) if limit_price is not None else None,
                 "order_id": str(order.id),
             })
+            # Link the buy-back to this item so a later click sees it as
+            # working/filled and won't place a duplicate.
+            new_positions.append({**p, "reentry_order_id": str(order.id)})
         except Exception as exc:  # noqa: BLE001
             failed.append({"symbol": p.get("symbol"), "error": str(exc)[:300]})
+            new_positions.append(p)  # stays 'pending' — retriable next click
+
+    # Reassign (not mutate) so SQLAlchemy persists the updated JSONB.
+    snap.positions = new_positions
+    db.commit()
 
     return {
-        "placed": placed, "failed": failed,
-        "placed_count": len(placed), "failed_count": len(failed),
+        "placed": placed, "skipped": skipped, "failed": failed,
+        "placed_count": len(placed), "skipped_count": len(skipped), "failed_count": len(failed),
         "discount_percent": str(discount_percent) if discount_percent is not None else None,
         "snapshot_id": str(snap.id),
     }
