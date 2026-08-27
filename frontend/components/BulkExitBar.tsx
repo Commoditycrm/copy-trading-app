@@ -102,14 +102,16 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const useTrail = !isNaN(trailNum) && trailNum > 0 && trailNum <= 100;
 
   // Sell-All snapshot + re-entry. After a Sell-All the positions are saved so
-  // they can be re-opened (at market, or a % below the exit price).
-  const [snapshot, setSnapshot] = useState<{ id: string; created_at: string; positions: unknown[] } | null>(null);
+  // they can be re-opened. Each item carries a live re-entry status
+  // (filled / working / pending); Re-Enter only acts on the pending ones.
+  type SnapSummary = { total: number; filled: number; working: number; pending: number };
+  const [snapshot, setSnapshot] = useState<{ id: string; summary: SnapSummary } | null>(null);
   const [reDiscount, setReDiscount] = useState("");
   const [reBusy, setReBusy] = useState(false);
 
   async function loadSnapshot() {
     try {
-      const r = await api<{ snapshot: { id: string; created_at: string; positions: unknown[] } | null }>(
+      const r = await api<{ snapshot: { id: string; summary: SnapSummary } | null }>(
         "/api/positions/snapshots/latest",
       );
       setSnapshot(r.snapshot);
@@ -121,23 +123,34 @@ export function BulkExitBar({ onActionComplete }: Props) {
     loadSnapshot();
   }, []);
 
+  // While a snapshot with unresolved items is shown, poll so fills flip
+  // pending/working → filled live (30s cadence, cheap).
+  useEffect(() => {
+    if (!snapshot || snapshot.summary.pending + snapshot.summary.working === 0) return;
+    const id = setInterval(loadSnapshot, 15_000);
+    return () => clearInterval(id);
+  }, [snapshot]);
+
   async function reEnter() {
     const d = parseFloat(reDiscount);
     const useD = !isNaN(d) && d > 0 && d <= 100;
     setReBusy(true);
     try {
-      const res = await api<{ placed_count: number; failed_count: number }>(
+      const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
         `/api/positions/re-enter${useD ? `?discount_percent=${d}` : ""}`,
         { method: "POST" },
       );
-      if (res.placed_count === 0 && res.failed_count === 0) notify.info("Nothing to re-enter.");
+      const skip = res.skipped_count ? `, ${res.skipped_count} already in/resting` : "";
+      if (res.placed_count === 0 && res.failed_count === 0)
+        notify.info(res.skipped_count ? `Nothing new to re-enter${skip}.` : "Nothing to re-enter.");
       else if (res.failed_count === 0)
         notify.success(
           `Re-entered ${res.placed_count} position${res.placed_count === 1 ? "" : "s"}` +
-          (useD ? ` — limit ${d}% below exit.` : " at market."),
+          (useD ? ` — limit ${d}% below exit` : " at market") + `${skip}.`,
         );
-      else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed — check Order History.`);
+      else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed${skip} — check Order History.`);
       onActionComplete?.();
+      loadSnapshot();  // refresh per-item status
     } catch (e) {
       notify.fromError(e, "Re-enter failed");
     } finally {
@@ -304,19 +317,26 @@ export function BulkExitBar({ onActionComplete }: Props) {
         </div>
       </div>
 
-      {snapshot && snapshot.positions.length > 0 && (
+      {snapshot && snapshot.summary.total > 0 && (
         <div
           className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
           style={cardStyle}
         >
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
             <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--good)" }} />
             <span className="text-[10px] uppercase tracking-[0.2em] font-semibold" style={{ color: "var(--text-2)" }}>
               Re-Enter Last Exit
             </span>
-            <span className="text-xs" style={{ color: "var(--muted)" }}>
-              {snapshot.positions.length} position{snapshot.positions.length === 1 ? "" : "s"} saved
+            {/* Fill-aware status: how many of the saved positions are back. */}
+            <span className="text-xs" style={{ color: "var(--good)" }}>
+              {snapshot.summary.filled}/{snapshot.summary.total} back in
             </span>
+            {snapshot.summary.working > 0 && (
+              <span className="text-xs" style={{ color: "#facc15" }}>· {snapshot.summary.working} resting</span>
+            )}
+            {snapshot.summary.pending > 0 && (
+              <span className="text-xs" style={{ color: "var(--muted)" }}>· {snapshot.summary.pending} to go</span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <div
@@ -340,11 +360,16 @@ export function BulkExitBar({ onActionComplete }: Props) {
             <button
               type="button"
               onClick={reEnter}
-              disabled={reBusy}
+              disabled={reBusy || snapshot.summary.pending === 0}
+              title={snapshot.summary.pending === 0
+                ? "Nothing to re-enter — all positions are back or have a resting order"
+                : `Re-enter the ${snapshot.summary.pending} position(s) not yet back`}
               className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               style={{ background: "var(--accent)", color: "var(--accent-ink)", border: "1px solid var(--accent)" }}
             >
-              {reBusy ? "Re-entering…" : "Re-Enter"}
+              {reBusy ? "Re-entering…"
+                : snapshot.summary.pending === 0 ? "All re-entered"
+                : `Re-Enter (${snapshot.summary.pending})`}
             </button>
           </div>
         </div>
