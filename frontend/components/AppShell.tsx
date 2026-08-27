@@ -434,25 +434,14 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   // Trader clicked the sidebar copy switch. `enabled` in the payload means
   // "fanout enabled" — resume when currently paused, pause when currently
-  // running. Before applying, offer to flip Discord alerts the same way:
-  //   pausing  + alerts ON              → prompt "also turn alerts OFF?"
-  //   resuming + alerts OFF + webhook   → prompt "also turn alerts ON?"
-  // Anything else (alerts already in the target state, or resume with no
-  // webhook to enable) skips the prompt and just toggles copy.
+  // running. ALWAYS prompt first to offer flipping Discord alerts the same way:
+  // pausing → offer alerts OFF, resuming → offer alerts ON (discordTarget = the
+  // copy direction). The apply step handles no-ops (alerts already in that
+  // state) and the resume-without-webhook case gracefully.
   function requestToggleBulkCopy() {
     if (!bulkCopy) return;
     const next = bulkCopy.paused;
-    const d = traderDiscord;
-    let discordTarget: boolean | null = null;
-    if (d) {
-      if (!next && d.enabled) discordTarget = false;                  // pausing → offer OFF
-      else if (next && !d.enabled && d.configured) discordTarget = true;  // resuming → offer ON
-    }
-    if (discordTarget === null) {
-      void applyBulkCopy(next, null);   // nothing sensible to prompt → just toggle copy
-      return;
-    }
-    setCopyPrompt({ next, discordTarget });
+    setCopyPrompt({ next, discordTarget: next });
   }
 
   // Apply the copy toggle, and — when discordTarget is non-null — flip Discord
@@ -776,9 +765,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             busy={bulkBusy}
             title={copyPrompt.next ? "Resume copy trading?" : "Pause copy trading?"}
             message={
-              copyPrompt.next
-                ? "You're resuming copy trading. Do you also want to turn your Discord trade alerts back ON?"
-                : "You're pausing copy trading. Do you also want to turn your Discord trade alerts OFF?"
+              copyPrompt.next ? (
+                <>
+                  You&apos;re resuming copy trading. Do you also want to turn your Discord trade alerts back ON?
+                  {traderDiscord && !traderDiscord.configured && (
+                    <span className="block mt-2" style={{ color: "var(--muted)" }}>
+                      Note: set a Discord webhook in Settings first — alerts can&apos;t turn on without one.
+                    </span>
+                  )}
+                </>
+              ) : (
+                "You're pausing copy trading. Do you also want to turn your Discord trade alerts OFF?"
+              )
             }
             alsoLabel={copyPrompt.next ? "Yes — turn alerts on" : "Yes — turn alerts off"}
             copyOnlyLabel={copyPrompt.next ? "No — just resume copy" : "No — just pause copy"}
