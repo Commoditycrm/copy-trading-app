@@ -205,10 +205,12 @@ class _PendingMirror:
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
-    raw = trader_qty * multiplier
-    if fractional:
-        return raw.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-    return raw.to_integral_value(rounding=ROUND_DOWN)
+    # WHOLE SHARES ONLY (product decision, 2026-08): copy trades are never
+    # fractional, even on brokers that support it. Always round the scaled size
+    # DOWN to a whole unit — so 3 × 0.5 = 1.5 → 1. A size that rounds to 0 (e.g.
+    # 1 × 0.5 = 0.5 → 0) yields no mirror (recorded as copy.skipped_zero_qty).
+    # ``fractional`` is kept for call-site compatibility but intentionally ignored.
+    return (trader_qty * multiplier).to_integral_value(rounding=ROUND_DOWN)
 
 
 class _DanglingEntryCancelled(Exception):
