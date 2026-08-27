@@ -91,15 +91,17 @@ export function CopyDiscordPromptModal({
           <X size={16} />
         </button>
 
-        {/* Icon badge */}
-        <div
-          className="grid place-items-center rounded-full mb-4"
-          style={{ width: 48, height: 48, background: `${BLURPLE}1F`, color: BLURPLE }}
-        >
-          <Icon size={22} />
+        {/* Icon + title on one row */}
+        <div className="flex items-center gap-3 mb-2.5 pr-6">
+          <div
+            className="grid place-items-center rounded-full shrink-0"
+            style={{ width: 40, height: 40, background: `${BLURPLE}1F`, color: BLURPLE }}
+          >
+            <Icon size={20} />
+          </div>
+          <h3 id="copy-discord-modal-title" className="text-base font-semibold">{title}</h3>
         </div>
 
-        <h3 id="copy-discord-modal-title" className="text-lg font-semibold mb-1.5">{title}</h3>
         <div className="text-sm leading-relaxed" style={{ color: "var(--text-2)" }}>{message}</div>
 
         <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 mt-6">
@@ -107,7 +109,7 @@ export function CopyDiscordPromptModal({
             type="button"
             disabled={busy}
             onClick={onCopyOnly}
-            className="btn-ghost px-4 py-2.5 text-sm rounded-lg disabled:opacity-50"
+            className="btn-ghost px-4 py-2.5 text-sm disabled:opacity-50"
           >
             {copyOnlyLabel}
           </button>
@@ -115,8 +117,8 @@ export function CopyDiscordPromptModal({
             type="button"
             disabled={busy}
             onClick={onAlso}
-            className="px-4 py-2.5 text-sm font-medium rounded-lg inline-flex items-center justify-center gap-2 transition-opacity disabled:opacity-60"
-            style={{ background: BLURPLE, color: "#fff" }}
+            className="px-4 py-2.5 text-sm font-medium inline-flex items-center justify-center gap-2 transition-opacity disabled:opacity-60"
+            style={{ background: BLURPLE, color: "#fff", border: "1px solid transparent", borderRadius: "var(--r-sm)" }}
           >
             {busy ? <Spinner /> : <Icon size={15} />}
             <span>{alsoLabel}</span>
