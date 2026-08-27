@@ -826,6 +826,15 @@ def _place_trader_order(
     from app.models.settings import TraderSettings  # local import — avoid cycle
     ts = db.get(TraderSettings, trader.id) if is_trader else None
     will_fanout = is_trader and not skip_fanout and not (ts and ts.copy_paused)
+    # Whether to actually HAND this order to fanout. We call fanout for EVERY
+    # trader order (unless the caller opted out) and let fanout_async make the
+    # pause decision — it forwards CLOSES to subscribers even while the trader's
+    # copy is paused (so a paused close still exits the subs) and drops OPENS.
+    # This mirrors the listener path (fanout_threadsafe calls fanout_async
+    # unconditionally). Gating the CALL on copy_paused (as `will_fanout` does,
+    # for the flag's sake) wrongly dropped paused CLOSES placed through the app —
+    # which is why closing from the broker worked but closing from Kopyaa didn't.
+    trigger_fanout = is_trader and not skip_fanout
 
     # Lifecycle: the moment the trader's submit hit our backend. Used by the
     # Performance page to compute api_to_broker_lag (= broker_accepted_at -
@@ -1093,8 +1102,10 @@ def _place_trader_order(
     # their own close don't propagate to anyone. Callers (e.g. close-all with
     # "mine only" scope) can also opt out via skip_fanout. The trader's master
     # pause is also checked at the start of fanout itself — we record the
-    # intended-fanout flag (`will_fanout`) on the order row above.
-    if will_fanout:
+    # intended-fanout flag (`will_fanout`) on the order row above, but ALWAYS
+    # hand the order to fanout (trigger_fanout) so fanout_async can still forward
+    # a CLOSE to subscribers while the trader's copy is paused.
+    if trigger_fanout:
         background.add_task(_run_fanout_in_background, order.id, trader.id)
     return order
 
