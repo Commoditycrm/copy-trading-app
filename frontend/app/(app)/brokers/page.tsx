@@ -679,9 +679,9 @@ export default function BrokersPage() {
 
             {/* Balance row */}
             <div className="mt-5 pt-4 hairline grid grid-cols-3 gap-4">
+              <Stat label="Total account value" value={fmtMoney(a.total_equity, a.currency)} />
               <Stat label="Cash" value={fmtMoney(a.cash, a.currency)} />
               <Stat label="Buying power" value={fmtMoney(a.buying_power, a.currency)} />
-              <Stat label="Total equity" value={fmtMoney(a.total_equity, a.currency)} />
             </div>
             <div className="mt-3 flex items-center justify-between">
               <span className="text-[10px]" style={{ color: "var(--faint)" }}>
