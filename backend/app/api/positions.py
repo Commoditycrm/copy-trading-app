@@ -18,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, require_trader
@@ -270,7 +270,13 @@ def close_all_positions(
 
     snapshot_id = None
     if snapshot_positions:
-        snap = SellAllSnapshot(user_id=user.id, positions=snapshot_positions)
+        # One active snapshot per user: this Sell-All supersedes any prior one.
+        db.execute(
+            update(SellAllSnapshot)
+            .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
+            .values(active=False)
+        )
+        snap = SellAllSnapshot(user_id=user.id, positions=snapshot_positions)  # active defaults True
         db.add(snap)
         db.commit()
         snapshot_id = str(snap.id)
@@ -314,12 +320,12 @@ def latest_sell_all_snapshot(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
-    """The user's most recent Sell-All snapshot, each position annotated with its
-    live re-entry status (filled / working / pending) plus a summary count. Null
-    if they haven't done a Sell-All yet."""
+    """The user's ACTIVE Sell-All snapshot (the current one — superseded on each
+    new Sell-All), each position annotated with its live re-entry status
+    (filled / working / pending) plus a summary count. Null if none active."""
     snap = db.execute(
         select(SellAllSnapshot)
-        .where(SellAllSnapshot.user_id == user.id)
+        .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
         .order_by(SellAllSnapshot.created_at.desc())
         .limit(1)
     ).scalars().first()
@@ -367,7 +373,11 @@ def re_enter_from_snapshot(
     re-buy rests as a LIMIT that % below the exit price ('buy the dip'). Safe to
     click repeatedly — filled/working items are skipped, so no double-buying."""
     q = select(SellAllSnapshot).where(SellAllSnapshot.user_id == user.id)
-    q = q.where(SellAllSnapshot.id == snapshot_id) if snapshot_id else q.order_by(SellAllSnapshot.created_at.desc())
+    if snapshot_id:
+        q = q.where(SellAllSnapshot.id == snapshot_id)
+    else:
+        # Default to the ACTIVE snapshot (the current one).
+        q = q.where(SellAllSnapshot.active.is_(True)).order_by(SellAllSnapshot.created_at.desc())
     snap = db.execute(q.limit(1)).scalars().first()
     if not snap or not snap.positions:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="no_snapshot")
