@@ -793,6 +793,15 @@ export default function TradesPage() {
                         <span className="inline-flex items-center gap-1.5">
                           <PositionIcon kind={orderKind(o)} />
                           {orderSymbolLabel(o)}
+                          {o.is_reentry && (
+                            <span
+                              className="chip font-semibold"
+                              style={{ background: "var(--accent-glow)", color: "var(--accent)", borderColor: "transparent", fontSize: 10 }}
+                              title="Placed by Sell-All Re-Enter (from a snapshot)"
+                            >
+                              ↻ Re-Entry
+                            </span>
+                          )}
                         </span>
                       </td>
                       <td className="px-5 py-3.5 num">{fmtQty(o.quantity)}</td>
