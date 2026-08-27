@@ -333,26 +333,6 @@ def send_webhook(webhook_url: str, payload: dict) -> bool:
     return False
 
 
-def _copy_paused_at(db, trader_user_id: uuid.UUID, when: datetime | None) -> bool:
-    """Was the trader's copy trading PAUSED at ``when`` (the order's trade time)?
-
-    Reconstructed from the copy pause/resume audit trail — the most recent
-    ``trader.copy_paused`` / ``trader.copy_resumed`` event at or before ``when``.
-    Lets the alert suppress a fill that happened while copy was OFF even when we
-    only detect it after copy resumes (SnapTrade fill-feed lag). Returns False
-    when there's no prior toggle (copy on by default) or ``when`` is unknown."""
-    if when is None:
-        return False
-    action = db.execute(
-        select(AuditLog.action).where(
-            AuditLog.actor_user_id == trader_user_id,
-            AuditLog.action.in_(("trader.copy_paused", "trader.copy_resumed")),
-            AuditLog.created_at <= when,
-        ).order_by(AuditLog.created_at.desc()).limit(1)
-    ).scalar()
-    return action == "trader.copy_paused"
-
-
 def _run(trader_order_id: uuid.UUID) -> None:
     """Load, gate, claim, format, send — all on the worker thread."""
     with SessionLocal() as db:
@@ -365,13 +345,6 @@ def _run(trader_order_id: uuid.UUID) -> None:
         if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
             return
         webhook_url = ts.discord_webhook_url
-        # Suppress if copy is paused NOW *or* was paused when this order actually
-        # traded. The fill-time check closes the lag edge (prod 2026-08-24): a
-        # trade that fills while copy is OFF must never alert, even if SnapTrade
-        # surfaces the fill to us only AFTER copy resumes (then `ts.copy_paused`
-        # reads False at detection time and the old check let it through).
-        _when = order.trader_submitted_at or order.submitted_at or order.created_at
-        copy_paused = bool(ts.copy_paused) or _copy_paused_at(db, order.user_id, _when)
 
         # Atomically CLAIM this order's alert. Several paths detect the same
         # fill almost simultaneously (SnapTrade/Webull listener + copy_engine
@@ -392,23 +365,8 @@ def _run(trader_order_id: uuid.UUID) -> None:
         ).first()
         if already is not None:
             return  # another path already claimed/sent this order's card
-        # Copy trading OFF at trade time → suppress OPENS only. Alerts mirror
-        # execution: while paused, a trader's OPEN is NOT copied to subscribers
-        # so it must never surface a card — but a trader's CLOSE IS still mirrored
-        # (copy_engine closes subscribers' held positions even while paused), so
-        # its card must still go out. So we suppress here only when paused AND
-        # this is NOT a close. Claiming the marker (below) also stops the resume
-        # sweep from re-alerting a suppressed open as "new".
-        if copy_paused and not _is_closing(db, order):
-            audit.record(
-                db, actor_user_id=order.user_id, action=_ALERT_SENT_ACTION,
-                entity_type="order", entity_id=order.id,
-                metadata={"suppressed": "copy_paused_open", "symbol": order.symbol},
-            )
-            db.commit()
-            return
-        # (A CLOSE while paused falls through here and alerts normally — it was
-        #  copied to subscribers, so its card should go out.)
+        # Simple rule: Discord alerts ON → every filled trader order gets a card,
+        # regardless of copy on/off. (OFF is handled by the enabled check above.)
         # Classify + compute round-trip P&L (ENTERING / TRIMMING / CLOSING).
         # If the FIFO calc fails for any reason, fall back to the basic
         # enter/close card (Phase-1 behaviour) so a bad calc can never break the
@@ -452,10 +410,6 @@ def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30)
     ts = db.get(TraderSettings, user_id)
     if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
         return
-    # NOTE: we do NOT early-return when copy is paused. The sweep must still
-    # process paused-period fills so `_run` CLAIMS them (marks suppressed) — that
-    # marker is what prevents them from being re-alerted the moment copy is turned
-    # back on. `_run` makes the send-vs-suppress decision per order.
     since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     oids = db.execute(
         select(Order.id).where(
