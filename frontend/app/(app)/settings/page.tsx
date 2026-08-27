@@ -1096,67 +1096,11 @@ export default function SettingsPage() {
             hint="Loss / profit / size / capital caps. When any live limit is hit, copy turns OFF for the day and auto-resumes the next UTC day."
           >
             <div className="space-y-2.5">
-              {/* SL/TP source toggle — choose between copying the trader's
-                  per-trade SL/TP (re-anchored onto your own fill) and using
-                  your own per-position TP/SL below. Mutually exclusive: when
-                  ON, the Individual Position row below is ignored. */}
-              <CopyTraderBracketRow
-                enabled={sub.copy_trader_bracket}
-                busy={copyBracketBusy}
-                onToggle={() => setCopyTraderBracket(!sub.copy_trader_bracket)}
-              />
-
-              {/* End-of-day 0DTE auto-close — opt-in. When on, this
-                  subscriber's same-day-expiry option positions are
-                  market-closed in the last N (1–30) minutes before the
-                  16:00 ET close, and new 0DTE mirrors are refused then. */}
-              <EodAutocloseRow
-                key={sub.eod_autoclose_minutes}
-                enabled={sub.eod_autoclose_enabled}
-                minutes={sub.eod_autoclose_minutes}
-                busy={eodBusy}
-                onToggle={() => setEodAutoclose({ enabled: !sub.eod_autoclose_enabled })}
-                onSaveMinutes={(m) => setEodAutoclose({ minutes: m })}
-              />
-
-              {/* Individual Position (TP/SL) — surfaced FIRST so the
-                  most-used per-position control sits at the top of the
-                  Risk Controls table. Doesn't share the Limit /
-                  Threshold / Today / Headroom / Used column layout
-                  (it has two inputs, no live readouts), so the column
-                  legend renders BELOW this row, right above the
-                  LimitRow grid where those columns actually apply.
-                  Dimmed + labelled "overridden" while the subscriber is
-                  copying the trader's bracket — those exits take over. */}
-              <div
-                className={sub.copy_trader_bracket ? "opacity-40" : ""}
-                title={
-                  sub.copy_trader_bracket
-                    ? "Ignored while 'Copy trader's SL/TP' is on"
-                    : undefined
-                }
-              >
-                <PositionTpSlRow
-                  tpInput={posTpInput}
-                  onTpInput={setPosTpInput}
-                  tpBusy={posTpBusy}
-                  onTpSave={savePosTp}
-                  tpCurrent={sub.position_tp_pct}
-                  slInput={posSlInput}
-                  onSlInput={setPosSlInput}
-                  slBusy={posSlBusy}
-                  onSlSave={savePosSl}
-                  slCurrent={sub.position_sl_pct}
-                />
-              </div>
-
               {/* Desktop column legend for the LimitRow grid below.
                   Hidden on mobile where rows stack their own labels.
-                  Lives here (not at the top of the card) because the
-                  Individual Position row above doesn't share these
-                  columns. USD column added between Today and Headroom
-                  to surface the actual dollar trigger derived from
-                  the % the trader typed. */}
+                  USD column added between Today and Headroom to surface
+                  the actual dollar trigger derived from the % the trader
+                  typed. */}
               <div
                 className="hidden md:grid items-center gap-3 px-4 pt-1 pb-1 text-[9px] uppercase tracking-widest"
                 style={{
@@ -1256,6 +1200,68 @@ export default function SettingsPage() {
                 hasLimit={false}
                 thresholdUsdDisplay="—"
                 headroomDisplay="—"
+              />
+            </div>
+          </Card>
+
+          {/* ── Position exits — SL/TP & auto-close, its own surface ──────
+              Moved out of Risk Controls so the daily caps card holds only
+              loss / profit / budget / per-contract limits. These three are
+              per-position exit rules, not daily caps: copy the trader's
+              bracket, flatten 0DTE options before the close, or run your
+              own TP/SL on each open position. */}
+          <Card
+            icon={<IconPercent />}
+            title="Position Exits (TP / SL)"
+            hint="Take-profit and stop-loss rules applied per open position, plus end-of-day auto-close for expiring options. Separate from the daily caps above."
+          >
+            <div className="space-y-2.5">
+              {/* SL/TP source toggle — choose between copying the trader's
+                  per-trade SL/TP (re-anchored onto your own fill) and using
+                  your own per-position TP/SL below. Mutually exclusive: when
+                  ON, the Individual Position row below is ignored. */}
+              <CopyTraderBracketRow
+                enabled={sub.copy_trader_bracket}
+                busy={copyBracketBusy}
+                onToggle={() => setCopyTraderBracket(!sub.copy_trader_bracket)}
+              />
+
+              {/* Individual Position (TP/SL) — your own per-position exits.
+                  Dimmed + labelled "overridden" while the subscriber is
+                  copying the trader's bracket — those exits take over. */}
+              <div
+                className={sub.copy_trader_bracket ? "opacity-40" : ""}
+                title={
+                  sub.copy_trader_bracket
+                    ? "Ignored while 'Copy trader's SL/TP' is on"
+                    : undefined
+                }
+              >
+                <PositionTpSlRow
+                  tpInput={posTpInput}
+                  onTpInput={setPosTpInput}
+                  tpBusy={posTpBusy}
+                  onTpSave={savePosTp}
+                  tpCurrent={sub.position_tp_pct}
+                  slInput={posSlInput}
+                  onSlInput={setPosSlInput}
+                  slBusy={posSlBusy}
+                  onSlSave={savePosSl}
+                  slCurrent={sub.position_sl_pct}
+                />
+              </div>
+
+              {/* End-of-day 0DTE auto-close — opt-in. When on, this
+                  subscriber's same-day-expiry option positions are
+                  market-closed in the last N (1–30) minutes before the
+                  16:00 ET close, and new 0DTE mirrors are refused then. */}
+              <EodAutocloseRow
+                key={sub.eod_autoclose_minutes}
+                enabled={sub.eod_autoclose_enabled}
+                minutes={sub.eod_autoclose_minutes}
+                busy={eodBusy}
+                onToggle={() => setEodAutoclose({ enabled: !sub.eod_autoclose_enabled })}
+                onSaveMinutes={(m) => setEodAutoclose({ minutes: m })}
               />
             </div>
           </Card>
