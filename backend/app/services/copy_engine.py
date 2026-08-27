@@ -909,10 +909,19 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
 
 def _closeable_quantity(
     db: Session, user_id: uuid.UUID, order: Order, subtract_reserved: bool = True,
+    exclude_order_id: uuid.UUID | None = None,
 ) -> Decimal:
     """Quantity the subscriber can still CLOSE in ``order``'s direction: their
     net filled position for the contract, MINUS what their own still-working
     orders on the same side have already reserved at the broker.
+
+    ``exclude_order_id`` drops one order from the net — used when asking "does
+    THIS order close a held position?" about the caller's OWN order: without
+    excluding it, a FULL close (the order that takes the position to flat) counts
+    its own fill in the net and reads 0, i.e. "not closing". That's how a paused
+    trader's market close of a whole position was mis-read as an open and dropped
+    from fanout, stranding subscribers long (QA 2026-08). Excluding the order
+    itself yields the position that existed BEFORE it.
 
     Two things reduce what a new close can take:
       * net filled position (filled buys − sells) — what they actually hold;
@@ -928,14 +937,17 @@ def _closeable_quantity(
 
     Tracks reality as fills sync in (SnapTrade reconciler + fills_sync). Returns
     a non-negative quantity."""
-    same_contract = (
+    same_contract = [
         Order.user_id == user_id,
         Order.symbol == order.symbol,
         Order.instrument_type == order.instrument_type,
         Order.option_expiry.is_not_distinct_from(order.option_expiry),
         Order.option_strike.is_not_distinct_from(order.option_strike),
         Order.option_right.is_not_distinct_from(order.option_right),
-    )
+    ]
+    if exclude_order_id is not None:
+        same_contract.append(Order.id != exclude_order_id)
+    same_contract = tuple(same_contract)
     # Net filled position (signed long).
     rows = db.execute(
         select(Order.side, func.coalesce(func.sum(Order.filled_quantity), 0))
@@ -1938,6 +1950,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # as it was before this change. Reused throughout the fanout below.
     trader_closing = bool(trader_order.is_closing) or _closeable_quantity(
         db, trader_order.user_id, trader_order, subtract_reserved=False,
+        # Exclude this order from the net: a FULL close (position → flat) counts
+        # its OWN fill and reads 0 ("not closing"), which — while paused — dropped
+        # the whole fanout and left subscribers holding a position the trader had
+        # exited. Excluding it yields the position that existed BEFORE this order.
+        exclude_order_id=trader_order.id,
     ) > 0
     # Trader master pause: while paused we drop OPENS (no new entries for anyone)
     # but STILL mirror CLOSES so a subscriber isn't left holding a position the
