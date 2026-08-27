@@ -145,6 +145,8 @@ export interface Order {
   /** Realized P&L this closing order produced (FIFO). Null for opening orders
    *  or anything that realized nothing. Decimal as string. */
   realized_pnl?: string | null;
+  /** True when this order was placed by a Sell-All Re-Enter (from a snapshot). */
+  is_reentry?: boolean;
   fills: Fill[];
 }
 
