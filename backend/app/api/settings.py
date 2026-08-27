@@ -888,6 +888,13 @@ def toggle_trading(
             raise HTTPException(400, "discord_webhook_required")
         s.discord_alerts_enabled = payload.discord_alerts_enabled
         changes["discord_alerts_enabled"] = payload.discord_alerts_enabled
+        if payload.discord_alerts_enabled:
+            # Turning alerts ON: claim the backlog of trades taken while alerts
+            # were OFF (write their sent-markers without sending) so the next
+            # emit sweep doesn't retroactively push them. Committed together with
+            # the settings change below, before any sweep can run.
+            from app.services import discord_alerts as _discord_alerts  # noqa: PLC0415
+            _discord_alerts.suppress_pending_trader_alerts(db, user.id)
     if changes:
         audit.record(
             db,
