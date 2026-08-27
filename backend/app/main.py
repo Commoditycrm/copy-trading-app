@@ -284,6 +284,18 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start alpaca subscriber reconciler")
 
+        # Direct-Webull subscriber mirror-fill reconciler — the Webull twin of
+        # the Alpaca one. Only relevant when subscribers execute mirrors on a
+        # direct-Webull account, so it's gated behind webull_direct_enabled
+        # (default off ⇒ never started). Every 30s it refreshes working Webull
+        # subscriber mirror orders' status via get_order. Worker-only.
+        if s.webull_direct_enabled:
+            try:
+                from app.services import webull_subscriber_reconciler
+                webull_subscriber_reconciler.start_webull_subscriber_reconciler()
+            except Exception:  # noqa: BLE001
+                log.exception("failed to start webull subscriber reconciler")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep
@@ -318,6 +330,11 @@ def create_app() -> FastAPI:
             await alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop alpaca subscriber reconciler cleanly")
+        try:
+            from app.services import webull_subscriber_reconciler
+            await webull_subscriber_reconciler.stop_webull_subscriber_reconciler()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop webull subscriber reconciler cleanly")
         try:
             await close_async_redis()
         except Exception:  # noqa: BLE001

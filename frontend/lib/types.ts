@@ -206,6 +206,12 @@ export interface SubscriberSettings {
    *  when not following anyone, or when following a legacy trader who
    *  pre-dates the business_name field. */
   following_trader_business_name?: string | null;
+  /** The followed trader's LIVE copy-trading status, from the subscriber's POV:
+   *  true = trader is broadcasting (trading on, not paused); false = trader has
+   *  paused / disabled copy trading (new entries won't mirror; exits still flow);
+   *  null = not following anyone. Lets the subscriber see "trader paused" rather
+   *  than silently receiving no trades. */
+  following_trader_copy_active?: boolean | null;
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;

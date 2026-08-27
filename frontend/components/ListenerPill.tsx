@@ -6,15 +6,20 @@
  *   🟢 Live           ← connected and receiving
  *   🟡 Reconnecting   ← drop detected, retrying
  *   🔴 Offline        ← disconnected (or credentials missing)
- *   ⚪ No broker      ← subscriber: trader hasn't connected, or follow is null
+ *   ⚪ No broker      ← no broker connected
  *
- * Trader sees their own listener's state ("Broker live"); subscribers see the
- * status of the trader they follow ("Trader's broker live"). Updates in real
- * time via the SSE `listener.state_changed` event.
+ * BOTH roles see the status of THEIR OWN broker ("Broker live"): a trader sees
+ * their live listener; a subscriber sees whether their own broker is connected
+ * (subscribers have no listener of their own, and deliberately do NOT see the
+ * trader's broker state). The trader's listener updates live via the SSE
+ * `listener.state_changed` event; the subscriber's own-broker state refreshes on
+ * mount + the periodic poll (that SSE is about a trader's listener, so it never
+ * drives a subscriber's pill).
  */
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { useEventStream, type ListenerStatus } from "@/lib/sse";
+import { onBrokerChanged } from "@/lib/traderSync";
 
 interface StatusPayload extends ListenerStatus {
   trader_id: string | null;
@@ -33,6 +38,7 @@ const STATE_LABEL: Record<ListenerStatus["state"], string> = {
   disconnected: "Offline",
   credentials_invalid: "Broker disconnected",
   no_trader: "No trader followed",
+  no_broker: "No broker",
 };
 
 const STATE_COLOR: Record<ListenerStatus["state"], string> = {
@@ -42,6 +48,7 @@ const STATE_COLOR: Record<ListenerStatus["state"], string> = {
   disconnected: "#ef4444",
   credentials_invalid: "#ef4444",
   no_trader: "#94a3b8",
+  no_broker: "#94a3b8",
 };
 
 function fmtRel(iso: string | null): string {
@@ -69,12 +76,18 @@ export function ListenerPill({ role }: Props) {
   useEffect(() => {
     refetch();
     const id = setInterval(refetch, 30_000);
-    return () => clearInterval(id);
+    // Instant refresh when the user connects/disconnects a broker (else the
+    // pill looks stuck until the next 30s poll or a manual page refresh).
+    const offBroker = onBrokerChanged(refetch);
+    return () => { clearInterval(id); offBroker(); };
   }, []);
 
   // Live updates via SSE.
   const sse = useEventStream((evt) => {
     if (evt.type !== "listener.state_changed") return;
+    // This SSE is about a TRADER's listener. A subscriber's pill shows their own
+    // broker (refreshed by fetch/poll), so never let a trader's event drive it.
+    if (role !== "trader") return;
     setStatus((prev) => ({
       // Preserve trader_id + viewer; only the inner status changes.
       trader_id: prev?.trader_id ?? evt.trader_id,
@@ -92,9 +105,11 @@ export function ListenerPill({ role }: Props) {
   const s = status?.state ?? "disconnected";
   const color = STATE_COLOR[s];
   const label = STATE_LABEL[s];
-  const prefix = role === "trader" ? "Broker" : "Trader's broker";
+  // Both roles now describe THEIR OWN broker.
+  const prefix = "Broker";
 
   const tooltip = (() => {
+    if (s === "no_broker") return "Connect a broker on the Brokers page";
     if (s === "no_trader") return "Pick a trader to follow on the Settings page";
     if (s === "credentials_invalid") return "Broker credentials missing or revoked";
     const last = status?.last_event_at ? `last event ${fmtRel(status.last_event_at)}` : "no events yet";
@@ -105,6 +120,12 @@ export function ListenerPill({ role }: Props) {
   // already stands alone (otherwise: "Trader's broker no trader followed" and
   // "Trader's broker broker disconnected").
   const display = (() => {
+    // Subscribers see a simple binary for THEIR OWN broker: Online when
+    // connected, Offline for anything else (no broker, disconnected, creds bad).
+    if (role !== "trader") {
+      return s === "connected" ? "Broker Online" : "Broker Offline";
+    }
+    if (s === "no_broker") return "No broker";
     if (s === "no_trader") return "No trader followed";
     if (s === "credentials_invalid") return `${prefix} disconnected`;
     return `${prefix} ${label.toLowerCase()}`;

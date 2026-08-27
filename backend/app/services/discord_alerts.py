@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.database import SessionLocal
 from app.models.audit_log import AuditLog
@@ -406,17 +406,26 @@ def emit_pending_trader_alerts(db, user_id: uuid.UUID, window_minutes: int = 30)
     single trader. No-op unless the trader has Discord alerts configured.
 
     ``db`` should reflect COMMITTED order state (call after commit) so each
-    spawned emit thread — which opens its own session — sees the FILLED rows."""
+    spawned emit thread — which opens its own session — sees the FILLED rows.
+
+    The window is on the TRADE time (closed_at/submitted_at), NOT created_at.
+    created_at is the ROW-INSERT time (server_default now), and fills_sync
+    SYNTHESIZES rows for historical/external trades with created_at=now but the
+    real (old) trade time in submitted_at/closed_at. Keying off created_at made
+    a backfill of old trades look "just filled" and posted the whole backlog to
+    Discord (prod incident after a deploy: a flood of old CLOSING cards). Trade
+    time excludes those while still catching genuinely-recent missed fills."""
     ts = db.get(TraderSettings, user_id)
     if ts is None or not ts.discord_alerts_enabled or not ts.discord_webhook_url:
         return
     since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    trade_time = func.coalesce(Order.closed_at, Order.submitted_at, Order.created_at)
     oids = db.execute(
         select(Order.id).where(
             Order.user_id == user_id,
             Order.parent_order_id.is_(None),
             Order.status == OrderStatus.FILLED,
-            Order.created_at > since,
+            trade_time > since,
         )
     ).scalars().all()
     if not oids:

@@ -1050,7 +1050,26 @@ export default function SettingsPage() {
                       <div className="flex items-center gap-2 shrink-0">
                         {isFollowing ? (
                           <>
-                            <span className="chip chip-good">Following</span>
+                            {/* Live status of the TRADER's copy trading, so the
+                                subscriber knows whether new trades will mirror
+                                (paused ⇒ no new entries, exits still flow) rather
+                                than a paused trader looking like dead silence. */}
+                            {sub.following_trader_copy_active === false ? (
+                              <span
+                                className="chip"
+                                style={{ background: "rgba(255,200,87,0.12)", color: "var(--warn)", borderColor: "rgba(255,200,87,0.28)" }}
+                                title="This trader has turned copy trading OFF — you won't receive new entries. Existing exits still flow through."
+                              >
+                                Copy OFF
+                              </span>
+                            ) : (
+                              <span
+                                className="chip chip-good"
+                                title="This trader's copy trading is ON — their new trades mirror to you."
+                              >
+                                Copy ON
+                              </span>
+                            )}
                             <button
                               onClick={() => follow(null)}
                               disabled={busy}
