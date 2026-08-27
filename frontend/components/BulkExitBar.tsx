@@ -93,19 +93,73 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const [user, setUser] = useState<User | null>(null);
   const [pending, setPending] = useState<ExitKey | null>(null);
   const [busy, setBusy] = useState(false);
+  // Optional trailing-stop trail (%) for "Exit My Positions". Empty = market
+  // close (the classic behaviour). When set, stock positions on brokers that
+  // support trailing stops close as a TRAILING_STOP; options / unsupported
+  // brokers fall back to market. See services/trailing_stop_close.
+  const [trailPct, setTrailPct] = useState("");
+  const trailNum = parseFloat(trailPct);
+  const useTrail = !isNaN(trailNum) && trailNum > 0 && trailNum <= 100;
+
+  // Sell-All snapshot + re-entry. After a Sell-All the positions are saved so
+  // they can be re-opened (at market, or a % below the exit price).
+  const [snapshot, setSnapshot] = useState<{ id: string; created_at: string; positions: unknown[] } | null>(null);
+  const [reDiscount, setReDiscount] = useState("");
+  const [reBusy, setReBusy] = useState(false);
+
+  async function loadSnapshot() {
+    try {
+      const r = await api<{ snapshot: { id: string; created_at: string; positions: unknown[] } | null }>(
+        "/api/positions/snapshots/latest",
+      );
+      setSnapshot(r.snapshot);
+    } catch { /* no snapshot yet */ }
+  }
 
   useEffect(() => {
     api<User>("/api/auth/me").then(setUser).catch(() => {});
+    loadSnapshot();
   }, []);
+
+  async function reEnter() {
+    const d = parseFloat(reDiscount);
+    const useD = !isNaN(d) && d > 0 && d <= 100;
+    setReBusy(true);
+    try {
+      const res = await api<{ placed_count: number; failed_count: number }>(
+        `/api/positions/re-enter${useD ? `?discount_percent=${d}` : ""}`,
+        { method: "POST" },
+      );
+      if (res.placed_count === 0 && res.failed_count === 0) notify.info("Nothing to re-enter.");
+      else if (res.failed_count === 0)
+        notify.success(
+          `Re-entered ${res.placed_count} position${res.placed_count === 1 ? "" : "s"}` +
+          (useD ? ` — limit ${d}% below exit.` : " at market."),
+        );
+      else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed — check Order History.`);
+      onActionComplete?.();
+    } catch (e) {
+      notify.fromError(e, "Re-enter failed");
+    } finally {
+      setReBusy(false);
+    }
+  }
 
   async function runExit(key: ExitKey) {
     if (key === "my_positions") {
-      const res = await api<{ closed_count: number; failed_count: number }>(
-        "/api/positions/close-all?include_subscribers=false",
-        { method: "POST" },
+      const url = "/api/positions/close-all?include_subscribers=false"
+        + (useTrail ? `&trail_percent=${trailNum}` : "");
+      const res = await api<{ closed: { method?: string }[]; closed_count: number; failed_count: number }>(
+        url, { method: "POST" },
       );
+      const nTrail = (res.closed ?? []).filter(c => c.method === "trailing_stop").length;
       if (res.closed_count === 0 && res.failed_count === 0) notify.info("No open positions to close (yours).");
-      else if (res.failed_count === 0) notify.success(`Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market — yours.`);
+      else if (res.failed_count === 0)
+        notify.success(
+          useTrail && nTrail > 0
+            ? `Exited ${res.closed_count} — ${nTrail} as trailing stop (${trailNum}%).`
+            : `Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market — yours.`,
+        );
       else notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Order History.`);
     } else if (key === "my_orders") {
       const res = await api<{ cancelled_count: number; failed_count: number }>(
@@ -144,6 +198,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
     try {
       await runExit(pending);
       onActionComplete?.();
+      loadSnapshot();  // a Sell-All just saved a new snapshot
       setPending(null);
     } catch (e) {
       notify.fromError(e, "Action failed");
@@ -172,7 +227,28 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Bulk Exit
           </span>
         </div>
-        <div className="flex flex-wrap gap-2 justify-end">
+        <div className="flex flex-wrap gap-2 justify-end items-center">
+          {/* Trailing-stop trail for Exit My Positions. Leave empty for a
+              market exit; enter e.g. 5 to close as a trailing stop where the
+              broker supports it. */}
+          <div
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit."
+          >
+            <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
+              Trail&nbsp;%
+            </span>
+            <input
+              type="number" min="0" max="100" step="0.5"
+              value={trailPct}
+              onChange={e => setTrailPct(e.target.value)}
+              placeholder="off"
+              aria-label="Trailing stop percent for Exit My Positions"
+              className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
+              style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+          </div>
           {keys.map(key => {
             const def = EXIT_DEFS[key];
             const isSubs = def.subs;
@@ -228,10 +304,60 @@ export function BulkExitBar({ onActionComplete }: Props) {
         </div>
       </div>
 
+      {snapshot && snapshot.positions.length > 0 && (
+        <div
+          className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
+          style={cardStyle}
+        >
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--good)" }} />
+            <span className="text-[10px] uppercase tracking-[0.2em] font-semibold" style={{ color: "var(--text-2)" }}>
+              Re-Enter Last Exit
+            </span>
+            <span className="text-xs" style={{ color: "var(--muted)" }}>
+              {snapshot.positions.length} position{snapshot.positions.length === 1 ? "" : "s"} saved
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div
+              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+              title="Optional: re-buy each position this % BELOW its exit price (a resting limit). Empty = buy back now at market."
+            >
+              <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
+                %&nbsp;below
+              </span>
+              <input
+                type="number" min="0" max="100" step="0.5"
+                value={reDiscount}
+                onChange={e => setReDiscount(e.target.value)}
+                placeholder="mkt"
+                aria-label="Re-enter discount percent below exit price"
+                className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
+                style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={reEnter}
+              disabled={reBusy}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              style={{ background: "var(--accent)", color: "var(--accent-ink)", border: "1px solid var(--accent)" }}
+            >
+              {reBusy ? "Re-entering…" : "Re-Enter"}
+            </button>
+          </div>
+        </div>
+      )}
+
       <ConfirmModal
         open={pending !== null}
         title={pending ? EXIT_DEFS[pending].title : ""}
-        message={pending ? EXIT_DEFS[pending].message : ""}
+        message={
+          pending === "my_positions" && useTrail
+            ? `Closes every open position in YOUR connected brokers with a TRAILING STOP (${trailNum}% trail) where the broker supports it (stocks); options and unsupported brokers fall back to a market close. Subscribers are not affected.`
+            : pending ? EXIT_DEFS[pending].message : ""
+        }
         confirmLabel={pending ? EXIT_DEFS[pending].confirmLabel : "Confirm"}
         variant="danger"
         busy={busy}
