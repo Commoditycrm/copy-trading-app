@@ -1220,7 +1220,10 @@ export default function SettingsPage() {
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per contract"
-                subtitle="Skips copying an OPTION entry when a single contract's value (premium × 100) is above this amount. Options only — closing trades always go through."
+                subtitle={"Skips copying an OPTION entry when a single contract's value (premium × 100) is above this amount. Options only — closing trades always go through."
+                  + (maxContractInput.trim()
+                    ? " Heads-up: when the trader places an option as a market order, enforcing this needs a quick live price check, which can slightly delay that copy."
+                    : "")}
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"

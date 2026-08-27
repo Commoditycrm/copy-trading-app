@@ -522,6 +522,46 @@ def _marketable_option_limit(adapter: Any, req: BrokerOrderRequest) -> BrokerOrd
     return replace(req, order_type=OrderType.LIMIT, limit_price=limit, stop_price=None)
 
 
+def _live_option_premium(db: Any, trader: Any, trader_order: Order) -> "Decimal | None":
+    """Best-effort LIVE per-contract option premium for the max-per-contract gate,
+    used only when the trader's OWN price isn't recorded yet — a MARKET option
+    order fanned out in the ~ms window before its fill commits, so
+    ``filled_avg_price`` is None and there's no ``limit_price``. Without a price
+    the cap fails OPEN and lets over-cap options through (QA 2026-08: a $145/contract
+    AAPL market option slipped a $100 cap). Priced off the TRADER's Alpaca account
+    (the adapter that exposes option quotes). Returns None for a non-Alpaca trader
+    or when no quote is available — the gate then keeps its prior fail-open."""
+    if not (trader_order.option_expiry and trader_order.option_strike and trader_order.option_right):
+        return None
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == trader.id,
+            BrokerAccount.broker == BrokerName.ALPACA,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is None:
+        return None
+    try:
+        from app.brokers import adapter_for  # noqa: PLC0415
+        from app.brokers.alpaca import AlpacaAdapter, build_occ_symbol  # noqa: PLC0415
+        from app.services.crypto import decrypt_json  # noqa: PLC0415
+        adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        if not isinstance(adapter, AlpacaAdapter):
+            return None
+        occ = build_occ_symbol(
+            trader_order.symbol, trader_order.option_expiry,
+            trader_order.option_strike, trader_order.option_right.value,
+        )
+        bid, ask = adapter.get_option_latest_quote(occ)
+    except Exception:  # noqa: BLE001
+        log.warning("max_per_contract: live option quote failed for %s", trader_order.symbol)
+        return None
+    # Per-contract COST: a BUY pays the ask, a SELL receives the bid; fall back to
+    # whichever side is quoted so a one-sided book still yields a price.
+    return (ask or bid) if trader_order.side == OrderSide.BUY else (bid or ask)
+
+
 def _option_market_no_quote(msg: str) -> bool:
     """True when a broker refused an option MARKET order because it had no
     quotable price ("no available quote" / no NBBO) — retryable as a marketable
@@ -2097,6 +2137,16 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             ).all():
                 _fresh_caps[_uid] = _cap
 
+    # Price the max-per-contract gate evaluates against. Prefer the trader's own
+    # premium; for a MARKET option fanned out BEFORE its fill commits that isn't
+    # recorded yet (filled_avg_price None, no limit_price) — which used to fail
+    # the cap OPEN and let over-cap options through (QA 2026-08) — fall back to a
+    # live option quote. Computed ONCE here (the contract's premium is the same
+    # for every subscriber), and only when some subscriber actually has a cap.
+    _gate_px: "Decimal | None" = trader_order.filled_avg_price or trader_order.limit_price
+    if _gate_px is None and _fresh_caps:
+        _gate_px = _live_option_premium(db, trader, trader_order)
+
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
         # gate (EOD lockout, daily kill switch, symbol filters) and, in the
@@ -2329,17 +2379,19 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # Skip an OPENING option mirror when a single contract's value
             # (premium × 100) exceeds the subscriber's max_per_contract ceiling.
             # A CLOSE always passes (they must be able to exit); stocks have no
-            # per-contract concept, so this is options-only. Priced off the
-            # trader's own premium — no price available → allow (fail-open).
-            # Read from the FRESH DB map (see _fresh_caps above), never the
-            # cached subscriber, so a just-set cap can't be missed.
+            # per-contract concept, so this is options-only. Priced off _gate_px
+            # (trader's premium, or a live option quote when a market order is
+            # fanned out before its fill records a price); only when NEITHER is
+            # available does it fall back to allow. Read the cap from the FRESH
+            # DB map (see _fresh_caps above), never the cached subscriber, so a
+            # just-set cap can't be missed.
             _mpc = _fresh_caps.get(sub.user_id)
             if (
                 not is_closing_effective
                 and _mpc is not None
                 and trader_order.instrument_type == InstrumentType.OPTION
             ):
-                _px = trader_order.filled_avg_price or trader_order.limit_price
+                _px = _gate_px  # trader premium, or a live quote for a pre-fill market option
                 if _px is not None and Decimal(_px) * Decimal(100) > Decimal(_mpc):
                     audit.record(
                         db, actor_user_id=sub.user_id,
