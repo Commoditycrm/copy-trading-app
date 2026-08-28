@@ -1445,19 +1445,28 @@ def cancel_and_replace_mirrors_for_modify(
         db.commit()
 
 
+# After a cancel is ACCEPTED, wait this long before re-reading the order's final
+# fill. Alpaca's cancel is async and a marketable-limit mirror fills within ~ms,
+# so the fill can land in the cancel window; the settle lets the broker record the
+# TRUE final filled qty before we decide how much (if any) to force-fill.
+_FORCE_FILL_SETTLE_S = 0.6
+
+
 def _force_fill_cancel_then_place(item: "tuple[Order, Any, BrokerOrderRequest, uuid.UUID]"):
     """Cancel ONE resting mirror then place its forced market/marketable close
     (worker-thread step of force_fill_mirrors_to_market). Extracted to module
     level so it's pure over its args (no DB) and unit-testable — mirrors the
     cancel+place fallback of _modify_place_one.
 
-    Returns ``(old_id, new_id, BrokerOrderResult | None, err_sentinel | None)``.
+    Returns ``(old_id, new_id, BrokerOrderResult | None, err_sentinel | None,
+    meta | None)`` where meta carries ``{"already": Decimal, "rq": request}`` so
+    the apply phase can record the partial fill and size the child correctly.
     """
     old_ch, ad, rq, new_id = item
     try:
         cancelled = ad.cancel_order(old_ch.broker_order_id)
     except Exception as exc:  # noqa: BLE001
-        return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300]
+        return old_ch.id, new_id, None, f"cancel_failed: {exc}"[:300], None
     # A False here means the broker had nothing to cancel — the order is already
     # terminal, and the overwhelmingly likely reason is that it FILLED. Placing
     # the replacement now would double the position, so bail. This is not
@@ -1467,7 +1476,28 @@ def _force_fill_cancel_then_place(item: "tuple[Order, Any, BrokerOrderRequest, u
     # neither our DB nor a get_order re-check could see the truth. The cancel
     # result is the only signal that reflects the broker's ACTUAL state now.
     if cancelled is False:
-        return old_ch.id, new_id, None, "cancel_noop_already_terminal"
+        return old_ch.id, new_id, None, "cancel_noop_already_terminal", None
+    # cancel==True means "cancel ACCEPTED", NOT "zero filled". Alpaca's cancel is
+    # async and a marketable-limit mirror can FILL in that window — so a full-size
+    # force-fill on top DOUBLES the subscriber (prod MSFT 2026-08: the "cancelled"
+    # limit filled 4-5 while a full 5 went on top → sub held ~2×). Re-read the
+    # order's FINAL fill after a short settle and place only the TRUE remainder
+    # (full mirror qty − whatever actually filled); place NOTHING if it fully
+    # filled. This is the double-buy guard.
+    time.sleep(_FORCE_FILL_SETTLE_S)
+    already = Decimal(str(old_ch.filled_quantity or 0))
+    try:
+        fin = ad.get_order(old_ch.broker_order_id)
+        if fin is not None and fin.filled_quantity is not None:
+            already = max(already, Decimal(str(fin.filled_quantity)))
+    except Exception:  # noqa: BLE001
+        pass
+    true_remaining = Decimal(str(old_ch.quantity)) - already
+    if true_remaining <= 0:
+        # The "cancelled" order actually filled the whole mirror — nothing to add.
+        return old_ch.id, new_id, None, "cancel_but_filled", {"already": already}
+    if true_remaining != rq.quantity:
+        rq = replace(rq, quantity=true_remaining)
     # Alpaca's cancel is ASYNC: the just-cancelled limit still holds the shares
     # (held_for_orders) for a beat, so an immediate re-place is rejected
     # "insufficient qty available" (prod RDGT 2026-08-10 left a subscriber long —
@@ -1477,14 +1507,14 @@ def _force_fill_cancel_then_place(item: "tuple[Order, Any, BrokerOrderRequest, u
     last_exc: BaseException | None = None
     for attempt in range(_MODIFY_PLACE_ATTEMPTS):
         try:
-            return old_ch.id, new_id, ad.place_order(rq), None
+            return old_ch.id, new_id, ad.place_order(rq), None, {"already": already, "rq": rq}
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if is_order_conflict_error(exc) and attempt < _MODIFY_PLACE_ATTEMPTS - 1:
                 time.sleep(_MODIFY_PLACE_BACKOFF_S)
                 continue
             break
-    return old_ch.id, new_id, None, f"place_failed: {last_exc}"[:300]
+    return old_ch.id, new_id, None, f"place_failed: {last_exc}"[:300], {"already": already, "rq": rq}
 
 
 def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
@@ -1618,11 +1648,34 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
 
         # Phase 3 (session thread): apply.
         req_by_new_id = {new_id: rq for _c, _a, rq, new_id in plan}
-        for old_id, new_id, resp, err in results:
+        for old_id, new_id, resp, err, meta in results:
             old_ch = db.get(Order, old_id)
             if old_ch is None:
                 continue
-            rq = req_by_new_id[new_id]
+            # The request the worker ACTUALLY placed (re-sized to the true
+            # remainder after re-reading the cancelled order's fill), else the
+            # planned one for the no-op branches.
+            rq = (meta or {}).get("rq") or req_by_new_id[new_id]
+            if err == "cancel_but_filled":
+                # The "cancelled" order actually FILLED the whole mirror during
+                # Alpaca's async cancel window — placing anything would DOUBLE it
+                # (the MSFT over-buy). Record the fill and place nothing.
+                already = (meta or {}).get("already")
+                if already is not None:
+                    old_ch.filled_quantity = already
+                old_ch.status = OrderStatus.FILLED
+                if old_ch.closed_at is None:
+                    old_ch.closed_at = datetime.now(timezone.utc)
+                audit.record(
+                    db, actor_user_id=old_ch.user_id,
+                    action="order.mirror_force_fill_raced_fill",
+                    entity_type="order", entity_id=old_ch.id,
+                    metadata={"parent_order_id": str(trader_order_id),
+                              "broker_order_id": old_ch.broker_order_id,
+                              "filled": str(already) if already is not None else None},
+                )
+                events.publish(old_ch.user_id, _order_event("order.placed", old_ch))
+                continue
             if err == "cancel_noop_already_terminal":
                 # The broker had nothing to cancel: the mirror already reached a
                 # terminal state, i.e. it FILLED while we still believed it was
@@ -1666,6 +1719,12 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
             # BOTH cancel AND place succeeded — the old order was genuinely open,
             # is now cancelled at the broker, and the replacement is live. Only
             # NOW is it safe to mark the old mirror CANCELED.
+            # Record any PARTIAL fill the cancelled order got before the cancel
+            # landed, so the sub's net = that partial + the (remainder) child =
+            # the full mirror — never double-counted, never lost.
+            _already = (meta or {}).get("already")
+            if _already is not None and _already > (old_ch.filled_quantity or Decimal(0)):
+                old_ch.filled_quantity = _already
             old_ch.status = OrderStatus.CANCELED
             old_ch.closed_at = datetime.now(timezone.utc)
             events.publish(old_ch.user_id, _order_event("order.cancelled", old_ch))
