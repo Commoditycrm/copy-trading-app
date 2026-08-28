@@ -152,9 +152,10 @@ export default function SettingsPage() {
   // first tick lands — typically within 60s of page load.
   const [maxPctInput, setMaxPctInput] = useState("");
   const [maxPctBusy, setMaxPctBusy] = useState(false);
-  // Auto-liquidation floor — when broker-reported equity drops to or
-  // below this dollar value, pnl_poller flattens the account at market
-  // and disables copy until the subscriber manually re-enables.
+  // Auto-liquidation target — when broker-reported equity (total account
+  // value) reaches or exceeds this dollar value, pnl_poller flattens the
+  // account at market and disables copy until the subscriber manually
+  // re-enables. A standing target, not a daily/P&L one.
   const [autoLiqInput, setAutoLiqInput] = useState("");
   const [autoLiqBusy, setAutoLiqBusy] = useState(false);
   // Per-position TP/SL — when any open position's unrealized P&L %
@@ -176,9 +177,10 @@ export default function SettingsPage() {
   const [beginningDayBalance, setBeginningDayBalance] = useState<string | null>(
     () => readTickCache().beginning_day_balance,
   );
-  // Live broker equity, refreshed by every pnl.tick. Used by the
-  // Auto-liquidation (take-profit) row to show how close the unrealized
-  // P&L is to the target. Null until the first tick lands.
+  // Live broker equity (total account value), refreshed by every pnl.tick.
+  // Used by the Auto-liquidation row to show how close the account value is
+  // to the target (and it's what the trigger compares). Null until the
+  // first tick lands.
   const [equity, setEquity] = useState<string | null>(null);
   // Today's UNREALIZED P&L (mark-to-market on still-open positions),
   // computed server-side as todays_total_pl − today_realized_pnl. The
@@ -341,7 +343,7 @@ export default function SettingsPage() {
     }
     if (e?.type === "copy.auto_liquidated") {
       notify.success(
-        `Take-profit hit — unrealized profit reached $${e.unrealized_pl} ` +
+        `Auto-liquidation hit — account value reached $${e.equity} ` +
         `(target $${e.auto_liquidation_limit}). ` +
         `${e.closed ?? 0} position(s) closed, ${e.cancelled ?? 0} open order(s) cancelled. ` +
         `Copy trading is OFF until you re-enable it.`,
@@ -617,7 +619,7 @@ export default function SettingsPage() {
       setAutoLiqInput(s.auto_liquidation_limit ?? "");
       notify.success(
         s.auto_liquidation_limit
-          ? `Auto-liquidation floor set to $${s.auto_liquidation_limit}`
+          ? `Auto-liquidation target set to $${s.auto_liquidation_limit}`
           : "Auto-liquidation cleared",
       );
     } catch (e) {
@@ -1309,8 +1311,8 @@ export default function SettingsPage() {
               new mirror entries. */}
               <Card
                 icon={<IconTrendUp />}
-                title="Auto-Liquidation (Take-Profit)"
-                hint="When today's unrealized profit reaches the target, every open position is closed at market and copy turns OFF. Manual re-enable required — it does NOT auto-resume next day."
+                title="Auto-Liquidation"
+                hint="When your account value reaches this target, every open position is closed at market and copy turns OFF. Fires whenever it's hit — whether that takes days or weeks. Manual re-enable required — it does NOT auto-resume."
               >
                 <div
                   className="hidden md:grid items-center gap-3 px-4 pb-2 text-[9px] uppercase tracking-widest"
@@ -1321,35 +1323,35 @@ export default function SettingsPage() {
                 >
                   <div>Target</div>
                   <div>Set</div>
-                  <div>Profit</div>
+                  <div>Value</div>
                   <div>USD</div>
                   <div>Headroom</div>
                   <div className="text-right">Progress</div>
                 </div>
                 {(() => {
-                  const unrealizedNum = unrealizedPl !== null ? Number(unrealizedPl) : null;
+                  const equityNum = equity !== null ? Number(equity) : null;
                   const liqLimitNum = sub.auto_liquidation_limit ? Number(sub.auto_liquidation_limit) : null;
-                  // Headroom = how much MORE profit you need before the
+                  // Headroom = how much MORE account value you need before the
                   // trigger fires. Clamped to 0 so once you've reached the
-                  // limit the cell reads "$0.00" instead of a negative.
+                  // target the cell reads "$0.00" instead of a negative.
                   const liqHeadroom =
-                    unrealizedNum !== null && liqLimitNum !== null
-                      ? Math.max(0, liqLimitNum - unrealizedNum)
+                    equityNum !== null && liqLimitNum !== null
+                      ? Math.max(0, liqLimitNum - equityNum)
                       : null;
-                  // Progress bar: unrealized / target, clamped 0–100.
+                  // Progress bar: account value / target, clamped 0–100.
                   const liqPctConsumed =
-                    unrealizedNum !== null && liqLimitNum !== null && liqLimitNum > 0
-                      ? Math.min(100, Math.max(0, (unrealizedNum / liqLimitNum) * 100))
+                    equityNum !== null && liqLimitNum !== null && liqLimitNum > 0
+                      ? Math.min(100, Math.max(0, (equityNum / liqLimitNum) * 100))
                       : 0;
                   return (
                     <LimitRow
                       accent="#22c55e"
                       icon={<IconTrendUp />}
                       title="Auto-liquidation target"
-                      subtitle="Sell everything + disable copy when today's unrealized profit hits this dollar value."
-                      todayLabel="Profit"
-                      todayValue={unrealizedPl !== null ? fmt(unrealizedPl) : "—"}
-                      todayColor={(unrealizedNum ?? 0) >= 0 ? "var(--good)" : "var(--bad)"}
+                      subtitle="Sell everything + disable copy when your account value reaches this dollar amount."
+                      todayLabel="Value"
+                      todayValue={equity !== null ? fmt(equity) : "—"}
+                      todayColor="var(--text)"
                       inputPrefix="USD"
                       input={autoLiqInput}
                       onInput={setAutoLiqInput}

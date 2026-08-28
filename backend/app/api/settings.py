@@ -421,12 +421,14 @@ def set_auto_liquidation_limit(
     db: Session = Depends(get_db),
     user: User = Depends(require_subscriber),
 ) -> SubscriberSettingsOut:
-    """Subscriber-set hard floor on account equity. Pass null to disable.
+    """Subscriber-set account-value TARGET. Pass null to disable.
 
-    When pnl_poller observes broker equity <= this value, every open
-    position on the subscriber's broker is closed at market AND
-    copy_enabled flips to False. Unlike the daily limits, this does NOT
-    auto-resume next day — the subscriber must manually re-enable copy.
+    When pnl_poller observes broker equity (total account value) >= this
+    value, every open position on the subscriber's broker is closed at
+    market AND copy_enabled flips to False. It's a standing target (NOT
+    daily and NOT P&L-based) — it fires whenever account value crosses it,
+    however long that takes — and unlike the daily limits it does NOT
+    auto-resume; the subscriber must manually re-enable copy.
 
     Clearing the limit (null) does NOT clear ``auto_liquidated_at`` —
     that stamp persists as an audit record of the last trigger.
@@ -434,6 +436,40 @@ def set_auto_liquidation_limit(
     s = db.get(SubscriberSettings, user.id)
     if not s:
         raise HTTPException(404, "settings_missing")
+
+    # Guard: an account-value target at or below the CURRENT account value would
+    # trip immediately (equity >= target is already true) and flatten the whole
+    # account at market — irreversible. Refuse it. Compare against a freshly
+    # refreshed balance (best-effort) so a stale figure can't wrongly block a
+    # valid target. If we genuinely can't read the account value, we allow it
+    # (can't validate) rather than block a legitimate change.
+    new_limit = payload.auto_liquidation_limit
+    if new_limit is not None:
+        from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+        from app.services import balance_sync  # noqa: PLC0415
+        from app.services.crypto import decrypt_json  # noqa: PLC0415
+        acct = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+            ).order_by(BrokerAccount.created_at.desc())
+        ).scalars().first()
+        if acct is not None:
+            try:
+                balance_sync.refresh_account_balance(
+                    acct, decrypt_json(acct.encrypted_credentials)
+                )
+            except Exception:  # noqa: BLE001
+                pass  # fall back to the last cached total_equity
+            current_equity = acct.total_equity
+            if current_equity is not None and new_limit <= current_equity:
+                raise HTTPException(
+                    422,
+                    f"Auto-liquidation target must be ABOVE your current account "
+                    f"value (${current_equity:,.2f}). Setting it at or below would "
+                    f"liquidate your account immediately.",
+                )
+
     old = s.auto_liquidation_limit
     s.auto_liquidation_limit = payload.auto_liquidation_limit
     audit.record(

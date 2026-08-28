@@ -1,11 +1,12 @@
 """Auto-liquidation — close every open position and cancel every open
-order on a subscriber's broker account when their equity floor trips.
+order on a subscriber's broker account when their account-value target
+is reached.
 
-Triggered by ``pnl_poller`` when broker-reported equity falls to or
-below ``SubscriberSettings.auto_liquidation_limit``. The poller has
-already flipped ``copy_enabled`` to False and stamped
-``auto_liquidated_at`` before calling us — we just have to flatten the
-account.
+Triggered by ``pnl_poller`` when broker-reported equity (total account
+value) rises to or above ``SubscriberSettings.auto_liquidation_limit``
+— a standing profit target, not a daily one. The poller has already
+flipped ``copy_enabled`` to False and stamped ``auto_liquidated_at``
+before calling us — we just have to flatten the account.
 
 Best-effort + per-leg-isolated: a failure on one symbol doesn't abort
 the rest. The poller catches any exception we raise so a bad

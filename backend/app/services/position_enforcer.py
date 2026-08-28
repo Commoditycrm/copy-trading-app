@@ -13,8 +13,8 @@ Per-position only — a triggered close does NOT pause copy or affect
 other positions. Distinct from:
   * daily_loss_limit_pct / daily_profit_limit_pct — pause copy when
     REALIZED daily P&L hits a % of the day-start balance.
-  * auto_liquidation_limit — flatten the WHOLE account when UNREALIZED
-    daily profit hits a USD ceiling AND disable copy.
+  * auto_liquidation_limit — flatten the WHOLE account when total account
+    value (equity) reaches a USD target AND disable copy.
 
 Best-effort + per-position-isolated: a failure on one symbol doesn't
 abort the rest. The poller catches any exception we raise so a bad

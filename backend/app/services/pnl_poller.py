@@ -803,20 +803,18 @@ def _enforce_one(acct: BrokerAccount) -> None:
             s.max_account_usd_per_day is not None
             and todays_trading_value >= s.max_account_usd_per_day
         )
-        # Auto-liquidation: a take-profit ceiling on UNREALIZED P&L for
-        # the day (today's total mark-to-market gains on still-open
-        # positions). Distinct from daily_profit_limit which is a REALIZED
-        # circuit breaker triggered by closed fills. When tripped we
-        # (1) flip copy_enabled, (2) stamp auto_liquidated_at as an audit
-        # marker, (3) hand off to auto_liquidator to flatten the broker —
-        # which converts the unrealized gain into a realized one.
-        #
-        #   unrealized = todays_total_pl − today_realized_pnl
-        #              = (equity − beginning_day_balance) − fills_today
-        #
-        # Requires beginning_day_balance to be known (some SnapTrade
-        # brokers don't expose it — for those subscribers the take-profit
-        # check is skipped, same as the pct kill switch).
+        # Auto-liquidation: an ABSOLUTE ACCOUNT-VALUE target. When the broker's
+        # reported equity (total account value) reaches the configured amount,
+        # flatten everything at market and turn copy OFF. NOT daily and NOT P&L-
+        # based — it's a standing target on total account value (e.g. "when my
+        # account hits $15k, liquidate and stop"), so it fires whenever equity
+        # crosses the target, whether that takes 5 days or 5 weeks. When tripped
+        # we (1) flip copy_enabled, (2) stamp auto_liquidated_at (sticky — never
+        # auto-resumed; the subscriber re-enables manually), (3) hand off to
+        # auto_liquidator to flatten the broker. Unlike the old take-profit
+        # version this needs only `equity`, so it works for brokers that don't
+        # expose a day-start balance. unrealized_pl is still computed below for
+        # the audit/notification metadata only, not the trigger.
         todays_realized = pnl.today_realized_pnl(db, s.user_id)
         unrealized_pl: Decimal | None = None
         if beginning_day_balance is not None:
@@ -824,8 +822,8 @@ def _enforce_one(acct: BrokerAccount) -> None:
         hit_liquidation = (
             s.auto_liquidation_limit is not None
             and s.auto_liquidation_limit > 0
-            and unrealized_pl is not None
-            and unrealized_pl >= s.auto_liquidation_limit
+            and equity is not None
+            and equity >= s.auto_liquidation_limit
             # NEVER liquidate on a stale/last-known snapshot — flattening the
             # whole account at market off ~minutes-old prices is unsafe. A
             # reversible copy PAUSE tolerates staleness; a market liquidation
@@ -878,9 +876,9 @@ def _enforce_one(acct: BrokerAccount) -> None:
                     user_id=s.user_id,
                     type="copy.auto_liquidated",
                     message=(
-                        f"Unrealized profit hit ${unrealized_pl} "
+                        f"Account value reached ${equity} "
                         f"(target ${s.auto_liquidation_limit}). "
-                        f"All positions closed to lock in the gain; "
+                        f"All positions were liquidated at market; "
                         f"copy trading is OFF until you turn it back on."
                     ),
                     metadata={
