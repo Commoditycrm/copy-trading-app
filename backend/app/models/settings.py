@@ -102,12 +102,14 @@ class SubscriberSettings(Base, TimestampMixin):
     )
 
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
-    # When the pnl_poller observes broker-reported equity <= this value,
-    # everything on the subscriber's broker is closed at market AND
-    # ``copy_enabled`` flips to False. NULL = off. Re-enable is manual
-    # only — the contract is "stop until I turn it back on", same as
-    # every other limit. Stamped with ``auto_liquidated_at`` when the
-    # trigger fires so the Settings page can show "Auto-liquidated at HH:MM".
+    # ABSOLUTE ACCOUNT-VALUE TARGET (not daily, not P&L-based). When the
+    # pnl_poller observes broker-reported equity (total account value) >= this
+    # value, everything on the subscriber's broker is closed at market AND
+    # ``copy_enabled`` flips to False. Fires whenever equity crosses the target,
+    # however long that takes (days or weeks). NULL = off. Re-enable is manual
+    # only — the contract is "stop until I turn it back on", same as every other
+    # limit. Stamped with ``auto_liquidated_at`` when the trigger fires so the
+    # Settings page can show "Auto-liquidated at HH:MM".
     auto_liquidation_limit: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )
@@ -128,10 +130,10 @@ class SubscriberSettings(Base, TimestampMixin):
     #
     # Auto-liquidation (`auto_liquidation_limit`) deliberately uses a
     # DIFFERENT column (`auto_liquidated_at`) and is NEVER touched by the
-    # auto-resume sweep — equity-floor liquidation stays sticky until the
-    # subscriber manually re-enables copy. That's the intentional split:
-    # daily limits forgive on the next day, hard-equity liquidation does
-    # not.
+    # auto-resume sweep — the account-value-target liquidation stays sticky
+    # until the subscriber manually re-enables copy. That's the intentional
+    # split: daily limits forgive on the next day, the hard account-value
+    # liquidation does not.
     pnl_auto_paused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
