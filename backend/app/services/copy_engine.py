@@ -1956,6 +1956,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         # exited. Excluding it yields the position that existed BEFORE this order.
         exclude_order_id=trader_order.id,
     ) > 0
+    # Did this order take the TRADER fully FLAT for the contract? Net position
+    # INCLUDING this order == 0 (and it was a close, not a naked short open). Used
+    # below so a subscriber whose fractional-multiplier close rounded DOWN to 0
+    # (e.g. mult 0.25, trader closing 1-2 contracts) still fully exits when the
+    # trader does — otherwise the sub is stranded holding a position the trader has
+    # left (prod 2026-08: skipped_zero_qty on SELLs). Computed once per fanout.
+    trader_fully_flat = trader_closing and _closeable_quantity(
+        db, trader_order.user_id, trader_order, subtract_reserved=False,
+    ) == 0
     # Trader master pause: while paused we drop OPENS (no new entries for anyone)
     # but STILL mirror CLOSES so a subscriber isn't left holding a position the
     # trader has exited. Paused + OPENING → skip the whole fanout here (exactly
@@ -2494,6 +2503,16 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                             },
                         )
                         scaled = closeable
+            # Full-exit override: when the trader has FULLY closed this contract,
+            # the subscriber closes their ENTIRE held position — regardless of the
+            # multiplier-scaled qty. Without this, a fractional multiplier that
+            # rounds a (small/incremental) close DOWN to 0 skips the sub's SELL and
+            # strands them holding a position the trader has already exited (prod:
+            # mult 0.25/0.5, closing 1-2 contracts → skipped_zero_qty). Only when
+            # they actually hold something (closeable > 0); partial closes keep
+            # their proportional scaling and self-correct on the trader's full exit.
+            if is_closing_effective and trader_fully_flat and closeable > 0:
+                scaled = closeable
             if scaled <= 0:
                 audit.record(
                     db,
