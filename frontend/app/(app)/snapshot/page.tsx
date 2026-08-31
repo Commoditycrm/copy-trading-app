@@ -119,8 +119,8 @@ export default function SnapshotPage() {
         <div>
           <h2 className="text-xl font-bold">Exit Snapshot</h2>
           <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            The positions from your last <b>Exit All</b>, with each order&apos;s exit price. Re-enter any order
-            individually — at market, or a % below its exit price.
+            Every position you&apos;ve exited (individually or via <b>Exit All</b>), with each order&apos;s exit
+            price. Re-enter any order individually or all at once — at market, or a % below its exit price.
           </p>
         </div>
         {snap && (
