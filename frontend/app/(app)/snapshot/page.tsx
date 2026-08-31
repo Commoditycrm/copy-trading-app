@@ -106,6 +106,12 @@ export default function SnapshotPage() {
   const th = "px-4 py-3 text-xs font-semibold whitespace-nowrap";
   const td = "px-4 py-3 text-sm whitespace-nowrap";
 
+  // Staleness: exit prices age with the snapshot, so re-entering "% below" an
+  // old price stops being meaningful. Warn once it's a couple of days old.
+  const ageDays = snap ? Math.floor((Date.now() - new Date(snap.created_at).getTime()) / 86_400_000) : 0;
+  const ageLabel = ageDays <= 0 ? "today" : ageDays === 1 ? "1 day ago" : `${ageDays} days ago`;
+  const stale = ageDays >= 2;
+
   return (
     <div className="space-y-5">
       <div className="flex items-start justify-between flex-wrap gap-3">
@@ -118,7 +124,10 @@ export default function SnapshotPage() {
         </div>
         {snap && (
           <div className="text-sm text-right" style={{ color: "var(--text-2)" }}>
-            <div><span style={{ color: "var(--muted)" }}>Taken:</span> {new Date(snap.created_at).toLocaleString()}</div>
+            <div>
+              <span style={{ color: "var(--muted)" }}>Taken:</span> {new Date(snap.created_at).toLocaleString()}
+              <span style={{ color: stale ? "var(--bad)" : "var(--muted)" }}> ({ageLabel})</span>
+            </div>
             <div className="mt-0.5">
               <span style={{ color: "var(--good)" }}>{snap.summary.filled}/{snap.summary.total} back in</span>
               {snap.summary.working > 0 && <span style={{ color: "#facc15" }}> · {snap.summary.working} resting</span>}
@@ -136,6 +145,15 @@ export default function SnapshotPage() {
         </div>
       ) : (
         <>
+          {stale && (
+            <div className="rounded-xl px-4 py-2.5 text-sm"
+                 style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "var(--bad)" }}>
+              ⚠ This snapshot was taken <b>{ageLabel}</b> — the exit prices are stale, so re-entering a
+              &ldquo;% below&rdquo; the exit price may not reflect the current market. Prefer a market re-entry,
+              or take a fresh Exit snapshot.
+            </div>
+          )}
+
           {/* Re-Enter All bar */}
           <div className="rounded-xl px-4 py-3 flex items-center justify-between gap-3 flex-wrap"
                style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
