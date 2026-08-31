@@ -42,7 +42,8 @@ from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.services import audit, excel_export, market_hours, visibility
-from app.services.pnl import realized_pnl_by_day
+from app.services.pnl import calendar_series, realized_pnl_by_day
+from app.schemas.order import DailyPnL
 from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
 from app.services.crypto import encrypt_json
@@ -473,6 +474,52 @@ def admin_daily_pnl(
             "users": len(days[day]["users"]),
         }
         for day in sorted(days, reverse=True)
+    ]
+
+
+@router.get("/users/{user_id}/pnl-calendar", response_model=list[DailyPnL])
+def admin_user_pnl_calendar(
+    user_id: uuid.UUID,
+    from_: date = Query(..., alias="from"),
+    to: date = Query(...),
+    tz: str | None = Query(default=None, description="IANA tz; defaults to US/Eastern."),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[DailyPnL]:
+    """Per-day P&L for ONE user, computed with the EXACT same function the user's
+    own Calendar uses (services.pnl.calendar_series). Single source of truth: the
+    number here is guaranteed to equal what the user sees on their Calendar — no
+    separate admin re-derivation that can drift. Use this (not admin_daily_pnl)
+    when you need admin to match a specific user's numbers.
+    """
+    if from_ > to:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="from must be <= to")
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    # Same subscriber de-dup rule the calendar applies.
+    mirrors_only = target.role == UserRole.SUBSCRIBER
+    # Today's live open-position swing, exactly as calendar_pnl folds it in.
+    live_unreal_today = None
+    if from_ <= market_hours.now_et().date() <= to:
+        from app.api.trades import _live_unrealized_today  # noqa: PLC0415  (avoid import cycle)
+        live_unreal_today = _live_unrealized_today(db, user_id)
+
+    series = calendar_series(
+        db, user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
+        live_today_unrealized=live_unreal_today,
+    )
+    return [
+        DailyPnL(
+            day=c.day,
+            realized_pnl=c.marked_pnl,   # the SHOWN number (marked), same as the calendar wire format
+            trade_count=c.trade_count,
+            pct=None,
+            unrealized_pnl=c.unrealized_pnl,
+            live=c.live,
+        )
+        for c in sorted(series.values(), key=lambda c: c.day)
     ]
 
 
