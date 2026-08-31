@@ -14,7 +14,23 @@ interface DailyRow {
   users: number;
 }
 
+// Shape of the per-user endpoint (DailyPnL) — the SAME figures the user's Calendar shows.
+interface CalRow {
+  day: string;
+  realized_pnl: string;   // the shown (marked) number
+  trade_count: number;
+  unrealized_pnl: string | null;
+  live: boolean;
+}
+
 interface UserRow { id: string; email: string; role: string; display_name: string | null; }
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+function daysAgoISO(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
 
 function Money({ v }: { v: string }) {
   const n = Number(v);
@@ -37,13 +53,35 @@ export default function AdminDailyPnlPage() {
   async function load() {
     setLoading(true);
     try {
-      const q = new URLSearchParams();
-      if (from) q.set("from", from);
-      if (to) q.set("to", to);
-      if (userId) q.set("user_id", userId);
-      else if (role) q.set("role", role);
-      const qs = q.toString();
-      setRows(await api<DailyRow[]>(`/api/admin/daily-pnl${qs ? `?${qs}` : ""}`));
+      if (userId) {
+        // ONE user → use the per-user endpoint that reuses the user's own
+        // Calendar computation, so the figures match exactly what they see.
+        // That endpoint requires a date range; default to the last 90 days.
+        const f = from || daysAgoISO(90);
+        const t = to || todayISO();
+        const q = new URLSearchParams({ from: f, to: t });
+        const data = await api<CalRow[]>(`/api/admin/users/${userId}/pnl-calendar?${q.toString()}`);
+        const urole = users.find((u) => u.id === userId)?.role ?? "trader";
+        const mapped: DailyRow[] = data
+          .filter((c) => Number(c.realized_pnl) !== 0 || c.trade_count > 0)
+          .map((c) => ({
+            day: c.day,
+            trader_pnl: urole === "trader" ? c.realized_pnl : "0",
+            subscriber_pnl: urole === "subscriber" ? c.realized_pnl : "0",
+            total: c.realized_pnl,
+            users: 1,
+          }))
+          .sort((a, b) => (a.day < b.day ? 1 : -1)); // newest first
+        setRows(mapped);
+      } else {
+        // No specific user → the all-users aggregate (unchanged).
+        const q = new URLSearchParams();
+        if (from) q.set("from", from);
+        if (to) q.set("to", to);
+        if (role) q.set("role", role);
+        const qs = q.toString();
+        setRows(await api<DailyRow[]>(`/api/admin/daily-pnl${qs ? `?${qs}` : ""}`));
+      }
     } catch (e) {
       notify.fromError(e, "Could not load daily P&L");
     } finally {
@@ -84,11 +122,18 @@ export default function AdminDailyPnlPage() {
     <div className="space-y-5">
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h2 className="text-xl font-bold">Daily P&L — All Users</h2>
-          <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            Per-day total from the broker-direct snapshots, split trader vs subscriber. ET days.
-            Webull is realized, Alpaca is marked — each broker's own daily figure.
-          </p>
+          <h2 className="text-xl font-bold">Daily P&L{userId ? " — Single User" : " — All Users"}</h2>
+          {userId ? (
+            <p className="text-sm mt-1" style={{ color: "var(--good)" }}>
+              Showing this user&apos;s own Calendar figures — matches exactly what the user sees.
+              (Last 90 days by default; set a date range to change.)
+            </p>
+          ) : (
+            <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+              Per-day total from the broker-direct snapshots, split trader vs subscriber. ET days.
+              Webull is realized, Alpaca is marked — each broker&apos;s own daily figure.
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {/* Role dropdown — picks the group; resets any specific-name pick. */}
