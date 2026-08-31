@@ -13,6 +13,7 @@
  *    `onActionComplete` hook (typically a table-refresh) and forget.
  */
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { ConfirmModal } from "@/components/ConfirmModal";
@@ -337,6 +338,10 @@ export function BulkExitBar({ onActionComplete }: Props) {
             {snapshot.summary.pending > 0 && (
               <span className="text-xs" style={{ color: "var(--muted)" }}>· {snapshot.summary.pending} to go</span>
             )}
+            {/* Jump to the full per-order Snapshot page. */}
+            <Link href="/snapshot" className="text-xs font-medium" style={{ color: "var(--accent)" }}>
+              View snapshot →
+            </Link>
           </div>
           <div className="flex items-center gap-2">
             <div
