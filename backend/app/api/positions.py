@@ -339,6 +339,9 @@ def latest_sell_all_snapshot(
             "instrument_type": p["instrument_type"],
             "quantity": p["quantity"],
             "price": p.get("price"),
+            "option_expiry": p.get("option_expiry"),
+            "option_strike": p.get("option_strike"),
+            "option_right": p.get("option_right"),
             "reentry_status": st,
         })
     summary = {
@@ -364,14 +367,19 @@ def re_enter_from_snapshot(
         description="Re-buy each position this % BELOW its exit price (a resting LIMIT). Omit / 0 = market buy now.",
     ),
     snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
+    symbol: str | None = Query(
+        default=None,
+        description="Re-enter ONLY this symbol (per-order re-entry). Omit to re-enter every pending position.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
     """Re-open the positions from a Sell-All snapshot, FILL-AWARE: only items not
     already back (or with a resting order) get a new buy. Long positions re-buy,
     short positions re-sell, same quantities. With ``discount_percent`` a stock
-    re-buy rests as a LIMIT that % below the exit price ('buy the dip'). Safe to
-    click repeatedly — filled/working items are skipped, so no double-buying."""
+    re-buy rests as a LIMIT that % below the exit price ('buy the dip'). Pass
+    ``symbol`` to re-enter a SINGLE order. Safe to click repeatedly — filled/
+    working items are skipped, so no double-buying."""
     q = select(SellAllSnapshot).where(SellAllSnapshot.user_id == user.id)
     if snapshot_id:
         q = q.where(SellAllSnapshot.id == snapshot_id)
@@ -397,6 +405,10 @@ def re_enter_from_snapshot(
     failed: list[dict] = []
     new_positions: list[dict] = []
     for p in snap.positions:
+        # Per-order re-entry: leave every other position untouched.
+        if symbol is not None and p["symbol"] != symbol:
+            new_positions.append(p)
+            continue
         st = _reentry_status(db, p)
         if st in ("filled", "working"):
             # Already back, or a buy-back is resting — don't place again.

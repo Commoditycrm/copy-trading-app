@@ -126,6 +126,7 @@ const NAV_TRADER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
   { href: "/positions", label: "Positions", Icon: IconLayers },
+  { href: "/snapshot", label: "Snapshot", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
