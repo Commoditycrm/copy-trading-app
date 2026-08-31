@@ -383,11 +383,26 @@ export function BulkExitBar({ onActionComplete }: Props) {
       <ConfirmModal
         open={pending !== null}
         title={pending ? EXIT_DEFS[pending].title : ""}
-        message={
-          pending === "my_positions" && useTrail
+        message={(() => {
+          if (pending !== "my_positions") return pending ? EXIT_DEFS[pending].message : "";
+          const base = useTrail
             ? `Closes every open position in YOUR connected brokers with a TRAILING STOP (${trailNum}% trail) where the broker supports it (stocks); options and unsupported brokers fall back to a market close. Subscribers are not affected.`
-            : pending ? EXIT_DEFS[pending].message : ""
-        }
+            : EXIT_DEFS.my_positions.message;
+          // Warn if the current snapshot still has positions not re-entered —
+          // this exit will supersede it and abandon them.
+          const nPending = snapshot?.summary.pending ?? 0;
+          if (nPending === 0) return base;
+          return (
+            <>
+              <span style={{ color: "var(--bad)", fontWeight: 600 }}>
+                ⚠ You still have {nPending} position{nPending === 1 ? "" : "s"} not re-entered from your last
+                exit. This new exit will REPLACE that snapshot, and those un-re-entered ones will no longer be
+                available to re-enter here.
+              </span>
+              <div className="mt-2">{base}</div>
+            </>
+          );
+        })()}
         confirmLabel={pending ? EXIT_DEFS[pending].confirmLabel : "Confirm"}
         variant="danger"
         busy={busy}
