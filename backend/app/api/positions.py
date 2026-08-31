@@ -18,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, require_trader
@@ -270,16 +270,10 @@ def close_all_positions(
 
     snapshot_id = None
     if snapshot_positions:
-        # One active snapshot per user: this Sell-All supersedes any prior one.
-        db.execute(
-            update(SellAllSnapshot)
-            .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
-            .values(active=False)
-        )
-        snap = SellAllSnapshot(user_id=user.id, positions=snapshot_positions)  # active defaults True
-        db.add(snap)
+        # Add these to the active re-entry basket (shared with individual closes).
+        snap = _capture_exit_snapshot(db, user.id, snapshot_positions)
         db.commit()
-        snapshot_id = str(snap.id)
+        snapshot_id = str(snap.id) if snap else None
 
     return {
         "closed": closed, "failed": failed,
@@ -320,6 +314,49 @@ def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None]":
 def _reentry_status(db: Session, item: dict) -> str:
     """Just the status (see _reentry_info)."""
     return _reentry_info(db, item)[0]
+
+
+def _snapshot_item(pos: BrokerPosition) -> dict:
+    """A snapshot position row from a live BrokerPosition (signed qty + exit price)."""
+    return {
+        "symbol": pos.symbol,
+        "instrument_type": pos.instrument_type.value,
+        "quantity": str(pos.quantity),
+        "price": str(pos.current_price) if pos.current_price is not None else None,
+        "option_expiry": pos.option_expiry.isoformat() if pos.option_expiry else None,
+        "option_strike": str(pos.option_strike) if pos.option_strike is not None else None,
+        "option_right": pos.option_right.value if pos.option_right else None,
+        "reentry_order_id": None,
+    }
+
+
+def _snap_key(p: dict) -> tuple:
+    """Identity of a snapshot item — symbol + option contract parts."""
+    return (p["symbol"], p.get("option_expiry"), p.get("option_strike"), p.get("option_right"))
+
+
+def _capture_exit_snapshot(db: Session, user_id: uuid.UUID, items: list[dict]) -> "SellAllSnapshot | None":
+    """Add exited positions to the user's ACTIVE snapshot (creating one if none) —
+    the shared re-entry basket. Both individual closes and Exit All feed this, so
+    ANY position you exit is re-enterable. Deduped by contract identity: re-exiting
+    a symbol replaces its row (fresh exit price, re-entry reset to pending)."""
+    if not items:
+        return None
+    snap = db.execute(
+        select(SellAllSnapshot)
+        .where(SellAllSnapshot.user_id == user_id, SellAllSnapshot.active.is_(True))
+        .order_by(SellAllSnapshot.created_at.desc())
+        .limit(1)
+    ).scalars().first()
+    if snap is None:
+        snap = SellAllSnapshot(user_id=user_id, positions=[], active=True)
+        db.add(snap)
+        db.flush()
+    by_key = {_snap_key(p): p for p in snap.positions}
+    for it in items:
+        by_key[_snap_key(it)] = it   # replace/insert (reentry reset to pending)
+    snap.positions = list(by_key.values())   # reassign so JSONB persists
+    return snap
 
 
 @router.get("/snapshots/latest")
@@ -871,7 +908,7 @@ def close_position(
     )
 
     try:
-        return _place_trader_order(
+        order = _place_trader_order(
             db, user, new_payload, acct.id, background, request, resolve_wash_trade=True,
         )
     except Exception as exc:  # noqa: BLE001
@@ -885,7 +922,16 @@ def close_position(
             retry_payload = new_payload.model_copy(
                 update={"order_type": OrderType.LIMIT, "limit_price": retry_px}
             )
-            return _place_trader_order(
+            order = _place_trader_order(
                 db, user, retry_payload, acct.id, background, request, resolve_wash_trade=True,
             )
-        raise
+        else:
+            raise
+
+    # Feed this exit into the re-entry basket (snapshot) so it's re-enterable —
+    # same as Exit All. Record the CLOSED quantity (partial closes included).
+    closed_item = _snapshot_item(pos)
+    closed_item["quantity"] = str(close_qty if pos.quantity > 0 else -close_qty)
+    _capture_exit_snapshot(db, user.id, [closed_item])
+    db.commit()
+    return order
