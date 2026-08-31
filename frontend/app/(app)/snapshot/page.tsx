@@ -18,6 +18,7 @@ interface SnapPos {
   instrument_type: string;
   quantity: string;            // signed
   price: string | null;        // exit price / share
+  reentry_price: string | null; // fill price (filled) or resting limit (working)
   option_expiry: string | null;
   option_strike: string | null;
   option_right: string | null;
@@ -190,6 +191,8 @@ export default function SnapshotPage() {
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Side</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Qty</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Exit Price</th>
+                    <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
+                    <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Enter</th>
                   </tr>
@@ -200,12 +203,31 @@ export default function SnapshotPage() {
                     const side = qty >= 0 ? "Long" : "Short";
                     const st = STATUS_STYLE[p.reentry_status];
                     const canReenter = p.reentry_status === "pending";
+                    const exitP = p.price != null ? Number(p.price) : null;
+                    const reP = p.reentry_price != null ? Number(p.reentry_price) : null;
+                    // Long buy-back: bought back cheaper than exit = positive (saved).
+                    const changePerSh =
+                      p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
                     return (
                       <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
                         <td className={`${td} font-medium`}>{p.symbol}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
                         <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
+                        {/* Re-entry price: fill when back in, resting limit when working. */}
+                        <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
+                          {p.reentry_status === "filled"
+                            ? fmtMoney(p.reentry_price)
+                            : p.reentry_status === "working"
+                              ? (p.reentry_price ? `resting @ ${fmtMoney(p.reentry_price)}` : "resting")
+                              : "—"}
+                        </td>
+                        {/* Change per share: exit − re-entry. Positive = re-bought cheaper. */}
+                        <td className={`${td} text-right num`} style={{
+                          color: changePerSh == null ? "var(--muted)" : changePerSh > 0 ? "var(--good)" : changePerSh < 0 ? "var(--bad)" : "var(--text-2)",
+                        }}>
+                          {changePerSh == null ? "—" : `${changePerSh > 0 ? "+" : ""}${changePerSh.toFixed(2)}`}
+                        </td>
                         <td className={td}>
                           <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: st.bg, color: st.color }}>
                             {st.label}
