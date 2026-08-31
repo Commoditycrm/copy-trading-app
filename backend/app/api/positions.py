@@ -295,24 +295,31 @@ _REENTRY_WORKING = {
 }
 
 
-def _reentry_status(db: Session, item: dict) -> str:
-    """Per-item re-entry state:
-      'filled'  — the buy-back filled; the position is back.
-      'working' — a buy-back is resting (waiting to fill).
-      'pending' — never re-entered, or the last attempt canceled/expired/
-                  rejected — so it still NEEDS a (re-)entry.
-    This is what makes Re-Enter fill-aware: only 'pending' items get placed."""
+def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None]":
+    """(status, reentry_price) for a snapshot item.
+      status: 'filled' / 'working' / 'pending' (see below).
+      reentry_price: what we re-entered at — the FILL price when filled, the
+                     resting LIMIT price when working, else None.
+    'filled'  — the buy-back filled; the position is back.
+    'working' — a buy-back is resting (waiting to fill).
+    'pending' — never re-entered, or the last attempt canceled/expired/rejected —
+                so it still NEEDS a (re-)entry (only 'pending' items get placed)."""
     oid = item.get("reentry_order_id")
     if not oid:
-        return "pending"
+        return "pending", None
     o = db.get(Order, uuid.UUID(oid))
     if o is None:
-        return "pending"
+        return "pending", None
     if o.status == OrderStatus.FILLED:
-        return "filled"
+        return "filled", o.filled_avg_price
     if o.status in _REENTRY_WORKING:
-        return "working"
-    return "pending"  # canceled / expired / rejected → re-enter is allowed again
+        return "working", o.limit_price   # resting at this limit (None for market)
+    return "pending", None  # canceled / expired / rejected → re-enter allowed again
+
+
+def _reentry_status(db: Session, item: dict) -> str:
+    """Just the status (see _reentry_info)."""
+    return _reentry_info(db, item)[0]
 
 
 @router.get("/snapshots/latest")
@@ -333,12 +340,13 @@ def latest_sell_all_snapshot(
         return {"snapshot": None}
     positions = []
     for p in snap.positions:
-        st = _reentry_status(db, p)
+        st, reentry_price = _reentry_info(db, p)
         positions.append({
             "symbol": p["symbol"],
             "instrument_type": p["instrument_type"],
             "quantity": p["quantity"],
-            "price": p.get("price"),
+            "price": p.get("price"),                                  # exit price
+            "reentry_price": str(reentry_price) if reentry_price is not None else None,
             "option_expiry": p.get("option_expiry"),
             "option_strike": p.get("option_strike"),
             "option_right": p.get("option_right"),
