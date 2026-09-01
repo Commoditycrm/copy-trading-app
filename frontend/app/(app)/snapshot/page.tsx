@@ -18,6 +18,7 @@ interface SnapPos {
   instrument_type: string;
   quantity: string;            // signed
   price: string | null;        // exit price / share
+  current_price: string | null; // live market price / share
   reentry_price: string | null; // fill price (filled) or resting limit (working)
   option_expiry: string | null;
   option_strike: string | null;
@@ -191,6 +192,7 @@ export default function SnapshotPage() {
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Side</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Qty</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Exit Price</th>
+                    <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>
@@ -208,12 +210,20 @@ export default function SnapshotPage() {
                     // Long buy-back: bought back cheaper than exit = positive (saved).
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
+                    // Dollar target for the chosen "% below" (this row's, else the global box).
+                    const effDisc = parseFloat(rowDisc[p.symbol] ?? globalDisc);
+                    const targetPx =
+                      !isNaN(effDisc) && effDisc > 0 && effDisc <= 100 && exitP != null
+                        ? exitP * (1 - effDisc / 100)
+                        : null;
                     return (
                       <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
                         <td className={`${td} font-medium`}>{p.symbol}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
                         <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
+                        {/* Live current market price (stocks). */}
+                        <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>{fmtMoney(p.current_price)}</td>
                         {/* Re-entry price: fill when back in, resting limit when working. */}
                         <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
                           {p.reentry_status === "filled"
@@ -247,6 +257,12 @@ export default function SnapshotPage() {
                                      style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
                               <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
                             </div>
+                            {/* Dollar target for the chosen %. */}
+                            {canReenter && targetPx != null && (
+                              <span className="text-[10px] num whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                                = ${targetPx.toFixed(2)}
+                              </span>
+                            )}
                             <button type="button" onClick={() => reEnter(p.symbol)}
                                     disabled={busy !== null || !canReenter}
                                     className="px-2.5 py-1 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
