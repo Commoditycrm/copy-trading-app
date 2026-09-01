@@ -375,6 +375,31 @@ def latest_sell_all_snapshot(
     ).scalars().first()
     if not snap:
         return {"snapshot": None}
+
+    # Best-effort live price per stock symbol for the "current market price"
+    # column (Alpaca get_stock_latest_price; None if unavailable).
+    adapter = None
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id, BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is not None:
+        try:
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        except Exception:  # noqa: BLE001
+            adapter = None
+
+    def _current(sym: str, itype: str) -> str | None:
+        fn = getattr(adapter, "get_stock_latest_price", None)
+        if adapter is None or itype != "stock" or fn is None:
+            return None
+        try:
+            px = fn(sym)
+            return str(px) if px is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
     positions = []
     for p in snap.positions:
         st, reentry_price = _reentry_info(db, p)
@@ -383,6 +408,7 @@ def latest_sell_all_snapshot(
             "instrument_type": p["instrument_type"],
             "quantity": p["quantity"],
             "price": p.get("price"),                                  # exit price
+            "current_price": _current(p["symbol"], p["instrument_type"]),
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
             "option_expiry": p.get("option_expiry"),
             "option_strike": p.get("option_strike"),
