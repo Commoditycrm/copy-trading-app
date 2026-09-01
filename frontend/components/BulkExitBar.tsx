@@ -114,6 +114,17 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const [snapshot, setSnapshot] = useState<{ id: string; summary: SnapSummary } | null>(null);
   const [reDiscount, setReDiscount] = useState("");
   const [reBusy, setReBusy] = useState(false);
+  // Open-position count so Exit My Positions can disable when there's nothing to
+  // exit. null = not yet known (keep enabled until we know it's 0).
+  const [posCount, setPosCount] = useState<number | null>(null);
+  const noPositions = posCount === 0;
+
+  async function loadPositions() {
+    try {
+      const list = await api<unknown[]>("/api/positions");
+      setPosCount(Array.isArray(list) ? list.length : null);
+    } catch { /* keep last known */ }
+  }
 
   async function loadSnapshot() {
     try {
@@ -127,6 +138,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   useEffect(() => {
     api<User>("/api/auth/me").then(setUser).catch(() => {});
     loadSnapshot();
+    loadPositions();
   }, []);
 
   // While a snapshot with unresolved items is shown, poll so fills flip
@@ -157,6 +169,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
       else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed${skip} — check Order History.`);
       onActionComplete?.();
       loadSnapshot();  // refresh per-item status
+      loadPositions();
     } catch (e) {
       notify.fromError(e, "Re-enter failed");
     } finally {
@@ -219,6 +232,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
       await runExit(pending);
       onActionComplete?.();
       loadSnapshot();  // a Sell-All just saved a new snapshot
+      loadPositions();
       setPending(null);
     } catch (e) {
       notify.fromError(e, "Action failed");
@@ -248,6 +262,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
           </span>
         </div>
         <div className="flex flex-wrap gap-2 justify-end items-center">
+          {/* Exit-only inputs (trail + default re-entry) — hidden when there's
+              nothing to exit. */}
+          {!noPositions && (<>
           {/* Trailing-stop trail for Exit My Positions. Leave empty for a
               market exit; enter e.g. 5 to close as a trailing stop where the
               broker supports it. */}
@@ -288,16 +305,19 @@ export function BulkExitBar({ onActionComplete }: Props) {
               style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
             />
           </div>
+          </>)}
           {keys.map(key => {
             const def = EXIT_DEFS[key];
             const isSubs = def.subs;
+            // Nothing to exit → disable Exit My Positions.
+            const disabledNoPos = key === "my_positions" && noPositions;
             return (
               <button
                 key={key}
                 type="button"
                 onClick={() => setPending(key)}
-                disabled={busy}
-                title={def.message}
+                disabled={busy || disabledNoPos}
+                title={disabledNoPos ? "No open positions to exit" : def.message}
                 className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 style={{
                   // Subs (destructive-to-subscribers) keep the red tint — it
