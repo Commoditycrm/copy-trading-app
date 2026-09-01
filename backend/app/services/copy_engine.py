@@ -984,6 +984,45 @@ def _closeable_quantity(
     return closeable if closeable > 0 else Decimal(0)
 
 
+def _entry_multiplier_for_close(
+    db: Session, user_id: uuid.UUID, order: Order
+) -> Decimal | None:
+    """The copy-size multiplier the subscriber's position in ``order``'s contract
+    was OPENED at — read from ``copy_multiplier`` on their most recent OPENING
+    mirror for that exact contract.
+
+    Closes scale by THIS instead of the subscriber's live setting, so lowering
+    the multiplier mid-position can't strand them on the exit: a trader's full
+    close then still maps to the subscriber's full position, and a chunked close
+    can't round each piece down to zero against a smaller current multiplier.
+
+    Returns None when there's no stored entry multiplier — a position opened
+    before this column existed, or acquired outside the copy engine — and the
+    caller falls back to the live setting (pre-existing behaviour).
+
+    Edge case (documented, not handled here): if the position was built from
+    several entries at DIFFERENT multipliers, this uses the most recent one. The
+    close-clamp still caps the exit at what's actually held, so the worst case is
+    a small residual on a mixed-multiplier position, never an over-close.
+    """
+    return db.execute(
+        select(Order.copy_multiplier)
+        .where(
+            Order.user_id == user_id,
+            Order.symbol == order.symbol,
+            Order.instrument_type == order.instrument_type,
+            Order.option_expiry.is_not_distinct_from(order.option_expiry),
+            Order.option_strike.is_not_distinct_from(order.option_strike),
+            Order.option_right.is_not_distinct_from(order.option_right),
+            Order.parent_order_id.isnot(None),   # a copy mirror, not a direct trade
+            Order.is_closing.is_(False),          # an OPENING order
+            Order.copy_multiplier.isnot(None),
+        )
+        .order_by(Order.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 # Statuses a mirror can be modified in: fully working AND untouched by any
 # fill. PARTIALLY_FILLED is deliberately excluded — cancel+replace of the full
 # new quantity would double-count the portion that already filled.
@@ -2413,9 +2452,6 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if is_exit_leg and is_alpaca and is_stock:
                 continue
 
-            scaled = _scale_quantity(
-                trader_order.quantity, sub.multiplier, acct.supports_fractional
-            )
             # ── Determine whether THIS is a close for the subscriber ──
             # The broker's is_closing flag is only reliable for OPTIONS (SnapTrade
             # sets SELL_TO_CLOSE); for STOCKS it's ALWAYS False (SnapTrade just
@@ -2438,6 +2474,26 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 db, sub.user_id, trader_order, subtract_reserved=False,
             )
             is_closing_effective = bool(trader_order.is_closing) or closeable > 0
+
+            # ── Scale the mirror ──
+            # ENTRY → the subscriber's CURRENT multiplier.
+            # CLOSE → the multiplier the position was OPENED at (stored on the
+            # entry mirror as copy_multiplier), NOT the current setting. This is
+            # the anti-stranding rule: if the subscriber lowers their multiplier
+            # while holding, a trader's full close still maps to their full
+            # position (floor(trader_qty × entry_mult)), and a chunked close can't
+            # round each piece to zero against a smaller current multiplier.
+            # Falls back to the live setting when no entry multiplier is on record
+            # (position opened before copy_multiplier existed, or acquired outside
+            # the copy engine) — i.e. pre-existing behaviour for legacy positions.
+            close_mult = (
+                _entry_multiplier_for_close(db, sub.user_id, trader_order)
+                if is_closing_effective else None
+            )
+            scale_mult = close_mult if close_mult is not None else sub.multiplier
+            scaled = _scale_quantity(
+                trader_order.quantity, scale_mult, acct.supports_fractional
+            )
 
             # Close-only (paused) subscriber: admit ONLY genuine closes. An
             # entry (is_closing_effective False) is dropped here so a paused
@@ -2590,6 +2646,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 option_strike=trader_order.option_strike,
                 option_right=trader_order.option_right,
                 is_closing=is_closing_effective,
+                # Record the multiplier actually applied to THIS mirror: the
+                # current setting for an entry, or the entry multiplier for a
+                # close (see scale_mult above / Order.copy_multiplier). Entries
+                # are what _entry_multiplier_for_close reads back on later closes.
+                copy_multiplier=scale_mult,
                 side=trader_order.side,
                 order_type=trader_order.order_type,
                 quantity=scaled,
