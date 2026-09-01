@@ -161,6 +161,8 @@ export interface Position {
   market_value: string | null;
   unrealized_pnl: string | null;
   cost_basis: string | null;
+  /** Price this symbol was last EXITED at (from the active snapshot). */
+  reference_price: string | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: OptionRight | null;
