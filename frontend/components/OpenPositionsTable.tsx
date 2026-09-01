@@ -401,7 +401,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       );
     };
 
-    const COLSPAN = 19;
+    const COLSPAN = 20;  // +1 for the Reference column
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -468,6 +468,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
+                  <Th label="Reference" />
                   <Th label="Filled price" />
                   <Th label="Market value" sortKey="market_value" />
                   <Th label="TP" />
@@ -612,6 +613,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         </td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.current_price, 2)}</td>
+                        {/* Reference = price this symbol was last exited at (snapshot). */}
+                        <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Price you last exited this symbol at">{fmtNum(p.reference_price, 2)}</td>
                         {(() => {
                           const t = orderTimestamps.byKey.get(orderTimestamps.key(
                             p.broker_account_id, p.instrument_type, p.symbol,
