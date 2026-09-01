@@ -99,6 +99,11 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // support trailing stops close as a TRAILING_STOP; options / unsupported
   // brokers fall back to market. See services/trailing_stop_close.
   const [trailPct, setTrailPct] = useState("");
+  // Default re-entry (% below exit) baked into the snapshot at exit time, so the
+  // Snapshot page pre-fills it and Re-Enter uses it without re-typing.
+  const [reentryPct, setReentryPct] = useState("");
+  const reentryNum = parseFloat(reentryPct);
+  const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
   const trailNum = parseFloat(trailPct);
   const useTrail = !isNaN(trailNum) && trailNum > 0 && trailNum <= 100;
 
@@ -162,7 +167,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
   async function runExit(key: ExitKey) {
     if (key === "my_positions") {
       const url = "/api/positions/close-all?include_subscribers=false"
-        + (useTrail ? `&trail_percent=${trailNum}` : "");
+        + (useTrail ? `&trail_percent=${trailNum}` : "")
+        + (useReentry ? `&reentry_percent=${reentryNum}` : "");
       const res = await api<{ closed: { method?: string }[]; closed_count: number; failed_count: number }>(
         url, { method: "POST" },
       );
@@ -259,6 +265,25 @@ export function BulkExitBar({ onActionComplete }: Props) {
               onChange={e => setTrailPct(e.target.value)}
               placeholder="off"
               aria-label="Trailing stop percent for Exit My Positions"
+              className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
+              style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+          </div>
+          {/* Default re-entry: pre-set the snapshot's Re-Enter to this % below exit. */}
+          <div
+            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+            style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+            title="Optional: bake a default re-entry into the snapshot — % below the exit price. The Snapshot page pre-fills this so Re-Enter uses it. Empty = re-enter at market by default."
+          >
+            <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
+              Re-enter&nbsp;%
+            </span>
+            <input
+              type="number" min="0" max="100" step="0.5"
+              value={reentryPct}
+              onChange={e => setReentryPct(e.target.value)}
+              placeholder="mkt"
+              aria-label="Default re-entry percent below exit"
               className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
               style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
             />

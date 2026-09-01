@@ -20,6 +20,8 @@ interface SnapPos {
   price: string | null;        // exit price / share
   current_price: string | null; // live market price / share
   reentry_price: string | null; // fill price (filled) or resting limit (working)
+  default_mode: "market" | "pct" | "limit"; // re-entry default chosen at exit
+  default_value: string | null;
   option_expiry: string | null;
   option_strike: string | null;
   option_right: string | null;
@@ -58,6 +60,22 @@ export default function SnapshotPage() {
     try {
       const r = await api<{ snapshot: Snapshot | null }>("/api/positions/snapshots/latest");
       setSnap(r.snapshot);
+      // Pre-fill the re-entry control from the default chosen at exit time —
+      // without overwriting anything the user has already edited.
+      if (r.snapshot) {
+        setRowMode((prev) => {
+          const next = { ...prev };
+          for (const p of r.snapshot!.positions)
+            if (!(p.symbol in next) && p.default_mode) next[p.symbol] = p.default_mode;
+          return next;
+        });
+        setRowVal((prev) => {
+          const next = { ...prev };
+          for (const p of r.snapshot!.positions)
+            if (!(p.symbol in next) && p.default_value != null) next[p.symbol] = p.default_value;
+          return next;
+        });
+      }
     } catch (e) {
       notify.fromError(e, "Could not load snapshot");
     } finally {
