@@ -48,8 +48,10 @@ export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [globalDisc, setGlobalDisc] = useState("");
-  const [rowDisc, setRowDisc] = useState<Record<string, string>>({});
-  const [rowLimit, setRowLimit] = useState<Record<string, string>>({}); // exact $ limit per symbol
+  // Per-row re-entry mode + value: market (no value), pct (% below exit), or limit ($ price).
+  type ReMode = "market" | "pct" | "limit";
+  const [rowMode, setRowMode] = useState<Record<string, ReMode>>({});
+  const [rowVal, setRowVal] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a symbol
 
   const load = useCallback(async () => {
@@ -72,11 +74,6 @@ export default function SnapshotPage() {
     return () => clearInterval(id);
   }, [snap, load]);
 
-  function discFor(sym: string): number | null {
-    const raw = rowDisc[sym] ?? globalDisc;
-    const d = parseFloat(raw);
-    return !isNaN(d) && d > 0 && d <= 100 ? d : null;
-  }
 
   async function reEnter(scope: "all" | string) {
     setBusy(scope);
@@ -87,13 +84,11 @@ export default function SnapshotPage() {
         if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
       } else {
         params.set("symbol", scope);
-        const lim = parseFloat(rowLimit[scope] ?? "");
-        if (!isNaN(lim) && lim > 0) {
-          params.set("limit_price", String(lim));       // exact price wins
-        } else {
-          const d = discFor(scope);
-          if (d !== null) params.set("discount_percent", String(d));
-        }
+        const mode = rowMode[scope] ?? "market";
+        const v = parseFloat(rowVal[scope] ?? "");
+        if (mode === "limit" && !isNaN(v) && v > 0) params.set("limit_price", String(v));
+        else if (mode === "pct" && !isNaN(v) && v > 0 && v <= 100) params.set("discount_percent", String(v));
+        // else market — send nothing
       }
       const qs = params.toString();
       const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
@@ -216,11 +211,12 @@ export default function SnapshotPage() {
                     // Long buy-back: bought back cheaper than exit = positive (saved).
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
-                    // Dollar target for the chosen "% below" (this row's, else the global box).
-                    const effDisc = parseFloat(rowDisc[p.symbol] ?? globalDisc);
+                    const mode: ReMode = rowMode[p.symbol] ?? "market";
+                    const rv = parseFloat(rowVal[p.symbol] ?? "");
+                    // Dollar target when using "% below".
                     const targetPx =
-                      !isNaN(effDisc) && effDisc > 0 && effDisc <= 100 && exitP != null
-                        ? exitP * (1 - effDisc / 100)
+                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && exitP != null
+                        ? exitP * (1 - rv / 100)
                         : null;
                     return (
                       <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
@@ -251,34 +247,33 @@ export default function SnapshotPage() {
                         </td>
                         <td className={`${td} text-right`}>
                           <div className="inline-flex items-center gap-2 justify-end">
-                            {/* Exact limit price ($) — wins over the % below. */}
-                            <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
-                                 style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}
-                                 title="Optional: exact limit price to re-buy at. Wins over the % below.">
-                              <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>
-                              <input type="number" min="0" step="0.01"
-                                     value={rowLimit[p.symbol] ?? ""} disabled={!canReenter}
-                                     onChange={(e) => setRowLimit((m) => ({ ...m, [p.symbol]: e.target.value }))}
-                                     placeholder="limit"
-                                     aria-label={`Limit price for ${p.symbol}`}
-                                     className="w-16 text-xs rounded px-1 py-0.5 outline-none"
-                                     style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
-                            </div>
-                            {/* % below exit — convenience; shows the $ target. */}
-                            <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
-                                 style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter && !rowLimit[p.symbol] ? 1 : 0.4 }}
-                                 title="Optional: % below this order's exit price. Ignored if a $ limit is set.">
-                              <input type="number" min="0" max="100" step="0.5"
-                                     value={rowDisc[p.symbol] ?? ""} disabled={!canReenter || !!rowLimit[p.symbol]}
-                                     onChange={(e) => setRowDisc((m) => ({ ...m, [p.symbol]: e.target.value }))}
-                                     placeholder={globalDisc || "mkt"}
-                                     aria-label={`Discount percent for ${p.symbol}`}
-                                     className="w-12 text-xs rounded px-1 py-0.5 outline-none"
-                                     style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
-                              <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
-                            </div>
-                            {/* Dollar target for the chosen % (when no explicit $ limit). */}
-                            {canReenter && !rowLimit[p.symbol] && targetPx != null && (
+                            {/* Re-entry mode selector. */}
+                            <select value={mode} disabled={!canReenter}
+                                    onChange={(e) => setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }))}
+                                    aria-label={`Re-entry type for ${p.symbol}`}
+                                    className="text-xs rounded-md px-1.5 py-1 outline-none disabled:opacity-40"
+                                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text)" }}>
+                              <option value="market">Market</option>
+                              <option value="pct">% below</option>
+                              <option value="limit">Limit $</option>
+                            </select>
+                            {/* Value input — only for pct / limit. */}
+                            {mode !== "market" && (
+                              <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
+                                   style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
+                                {mode === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
+                                <input type="number" min="0" max={mode === "pct" ? 100 : undefined} step={mode === "pct" ? 0.5 : 0.01}
+                                       value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
+                                       onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
+                                       placeholder={mode === "limit" ? "price" : "%"}
+                                       aria-label={`${mode === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
+                                       className="w-14 text-xs rounded px-1 py-0.5 outline-none"
+                                       style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
+                                {mode === "pct" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
+                              </div>
+                            )}
+                            {/* Dollar target for a % below. */}
+                            {targetPx != null && (
                               <span className="text-[10px] num whitespace-nowrap" style={{ color: "var(--muted)" }}>
                                 = ${targetPx.toFixed(2)}
                               </span>
