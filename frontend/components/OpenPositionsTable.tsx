@@ -12,7 +12,7 @@ import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { Order, Position } from "@/lib/types";
+import type { BrokerAccount, Order, Position } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -107,6 +107,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // return nav, then refresh() below revalidates. Cleared on logout.
     const [positions, setPositions] = useState<Position[]>(() => getSnapshot<PosSnap>(POS_KEY)?.positions ?? []);
     const [orders, setOrders] = useState<Order[]>(() => getSnapshot<PosSnap>(POS_KEY)?.orders ?? []);
+    // Today's realized P&L (market tz), fetched alongside positions for the
+    // summary strip. null until the first fetch lands.
+    const [todayRealized, setTodayRealized] = useState<number | null>(null);
+    // Total account value = sum of total_equity across broker accounts (same
+    // source as the dashboard "Total equity" KPI). null until first fetch.
+    const [totalEquity, setTotalEquity] = useState<number | null>(null);
     const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
@@ -132,12 +138,16 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     const refresh = useCallback(async () => {
       try {
-        const [pos, ords] = await Promise.all([
+        const [pos, ords, realized, brokers] = await Promise.all([
           api<Position[]>("/api/positions"),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
+          api<{ realized_pnl: number }>("/api/positions/today-realized").catch(() => null),
+          api<BrokerAccount[]>("/api/brokers").catch(() => [] as BrokerAccount[]),
         ]);
         setPositions(pos);
         setOrders(ords);
+        if (realized) setTodayRealized(realized.realized_pnl);
+        setTotalEquity(brokers.reduce((acc, b) => acc + (Number(b.total_equity) || 0), 0));
         setSnapshot<PosSnap>(POS_KEY, { positions: pos, orders: ords });
       } catch (e) {
         notify.fromError(e, "failed to load positions");
@@ -396,16 +406,24 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
         {/* Summary strip */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 mb-4">
-          <SummaryTile label="Positions" tone="neutral"
-            node={<AnimatedNumber value={summary.count} format={(n) => String(Math.round(n))} className="num" />}
-            sub={`${summary.longs} long · ${summary.shorts} short`} />
-          <SummaryTile label="Market value" tone="neutral"
-            node={<AnimatedNumber value={summary.mv} format={fmtUsd} className="num" />}
-            sub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
+          <SummaryTile label="Realized P&L · Today"
+            tone={todayRealized == null ? "neutral" : todayRealized > 0 ? "good" : todayRealized < 0 ? "bad" : "neutral"}
+            node={todayRealized == null
+              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+              : <AnimatedNumber value={todayRealized} format={fmtSignedUsd} className="num" />}
+            sub="Closed today" />
           <SummaryTile label="Unrealized P&L" tone={summary.pnl > 0 ? "good" : summary.pnl < 0 ? "bad" : "neutral"}
             node={<AnimatedNumber value={summary.pnl} format={fmtSignedUsd} className="num" />}
             sub="On open positions" />
+          <SummaryTile label="Market value" tone="neutral"
+            node={<AnimatedNumber value={summary.mv} format={fmtUsd} className="num" />}
+            sub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
+          <SummaryTile label="Account value" tone="neutral"
+            node={totalEquity == null
+              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+              : <AnimatedNumber value={totalEquity} format={fmtUsd} className="num" />}
+            sub="Total equity" />
           <SummaryTile label="Long / Short" tone="neutral"
             node={<span className="num">{summary.longs} / {summary.shorts}</span>}
             sub="Direction split" />
@@ -477,9 +495,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           {positions.length === 0
                             ? "No open positions"
                             : search
-                            ? `No positions match “${search}”`
-                            : filter === "option" ? "No open option positions"
-                            : "No open stock positions"}
+                              ? `No positions match “${search}”`
+                              : filter === "option" ? "No open option positions"
+                                : "No open stock positions"}
                         </div>
                         <div className="text-xs">Positions appear here once your orders fill.</div>
                       </div>

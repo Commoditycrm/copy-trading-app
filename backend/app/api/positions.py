@@ -32,7 +32,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderType
 from app.models.settings import SubscriberSettings
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import ClosePositionIn, PositionOut
 from app.services.crypto import decrypt_json
@@ -118,6 +118,33 @@ def list_positions(
             # Best-effort: one broker's outage shouldn't blank the whole table.
             continue
     return out
+
+
+@router.get("/today-realized")
+def today_realized(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, float]:
+    """Today's realized P&L for the caller, in their market timezone.
+
+    Used by the positions-page summary strip. Subscribers get mirror
+    de-duplication (their real trades ARE the copy mirrors — the SnapTrade
+    listener re-records those as duplicate standalone rows), so we call
+    ``realized_pnl_by_day`` directly with ``mirrors_only`` rather than the
+    plain ``today_realized_pnl`` helper which doesn't dedup.
+    """
+    from datetime import datetime
+
+    from app.services.pnl import _tz_or_market, realized_pnl_by_day
+
+    tz = _tz_or_market(None)
+    today = datetime.now(tz).date()
+    daily = realized_pnl_by_day(
+        db, user.id, start=today, end=today,
+        mirrors_only=(user.role == UserRole.SUBSCRIBER),
+    )
+    pnl, _ = daily.get(today, (Decimal(0), 0))
+    return {"realized_pnl": float(pnl)}
 
 
 @router.post("/close-all")
