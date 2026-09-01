@@ -162,6 +162,10 @@ def close_all_positions(
         default=None, gt=0, le=100,
         description="Sell-All trailing-stop variation. When set, stock positions on brokers that support trailing stops are closed with a TRAILING_STOP at this trail %; options and unsupported brokers fall back to the normal market/limit close.",
     ),
+    reentry_percent: Decimal | None = Query(
+        default=None, gt=0, le=100,
+        description="Default re-entry: pre-set each snapshotted position to re-buy this % below its exit price, so Re-Enter uses it without re-typing. Omit = default to market.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -206,16 +210,12 @@ def close_all_positions(
                 continue
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
-            # Record what we held (signed qty + exit price) for Re-Enter.
-            snapshot_positions.append({
-                "symbol": pos.symbol,
-                "instrument_type": pos.instrument_type.value,
-                "quantity": str(pos.quantity),
-                "price": str(pos.current_price) if pos.current_price is not None else None,
-                "option_expiry": pos.option_expiry.isoformat() if pos.option_expiry else None,
-                "option_strike": str(pos.option_strike) if pos.option_strike is not None else None,
-                "option_right": pos.option_right.value if pos.option_right else None,
-            })
+            # Record what we held (signed qty + exit price) for Re-Enter, with the
+            # optional default re-entry (% below) chosen at exit time.
+            _item = _snapshot_item(pos)
+            _item["default_mode"] = "pct" if reentry_percent is not None else "market"
+            _item["default_value"] = str(reentry_percent) if reentry_percent is not None else None
+            snapshot_positions.append(_item)
             # Stocks close at MARKET; OPTIONS always as a LIMIT — both brokers
             # refuse option market orders (Alpaca always; Webull on
             # limited-liquidity contracts). See _option_close_limit.
@@ -327,6 +327,8 @@ def _snapshot_item(pos: BrokerPosition) -> dict:
         "option_strike": str(pos.option_strike) if pos.option_strike is not None else None,
         "option_right": pos.option_right.value if pos.option_right else None,
         "reentry_order_id": None,
+        "default_mode": "market",   # re-entry default chosen at exit ("market"/"pct"/"limit")
+        "default_value": None,      # the % or $ for the default
     }
 
 
@@ -410,6 +412,8 @@ def latest_sell_all_snapshot(
             "price": p.get("price"),                                  # exit price
             "current_price": _current(p["symbol"], p["instrument_type"]),
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
+            "default_mode": p.get("default_mode", "market"),          # default re-entry chosen at exit
+            "default_value": p.get("default_value"),
             "option_expiry": p.get("option_expiry"),
             "option_strike": p.get("option_strike"),
             "option_right": p.get("option_right"),
