@@ -116,6 +116,10 @@ export default function SettingsPage() {
   const [discordBusy, setDiscordBusy] = useState(false);
   const [discordTesting, setDiscordTesting] = useState(false);
   const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string; business_name?: string | null; auto_approve_follows?: boolean }[]>([]);
+  // We don't list every trader by default — the subscriber searches by name /
+  // email to find the one to follow. Empty query shows only the trader they
+  // currently follow (so Unfollow stays reachable).
+  const [traderSearch, setTraderSearch] = useState("");
   // Follow-request workflow. Subscriber: their own requests (chips + which
   // traders they may follow). Trader: incoming pending requests to action.
   const [myRequests, setMyRequests] = useState<FollowRequest[]>([]);
@@ -915,6 +919,16 @@ export default function SettingsPage() {
     myRequests.filter(r => r.status === "approved").map(r => r.trader_id),
   );
 
+  // What the Traders list actually renders. With a query, filter every trader
+  // by name / email / business name. Without one, show only the followed
+  // trader (or nothing) instead of dumping the whole roster.
+  const traderQuery = traderSearch.trim().toLowerCase();
+  const visibleTraders = traderQuery
+    ? traders.filter(t =>
+        [traderLabel(t), t.email, t.business_name ?? "", t.display_name ?? ""]
+          .join(" ").toLowerCase().includes(traderQuery))
+    : followedTrader ? [followedTrader] : [];
+
   return (
     <div className="space-y-5 max-w-6xl pb-12">
       {user.role === "subscriber" && sub && (
@@ -1015,7 +1029,47 @@ export default function SettingsPage() {
               </p>
             ) : (
               <div>
-                {traders.map((t, idx) => {
+                {/* Search — the roster isn't listed by default; type to find a
+                    trader. Empty query keeps just the followed trader in view. */}
+                <div className="relative mb-3">
+                  <svg
+                    aria-hidden viewBox="0 0 24 24" width="15" height="15" fill="none"
+                    stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                    className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                    style={{ color: "var(--muted)" }}
+                  >
+                    <circle cx="11" cy="11" r="7" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                  <input
+                    type="text"
+                    value={traderSearch}
+                    onChange={(e) => setTraderSearch(e.target.value)}
+                    placeholder="Search traders by name or email…"
+                    className="w-full rounded-lg border pl-9 pr-8 py-2 text-sm bg-transparent focus-ring"
+                    style={{ borderColor: "var(--border)" }}
+                  />
+                  {traderSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setTraderSearch("")}
+                      aria-label="Clear search"
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs leading-none"
+                      style={{ color: "var(--muted)" }}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+
+                {visibleTraders.length === 0 ? (
+                  <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
+                    {traderQuery
+                      ? `No traders match "${traderSearch.trim()}".`
+                      : "Search for a trader above to find and follow them."}
+                  </p>
+                ) : (
+                  visibleTraders.map((t, idx) => {
                   const req = requestByTraderId.get(t.id);
                   const isFollowing = sub.following_trader_id === t.id;
                   const isApproved = approvedTraderIds.has(t.id);
@@ -1113,7 +1167,8 @@ export default function SettingsPage() {
                       </div>
                     </div>
                   );
-                })}
+                  })
+                )}
               </div>
             )}
           </Card>
