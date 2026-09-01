@@ -2645,7 +2645,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 sub_adapter = adapter_for(acct, sub_creds)
             except Exception as exc:  # noqa: BLE001
                 child.status = OrderStatus.REJECTED
-                child.reject_reason = f"credentials_error: {exc}"[:480]
+                child.reject_reason = f"Broker credentials error: {exc}"[:480]
                 child.closed_at = datetime.now(timezone.utc)
                 results.append(FanoutResult(
                     subscriber_user_id=sub.user_id,
@@ -3088,20 +3088,31 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if r.status != "error":
                 continue
             try:
+                # Single source of truth: show the SAME reject_reason we stored
+                # on the order (what the admin panel reads), so the subscriber's
+                # notification can't diverge from admin. db.get hits the identity
+                # map, returning the child we just stamped — no extra query, no
+                # commit needed. Fall back to r.detail only if the row vanished.
+                rejected_child = db.get(Order, r.order_id) if r.order_id else None
+                reason = (
+                    (rejected_child.reject_reason if rejected_child and rejected_child.reject_reason else None)
+                    or r.detail
+                    or "unknown error"
+                )
                 create_notification(
                     db,
                     user_id=r.subscriber_user_id,
                     type="copy.rejected",
                     message=(
                         f"Your copy of the {_side} {trader_order.symbol} order was "
-                        f"rejected: {(r.detail or 'unknown error')[:180]}"
+                        f"rejected: {reason}"
                     ),
                     metadata={
                         "parent_order_id": str(trader_order.id),
                         "order_id": str(r.order_id),
                         "symbol": trader_order.symbol,
                         "side": _side,
-                        "reason": (r.detail or "")[:300],
+                        "reason": reason,
                         "trader_id": str(trader_order.user_id),
                     },
                 )
