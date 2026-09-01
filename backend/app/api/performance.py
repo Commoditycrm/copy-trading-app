@@ -27,7 +27,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from app.api.deps import require_trader
 from app.database import get_db
@@ -252,13 +252,23 @@ def list_fanouts(
           "fanouts": [ {...per-fanout breakdown...} ]
         }
     """
+    # Surface parents flagged as broadcast OR that actually have subscriber
+    # mirror children — the latter covers closes placed while copy was paused,
+    # whose flag was historically left False (see copy_engine.fanout_async).
+    _child = aliased(Order)
+    _has_mirror_children = (
+        select(_child.id).where(_child.parent_order_id == Order.id).exists()
+    )
     parents = list(
         db.execute(
             select(Order)
             .where(
                 Order.user_id == trader.id,
                 Order.parent_order_id.is_(None),
-                Order.fanned_out_to_subscribers.is_(True),
+                or_(
+                    Order.fanned_out_to_subscribers.is_(True),
+                    _has_mirror_children,
+                ),
                 visibility.order_is_visible(),
                 realtime_fanout_clause(),
             )

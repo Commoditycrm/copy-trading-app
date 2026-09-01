@@ -3180,6 +3180,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             except Exception:  # noqa: BLE001
                 log.exception("copy: rejection notification failed for order %s", r.order_id)
 
+    # Mark the order as broadcast-to-subscribers here — the SINGLE place the flag
+    # flips post-fanout, so every entry point (in-app _fanout task, listener
+    # fanout_threadsafe, sync fanout wrapper) stays consistent. Set it when copy
+    # was ACTIVE, or when a paused CLOSE still forwarded to holders (non-empty
+    # results). A paused OPEN returns early above with EMPTY results and never
+    # reaches here, so it correctly stays False. Caller owns the commit.
+    if not trader_paused or results:
+        trader_order.fanned_out_to_subscribers = True
+
     return results
 
 
@@ -3219,16 +3228,11 @@ def fanout_threadsafe(
             trader = db.get(User, trader_id)
             if order is None or trader is None:
                 return []
+            # fanout_async now flips fanned_out_to_subscribers itself (single
+            # source of truth), correctly handling the paused-CLOSE case — so we
+            # just run it and commit. A paused MU close that mirrored to subs used
+            # to stay flagged False here and vanish from the admin fanouts panel.
             results = await fanout_async(db, order, trader)
-            # Only flag as broadcast if copy was actually ACTIVE. When the
-            # trader's master copy is paused, fanout_async no-ops (returns
-            # early) and nothing was sent to subscribers — so leave the flag
-            # False. Otherwise an order placed (or observed) while copy was
-            # OFF would wrongly land in the trader's "All Orders" tab
-            # (copy-on) instead of "My Orders" (copy-off).
-            ts = db.get(TraderSettings, trader_id)
-            if not (ts is not None and ts.copy_paused):
-                order.fanned_out_to_subscribers = True
             db.commit()
             return results
 

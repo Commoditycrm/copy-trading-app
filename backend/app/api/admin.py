@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, or_, select, update
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from app.api.deps import get_db, require_admin
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -914,9 +914,23 @@ def _fanout_window_query(trader_id, from_, to):
     from app.api.performance import realtime_fanout_clause  # noqa: PLC0415
 
     anchor = func.coalesce(Order.trader_submitted_at, Order.created_at)
+    # A CLOSE placed while the trader's copy was PAUSED forwards to subscribers
+    # but its fanned_out_to_subscribers flag was historically left False (see
+    # copy_engine.fanout_threadsafe) — so it vanished from this panel even though
+    # it really did fan out (prod: a paused MU close). Surface ANY parent that
+    # actually has subscriber mirror children too, not just the flagged ones.
+    # New paused closes now get the flag correctly; this OR covers the ones
+    # already stored with it False.
+    _child = aliased(Order)
+    has_mirror_children = (
+        select(_child.id).where(_child.parent_order_id == Order.id).exists()
+    )
     q = select(Order).where(
         Order.parent_order_id.is_(None),
-        Order.fanned_out_to_subscribers.is_(True),
+        or_(
+            Order.fanned_out_to_subscribers.is_(True),
+            has_mirror_children,
+        ),
         visibility.order_is_visible(),
         realtime_fanout_clause(),
     )
