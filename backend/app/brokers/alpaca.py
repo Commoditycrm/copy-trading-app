@@ -599,6 +599,33 @@ class AlpacaAdapter(BrokerAdapter):
         log.warning("get_stock_latest_price(%s): no usable price returned", sym)
         return None
 
+    def get_stock_prev_close(self, symbol: str) -> Decimal | None:
+        """Previous session's official daily CLOSE for a stock (the market-close
+        price). Uses the snapshot's ``previous_daily_bar``; falls back to today's
+        ``daily_bar`` close once a session has ended. None on failure."""
+        from alpaca.data.enums import DataFeed  # noqa: PLC0415
+        from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
+        from alpaca.data.requests import StockSnapshotRequest  # noqa: PLC0415
+
+        client = StockHistoricalDataClient(
+            api_key=self.credentials["api_key"],
+            secret_key=self.credentials["api_secret"],
+        )
+        sym = symbol.upper()
+        try:
+            snaps = client.get_stock_snapshot(
+                StockSnapshotRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+            )
+            s = snaps.get(sym) if isinstance(snaps, dict) else snaps
+            for attr in ("previous_daily_bar", "daily_bar"):
+                bar = getattr(s, attr, None) if s else None
+                px = _dec_or_none(getattr(bar, "close", None)) if bar else None
+                if px and px > 0:
+                    return px
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_stock_prev_close(%s) failed: %s", sym, exc)
+        return None
+
     def get_option_latest_quote(self, occ_symbol: str) -> tuple[Decimal | None, Decimal | None]:
         """Latest bid + ask for an OCC option symbol. Used by the trade
         panel to surface live pricing alongside the strike picker and to

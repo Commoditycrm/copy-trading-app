@@ -19,9 +19,9 @@ class PositionOut(BaseModel):
     market_value: Decimal | None
     unrealized_pnl: Decimal | None
     cost_basis: Decimal | None
-    # Reference price: the price this symbol was last EXITED at (from the active
-    # Sell-All snapshot). Lets the user compare the current holding to where they
-    # last closed it. None if the symbol isn't in the snapshot.
+    # Reference price: the previous session's official market CLOSE for this
+    # symbol (Alpaca previous_daily_bar). Lets the user compare the live price to
+    # yesterday's close. None for options / when unavailable.
     reference_price: Decimal | None = None
     option_expiry: date | None
     option_strike: Decimal | None
