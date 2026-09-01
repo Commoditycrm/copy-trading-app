@@ -269,7 +269,11 @@ export default function SnapshotPage() {
                             <div className="inline-flex items-stretch rounded-md overflow-hidden"
                                  style={{ border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
                               <select value={mode} disabled={!canReenter}
-                                      onChange={(e) => setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }))}
+                                      onChange={(e) => {
+                                        setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }));
+                                        // Clear the value so a % isn't misread as a $ (and vice-versa).
+                                        setRowVal((m) => ({ ...m, [p.symbol]: "" }));
+                                      }}
                                       aria-label={`Re-entry type for ${p.symbol}`}
                                       className="text-xs px-1.5 py-1 outline-none"
                                       style={{ background: "var(--panel-2)", border: "none", color: "var(--text)" }}>
