@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 
 type Status = "filled" | "working" | "pending";
 
@@ -85,10 +86,17 @@ export default function SnapshotPage() {
 
   useEffect(() => { load(); }, [load]);
 
-  // Poll while anything is unresolved so fills flip to "Back in" live.
+  // Live update: reload when an order event lands (the listener re-publishes
+  // order.placed as it fills), so a re-entry flips to "Back in" without a
+  // manual refresh.
+  useEventStream((evt) => {
+    if (typeof evt?.type === "string" && evt.type.startsWith("order.")) load();
+  });
+
+  // Backstop poll while anything is unresolved (in case an event is missed).
   useEffect(() => {
     if (!snap || snap.summary.pending + snap.summary.working === 0) return;
-    const id = setInterval(load, 15_000);
+    const id = setInterval(load, 5_000);
     return () => clearInterval(id);
   }, [snap, load]);
 
