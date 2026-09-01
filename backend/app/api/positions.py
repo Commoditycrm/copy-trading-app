@@ -96,12 +96,26 @@ def list_positions(
         )
     ).scalars().all()
 
+    # Reference (last-exit) price per symbol, from the active snapshot.
+    ref_by_symbol: dict[str, str] = {}
+    snap = db.execute(
+        select(SellAllSnapshot)
+        .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
+        .order_by(SellAllSnapshot.created_at.desc())
+        .limit(1)
+    ).scalars().first()
+    if snap is not None:
+        for sp in snap.positions:
+            if sp.get("price") is not None:
+                ref_by_symbol[sp["symbol"]] = sp["price"]
+
     out: list[PositionOut] = []
     for acct in accts:
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
             for p in adapter.get_positions():
+                ref = ref_by_symbol.get(p.symbol)
                 out.append(PositionOut(
                     broker_account_id=acct.id,
                     broker_symbol=p.broker_symbol,
@@ -113,6 +127,7 @@ def list_positions(
                     market_value=p.market_value,
                     unrealized_pnl=p.unrealized_pnl,
                     cost_basis=p.cost_basis,
+                    reference_price=Decimal(ref) if ref is not None else None,
                     option_expiry=p.option_expiry,
                     option_strike=p.option_strike,
                     option_right=p.option_right,
