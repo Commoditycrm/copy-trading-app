@@ -49,6 +49,7 @@ export default function SnapshotPage() {
   const [loading, setLoading] = useState(true);
   const [globalDisc, setGlobalDisc] = useState("");
   const [rowDisc, setRowDisc] = useState<Record<string, string>>({});
+  const [rowLimit, setRowLimit] = useState<Record<string, string>>({}); // exact $ limit per symbol
   const [busy, setBusy] = useState<string | null>(null); // "all" or a symbol
 
   const load = useCallback(async () => {
@@ -86,8 +87,13 @@ export default function SnapshotPage() {
         if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
       } else {
         params.set("symbol", scope);
-        const d = discFor(scope);
-        if (d !== null) params.set("discount_percent", String(d));
+        const lim = parseFloat(rowLimit[scope] ?? "");
+        if (!isNaN(lim) && lim > 0) {
+          params.set("limit_price", String(lim));       // exact price wins
+        } else {
+          const d = discFor(scope);
+          if (d !== null) params.set("discount_percent", String(d));
+        }
       }
       const qs = params.toString();
       const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
@@ -245,11 +251,25 @@ export default function SnapshotPage() {
                         </td>
                         <td className={`${td} text-right`}>
                           <div className="inline-flex items-center gap-2 justify-end">
+                            {/* Exact limit price ($) — wins over the % below. */}
                             <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
                                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}
-                                 title="Optional: % below this order's exit price. Empty = market (or the top box's value).">
+                                 title="Optional: exact limit price to re-buy at. Wins over the % below.">
+                              <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>
+                              <input type="number" min="0" step="0.01"
+                                     value={rowLimit[p.symbol] ?? ""} disabled={!canReenter}
+                                     onChange={(e) => setRowLimit((m) => ({ ...m, [p.symbol]: e.target.value }))}
+                                     placeholder="limit"
+                                     aria-label={`Limit price for ${p.symbol}`}
+                                     className="w-16 text-xs rounded px-1 py-0.5 outline-none"
+                                     style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
+                            </div>
+                            {/* % below exit — convenience; shows the $ target. */}
+                            <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
+                                 style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter && !rowLimit[p.symbol] ? 1 : 0.4 }}
+                                 title="Optional: % below this order's exit price. Ignored if a $ limit is set.">
                               <input type="number" min="0" max="100" step="0.5"
-                                     value={rowDisc[p.symbol] ?? ""} disabled={!canReenter}
+                                     value={rowDisc[p.symbol] ?? ""} disabled={!canReenter || !!rowLimit[p.symbol]}
                                      onChange={(e) => setRowDisc((m) => ({ ...m, [p.symbol]: e.target.value }))}
                                      placeholder={globalDisc || "mkt"}
                                      aria-label={`Discount percent for ${p.symbol}`}
@@ -257,8 +277,8 @@ export default function SnapshotPage() {
                                      style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
                               <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
                             </div>
-                            {/* Dollar target for the chosen %. */}
-                            {canReenter && targetPx != null && (
+                            {/* Dollar target for the chosen % (when no explicit $ limit). */}
+                            {canReenter && !rowLimit[p.symbol] && targetPx != null && (
                               <span className="text-[10px] num whitespace-nowrap" style={{ color: "var(--muted)" }}>
                                 = ${targetPx.toFixed(2)}
                               </span>
