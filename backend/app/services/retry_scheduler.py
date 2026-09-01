@@ -76,22 +76,26 @@ def _notify_retry_failed(
     db: Session,
     child: Order,
     trader_order: Order,
-    reason: str,
     attempts_made: int,
 ) -> None:
     """Drop a persistent notification on the subscriber telling them
-    their mirror retry didn't make it."""
+    their mirror retry didn't make it.
+
+    The reason shown is the SAME reject_reason stored on the order (what the
+    admin panel reads), so the subscriber's notification can't diverge from
+    admin. Callers must set ``child.reject_reason`` before calling."""
     trader_name = _trader_email(db, trader_order.user_id)
     symbol = trader_order.symbol
     side = trader_order.side.value.upper()
     qty = str(child.quantity)
     instrument = "option" if trader_order.instrument_type.value == "option" else "share"
     retry_word = "retry" if attempts_made == 1 else "retries"
+    reason = child.reject_reason or "broker was unreachable"
 
     message = (
         f"Your mirror of {trader_name}'s {side} {qty} {symbol} "
-        f"{instrument} order failed after {attempts_made} {retry_word} "
-        f"(broker was unreachable). Reason: {reason[:200]}"
+        f"{instrument} order failed after {attempts_made} {retry_word}. "
+        f"Reason: {reason}"
     )
     create_notification(
         db,
@@ -104,7 +108,7 @@ def _notify_retry_failed(
             "symbol": symbol,
             "side": side,
             "qty": qty,
-            "reason": reason[:300],
+            "reason": reason,
             "trader_id": str(trader_order.user_id),
             "trader_name": trader_name,
             "attempts_made": attempts_made,
@@ -213,14 +217,14 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             child.retry_count += 1
             new_count = child.retry_count
             child.status = OrderStatus.REJECTED
-            child.reject_reason = f"credentials_error: {exc}"[:480]
+            child.reject_reason = f"Broker credentials error: {exc}"[:480]
             child.closed_at = datetime.now(timezone.utc)
             audit.record(
                 db, actor_user_id=child.user_id, action="copy.retry_failed",
                 entity_type="order", entity_id=child.id,
                 metadata={"reason": "credentials_error", "error": str(exc)[:300]},
             )
-            _notify_retry_failed(db, child, trader_order, f"Broker credentials error: {exc}", new_count)
+            _notify_retry_failed(db, child, trader_order, new_count)
             db.commit()
             events.publish(child.user_id, _order_event("order.copy_failed", child))
             return "broker_failed"
@@ -303,7 +307,6 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             return "rescheduled"
 
         # Hit the max — final failure.
-        reason_str = broker_friendly or str(broker_exc)
         child.status = OrderStatus.REJECTED
         child.reject_reason = (broker_friendly or str(broker_exc))[:480]
         child.closed_at = datetime.now(timezone.utc)
@@ -321,7 +324,7 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
                 ),
             },
         )
-        _notify_retry_failed(db, child, trader_order, reason_str, new_count)
+        _notify_retry_failed(db, child, trader_order, new_count)
         db.commit()
         events.publish(child.user_id, _order_event("order.copy_failed", child))
         return "broker_failed"
