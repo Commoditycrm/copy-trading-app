@@ -437,6 +437,10 @@ def re_enter_from_snapshot(
         default=None, ge=0, le=100,
         description="Re-buy each position this % BELOW its exit price (a resting LIMIT). Omit / 0 = market buy now.",
     ),
+    limit_price: Decimal | None = Query(
+        default=None, gt=0,
+        description="Exact LIMIT price to re-buy at (per-order; wins over discount_percent). Use with symbol.",
+    ),
     snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
     symbol: str | None = Query(
         default=None,
@@ -491,16 +495,22 @@ def re_enter_from_snapshot(
             side = OrderSide.BUY if qty > 0 else OrderSide.SELL
             it = InstrumentType(p["instrument_type"])
             price = Decimal(p["price"]) if p.get("price") else None
-            # Discount only applies to a stock RE-BUY with a known exit price.
-            use_limit = disc > 0 and price is not None and side == OrderSide.BUY and it == InstrumentType.STOCK
-            limit_price = (price * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01")) if use_limit else None
+            is_stock_buy = side == OrderSide.BUY and it == InstrumentType.STOCK
+            # Limit price: an explicit price wins over a % below the exit price;
+            # either only applies to a stock re-buy, else it's a market order.
+            if limit_price is not None and is_stock_buy:
+                use_limit, limit_val = True, limit_price
+            elif disc > 0 and price is not None and is_stock_buy:
+                use_limit, limit_val = True, (price * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
+            else:
+                use_limit, limit_val = False, None
             payload = PlaceOrderIn(
                 instrument_type=it,
                 symbol=p["symbol"],
                 side=side,
                 order_type=OrderType.LIMIT if use_limit else OrderType.MARKET,
                 quantity=abs(qty),
-                limit_price=limit_price,
+                limit_price=limit_val,
                 option_expiry=date.fromisoformat(p["option_expiry"]) if p.get("option_expiry") else None,
                 option_strike=Decimal(p["option_strike"]) if p.get("option_strike") else None,
                 option_right=OptionRight(p["option_right"]) if p.get("option_right") else None,
@@ -512,7 +522,7 @@ def re_enter_from_snapshot(
             placed.append({
                 "symbol": p["symbol"], "side": side.value, "qty": str(abs(qty)),
                 "order_type": payload.order_type.value,
-                "limit_price": str(limit_price) if limit_price is not None else None,
+                "limit_price": str(limit_val) if limit_val is not None else None,
                 "order_id": str(order.id),
             })
             # Link the buy-back to this item so a later click sees it as
