@@ -613,8 +613,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         </td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.current_price, 2)}</td>
-                        {/* Reference = price this symbol was last exited at (snapshot). */}
-                        <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Price you last exited this symbol at">{fmtNum(p.reference_price, 2)}</td>
+                        {/* Reference = previous session's market close price. */}
+                        <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
                         {(() => {
                           const t = orderTimestamps.byKey.get(orderTimestamps.key(
                             p.broker_account_id, p.instrument_type, p.symbol,
