@@ -246,35 +246,37 @@ export default function SnapshotPage() {
                           </span>
                         </td>
                         <td className={`${td} text-right`}>
-                          <div className="inline-flex items-center gap-2 justify-end">
-                            {/* Re-entry mode selector. */}
-                            <select value={mode} disabled={!canReenter}
-                                    onChange={(e) => setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }))}
-                                    aria-label={`Re-entry type for ${p.symbol}`}
-                                    className="text-xs rounded-md px-1.5 py-1 outline-none disabled:opacity-40"
-                                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text)" }}>
-                              <option value="market">Market</option>
-                              <option value="pct">% below</option>
-                              <option value="limit">Limit $</option>
-                            </select>
-                            {/* Value input — only for pct / limit. */}
-                            {mode !== "market" && (
-                              <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md"
-                                   style={{ background: "var(--panel-2)", border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
-                                {mode === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
-                                <input type="number" min="0" max={mode === "pct" ? 100 : undefined} step={mode === "pct" ? 0.5 : 0.01}
-                                       value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
-                                       onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
-                                       placeholder={mode === "limit" ? "price" : "%"}
-                                       aria-label={`${mode === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
-                                       className="w-14 text-xs rounded px-1 py-0.5 outline-none"
-                                       style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
-                                {mode === "pct" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
-                              </div>
-                            )}
+                          <div className="inline-flex items-center gap-2 justify-end whitespace-nowrap">
+                            {/* Single connected control: mode selector + its value input. */}
+                            <div className="inline-flex items-stretch rounded-md overflow-hidden"
+                                 style={{ border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
+                              <select value={mode} disabled={!canReenter}
+                                      onChange={(e) => setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }))}
+                                      aria-label={`Re-entry type for ${p.symbol}`}
+                                      className="text-xs px-1.5 py-1 outline-none"
+                                      style={{ background: "var(--panel-2)", border: "none", color: "var(--text)" }}>
+                                <option value="market">Market</option>
+                                <option value="pct">% below</option>
+                                <option value="limit">Limit $</option>
+                              </select>
+                              {mode !== "market" && (
+                                <div className="inline-flex items-center gap-0.5 px-1.5"
+                                     style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
+                                  {mode === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
+                                  <input type="number" min="0" max={mode === "pct" ? 100 : undefined} step={mode === "pct" ? 0.5 : 0.01}
+                                         value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
+                                         onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
+                                         placeholder={mode === "limit" ? "price" : "%"}
+                                         aria-label={`${mode === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
+                                         className="w-14 text-xs py-0.5 outline-none"
+                                         style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+                                  {mode === "pct" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
+                                </div>
+                              )}
+                            </div>
                             {/* Dollar target for a % below. */}
                             {targetPx != null && (
-                              <span className="text-[10px] num whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                              <span className="text-[10px] num" style={{ color: "var(--muted)" }}>
                                 = ${targetPx.toFixed(2)}
                               </span>
                             )}
