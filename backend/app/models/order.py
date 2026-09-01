@@ -198,6 +198,16 @@ class Order(Base, TimestampMixin):
         Boolean, default=False, nullable=False
     )
 
+    # The subscriber's copy-size multiplier applied when this mirror was scaled
+    # (quantity = floor(trader_qty × copy_multiplier)). Recorded at fanout time
+    # so we retain the ENTRY multiplier even if the subscriber changes it after
+    # opening — safety + future enhancement (a close can flatten based on the
+    # multiplier the position was opened at, not the current one). NULL for
+    # trader/standalone orders (no copy scaling involved).
+    copy_multiplier: Mapped[Decimal | None] = mapped_column(
+        Numeric(9, 4), nullable=True
+    )
+
     # True when this order was broadcast to subscribers via the copy-engine
     # fanout. False for: subscriber-owned orders, trader orders placed while
     # copy was paused, and orders placed with skip_fanout (e.g. Exit All "Just
