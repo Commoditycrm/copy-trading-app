@@ -289,7 +289,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
           <div
             className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
             style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Current = trail off the live price; Reference = a dollar trail sized off the previous close."
+            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Market = trail off the live price; PDC = a dollar trail sized off the previous day's close."
           >
             <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
               Trail&nbsp;%
@@ -310,15 +310,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}
             >
-              <option value="current">Current</option>
-              <option value="reference">Reference</option>
+              <option value="current">Market</option>
+              <option value="reference">PDC</option>
             </select>
           </div>
           {/* Default re-entry baked into the snapshot — one connected pill. */}
           <div
             className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
             style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: bake a default re-entry into the snapshot — % below the chosen basis. The Snapshot page pre-fills this. Empty = re-enter at market. Current = % below the live price; Reference = % below the previous close."
+            title="Optional: bake a default re-entry into the snapshot — % below the chosen basis. The Snapshot page pre-fills this. Empty = re-enter at market. Market = % below the live price; PDC = % below the previous day's close."
           >
             <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
               Re-enter&nbsp;%
@@ -339,8 +339,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}
             >
-              <option value="current">Current</option>
-              <option value="reference">Reference</option>
+              <option value="current">Market</option>
+              <option value="reference">PDC</option>
             </select>
           </div>
           </>)}
@@ -430,7 +430,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
             <div
               className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
               style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-              title="Optional: re-buy each position this % BELOW the chosen basis (a resting limit). Empty = buy back now at market. Current = % below the live price; Reference = % below the previous close."
+              title="Optional: re-buy each position this % BELOW the chosen basis (a resting limit). Empty = buy back now at market. Market = % below the live price; PDC = % below the previous day's close."
             >
               <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
                 %&nbsp;below
@@ -451,8 +451,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 className="text-xs outline-none cursor-pointer"
                 style={{ background: "transparent", border: "none", color: "var(--text)" }}
               >
-                <option value="current">Current</option>
-                <option value="reference">Reference</option>
+                <option value="current">Market</option>
+                <option value="reference">PDC</option>
               </select>
             </div>
             <button
