@@ -468,7 +468,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
-                  <Th label="Reference" />
+                  <Th label="Prev day close" />
                   <Th label="Filled price" />
                   <Th label="Market value" sortKey="market_value" />
                   <Th label="TP" />

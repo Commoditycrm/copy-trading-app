@@ -16,6 +16,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import type { User } from "@/lib/types";
 
@@ -99,9 +100,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // support trailing stops close as a TRAILING_STOP; options / unsupported
   // brokers fall back to market. See services/trailing_stop_close.
   const [trailPct, setTrailPct] = useState("");
+  // What the trail % is measured from: "current" (percent trail off the live
+  // price — Alpaca-native trailing stop) or "reference" (a dollar trail =
+  // trail% of the previous market close). See close_all_positions.
+  const [trailBasis, setTrailBasis] = useState<"current" | "reference">("current");
   // Default re-entry (% below exit) baked into the snapshot at exit time, so the
   // Snapshot page pre-fills it and Re-Enter uses it without re-typing.
   const [reentryPct, setReentryPct] = useState("");
+  // Basis for the baked-in default re-entry %: live price vs previous close.
+  const [reentryBasis, setReentryBasis] = useState<"current" | "reference">("current");
   const reentryNum = parseFloat(reentryPct);
   const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
   const trailNum = parseFloat(trailPct);
@@ -113,6 +120,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
   type SnapSummary = { total: number; filled: number; working: number; pending: number };
   const [snapshot, setSnapshot] = useState<{ id: string; summary: SnapSummary } | null>(null);
   const [reDiscount, setReDiscount] = useState("");
+  // Basis for the Re-Enter "% below": live price ("current") or previous
+  // market close ("reference"). Omitted server-side falls back to exit price.
+  const [reBasis, setReBasis] = useState<"current" | "reference">("current");
   const [reBusy, setReBusy] = useState(false);
   // Open-position count so Exit My Positions can disable when there's nothing to
   // exit. null = not yet known (keep enabled until we know it's 0).
@@ -141,6 +151,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
     loadPositions();
   }, []);
 
+  // Live: an order event means a position opened/closed — refresh the count so
+  // the exit inputs + "Exit My Positions" enable/disable without a manual reload.
+  useEventStream((evt) => {
+    if (typeof evt?.type === "string" && evt.type.startsWith("order.")) {
+      loadPositions();
+      loadSnapshot();
+    }
+  });
+
   // While a snapshot with unresolved items is shown, poll so fills flip
   // pending/working → filled live (30s cadence, cheap).
   useEffect(() => {
@@ -155,7 +174,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
     setReBusy(true);
     try {
       const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
-        `/api/positions/re-enter${useD ? `?discount_percent=${d}` : ""}`,
+        `/api/positions/re-enter${useD ? `?discount_percent=${d}&basis=${reBasis}` : ""}`,
         { method: "POST" },
       );
       const skip = res.skipped_count ? `, ${res.skipped_count} already in/resting` : "";
@@ -180,8 +199,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
   async function runExit(key: ExitKey) {
     if (key === "my_positions") {
       const url = "/api/positions/close-all?include_subscribers=false"
-        + (useTrail ? `&trail_percent=${trailNum}` : "")
-        + (useReentry ? `&reentry_percent=${reentryNum}` : "");
+        + (useTrail ? `&trail_percent=${trailNum}&trail_basis=${trailBasis}` : "")
+        + (useReentry ? `&reentry_percent=${reentryNum}&reentry_basis=${reentryBasis}` : "");
       const res = await api<{ closed: { method?: string }[]; closed_count: number; failed_count: number }>(
         url, { method: "POST" },
       );
@@ -265,13 +284,12 @@ export function BulkExitBar({ onActionComplete }: Props) {
           {/* Exit-only inputs (trail + default re-entry) — hidden when there's
               nothing to exit. */}
           {!noPositions && (<>
-          {/* Trailing-stop trail for Exit My Positions. Leave empty for a
-              market exit; enter e.g. 5 to close as a trailing stop where the
-              broker supports it. */}
+          {/* Trailing-stop trail for Exit My Positions — one connected pill:
+              label · % · basis. Empty = market exit. */}
           <div
-            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+            className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
             style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit."
+            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Current = trail off the live price; Reference = a dollar trail sized off the previous close."
           >
             <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
               Trail&nbsp;%
@@ -282,15 +300,25 @@ export function BulkExitBar({ onActionComplete }: Props) {
               onChange={e => setTrailPct(e.target.value)}
               placeholder="off"
               aria-label="Trailing stop percent for Exit My Positions"
-              className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
-              style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+              className="w-10 text-xs outline-none text-center"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}
             />
+            <select
+              value={trailBasis}
+              onChange={e => setTrailBasis(e.target.value as "current" | "reference")}
+              aria-label="Trail basis"
+              className="text-xs outline-none cursor-pointer"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}
+            >
+              <option value="current">Current</option>
+              <option value="reference">Reference</option>
+            </select>
           </div>
-          {/* Default re-entry: pre-set the snapshot's Re-Enter to this % below exit. */}
+          {/* Default re-entry baked into the snapshot — one connected pill. */}
           <div
-            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+            className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
             style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: bake a default re-entry into the snapshot — % below the exit price. The Snapshot page pre-fills this so Re-Enter uses it. Empty = re-enter at market by default."
+            title="Optional: bake a default re-entry into the snapshot — % below the chosen basis. The Snapshot page pre-fills this. Empty = re-enter at market. Current = % below the live price; Reference = % below the previous close."
           >
             <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
               Re-enter&nbsp;%
@@ -301,9 +329,19 @@ export function BulkExitBar({ onActionComplete }: Props) {
               onChange={e => setReentryPct(e.target.value)}
               placeholder="mkt"
               aria-label="Default re-entry percent below exit"
-              className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
-              style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+              className="w-10 text-xs outline-none text-center"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}
             />
+            <select
+              value={reentryBasis}
+              onChange={e => setReentryBasis(e.target.value as "current" | "reference")}
+              aria-label="Default re-entry basis"
+              className="text-xs outline-none cursor-pointer"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}
+            >
+              <option value="current">Current</option>
+              <option value="reference">Reference</option>
+            </select>
           </div>
           </>)}
           {keys.map(key => {
@@ -390,9 +428,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
           </div>
           <div className="flex items-center gap-2">
             <div
-              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+              className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
               style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-              title="Optional: re-buy each position this % BELOW its exit price (a resting limit). Empty = buy back now at market."
+              title="Optional: re-buy each position this % BELOW the chosen basis (a resting limit). Empty = buy back now at market. Current = % below the live price; Reference = % below the previous close."
             >
               <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
                 %&nbsp;below
@@ -403,9 +441,19 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 onChange={e => setReDiscount(e.target.value)}
                 placeholder="mkt"
                 aria-label="Re-enter discount percent below exit price"
-                className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
-                style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }}
+                className="w-10 text-xs outline-none text-center"
+                style={{ background: "transparent", border: "none", color: "var(--text)" }}
               />
+              <select
+                value={reBasis}
+                onChange={e => setReBasis(e.target.value as "current" | "reference")}
+                aria-label="Re-enter basis"
+                className="text-xs outline-none cursor-pointer"
+                style={{ background: "transparent", border: "none", color: "var(--text)" }}
+              >
+                <option value="current">Current</option>
+                <option value="reference">Reference</option>
+              </select>
             </div>
             <button
               type="button"

@@ -175,6 +175,14 @@ def close_all_positions(
         default=None, gt=0, le=100,
         description="Default re-entry: pre-set each snapshotted position to re-buy this % below its exit price, so Re-Enter uses it without re-typing. Omit = default to market.",
     ),
+    trail_basis: str | None = Query(
+        default=None,
+        description="What trail_percent is measured from: 'current' (percent trail off the live price) or 'reference' (a dollar trail = trail_percent% of the previous market close). Omit = current.",
+    ),
+    reentry_basis: str | None = Query(
+        default=None,
+        description="Default basis for the baked-in re-entry %: 'current' (live price) or 'reference' (previous market close). Stored on the snapshot so Re-Enter uses it without re-choosing. Omit = current.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -224,6 +232,7 @@ def close_all_positions(
             _item = _snapshot_item(pos)
             _item["default_mode"] = "pct" if reentry_percent is not None else "market"
             _item["default_value"] = str(reentry_percent) if reentry_percent is not None else None
+            _item["default_basis"] = (reentry_basis or "current") if reentry_percent is not None else None
             snapshot_positions.append(_item)
             # Stocks close at MARKET; OPTIONS always as a LIMIT — both brokers
             # refuse option market orders (Alpaca always; Webull on
@@ -231,6 +240,7 @@ def close_all_positions(
             close_type = OrderType.MARKET
             close_limit: Decimal | None = None
             close_trail: Decimal | None = None
+            close_trail_price: Decimal | None = None
             close_method = "market"
             if (
                 trail_percent is not None
@@ -238,8 +248,22 @@ def close_all_positions(
             ):
                 # Sell-All trailing-stop variation, where the broker supports it.
                 close_type = OrderType.TRAILING_STOP
-                close_trail = trail_percent
                 close_method = "trailing_stop"
+                if trail_basis == "reference":
+                    # Dollar trail = trail_percent% of the previous market close.
+                    ref = None
+                    _pc = getattr(adapter, "get_stock_prev_close", None)
+                    if _pc is not None:
+                        try:
+                            ref = _pc(pos.symbol)
+                        except Exception:  # noqa: BLE001
+                            ref = None
+                    if ref is not None and ref > 0:
+                        close_trail_price = (ref * trail_percent / Decimal(100)).quantize(Decimal("0.01"))
+                    else:
+                        close_trail = trail_percent   # fall back to percent trail
+                else:
+                    close_trail = trail_percent       # 'current' = percent trail off the live price
             elif pos.instrument_type == InstrumentType.OPTION:
                 close_type = OrderType.LIMIT
                 close_limit = _option_close_limit(adapter, pos, reverse_side)
@@ -253,6 +277,7 @@ def close_all_positions(
                 limit_price=close_limit,
                 stop_price=None,
                 trail_percent=close_trail,
+                trail_price=close_trail_price,
                 option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
                 option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
@@ -338,6 +363,7 @@ def _snapshot_item(pos: BrokerPosition) -> dict:
         "reentry_order_id": None,
         "default_mode": "market",   # re-entry default chosen at exit ("market"/"pct"/"limit")
         "default_value": None,      # the % or $ for the default
+        "default_basis": None,      # "current"/"reference" for a "pct" default
     }
 
 
@@ -423,6 +449,7 @@ def latest_sell_all_snapshot(
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
             "default_mode": p.get("default_mode", "market"),          # default re-entry chosen at exit
             "default_value": p.get("default_value"),
+            "default_basis": p.get("default_basis"),
             "option_expiry": p.get("option_expiry"),
             "option_strike": p.get("option_strike"),
             "option_right": p.get("option_right"),
@@ -453,6 +480,10 @@ def re_enter_from_snapshot(
     limit_price: Decimal | None = Query(
         default=None, gt=0,
         description="Exact LIMIT price to re-buy at (per-order; wins over discount_percent). Use with symbol.",
+    ),
+    basis: str | None = Query(
+        default=None,
+        description="What discount_percent is % below: 'current' (live price) or 'reference' (previous market close). Omit = the exit price.",
     ),
     snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
     symbol: str | None = Query(
@@ -487,6 +518,22 @@ def re_enter_from_snapshot(
     if acct is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="no_connected_broker")
 
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+
+    def _basis_price(sym: str) -> "Decimal | None":
+        """Live price the discount is taken from: 'current' or 'reference' (prev close)."""
+        fn = None
+        if basis == "current":
+            fn = getattr(adapter, "get_stock_latest_price", None)
+        elif basis == "reference":
+            fn = getattr(adapter, "get_stock_prev_close", None)
+        if fn is None:
+            return None
+        try:
+            return fn(sym)
+        except Exception:  # noqa: BLE001
+            return None
+
     disc = Decimal(discount_percent) if discount_percent is not None else Decimal(0)
     placed: list[dict] = []
     skipped: list[dict] = []
@@ -513,8 +560,13 @@ def re_enter_from_snapshot(
             # either only applies to a stock re-buy, else it's a market order.
             if limit_price is not None and is_stock_buy:
                 use_limit, limit_val = True, limit_price
-            elif disc > 0 and price is not None and is_stock_buy:
-                use_limit, limit_val = True, (price * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
+            elif disc > 0 and is_stock_buy:
+                # % below the chosen basis: current price / previous close / (else) exit price.
+                base_px = _basis_price(p["symbol"]) if basis else price
+                if base_px is not None and base_px > 0:
+                    use_limit, limit_val = True, (base_px * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
+                else:
+                    use_limit, limit_val = False, None   # couldn't price it → market
             else:
                 use_limit, limit_val = False, None
             payload = PlaceOrderIn(
