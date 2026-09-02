@@ -228,12 +228,20 @@ def close_all_positions(
             reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
             qty = abs(pos.quantity)
             # Record what we held (signed qty + exit price) for Re-Enter, with the
-            # optional default re-entry (% below) chosen at exit time.
+            # optional default re-entry chosen at exit time. Appended to the
+            # snapshot only if the close actually places (see below) — a position
+            # that fails to exit must NOT end up in the re-entry basket.
             _item = _snapshot_item(pos)
-            _item["default_mode"] = "pct" if reentry_percent is not None else "market"
-            _item["default_value"] = str(reentry_percent) if reentry_percent is not None else None
-            _item["default_basis"] = (reentry_basis or "current") if reentry_percent is not None else None
-            snapshot_positions.append(_item)
+            if reentry_percent is not None:
+                _item["default_mode"] = "pct"
+                _item["default_value"] = str(reentry_percent)
+                _item["default_basis"] = reentry_basis or "current"
+            elif reentry_basis == "exit":
+                # "Exit price" default with no % — re-enter AT the exit price.
+                _item["default_mode"] = "pct"
+                _item["default_value"] = None
+                _item["default_basis"] = "exit"
+            # else leaves the _snapshot_item defaults (market / None / None).
             # Stocks close at MARKET; OPTIONS always as a LIMIT — both brokers
             # refuse option market orders (Alpaca always; Webull on
             # limited-liquidity contracts). See _option_close_limit.
@@ -260,6 +268,11 @@ def close_all_positions(
                             ref = None
                     if ref is not None and ref > 0:
                         close_trail_price = (ref * trail_percent / Decimal(100)).quantize(Decimal("0.01"))
+                        if close_trail_price <= 0:
+                            # Trail too small to be a valid $ amount (rounds to $0)
+                            # — fall back to a percent trail off the live price.
+                            close_trail_price = None
+                            close_trail = trail_percent
                     else:
                         close_trail = trail_percent   # fall back to percent trail
                 else:
@@ -295,6 +308,9 @@ def close_all_positions(
                     "order_id": str(order.id),
                     "method": close_method,
                 })
+                # Only a position we actually placed a close for goes into the
+                # re-entry snapshot.
+                snapshot_positions.append(_item)
             except Exception as exc:  # noqa: BLE001
                 failed.append({
                     "broker_account_id": str(acct.id),
