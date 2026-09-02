@@ -12,7 +12,7 @@
  *  - drives the HTTP + toast plumbing internally — callers just pass an
  *    `onActionComplete` hook (typically a table-refresh) and forget.
  */
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -108,7 +108,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // Snapshot page pre-fills it and Re-Enter uses it without re-typing.
   const [reentryPct, setReentryPct] = useState("");
   // Basis for the baked-in default re-entry %: live price / previous close / exit price.
-  const [reentryBasis, setReentryBasis] = useState<"current" | "reference">("current");
+  const [reentryBasis, setReentryBasis] = useState<"current" | "reference" | "exit">("current");
   const reentryNum = parseFloat(reentryPct);
   const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
   const trailNum = parseFloat(trailPct);
@@ -199,7 +199,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
     if (key === "my_positions") {
       const url = "/api/positions/close-all?include_subscribers=false"
         + (useTrail ? `&trail_percent=${trailNum}&trail_basis=${trailBasis}` : "")
-        + (useReentry ? `&reentry_percent=${reentryNum}&reentry_basis=${reentryBasis}` : "");
+        + (useReentry
+            ? `&reentry_percent=${reentryNum}&reentry_basis=${reentryBasis}`
+            : (reentryBasis === "exit" ? "&reentry_basis=exit" : ""));
       const res = await api<{ closed: { method?: string }[]; closed_count: number; failed_count: number }>(
         url, { method: "POST" },
       );
@@ -313,44 +315,49 @@ export function BulkExitBar({ onActionComplete }: Props) {
               <option value="reference">PDC</option>
             </select>
           </div>
-          {/* Default re-entry baked into the snapshot — one connected pill. */}
-          <div
-            className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: bake a default re-entry into the snapshot — % below the chosen basis. The Snapshot page pre-fills this. Empty = re-enter at market. Market = % below the live price; PDC = % below the previous day's close."
-          >
-            <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
-              Re-enter&nbsp;%
-            </span>
-            <input
-              type="number" min="0" max="100" step="0.5"
-              value={reentryPct}
-              onChange={e => setReentryPct(e.target.value)}
-              placeholder="mkt"
-              aria-label="Default re-entry percent below exit"
-              className="w-10 text-xs outline-none text-center"
-              style={{ background: "transparent", border: "none", color: "var(--text)" }}
-            />
-            <select
-              value={reentryBasis}
-              onChange={e => setReentryBasis(e.target.value as "current" | "reference")}
-              aria-label="Default re-entry basis"
-              className="text-xs outline-none cursor-pointer"
-              style={{ background: "transparent", border: "none", color: "var(--text)" }}
-            >
-              <option value="current">Market</option>
-              <option value="reference">PDC</option>
-            </select>
-          </div>
           </>)}
           {keys.map(key => {
             const def = EXIT_DEFS[key];
             const isSubs = def.subs;
             // Nothing to exit → disable Exit My Positions.
             const disabledNoPos = key === "my_positions" && noPositions;
+            // The default-re-entry pill renders right AFTER Exit My Positions
+            // (re-entry happens after the exit), only when there's something to exit.
+            const reentryPill = key === "my_positions" && !noPositions ? (
+              <div
+                key="reentry-pill"
+                className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
+                style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+                title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
+              >
+                <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
+                  Re-enter&nbsp;%
+                </span>
+                <input
+                  type="number" min="0" max="100" step="0.5"
+                  value={reentryPct}
+                  onChange={e => setReentryPct(e.target.value)}
+                  placeholder="mkt"
+                  aria-label="Default re-entry percent below exit"
+                  className="w-10 text-xs outline-none text-center"
+                  style={{ background: "transparent", border: "none", color: "var(--text)" }}
+                />
+                <select
+                  value={reentryBasis}
+                  onChange={e => setReentryBasis(e.target.value as "current" | "reference" | "exit")}
+                  aria-label="Default re-entry basis"
+                  className="text-xs outline-none cursor-pointer"
+                  style={{ background: "transparent", border: "none", color: "var(--text)" }}
+                >
+                  <option value="current">Market</option>
+                  <option value="reference">PDC</option>
+                  <option value="exit">Exit</option>
+                </select>
+              </div>
+            ) : null;
             return (
+              <Fragment key={key}>
               <button
-                key={key}
                 type="button"
                 onClick={() => setPending(key)}
                 disabled={busy || disabledNoPos}
@@ -395,6 +402,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 </svg>
                 <span>{def.label}</span>
               </button>
+              {reentryPill}
+              </Fragment>
             );
           })}
         </div>
@@ -451,7 +460,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 style={{ background: "transparent", border: "none", color: "var(--text)" }}
               >
                 <option value="current">Market</option>
-                <option value="reference">PDC</option>
+                <option value="reference">PDC</option>
+
               </select>
             </div>
             <button
