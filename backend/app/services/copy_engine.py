@@ -32,7 +32,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -205,12 +205,21 @@ class _PendingMirror:
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
-    # WHOLE SHARES ONLY (product decision, 2026-08): copy trades are never
-    # fractional, even on brokers that support it. Always round the scaled size
-    # DOWN to a whole unit — so 3 × 0.5 = 1.5 → 1. A size that rounds to 0 (e.g.
-    # 1 × 0.5 = 0.5 → 0) yields no mirror (recorded as copy.skipped_zero_qty).
-    # ``fractional`` is kept for call-site compatibility but intentionally ignored.
-    return (trader_qty * multiplier).to_integral_value(rounding=ROUND_DOWN)
+    # WHOLE UNITS ONLY (copy trades are never fractional, even on brokers that
+    # support it). Round the scaled size UP (ceil) to a whole unit — so
+    # 3 × 0.5 = 1.5 → 2 and 1 × 0.5 = 0.5 → 1.
+    #
+    # Rounding UP (product decision 2026-09, replacing the earlier round-DOWN)
+    # guarantees a below-1 multiplier never rounds a trim to zero — the bug that
+    # stranded subscribers on chunked exits, where each partial close lost its
+    # fraction and the sub was left holding a residual. The close-clamp still caps
+    # a close at what the subscriber actually holds, so ceil can never over-SELL.
+    #
+    # Trade-off (accepted): ENTRIES are slightly OVER-sized vs the exact
+    # multiplier — e.g. a 0.25× subscriber gets a full contract on a trader's
+    # 1-lot buy (ceil(0.25) = 1). Only a zero product (multiplier 0) yields no
+    # mirror. ``fractional`` is kept for call-site compatibility but ignored.
+    return (trader_qty * multiplier).to_integral_value(rounding=ROUND_CEILING)
 
 
 class _DanglingEntryCancelled(Exception):
