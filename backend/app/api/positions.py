@@ -275,6 +275,16 @@ def close_all_positions(
                             close_trail = trail_percent
                     else:
                         close_trail = trail_percent   # fall back to percent trail
+                elif trail_basis == "exit":
+                    # Dollar trail = trail_percent% of the current (exit-time) price.
+                    cur = pos.current_price
+                    if cur is not None and cur > 0:
+                        close_trail_price = (Decimal(cur) * trail_percent / Decimal(100)).quantize(Decimal("0.01"))
+                        if close_trail_price <= 0:
+                            close_trail_price = None
+                            close_trail = trail_percent
+                    else:
+                        close_trail = trail_percent   # no price → percent trail
                 else:
                     close_trail = trail_percent       # 'current' = percent trail off the live price
             elif pos.instrument_type == InstrumentType.OPTION:
