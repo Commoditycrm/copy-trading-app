@@ -495,7 +495,7 @@ def re_enter_from_snapshot(
     ),
     basis: str | None = Query(
         default=None,
-        description="What discount_percent is % below: 'current' (live price) or 'reference' (previous market close). Omit = the exit price.",
+        description="What discount_percent is % below: 'current' (live price), 'reference' (previous market close), or 'exit' (the recorded exit price). Omit = exit price.",
     ),
     snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
     symbol: str | None = Query(
@@ -573,8 +573,9 @@ def re_enter_from_snapshot(
             if limit_price is not None and is_stock_buy:
                 use_limit, limit_val = True, limit_price
             elif disc > 0 and is_stock_buy:
-                # % below the chosen basis: current price / previous close / (else) exit price.
-                base_px = _basis_price(p["symbol"]) if basis else price
+                # % below the chosen basis: current (live) / reference (prev close)
+                # / exit (the recorded exit price; also the default when omitted).
+                base_px = _basis_price(p["symbol"]) if basis in ("current", "reference") else price
                 if base_px is not None and base_px > 0:
                     use_limit, limit_val = True, (base_px * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
                 else:
