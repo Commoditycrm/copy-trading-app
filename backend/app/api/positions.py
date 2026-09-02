@@ -572,9 +572,10 @@ def re_enter_from_snapshot(
             # either only applies to a stock re-buy, else it's a market order.
             if limit_price is not None and is_stock_buy:
                 use_limit, limit_val = True, limit_price
-            elif disc > 0 and is_stock_buy:
-                # % below the chosen basis: current (live) / reference (prev close)
-                # / exit (the recorded exit price; also the default when omitted).
+            elif is_stock_buy and (disc > 0 or basis == "exit"):
+                # A resting limit: % below the chosen basis — current (live) /
+                # reference (prev close) / exit (the recorded exit price). With
+                # basis="exit" and no discount, the limit is exactly the exit price.
                 base_px = _basis_price(p["symbol"]) if basis in ("current", "reference") else price
                 if base_px is not None and base_px > 0:
                     use_limit, limit_val = True, (base_px * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
