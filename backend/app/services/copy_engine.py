@@ -984,43 +984,74 @@ def _closeable_quantity(
     return closeable if closeable > 0 else Decimal(0)
 
 
-def _entry_multiplier_for_close(
+def _locked_instrument_multiplier(
     db: Session, user_id: uuid.UUID, order: Order
 ) -> Decimal | None:
-    """The copy-size multiplier the subscriber's position in ``order``'s contract
-    was OPENED at — read from ``copy_multiplier`` on their most recent OPENING
-    mirror for that exact contract.
+    """The copy-size multiplier LOCKED to the subscriber's CURRENT position in
+    ``order``'s contract — the ``copy_multiplier`` stored on the mirror that
+    OPENED that position.
 
-    Closes scale by THIS instead of the subscriber's live setting, so lowering
-    the multiplier mid-position can't strand them on the exit: a trader's full
-    close then still maps to the subscriber's full position, and a chunked close
-    can't round each piece down to zero against a smaller current multiplier.
+    The lock rule: a position's multiplier is fixed at first entry. Every later
+    order on the SAME instrument — add more, trim, or close — scales by THIS,
+    NOT the subscriber's live setting. So a mid-position settings change can't
+    distort an add or strand an exit; the position behaves at the size it was
+    opened at until it is fully closed.
 
-    Returns None when there's no stored entry multiplier — a position opened
-    before this column existed, or acquired outside the copy engine — and the
-    caller falls back to the live setting (pre-existing behaviour).
+    Returns None (→ caller uses the live setting, which RE-LOCKS the instrument
+    for the new position) when either:
+      * the subscriber has no active position or working order in the contract —
+        i.e. this is a FRESH entry (nothing held, nothing forming); or
+      * the position was opened before copy_multiplier existed / outside the copy
+        engine — no stored multiplier to lock onto (legacy fallback).
 
-    Edge case (documented, not handled here): if the position was built from
-    several entries at DIFFERENT multipliers, this uses the most recent one. The
-    close-clamp still caps the exit at what's actually held, so the worst case is
-    a small residual on a mixed-multiplier position, never an over-close.
+    Edge case (documented): a position built from several entries at DIFFERENT
+    stored multipliers uses the most recent opening's value. Under the lock rule
+    that can't happen going forward (adds reuse the lock), but legacy rows can.
     """
-    return db.execute(
-        select(Order.copy_multiplier)
-        .where(
-            Order.user_id == user_id,
-            Order.symbol == order.symbol,
-            Order.instrument_type == order.instrument_type,
-            Order.option_expiry.is_not_distinct_from(order.option_expiry),
-            Order.option_strike.is_not_distinct_from(order.option_strike),
-            Order.option_right.is_not_distinct_from(order.option_right),
+    same_contract = (
+        Order.user_id == user_id,
+        Order.symbol == order.symbol,
+        Order.instrument_type == order.instrument_type,
+        Order.option_expiry.is_not_distinct_from(order.option_expiry),
+        Order.option_strike.is_not_distinct_from(order.option_strike),
+        Order.option_right.is_not_distinct_from(order.option_right),
+    )
+    # The multiplier the current position was opened at (most recent opening
+    # mirror). Cheap first check: no opening mirror at all → never held as a
+    # mirror → fresh entry, no lock.
+    locked = db.execute(
+        select(Order.copy_multiplier).where(
+            *same_contract,
             Order.parent_order_id.isnot(None),   # a copy mirror, not a direct trade
             Order.is_closing.is_(False),          # an OPENING order
             Order.copy_multiplier.isnot(None),
-        )
-        .order_by(Order.created_at.desc())
-        .limit(1)
+        ).order_by(Order.created_at.desc()).limit(1)
     ).scalar_one_or_none()
+    if locked is None:
+        return None
+
+    # A prior opening exists — but only keep the lock while the position is still
+    # ACTIVE (net filled qty != 0, or a working order still forming it). If it's
+    # flat with nothing working, the prior position fully closed and this is a
+    # fresh RE-ENTRY that must re-lock at the live setting.
+    rows = db.execute(
+        select(Order.side, func.coalesce(func.sum(Order.filled_quantity), 0))
+        .where(*same_contract).group_by(Order.side)
+    ).all()
+    net = Decimal(0)
+    for side, qty in rows:
+        if side == OrderSide.BUY:
+            net += Decimal(str(qty))
+        elif side == OrderSide.SELL:
+            net -= Decimal(str(qty))
+    if net != 0:
+        return locked
+    working = db.execute(
+        select(func.count()).select_from(Order).where(
+            *same_contract, Order.status.in_(_WORKING_ORDER_STATUSES),
+        )
+    ).scalar_one()
+    return locked if working else None
 
 
 # Statuses a mirror can be modified in: fully working AND untouched by any
@@ -2475,22 +2506,17 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             )
             is_closing_effective = bool(trader_order.is_closing) or closeable > 0
 
-            # ── Scale the mirror ──
-            # ENTRY → the subscriber's CURRENT multiplier.
-            # CLOSE → the multiplier the position was OPENED at (stored on the
-            # entry mirror as copy_multiplier), NOT the current setting. This is
-            # the anti-stranding rule: if the subscriber lowers their multiplier
-            # while holding, a trader's full close still maps to their full
-            # position (floor(trader_qty × entry_mult)), and a chunked close can't
-            # round each piece to zero against a smaller current multiplier.
-            # Falls back to the live setting when no entry multiplier is on record
-            # (position opened before copy_multiplier existed, or acquired outside
-            # the copy engine) — i.e. pre-existing behaviour for legacy positions.
-            close_mult = (
-                _entry_multiplier_for_close(db, sub.user_id, trader_order)
-                if is_closing_effective else None
-            )
-            scale_mult = close_mult if close_mult is not None else sub.multiplier
+            # ── Scale the mirror (instrument-locked multiplier) ──
+            # The multiplier is LOCKED per instrument at first entry. Every order
+            # on a contract the subscriber already holds — add more, trim, or
+            # close — scales by the multiplier the position was OPENED at, NOT the
+            # live setting. Only a FRESH entry (nothing held / forming) uses the
+            # live setting, which re-locks the instrument for the new position.
+            # This keeps adds proportional and exits un-strandable when the
+            # subscriber changes their multiplier mid-position, and falls back to
+            # the live setting for legacy positions with no stored multiplier.
+            locked_mult = _locked_instrument_multiplier(db, sub.user_id, trader_order)
+            scale_mult = locked_mult if locked_mult is not None else sub.multiplier
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )
@@ -2646,10 +2672,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 option_strike=trader_order.option_strike,
                 option_right=trader_order.option_right,
                 is_closing=is_closing_effective,
-                # Record the multiplier actually applied to THIS mirror: the
-                # current setting for an entry, or the entry multiplier for a
-                # close (see scale_mult above / Order.copy_multiplier). Entries
-                # are what _entry_multiplier_for_close reads back on later closes.
+                # Record the multiplier actually applied to THIS mirror (scale_mult
+                # above): the live setting for a fresh entry, or the instrument's
+                # locked multiplier for an add/trim/close. The FIRST opening mirror
+                # of a position is what _locked_instrument_multiplier reads back to
+                # scale every later order on the same contract.
                 copy_multiplier=scale_mult,
                 side=trader_order.side,
                 order_type=trader_order.order_type,
