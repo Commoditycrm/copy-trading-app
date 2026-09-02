@@ -55,6 +55,8 @@ export default function SnapshotPage() {
   const [globalDisc, setGlobalDisc] = useState("");
   // Re-Enter All mode: market (buy back now) or % below the exit price.
   const [globalMode, setGlobalMode] = useState<"market" | "pct">("pct");
+  // Re-Enter All basis for "% below": live market price or previous day close.
+  const [globalBasis, setGlobalBasis] = useState<"current" | "reference">("current");
   // Per-row re-entry mode + value: market (no value), pct (% below exit), or limit ($ price).
   type ReMode = "market" | "pct" | "limit";
   const [rowMode, setRowMode] = useState<Record<string, ReMode>>({});
@@ -122,7 +124,10 @@ export default function SnapshotPage() {
       if (scope === "all") {
         if (globalMode === "pct") {
           const d = parseFloat(globalDisc);
-          if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
+          if (!isNaN(d) && d > 0 && d <= 100) {
+            params.set("discount_percent", String(d));
+            params.set("basis", globalBasis);
+          }
         }
         // market — send nothing
       } else {
@@ -230,6 +235,16 @@ export default function SnapshotPage() {
                            className="w-10 text-xs outline-none text-center"
                            style={{ background: "transparent", border: "none", color: "var(--text)" }} />
                     <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
+                    {/* Basis: below the live market price or the previous day close. */}
+                    <select value={globalBasis}
+                            onChange={(e) => setGlobalBasis(e.target.value as "current" | "reference")}
+                            aria-label="Re-Enter All basis"
+                            title="Market = % below the live price. PDC = % below the previous day's market close."
+                            className="text-xs outline-none cursor-pointer"
+                            style={{ background: "transparent", border: "none", color: "var(--text-2)" }}>
+                      <option value="current">Market</option>
+                      <option value="reference">PDC</option>
+                    </select>
                   </div>
                 )}
               </div>
