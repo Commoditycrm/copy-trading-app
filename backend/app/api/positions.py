@@ -437,6 +437,17 @@ def latest_sell_all_snapshot(
         except Exception:  # noqa: BLE001
             return None
 
+    def _pdc(sym: str, itype: str) -> str | None:
+        """Previous day's market close — the PDC re-entry basis."""
+        fn = getattr(adapter, "get_stock_prev_close", None)
+        if adapter is None or itype != "stock" or fn is None:
+            return None
+        try:
+            px = fn(sym)
+            return str(px) if px is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
     positions = []
     for p in snap.positions:
         st, reentry_price = _reentry_info(db, p)
@@ -446,6 +457,7 @@ def latest_sell_all_snapshot(
             "quantity": p["quantity"],
             "price": p.get("price"),                                  # exit price
             "current_price": _current(p["symbol"], p["instrument_type"]),
+            "pdc": _pdc(p["symbol"], p["instrument_type"]),           # previous day close
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
             "default_mode": p.get("default_mode", "market"),          # default re-entry chosen at exit
             "default_value": p.get("default_value"),
