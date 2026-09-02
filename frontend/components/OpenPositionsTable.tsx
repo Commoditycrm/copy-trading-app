@@ -387,10 +387,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
     };
 
-    const Th = ({ label, sortKey, className: thc = "" }: { label: string; sortKey?: SortKey; className?: string }) => {
+    const Th = ({ label, sortKey, className: thc = "", title }: { label: string; sortKey?: SortKey; className?: string; title?: string }) => {
       const active = sortKey && sort?.key === sortKey;
       return (
-        <th className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
+        <th title={title} className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
           {sortKey ? (
             <button type="button" onClick={() => toggleSort(sortKey)} className="inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors uppercase tracking-[0.06em] text-[11px]" style={{ color: "inherit" }}>
               {label}
@@ -468,7 +468,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
-                  <Th label="Prev day close" />
+                  <Th label="PDC" title="Previous day's market close price" />
                   <Th label="Filled price" />
                   <Th label="Market value" sortKey="market_value" />
                   <Th label="TP" />
