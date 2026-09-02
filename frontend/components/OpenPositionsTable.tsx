@@ -401,7 +401,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       );
     };
 
-    const COLSPAN = 20;  // +1 for the Reference column
+    const COLSPAN = 21;  // +Reference (PDC) +P&L %
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -466,6 +466,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Close %" />
                   <Th label="Actions" />
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
+                  <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
                   <Th label="Current price" sortKey="current_price" />
                   <Th label="PDC" title="Previous day's market close price" />
@@ -611,6 +612,17 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             {pnl.text}
                           </span>
                         </td>
+                        {/* P&L % = unrealized P&L / cost basis. */}
+                        {(() => {
+                          const cb = Number(p.cost_basis);
+                          const upnl = Number(p.unrealized_pnl);
+                          const pct = Number.isFinite(cb) && cb !== 0 && Number.isFinite(upnl) ? (upnl / Math.abs(cb)) * 100 : null;
+                          return (
+                            <td className="px-5 py-3.5 num" style={{ color: pct == null ? "var(--muted)" : pct > 0 ? "var(--good)" : pct < 0 ? "var(--bad)" : "var(--text-2)" }}>
+                              {pct == null ? "—" : `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`}
+                            </td>
+                          );
+                        })()}
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
                         <td className="px-5 py-3.5 num">{fmtNum(p.current_price, 2)}</td>
                         {/* Reference = previous session's market close price. */}

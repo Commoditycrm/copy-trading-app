@@ -108,7 +108,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // Snapshot page pre-fills it and Re-Enter uses it without re-typing.
   const [reentryPct, setReentryPct] = useState("");
   // Basis for the baked-in default re-entry %: live price / previous close / exit price.
-  const [reentryBasis, setReentryBasis] = useState<"current" | "reference" | "exit">("current");
+  const [reentryBasis, setReentryBasis] = useState<"current" | "reference">("current");
   const reentryNum = parseFloat(reentryPct);
   const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
   const trailNum = parseFloat(trailPct);
@@ -121,7 +121,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const [snapshot, setSnapshot] = useState<{ id: string; summary: SnapSummary } | null>(null);
   const [reDiscount, setReDiscount] = useState("");
   // Basis for the Re-Enter "% below": live price / previous close / exit price.
-  const [reBasis, setReBasis] = useState<"current" | "reference" | "exit">("current");
+  const [reBasis, setReBasis] = useState<"current" | "reference">("current");
   const [reBusy, setReBusy] = useState(false);
   // Open-position count so Exit My Positions can disable when there's nothing to
   // exit. null = not yet known (keep enabled until we know it's 0).
@@ -333,14 +333,13 @@ export function BulkExitBar({ onActionComplete }: Props) {
             />
             <select
               value={reentryBasis}
-              onChange={e => setReentryBasis(e.target.value as "current" | "reference" | "exit")}
+              onChange={e => setReentryBasis(e.target.value as "current" | "reference")}
               aria-label="Default re-entry basis"
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}
             >
               <option value="current">Market</option>
-              <option value="reference">PDC</option>
-              <option value="exit">Exit</option>
+              <option value="reference">PDC</option>
             </select>
           </div>
           </>)}
@@ -446,14 +445,13 @@ export function BulkExitBar({ onActionComplete }: Props) {
               />
               <select
                 value={reBasis}
-                onChange={e => setReBasis(e.target.value as "current" | "reference" | "exit")}
+                onChange={e => setReBasis(e.target.value as "current" | "reference")}
                 aria-label="Re-enter basis"
                 className="text-xs outline-none cursor-pointer"
                 style={{ background: "transparent", border: "none", color: "var(--text)" }}
               >
                 <option value="current">Market</option>
-                <option value="reference">PDC</option>
-                <option value="exit">Exit</option>
+                <option value="reference">PDC</option>
               </select>
             </div>
             <button

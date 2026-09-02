@@ -57,17 +57,18 @@ export default function SnapshotPage() {
   //  market        — buy back now at market
   //  pct_current   — a resting limit % below the live market price
   //  pct_reference — a resting limit % below the previous day close (PDC)
-  //  pct_exit      — a resting limit % below the recorded exit price
+  //  at_exit       — a resting limit AT the recorded exit price (no discount)
   //  limit         — an exact $ limit price (per-row only)
-  type ReChoice = "market" | "pct_current" | "pct_reference" | "pct_exit" | "limit";
+  type ReChoice = "market" | "pct_current" | "pct_reference" | "at_exit" | "limit";
   // Re-Enter All (no per-symbol limit — price differs per symbol).
   const [globalChoice, setGlobalChoice] = useState<Exclude<ReChoice, "limit">>("pct_current");
   const [rowChoice, setRowChoice] = useState<Record<string, ReChoice>>({});
   const [rowVal, setRowVal] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a symbol
-  // A "% below" choice measures off the live price (current), the PDC (reference), or the exit price.
-  const choiceBasis = (c: ReChoice) =>
-    c === "pct_reference" ? "reference" : c === "pct_exit" ? "exit" : "current";
+  // A "% below" choice measures off the live price (current) or the PDC (reference).
+  const choiceBasis = (c: ReChoice) => (c === "pct_reference" ? "reference" : "current");
+  // Choices that take a percent value input.
+  const isPctChoice = (c: ReChoice) => c === "pct_current" || c === "pct_reference";
 
   const load = useCallback(async () => {
     try {
@@ -83,7 +84,7 @@ export default function SnapshotPage() {
             // Fold the exit-time default (mode + basis) into one choice.
             if (p.default_mode === "pct")
               next[p.symbol] = p.default_basis === "reference" ? "pct_reference"
-                : p.default_basis === "exit" ? "pct_exit" : "pct_current";
+                : p.default_basis === "exit" ? "at_exit" : "pct_current";
             else if (p.default_mode === "limit") next[p.symbol] = "limit";
             else if (p.default_mode === "market") next[p.symbol] = "market";
           }
@@ -125,7 +126,9 @@ export default function SnapshotPage() {
     try {
       const params = new URLSearchParams();
       if (scope === "all") {
-        if (globalChoice !== "market") {
+        if (globalChoice === "at_exit") {
+          params.set("basis", "exit");   // a resting limit at each position's exit price
+        } else if (globalChoice !== "market") {
           const d = parseFloat(globalDisc);
           if (!isNaN(d) && d > 0 && d <= 100) {
             params.set("discount_percent", String(d));
@@ -138,7 +141,8 @@ export default function SnapshotPage() {
         const choice = rowChoice[scope] ?? "market";
         const v = parseFloat(rowVal[scope] ?? "");
         if (choice === "limit" && !isNaN(v) && v > 0) params.set("limit_price", String(v));
-        else if ((choice === "pct_current" || choice === "pct_reference" || choice === "pct_exit") && !isNaN(v) && v > 0 && v <= 100) {
+        else if (choice === "at_exit") params.set("basis", "exit");  // limit at the exit price
+        else if (isPctChoice(choice) && !isNaN(v) && v > 0 && v <= 100) {
           params.set("discount_percent", String(v));
           params.set("basis", choiceBasis(choice));
         }
@@ -230,9 +234,9 @@ export default function SnapshotPage() {
                   <option value="market">Market</option>
                   <option value="pct_current">% below Market</option>
                   <option value="pct_reference">% below PDC</option>
-                  <option value="pct_exit">% below Exit</option>
+                  <option value="at_exit">Exit price</option>
                 </select>
-                {globalChoice !== "market" && (
+                {isPctChoice(globalChoice) && (
                   <div className="inline-flex items-center gap-0.5">
                     <input type="number" min="0" max="100" step="0.5" value={globalDisc}
                            onChange={(e) => setGlobalDisc(e.target.value)} placeholder="%"
@@ -283,17 +287,18 @@ export default function SnapshotPage() {
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
                     const choice: ReChoice = rowChoice[p.symbol] ?? "market";
-                    const isPct = choice === "pct_current" || choice === "pct_reference" || choice === "pct_exit";
+                    const isPct = isPctChoice(choice);
                     const rv = parseFloat(rowVal[p.symbol] ?? "");
                     const curP = p.current_price != null ? Number(p.current_price) : null;
                     const pdcP = p.pdc != null ? Number(p.pdc) : null;
-                    // Dollar target when using a "% below": off the live price
-                    // (Market), the previous day close (PDC), or the exit price.
-                    const basisPx = choice === "pct_reference" ? pdcP : choice === "pct_exit" ? exitP : curP;
+                    // Dollar target: "% below" off the live price (Market) / PDC,
+                    // or the exit price itself for "Exit price".
+                    const basisPx = choice === "pct_reference" ? pdcP : curP;
                     const targetPx =
-                      isPct && !isNaN(rv) && rv > 0 && rv <= 100 && basisPx != null
-                        ? basisPx * (1 - rv / 100)
-                        : null;
+                      choice === "at_exit" ? exitP
+                        : isPct && !isNaN(rv) && rv > 0 && rv <= 100 && basisPx != null
+                          ? basisPx * (1 - rv / 100)
+                          : null;
                     // "%" column: how far the current price sits from the exit price.
                     const pctVsExit =
                       exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
@@ -349,10 +354,10 @@ export default function SnapshotPage() {
                                 <option value="market">Market</option>
                                 <option value="pct_current">% below Market</option>
                                 <option value="pct_reference">% below PDC</option>
-                                <option value="pct_exit">% below Exit</option>
+                                <option value="at_exit">Exit price</option>
                                 <option value="limit">Limit $</option>
                               </select>
-                              {choice !== "market" && (
+                              {(isPct || choice === "limit") && (
                                 <div className="inline-flex items-center gap-0.5 px-1.5"
                                      style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
                                   {choice === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
