@@ -53,19 +53,19 @@ export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [globalDisc, setGlobalDisc] = useState("");
-  // Re-Enter All mode: market (buy back now) or % below the exit price.
-  const [globalMode, setGlobalMode] = useState<"market" | "pct">("pct");
-  // Re-Enter All basis for "% below": live market price or previous day close.
-  const [globalBasis, setGlobalBasis] = useState<"current" | "reference">("current");
-  // Per-row re-entry mode + value: market (no value), pct (% below exit), or limit ($ price).
-  type ReMode = "market" | "pct" | "limit";
-  const [rowMode, setRowMode] = useState<Record<string, ReMode>>({});
+  // One combined choice for the re-entry price:
+  //  market        — buy back now at market
+  //  pct_current   — a resting limit % below the live market price
+  //  pct_reference — a resting limit % below the previous day close (PDC)
+  //  limit         — an exact $ limit price (per-row only)
+  type ReChoice = "market" | "pct_current" | "pct_reference" | "limit";
+  // Re-Enter All (no per-symbol limit — price differs per symbol).
+  const [globalChoice, setGlobalChoice] = useState<Exclude<ReChoice, "limit">>("pct_current");
+  const [rowChoice, setRowChoice] = useState<Record<string, ReChoice>>({});
   const [rowVal, setRowVal] = useState<Record<string, string>>({});
-  // For "% below": measure the discount off the live price ("current") or the
-  // previous market close ("reference"). Defaults to current.
-  type Basis = "current" | "reference";
-  const [rowBasis, setRowBasis] = useState<Record<string, Basis>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a symbol
+  // A "% below" choice measures off the live price (current) or the PDC (reference).
+  const choiceBasis = (c: ReChoice) => (c === "pct_reference" ? "reference" : "current");
 
   const load = useCallback(async () => {
     try {
@@ -74,22 +74,22 @@ export default function SnapshotPage() {
       // Pre-fill the re-entry control from the default chosen at exit time —
       // without overwriting anything the user has already edited.
       if (r.snapshot) {
-        setRowMode((prev) => {
+        setRowChoice((prev) => {
           const next = { ...prev };
-          for (const p of r.snapshot!.positions)
-            if (!(p.symbol in next) && p.default_mode) next[p.symbol] = p.default_mode;
+          for (const p of r.snapshot!.positions) {
+            if (p.symbol in next) continue;
+            // Fold the exit-time default (mode + basis) into one choice.
+            if (p.default_mode === "pct")
+              next[p.symbol] = p.default_basis === "reference" ? "pct_reference" : "pct_current";
+            else if (p.default_mode === "limit") next[p.symbol] = "limit";
+            else if (p.default_mode === "market") next[p.symbol] = "market";
+          }
           return next;
         });
         setRowVal((prev) => {
           const next = { ...prev };
           for (const p of r.snapshot!.positions)
             if (!(p.symbol in next) && p.default_value != null) next[p.symbol] = p.default_value;
-          return next;
-        });
-        setRowBasis((prev) => {
-          const next = { ...prev };
-          for (const p of r.snapshot!.positions)
-            if (!(p.symbol in next) && p.default_basis) next[p.symbol] = p.default_basis;
           return next;
         });
       }
@@ -122,22 +122,22 @@ export default function SnapshotPage() {
     try {
       const params = new URLSearchParams();
       if (scope === "all") {
-        if (globalMode === "pct") {
+        if (globalChoice !== "market") {
           const d = parseFloat(globalDisc);
           if (!isNaN(d) && d > 0 && d <= 100) {
             params.set("discount_percent", String(d));
-            params.set("basis", globalBasis);
+            params.set("basis", choiceBasis(globalChoice));
           }
         }
         // market — send nothing
       } else {
         params.set("symbol", scope);
-        const mode = rowMode[scope] ?? "market";
+        const choice = rowChoice[scope] ?? "market";
         const v = parseFloat(rowVal[scope] ?? "");
-        if (mode === "limit" && !isNaN(v) && v > 0) params.set("limit_price", String(v));
-        else if (mode === "pct" && !isNaN(v) && v > 0 && v <= 100) {
+        if (choice === "limit" && !isNaN(v) && v > 0) params.set("limit_price", String(v));
+        else if ((choice === "pct_current" || choice === "pct_reference") && !isNaN(v) && v > 0 && v <= 100) {
           params.set("discount_percent", String(v));
-          params.set("basis", rowBasis[scope] ?? "current");
+          params.set("basis", choiceBasis(choice));
         }
         // else market — send nothing
       }
@@ -215,19 +215,20 @@ export default function SnapshotPage() {
               Re-enter everything not back yet ({snap.summary.pending} pending):
             </span>
             <div className="flex items-center gap-2">
-              {/* One pill: Market / % below · value. */}
+              {/* One pill: single choice · value. */}
               <div className="inline-flex items-center rounded-lg h-7 px-1 gap-1"
                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-                   title="Re-enter every pending position at market, or a % below its exit price.">
-                <select value={globalMode}
-                        onChange={(e) => { setGlobalMode(e.target.value as "market" | "pct"); setGlobalDisc(""); }}
-                        aria-label="Re-Enter All mode"
+                   title="Re-enter every pending position at market, or a resting limit % below the live price (Market) or the previous day close (PDC).">
+                <select value={globalChoice}
+                        onChange={(e) => { setGlobalChoice(e.target.value as Exclude<ReChoice, "limit">); setGlobalDisc(""); }}
+                        aria-label="Re-Enter All choice"
                         className="text-xs outline-none cursor-pointer"
                         style={{ background: "transparent", border: "none", color: "var(--text)" }}>
                   <option value="market">Market</option>
-                  <option value="pct">% below</option>
+                  <option value="pct_current">% below Market</option>
+                  <option value="pct_reference">% below PDC</option>
                 </select>
-                {globalMode === "pct" && (
+                {globalChoice !== "market" && (
                   <div className="inline-flex items-center gap-0.5">
                     <input type="number" min="0" max="100" step="0.5" value={globalDisc}
                            onChange={(e) => setGlobalDisc(e.target.value)} placeholder="%"
@@ -235,16 +236,6 @@ export default function SnapshotPage() {
                            className="w-10 text-xs outline-none text-center"
                            style={{ background: "transparent", border: "none", color: "var(--text)" }} />
                     <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
-                    {/* Basis: below the live market price or the previous day close. */}
-                    <select value={globalBasis}
-                            onChange={(e) => setGlobalBasis(e.target.value as "current" | "reference")}
-                            aria-label="Re-Enter All basis"
-                            title="Market = % below the live price. PDC = % below the previous day's market close."
-                            className="text-xs outline-none cursor-pointer"
-                            style={{ background: "transparent", border: "none", color: "var(--text-2)" }}>
-                      <option value="current">Market</option>
-                      <option value="reference">PDC</option>
-                    </select>
                   </div>
                 )}
               </div>
@@ -286,16 +277,16 @@ export default function SnapshotPage() {
                     // Long buy-back: bought back cheaper than exit = positive (saved).
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
-                    const mode: ReMode = rowMode[p.symbol] ?? "market";
-                    const basis: Basis = rowBasis[p.symbol] ?? "current";
+                    const choice: ReChoice = rowChoice[p.symbol] ?? "market";
+                    const isPct = choice === "pct_current" || choice === "pct_reference";
                     const rv = parseFloat(rowVal[p.symbol] ?? "");
                     const curP = p.current_price != null ? Number(p.current_price) : null;
                     const pdcP = p.pdc != null ? Number(p.pdc) : null;
-                    // Dollar target when using "% below": off the live price
-                    // ("current") or the previous day close ("reference"/PDC).
-                    const basisPx = basis === "reference" ? pdcP : curP;
+                    // Dollar target when using a "% below": off the live price
+                    // (Market) or the previous day close (PDC).
+                    const basisPx = choice === "pct_reference" ? pdcP : curP;
                     const targetPx =
-                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && basisPx != null
+                      isPct && !isNaN(rv) && rv > 0 && rv <= 100 && basisPx != null
                         ? basisPx * (1 - rv / 100)
                         : null;
                     return (
@@ -329,12 +320,12 @@ export default function SnapshotPage() {
                         </td>
                         <td className={`${td} text-right`}>
                           <div className="inline-flex items-center gap-2 justify-end whitespace-nowrap">
-                            {/* Single connected control: mode selector + its value input. */}
+                            {/* Single connected control: one choice + its value input. */}
                             <div className="inline-flex items-stretch rounded-md overflow-hidden"
                                  style={{ border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
-                              <select value={mode} disabled={!canReenter}
+                              <select value={choice} disabled={!canReenter}
                                       onChange={(e) => {
-                                        setRowMode((m) => ({ ...m, [p.symbol]: e.target.value as ReMode }));
+                                        setRowChoice((m) => ({ ...m, [p.symbol]: e.target.value as ReChoice }));
                                         // Clear the value so a % isn't misread as a $ (and vice-versa).
                                         setRowVal((m) => ({ ...m, [p.symbol]: "" }));
                                       }}
@@ -342,37 +333,25 @@ export default function SnapshotPage() {
                                       className="text-xs px-1.5 py-1 outline-none"
                                       style={{ background: "var(--panel-2)", border: "none", color: "var(--text)" }}>
                                 <option value="market">Market</option>
-                                <option value="pct">% below</option>
+                                <option value="pct_current">% below Market</option>
+                                <option value="pct_reference">% below PDC</option>
                                 <option value="limit">Limit $</option>
                               </select>
-                              {mode !== "market" && (
+                              {choice !== "market" && (
                                 <div className="inline-flex items-center gap-0.5 px-1.5"
                                      style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
-                                  {mode === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
-                                  <input type="number" min="0" max={mode === "pct" ? 100 : undefined} step={mode === "pct" ? 0.5 : 0.01}
+                                  {choice === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
+                                  <input type="number" min="0" max={isPct ? 100 : undefined} step={isPct ? 0.5 : 0.01}
                                          value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
                                          onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
-                                         placeholder={mode === "limit" ? "price" : "%"}
-                                         aria-label={`${mode === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
+                                         placeholder={choice === "limit" ? "price" : "%"}
+                                         aria-label={`${choice === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
                                          className="w-14 text-xs py-0.5 outline-none"
                                          style={{ background: "transparent", border: "none", color: "var(--text)" }} />
-                                  {mode === "pct" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
+                                  {isPct && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
                                 </div>
                               )}
                             </div>
-                            {/* % below basis — off the live market price or the
-                                previous day close (PDC). Sits to the right. */}
-                            {mode === "pct" && (
-                              <select value={basis} disabled={!canReenter}
-                                      onChange={(e) => setRowBasis((m) => ({ ...m, [p.symbol]: e.target.value as Basis }))}
-                                      aria-label={`Basis for ${p.symbol}`}
-                                      title="Market = % below the live price. PDC = % below the previous day's market close."
-                                      className="text-xs rounded-md px-1 py-1 outline-none disabled:opacity-50"
-                                      style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}>
-                                <option value="current">Market</option>
-                                <option value="reference">PDC</option>
-                              </select>
-                            )}
                             {/* Dollar target for a % below. */}
                             {targetPx != null && (
                               <span className="text-[10px] num" style={{ color: "var(--muted)" }}>
