@@ -20,6 +20,7 @@ interface SnapPos {
   quantity: string;            // signed
   price: string | null;        // exit price / share
   current_price: string | null; // live market price / share
+  pdc: string | null;           // previous day's market close / share
   reentry_price: string | null; // fill price (filled) or resting limit (working)
   default_mode: "market" | "pct" | "limit"; // re-entry default chosen at exit
   default_value: string | null;
@@ -252,6 +253,7 @@ export default function SnapshotPage() {
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Qty</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Exit Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
+                    <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Previous day's market close price">PDC</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>
@@ -273,12 +275,13 @@ export default function SnapshotPage() {
                     const basis: Basis = rowBasis[p.symbol] ?? "current";
                     const rv = parseFloat(rowVal[p.symbol] ?? "");
                     const curP = p.current_price != null ? Number(p.current_price) : null;
-                    // Dollar target when using "% below": off the live price for
-                    // "current". "reference" resolves server-side (no prev-close
-                    // here), so we don't preview it.
+                    const pdcP = p.pdc != null ? Number(p.pdc) : null;
+                    // Dollar target when using "% below": off the live price
+                    // ("current") or the previous day close ("reference"/PDC).
+                    const basisPx = basis === "reference" ? pdcP : curP;
                     const targetPx =
-                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && basis === "current" && curP != null
-                        ? curP * (1 - rv / 100)
+                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && basisPx != null
+                        ? basisPx * (1 - rv / 100)
                         : null;
                     return (
                       <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
@@ -288,6 +291,8 @@ export default function SnapshotPage() {
                         <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
                         {/* Live current market price (stocks). */}
                         <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>{fmtMoney(p.current_price)}</td>
+                        {/* Previous day's market close (PDC). */}
+                        <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }} title="Previous day's market close price">{fmtMoney(p.pdc)}</td>
                         {/* Re-entry price: fill when back in, resting limit when working. */}
                         <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
                           {p.reentry_status === "filled"
@@ -340,6 +345,19 @@ export default function SnapshotPage() {
                                 </div>
                               )}
                             </div>
+                            {/* % below basis — off the live market price or the
+                                previous day close (PDC). Sits to the right. */}
+                            {mode === "pct" && (
+                              <select value={basis} disabled={!canReenter}
+                                      onChange={(e) => setRowBasis((m) => ({ ...m, [p.symbol]: e.target.value as Basis }))}
+                                      aria-label={`Basis for ${p.symbol}`}
+                                      title="Market = % below the live price. PDC = % below the previous day's market close."
+                                      className="text-xs rounded-md px-1 py-1 outline-none disabled:opacity-50"
+                                      style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)" }}>
+                                <option value="current">Market</option>
+                                <option value="reference">PDC</option>
+                              </select>
+                            )}
                             {/* Dollar target for a % below. */}
                             {targetPx != null && (
                               <span className="text-[10px] num" style={{ color: "var(--muted)" }}>
