@@ -103,7 +103,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // What the trail % is measured from: "current" (percent trail off the live
   // price — Alpaca-native trailing stop) or "reference" (a dollar trail =
   // trail% of the previous market close). See close_all_positions.
-  const [trailBasis, setTrailBasis] = useState<"current" | "reference">("current");
+  const [trailBasis, setTrailBasis] = useState<"current" | "reference" | "exit">("current");
   // Default re-entry (% below exit) baked into the snapshot at exit time, so the
   // Snapshot page pre-fills it and Re-Enter uses it without re-typing.
   const [reentryPct, setReentryPct] = useState("");
@@ -306,13 +306,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
             />
             <select
               value={trailBasis}
-              onChange={e => setTrailBasis(e.target.value as "current" | "reference")}
+              onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
               aria-label="Trail basis"
+              title="Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the current (exit-time) price."
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}
             >
               <option value="current">Market</option>
               <option value="reference">PDC</option>
+              <option value="exit">Exit</option>
             </select>
           </div>
           </>)}
