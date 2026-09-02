@@ -23,6 +23,7 @@ interface SnapPos {
   reentry_price: string | null; // fill price (filled) or resting limit (working)
   default_mode: "market" | "pct" | "limit"; // re-entry default chosen at exit
   default_value: string | null;
+  default_basis: "current" | "reference" | null; // basis for a "pct" default
   option_expiry: string | null;
   option_strike: string | null;
   option_right: string | null;
@@ -51,10 +52,16 @@ export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [globalDisc, setGlobalDisc] = useState("");
+  // Re-Enter All mode: market (buy back now) or % below the exit price.
+  const [globalMode, setGlobalMode] = useState<"market" | "pct">("pct");
   // Per-row re-entry mode + value: market (no value), pct (% below exit), or limit ($ price).
   type ReMode = "market" | "pct" | "limit";
   const [rowMode, setRowMode] = useState<Record<string, ReMode>>({});
   const [rowVal, setRowVal] = useState<Record<string, string>>({});
+  // For "% below": measure the discount off the live price ("current") or the
+  // previous market close ("reference"). Defaults to current.
+  type Basis = "current" | "reference";
+  const [rowBasis, setRowBasis] = useState<Record<string, Basis>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a symbol
 
   const load = useCallback(async () => {
@@ -74,6 +81,12 @@ export default function SnapshotPage() {
           const next = { ...prev };
           for (const p of r.snapshot!.positions)
             if (!(p.symbol in next) && p.default_value != null) next[p.symbol] = p.default_value;
+          return next;
+        });
+        setRowBasis((prev) => {
+          const next = { ...prev };
+          for (const p of r.snapshot!.positions)
+            if (!(p.symbol in next) && p.default_basis) next[p.symbol] = p.default_basis;
           return next;
         });
       }
@@ -106,14 +119,20 @@ export default function SnapshotPage() {
     try {
       const params = new URLSearchParams();
       if (scope === "all") {
-        const d = parseFloat(globalDisc);
-        if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
+        if (globalMode === "pct") {
+          const d = parseFloat(globalDisc);
+          if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
+        }
+        // market — send nothing
       } else {
         params.set("symbol", scope);
         const mode = rowMode[scope] ?? "market";
         const v = parseFloat(rowVal[scope] ?? "");
         if (mode === "limit" && !isNaN(v) && v > 0) params.set("limit_price", String(v));
-        else if (mode === "pct" && !isNaN(v) && v > 0 && v <= 100) params.set("discount_percent", String(v));
+        else if (mode === "pct" && !isNaN(v) && v > 0 && v <= 100) {
+          params.set("discount_percent", String(v));
+          params.set("basis", rowBasis[scope] ?? "current");
+        }
         // else market — send nothing
       }
       const qs = params.toString();
@@ -190,15 +209,28 @@ export default function SnapshotPage() {
               Re-enter everything not back yet ({snap.summary.pending} pending):
             </span>
             <div className="flex items-center gap-2">
-              <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg"
+              {/* One pill: Market / % below · value. */}
+              <div className="inline-flex items-center rounded-lg h-7 px-1 gap-1"
                    style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-                   title="Optional: re-buy each at this % below its exit price. Empty = market.">
-                <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>%&nbsp;below</span>
-                <input type="number" min="0" max="100" step="0.5" value={globalDisc}
-                       onChange={(e) => setGlobalDisc(e.target.value)} placeholder="mkt"
-                       aria-label="Discount percent for Re-Enter All"
-                       className="w-14 text-xs rounded-md px-1.5 py-0.5 outline-none"
-                       style={{ background: "var(--panel)", border: "1px solid var(--border)", color: "var(--text)" }} />
+                   title="Re-enter every pending position at market, or a % below its exit price.">
+                <select value={globalMode}
+                        onChange={(e) => { setGlobalMode(e.target.value as "market" | "pct"); setGlobalDisc(""); }}
+                        aria-label="Re-Enter All mode"
+                        className="text-xs outline-none cursor-pointer"
+                        style={{ background: "transparent", border: "none", color: "var(--text)" }}>
+                  <option value="market">Market</option>
+                  <option value="pct">% below</option>
+                </select>
+                {globalMode === "pct" && (
+                  <div className="inline-flex items-center gap-0.5">
+                    <input type="number" min="0" max="100" step="0.5" value={globalDisc}
+                           onChange={(e) => setGlobalDisc(e.target.value)} placeholder="%"
+                           aria-label="Discount percent for Re-Enter All"
+                           className="w-10 text-xs outline-none text-center"
+                           style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+                    <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
+                  </div>
+                )}
               </div>
               <button type="button" onClick={() => reEnter("all")}
                       disabled={busy !== null || snap.summary.pending === 0}
@@ -238,11 +270,15 @@ export default function SnapshotPage() {
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
                     const mode: ReMode = rowMode[p.symbol] ?? "market";
+                    const basis: Basis = rowBasis[p.symbol] ?? "current";
                     const rv = parseFloat(rowVal[p.symbol] ?? "");
-                    // Dollar target when using "% below".
+                    const curP = p.current_price != null ? Number(p.current_price) : null;
+                    // Dollar target when using "% below": off the live price for
+                    // "current". "reference" resolves server-side (no prev-close
+                    // here), so we don't preview it.
                     const targetPx =
-                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && exitP != null
-                        ? exitP * (1 - rv / 100)
+                      mode === "pct" && !isNaN(rv) && rv > 0 && rv <= 100 && basis === "current" && curP != null
+                        ? curP * (1 - rv / 100)
                         : null;
                     return (
                       <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
