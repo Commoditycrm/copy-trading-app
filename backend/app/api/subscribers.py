@@ -21,7 +21,7 @@ from app.schemas.settings import (
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
-from app.services import audit, cache, notifications
+from app.services import audit, cache, events, notifications
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api/subscribers", tags=["subscribers"])
@@ -143,6 +143,12 @@ def set_bulk_copy_state(
     )
     db.commit()
     cache.invalidate_subscribers_for_trader(trader.id)
+    # Live-sync the trader's OWN sidebar copy switch across their other open
+    # tabs / devices. The switch loads once on mount and otherwise only tracks a
+    # local toggle, so without this a second tab (or their phone) keeps showing
+    # a stale ON/OFF — the trader then thinks copy is off while it's actually on
+    # (subscribers still receive trades) and reports a "bug". Fire-and-forget.
+    events.publish(trader.id, {"type": "copy.master_toggled", "paused": ts.copy_paused})
     return _bulk_state(db, trader.id)
 
 
