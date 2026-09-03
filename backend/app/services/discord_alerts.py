@@ -214,12 +214,17 @@ def _round_trip_summary(db, order: Order) -> dict:
     return result
 
 
-def build_card(order: Order, summary: dict | None = None) -> dict:
+def build_card(order: Order, summary: dict | None = None, copy_on: bool | None = None) -> dict:
     """Build the Discord webhook payload (one embed) for a filled trader order.
 
     ``summary`` comes from ``_round_trip_summary`` and drives the card type:
     ENTERING (green) / TRIMMING (amber, partial close w/ P&L + "X of Y open") /
-    CLOSING (red, full exit w/ P&L + round-trip total). None → ENTERING."""
+    CLOSING (red, full exit w/ P&L + round-trip total). None → ENTERING.
+
+    ``copy_on`` — the trader's master copy switch state at the moment this trade
+    filled (True = copying to subscribers, False = paused). When provided, it's
+    shown as a field so channel readers can tell whether the trade was mirrored.
+    None omits the field (e.g. legacy callers)."""
     contract = _contract_label(order)
     qty_str = _qty_str(order.filled_quantity or order.quantity or Decimal(0))
     price = _fmt_money(order.filled_avg_price)
@@ -247,15 +252,20 @@ def build_card(order: Order, summary: dict | None = None) -> dict:
         desc = f"{qty_str} @ {price} · {_fmt_money(_notional(order))}"
         color = _COLOR_ENTER
 
-    return {
-        "embeds": [{
-            "title": title,
-            "description": desc,
-            "color": color,
-            "footer": {"text": _FOOTER},
-            "timestamp": now.isoformat(),
-        }]
+    embed = {
+        "title": title,
+        "description": desc,
+        "color": color,
+        "footer": {"text": _FOOTER},
+        "timestamp": now.isoformat(),
     }
+    if copy_on is not None:
+        embed["fields"] = [{
+            "name": "Copy Trading",
+            "value": "🟢 ON" if copy_on else "🔴 OFF",
+            "inline": True,
+        }]
+    return {"embeds": [embed]}
 
 
 def _contract_filter(order: Order):
@@ -376,7 +386,11 @@ def _run(trader_order_id: uuid.UUID) -> None:
         except Exception:  # noqa: BLE001
             log.warning("discord: round-trip calc failed for %s; basic card", order.id, exc_info=True)
             summary = {"kind": "close" if _is_closing(db, order) else "enter"}
-        payload = build_card(order, summary)
+        # Show whether copy trading was ON/OFF for this trade. Use the trader's
+        # master switch (ts.copy_paused) read here at fill time — not the order's
+        # fanned_out flag, which can still be unset if this alert path fires
+        # before the fanout finishes.
+        payload = build_card(order, summary, copy_on=not ts.copy_paused)
         # Write the dedup marker as the CLAIM (before sending) and commit to
         # release the advisory lock. A broken/slow webhook can then never cause
         # a duplicate; the trade-off is that a crash in the tiny window between
