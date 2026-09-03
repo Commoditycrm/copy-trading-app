@@ -538,7 +538,10 @@ class AlpacaAdapter(BrokerAdapter):
             StockLatestQuoteRequest,
             StockLatestTradeRequest,
         )
+        from app.config import get_settings  # noqa: PLC0415
 
+        # SIP (paid, real-time consolidated) where subscribed, else free IEX.
+        _feed = DataFeed.SIP if get_settings().alpaca_data_feed.lower() == "sip" else DataFeed.IEX
         client = StockHistoricalDataClient(
             api_key=self.credentials["api_key"],
             secret_key=self.credentials["api_secret"],
@@ -547,7 +550,7 @@ class AlpacaAdapter(BrokerAdapter):
 
         try:
             quotes = client.get_stock_latest_quote(
-                StockLatestQuoteRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+                StockLatestQuoteRequest(symbol_or_symbols=sym, feed=_feed)
             )
             q = quotes.get(sym) if isinstance(quotes, dict) else None
             bid = _dec_or_none(getattr(q, "bid_price", None)) if q else None
@@ -567,7 +570,7 @@ class AlpacaAdapter(BrokerAdapter):
 
         try:
             trades = client.get_stock_latest_trade(
-                StockLatestTradeRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+                StockLatestTradeRequest(symbol_or_symbols=sym, feed=_feed)
             )
             t = trades.get(sym) if isinstance(trades, dict) else None
             px = _dec_or_none(getattr(t, "price", None)) if t else None
@@ -586,7 +589,7 @@ class AlpacaAdapter(BrokerAdapter):
         # known mid" and works for any ticker.
         try:
             bars = client.get_stock_latest_bar(
-                StockLatestBarRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+                StockLatestBarRequest(symbol_or_symbols=sym, feed=_feed)
             )
             b = bars.get(sym) if isinstance(bars, dict) else None
             close = _dec_or_none(getattr(b, "close", None)) if b else None
@@ -606,7 +609,10 @@ class AlpacaAdapter(BrokerAdapter):
         from alpaca.data.enums import DataFeed  # noqa: PLC0415
         from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
         from alpaca.data.requests import StockSnapshotRequest  # noqa: PLC0415
+        from app.config import get_settings  # noqa: PLC0415
 
+        # SIP (paid, real-time consolidated) where subscribed, else free IEX.
+        _feed = DataFeed.SIP if get_settings().alpaca_data_feed.lower() == "sip" else DataFeed.IEX
         client = StockHistoricalDataClient(
             api_key=self.credentials["api_key"],
             secret_key=self.credentials["api_secret"],
@@ -614,7 +620,7 @@ class AlpacaAdapter(BrokerAdapter):
         sym = symbol.upper()
         try:
             snaps = client.get_stock_snapshot(
-                StockSnapshotRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+                StockSnapshotRequest(symbol_or_symbols=sym, feed=_feed)
             )
             s = snaps.get(sym) if isinstance(snaps, dict) else snaps
             for attr in ("previous_daily_bar", "daily_bar"):
