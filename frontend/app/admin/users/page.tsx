@@ -191,23 +191,6 @@ export default function AdminUsersPage() {
     }
   }
 
-  async function toggleSellAll(user: AdminUser) {
-    const enabled = !user.sell_all_access;
-    setBusy(user.id);
-    try {
-      await api(`/api/admin/users/${user.id}/sell-all-access`, {
-        method: "PATCH",
-        body: JSON.stringify({ enabled }),
-      });
-      notify.success(`Sell-All ${enabled ? "enabled" : "disabled"} for ${user.email}`);
-      setUsers(us => us.map(u => u.id === user.id ? { ...u, sell_all_access: enabled } : u));
-    } catch (e) {
-      notify.fromError(e, "Could not update Sell-All access");
-    } finally {
-      setBusy(null);
-    }
-  }
-
   // Sorting is server-side; changing it jumps back to page 1.
   function toggleSort(k: SortKey) {
     setOffset(0);
@@ -495,23 +478,6 @@ export default function AdminUsersPage() {
                               }}
                             >
                               Hide P&L
-                            </button>
-                          )}
-                          {/* Sell-All / Snapshot / Re-entry access allow-list (traders). */}
-                          {u.role === "trader" && (
-                            <button
-                              disabled={busy === u.id}
-                              onClick={() => toggleSellAll(u)}
-                              title="Allow this trader to use the Sell-All / Snapshot / Re-entry suite"
-                              className="text-xs px-3 py-1 rounded-lg transition-colors"
-                              style={{
-                                background: u.sell_all_access ? "var(--good-soft)" : "var(--panel-2)",
-                                color: u.sell_all_access ? "var(--good)" : "var(--text-2)",
-                                border: `1px solid ${u.sell_all_access ? "var(--good)" : "var(--border)"}`,
-                                cursor: busy === u.id ? "not-allowed" : "pointer",
-                              }}
-                            >
-                              {u.sell_all_access ? "Sell-All: On" : "Sell-All: Off"}
                             </button>
                           )}
                         </div>
