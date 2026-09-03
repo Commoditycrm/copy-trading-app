@@ -119,7 +119,15 @@ export default function SnapshotPage() {
   // order.placed as it fills), so a re-entry flips to "Back in" without a
   // manual refresh.
   useEventStream((evt) => {
-    if (typeof evt?.type === "string" && evt.type.startsWith("order.")) load();
+    if (typeof evt?.type !== "string") return;
+    // Admin flipped this trader's Sell-All access — re-check live.
+    if (evt.type === "access.sell_all_changed") {
+      api<User>("/api/auth/me")
+        .then((u) => setAccess(u.role === "trader" && !!u.sell_all_access))
+        .catch(() => setAccess(false));
+      return;
+    }
+    if (evt.type.startsWith("order.")) load();
   });
 
   // Backstop poll while anything is unresolved (in case an event is missed).

@@ -25,7 +25,10 @@ export type AppEvent =
       position_tp_pct: string | null;
       position_sl_pct: string | null;
       broker: string;
-    };
+    }
+  /** Fired when an admin toggles a trader's Sell-All access — the trader's
+   *  client re-fetches /me so the suite shows/hides live. */
+  | { type: "access.sell_all_changed"; enabled: boolean };
 
 export interface NotificationEventPayload {
   id: string;
