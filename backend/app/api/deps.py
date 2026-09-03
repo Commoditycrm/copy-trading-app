@@ -44,6 +44,16 @@ def require_trader(user: User = Depends(current_user)) -> User:
     return user
 
 
+def require_sell_all_access(user: User = Depends(current_user)) -> User:
+    """Gate the Sell-All / Snapshot / Re-entry suite: trader-only AND
+    admin-allow-listed (users.sell_all_access). Admins toggle it per trader."""
+    if user.role != UserRole.TRADER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="trader_only")
+    if not getattr(user, "sell_all_access", False):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="sell_all_access_required")
+    return user
+
+
 def require_subscriber(user: User = Depends(current_user)) -> User:
     if user.role != UserRole.SUBSCRIBER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="subscriber_only")

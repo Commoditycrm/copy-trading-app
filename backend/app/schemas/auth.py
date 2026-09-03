@@ -214,5 +214,7 @@ class UserOut(BaseModel):
     sms_on_broker_connection: bool = True
     is_active: bool
     email_verified: bool = True
+    # Admin-controlled access to the Sell-All / Snapshot / Re-entry suite.
+    sell_all_access: bool = False
 
     model_config = {"from_attributes": True}

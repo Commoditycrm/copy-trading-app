@@ -30,6 +30,13 @@ class User(Base, TimestampMixin):
     # role=trader, nullable here so existing rows + subscriber rows are valid.
     business_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # Sell-All / Snapshot / Re-entry access gate. Trader-only feature, allow-listed
+    # by an admin (PATCH /api/admin/users/{id}/sell-all-access). Off by default —
+    # traders see the Sell-All suite (Exit My Positions trailing-stop, snapshot,
+    # re-entry) and its endpoints work ONLY when an admin has enabled this.
+    sell_all_access: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     # Email verification (soft-enforced): unverified users can still log in,
     # but the app nags them with a banner until they confirm. Existing rows
     # were grandfathered to True by the migration.

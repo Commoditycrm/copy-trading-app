@@ -262,9 +262,14 @@ export function BulkExitBar({ onActionComplete }: Props) {
   }
 
   const isTrader = user?.role === "trader";
-  const keys: ExitKey[] = isTrader
+  // Sell-All suite (Exit My Positions + trailing stop + snapshot/re-entry) is
+  // admin-allow-listed per trader. Without access, hide the Exit-My-Positions
+  // chip, its trail/re-entry inputs, and the Re-Enter card (the API 403s too).
+  const hasSellAll = !!user?.sell_all_access;
+  const keys: ExitKey[] = (isTrader
     ? ["my_positions", "my_orders", "subs_positions", "subs_orders"]
-    : ["my_positions", "my_orders"];
+    : ["my_positions", "my_orders"]
+  ).filter((k) => k !== "my_positions" || hasSellAll) as ExitKey[];
 
   return (
     <>
@@ -284,7 +289,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
         <div className="flex flex-wrap gap-2 justify-end items-center">
           {/* Exit-only inputs (trail + default re-entry) — hidden when there's
               nothing to exit. */}
-          {!noPositions && (<>
+          {hasSellAll && !noPositions && (<>
           {/* Trailing-stop trail for Exit My Positions — one connected pill:
               label · % · basis. Empty = market exit. */}
           <div
@@ -411,7 +416,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
         </div>
       </div>
 
-      {snapshot && snapshot.summary.total > 0 && (
+      {hasSellAll && snapshot && snapshot.summary.total > 0 && (
         <div
           className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
           style={cardStyle}

@@ -557,7 +557,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
   if (!user) return null;
 
-  const nav = user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER;
+  // The Snapshot page is part of the admin-gated Sell-All suite — hide its nav
+  // entry unless the trader is allow-listed.
+  const nav = (user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER)
+    .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access);
   const displayName = user.display_name || user.email.split("@")[0];
   // App wordmark: trader sees their own business_name; subscriber sees
   // the business_name of the trader they follow (loaded via /api/settings/subscriber

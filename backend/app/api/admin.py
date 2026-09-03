@@ -89,6 +89,10 @@ class RoleChangeIn(BaseModel):
     role: str = Field(pattern="^(trader|subscriber|admin)$")
 
 
+class SellAllAccessIn(BaseModel):
+    enabled: bool
+
+
 class BusinessNameIn(BaseModel):
     """Trader brand / app name. 1–120 chars, whitespace stripped.
 
@@ -497,6 +501,29 @@ def change_role(
     db.commit()
     log.info("admin changed role of %s to %s", user.email, payload.role)
     return {"ok": True, "user_id": str(user_id), "role": payload.role}
+
+
+@router.patch("/users/{user_id}/sell-all-access")
+def set_sell_all_access(
+    user_id: uuid.UUID,
+    payload: SellAllAccessIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """Allow-list a trader for the Sell-All / Snapshot / Re-entry suite. The
+    feature (Exit My Positions trailing-stop, snapshot, re-entry endpoints) is
+    trader-only and stays hidden + API-blocked until enabled here."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+    if user.role != UserRole.TRADER:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="sell_all_access only applies to traders"
+        )
+    user.sell_all_access = payload.enabled
+    db.commit()
+    log.info("admin set sell_all_access=%s for %s", payload.enabled, user.email)
+    return {"ok": True, "user_id": str(user_id), "sell_all_access": payload.enabled}
 
 
 @router.patch("/users/{user_id}/business-name")
