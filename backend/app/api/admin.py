@@ -523,6 +523,10 @@ def set_sell_all_access(
     user.sell_all_access = payload.enabled
     db.commit()
     log.info("admin set sell_all_access=%s for %s", payload.enabled, user.email)
+    # Push to the trader's SSE channel so their UI shows/hides the Sell-All suite
+    # live, without a page refresh.
+    from app.services import events  # noqa: PLC0415
+    events.publish(user.id, {"type": "access.sell_all_changed", "enabled": payload.enabled})
     return {"ok": True, "user_id": str(user_id), "sell_all_access": payload.enabled}
 
 
