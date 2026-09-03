@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import type { User } from "@/lib/types";
 
 type Status = "filled" | "working" | "pending";
 
@@ -52,6 +53,8 @@ function fmtMoney(v: string | null): string {
 export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  // Admin-gated access to the Sell-All suite. null = still checking.
+  const [access, setAccess] = useState<boolean | null>(null);
   const [globalDisc, setGlobalDisc] = useState("");
   // One combined choice for the re-entry price:
   //  market        — buy back now at market
@@ -102,6 +105,12 @@ export default function SnapshotPage() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    api<User>("/api/auth/me")
+      .then((u) => setAccess(u.role === "trader" && !!u.sell_all_access))
+      .catch(() => setAccess(false));
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -172,6 +181,17 @@ export default function SnapshotPage() {
   const ageDays = snap ? Math.floor((Date.now() - new Date(snap.created_at).getTime()) / 86_400_000) : 0;
   const ageLabel = ageDays <= 0 ? "today" : ageDays === 1 ? "1 day ago" : `${ageDays} days ago`;
   const stale = ageDays >= 2;
+
+  if (access === false) {
+    return (
+      <div className="space-y-5">
+        <h2 className="text-xl font-bold">Exit Snapshot</h2>
+        <div className="rounded-xl p-10 text-center" style={{ border: "1px solid var(--border)", color: "var(--muted)" }}>
+          The Sell-All snapshot &amp; re-entry feature isn&apos;t enabled for your account. Ask an admin to enable it.
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">

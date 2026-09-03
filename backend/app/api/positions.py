@@ -21,7 +21,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, require_trader
+from app.api.deps import current_user, require_sell_all_access, require_trader
 from app.api.trades import _place_trader_order
 from collections.abc import Callable
 from decimal import Decimal
@@ -184,7 +184,7 @@ def close_all_positions(
         description="Default basis for the baked-in re-entry %: 'current' (live price) or 'reference' (previous market close). Stored on the snapshot so Re-Enter uses it without re-choosing. Omit = current.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(require_sell_all_access),
 ) -> dict:
     """Flatten every open position across the caller's connected broker
     accounts by placing a market reverse order for each. For traders this
@@ -425,7 +425,7 @@ def _capture_exit_snapshot(db: Session, user_id: uuid.UUID, items: list[dict]) -
 @router.get("/snapshots/latest")
 def latest_sell_all_snapshot(
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(require_sell_all_access),
 ) -> dict:
     """The user's ACTIVE Sell-All snapshot (the current one — superseded on each
     new Sell-All), each position annotated with its live re-entry status
@@ -529,7 +529,7 @@ def re_enter_from_snapshot(
         description="Re-enter ONLY this symbol (per-order re-entry). Omit to re-enter every pending position.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(require_sell_all_access),
 ) -> dict:
     """Re-open the positions from a Sell-All snapshot, FILL-AWARE: only items not
     already back (or with a resting order) get a new buy. Long positions re-buy,
