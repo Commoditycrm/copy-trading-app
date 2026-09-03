@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     frontend_base_url: str = "http://localhost:3000"
     redis_url: str = "redis://localhost:6379/0"
+    # Alpaca market-data feed for price/quote/bar/snapshot lookups (current
+    # price, PDC). "iex" = free single-exchange feed; "sip" = full consolidated
+    # real-time (requires a paid Alpaca market-data subscription, e.g. Algo
+    # Trader Plus). Set ALPACA_DATA_FEED=sip where subscribed.
+    alpaca_data_feed: str = "iex"
     # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
     broker_concurrency_alpaca: int = 200
     # SnapTrade throttles order placement HARD (esp. multi-leg/option
