@@ -12,7 +12,7 @@
  *  - drives the HTTP + toast plumbing internally — callers just pass an
  *    `onActionComplete` hook (typically a table-refresh) and forget.
  */
-import { Fragment, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -272,10 +272,94 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // admin-allow-listed per trader. Without access, hide the Exit-My-Positions
   // chip, its trail/re-entry inputs, and the Re-Enter card (the API 403s too).
   const hasSellAll = !!user?.sell_all_access;
-  const keys: ExitKey[] = (isTrader
-    ? ["my_positions", "my_orders", "subs_positions", "subs_orders"]
-    : ["my_positions", "my_orders"]
-  ).filter((k) => k !== "my_positions" || hasSellAll) as ExitKey[];
+
+  const renderButton = (key: ExitKey) => {
+    const def = EXIT_DEFS[key];
+    const isSubs = def.subs;
+    const disabledNoPos = key === "my_positions" && noPositions;
+    return (
+      <button
+        key={key}
+        type="button"
+        onClick={() => setPending(key)}
+        disabled={busy || disabledNoPos}
+        title={disabledNoPos ? "No open positions to exit" : def.message}
+        className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        style={{
+          background: isSubs
+            ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
+            : "var(--panel-2)",
+          border: `1px solid ${isSubs ? "rgba(239,68,68,0.35)" : "var(--border)"}`,
+          color: isSubs ? "var(--bad)" : "var(--text)",
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.background = isSubs
+            ? "linear-gradient(180deg, rgba(239,68,68,0.28), rgba(239,68,68,0.10))"
+            : "var(--accent-glow)";
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.background = isSubs
+            ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
+            : "var(--panel-2)";
+        }}
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          {def.iconPath.split(" M").map((seg, i) => (
+            <path key={i} d={i === 0 ? seg : `M${seg}`} />
+          ))}
+        </svg>
+        <span>{def.label}</span>
+      </button>
+    );
+  };
+
+  const trailPill = (
+    <div
+      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1"
+      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+      title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Market = trail off the live price; PDC = a dollar trail sized off the previous day's close."
+    >
+      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Trail&nbsp;%</span>
+      <input type="number" min="0" max="100" step="0.5" value={trailPct}
+             onChange={e => setTrailPct(e.target.value)} placeholder="off"
+             aria-label="Trailing stop percent for Exit My Positions"
+             className="w-10 text-xs outline-none text-center"
+             style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+      <select value={trailBasis} onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
+              aria-label="Trail basis"
+              title="Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the current (exit-time) price."
+              className="text-xs outline-none cursor-pointer"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}>
+        <option value="current">Market</option>
+        <option value="reference">PDC</option>
+        <option value="exit">Exit</option>
+      </select>
+    </div>
+  );
+
+  const reentryPill = (
+    <div
+      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1"
+      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+      title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
+    >
+      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Re-enter&nbsp;%</span>
+      <input type="number" min="0" max="100" step="0.5" value={reentryPct}
+             onChange={e => setReentryPct(e.target.value)} placeholder="mkt"
+             aria-label="Default re-entry percent below exit"
+             className="w-10 text-xs outline-none text-center"
+             style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+      <select value={reentryBasis} onChange={e => setReentryBasis(e.target.value as "current" | "reference" | "exit")}
+              aria-label="Default re-entry basis"
+              className="text-xs outline-none cursor-pointer"
+              style={{ background: "transparent", border: "none", color: "var(--text)" }}>
+        <option value="current">Market</option>
+        <option value="reference">PDC</option>
+        <option value="exit">Exit</option>
+      </select>
+    </div>
+  );
 
   return (
     <>
@@ -292,133 +376,21 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Bulk Exit
           </span>
         </div>
-        <div className="flex flex-wrap gap-2 justify-end items-center">
-          {/* Exit-only inputs (trail + default re-entry) — hidden when there's
-              nothing to exit. */}
-          {hasSellAll && !noPositions && (<>
-          {/* Trailing-stop trail for Exit My Positions — one connected pill:
-              label · % · basis. Empty = market exit. */}
-          <div
-            className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
-            style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-            title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Market = trail off the live price; PDC = a dollar trail sized off the previous day's close."
-          >
-            <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
-              Trail&nbsp;%
-            </span>
-            <input
-              type="number" min="0" max="100" step="0.5"
-              value={trailPct}
-              onChange={e => setTrailPct(e.target.value)}
-              placeholder="off"
-              aria-label="Trailing stop percent for Exit My Positions"
-              className="w-10 text-xs outline-none text-center"
-              style={{ background: "transparent", border: "none", color: "var(--text)" }}
-            />
-            <select
-              value={trailBasis}
-              onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
-              aria-label="Trail basis"
-              title="Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the current (exit-time) price."
-              className="text-xs outline-none cursor-pointer"
-              style={{ background: "transparent", border: "none", color: "var(--text)" }}
-            >
-              <option value="current">Market</option>
-              <option value="reference">PDC</option>
-              <option value="exit">Exit</option>
-            </select>
+        <div className="flex flex-col gap-2 items-end">
+          {/* Row 1 — your own positions & orders. */}
+          <div className="flex flex-wrap gap-2 justify-end items-center">
+            {hasSellAll && !noPositions && trailPill}
+            {hasSellAll && renderButton("my_positions")}
+            {hasSellAll && !noPositions && reentryPill}
+            {renderButton("my_orders")}
           </div>
-          </>)}
-          {keys.map(key => {
-            const def = EXIT_DEFS[key];
-            const isSubs = def.subs;
-            // Nothing to exit → disable Exit My Positions.
-            const disabledNoPos = key === "my_positions" && noPositions;
-            // The default-re-entry pill renders right AFTER Exit My Positions
-            // (re-entry happens after the exit), only when there's something to exit.
-            const reentryPill = key === "my_positions" && !noPositions ? (
-              <div
-                key="reentry-pill"
-                className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
-                style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-                title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
-              >
-                <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
-                  Re-enter&nbsp;%
-                </span>
-                <input
-                  type="number" min="0" max="100" step="0.5"
-                  value={reentryPct}
-                  onChange={e => setReentryPct(e.target.value)}
-                  placeholder="mkt"
-                  aria-label="Default re-entry percent below exit"
-                  className="w-10 text-xs outline-none text-center"
-                  style={{ background: "transparent", border: "none", color: "var(--text)" }}
-                />
-                <select
-                  value={reentryBasis}
-                  onChange={e => setReentryBasis(e.target.value as "current" | "reference" | "exit")}
-                  aria-label="Default re-entry basis"
-                  className="text-xs outline-none cursor-pointer"
-                  style={{ background: "transparent", border: "none", color: "var(--text)" }}
-                >
-                  <option value="current">Market</option>
-                  <option value="reference">PDC</option>
-                  <option value="exit">Exit</option>
-                </select>
-              </div>
-            ) : null;
-            return (
-              <Fragment key={key}>
-              <button
-                type="button"
-                onClick={() => setPending(key)}
-                disabled={busy || disabledNoPos}
-                title={disabledNoPos ? "No open positions to exit" : def.message}
-                className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{
-                  // Subs (destructive-to-subscribers) keep the red tint — it
-                  // reads on both themes. Non-subs use the elevated panel token
-                  // so they're a visible pill on both light and dark (the old
-                  // white overlay vanished on a light card).
-                  background: isSubs
-                    ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
-                    : "var(--panel-2)",
-                  border: `1px solid ${isSubs ? "rgba(239,68,68,0.35)" : "var(--border)"}`,
-                  color: isSubs ? "var(--bad)" : "var(--text)",
-                }}
-                onMouseEnter={e => {
-                  e.currentTarget.style.background = isSubs
-                    ? "linear-gradient(180deg, rgba(239,68,68,0.28), rgba(239,68,68,0.10))"
-                    : "var(--accent-glow)";
-                }}
-                onMouseLeave={e => {
-                  e.currentTarget.style.background = isSubs
-                    ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
-                    : "var(--panel-2)";
-                }}
-              >
-                <svg
-                  width="13"
-                  height="13"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden
-                >
-                  {def.iconPath.split(" M").map((seg, i) => (
-                    <path key={i} d={i === 0 ? seg : `M${seg}`} />
-                  ))}
-                </svg>
-                <span>{def.label}</span>
-              </button>
-              {reentryPill}
-              </Fragment>
-            );
-          })}
+          {/* Row 2 — subscriber-wide actions (trader only). */}
+          {isTrader && (
+            <div className="flex flex-wrap gap-2 justify-end items-center">
+              {renderButton("subs_positions")}
+              {renderButton("subs_orders")}
+            </div>
+          )}
         </div>
       </div>
 
