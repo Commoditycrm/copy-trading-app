@@ -153,9 +153,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // Live: an order event means a position opened/closed — refresh the count so
   // the exit inputs + "Exit My Positions" enable/disable without a manual reload.
   useEventStream((evt) => {
-    if (typeof evt?.type === "string" && evt.type.startsWith("order.")) {
+    if (typeof evt?.type !== "string") return;
+    if (evt.type.startsWith("order.")) {
       loadPositions();
       loadSnapshot();
+    }
+    // Admin flipped this trader's Sell-All access — re-fetch so the suite
+    // shows/hides live without a refresh.
+    if (evt.type === "access.sell_all_changed") {
+      api<User>("/api/auth/me").then(setUser).catch(() => {});
     }
   });
 

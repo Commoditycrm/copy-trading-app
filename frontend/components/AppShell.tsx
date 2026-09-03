@@ -348,6 +348,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       setBulkCopy(prev => prev ? { ...prev, paused: !!e.paused } : prev);
       return;
     }
+    // Admin flipped this trader's Sell-All access — re-fetch the user so the
+    // Snapshot nav entry appears/disappears live (no page refresh).
+    if (e?.type === "access.sell_all_changed") {
+      api<User>("/api/auth/me").then(setUser).catch(() => {});
+      return;
+    }
     if (e?.type === "pnl.tick") {
       if (typeof e.copy_enabled === "boolean") {
         setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
