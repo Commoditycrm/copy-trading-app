@@ -122,7 +122,6 @@ function IconSettings() {
     </svg>
   );
 }
-
 const NAV_TRADER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
@@ -340,6 +339,14 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       setSubCopy(prev => prev ? { ...prev, copy_enabled: true } : prev);
       return;
     }
+    // Trader's own MASTER copy switch was toggled — possibly from another tab
+    // or device. Keep this sidebar switch in sync so it never shows a stale
+    // ON/OFF (the switch loads once on mount and otherwise only tracks a local
+    // toggle). Without this, a stale switch reads "off" while copy is really on.
+    if (e?.type === "copy.master_toggled") {
+      setBulkCopy(prev => prev ? { ...prev, paused: !!e.paused } : prev);
+      return;
+    }
     if (e?.type === "pnl.tick") {
       if (typeof e.copy_enabled === "boolean") {
         setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
@@ -419,6 +426,24 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Keep the sidebar's Discord state in sync when it's changed from the Settings
   // page (so the copy-toggle prompt's hint stays accurate without a refresh).
   useEffect(() => onDiscordChanged((d) => setTraderDiscord(d)), []);
+
+  // Backstop for the master copy switch: a dropped SSE event (reconnect, brief
+  // 5xx) shouldn't leave the switch stale. Re-fetch the true copy state whenever
+  // the tab regains focus, so returning to a background tab corrects it.
+  useEffect(() => {
+    if (user?.role !== "trader") return;
+    const refetch = () => {
+      if (document.visibilityState === "visible") {
+        api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+      }
+    };
+    window.addEventListener("focus", refetch);
+    document.addEventListener("visibilitychange", refetch);
+    return () => {
+      window.removeEventListener("focus", refetch);
+      document.removeEventListener("visibilitychange", refetch);
+    };
+  }, [user]);
 
   async function toggleSubscriberCopy() {
     if (!subCopy) return;
