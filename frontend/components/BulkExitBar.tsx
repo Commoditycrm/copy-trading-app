@@ -364,10 +364,11 @@ export function BulkExitBar({ onActionComplete }: Props) {
   return (
     <>
       <div
-        className="rounded-xl px-3 py-2.5 flex items-center gap-3"
+        className="rounded-xl px-3 py-2.5 flex flex-col gap-2.5"
         style={cardStyle}
       >
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Label — top-left, on its own line. */}
+        <div className="flex items-center gap-2">
           <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--bad)" }} />
           <span
             className="text-[10px] uppercase tracking-[0.2em] font-semibold"
@@ -376,22 +377,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Bulk Exit
           </span>
         </div>
-        <div className="flex-1 min-w-0 flex flex-col gap-2 items-end">
-          {/* Row 1 — your own actions, kept on one line (scrolls if the panel is
-              too narrow) so they never wrap into the subscriber row. */}
-          <div className="max-w-full flex items-center gap-2 flex-nowrap overflow-x-auto justify-end">
-            {hasSellAll && !noPositions && trailPill}
-            {hasSellAll && renderButton("my_positions")}
-            {hasSellAll && !noPositions && reentryPill}
-            {renderButton("my_orders")}
-          </div>
-          {/* Row 2 — subscriber-wide actions, one row below (trader only). */}
-          {isTrader && (
-            <div className="max-w-full flex items-center gap-2 flex-nowrap overflow-x-auto justify-end">
-              {renderButton("subs_positions")}
-              {renderButton("subs_orders")}
-            </div>
-          )}
+        {/* All actions on one line below the label (scrolls horizontally if the
+            panel is too narrow — never wraps). */}
+        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto">
+          {hasSellAll && !noPositions && trailPill}
+          {hasSellAll && renderButton("my_positions")}
+          {hasSellAll && !noPositions && reentryPill}
+          {renderButton("my_orders")}
+          {isTrader && renderButton("subs_positions")}
+          {isTrader && renderButton("subs_orders")}
         </div>
       </div>
 
