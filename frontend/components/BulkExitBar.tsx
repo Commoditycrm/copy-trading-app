@@ -377,15 +377,22 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Bulk Exit
           </span>
         </div>
-        {/* All actions on one line below the label (scrolls horizontally if the
-            panel is too narrow — never wraps). */}
-        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto">
-          {hasSellAll && !noPositions && trailPill}
-          {hasSellAll && renderButton("my_positions")}
-          {hasSellAll && !noPositions && reentryPill}
-          {renderButton("my_orders")}
-          {isTrader && renderButton("subs_positions")}
-          {isTrader && renderButton("subs_orders")}
+        {/* One line below the label — your actions hug the left, the subscriber
+            actions hug the right, so the row fills the width with no trailing gap.
+            Scrolls horizontally only if the panel is very narrow. */}
+        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
+          <div className="flex items-center gap-2 shrink-0">
+            {hasSellAll && !noPositions && trailPill}
+            {hasSellAll && renderButton("my_positions")}
+            {hasSellAll && !noPositions && reentryPill}
+            {renderButton("my_orders")}
+          </div>
+          {isTrader && (
+            <div className="flex items-center gap-2 shrink-0">
+              {renderButton("subs_positions")}
+              {renderButton("subs_orders")}
+            </div>
+          )}
         </div>
       </div>
 
