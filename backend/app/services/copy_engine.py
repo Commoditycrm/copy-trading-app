@@ -2111,7 +2111,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # For every subscriber whose copy was paused by a DAILY limit
     # (daily_loss_limit / daily_profit_limit / max_account_pct_per_day,
     # plus their _pct variants — all stamp `pnl_auto_paused_at`), check
-    # whether the pause was set on a PRIOR UTC day. If so, clear the
+    # whether the pause was set on a PRIOR ET *market* day. If so, clear the
     # pause + re-enable copy_enabled so today's trades flow. Keying off
     # `pnl_auto_paused_at` (not just `copy_enabled=False`) means a
     # subscriber who manually paused their own copy won't be re-enabled
@@ -2127,7 +2127,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # (one whose trader hasn't placed any orders today) still auto-resumes
     # on schedule. Both sweeps clear `pnl_auto_paused_at` on success so
     # they're idempotent against each other.
-    today_utc = datetime.now(timezone.utc).date()
+    #
+    # ET, not UTC: resume must align with when the broker's day-P&L resets
+    # (Alpaca's todays_pl keys off the prior ET market close) — a UTC-day
+    # boundary resumes at 8pm ET, before the ET day rolls, and the standing
+    # loss re-pauses on the next tick. See the matching note in pnl_poller.
+    now_et = market_hours.now_et()
+    today_et = now_et.date()
     resumed_user_ids: list[uuid.UUID] = []
     for sub in subs:
         paused_iso = getattr(sub, "pnl_auto_paused_at", None)
@@ -2137,7 +2143,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             paused_at = datetime.fromisoformat(paused_iso) if isinstance(paused_iso, str) else paused_iso
         except ValueError:
             continue
-        if paused_at.astimezone(timezone.utc).date() < today_utc:
+        if paused_at.astimezone(market_hours.ET).date() < today_et:
             db_settings = db.get(SubscriberSettings, sub.user_id)
             if db_settings is not None:
                 db_settings.copy_enabled = True
@@ -2149,7 +2155,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     action="copy.auto_resumed_next_day",
                     entity_type="subscriber_settings",
                     entity_id=sub.user_id,
-                    metadata={"paused_at": str(paused_iso), "resumed_at": today_utc.isoformat()},
+                    metadata={"paused_at": str(paused_iso), "resumed_at": today_et.isoformat()},
                 )
                 events.publish(sub.user_id, {
                     "type": "copy.auto_resumed",
