@@ -284,7 +284,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
         onClick={() => setPending(key)}
         disabled={busy || disabledNoPos}
         title={disabledNoPos ? "No open positions to exit" : def.message}
-        className="group inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        className="group shrink-0 whitespace-nowrap inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
         style={{
           background: isSubs
             ? "linear-gradient(180deg, rgba(239,68,68,0.18), rgba(239,68,68,0.06))"
@@ -316,7 +316,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
 
   const trailPill = (
     <div
-      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1"
+      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
       style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
       title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Market = trail off the live price; PDC = a dollar trail sized off the previous day's close."
     >
@@ -340,7 +340,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
 
   const reentryPill = (
     <div
-      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1"
+      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
       style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
       title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
     >
@@ -364,7 +364,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   return (
     <>
       <div
-        className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap"
+        className="rounded-xl px-3 py-2.5 flex items-center gap-3"
         style={cardStyle}
       >
         <div className="flex items-center gap-2 shrink-0">
@@ -376,21 +376,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Bulk Exit
           </span>
         </div>
-        <div className="flex flex-col gap-2 items-end">
-          {/* Row 1 — your own positions & orders. */}
-          <div className="flex flex-wrap gap-2 justify-end items-center">
-            {hasSellAll && !noPositions && trailPill}
-            {hasSellAll && renderButton("my_positions")}
-            {hasSellAll && !noPositions && reentryPill}
-            {renderButton("my_orders")}
-          </div>
-          {/* Row 2 — subscriber-wide actions (trader only). */}
-          {isTrader && (
-            <div className="flex flex-wrap gap-2 justify-end items-center">
-              {renderButton("subs_positions")}
-              {renderButton("subs_orders")}
-            </div>
-          )}
+        {/* Single row: everything stays on one line; scrolls horizontally if the
+            panel is too narrow (never wraps to a second row). */}
+        <div className="flex-1 min-w-0 flex items-center gap-2 flex-nowrap overflow-x-auto justify-end">
+          {hasSellAll && !noPositions && trailPill}
+          {hasSellAll && renderButton("my_positions")}
+          {hasSellAll && !noPositions && reentryPill}
+          {renderButton("my_orders")}
+          {isTrader && renderButton("subs_positions")}
+          {isTrader && renderButton("subs_orders")}
         </div>
       </div>
 

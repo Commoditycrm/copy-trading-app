@@ -14,6 +14,8 @@ interface AdminUser {
   is_active: boolean;
   /** Admin allow-list for the Sell-All / Snapshot / Re-entry suite. */
   sell_all_access: boolean;
+  /** True when this trader has any currently-hidden orders / P&L days. */
+  has_hidden: boolean;
   created_at: string;
 }
 
@@ -154,17 +156,27 @@ export default function AdminTradersPage() {
                       </button>
                     </td>
                     {/* Hide P&L — opens the hide/unhide modal; stopPropagation so
-                        it doesn't open the trader detail row. */}
+                        it doesn't open the trader detail row. Shows a "Hidden" badge
+                        when this trader currently has hidden history. */}
                     <td className="px-4 py-3">
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); setHideFor(t); }}
-                        title="Hide this trader's order history + P&L"
-                        className="text-xs px-3 py-1 rounded-lg transition-colors"
-                        style={{ background: "var(--panel-2)", color: "var(--text-2)", border: "1px solid var(--border)" }}
-                      >
-                        Hide P&amp;L
-                      </button>
+                      <div className="inline-flex items-center gap-2">
+                        {t.has_hidden && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
+                                style={{ background: "rgba(250,204,21,0.12)", color: "#facc15", border: "1px solid rgba(250,204,21,0.25)" }}
+                                title="This trader has hidden orders / P&L">
+                            Hidden
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setHideFor(t); }}
+                          title="Hide this trader's order history + P&L"
+                          className="text-xs px-3 py-1 rounded-lg transition-colors"
+                          style={{ background: "var(--panel-2)", color: "var(--text-2)", border: "1px solid var(--border)" }}
+                        >
+                          Hide P&amp;L
+                        </button>
+                      </div>
                     </td>
                     <td className="px-4 py-3 text-xs" style={{ color: "var(--muted)" }}>
                       {new Date(t.created_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}
@@ -179,7 +191,11 @@ export default function AdminTradersPage() {
       )}
 
       {hideFor && (
-        <HideHistoryModal user={hideFor} onClose={() => setHideFor(null)} />
+        <HideHistoryModal
+          user={hideFor}
+          onClose={() => setHideFor(null)}
+          onChanged={(h) => setTraders(ts => ts.map(x => x.id === hideFor.id ? { ...x, has_hidden: h } : x))}
+        />
       )}
     </div>
   );
@@ -189,10 +205,12 @@ export default function AdminTradersPage() {
 // Soft-delete: rows keep their DB records so a broker re-sync won't recreate
 // them, but they vanish from every history / P&L view. Reversible via Unhide.
 function HideHistoryModal({
-  user, onClose,
+  user, onClose, onChanged,
 }: {
   user: AdminUser;
   onClose: () => void;
+  /** Called with the trader's live hidden state so the row badge stays in sync. */
+  onChanged?: (hasHidden: boolean) => void;
 }) {
   const [from, setFrom] = useState("");
   const [to, setTo]     = useState("");
@@ -201,9 +219,11 @@ function HideHistoryModal({
 
   const refreshCounts = useCallback(async () => {
     try {
-      setCounts(await api(`/api/admin/users/${user.id}/orders/hidden-count`));
+      const c = await api<{ orders_hidden: number; snapshots_hidden: number }>(`/api/admin/users/${user.id}/orders/hidden-count`);
+      setCounts(c);
+      onChanged?.((c.orders_hidden + c.snapshots_hidden) > 0);
     } catch { /* non-blocking */ }
-  }, [user.id]);
+  }, [user.id, onChanged]);
   useEffect(() => { refreshCounts(); }, [refreshCounts]);
 
   async function hide() {

@@ -80,6 +80,13 @@ class UserOut(BaseModel):
     # The admin users page renders + edits this via PATCH .../business-name.
     business_name: Optional[str] = None
     is_active: bool
+    # Admin-controlled Sell-All / Snapshot / Re-entry access (traders only). The
+    # admin Traders page reads this to render the Sell-All On/Off toggle — without
+    # it the toggle always renders Off after a reload.
+    sell_all_access: bool = False
+    # True when the user has any currently-hidden orders or P&L snapshot days —
+    # drives the "Hidden" badge on the admin Traders page (computed in list_users).
+    has_hidden: bool = False
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -327,6 +334,22 @@ def list_users(
             base.order_by(ordering, User.id.desc()).limit(limit).offset(offset)
         ).scalars()
     )
+    # Flag which users have currently-hidden history (orders or P&L snapshot days)
+    # so the admin Traders page can show a persistent "Hidden" badge. One query
+    # each over just this page's ids.
+    ids = [u.id for u in rows]
+    hidden_ids: set = set()
+    if ids:
+        hidden_ids.update(db.execute(
+            select(Order.user_id).where(Order.user_id.in_(ids), Order.hidden_at.isnot(None)).distinct()
+        ).scalars())
+        hidden_ids.update(db.execute(
+            select(DailyRealizedPnlSnapshot.user_id).where(
+                DailyRealizedPnlSnapshot.user_id.in_(ids), DailyRealizedPnlSnapshot.hidden.is_(True)
+            ).distinct()
+        ).scalars())
+    for u in rows:
+        u.has_hidden = u.id in hidden_ids  # attached for UserOut.from_attributes
     return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
