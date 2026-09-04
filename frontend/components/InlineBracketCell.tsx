@@ -26,6 +26,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { PercentInput } from "@/components/PercentInput";
 import type { Order, OrderSide } from "@/lib/types";
 
 interface Props {
@@ -257,9 +258,8 @@ export function InlineBracketCell({ orderId, leg, value, entryPrice, side, canEd
       <span className="inline-flex items-stretch border rounded overflow-hidden"
         style={{ borderColor: colorVar }}
       >
-        <input
+        <PercentInput
           ref={inputRef}
-          type="number"
           step={inPercentMode ? "0.01" : "0.01"}
           min="0.01"
           placeholder={inPercentMode ? "—" : "—"}

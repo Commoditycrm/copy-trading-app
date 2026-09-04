@@ -18,6 +18,7 @@ import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { ConfirmModal } from "@/components/ConfirmModal";
+import { PercentInput } from "@/components/PercentInput";
 import type { User } from "@/lib/types";
 
 type ExitKey = "my_positions" | "my_orders" | "subs_positions" | "subs_orders";
@@ -328,7 +329,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
       title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. Market = trail off the live price; PDC = a dollar trail sized off the previous day's close."
     >
       <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Trail&nbsp;%</span>
-      <input type="number" min="0" max="100" step="0.5" value={trailPct}
+      <PercentInput min="0" max="100" step="0.5" value={trailPct}
              onChange={e => setTrailPct(e.target.value)} placeholder="off"
              aria-label="Trailing stop percent for Exit My Positions"
              className="w-10 text-xs outline-none text-center"
@@ -352,7 +353,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
       title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
     >
       <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Re-enter&nbsp;%</span>
-      <input type="number" min="0" max="100" step="0.5" value={reentryPct}
+      <PercentInput min="0" max="100" step="0.5" value={reentryPct}
              onChange={e => setReentryPct(e.target.value)} placeholder="mkt"
              aria-label="Default re-entry percent below exit"
              className="w-10 text-xs outline-none text-center"
@@ -437,8 +438,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
               <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
                 %&nbsp;below
               </span>
-              <input
-                type="number" min="0" max="100" step="0.5"
+              <PercentInput
+                min="0" max="100" step="0.5"
                 value={reDiscount}
                 onChange={e => setReDiscount(e.target.value)}
                 placeholder={reBasis === "exit" ? "exit" : "mkt"}
