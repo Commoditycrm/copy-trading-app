@@ -350,12 +350,12 @@ export function BulkExitBar({ onActionComplete }: Props) {
     <div
       className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
       style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-      title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market. Market / PDC = % below the live price / previous close; Exit = re-enter at the exit price."
+      title="Optional: bake a default re-entry into the snapshot. The Snapshot page pre-fills this. Empty = re-enter at market (or, with Exit, at the exit price). Market / PDC / Exit = % below the live price / previous close / recorded exit price."
     >
       <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Re-enter&nbsp;%</span>
       <PercentInput min="0" max="100" step="0.5" value={reentryPct}
-             onChange={e => setReentryPct(e.target.value)} placeholder="mkt"
-             aria-label="Default re-entry percent below exit"
+             onChange={e => setReentryPct(e.target.value)} placeholder={reentryBasis === "exit" ? "exit" : "mkt"}
+             aria-label="Default re-entry percent below basis"
              className="w-10 text-xs outline-none text-center"
              style={{ background: "transparent", border: "none", color: "var(--text)" }} />
       <select value={reentryBasis} onChange={e => setReentryBasis(e.target.value as "current" | "reference" | "exit")}
