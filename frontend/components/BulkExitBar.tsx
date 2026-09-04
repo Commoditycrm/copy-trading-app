@@ -121,7 +121,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const [snapshot, setSnapshot] = useState<{ id: string; summary: SnapSummary } | null>(null);
   const [reDiscount, setReDiscount] = useState("");
   // Basis for the Re-Enter "% below": live price / previous close / exit price.
-  const [reBasis, setReBasis] = useState<"current" | "reference">("current");
+  const [reBasis, setReBasis] = useState<"current" | "reference" | "exit">("current");
   const [reBusy, setReBusy] = useState(false);
   // Open-position count so Exit My Positions can disable when there's nothing to
   // exit. null = not yet known (keep enabled until we know it's 0).
@@ -176,19 +176,26 @@ export function BulkExitBar({ onActionComplete }: Props) {
   async function reEnter() {
     const d = parseFloat(reDiscount);
     const useD = !isNaN(d) && d > 0 && d <= 100;
+    // Exit basis always rests a limit (at the exit price, or % below it when a
+    // % is given); Market/PDC with an empty % just buy back at market.
+    const sendBasis = useD || reBasis === "exit";
+    const qs = sendBasis ? `?basis=${reBasis}${useD ? `&discount_percent=${d}` : ""}` : "";
     setReBusy(true);
     try {
       const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
-        `/api/positions/re-enter${useD ? `?discount_percent=${d}&basis=${reBasis}` : ""}`,
+        `/api/positions/re-enter${qs}`,
         { method: "POST" },
       );
       const skip = res.skipped_count ? `, ${res.skipped_count} already in/resting` : "";
+      const how = useD
+        ? ` — limit ${d}% below ${reBasis === "exit" ? "exit" : reBasis === "reference" ? "PDC" : "market"}`
+        : reBasis === "exit" ? " at exit price" : " at market";
       if (res.placed_count === 0 && res.failed_count === 0)
         notify.info(res.skipped_count ? `Nothing new to re-enter${skip}.` : "Nothing to re-enter.");
       else if (res.failed_count === 0)
         notify.success(
           `Re-entered ${res.placed_count} position${res.placed_count === 1 ? "" : "s"}` +
-          (useD ? ` — limit ${d}% below exit` : " at market") + `${skip}.`,
+          how + `${skip}.`,
         );
       else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed${skip} — check Order History.`);
       onActionComplete?.();
@@ -425,7 +432,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
             <div
               className="inline-flex items-center rounded-lg h-7 pl-2 pr-1 gap-1"
               style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-              title="Optional: re-buy each position this % BELOW the chosen basis (a resting limit). Empty = buy back now at market. Market = % below the live price; PDC = % below the previous day's close."
+              title="Optional: re-buy each position this % BELOW the chosen basis (a resting limit). Empty = buy back now at market (or, with Exit, at the exit price). Market = % below the live price; PDC = % below the previous day's close; Exit = % below the recorded exit price."
             >
               <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>
                 %&nbsp;below
@@ -434,21 +441,21 @@ export function BulkExitBar({ onActionComplete }: Props) {
                 type="number" min="0" max="100" step="0.5"
                 value={reDiscount}
                 onChange={e => setReDiscount(e.target.value)}
-                placeholder="mkt"
-                aria-label="Re-enter discount percent below exit price"
+                placeholder={reBasis === "exit" ? "exit" : "mkt"}
+                aria-label="Re-enter discount percent below basis"
                 className="w-10 text-xs outline-none text-center"
                 style={{ background: "transparent", border: "none", color: "var(--text)" }}
               />
               <select
                 value={reBasis}
-                onChange={e => setReBasis(e.target.value as "current" | "reference")}
+                onChange={e => setReBasis(e.target.value as "current" | "reference" | "exit")}
                 aria-label="Re-enter basis"
                 className="text-xs outline-none cursor-pointer"
                 style={{ background: "transparent", border: "none", color: "var(--text)" }}
               >
                 <option value="current">Market</option>
                 <option value="reference">PDC</option>
-
+                <option value="exit">Exit</option>
               </select>
             </div>
             <button
