@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import { PercentInput } from "@/components/PercentInput";
 import type { User } from "@/lib/types";
 
 type Status = "filled" | "working" | "pending";
@@ -267,7 +268,7 @@ export default function SnapshotPage() {
                 </select>
                 {isPctChoice(globalChoice) && (
                   <div className="inline-flex items-center gap-0.5">
-                    <input type="number" min="0" max="100" step="0.5" value={globalDisc}
+                    <PercentInput min="0" max="100" step="0.5" value={globalDisc}
                            onChange={(e) => setGlobalDisc(e.target.value)} placeholder="%"
                            aria-label="Discount percent for Re-Enter All"
                            className="w-10 text-xs outline-none text-center"
@@ -391,7 +392,7 @@ export default function SnapshotPage() {
                                 <div className="inline-flex items-center gap-0.5 px-1.5"
                                      style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
                                   {choice === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
-                                  <input type="number" min="0" max={isPct ? 100 : undefined} step={isPct ? 0.5 : 0.01}
+                                  <PercentInput min="0" max={isPct ? 100 : undefined} step={isPct ? 0.5 : 0.01}
                                          value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
                                          onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
                                          placeholder={choice === "limit" ? "price" : "%"}
