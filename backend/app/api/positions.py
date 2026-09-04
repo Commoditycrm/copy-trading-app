@@ -137,26 +137,29 @@ def today_realized(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict[str, float]:
-    """Today's realized P&L for the caller, in their market timezone.
+    """Today's P&L for the positions-page summary strip — the SAME MARKED value
+    the Calendar shows for today (realized + today's live unrealized swing), so
+    the two never disagree.
 
-    Used by the positions-page summary strip. Subscribers get mirror
-    de-duplication (their real trades ARE the copy mirrors — the SnapTrade
-    listener re-records those as duplicate standalone rows), so we call
-    ``realized_pnl_by_day`` directly with ``mirrors_only`` rather than the
-    plain ``today_realized_pnl`` helper which doesn't dedup.
+    Single source of truth: ``calendar_series`` with the live open-position
+    unrealized, exactly like the Calendar endpoint (``_live_unrealized_today`` +
+    ``calendar_series(..., live_today_unrealized=...)``). Subscribers keep mirror
+    de-duplication via ``mirrors_only``. The response key stays ``realized_pnl``
+    for the frontend, but the number is now the marked day P&L.
     """
-    from datetime import datetime
+    from app.api.trades import _live_unrealized_today
+    from app.services import market_hours
+    from app.services.pnl import calendar_series
 
-    from app.services.pnl import _tz_or_market, realized_pnl_by_day
-
-    tz = _tz_or_market(None)
-    today = datetime.now(tz).date()
-    daily = realized_pnl_by_day(
-        db, user.id, start=today, end=today,
-        mirrors_only=(user.role == UserRole.SUBSCRIBER),
+    today = market_hours.now_et().date()
+    mirrors = user.role == UserRole.SUBSCRIBER
+    live = _live_unrealized_today(db, user.id)
+    series = calendar_series(
+        db, user.id, today, today, tz_name=None,
+        mirrors_only=mirrors, live_today_unrealized=live,
     )
-    pnl, _ = daily.get(today, (Decimal(0), 0))
-    return {"realized_pnl": float(pnl)}
+    day = series.get(today)
+    return {"realized_pnl": float(day.marked_pnl) if day else 0.0}
 
 
 @router.post("/close-all")
