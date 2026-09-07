@@ -85,21 +85,26 @@ export default function SnapshotPage() {
       if (r.snapshot) {
         setRowChoice((prev) => {
           const next = { ...prev };
-          for (const p of r.snapshot!.positions) {
-            if (p.symbol in next) continue;
+          // Key by array index, not symbol — the same symbol can appear twice
+          // (two separate exits) and must be re-entered independently.
+          r.snapshot!.positions.forEach((p, i) => {
+            const k = String(i);
+            if (k in next) return;
             // Fold the exit-time default (mode + basis) into one choice.
             if (p.default_mode === "pct")
-              next[p.symbol] = p.default_basis === "reference" ? "pct_reference"
+              next[k] = p.default_basis === "reference" ? "pct_reference"
                 : p.default_basis === "exit" ? "at_exit" : "pct_current";
-            else if (p.default_mode === "limit") next[p.symbol] = "limit";
-            else if (p.default_mode === "market") next[p.symbol] = "market";
-          }
+            else if (p.default_mode === "limit") next[k] = "limit";
+            else if (p.default_mode === "market") next[k] = "market";
+          });
           return next;
         });
         setRowVal((prev) => {
           const next = { ...prev };
-          for (const p of r.snapshot!.positions)
-            if (!(p.symbol in next) && p.default_value != null) next[p.symbol] = p.default_value;
+          r.snapshot!.positions.forEach((p, i) => {
+            const k = String(i);
+            if (!(k in next) && p.default_value != null) next[k] = p.default_value;
+          });
           return next;
         });
       }
@@ -156,7 +161,9 @@ export default function SnapshotPage() {
         }
         // market — send nothing
       } else {
-        params.set("symbol", scope);
+        // `scope` is the row's array index — pins the exact position even when
+        // the same symbol appears twice in the snapshot.
+        params.set("index", scope);
         const choice = rowChoice[scope] ?? "market";
         const v = parseFloat(rowVal[scope] ?? "");
         if (choice === "limit") {
@@ -306,7 +313,10 @@ export default function SnapshotPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {snap.positions.map((p) => {
+                  {snap.positions.map((p, i) => {
+                    // Row identity is the array index, not the symbol — the same
+                    // symbol can appear twice and must be targeted independently.
+                    const rowKey = String(i);
                     const qty = Number(p.quantity);
                     const side = qty >= 0 ? "Long" : "Short";
                     const st = STATUS_STYLE[p.reentry_status];
@@ -316,9 +326,9 @@ export default function SnapshotPage() {
                     // Long buy-back: bought back cheaper than exit = positive (saved).
                     const changePerSh =
                       p.reentry_status === "filled" && exitP != null && reP != null ? exitP - reP : null;
-                    const choice: ReChoice = rowChoice[p.symbol] ?? "market";
+                    const choice: ReChoice = rowChoice[rowKey] ?? "market";
                     const isPct = isPctChoice(choice);
-                    const rv = parseFloat(rowVal[p.symbol] ?? "");
+                    const rv = parseFloat(rowVal[rowKey] ?? "");
                     const curP = p.current_price != null ? Number(p.current_price) : null;
                     const pdcP = p.pdc != null ? Number(p.pdc) : null;
                     // Dollar target: "% below" off the live price (Market), PDC,
@@ -334,7 +344,7 @@ export default function SnapshotPage() {
                     const pctVsExit =
                       exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
                     return (
-                      <tr key={p.symbol} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)" }}>
                         <td className={`${td} font-medium`}>{p.symbol}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
@@ -375,9 +385,9 @@ export default function SnapshotPage() {
                                  style={{ border: "1px solid var(--border)", opacity: canReenter ? 1 : 0.4 }}>
                               <select value={choice} disabled={!canReenter}
                                       onChange={(e) => {
-                                        setRowChoice((m) => ({ ...m, [p.symbol]: e.target.value as ReChoice }));
+                                        setRowChoice((m) => ({ ...m, [rowKey]: e.target.value as ReChoice }));
                                         // Clear the value so a % isn't misread as a $ (and vice-versa).
-                                        setRowVal((m) => ({ ...m, [p.symbol]: "" }));
+                                        setRowVal((m) => ({ ...m, [rowKey]: "" }));
                                       }}
                                       aria-label={`Re-entry type for ${p.symbol}`}
                                       className="text-xs px-1.5 py-1 outline-none"
@@ -393,8 +403,8 @@ export default function SnapshotPage() {
                                      style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
                                   {choice === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
                                   <PercentInput min="0" max={isPct ? 100 : undefined} step={isPct ? 0.5 : 0.01}
-                                         value={rowVal[p.symbol] ?? ""} disabled={!canReenter}
-                                         onChange={(e) => setRowVal((m) => ({ ...m, [p.symbol]: e.target.value }))}
+                                         value={rowVal[rowKey] ?? ""} disabled={!canReenter}
+                                         onChange={(e) => setRowVal((m) => ({ ...m, [rowKey]: e.target.value }))}
                                          placeholder={choice === "limit" ? "price" : "%"}
                                          aria-label={`${choice === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
                                          className="w-14 text-xs py-0.5 outline-none"
@@ -409,11 +419,11 @@ export default function SnapshotPage() {
                                 = ${targetPx.toFixed(2)}
                               </span>
                             )}
-                            <button type="button" onClick={() => reEnter(p.symbol)}
+                            <button type="button" onClick={() => reEnter(rowKey)}
                                     disabled={busy !== null || !canReenter}
                                     className="px-2.5 py-1 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                                     style={{ background: "var(--panel-2)", color: "var(--text)", border: "1px solid var(--border)" }}>
-                              {busy === p.symbol ? "…" : "Re-Enter"}
+                              {busy === rowKey ? "…" : "Re-Enter"}
                             </button>
                           </div>
                         </td>

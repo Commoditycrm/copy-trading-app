@@ -529,7 +529,11 @@ def re_enter_from_snapshot(
     snapshot_id: uuid.UUID | None = Query(default=None, description="Which snapshot; omit for the latest."),
     symbol: str | None = Query(
         default=None,
-        description="Re-enter ONLY this symbol (per-order re-entry). Omit to re-enter every pending position.",
+        description="Re-enter ONLY this symbol (legacy per-order re-entry). Ambiguous when the snapshot has the same symbol twice — prefer `index`.",
+    ),
+    index: int | None = Query(
+        default=None, ge=0,
+        description="Re-enter ONLY the position at this 0-based index in the snapshot. Unambiguous even when a symbol appears more than once. Wins over `symbol`.",
     ),
     db: Session = Depends(get_db),
     user: User = Depends(require_sell_all_access),
@@ -580,9 +584,16 @@ def re_enter_from_snapshot(
     skipped: list[dict] = []
     failed: list[dict] = []
     new_positions: list[dict] = []
-    for p in snap.positions:
-        # Per-order re-entry: leave every other position untouched.
-        if symbol is not None and p["symbol"] != symbol:
+    for i, p in enumerate(snap.positions):
+        # Per-order re-entry: leave every other position untouched. `index`
+        # pins the EXACT row (the same symbol can appear twice — e.g. two
+        # separate exits — and matching on symbol alone would re-enter the
+        # wrong one). `symbol` stays as a legacy fallback.
+        if index is not None:
+            if i != index:
+                new_positions.append(p)
+                continue
+        elif symbol is not None and p["symbol"] != symbol:
             new_positions.append(p)
             continue
         st = _reentry_status(db, p)
