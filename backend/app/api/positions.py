@@ -186,6 +186,10 @@ def close_all_positions(
         default=None,
         description="Default basis for the baked-in re-entry %: 'current' (live price) or 'reference' (previous market close). Stored on the snapshot so Re-Enter uses it without re-choosing. Omit = current.",
     ),
+    take_profit_percent: Decimal | None = Query(
+        default=None, gt=0, le=1000,
+        description="Take-profit variation: instead of closing at market/trailing, rest a LIMIT to close IN PROFIT at this % off the live price — a long sells at current×(1+%/100), a short buys back at current×(1−%/100). Stock-only; options/no-price fall back to the normal close. Mutually exclusive with trail_percent.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(require_sell_all_access),
 ) -> dict:
@@ -254,6 +258,24 @@ def close_all_positions(
             close_trail_price: Decimal | None = None
             close_method = "market"
             if (
+                take_profit_percent is not None
+                and take_profit_percent > 0
+                and pos.instrument_type == InstrumentType.STOCK
+                and pos.current_price is not None
+                and pos.current_price > 0
+            ):
+                # Take-profit: rest a LIMIT to close in profit rather than sell now.
+                # Long → sell HIGHER (current × (1 + %/100)); short → buy back LOWER
+                # (current × (1 − %/100)). Options/no-price fall through to market.
+                cur = Decimal(pos.current_price)
+                factor = (Decimal(1) + take_profit_percent / Decimal(100)) if pos.quantity > 0 \
+                    else (Decimal(1) - take_profit_percent / Decimal(100))
+                tp_limit = (cur * factor).quantize(Decimal("0.01"))
+                if tp_limit > 0:
+                    close_type = OrderType.LIMIT
+                    close_limit = tp_limit
+                    close_method = "take_profit_limit"
+            elif (
                 trail_percent is not None
                 and trailing_stop_close.trailing_stop_supported(adapter, pos)
             ):
