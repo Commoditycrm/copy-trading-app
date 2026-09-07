@@ -11,6 +11,12 @@ class DiscordAlertSource(Base, TimestampMixin):
     """A trader-connected Discord channel that Kopyaa READS trade alerts FROM
     (INBOUND alert-copying).
 
+    Follow model: ``channel_id`` is a channel in the TRADER'S OWN server that
+    receives a source's announcements via Discord Channel Following. We never add
+    a bot to the third-party source server (no permission) — the trader Follows
+    the source into their own channel and adds our bot there. See
+    services/discord_reader.py for the full rationale.
+
     Deliberately SEPARATE from the OUTBOUND webhook broadcast
     (``TraderSettings.discord_webhook_url`` / ``discord_alerts_enabled``, which
     posts the trader's own fills TO Discord). Different direction, different
@@ -18,8 +24,8 @@ class DiscordAlertSource(Base, TimestampMixin):
 
     Step 1 (this table) is only the CONNECTION: the trader supplies their OWN
     Discord bot token (stored Fernet-encrypted, like broker credentials) plus the
-    channel to watch. Reading messages, parsing alerts, placing orders and
-    mirroring are later phases and do NOT live here.
+    follower channel to watch. Reading messages, parsing alerts, placing orders
+    and mirroring are later phases and do NOT live here.
     """
 
     __tablename__ = "discord_alert_sources"
@@ -35,8 +41,9 @@ class DiscordAlertSource(Base, TimestampMixin):
     # pattern as broker_account.encrypted_credentials.
     encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
 
-    # Discord identifiers. channel_id is the channel we read; guild_id (server)
-    # and channel_name are captured at verify time for display.
+    # Discord identifiers. channel_id is the trader's OWN follower channel we
+    # read; guild_id (their server) and channel_name are captured at verify time
+    # for display.
     guild_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
     channel_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     channel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
