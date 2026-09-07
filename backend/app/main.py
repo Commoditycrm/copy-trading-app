@@ -10,6 +10,7 @@ from app.api import (
     admin as admin_api,
     auth,
     brokers,
+    discord_sources,
     events,
     follow_requests,
     listener as listener_api,
@@ -127,6 +128,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_api.router)
     app.include_router(auth.router)
     app.include_router(brokers.router)
+    app.include_router(discord_sources.router)
     app.include_router(trades.router)
     app.include_router(settings.router)
     app.include_router(subscribers.router)

@@ -122,6 +122,14 @@ function IconSettings() {
     </svg>
   );
 }
+function IconDiscord() {
+  // Chat bubble — reads as "Discord alert channel".
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
 const NAV_TRADER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
@@ -132,6 +140,7 @@ const NAV_TRADER = [
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
   { href: "/performance", label: "Performance", Icon: IconActivity },
   { href: "/brokers", label: "Broker", Icon: IconLink },
+  { href: "/discord", label: "Discord", Icon: IconDiscord },
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 const NAV_SUBSCRIBER = [
