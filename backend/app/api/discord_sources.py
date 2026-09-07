@@ -1,9 +1,15 @@
 """Inbound Discord alert sources — Step 1: connection management only.
 
-A trader connects a Discord channel (via their OWN bot token) that Kopyaa will,
-in later phases, read trade alerts from and act on. This router ONLY manages the
-connection lifecycle: create + verify, list, update/toggle, re-verify, delete.
-No message reading, parsing, or order placement lives here.
+A trader connects a Discord channel that Kopyaa will, in later phases, read trade
+alerts from and act on. This router ONLY manages the connection lifecycle: create
++ verify, list, update/toggle, re-verify, delete. No message reading, parsing, or
+order placement lives here.
+
+── The Follow model ─────────────────────────────────────────────────────────────
+We never add a bot to a third-party alert server. The trader uses Discord's
+native Channel Following to pull a source announcement channel into a channel in
+THEIR OWN server, then adds our bot there. So the ``channel_id`` on every source
+is the trader's own follower channel — see services/discord_reader.py.
 
 Separate from the OUTBOUND webhook broadcast (api/settings.py PATCH
 /settings/trader + services/discord_alerts.py), which posts the trader's own
@@ -35,6 +41,13 @@ def _get_owned(db: Session, user: User, source_id: uuid.UUID) -> DiscordAlertSou
     return src
 
 
+def _to_out(src: DiscordAlertSource, receiving_alerts: bool | None = None) -> DiscordSourceOut:
+    """ORM → response, folding in the transient (non-persisted) live-verify hint."""
+    out = DiscordSourceOut.model_validate(src)
+    out.receiving_alerts = receiving_alerts
+    return out
+
+
 @router.get("", response_model=list[DiscordSourceOut])
 def list_sources(
     db: Session = Depends(get_db),
@@ -54,7 +67,7 @@ def create_source(
     payload: DiscordSourceIn,
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
-) -> DiscordAlertSource:
+) -> DiscordSourceOut:
     # Verify the bot token + channel access with Discord BEFORE storing, so a
     # trader can't save a connection that won't work.
     try:
@@ -76,7 +89,7 @@ def create_source(
     db.add(src)
     db.commit()
     db.refresh(src)
-    return src
+    return _to_out(src, info.get("receiving_alerts"))
 
 
 @router.patch("/{source_id}", response_model=DiscordSourceOut)
@@ -85,8 +98,9 @@ def update_source(
     payload: DiscordSourceUpdateIn,
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
-) -> DiscordAlertSource:
+) -> DiscordSourceOut:
     src = _get_owned(db, user, source_id)
+    receiving: bool | None = None
     if payload.label is not None:
         src.label = payload.label.strip()
     if payload.is_enabled is not None:
@@ -102,9 +116,10 @@ def update_source(
         src.guild_id = info.get("guild_id")
         src.status = "connected"
         src.last_error = None
+        receiving = info.get("receiving_alerts")
     db.commit()
     db.refresh(src)
-    return src
+    return _to_out(src, receiving)
 
 
 @router.post("/{source_id}/verify", response_model=DiscordSourceOut)
@@ -112,22 +127,24 @@ def verify_source(
     source_id: uuid.UUID,
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
-) -> DiscordAlertSource:
+) -> DiscordSourceOut:
     """Re-check a stored connection against Discord and update its status."""
     src = _get_owned(db, user, source_id)
     token = decrypt_json(src.encrypted_credentials).get("bot_token", "")
+    receiving: bool | None = None
     try:
         info = verify_bot_channel(token, src.channel_id)
         src.status = "connected"
         src.last_error = None
         src.channel_name = info.get("channel_name")
         src.guild_id = info.get("guild_id")
+        receiving = info.get("receiving_alerts")
     except DiscordVerifyError as exc:
         src.status = "error"
         src.last_error = str(exc)[:480]
     db.commit()
     db.refresh(src)
-    return src
+    return _to_out(src, receiving)
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
