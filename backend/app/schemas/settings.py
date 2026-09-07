@@ -124,23 +124,28 @@ class SubscriberSelfMultiplierIn(BaseModel):
 
 
 class DailyLossLimitIn(BaseModel):
-    """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
+    """Subscriber-set daily realized-loss kill switch. Pass null to disable.
+    amount > 0 — a $0 limit would trip on the first tick and pause copy
+    immediately; "off" is expressed as null, not 0."""
 
-    daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+    daily_loss_limit: Decimal | None = Field(default=None, gt=0)
 
 
 class DailyProfitLimitIn(BaseModel):
     """Subscriber-set daily realized-profit auto-pause. Pass null to disable.
     Symmetric to DailyLossLimitIn — both flip copy_enabled=False when hit,
-    both auto-resume at the next UTC midnight via copy_engine."""
+    both auto-resume at the next UTC midnight via copy_engine. amount > 0
+    for the same reason as the loss side — 0 means "trip now", not "off"."""
 
-    daily_profit_limit: Decimal | None = Field(default=None, ge=0)
+    daily_profit_limit: Decimal | None = Field(default=None, gt=0)
 
 
 class MaxPerContractIn(BaseModel):
-    """UI-only dollar ceiling per contract. Persisted but not enforced."""
+    """Dollar ceiling per option contract. Pass null to disable. amount > 0 —
+    a $0 ceiling would skip every option copy rather than acting as "no
+    ceiling"."""
 
-    max_per_contract: Decimal | None = Field(default=None, ge=0)
+    max_per_contract: Decimal | None = Field(default=None, gt=0)
 
 
 class MaxAccountPctIn(BaseModel):

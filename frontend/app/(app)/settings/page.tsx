@@ -107,6 +107,26 @@ function pickUnit(usd: string | null, pct: string | null): { unit: LimitUnit; va
   return { unit: "%", value: pct ?? "" };
 }
 
+/** Guard for the risk-limit inputs (loss / profit / daily budget / per
+ *  contract). An empty field is how you turn a limit OFF, so blank stays
+ *  valid — but a typed 0 is never a real limit: a 0 daily loss/profit cap
+ *  or a 0 budget trips on the very first tick, and a $0 per-contract
+ *  ceiling would skip every option copy. Reject it before the PATCH and
+ *  tell the user which field, rather than letting the backend answer with
+ *  a 422. Returns true when the save should be aborted. */
+function blockZeroLimit(raw: string, label: string): boolean {
+  const trimmed = raw.trim();
+  if (trimmed === "") return false;
+  const n = Number(trimmed);
+  if (Number.isFinite(n) && n <= 0) {
+    notify.error(
+      `${label} can't be 0. Enter a value above 0, or clear the field to turn the limit off.`,
+    );
+    return true;
+  }
+  return false;
+}
+
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
@@ -510,6 +530,7 @@ export default function SettingsPage() {
   // warn before saving a non-empty value. Clearing the limit skips the warning.
   function saveLimit() {
     if (limitInput.trim() === "") { void doSaveLimit(); return; }
+    if (blockZeroLimit(limitInput, "Daily loss limit")) return;
     setConfirmLimitKind("loss");
   }
   async function doSaveLimit() {
@@ -540,6 +561,7 @@ export default function SettingsPage() {
   }
   function saveProfit() {
     if (profitInput.trim() === "") { void doSaveProfit(); return; }
+    if (blockZeroLimit(profitInput, "Daily profit limit")) return;
     setConfirmLimitKind("profit");
   }
   // Runs the actual save once the warning is confirmed (or when clearing).
@@ -572,6 +594,7 @@ export default function SettingsPage() {
     }
   }
   async function saveMaxContract() {
+    if (blockZeroLimit(maxContractInput, "Max per contract")) return;
     setMaxContractBusy(true);
     try {
       const trimmed = maxContractInput.trim();
@@ -589,6 +612,7 @@ export default function SettingsPage() {
     }
   }
   async function saveMaxPct() {
+    if (blockZeroLimit(maxPctInput, "Max trading budget / day")) return;
     setMaxPctBusy(true);
     try {
       const trimmed = maxPctInput.trim();
