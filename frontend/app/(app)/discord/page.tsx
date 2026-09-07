@@ -10,9 +10,11 @@ import type { User } from "@/lib/types";
 /**
  * Discord — INBOUND alert-copying (Step 1: connection only).
  *
- * A trader connects a Discord channel (via their own bot token) that Kopyaa will
- * later read trade alerts from. This page manages the connection lifecycle only:
- * add + verify, list, enable/disable, delete. No message reading or trading yet.
+ * The Follow model: we never add a bot to a third-party alert server (no
+ * permission). The trader uses Discord's native **Channel Following** to pull a
+ * source announcement channel into a channel in THEIR OWN server, then adds our
+ * bot there. This page connects that follower channel; reading alerts and
+ * placing trades roll out in later phases.
  *
  * Deliberately separate from the OUTBOUND webhook broadcast (Settings → Discord
  * alerts), which posts the trader's fills TO a channel.
@@ -27,6 +29,9 @@ type DiscordSource = {
   status: string;
   last_error: string | null;
   created_at: string;
+  // Transient: True = followed alerts seen flowing, False = none seen yet,
+  // null = not checked this render (plain list).
+  receiving_alerts?: boolean | null;
 };
 
 export default function DiscordPage() {
@@ -66,7 +71,7 @@ export default function DiscordPage() {
     e.preventDefault();
     setAdding(true);
     try {
-      await api("/api/discord-sources", {
+      const created = await api<DiscordSource>("/api/discord-sources", {
         method: "POST",
         body: JSON.stringify({
           label: label.trim(),
@@ -75,10 +80,16 @@ export default function DiscordPage() {
         }),
       });
       setLabel(""); setToken(""); setChannelId("");
-      notify.success("Channel connected");
-      await load();
+      // Keep the freshly returned object (it carries the receiving_alerts hint)
+      // rather than reloading, which would drop it.
+      setSources((prev) => [created, ...prev]);
+      notify.success(
+        created.receiving_alerts === false
+          ? "Connected — but no followed alerts seen yet. Post/publish one in the source to test."
+          : "Channel connected — alerts are flowing"
+      );
     } catch (e) {
-      notify.fromError(e, "Could not connect — check the bot token and channel ID");
+      notify.fromError(e, "Could not connect — check the bot token and follower channel ID");
     } finally {
       setAdding(false);
     }
@@ -91,7 +102,10 @@ export default function DiscordPage() {
       const updated = await api<DiscordSource>(`/api/discord-sources/${s.id}`, {
         method: "PATCH", body: JSON.stringify({ is_enabled: next }),
       });
-      setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+      // A plain toggle doesn't re-probe Discord, so preserve the last known
+      // receiving_alerts rather than clobbering it with null.
+      setSources((prev) => prev.map((x) => (x.id === s.id
+        ? { ...updated, receiving_alerts: updated.receiving_alerts ?? x.receiving_alerts } : x)));
     } catch (e) {
       setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, is_enabled: !next } : x)));
       notify.fromError(e, "Could not update");
@@ -105,7 +119,13 @@ export default function DiscordPage() {
     try {
       const updated = await api<DiscordSource>(`/api/discord-sources/${s.id}/verify`, { method: "POST" });
       setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
-      notify.success(updated.status === "connected" ? "Connection OK" : "Connection failed — see details");
+      notify.success(
+        updated.status !== "connected"
+          ? "Connection failed — see details"
+          : updated.receiving_alerts === false
+            ? "Bot OK, but no followed alerts seen recently"
+            : "Connection OK — alerts flowing"
+      );
     } catch (e) {
       notify.fromError(e, "Verify failed");
     } finally {
@@ -130,7 +150,7 @@ export default function DiscordPage() {
 
   if (user.role !== "trader") {
     return (
-      <div className="max-w-[760px] mx-auto">
+      <div className="max-w-[820px] mx-auto">
         <div className="card p-8 text-center text-sm" style={{ color: "var(--muted)" }}>
           Connecting a Discord alert channel is a trader feature — it reads a channel you connect and
           (later) places its alerts as trades on your account.
@@ -143,31 +163,52 @@ export default function DiscordPage() {
   const inputStyle = { borderColor: "var(--border)", color: "var(--text)" } as const;
 
   return (
-    <div className="max-w-[760px] mx-auto space-y-4 pb-12">
+    <div className="max-w-[820px] mx-auto space-y-4 pb-12">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
           Discord
         </h1>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Connect a Discord channel that posts trade alerts. Kopyaa will read those alerts and
-          (in an upcoming release) place the matching trades on your connected broker.
+          Pull trade alerts out of a Discord channel and (in an upcoming release) place the matching
+          trades on your connected broker. You <strong>Follow</strong> the source into a channel in
+          your own server, then connect that channel here.
         </p>
         <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>
           This is separate from the alert <strong>broadcast</strong> (Settings), which posts <em>your</em> fills out to a channel.
         </p>
       </div>
 
-      {/* Add source */}
+      {/* How it works — the Follow model up front, because it's the whole trick */}
+      <div className="card p-5" style={{ background: "var(--surface-2, transparent)" }}>
+        <h3 className="text-sm font-semibold mb-2" style={{ color: "var(--text)" }}>How it works</h3>
+        <p className="text-sm" style={{ color: "var(--text-2)" }}>
+          Discord won&apos;t let a bot read someone else&apos;s server. So instead of joining the source,
+          you use Discord&apos;s built-in <strong>Follow</strong> feature to mirror the source&apos;s
+          announcement channel into <strong>your own</strong> server — then our bot reads it there.
+          Fully within Discord&apos;s rules; no passwords or personal tokens.
+        </p>
+        <div className="text-xs mt-3 flex items-center gap-2 flex-wrap" style={{ color: "var(--muted)" }}>
+          <span className="chip">Source 📢 announcement</span>
+          <span aria-hidden>──Follow──▶</span>
+          <span className="chip">Your channel</span>
+          <span aria-hidden>──reads──▶</span>
+          <span className="chip">Kopyaa bot</span>
+        </div>
+      </div>
+
+      {/* Connect form */}
       <form onSubmit={addSource} className="card p-5 space-y-3">
-        <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>Connect a channel</h3>
+        <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>Connect a follower channel</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>Label</label>
+            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>Name this source</label>
             <input className={`${inputCls} mt-1.5`} style={inputStyle} value={label}
-              onChange={(e) => setLabel(e.target.value)} placeholder="e.g. My Alerts Room" required />
+              onChange={(e) => setLabel(e.target.value)} placeholder="e.g. OptionHaven Alerts" required />
           </div>
           <div>
-            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>Channel ID</label>
+            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
+              Follower channel ID <span style={{ color: "var(--muted)" }}>(in your server)</span>
+            </label>
             <input className={`${inputCls} mt-1.5`} style={inputStyle} value={channelId}
               onChange={(e) => setChannelId(e.target.value)} placeholder="e.g. 123456789012345678"
               inputMode="numeric" required />
@@ -197,7 +238,7 @@ export default function DiscordPage() {
         </h3>
         {sources.length === 0 ? (
           <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
-            No channels connected yet. Add one above to get started.
+            No channels connected yet. Follow a source into your server, then add one above.
           </p>
         ) : (
           <div className="flex flex-col divide-y" style={{ borderColor: "var(--border)" }}>
@@ -210,6 +251,19 @@ export default function DiscordPage() {
                     {s.status === "error" && s.last_error ? ` · ${s.last_error}` : ""}
                   </div>
                 </div>
+                {/* Alerts-flowing hint (only when we have a live signal) */}
+                {s.receiving_alerts === true && (
+                  <span className="chip chip-good" title="Followed alerts are arriving in this channel">
+                    <span className="inline-block rounded-full" style={{ width: 6, height: 6, background: "currentColor" }} />
+                    Alerts flowing
+                  </span>
+                )}
+                {s.receiving_alerts === false && (
+                  <span className="chip" title="Bot can read the channel, but no followed messages seen recently"
+                    style={{ color: "var(--warn, #b45309)" }}>
+                    No alerts yet
+                  </span>
+                )}
                 <span className={s.status === "connected" ? "chip chip-good" : s.status === "error" ? "chip chip-bad" : "chip"}>
                   <span className="inline-block rounded-full" style={{ width: 6, height: 6, background: "currentColor" }} />
                   {s.status}
@@ -234,18 +288,37 @@ export default function DiscordPage() {
         )}
       </div>
 
-      {/* Instructions */}
+      {/* Setup instructions — the Follow flow */}
       <div className="card p-5">
-        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text)" }}>How to connect</h3>
+        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text)" }}>Set it up</h3>
         <ol className="text-sm space-y-2 list-decimal pl-5" style={{ color: "var(--text-2)" }}>
-          <li>Create a bot at <strong>discord.com/developers</strong> → <strong>New Application</strong> → <strong>Bot</strong>, and copy its <strong>token</strong>.</li>
-          <li>Under the bot's settings, enable the <strong>Message Content Intent</strong> (required to read messages).</li>
-          <li>Invite the bot to the server that has the alerts channel, and give it permission to <strong>view</strong> that channel.</li>
-          <li>In Discord, enable <strong>Developer Mode</strong> (User Settings → Advanced), then right-click the channel → <strong>Copy Channel ID</strong>.</li>
-          <li>Paste the token + channel ID above and hit <strong>Connect</strong>.</li>
+          <li>
+            In <strong>your own</strong> Discord server, make (or pick) a channel to receive the alerts —
+            e.g. <code>#alerts-in</code>. If you don&apos;t have a server, create a free one first.
+          </li>
+          <li>
+            Open the source&apos;s <strong>📢 announcement channel</strong> (the one you subscribe to), click
+            its name → <strong>Follow</strong>, and choose your <code>#alerts-in</code> channel. Its published
+            alerts now mirror into your channel automatically.
+          </li>
+          <li>
+            Create a bot at <strong>discord.com/developers</strong> → <strong>New Application</strong> →
+            <strong> Bot</strong>, and copy its <strong>token</strong>.
+          </li>
+          <li>Under the bot&apos;s settings, enable the <strong>Message Content Intent</strong> (required to read messages).</li>
+          <li>
+            Invite the bot to <strong>your</strong> server and give it permission to <strong>View Channel</strong> and
+            <strong> Read Message History</strong> on <code>#alerts-in</code>.
+          </li>
+          <li>
+            Enable <strong>Developer Mode</strong> (User Settings → Advanced), then right-click <code>#alerts-in</code> →
+            <strong> Copy Channel ID</strong>.
+          </li>
+          <li>Paste the token + that channel ID above and hit <strong>Connect</strong>.</li>
         </ol>
         <p className="text-[11px] mt-3" style={{ color: "var(--muted)" }}>
-          Connecting only links the channel — reading alerts and placing trades will roll out in later updates.
+          Only <strong>announcement</strong> channels can be followed. Connecting only links the channel —
+          reading alerts and placing trades will roll out in later updates.
         </p>
       </div>
     </div>

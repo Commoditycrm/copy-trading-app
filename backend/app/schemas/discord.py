@@ -5,9 +5,13 @@ from pydantic import BaseModel, Field
 
 
 class DiscordSourceIn(BaseModel):
-    """Create an inbound Discord alert source. The trader supplies their OWN
-    Discord bot token (stored encrypted, never returned) plus the channel to
-    read. Verified against Discord before it's saved."""
+    """Create an inbound Discord alert source.
+
+    In the Follow model, ``channel_id`` is a channel in the TRADER'S OWN server
+    that receives a source's announcements via Discord Channel Following. The
+    trader supplies their OWN bot token (stored encrypted, never returned); we
+    verify the bot can read that follower channel before saving.
+    """
 
     label: str = Field(min_length=1, max_length=120)
     bot_token: str = Field(min_length=20, max_length=200)
@@ -35,5 +39,12 @@ class DiscordSourceOut(BaseModel):
     status: str
     last_error: str | None
     created_at: datetime
+
+    # Transient hint from the most recent verify (NOT a stored column):
+    #   True  = followed alerts were seen arriving in the channel,
+    #   False = channel is readable but no followed messages seen recently,
+    #   None  = couldn't tell (e.g. list endpoints don't re-probe live).
+    # Set by create/verify routes; absent (None) on plain list.
+    receiving_alerts: bool | None = None
 
     model_config = {"from_attributes": True}
