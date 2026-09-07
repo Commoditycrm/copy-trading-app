@@ -100,7 +100,7 @@ export default function AdminTradersPage() {
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                {["Trader", "Business", "Status", "Sell-All", "P&L", "Joined", ""].map(h => (
+                {["Trader", "Business", "Status", "Sell-All Access", "P&L", "Joined", ""].map(h => (
                   <th key={h} className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>{h}</th>
                 ))}
               </tr>

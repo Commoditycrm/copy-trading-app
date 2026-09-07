@@ -8,6 +8,7 @@ import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
+import { PercentInput } from "@/components/PercentInput";
 import { SmsNotificationsForm } from "@/components/settings/SmsNotificationsForm";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
@@ -1772,8 +1773,8 @@ function NumberInput({
   ariaLabel?: string;
 }) {
   return (
-    <input
-      type="number" step={step} min={min} max={max} placeholder={placeholder}
+    <PercentInput
+      step={step} min={min} max={max} placeholder={placeholder}
       aria-label={ariaLabel}
       value={value}
       onChange={(e) => onChange(e.target.value)}
@@ -2065,8 +2066,7 @@ function LimitRow({
                     {effPrefix}
                   </span>
                 )}
-                <input
-                  type="number"
+                <PercentInput
                   step={isPct ? 0.5 : 0.01}
                   min={0}
                   max={isPct ? 100 : undefined}
@@ -2341,9 +2341,8 @@ function EodAutocloseRow({
           <label htmlFor="odte-minutes-before-close" className="text-[11px]" style={{ color: "var(--muted)" }}>
             Minutes before close
           </label>
-          <input
+          <PercentInput
             id="odte-minutes-before-close"
-            type="number"
             min={1}
             max={30}
             value={mins}
@@ -2503,8 +2502,7 @@ function PercentInputCell({
           >
             {prefix}
           </span>
-          <input
-            type="number"
+          <PercentInput
             step={0.5}
             min={0}
             placeholder="no limit"

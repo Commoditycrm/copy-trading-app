@@ -10,6 +10,7 @@ import { PageLoading } from "@/components/PageLoading";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { BulkExitBar } from "@/components/BulkExitBar";
 import { SearchableSelect } from "@/components/SearchableSelect";
+import { PercentInput } from "@/components/PercentInput";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 /** Build OCC option symbol — ROOT + YYMMDD + C/P + strike*1000 (8 digits). */
@@ -855,8 +856,8 @@ export default function TradePanelPage() {
                       label only; no inline suffix, no wrapper div. */}
                   <div>
                     <TinyLabel>Take profit %</TinyLabel>
-                    <input
-                      type="number" step="0.01" min="0.01"
+                    <PercentInput
+                      step="0.01" min="0.01"
                       className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
                       style={{
                         ...inputStyle,
@@ -879,8 +880,8 @@ export default function TradePanelPage() {
                   {/* Stop loss % — same shape, red accent when filled. */}
                   <div>
                     <TinyLabel>Stop loss %</TinyLabel>
-                    <input
-                      type="number" step="0.01" min="0.01"
+                    <PercentInput
+                      step="0.01" min="0.01"
                       className="w-full px-2.5 py-1.5 text-sm tabular-nums outline-none"
                       style={{
                         ...inputStyle,
