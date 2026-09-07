@@ -101,6 +101,10 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // support trailing stops close as a TRAILING_STOP; options / unsupported
   // brokers fall back to market. See services/trailing_stop_close.
   const [trailPct, setTrailPct] = useState("");
+  // Take-profit %: instead of closing now, rest a SELL LIMIT to close in profit
+  // at this % above the live price (long) / below (short). Mutually exclusive
+  // with Trail % — setting one clears the other.
+  const [takeProfitPct, setTakeProfitPct] = useState("");
   // What the trail % is measured from: "current" (percent trail off the live
   // price — Alpaca-native trailing stop) or "reference" (a dollar trail =
   // trail% of the previous market close). See close_all_positions.
@@ -114,6 +118,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
   const trailNum = parseFloat(trailPct);
   const useTrail = !isNaN(trailNum) && trailNum > 0 && trailNum <= 100;
+  const tpNum = parseFloat(takeProfitPct);
+  const useTakeProfit = !isNaN(tpNum) && tpNum > 0 && tpNum <= 1000;
 
   // Sell-All snapshot + re-entry. After a Sell-All the positions are saved so
   // they can be re-opened. Each item carries a live re-entry status
@@ -212,7 +218,8 @@ export function BulkExitBar({ onActionComplete }: Props) {
   async function runExit(key: ExitKey) {
     if (key === "my_positions") {
       const url = "/api/positions/close-all?include_subscribers=false"
-        + (useTrail ? `&trail_percent=${trailNum}&trail_basis=${trailBasis}` : "")
+        + (useTakeProfit ? `&take_profit_percent=${tpNum}` : "")
+        + (!useTakeProfit && useTrail ? `&trail_percent=${trailNum}&trail_basis=${trailBasis}` : "")
         + (useReentry
             ? `&reentry_percent=${reentryNum}&reentry_basis=${reentryBasis}`
             : (reentryBasis === "exit" ? "&reentry_basis=exit" : ""));
@@ -220,12 +227,15 @@ export function BulkExitBar({ onActionComplete }: Props) {
         url, { method: "POST" },
       );
       const nTrail = (res.closed ?? []).filter(c => c.method === "trailing_stop").length;
+      const nTP = (res.closed ?? []).filter(c => c.method === "take_profit_limit").length;
       if (res.closed_count === 0 && res.failed_count === 0) notify.info("No open positions to close (yours).");
       else if (res.failed_count === 0)
         notify.success(
-          useTrail && nTrail > 0
-            ? `Exited ${res.closed_count} — ${nTrail} as trailing stop (${trailNum}%).`
-            : `Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market — yours.`,
+          useTakeProfit && nTP > 0
+            ? `Placed ${nTP} take-profit sell limit${nTP === 1 ? "" : "s"} at +${tpNum}%${res.closed_count > nTP ? ` (+${res.closed_count - nTP} closed at market)` : ""}.`
+            : useTrail && nTrail > 0
+              ? `Exited ${res.closed_count} — ${nTrail} as trailing stop (${trailNum}%).`
+              : `Exited ${res.closed_count} position${res.closed_count === 1 ? "" : "s"} at market — yours.`,
         );
       else notify.warn(`Exited ${res.closed_count}; ${res.failed_count} failed — check Order History.`);
     } else if (key === "my_orders") {
@@ -330,7 +340,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
     >
       <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Trail&nbsp;%</span>
       <PercentInput min="0" max="100" step="0.5" value={trailPct}
-             onChange={e => setTrailPct(e.target.value)} placeholder="off"
+             onChange={e => { setTrailPct(e.target.value); if (e.target.value) setTakeProfitPct(""); }} placeholder="off"
              aria-label="Trailing stop percent for Exit My Positions"
              className="w-10 text-xs outline-none text-center"
              style={{ background: "transparent", border: "none", color: "var(--text)" }} />
@@ -343,6 +353,25 @@ export function BulkExitBar({ onActionComplete }: Props) {
         <option value="reference">% below PDC</option>
         <option value="exit">% below Exit</option>
       </select>
+    </div>
+  );
+
+  // Sell-on-a-RISE companion to Trail % (which sells on a drop): rest a SELL
+  // LIMIT to take profit at this % above the live price. Mutually exclusive
+  // with Trail % — typing here clears Trail and vice-versa.
+  const takeProfitPill = (
+    <div
+      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
+      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+      title="Optional: instead of closing now, rest a SELL LIMIT to take profit at this % ABOVE the live price (stocks). e.g. price $100, +10% → sells at $110 when it gets there. Empty = close now. Mutually exclusive with Trail %."
+    >
+      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--good)" }}>Take&nbsp;Profit&nbsp;%</span>
+      <PercentInput min="0" max="1000" step="0.5" value={takeProfitPct}
+             onChange={e => { setTakeProfitPct(e.target.value); if (e.target.value) setTrailPct(""); }} placeholder="off"
+             aria-label="Take profit percent for Exit My Positions"
+             className="w-10 text-xs outline-none text-center"
+             style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+      <span className="text-[10px] font-semibold" style={{ color: "var(--good)" }}>&uarr;</span>
     </div>
   );
 
@@ -391,6 +420,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
         <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
           <div className="flex items-center gap-2 shrink-0">
             {hasSellAll && !noPositions && trailPill}
+            {hasSellAll && !noPositions && takeProfitPill}
             {hasSellAll && renderButton("my_positions")}
             {hasSellAll && !noPositions && reentryPill}
             {renderButton("my_orders")}
@@ -481,9 +511,11 @@ export function BulkExitBar({ onActionComplete }: Props) {
         open={pending !== null}
         title={pending ? EXIT_DEFS[pending].title : ""}
         message={
-          pending === "my_positions" && useTrail
-            ? `Closes every open position in YOUR connected brokers with a TRAILING STOP (${trailNum}% trail) where the broker supports it (stocks); options and unsupported brokers fall back to a market close. Subscribers are not affected.`
-            : pending ? EXIT_DEFS[pending].message : ""
+          pending === "my_positions" && useTakeProfit
+            ? `Instead of selling now, rests a SELL LIMIT to TAKE PROFIT at +${tpNum}% above the live price for each stock position (a long sells higher, a short buys back lower); options / no-price positions close at market. It sells only if the price gets there. Subscribers are not affected.`
+            : pending === "my_positions" && useTrail
+              ? `Closes every open position in YOUR connected brokers with a TRAILING STOP (${trailNum}% trail) where the broker supports it (stocks); options and unsupported brokers fall back to a market close. Subscribers are not affected.`
+              : pending ? EXIT_DEFS[pending].message : ""
         }
         confirmLabel={pending ? EXIT_DEFS[pending].confirmLabel : "Confirm"}
         variant="danger"
