@@ -137,6 +137,9 @@ const NAV_TRADER = [
 const NAV_SUBSCRIBER = [
   { href: "/dashboard", label: "Dashboard", Icon: IconGrid },
   { href: "/positions", label: "Positions", Icon: IconLayers },
+  // Gated by sell_all_access (admin-enabled) via the nav filter below, same as
+  // the trader nav — hidden until an admin turns the Sell-All suite on.
+  { href: "/snapshot", label: "Snapshot", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/brokers", label: "Broker", Icon: IconLink },

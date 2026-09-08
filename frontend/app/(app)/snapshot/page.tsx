@@ -117,7 +117,7 @@ export default function SnapshotPage() {
 
   useEffect(() => {
     api<User>("/api/auth/me")
-      .then((u) => setAccess(u.role === "trader" && !!u.sell_all_access))
+      .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_access))
       .catch(() => setAccess(false));
   }, []);
 
@@ -131,7 +131,7 @@ export default function SnapshotPage() {
     // Admin flipped this trader's Sell-All access — re-check live.
     if (evt.type === "access.sell_all_changed") {
       api<User>("/api/auth/me")
-        .then((u) => setAccess(u.role === "trader" && !!u.sell_all_access))
+        .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_access))
         .catch(() => setAccess(false));
       return;
     }
