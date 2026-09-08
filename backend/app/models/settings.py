@@ -252,5 +252,20 @@ class SubscriberSettings(Base, TimestampMixin):
         Integer, default=15, server_default="15", nullable=False,
     )
 
+    # Per-subscriber auto-cancel of a copied order that stays WORKING (unfilled)
+    # too long. When enabled, a background scanner cancels this subscriber's
+    # mirror orders (entries AND closes) that have been working longer than
+    # ``unfilled_timeout_seconds`` at the broker, then notifies them. Stored in
+    # SECONDS (the UI offers seconds/minutes and converts). OFF by default
+    # (opt-in) so existing subscribers' behaviour is unchanged. Distinct from
+    # the retry policy above: retry re-places orders the broker REJECTED; this
+    # cancels orders the broker ACCEPTED but that aren't filling.
+    unfilled_timeout_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+    unfilled_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, default=60, server_default="60", nullable=False,
+    )
+
     user = relationship("User", back_populates="subscriber_settings", foreign_keys=[user_id])
     following_trader = relationship("User", foreign_keys=[following_trader_id])

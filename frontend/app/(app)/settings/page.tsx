@@ -172,6 +172,7 @@ export default function SettingsPage() {
   const [posSlBusy, setPosSlBusy] = useState(false);
   const [copyBracketBusy, setCopyBracketBusy] = useState(false);
   const [eodBusy, setEodBusy] = useState(false);
+  const [timeoutBusy, setTimeoutBusy] = useState(false);
   // Reset-to-defaults confirm modal + in-flight flag.
   const [resetOpen, setResetOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
@@ -715,6 +716,30 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update 0DTE auto-close");
     } finally {
       setEodBusy(false);
+    }
+  }
+
+  async function setUnfilledTimeout(next: { enabled?: boolean; seconds?: number }) {
+    setTimeoutBusy(true);
+    try {
+      const s = await api<SubscriberSettings>(
+        "/api/settings/subscriber/unfilled-timeout",
+        { method: "PATCH", body: JSON.stringify(next) },
+      );
+      setSub(s);
+      if (next.enabled !== undefined) {
+        notify.success(
+          next.enabled
+            ? "Unfilled-order timeout on — stale copied orders will be auto-cancelled"
+            : "Unfilled-order timeout off",
+        );
+      } else {
+        notify.success("Timeout updated");
+      }
+    } catch (e) {
+      notify.fromError(e, "Could not update unfilled-order timeout");
+    } finally {
+      setTimeoutBusy(false);
     }
   }
   async function resetSettings() {
@@ -1355,6 +1380,18 @@ export default function SettingsPage() {
                 busy={eodBusy}
                 onToggle={() => setEodAutoclose({ enabled: !sub.eod_autoclose_enabled })}
                 onSaveMinutes={(m) => setEodAutoclose({ minutes: m })}
+              />
+
+              {/* Unfilled-order timeout — opt-in. When on, a copied order that
+                  stays working (unfilled) longer than the chosen duration is
+                  auto-cancelled at the broker and the subscriber is notified. */}
+              <UnfilledTimeoutRow
+                key={sub.unfilled_timeout_seconds}
+                enabled={sub.unfilled_timeout_enabled}
+                seconds={sub.unfilled_timeout_seconds}
+                busy={timeoutBusy}
+                onToggle={() => setUnfilledTimeout({ enabled: !sub.unfilled_timeout_enabled })}
+                onSaveSeconds={(sec) => setUnfilledTimeout({ seconds: sec })}
               />
             </div>
           </Card>
@@ -2365,6 +2402,145 @@ function EodAutocloseRow({
             Save
           </button>
           <span className="text-[11px]" style={{ color: "var(--muted)" }}>(1–30)</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UnfilledTimeoutRow({
+  enabled, seconds, busy, onToggle, onSaveSeconds,
+}: {
+  enabled: boolean;
+  seconds: number;
+  busy: boolean;
+  onToggle: () => void;
+  onSaveSeconds: (s: number) => void;
+}) {
+  const ACCENT = "#6366f1";
+  const MIN_S = 10;
+  const MAX_S = 86400; // 24h
+  // Default the unit to minutes when the stored value is a whole number of
+  // minutes, else seconds — so a 60s timeout shows as "1 min" and a 45s one
+  // shows as "45 sec".
+  const initUnit: "sec" | "min" =
+    seconds % 60 === 0 && seconds >= 60 ? "min" : "sec";
+  const [unit, setUnit] = useState<"sec" | "min">(initUnit);
+  const [val, setVal] = useState(
+    String(initUnit === "min" ? Math.round(seconds / 60) : seconds),
+  );
+  const rawNum = parseInt(val || "0", 10) || 0;
+  const canonical = Math.max(
+    MIN_S,
+    Math.min(MAX_S, unit === "min" ? rawNum * 60 : rawNum),
+  );
+  const dirty = val.trim() !== "" && canonical !== seconds;
+
+  function changeUnit(u: "sec" | "min") {
+    // Preserve the effective seconds when switching units.
+    const secs = unit === "min" ? rawNum * 60 : rawNum;
+    setUnit(u);
+    setVal(String(u === "min" ? Math.max(1, Math.round(secs / 60)) : secs));
+  }
+
+  const humanCurrent =
+    seconds % 60 === 0 && seconds >= 60 ? `${seconds / 60} min` : `${seconds} sec`;
+
+  return (
+    <div
+      className="relative rounded-xl border overflow-hidden p-3 pl-4"
+      style={{
+        background:
+          "linear-gradient(135deg, rgba(255,255,255,0.025) 0%, rgba(255,255,255,0.005) 60%, rgba(0,0,0,0.15) 100%)",
+        borderColor: enabled ? `${ACCENT}66` : "var(--border)",
+        boxShadow:
+          "inset 0 1px 0 rgba(255,255,255,0.03), 0 1px 2px rgba(0,0,0,0.2)",
+      }}
+    >
+      <div
+        aria-hidden
+        className="absolute left-0 top-0 bottom-0 w-1"
+        style={{ background: enabled ? ACCENT : "var(--border)" }}
+      />
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold leading-tight">
+            Auto-cancel unfilled copied orders
+          </div>
+          <div className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+            {enabled
+              ? `A copied order still unfilled after ${humanCurrent} is automatically cancelled at your broker and you're notified. Applies to opening and closing orders — a cancelled close may leave a position open.`
+              : "Off — copied orders stay working until they fill or are cancelled. Turn on to auto-cancel ones that sit unfilled too long."}
+          </div>
+        </div>
+        {/* Switch */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          disabled={busy}
+          onClick={onToggle}
+          className="relative shrink-0 rounded-full transition-colors"
+          style={{
+            width: 44,
+            height: 24,
+            background: enabled ? ACCENT : "var(--border)",
+            opacity: busy ? 0.6 : 1,
+            cursor: busy ? "default" : "pointer",
+          }}
+          title={enabled ? "Turn off unfilled-order timeout" : "Turn on unfilled-order timeout"}
+        >
+          <span
+            className="absolute top-0.5 rounded-full bg-white transition-all"
+            style={{
+              width: 20,
+              height: 20,
+              left: enabled ? 22 : 2,
+              boxShadow: "0 1px 2px rgba(0,0,0,0.35)",
+            }}
+          />
+        </button>
+      </div>
+      {enabled && (
+        <div className="mt-3 flex items-center gap-2 flex-wrap">
+          <label htmlFor="unfilled-timeout-value" className="text-[11px]" style={{ color: "var(--muted)" }}>
+            Cancel after
+          </label>
+          <PercentInput
+            id="unfilled-timeout-value"
+            min={unit === "min" ? 1 : MIN_S}
+            max={unit === "min" ? MAX_S / 60 : MAX_S}
+            value={val}
+            disabled={busy}
+            onChange={(e) => setVal(e.target.value)}
+            className="w-16 rounded-md border px-2 py-1 text-sm bg-transparent"
+            style={{ borderColor: "var(--border)" }}
+          />
+          <select
+            aria-label="Timeout unit"
+            value={unit}
+            disabled={busy}
+            onChange={(e) => changeUnit(e.target.value as "sec" | "min")}
+            className="rounded-md border px-2 py-1 text-sm bg-transparent"
+            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+          >
+            <option value="sec">seconds</option>
+            <option value="min">minutes</option>
+          </select>
+          <button
+            type="button"
+            disabled={busy || !dirty}
+            onClick={() => onSaveSeconds(canonical)}
+            className="rounded-md px-2.5 py-1 text-xs font-semibold text-white transition-colors"
+            style={{
+              background: dirty ? ACCENT : "var(--border)",
+              opacity: busy ? 0.6 : 1,
+              cursor: busy || !dirty ? "default" : "pointer",
+            }}
+          >
+            Save
+          </button>
+          <span className="text-[11px]" style={{ color: "var(--muted)" }}>(10s–24h)</span>
         </div>
       )}
     </div>

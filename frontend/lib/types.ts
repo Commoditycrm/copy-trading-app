@@ -292,6 +292,11 @@ export interface SubscriberSettings {
    *  close, and new same-day-expiry option mirrors are refused in that window. */
   eod_autoclose_enabled: boolean;
   eod_autoclose_minutes: number;
+  /** Per-subscriber auto-cancel of a copied order left working (unfilled) longer
+   *  than `unfilled_timeout_seconds` (opt-in, off by default). Canonical seconds;
+   *  the UI offers a seconds/minutes unit selector. */
+  unfilled_timeout_enabled: boolean;
+  unfilled_timeout_seconds: number;
 }
 
 /** In-app notification (mirror retry failed, etc.). Persisted server-side

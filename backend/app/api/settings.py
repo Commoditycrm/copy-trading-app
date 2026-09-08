@@ -30,6 +30,7 @@ from app.schemas.settings import (
     SymbolFilterIn,
     TraderSettingsOut,
     TraderToggleIn,
+    UnfilledTimeoutIn,
 )
 from app.services.pnl import today_realized_pnl
 from app.services import audit, cache, market_hours
@@ -96,6 +97,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         copy_trader_bracket=s.copy_trader_bracket,
         eod_autoclose_enabled=s.eod_autoclose_enabled,
         eod_autoclose_minutes=s.eod_autoclose_minutes,
+        unfilled_timeout_enabled=s.unfilled_timeout_enabled,
+        unfilled_timeout_seconds=s.unfilled_timeout_seconds,
     )
 
 
@@ -142,6 +145,8 @@ def reset_subscriber_settings(
     s.copy_trader_bracket = False
     s.eod_autoclose_enabled = False
     s.eod_autoclose_minutes = 15
+    s.unfilled_timeout_enabled = False
+    s.unfilled_timeout_seconds = 60
     s.retry_interval_open = RetryInterval.NEVER
     s.retry_interval_close = RetryInterval.NEVER
     s.retry_max_attempts = 1
@@ -631,6 +636,48 @@ def set_eod_autoclose(
     db.refresh(s)
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/unfilled-timeout", response_model=SubscriberSettingsOut)
+def set_unfilled_timeout(
+    payload: UnfilledTimeoutIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Per-subscriber auto-cancel of a copied order left WORKING (unfilled) too
+    long: toggle on/off and set the timeout in seconds (10s–24h; the UI offers
+    seconds/minutes and converts). No cache-bust — this is read only by the
+    background scanner off the DB, not on the fanout hot path."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = {
+        "enabled": bool(s.unfilled_timeout_enabled),
+        "seconds": int(s.unfilled_timeout_seconds),
+    }
+    if payload.enabled is not None:
+        s.unfilled_timeout_enabled = payload.enabled
+    if payload.seconds is not None:
+        s.unfilled_timeout_seconds = max(10, min(86400, int(payload.seconds)))
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.unfilled_timeout_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": old,
+            "new": {
+                "enabled": bool(s.unfilled_timeout_enabled),
+                "seconds": int(s.unfilled_timeout_seconds),
+            },
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
     return _to_out(db, s)
 
 

@@ -312,6 +312,17 @@ def create_app() -> FastAPI:
         )
         scheduler_thread.start()
 
+        # Stale-order canceller: cancels a subscriber's copied order that's been
+        # working (unfilled) longer than their opt-in unfilled_timeout_seconds,
+        # then notifies them. Same daemon-thread + shutdown_event pattern.
+        from app.services import stale_order_canceller
+        threading.Thread(
+            target=stale_order_canceller.poll_loop,
+            kwargs={"shutdown_check": shutdown_event.is_set},
+            name="stale-order-canceller",
+            daemon=True,
+        ).start()
+
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
         # Signal the retry scheduler to exit at its next poll tick. We

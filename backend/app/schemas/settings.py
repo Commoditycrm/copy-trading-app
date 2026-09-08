@@ -83,6 +83,11 @@ class SubscriberSettingsOut(BaseModel):
     # close, and new same-day-expiry option mirrors are refused in that window.
     eod_autoclose_enabled: bool = False
     eod_autoclose_minutes: int = 15
+    # Per-subscriber auto-cancel of a copied order left WORKING (unfilled) longer
+    # than ``unfilled_timeout_seconds`` (opt-in, OFF by default). Canonical
+    # seconds; the UI offers seconds/minutes.
+    unfilled_timeout_enabled: bool = False
+    unfilled_timeout_seconds: int = 60
 
     @field_validator("retry_interval_open", "retry_interval_close", mode="before")
     @classmethod
@@ -224,6 +229,16 @@ class EodAutocloseIn(BaseModel):
 
     enabled: bool | None = None
     minutes: int | None = Field(default=None, ge=1, le=30)
+
+
+class UnfilledTimeoutIn(BaseModel):
+    """Per-subscriber auto-cancel of a copied order that stays working (unfilled)
+    too long. Either field may be omitted — only the supplied one is updated.
+    ``seconds`` is canonical (the UI offers seconds/minutes and converts);
+    clamped server-side to 10s–24h."""
+
+    enabled: bool | None = None
+    seconds: int | None = Field(default=None, ge=10, le=86400)
 
 
 class RetryIntervalIn(BaseModel):
