@@ -580,15 +580,16 @@ def set_sell_all_access(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ) -> dict:
-    """Allow-list a trader for the Sell-All / Snapshot / Re-entry suite. The
-    feature (Exit My Positions trailing-stop, snapshot, re-entry endpoints) is
-    trader-only and stays hidden + API-blocked until enabled here."""
+    """Allow-list a trader OR subscriber for the Sell-All / Snapshot / Re-entry
+    suite. The feature (Exit My Positions trailing-stop / take-profit, snapshot,
+    re-entry endpoints) stays hidden + API-blocked until enabled here. Toggled
+    from Admin -> Traders (traders) or Admin -> Users (subscribers)."""
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
-    if user.role != UserRole.TRADER:
+    if user.role not in (UserRole.TRADER, UserRole.SUBSCRIBER):
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, detail="sell_all_access only applies to traders"
+            status.HTTP_400_BAD_REQUEST, detail="sell_all_access only applies to traders and subscribers"
         )
     user.sell_all_access = payload.enabled
     db.commit()

@@ -142,6 +142,25 @@ export default function AdminUsersPage() {
     }
   }
 
+  // Sell-All access allow-list (traders AND subscribers). Same endpoint the
+  // Traders page uses; here it also covers subscribers per the client request.
+  async function toggleSellAll(user: AdminUser) {
+    const enabled = !user.sell_all_access;
+    setBusy(user.id);
+    try {
+      await api(`/api/admin/users/${user.id}/sell-all-access`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled }),
+      });
+      notify.success(`Sell-All ${enabled ? "enabled" : "disabled"} for ${user.email}`);
+      setUsers(us => us.map(u => u.id === user.id ? { ...u, sell_all_access: enabled } : u));
+    } catch (e) {
+      notify.fromError(e, "Could not update Sell-All access");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function saveBusinessName(user: AdminUser) {
     if (!editingBiz || editingBiz.id !== user.id) return;
     const next = editingBiz.draft.trim();
@@ -292,13 +311,14 @@ export default function AdminUsersPage() {
                 <SortableTh label="Business Name" colKey="business_name" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Status"        colKey="status"        sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Joined"        colKey="created_at"    sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }} title="Access to the Sell-All / Snapshot / Re-entry suite">Sell-All</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Actions</th>
               </tr>
             </thead>
             <tbody>
               {realUsers.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={7} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
                     No users match this filter.
                   </td>
                 </tr>
@@ -442,6 +462,36 @@ export default function AdminUsersPage() {
                     {/* Joined */}
                     <td className="px-4 py-3 text-xs" style={{ color: "var(--muted)" }}>
                       {new Date(u.created_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}
+                    </td>
+
+                    {/* Sell-All access — solid green ON / grey OFF. Applies to
+                        traders + subscribers; admins have no positions so "—". */}
+                    <td className="px-4 py-3">
+                      {u.role === "admin" ? (
+                        <span style={{ color: "var(--muted)" }}>—</span>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={busy === u.id}
+                          onClick={() => toggleSellAll(u)}
+                          title={u.sell_all_access
+                            ? "Sell-All enabled — click to disable"
+                            : "Sell-All disabled — click to enable"}
+                          className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors disabled:opacity-50"
+                          style={{
+                            background: u.sell_all_access ? "var(--good)" : "var(--panel-2)",
+                            color: u.sell_all_access ? "#fff" : "var(--muted)",
+                            border: `1px solid ${u.sell_all_access ? "var(--good)" : "var(--border)"}`,
+                            cursor: busy === u.id ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          <span style={{
+                            width: 7, height: 7, borderRadius: "9999px",
+                            background: u.sell_all_access ? "#fff" : "var(--muted)",
+                          }} />
+                          {u.sell_all_access ? "ON" : "OFF"}
+                        </button>
+                      )}
                     </td>
 
                     {/* Actions */}
