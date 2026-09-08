@@ -336,7 +336,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
     <div
       className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
       style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-      title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. % below Market = trail off the live price; % below PDC = a dollar trail sized off the previous day's close; % below Exit = a dollar trail sized off the exit-time price."
+      title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. The dropdown is the basis the trail % measures against: Market = trail off the live price; PDC = a dollar trail sized off the previous day's close; Exit = a dollar trail sized off the exit-time price."
     >
       <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Trail&nbsp;%</span>
       <PercentInput min="0" max="100" step="0.5" value={trailPct}
@@ -346,12 +346,12 @@ export function BulkExitBar({ onActionComplete }: Props) {
              style={{ background: "transparent", border: "none", color: "var(--text)" }} />
       <select value={trailBasis} onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
               aria-label="Trail basis"
-              title="% below Market = percent trail off the live price. % below PDC = dollar trail = trail% of the previous day's close. % below Exit = dollar trail = trail% of the exit-time price. (Same basis choices as Re-enter.)"
+              title="Basis the trail % measures against. Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the exit-time price."
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}>
-        <option value="current">% below Market</option>
-        <option value="reference">% below PDC</option>
-        <option value="exit">% below Exit</option>
+        <option value="current">Market</option>
+        <option value="reference">PDC</option>
+        <option value="exit">Exit</option>
       </select>
     </div>
   );
@@ -391,9 +391,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
               aria-label="Default re-entry basis"
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}>
-        <option value="current">% below Market</option>
-        <option value="reference">% below PDC</option>
-        <option value="exit">% below Exit</option>
+        <option value="current">Market</option>
+        <option value="reference">PDC</option>
+        <option value="exit">Exit</option>
       </select>
     </div>
   );
