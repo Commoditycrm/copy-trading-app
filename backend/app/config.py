@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     close_reconcile_enabled: bool = False
     close_reconcile_apply: bool = False
     close_reconcile_interval_s: float = 30.0
+    # ── Unfilled-order auto-cancel scanner ──────────────────────────────
+    # How often the stale_order_canceller thread scans for subscriber mirror
+    # orders that have been working (unfilled) longer than the subscriber's
+    # per-account unfilled_timeout_seconds. Only runs when
+    # run_background_workers=true; the per-subscriber opt-in toggle is the real
+    # gate (an all-disabled deployment makes the scan a cheap empty query).
+    unfilled_order_scan_interval_s: float = 15.0
     # ── Direct Webull integration (real-time gRPC trade signal) ──────────
     # Master switch for the direct-Webull path (adapter + trade-event
     # listener). Default OFF — when false, WEBULL broker accounts are
