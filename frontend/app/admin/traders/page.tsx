@@ -12,7 +12,7 @@ interface AdminUser {
   display_name: string | null;
   business_name: string | null;
   is_active: boolean;
-  /** Admin allow-list for the Sell-All / Snapshot / Re-entry suite. */
+  /** Admin allow-list for the Snapshot / Snapshot / Re-entry suite. */
   sell_all_access: boolean;
   /** True when this trader has any currently-hidden orders / P&L days. */
   has_hidden: boolean;
@@ -35,10 +35,10 @@ export default function AdminTradersPage() {
         method: "PATCH",
         body: JSON.stringify({ enabled }),
       });
-      notify.success(`Sell-All ${enabled ? "enabled" : "disabled"} for ${t.email}`);
+      notify.success(`Snapshot ${enabled ? "enabled" : "disabled"} for ${t.email}`);
       setTraders(ts => ts.map(x => x.id === t.id ? { ...x, sell_all_access: enabled } : x));
     } catch (e) {
-      notify.fromError(e, "Could not update Sell-All access");
+      notify.fromError(e, "Could not update Snapshot access");
     } finally {
       setBusy(null);
     }
@@ -100,7 +100,7 @@ export default function AdminTradersPage() {
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                {["Trader", "Business", "Status", "Sell-All Access", "P&L", "Joined", ""].map(h => (
+                {["Trader", "Business", "Status", "Snapshot Access", "P&L", "Joined", ""].map(h => (
                   <th key={h} className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>{h}</th>
                 ))}
               </tr>
@@ -130,7 +130,7 @@ export default function AdminTradersPage() {
                         {t.is_active ? "Active" : "Inactive"}
                       </span>
                     </td>
-                    {/* Sell-All access toggle — clear ON (solid green) / OFF (grey).
+                    {/* Snapshot access toggle — clear ON (solid green) / OFF (grey).
                         stopPropagation so it doesn't open the trader detail row. */}
                     <td className="px-4 py-3">
                       <button
@@ -138,8 +138,8 @@ export default function AdminTradersPage() {
                         disabled={busy === t.id}
                         onClick={(e) => { e.stopPropagation(); toggleSellAll(t); }}
                         title={t.sell_all_access
-                          ? "Sell-All enabled — click to disable"
-                          : "Sell-All disabled — click to enable"}
+                          ? "Snapshot enabled — click to disable"
+                          : "Snapshot disabled — click to enable"}
                         className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors disabled:opacity-50"
                         style={{
                           background: t.sell_all_access ? "var(--good)" : "var(--panel-2)",

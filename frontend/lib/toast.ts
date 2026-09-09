@@ -40,7 +40,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   // role gates
   trader_only: "Only the trader can do this.",
   subscriber_only: "Only subscribers can do this.",
-  sell_all_access_required: "You don't have access to the Sell-All tools yet. Please contact your admin to enable it.",
+  sell_all_access_required: "You don't have access to the Snapshot tools yet. Please contact your admin to enable it.",
 
   // trading kill-switch
   trading_disabled: "Trading is turned off. Enable it before placing orders.",
