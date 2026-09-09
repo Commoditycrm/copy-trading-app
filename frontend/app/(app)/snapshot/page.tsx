@@ -38,6 +38,17 @@ interface Snapshot {
   positions: SnapPos[];
   summary: { total: number; filled: number; working: number; pending: number; expired?: number };
 }
+/** One row in the snapshot history list (cheap counts, no prices). */
+interface SnapListItem {
+  id: string;
+  created_at: string;
+  active: boolean;
+  total: number;
+  filled: number;
+  working: number;
+  pending: number;
+  expired: number;
+}
 
 const STATUS_STYLE: Record<Status, { bg: string; color: string; label: string }> = {
   filled:  { bg: "var(--good-soft)", color: "var(--good)", label: "Back in" },
@@ -61,8 +72,20 @@ function fmtExpiry(iso: string | null): string {
   return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
+/** Full descriptor like Order History — stock: "MSFT"; option: "MSFT $250 Call 10 Jul 26". */
+function positionLabel(p: SnapPos): string {
+  if (p.instrument_type !== "option") return p.symbol.toUpperCase();
+  const cp = p.option_right === "call" ? "Call" : p.option_right === "put" ? "Put" : "";
+  const strike = p.option_strike != null && p.option_strike !== "" ? `$${Number(p.option_strike)}` : "";
+  const exp = p.option_expiry ? fmtExpiry(p.option_expiry) : "";
+  return [p.symbol.toUpperCase(), strike, cp, exp].filter(Boolean).join(" ");
+}
+
 export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
+  // History of snapshots + which one is open in the detail table.
+  const [snaps, setSnaps] = useState<SnapListItem[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   // Admin-gated access to the Sell-All suite. null = still checking.
   const [access, setAccess] = useState<boolean | null>(null);
@@ -86,9 +109,24 @@ export default function SnapshotPage() {
   // Choices that take a percent value input. "% below Exit" (at_exit) is one too.
   const isPctChoice = (c: ReChoice) => c === "pct_current" || c === "pct_reference" || c === "at_exit";
 
-  const load = useCallback(async () => {
+  // Snapshot history list (cheap counts). Default-selects the active/newest one.
+  const loadList = useCallback(async () => {
     try {
-      const r = await api<{ snapshot: Snapshot | null }>("/api/positions/snapshots/latest");
+      const r = await api<{ snapshots: SnapListItem[] }>("/api/positions/snapshots");
+      setSnaps(r.snapshots);
+      setSelectedId((cur) =>
+        cur && r.snapshots.some((s) => s.id === cur)
+          ? cur
+          : (r.snapshots.find((s) => s.active) ?? r.snapshots[0])?.id ?? null,
+      );
+      if (r.snapshots.length === 0) { setSnap(null); setLoading(false); }
+    } catch { setLoading(false); }
+  }, []);
+
+  const load = useCallback(async () => {
+    if (!selectedId) return;   // nothing selected yet (loadList handles empty)
+    try {
+      const r = await api<{ snapshot: Snapshot | null }>(`/api/positions/snapshots/latest?snapshot_id=${selectedId}`);
       setSnap(r.snapshot);
       // Pre-fill the re-entry control from the default chosen at exit time —
       // without overwriting anything the user has already edited.
@@ -123,7 +161,23 @@ export default function SnapshotPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedId]);
+
+  // Delete a snapshot from the history (only the re-entry record, not orders).
+  async function deleteSnap(id: string) {
+    if (!confirm("Delete this snapshot? This only removes the re-entry record — it does NOT touch any orders you already placed.")) return;
+    setBusy("del:" + id);
+    try {
+      await api(`/api/positions/snapshots/${id}`, { method: "DELETE" });
+      notify.success("Snapshot deleted.");
+      if (selectedId === id) setSelectedId(null);   // re-defaults on the next list load
+      await loadList();
+    } catch (e) {
+      notify.fromError(e, "Could not delete snapshot");
+    } finally {
+      setBusy(null);
+    }
+  }
 
   useEffect(() => {
     api<User>("/api/auth/me")
@@ -131,7 +185,10 @@ export default function SnapshotPage() {
       .catch(() => setAccess(false));
   }, []);
 
+  useEffect(() => { loadList(); }, [loadList]);
   useEffect(() => { load(); }, [load]);
+  // Switching snapshots: drop per-row edits so index keys don't bleed across snapshots.
+  useEffect(() => { setRowChoice({}); setRowVal({}); }, [selectedId]);
 
   // Live update: reload when an order event lands (the listener re-publishes
   // order.placed as it fills), so a re-entry flips to "Back in" without a
@@ -145,7 +202,7 @@ export default function SnapshotPage() {
         .catch(() => setAccess(false));
       return;
     }
-    if (evt.type.startsWith("order.")) load();
+    if (evt.type.startsWith("order.")) { load(); loadList(); }
   });
 
   // Backstop poll while anything is unresolved (in case an event is missed).
@@ -160,6 +217,8 @@ export default function SnapshotPage() {
     setBusy(scope);
     try {
       const params = new URLSearchParams();
+      // Act on the snapshot currently open, not just the active one.
+      if (selectedId) params.set("snapshot_id", selectedId);
       // Any non-market choice sends its basis; the % is optional. Backend rests
       // a limit at basis × (1 − %/100): for Market/PDC an empty % means market,
       // for Exit an empty % means exactly the exit price.
@@ -192,7 +251,7 @@ export default function SnapshotPage() {
       if (res.placed_count === 0 && res.failed_count === 0) notify.info("Nothing new to re-enter.");
       else if (res.failed_count === 0) notify.success(`Re-entered ${res.placed_count} order${res.placed_count === 1 ? "" : "s"}.`);
       else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed — check Order History.`);
-      await load();
+      await load(); loadList();
     } catch (e) {
       notify.fromError(e, "Re-enter failed");
     } finally {
@@ -248,18 +307,54 @@ export default function SnapshotPage() {
 
       {loading ? (
         <div style={{ color: "var(--muted)" }}>Loading…</div>
-      ) : !snap || snap.positions.length === 0 ? (
+      ) : snaps.length === 0 ? (
         <div className="rounded-xl p-10 text-center" style={{ border: "1px solid var(--border)", color: "var(--muted)" }}>
           No snapshot yet. Use <b>Exit My Positions</b> on the Trade Panel to close your positions — a snapshot is saved automatically, and you can re-enter it here.
         </div>
       ) : (
         <>
+          {/* Snapshot history — each Exit-All is its own snapshot. Click one to open it; Delete removes just the re-entry record. */}
+          <div className="rounded-xl p-3" style={{ border: "1px solid var(--border)", background: "var(--panel)" }}>
+            <div className="text-[11px] uppercase tracking-wider font-semibold mb-2" style={{ color: "var(--muted)" }}>
+              Snapshots ({snaps.length})
+            </div>
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {snaps.map((s) => {
+                const sel = s.id === selectedId;
+                return (
+                  <div key={s.id} onClick={() => setSelectedId(s.id)}
+                       className="shrink-0 rounded-lg px-3 py-2 cursor-pointer"
+                       style={{ minWidth: 190, background: sel ? "var(--accent-glow)" : "var(--panel-2)", border: `1px solid ${sel ? "var(--accent)" : "var(--border)"}` }}>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold" style={{ color: "var(--text)" }}>
+                        {new Date(s.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+                      </span>
+                      {s.active && <span className="text-[9px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--good-soft)", color: "var(--good)" }}>current</span>}
+                    </div>
+                    <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+                      {s.total} pos · {s.filled}/{s.total} back{s.pending > 0 ? ` · ${s.pending} to go` : ""}{s.expired > 0 ? ` · ${s.expired} exp` : ""}
+                    </div>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); deleteSnap(s.id); }} disabled={busy === "del:" + s.id}
+                            className="mt-1.5 text-[10px] px-2 py-0.5 rounded disabled:opacity-50"
+                            style={{ background: "rgba(239,68,68,0.10)", color: "var(--bad)", border: "1px solid rgba(239,68,68,0.25)" }}>
+                      {busy === "del:" + s.id ? "Deleting…" : "Delete"}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {!snap || snap.positions.length === 0 ? (
+            <div style={{ color: "var(--muted)" }}>Loading snapshot…</div>
+          ) : (
+          <>
           {stale && (
             <div className="rounded-xl px-4 py-2.5 text-sm"
                  style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "var(--bad)" }}>
               ⚠ This snapshot was taken <b>{ageLabel}</b> — the exit prices are stale, so re-entering a
               &ldquo;% below&rdquo; the exit price may not reflect the current market. Prefer a market re-entry,
-              or take a fresh Exit snapshot.
+              take a fresh Exit snapshot, or <b>Delete</b> this one from the list above.
             </div>
           )}
 
@@ -357,7 +452,7 @@ export default function SnapshotPage() {
                       exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
                     return (
                       <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)", opacity: p.reentry_status === "expired" ? 0.55 : 1 }}>
-                        <td className={`${td} font-medium`}>{p.symbol}</td>
+                        <td className={`${td} font-medium`}>{positionLabel(p)}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
                         {/* Option expiry — red once expired so it's obvious why Re-Enter is off. */}
@@ -451,6 +546,8 @@ export default function SnapshotPage() {
               </table>
             </div>
           </div>
+          </>
+          )}
         </>
       )}
     </div>
