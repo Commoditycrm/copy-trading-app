@@ -14,7 +14,7 @@ import { useEventStream } from "@/lib/sse";
 import { PercentInput } from "@/components/PercentInput";
 import type { User } from "@/lib/types";
 
-type Status = "filled" | "working" | "pending";
+type Status = "filled" | "working" | "pending" | "expired";
 
 interface SnapPos {
   symbol: string;
@@ -36,13 +36,14 @@ interface Snapshot {
   id: string;
   created_at: string;
   positions: SnapPos[];
-  summary: { total: number; filled: number; working: number; pending: number };
+  summary: { total: number; filled: number; working: number; pending: number; expired?: number };
 }
 
 const STATUS_STYLE: Record<Status, { bg: string; color: string; label: string }> = {
   filled:  { bg: "var(--good-soft)", color: "var(--good)", label: "Back in" },
   working: { bg: "rgba(250,204,21,0.12)", color: "#facc15", label: "Resting" },
   pending: { bg: "var(--panel-2)", color: "var(--muted)", label: "To re-enter" },
+  expired: { bg: "rgba(239,68,68,0.12)", color: "var(--bad)", label: "Expired" },
 };
 
 function fmtMoney(v: string | null): string {
@@ -230,6 +231,7 @@ export default function SnapshotPage() {
               <span style={{ color: "var(--good)" }}>{snap.summary.filled}/{snap.summary.total} back in</span>
               {snap.summary.working > 0 && <span style={{ color: "#facc15" }}> · {snap.summary.working} resting</span>}
               {snap.summary.pending > 0 && <span style={{ color: "var(--muted)" }}> · {snap.summary.pending} to go</span>}
+              {(snap.summary.expired ?? 0) > 0 && <span style={{ color: "var(--bad)" }}> · {snap.summary.expired} expired</span>}
             </div>
           </div>
         )}
@@ -344,7 +346,7 @@ export default function SnapshotPage() {
                     const pctVsExit =
                       exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
                     return (
-                      <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)", opacity: p.reentry_status === "expired" ? 0.55 : 1 }}>
                         <td className={`${td} font-medium`}>{p.symbol}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>

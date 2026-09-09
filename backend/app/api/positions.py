@@ -526,9 +526,28 @@ def latest_sell_all_snapshot(
         except Exception:  # noqa: BLE001
             return None
 
+    # An expired option can't be re-bought (the contract is gone). Flag it as a
+    # distinct "expired" status so the row disables Re-Enter and Re-Enter All
+    # skips it. Expired = expiry strictly before today ET (it's still tradeable
+    # ON the expiry date until close).
+    from app.services import market_hours as _mh  # noqa: PLC0415
+    _today_et = _mh.now_et().date()
+
+    def _is_expired_option(pos: dict) -> bool:
+        if pos.get("instrument_type") != "option" or not pos.get("option_expiry"):
+            return False
+        try:
+            return date.fromisoformat(pos["option_expiry"]) < _today_et
+        except (ValueError, TypeError):
+            return False
+
     positions = []
     for p in snap.positions:
         st, reentry_price = _reentry_info(db, p)
+        # Overlay expiry only on a not-yet-re-entered row; a filled/working one
+        # keeps its status (it already has an order).
+        if st == "pending" and _is_expired_option(p):
+            st = "expired"
         positions.append({
             "symbol": p["symbol"],
             "instrument_type": p["instrument_type"],
@@ -550,6 +569,7 @@ def latest_sell_all_snapshot(
         "filled": sum(1 for x in positions if x["reentry_status"] == "filled"),
         "working": sum(1 for x in positions if x["reentry_status"] == "working"),
         "pending": sum(1 for x in positions if x["reentry_status"] == "pending"),
+        "expired": sum(1 for x in positions if x["reentry_status"] == "expired"),
     }
     return {"snapshot": {
         "id": str(snap.id),
@@ -651,6 +671,17 @@ def re_enter_from_snapshot(
             skipped.append({"symbol": p["symbol"], "reason": st})
             new_positions.append(p)
             continue
+        # An expired option contract can't be re-bought — never send it to the
+        # broker (guards direct API / index calls, not just the UI).
+        if p.get("instrument_type") == "option" and p.get("option_expiry"):
+            try:
+                from app.services import market_hours as _mh  # noqa: PLC0415
+                if date.fromisoformat(p["option_expiry"]) < _mh.now_et().date():
+                    skipped.append({"symbol": p["symbol"], "reason": "expired"})
+                    new_positions.append(p)
+                    continue
+            except (ValueError, TypeError):
+                pass
         try:
             qty = Decimal(p["quantity"])
             side = OrderSide.BUY if qty > 0 else OrderSide.SELL
