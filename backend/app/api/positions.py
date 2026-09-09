@@ -478,15 +478,42 @@ def latest_sell_all_snapshot(
         except Exception:  # noqa: BLE001
             adapter = None
 
-    def _current(sym: str, itype: str) -> str | None:
-        fn = getattr(adapter, "get_stock_latest_price", None)
-        if adapter is None or itype != "stock" or fn is None:
+    def _current(p: dict) -> str | None:
+        """Live price for the Current Price column. Stocks use the stock quote;
+        options use the OCC bid/ask mid (Alpaca OPRA). Best-effort — "—" when a
+        contract can't be quoted (illiquid / after-hours) or the broker lacks the
+        method."""
+        if adapter is None:
             return None
-        try:
-            px = fn(sym)
-            return str(px) if px is not None else None
-        except Exception:  # noqa: BLE001
-            return None
+        itype = p["instrument_type"]
+        if itype == "stock":
+            fn = getattr(adapter, "get_stock_latest_price", None)
+            if fn is None:
+                return None
+            try:
+                px = fn(p["symbol"])
+                return str(px) if px is not None else None
+            except Exception:  # noqa: BLE001
+                return None
+        # Option: mid of the OCC bid/ask. Skips cleanly on non-Alpaca adapters
+        # (no get_option_latest_quote) or when the contract details are missing.
+        if itype == "option" and p.get("option_expiry") and p.get("option_strike") and p.get("option_right"):
+            fn = getattr(adapter, "get_option_latest_quote", None)
+            if fn is None:
+                return None
+            try:
+                from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+                occ = build_occ_symbol(
+                    p["symbol"], date.fromisoformat(p["option_expiry"]),
+                    Decimal(p["option_strike"]), p["option_right"],
+                )
+                bid, ask = fn(occ)
+                mid = (bid + ask) / Decimal(2) if bid is not None and ask is not None \
+                    else (ask if ask is not None else bid)
+                return str(mid.quantize(Decimal("0.01"))) if mid is not None else None
+            except Exception:  # noqa: BLE001
+                return None
+        return None
 
     def _pdc(sym: str, itype: str) -> str | None:
         """Previous day's market close — the PDC re-entry basis."""
@@ -507,7 +534,7 @@ def latest_sell_all_snapshot(
             "instrument_type": p["instrument_type"],
             "quantity": p["quantity"],
             "price": p.get("price"),                                  # exit price
-            "current_price": _current(p["symbol"], p["instrument_type"]),
+            "current_price": _current(p),
             "pdc": _pdc(p["symbol"], p["instrument_type"]),           # previous day close
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
             "default_mode": p.get("default_mode", "market"),          # default re-entry chosen at exit
