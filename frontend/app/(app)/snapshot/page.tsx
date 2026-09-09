@@ -52,6 +52,15 @@ function fmtMoney(v: string | null): string {
   return Number.isFinite(n) ? `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : String(v);
 }
 
+/** Option expiry "YYYY-MM-DD" → "10 Jul 26"; "—" for stocks / no expiry. */
+function fmtExpiry(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso.length === 10 ? iso + "T00:00:00Z" : iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const mon = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+  return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
 export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -304,6 +313,7 @@ export default function SnapshotPage() {
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Symbol</th>
                     <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Side</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Qty</th>
+                    <th className={`${th} text-left`} style={{ color: "var(--muted)" }} title="Option expiry date (— for stocks)">Expiry</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Exit Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
                     <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Previous day's market close price">PDC</th>
@@ -350,6 +360,11 @@ export default function SnapshotPage() {
                         <td className={`${td} font-medium`}>{p.symbol}</td>
                         <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
                         <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
+                        {/* Option expiry — red once expired so it's obvious why Re-Enter is off. */}
+                        <td className={`${td} text-left num`}
+                            style={{ color: p.reentry_status === "expired" ? "var(--bad)" : "var(--text-2)" }}>
+                          {fmtExpiry(p.option_expiry)}
+                        </td>
                         <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
                         {/* Live current market price (stocks). */}
                         <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>{fmtMoney(p.current_price)}</td>
