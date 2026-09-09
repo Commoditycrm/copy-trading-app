@@ -260,13 +260,14 @@ def close_all_positions(
             if (
                 take_profit_percent is not None
                 and take_profit_percent > 0
-                and pos.instrument_type == InstrumentType.STOCK
                 and pos.current_price is not None
                 and pos.current_price > 0
             ):
                 # Take-profit: rest a LIMIT to close in profit rather than sell now.
                 # Long → sell HIGHER (current × (1 + %/100)); short → buy back LOWER
-                # (current × (1 − %/100)). Options/no-price fall through to market.
+                # (current × (1 − %/100)). Works for stocks AND options (Alpaca's
+                # positions feed carries current_price for both). Only positions
+                # with no live price fall through to the market/limit close.
                 cur = Decimal(pos.current_price)
                 factor = (Decimal(1) + take_profit_percent / Decimal(100)) if pos.quantity > 0 \
                     else (Decimal(1) - take_profit_percent / Decimal(100))
@@ -648,6 +649,32 @@ def delete_sell_all_snapshot(
     return {"ok": True, "deleted": str(snapshot_id)}
 
 
+@router.delete("/snapshots/{snapshot_id}/positions/{index}")
+def delete_snapshot_position(
+    snapshot_id: uuid.UUID,
+    index: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_sell_all_access),
+) -> dict:
+    """Remove ONE order (by 0-based index) from a snapshot's re-entry list. If it
+    was the last one, the whole snapshot is deleted. Only touches the re-entry
+    record — never any orders already placed."""
+    snap = db.get(SellAllSnapshot, snapshot_id)
+    if snap is None or snap.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="snapshot_not_found")
+    poss = list(snap.positions)
+    if index < 0 or index >= len(poss):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="position_not_found")
+    del poss[index]
+    if not poss:
+        db.delete(snap)
+        db.commit()
+        return {"ok": True, "remaining": 0, "snapshot_deleted": True}
+    snap.positions = poss   # reassign so JSONB persists
+    db.commit()
+    return {"ok": True, "remaining": len(poss), "snapshot_deleted": False}
+
+
 @router.post("/re-enter")
 def re_enter_from_snapshot(
     request: Request,
@@ -672,6 +699,10 @@ def re_enter_from_snapshot(
     index: int | None = Query(
         default=None, ge=0,
         description="Re-enter ONLY the position at this 0-based index in the snapshot. Unambiguous even when a symbol appears more than once. Wins over `symbol`.",
+    ),
+    trail_percent: Decimal | None = Query(
+        default=None, gt=0, le=100,
+        description="Re-enter as a TRAILING-STOP order at this trail % instead of market/limit (stock only; options fall back to market). Wins over discount_percent/limit_price.",
     ),
     db: Session = Depends(get_db),
     user: User = Depends(require_sell_all_access),
@@ -703,8 +734,28 @@ def re_enter_from_snapshot(
 
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
 
-    def _basis_price(sym: str) -> "Decimal | None":
-        """Live price the discount is taken from: 'current' or 'reference' (prev close)."""
+    def _basis_price(item: dict) -> "Decimal | None":
+        """Live price the discount is taken from. 'current' = live quote (stock
+        quote, or the option bid/ask mid); 'reference' = previous close (stocks
+        only — options have no PDC)."""
+        sym = item["symbol"]
+        is_opt = item.get("instrument_type") == "option"
+        if basis == "current" and is_opt:
+            fn = getattr(adapter, "get_option_latest_quote", None)
+            if fn is None or not (item.get("option_expiry") and item.get("option_strike") and item.get("option_right")):
+                return None
+            try:
+                from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+                occ = build_occ_symbol(sym, date.fromisoformat(item["option_expiry"]),
+                                       Decimal(item["option_strike"]), item["option_right"])
+                bid, ask = fn(occ)
+                if bid is not None and ask is not None:
+                    return (bid + ask) / Decimal(2)
+                return ask if ask is not None else bid
+            except Exception:  # noqa: BLE001
+                return None
+        if is_opt:
+            return None   # options have no previous-day close
         fn = None
         if basis == "current":
             fn = getattr(adapter, "get_stock_latest_price", None)
@@ -756,16 +807,23 @@ def re_enter_from_snapshot(
             side = OrderSide.BUY if qty > 0 else OrderSide.SELL
             it = InstrumentType(p["instrument_type"])
             price = Decimal(p["price"]) if p.get("price") else None
-            is_stock_buy = side == OrderSide.BUY and it == InstrumentType.STOCK
-            # Limit price: an explicit price wins over a % below the exit price;
-            # either only applies to a stock re-buy, else it's a market order.
-            if limit_price is not None and is_stock_buy:
+            is_buy = side == OrderSide.BUY
+            is_stock = it == InstrumentType.STOCK
+            # Trailing re-entry: a TRAILING_STOP that follows the price and
+            # triggers the buy-back once it turns by the trail %. STOCK-only —
+            # Alpaca can't trail options, so an option here falls through to a
+            # limit/market re-buy.
+            use_trail = trail_percent is not None and trail_percent > 0 and is_buy and is_stock
+            # Limit re-buy (BUY side). Works for stocks AND options now: an
+            # explicit Limit $, or a % below the chosen basis (live/PDC/exit).
+            # For options only 'current' (option bid/ask mid) and 'exit' (the
+            # recorded exit price) are priceable — PDC returns None → market.
+            if use_trail:
+                use_limit, limit_val = False, None
+            elif limit_price is not None and is_buy:
                 use_limit, limit_val = True, limit_price
-            elif is_stock_buy and (disc > 0 or basis == "exit"):
-                # A resting limit: % below the chosen basis — current (live) /
-                # reference (prev close) / exit (the recorded exit price). With
-                # basis="exit" and no discount, the limit is exactly the exit price.
-                base_px = _basis_price(p["symbol"]) if basis in ("current", "reference") else price
+            elif is_buy and (disc > 0 or basis == "exit"):
+                base_px = _basis_price(p) if basis in ("current", "reference") else price
                 if base_px is not None and base_px > 0:
                     use_limit, limit_val = True, (base_px * (Decimal(1) - disc / Decimal(100))).quantize(Decimal("0.01"))
                 else:
@@ -776,9 +834,10 @@ def re_enter_from_snapshot(
                 instrument_type=it,
                 symbol=p["symbol"],
                 side=side,
-                order_type=OrderType.LIMIT if use_limit else OrderType.MARKET,
+                order_type=OrderType.TRAILING_STOP if use_trail else (OrderType.LIMIT if use_limit else OrderType.MARKET),
                 quantity=abs(qty),
                 limit_price=limit_val,
+                trail_percent=trail_percent if use_trail else None,
                 option_expiry=date.fromisoformat(p["option_expiry"]) if p.get("option_expiry") else None,
                 option_strike=Decimal(p["option_strike"]) if p.get("option_strike") else None,
                 option_right=OptionRight(p["option_right"]) if p.get("option_right") else None,

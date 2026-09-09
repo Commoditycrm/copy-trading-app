@@ -797,7 +797,7 @@ export default function TradesPage() {
                             <span
                               className="chip font-semibold"
                               style={{ background: "var(--accent-glow)", color: "var(--accent)", borderColor: "transparent", fontSize: 10 }}
-                              title="Placed by Sell-All Re-Enter (from a snapshot)"
+                              title="Placed by Snapshot Re-Enter (from a snapshot)"
                             >
                               ↻ Re-Entry
                             </span>

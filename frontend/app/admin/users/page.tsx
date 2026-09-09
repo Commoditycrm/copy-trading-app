@@ -15,7 +15,7 @@ interface AdminUser {
    *  for role=trader. Null for subscribers / admins. */
   business_name: string | null;
   is_active: boolean;
-  /** Admin allow-list for the Sell-All / Snapshot / Re-entry suite (traders). */
+  /** Admin allow-list for the Snapshot / Snapshot / Re-entry suite (traders). */
   sell_all_access: boolean;
   created_at: string;
 }
@@ -142,7 +142,7 @@ export default function AdminUsersPage() {
     }
   }
 
-  // Sell-All access allow-list (traders AND subscribers). Same endpoint the
+  // Snapshot access allow-list (traders AND subscribers). Same endpoint the
   // Traders page uses; here it also covers subscribers per the client request.
   async function toggleSellAll(user: AdminUser) {
     const enabled = !user.sell_all_access;
@@ -152,10 +152,10 @@ export default function AdminUsersPage() {
         method: "PATCH",
         body: JSON.stringify({ enabled }),
       });
-      notify.success(`Sell-All ${enabled ? "enabled" : "disabled"} for ${user.email}`);
+      notify.success(`Snapshot ${enabled ? "enabled" : "disabled"} for ${user.email}`);
       setUsers(us => us.map(u => u.id === user.id ? { ...u, sell_all_access: enabled } : u));
     } catch (e) {
-      notify.fromError(e, "Could not update Sell-All access");
+      notify.fromError(e, "Could not update Snapshot access");
     } finally {
       setBusy(null);
     }
@@ -311,7 +311,7 @@ export default function AdminUsersPage() {
                 <SortableTh label="Business Name" colKey="business_name" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Status"        colKey="status"        sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Joined"        colKey="created_at"    sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }} title="Access to the Sell-All / Snapshot / Re-entry suite">Sell-All</th>
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }} title="Access to the Snapshot / Re-entry suite">Snapshot</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Actions</th>
               </tr>
             </thead>
@@ -464,7 +464,7 @@ export default function AdminUsersPage() {
                       {new Date(u.created_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}
                     </td>
 
-                    {/* Sell-All access — solid green ON / grey OFF. Applies to
+                    {/* Snapshot access — solid green ON / grey OFF. Applies to
                         traders + subscribers; admins have no positions so "—". */}
                     <td className="px-4 py-3">
                       {u.role === "admin" ? (
@@ -475,8 +475,8 @@ export default function AdminUsersPage() {
                           disabled={busy === u.id}
                           onClick={() => toggleSellAll(u)}
                           title={u.sell_all_access
-                            ? "Sell-All enabled — click to disable"
-                            : "Sell-All disabled — click to enable"}
+                            ? "Snapshot enabled — click to disable"
+                            : "Snapshot disabled — click to enable"}
                           className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors disabled:opacity-50"
                           style={{
                             background: u.sell_all_access ? "var(--good)" : "var(--panel-2)",

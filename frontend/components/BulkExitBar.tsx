@@ -100,11 +100,11 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // close (the classic behaviour). When set, stock positions on brokers that
   // support trailing stops close as a TRAILING_STOP; options / unsupported
   // brokers fall back to market. See services/trailing_stop_close.
-  const [trailPct, setTrailPct] = useState("");
-  // Take-profit %: instead of closing now, rest a SELL LIMIT to close in profit
-  // at this % above the live price (long) / below (short). Mutually exclusive
-  // with Trail % — setting one clears the other.
-  const [takeProfitPct, setTakeProfitPct] = useState("");
+  // Exit My Positions can close at market, as a TRAILING STOP, or rest a
+  // TAKE-PROFIT sell limit — one "Exit as" dropdown drives which, with a single
+  // % input (and the Market/PDC/Exit basis when trailing).
+  const [exitMode, setExitMode] = useState<"market" | "trailing" | "take_profit">("market");
+  const [exitPct, setExitPct] = useState("");
   // What the trail % is measured from: "current" (percent trail off the live
   // price — Alpaca-native trailing stop) or "reference" (a dollar trail =
   // trail% of the previous market close). See close_all_positions.
@@ -116,10 +116,10 @@ export function BulkExitBar({ onActionComplete }: Props) {
   const [reentryBasis, setReentryBasis] = useState<"current" | "reference" | "exit">("current");
   const reentryNum = parseFloat(reentryPct);
   const useReentry = !isNaN(reentryNum) && reentryNum > 0 && reentryNum <= 100;
-  const trailNum = parseFloat(trailPct);
-  const useTrail = !isNaN(trailNum) && trailNum > 0 && trailNum <= 100;
-  const tpNum = parseFloat(takeProfitPct);
-  const useTakeProfit = !isNaN(tpNum) && tpNum > 0 && tpNum <= 1000;
+  const exitNum = parseFloat(exitPct);
+  const trailNum = exitNum, tpNum = exitNum;   // aliases so messages read naturally
+  const useTrail = exitMode === "trailing" && !isNaN(exitNum) && exitNum > 0 && exitNum <= 100;
+  const useTakeProfit = exitMode === "take_profit" && !isNaN(exitNum) && exitNum > 0 && exitNum <= 1000;
 
   // Sell-All snapshot + re-entry. After a Sell-All the positions are saved so
   // they can be re-opened. Each item carries a live re-entry status
@@ -332,46 +332,46 @@ export function BulkExitBar({ onActionComplete }: Props) {
     );
   };
 
-  const trailPill = (
+  // One "Exit as" control: Market (close now) / Trailing stop / Take profit.
+  // Non-market modes show a % input; trailing also shows the Market/PDC/Exit basis.
+  const exitModePill = (
     <div
       className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
       style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-      title="Optional: close Exit My Positions as a trailing stop at this % (stocks on supported brokers). Empty = market exit. The dropdown is the basis the trail % measures against: Market = trail off the live price; PDC = a dollar trail sized off the previous day's close; Exit = a dollar trail sized off the exit-time price."
+      title="How Exit My Positions closes: Market = sell now; Trailing stop = a trailing stop at the % (stocks); Take profit = rest a SELL LIMIT at +% above the live price. The basis (Market/PDC/Exit) applies to the trailing stop."
     >
-      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Trail&nbsp;%</span>
-      <PercentInput min="0" max="100" step="0.5" value={trailPct}
-             onChange={e => { setTrailPct(e.target.value); if (e.target.value) setTakeProfitPct(""); }} placeholder="off"
-             aria-label="Trailing stop percent for Exit My Positions"
-             className="w-10 text-xs outline-none text-center"
-             style={{ background: "transparent", border: "none", color: "var(--text)" }} />
-      <select value={trailBasis} onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
-              aria-label="Trail basis"
-              title="Basis the trail % measures against. Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the exit-time price."
+      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text-2)" }}>Exit&nbsp;as</span>
+      <select value={exitMode}
+              onChange={e => { setExitMode(e.target.value as "market" | "trailing" | "take_profit"); setExitPct(""); }}
+              aria-label="Exit mode"
               className="text-xs outline-none cursor-pointer"
               style={{ background: "transparent", border: "none", color: "var(--text)" }}>
-        <option value="current">Market</option>
-        <option value="reference">PDC</option>
-        <option value="exit">Exit</option>
+        <option value="market">Market</option>
+        <option value="trailing">Trailing stop</option>
+        <option value="take_profit">Take profit</option>
       </select>
-    </div>
-  );
-
-  // Sell-on-a-RISE companion to Trail % (which sells on a drop): rest a SELL
-  // LIMIT to take profit at this % above the live price. Mutually exclusive
-  // with Trail % — typing here clears Trail and vice-versa.
-  const takeProfitPill = (
-    <div
-      className="inline-flex items-center rounded-lg h-8 pl-2 pr-1 gap-1 shrink-0"
-      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
-      title="Optional: instead of closing now, rest a SELL LIMIT to take profit at this % ABOVE the live price (stocks). e.g. price $100, +10% → sells at $110 when it gets there. Empty = close now. Mutually exclusive with Trail %."
-    >
-      <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--good)" }}>Take&nbsp;Profit&nbsp;%</span>
-      <PercentInput min="0" max="1000" step="0.5" value={takeProfitPct}
-             onChange={e => { setTakeProfitPct(e.target.value); if (e.target.value) setTrailPct(""); }} placeholder="off"
-             aria-label="Take profit percent for Exit My Positions"
-             className="w-10 text-xs outline-none text-center"
-             style={{ background: "transparent", border: "none", color: "var(--text)" }} />
-      <span className="text-[10px] font-semibold" style={{ color: "var(--good)" }}>&uarr;</span>
+      {exitMode !== "market" && (
+        <div className="inline-flex items-center gap-0.5 pl-1" style={{ borderLeft: "1px solid var(--border)" }}>
+          <PercentInput min="0" max={exitMode === "take_profit" ? "1000" : "100"} step="0.5" value={exitPct}
+                 onChange={e => setExitPct(e.target.value)}
+                 placeholder={exitMode === "trailing" ? "trail" : "+%"}
+                 aria-label={exitMode === "trailing" ? "Trail percent" : "Take profit percent"}
+                 className="w-11 text-xs outline-none text-center"
+                 style={{ background: "transparent", border: "none", color: "var(--text)" }} />
+          <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
+        </div>
+      )}
+      {exitMode === "trailing" && (
+        <select value={trailBasis} onChange={e => setTrailBasis(e.target.value as "current" | "reference" | "exit")}
+                aria-label="Trail basis"
+                title="Basis the trail % measures against. Market = percent trail off the live price. PDC = dollar trail = trail% of the previous day's close. Exit = dollar trail = trail% of the exit-time price."
+                className="text-xs outline-none cursor-pointer pl-1"
+                style={{ background: "transparent", border: "none", color: "var(--text)", borderLeft: "1px solid var(--border)" }}>
+          <option value="current">Market</option>
+          <option value="reference">PDC</option>
+          <option value="exit">Exit</option>
+        </select>
+      )}
     </div>
   );
 
@@ -419,8 +419,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
             Scrolls horizontally only if the panel is very narrow. */}
         <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
           <div className="flex items-center gap-2 shrink-0">
-            {hasSellAll && !noPositions && trailPill}
-            {hasSellAll && !noPositions && takeProfitPill}
+            {hasSellAll && !noPositions && exitModePill}
             {hasSellAll && renderButton("my_positions")}
             {hasSellAll && !noPositions && reentryPill}
             {renderButton("my_orders")}

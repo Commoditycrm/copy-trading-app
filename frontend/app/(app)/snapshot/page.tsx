@@ -8,6 +8,8 @@
  * skipped so you never double-buy.
  */
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -38,17 +40,6 @@ interface Snapshot {
   positions: SnapPos[];
   summary: { total: number; filled: number; working: number; pending: number; expired?: number };
 }
-/** One row in the snapshot history list (cheap counts, no prices). */
-interface SnapListItem {
-  id: string;
-  created_at: string;
-  active: boolean;
-  total: number;
-  filled: number;
-  working: number;
-  pending: number;
-  expired: number;
-}
 
 const STATUS_STYLE: Record<Status, { bg: string; color: string; label: string }> = {
   filled:  { bg: "var(--good-soft)", color: "var(--good)", label: "Back in" },
@@ -72,20 +63,21 @@ function fmtExpiry(iso: string | null): string {
   return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
-/** Full descriptor like Order History — stock: "MSFT"; option: "MSFT $250 Call 10 Jul 26". */
+/** Full descriptor like Order History — stock: "MSFT"; option: "MSFT C $492.5 9 Sep 26"
+ *  (ticker · C/P · $strike · expiry). */
 function positionLabel(p: SnapPos): string {
   if (p.instrument_type !== "option") return p.symbol.toUpperCase();
-  const cp = p.option_right === "call" ? "Call" : p.option_right === "put" ? "Put" : "";
+  const cp = p.option_right === "call" ? "C" : p.option_right === "put" ? "P" : "";
   const strike = p.option_strike != null && p.option_strike !== "" ? `$${Number(p.option_strike)}` : "";
   const exp = p.option_expiry ? fmtExpiry(p.option_expiry) : "";
-  return [p.symbol.toUpperCase(), strike, cp, exp].filter(Boolean).join(" ");
+  return [p.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
 }
 
 export default function SnapshotPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
-  // History of snapshots + which one is open in the detail table.
-  const [snaps, setSnaps] = useState<SnapListItem[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Which snapshot to show: ?id=… opens a specific one from the History page;
+  // no id = the current (active) snapshot.
+  const idParam = useSearchParams().get("id");
   const [loading, setLoading] = useState(true);
   // Admin-gated access to the Sell-All suite. null = still checking.
   const [access, setAccess] = useState<boolean | null>(null);
@@ -95,8 +87,11 @@ export default function SnapshotPage() {
   //  pct_current   — a resting limit % below the live market price
   //  pct_reference — a resting limit % below the previous day close (PDC)
   //  at_exit       — a resting limit % below the recorded exit price (0% = at exit)
+  //  trailing      — a trailing-stop BUY at a trail % (stock only)
   //  limit         — an exact $ limit price (per-row only)
-  type ReChoice = "market" | "pct_current" | "pct_reference" | "at_exit" | "limit";
+  type ReChoice = "market" | "pct_current" | "pct_reference" | "at_exit" | "trailing" | "limit";
+  // Choices that take a percent-style value input (incl. trailing's trail %).
+  const takesPct = (c: ReChoice) => isPctChoice(c) || c === "trailing";
   // Re-Enter All (no per-symbol limit — price differs per symbol).
   const [globalChoice, setGlobalChoice] = useState<Exclude<ReChoice, "limit">>("pct_current");
   const [rowChoice, setRowChoice] = useState<Record<string, ReChoice>>({});
@@ -109,24 +104,10 @@ export default function SnapshotPage() {
   // Choices that take a percent value input. "% below Exit" (at_exit) is one too.
   const isPctChoice = (c: ReChoice) => c === "pct_current" || c === "pct_reference" || c === "at_exit";
 
-  // Snapshot history list (cheap counts). Default-selects the active/newest one.
-  const loadList = useCallback(async () => {
-    try {
-      const r = await api<{ snapshots: SnapListItem[] }>("/api/positions/snapshots");
-      setSnaps(r.snapshots);
-      setSelectedId((cur) =>
-        cur && r.snapshots.some((s) => s.id === cur)
-          ? cur
-          : (r.snapshots.find((s) => s.active) ?? r.snapshots[0])?.id ?? null,
-      );
-      if (r.snapshots.length === 0) { setSnap(null); setLoading(false); }
-    } catch { setLoading(false); }
-  }, []);
-
   const load = useCallback(async () => {
-    if (!selectedId) return;   // nothing selected yet (loadList handles empty)
     try {
-      const r = await api<{ snapshot: Snapshot | null }>(`/api/positions/snapshots/latest?snapshot_id=${selectedId}`);
+      const qs = idParam ? `?snapshot_id=${idParam}` : "";
+      const r = await api<{ snapshot: Snapshot | null }>(`/api/positions/snapshots/latest${qs}`);
       setSnap(r.snapshot);
       // Pre-fill the re-entry control from the default chosen at exit time —
       // without overwriting anything the user has already edited.
@@ -161,19 +142,20 @@ export default function SnapshotPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedId]);
+  }, [idParam]);
 
-  // Delete a snapshot from the history (only the re-entry record, not orders).
-  async function deleteSnap(id: string) {
-    if (!confirm("Delete this snapshot? This only removes the re-entry record — it does NOT touch any orders you already placed.")) return;
-    setBusy("del:" + id);
+  // Remove a single order (row) from the open snapshot.
+  async function deleteRow(index: number) {
+    if (!snap) return;
+    if (!confirm("Remove this order from the snapshot? This only clears the re-entry record — it won't touch any order already placed.")) return;
+    setBusy("delrow:" + index);
     try {
-      await api(`/api/positions/snapshots/${id}`, { method: "DELETE" });
-      notify.success("Snapshot deleted.");
-      if (selectedId === id) setSelectedId(null);   // re-defaults on the next list load
-      await loadList();
+      await api(`/api/positions/snapshots/${snap.id}/positions/${index}`, { method: "DELETE" });
+      notify.success("Removed from snapshot.");
+      setRowChoice({}); setRowVal({});   // indices shift after a removal — re-prefill fresh
+      await load();
     } catch (e) {
-      notify.fromError(e, "Could not delete snapshot");
+      notify.fromError(e, "Could not remove order");
     } finally {
       setBusy(null);
     }
@@ -185,10 +167,9 @@ export default function SnapshotPage() {
       .catch(() => setAccess(false));
   }, []);
 
-  useEffect(() => { loadList(); }, [loadList]);
   useEffect(() => { load(); }, [load]);
-  // Switching snapshots: drop per-row edits so index keys don't bleed across snapshots.
-  useEffect(() => { setRowChoice({}); setRowVal({}); }, [selectedId]);
+  // Opening a different snapshot: drop per-row edits so index keys don't bleed.
+  useEffect(() => { setRowChoice({}); setRowVal({}); }, [idParam]);
 
   // Live update: reload when an order event lands (the listener re-publishes
   // order.placed as it fills), so a re-entry flips to "Back in" without a
@@ -202,7 +183,7 @@ export default function SnapshotPage() {
         .catch(() => setAccess(false));
       return;
     }
-    if (evt.type.startsWith("order.")) { load(); loadList(); }
+    if (evt.type.startsWith("order.")) load();
   });
 
   // Backstop poll while anything is unresolved (in case an event is missed).
@@ -218,12 +199,15 @@ export default function SnapshotPage() {
     try {
       const params = new URLSearchParams();
       // Act on the snapshot currently open, not just the active one.
-      if (selectedId) params.set("snapshot_id", selectedId);
+      if (snap) params.set("snapshot_id", snap.id);
       // Any non-market choice sends its basis; the % is optional. Backend rests
       // a limit at basis × (1 − %/100): for Market/PDC an empty % means market,
       // for Exit an empty % means exactly the exit price.
       if (scope === "all") {
-        if (globalChoice !== "market") {
+        if (globalChoice === "trailing") {
+          const d = parseFloat(globalDisc);
+          if (!isNaN(d) && d > 0 && d <= 100) params.set("trail_percent", String(d));
+        } else if (globalChoice !== "market") {
           params.set("basis", choiceBasis(globalChoice));
           const d = parseFloat(globalDisc);
           if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
@@ -235,7 +219,9 @@ export default function SnapshotPage() {
         params.set("index", scope);
         const choice = rowChoice[scope] ?? "market";
         const v = parseFloat(rowVal[scope] ?? "");
-        if (choice === "limit") {
+        if (choice === "trailing") {
+          if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_percent", String(v));
+        } else if (choice === "limit") {
           if (!isNaN(v) && v > 0) params.set("limit_price", String(v));
         } else if (choice !== "market") {
           params.set("basis", choiceBasis(choice));
@@ -251,7 +237,7 @@ export default function SnapshotPage() {
       if (res.placed_count === 0 && res.failed_count === 0) notify.info("Nothing new to re-enter.");
       else if (res.failed_count === 0) notify.success(`Re-entered ${res.placed_count} order${res.placed_count === 1 ? "" : "s"}.`);
       else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed — check Order History.`);
-      await load(); loadList();
+      await load();
     } catch (e) {
       notify.fromError(e, "Re-enter failed");
     } finally {
@@ -273,7 +259,7 @@ export default function SnapshotPage() {
       <div className="space-y-5">
         <h2 className="text-xl font-bold">Exit Snapshot</h2>
         <div className="rounded-xl p-10 text-center" style={{ border: "1px solid var(--border)", color: "var(--muted)" }}>
-          The Sell-All snapshot &amp; re-entry feature isn&apos;t enabled for your account. Ask an admin to enable it.
+          The Snapshot &amp; Re-entry feature isn&apos;t enabled for your account. Ask an admin to enable it.
         </div>
       </div>
     );
@@ -288,6 +274,14 @@ export default function SnapshotPage() {
             Every position you&apos;ve exited (individually or via <b>Exit All</b>), with each order&apos;s exit
             price. Re-enter any order individually or all at once — at market, or a % below its exit price.
           </p>
+          <Link href="/snapshot/history" className="text-sm font-medium inline-block mt-1.5" style={{ color: "var(--accent)" }}>
+            View snapshot history →
+          </Link>
+          {idParam && (
+            <div className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+              Viewing a past snapshot. <Link href="/snapshot" style={{ color: "var(--accent)" }}>Back to current →</Link>
+            </div>
+          )}
         </div>
         {snap && (
           <div className="text-sm text-right" style={{ color: "var(--text-2)" }}>
@@ -307,57 +301,14 @@ export default function SnapshotPage() {
 
       {loading ? (
         <div style={{ color: "var(--muted)" }}>Loading…</div>
-      ) : snaps.length === 0 ? (
+      ) : !snap || snap.positions.length === 0 ? (
         <div className="rounded-xl p-10 text-center" style={{ border: "1px solid var(--border)", color: "var(--muted)" }}>
-          No snapshot yet. Use <b>Exit My Positions</b> on the Trade Panel to close your positions — a snapshot is saved automatically, and you can re-enter it here.
+          {idParam
+            ? <>That snapshot is empty or was deleted. <Link href="/snapshot/history" style={{ color: "var(--accent)" }}>Back to history →</Link></>
+            : <>No snapshot yet. Use <b>Exit My Positions</b> on the Trade Panel to close your positions — a snapshot is saved automatically, and you can re-enter it here.</>}
         </div>
       ) : (
         <>
-          {/* Snapshot history — each Exit-All is its own snapshot. Click one to open it; Delete removes just the re-entry record. */}
-          <div className="rounded-xl p-3" style={{ border: "1px solid var(--border)", background: "var(--panel)" }}>
-            <div className="text-[11px] uppercase tracking-wider font-semibold mb-2" style={{ color: "var(--muted)" }}>
-              Snapshots ({snaps.length})
-            </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {snaps.map((s) => {
-                const sel = s.id === selectedId;
-                return (
-                  <div key={s.id} onClick={() => setSelectedId(s.id)}
-                       className="shrink-0 rounded-lg px-3 py-2 cursor-pointer"
-                       style={{ minWidth: 190, background: sel ? "var(--accent-glow)" : "var(--panel-2)", border: `1px solid ${sel ? "var(--accent)" : "var(--border)"}` }}>
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-semibold" style={{ color: "var(--text)" }}>
-                        {new Date(s.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
-                      </span>
-                      {s.active && <span className="text-[9px] px-1.5 py-0.5 rounded-full" style={{ background: "var(--good-soft)", color: "var(--good)" }}>current</span>}
-                    </div>
-                    <div className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
-                      {s.total} pos · {s.filled}/{s.total} back{s.pending > 0 ? ` · ${s.pending} to go` : ""}{s.expired > 0 ? ` · ${s.expired} exp` : ""}
-                    </div>
-                    <button type="button" onClick={(e) => { e.stopPropagation(); deleteSnap(s.id); }} disabled={busy === "del:" + s.id}
-                            className="mt-1.5 text-[10px] px-2 py-0.5 rounded disabled:opacity-50"
-                            style={{ background: "rgba(239,68,68,0.10)", color: "var(--bad)", border: "1px solid rgba(239,68,68,0.25)" }}>
-                      {busy === "del:" + s.id ? "Deleting…" : "Delete"}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {!snap || snap.positions.length === 0 ? (
-            <div style={{ color: "var(--muted)" }}>Loading snapshot…</div>
-          ) : (
-          <>
-          {stale && (
-            <div className="rounded-xl px-4 py-2.5 text-sm"
-                 style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", color: "var(--bad)" }}>
-              ⚠ This snapshot was taken <b>{ageLabel}</b> — the exit prices are stale, so re-entering a
-              &ldquo;% below&rdquo; the exit price may not reflect the current market. Prefer a market re-entry,
-              take a fresh Exit snapshot, or <b>Delete</b> this one from the list above.
-            </div>
-          )}
-
           {/* Re-Enter All bar */}
           <div className="rounded-xl px-4 py-3 flex items-center justify-between gap-3 flex-wrap"
                style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
@@ -378,12 +329,13 @@ export default function SnapshotPage() {
                   <option value="pct_current">% below Market</option>
                   <option value="pct_reference">% below PDC</option>
                   <option value="at_exit">% below Exit</option>
+                  <option value="trailing">Trailing %</option>
                 </select>
-                {isPctChoice(globalChoice) && (
+                {takesPct(globalChoice) && (
                   <div className="inline-flex items-center gap-0.5">
                     <PercentInput min="0" max="100" step="0.5" value={globalDisc}
-                           onChange={(e) => setGlobalDisc(e.target.value)} placeholder="%"
-                           aria-label="Discount percent for Re-Enter All"
+                           onChange={(e) => setGlobalDisc(e.target.value)} placeholder={globalChoice === "trailing" ? "trail" : "%"}
+                           aria-label={globalChoice === "trailing" ? "Trail percent for Re-Enter All" : "Discount percent for Re-Enter All"}
                            className="w-10 text-xs outline-none text-center"
                            style={{ background: "transparent", border: "none", color: "var(--text)" }} />
                     <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
@@ -506,22 +458,24 @@ export default function SnapshotPage() {
                                       style={{ background: "var(--panel-2)", border: "none", color: "var(--text)" }}>
                                 <option value="market">Market</option>
                                 <option value="pct_current">% below Market</option>
-                                <option value="pct_reference">% below PDC</option>
+                                {/* PDC + Trailing aren't available for options (no PDC; Alpaca can't trail options). */}
+                                <option value="pct_reference" disabled={p.instrument_type === "option"}>% below PDC</option>
                                 <option value="at_exit">% below Exit</option>
+                                <option value="trailing" disabled={p.instrument_type === "option"}>Trailing %</option>
                                 <option value="limit">Limit $</option>
                               </select>
-                              {(isPct || choice === "limit") && (
+                              {(takesPct(choice) || choice === "limit") && (
                                 <div className="inline-flex items-center gap-0.5 px-1.5"
                                      style={{ background: "var(--panel)", borderLeft: "1px solid var(--border)" }}>
                                   {choice === "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>$</span>}
-                                  <PercentInput min="0" max={isPct ? 100 : undefined} step={isPct ? 0.5 : 0.01}
+                                  <PercentInput min="0" max={choice === "limit" ? undefined : 100} step={choice === "limit" ? 0.01 : 0.5}
                                          value={rowVal[rowKey] ?? ""} disabled={!canReenter}
                                          onChange={(e) => setRowVal((m) => ({ ...m, [rowKey]: e.target.value }))}
-                                         placeholder={choice === "limit" ? "price" : "%"}
-                                         aria-label={`${choice === "limit" ? "Limit price" : "Percent below"} for ${p.symbol}`}
+                                         placeholder={choice === "limit" ? "price" : choice === "trailing" ? "trail" : "%"}
+                                         aria-label={`${choice === "limit" ? "Limit price" : choice === "trailing" ? "Trail percent" : "Percent below"} for ${p.symbol}`}
                                          className="w-14 text-xs py-0.5 outline-none"
                                          style={{ background: "transparent", border: "none", color: "var(--text)" }} />
-                                  {isPct && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
+                                  {choice !== "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
                                 </div>
                               )}
                             </div>
@@ -537,6 +491,15 @@ export default function SnapshotPage() {
                                     style={{ background: "var(--panel-2)", color: "var(--text)", border: "1px solid var(--border)" }}>
                               {busy === rowKey ? "…" : "Re-Enter"}
                             </button>
+                            {/* Remove this single order from the snapshot. */}
+                            <button type="button" onClick={() => deleteRow(i)}
+                                    disabled={busy !== null}
+                                    title="Remove this order from the snapshot"
+                                    aria-label={`Remove ${positionLabel(p)} from snapshot`}
+                                    className="px-2 py-1 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                                    style={{ background: "rgba(239,68,68,0.10)", color: "var(--bad)", border: "1px solid rgba(239,68,68,0.25)" }}>
+                              {busy === "delrow:" + i ? "…" : "✕"}
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -546,8 +509,6 @@ export default function SnapshotPage() {
               </table>
             </div>
           </div>
-          </>
-          )}
         </>
       )}
     </div>
