@@ -421,43 +421,52 @@ def _snap_key(p: dict) -> tuple:
 
 
 def _capture_exit_snapshot(db: Session, user_id: uuid.UUID, items: list[dict]) -> "SellAllSnapshot | None":
-    """Add exited positions to the user's ACTIVE snapshot (creating one if none) —
-    the shared re-entry basket. Both individual closes and Exit All feed this, so
-    ANY position you exit is re-enterable. Deduped by contract identity: re-exiting
-    a symbol replaces its row (fresh exit price, re-entry reset to pending)."""
+    """History model: each exit event (an Exit-All sweep or a single close) is
+    its OWN snapshot. Deactivate the prior active one and create a fresh snapshot
+    holding just this event's positions (deduped within the event by contract
+    identity). Older snapshots are retained — their Re-Entry badges survive and
+    the user can still re-enter or delete them from the snapshot list."""
     if not items:
         return None
-    snap = db.execute(
-        select(SellAllSnapshot)
-        .where(SellAllSnapshot.user_id == user_id, SellAllSnapshot.active.is_(True))
-        .order_by(SellAllSnapshot.created_at.desc())
-        .limit(1)
-    ).scalars().first()
-    if snap is None:
-        snap = SellAllSnapshot(user_id=user_id, positions=[], active=True)
-        db.add(snap)
-        db.flush()
-    by_key = {_snap_key(p): p for p in snap.positions}
+    for s in db.execute(
+        select(SellAllSnapshot).where(
+            SellAllSnapshot.user_id == user_id, SellAllSnapshot.active.is_(True)
+        )
+    ).scalars().all():
+        s.active = False
+    by_key: dict = {}
     for it in items:
-        by_key[_snap_key(it)] = it   # replace/insert (reentry reset to pending)
-    snap.positions = list(by_key.values())   # reassign so JSONB persists
+        by_key[_snap_key(it)] = it   # dedup within this one exit event
+    snap = SellAllSnapshot(user_id=user_id, positions=list(by_key.values()), active=True)
+    db.add(snap)
+    db.flush()
     return snap
 
 
 @router.get("/snapshots/latest")
 def latest_sell_all_snapshot(
+    snapshot_id: uuid.UUID | None = Query(
+        default=None,
+        description="Load a SPECIFIC snapshot from the history. Omit for the current (active/newest) one.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(require_sell_all_access),
 ) -> dict:
-    """The user's ACTIVE Sell-All snapshot (the current one — superseded on each
-    new Sell-All), each position annotated with its live re-entry status
-    (filled / working / pending) plus a summary count. Null if none active."""
-    snap = db.execute(
-        select(SellAllSnapshot)
-        .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
-        .order_by(SellAllSnapshot.created_at.desc())
-        .limit(1)
-    ).scalars().first()
+    """One Sell-All snapshot with each position's live re-entry status
+    (filled / working / pending / expired) + current price and a summary count.
+    Omit `snapshot_id` for the current (active) snapshot; pass it to open any
+    snapshot from the history. Null if none / not found."""
+    if snapshot_id is not None:
+        snap = db.get(SellAllSnapshot, snapshot_id)
+        if snap is None or snap.user_id != user.id:
+            return {"snapshot": None}
+    else:
+        snap = db.execute(
+            select(SellAllSnapshot)
+            .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
+            .order_by(SellAllSnapshot.created_at.desc())
+            .limit(1)
+        ).scalars().first()
     if not snap:
         return {"snapshot": None}
 
@@ -574,6 +583,66 @@ def latest_sell_all_snapshot(
         "positions": positions,
         "summary": summary,
     }}
+
+
+@router.get("/snapshots")
+def list_sell_all_snapshots(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_sell_all_access),
+) -> dict:
+    """History of the user's Sell-All snapshots, newest first: id, when it was
+    taken, position count, and a status breakdown. Cheap — counts come from the
+    DB order rows + expiry, no live price calls (the per-snapshot detail endpoint
+    does the pricing). `active` marks the current one."""
+    from app.services import market_hours as _mh  # noqa: PLC0415
+    today_et = _mh.now_et().date()
+
+    def _expired(pos: dict) -> bool:
+        if pos.get("instrument_type") != "option" or not pos.get("option_expiry"):
+            return False
+        try:
+            return date.fromisoformat(pos["option_expiry"]) < today_et
+        except (ValueError, TypeError):
+            return False
+
+    snaps = db.execute(
+        select(SellAllSnapshot)
+        .where(SellAllSnapshot.user_id == user.id)
+        .order_by(SellAllSnapshot.created_at.desc())
+    ).scalars().all()
+
+    items = []
+    for snap in snaps:
+        counts = {"filled": 0, "working": 0, "pending": 0, "expired": 0}
+        for p in snap.positions:
+            st = _reentry_status(db, p)
+            if st == "pending" and _expired(p):
+                st = "expired"
+            counts[st] = counts.get(st, 0) + 1
+        items.append({
+            "id": str(snap.id),
+            "created_at": snap.created_at.isoformat(),
+            "active": snap.active,
+            "total": len(snap.positions),
+            **counts,
+        })
+    return {"snapshots": items}
+
+
+@router.delete("/snapshots/{snapshot_id}")
+def delete_sell_all_snapshot(
+    snapshot_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_sell_all_access),
+) -> dict:
+    """Delete one snapshot from the history. Only removes the re-entry record —
+    it never touches any orders that were already placed."""
+    snap = db.get(SellAllSnapshot, snapshot_id)
+    if snap is None or snap.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="snapshot_not_found")
+    db.delete(snap)
+    db.commit()
+    return {"ok": True, "deleted": str(snapshot_id)}
 
 
 @router.post("/re-enter")
