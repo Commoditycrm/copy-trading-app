@@ -171,7 +171,18 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
     # FILLED fires any close parked behind it; one that DIED cancels it.
     if filled_entries or dead_entries:
         from app.services import copy_engine  # noqa: PLC0415
+        from app.services import events as _events  # noqa: PLC0415
         for e in filled_entries:
+            # A mirror entry just filled → a new open position exists. The
+            # subscriber has no real-time listener, so this poll is the only
+            # place that fill is seen; publish order.placed (the same event the
+            # trader websocket emits on fill, and the one the positions table
+            # already refreshes on) so the position shows up live instead of
+            # only after a manual reload.
+            try:
+                _events.publish(e.user_id, copy_engine._order_event("order.placed", e))  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                log.exception("fills_sync: order.placed publish failed for entry=%s", e.id)
             try:
                 copy_engine.fire_deferred_closes_for_entry(e)
             except Exception:  # noqa: BLE001
