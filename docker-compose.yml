@@ -116,6 +116,58 @@ services:
       backend:
         condition: service_healthy
 
+  # Inbound Discord alert-copying: watches the channels traders have connected
+  # and forwards newly rendered messages to `backend`. Deliberately isolated —
+  # NO database URL, NO broker credentials, no .env. Its only authority is
+  # DISCORD_LISTENER_TOKEN, which reaches exactly four internal endpoints.
+  #
+  # Keeps the full hardening block: Chromium executes from /ms-playwright in the
+  # image layer, which stays executable under a read-only root filesystem, so
+  # nothing has to be relaxed for a browser to run here. Its own sandbox is
+  # disabled instead (--no-sandbox), since it would need capabilities we drop.
+  #
+  # Never scale >1: watchers are assigned by reconciling against the backend's
+  # assignment list, so a second replica would open every channel a second time
+  # and double every alert into the pipeline.
+  discord-listener:
+    <<: *hardening
+    build: ./discord-listener
+    restart: unless-stopped
+    # Opt-in profile: `docker compose up` does NOT start this service, so an
+    # environment that hasn't set up the inbound Discord feature is completely
+    # unaffected. Start it explicitly with:
+    #     docker compose --profile discord up -d
+    # (A required-variable interpolation like ${VAR:?} would break EVERY compose
+    # command here, active service or not — compose interpolates the whole file
+    # up front. The listener validates its own env at boot instead.)
+    profiles:
+      - discord
+    environment:
+      KOPYAA_BACKEND_URL: http://backend:8000
+      KOPYAA_LISTENER_TOKEN: ${DISCORD_LISTENER_TOKEN:-}
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+    # Chromium needs writable scratch and a large shared-memory area. /dev/shm
+    # is mounted as tmpfs rather than raised via shm_size because the hardening
+    # block keeps everything writable on noexec mounts — Chromium writes data
+    # there, never executables.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+      - /dev/shm:rw,noexec,nosuid,nodev,size=512m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    # A Chromium context per watched channel runs ~150-250MB with images, video
+    # and fonts blocked. Raise this before adding many more channels.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2g
+    depends_on:
+      backend:
+        condition: service_healthy
+
   frontend:
     <<: *hardening
     build: ./frontend
