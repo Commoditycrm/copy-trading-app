@@ -1,0 +1,9 @@
+# Kept intentionally tiny. This service talks to exactly two things: a browser
+# and the Kopyaa backend. It has no database driver and no broker SDK, so a
+# compromise here cannot reach either.
+#
+# Version matches the Playwright base image in the Dockerfile — the Python
+# package and the bundled browsers must be built together or Playwright refuses
+# to launch.
+playwright==1.48.0
+httpx==0.27.2

@@ -192,6 +192,29 @@ class Settings(BaseSettings):
     twilio_messaging_service_sid: str = ""
     twilio_from_number: str = ""
 
+    # ── Inbound Discord alert-copying (browser listener) ──────────────────
+    # Master switch for the whole inbound Discord feature. OFF by default so an
+    # environment without the discord-listener container behaves exactly as it
+    # did before: the /api/discord-sources routes return 503 rather than letting
+    # a trader connect a source nothing will ever monitor.
+    discord_listener_enabled: bool = False
+    # Shared secret the discord-listener service presents on the internal
+    # /api/discord-sources/internal/* endpoints (assignments, session fetch,
+    # message intake, heartbeat). The listener runs in its own container with no
+    # database or broker credentials, so this token is its ONLY authority — it
+    # can read Discord sessions and post messages, nothing else. Blank disables
+    # every internal endpoint outright (they 503), which is the safe default:
+    # an unset secret must never mean "no auth required".
+    discord_listener_token: str = ""
+    # Cap on a single intake batch from the listener. The observer flushes in
+    # small batches; anything larger is a malformed or hostile payload.
+    discord_ingest_max_batch: int = 50
+    # How long a message's idempotency marker is held in Redis. Sized to cover a
+    # listener restart / reconnect replaying the visible channel backlog, which
+    # is the realistic duplicate window. The durable guard is the DB unique
+    # constraint added in step 3; this only spares us the round-trip.
+    discord_ingest_dedup_ttl_s: int = 86400
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

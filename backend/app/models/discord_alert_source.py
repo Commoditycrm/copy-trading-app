@@ -1,6 +1,7 @@
 import uuid
+from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -8,27 +9,42 @@ from app.models.base import Base, TimestampMixin
 
 
 class DiscordAlertSource(Base, TimestampMixin):
-    """A trader-connected Discord channel that Kopyaa READS trade alerts FROM
-    (INBOUND alert-copying).
+    """A Discord channel that Kopyaa READS trade alerts FROM (INBOUND
+    alert-copying), monitored through an authenticated Discord Web session.
 
-    Follow model: ``channel_id`` is a channel in the TRADER'S OWN server that
-    receives a source's announcements via Discord Channel Following. We never add
-    a bot to the third-party source server (no permission) — the trader Follows
-    the source into their own channel and adds our bot there. See
-    services/discord_reader.py for the full rationale.
+    ── Ingestion model: browser session, not a bot ──────────────────────────────
+    Step 1 of this feature connected a channel with the trader's own BOT token
+    plus Discord's Channel-Following. That model is replaced here: a bot can only
+    read a channel it was invited to, which rules out the third-party alert
+    servers traders actually subscribe to, and the Follow workaround required
+    them to own a server and wire up cross-posting.
+
+    Instead we monitor Discord Web as the trader's own logged-in account, reading
+    only channels that account can already legitimately open. No Discord
+    authentication, permission, MFA or rate-limit mechanism is bypassed — we
+    observe rendered messages in a session the trader established themselves.
+
+    ``encrypted_session`` holds the Fernet-encrypted Playwright storage state
+    (cookies + localStorage) captured during a one-time headed login the trader
+    performs on their OWN machine — Kopyaa never sees their password or MFA code.
+    Same encryption-at-rest treatment as broker credentials
+    (``broker_account.encrypted_credentials``); it is NEVER returned to the
+    frontend or written to logs.
 
     Deliberately SEPARATE from the OUTBOUND webhook broadcast
     (``TraderSettings.discord_webhook_url`` / ``discord_alerts_enabled``, which
     posts the trader's own fills TO Discord). Different direction, different
     lifecycle, different data — they must not share storage.
-
-    Step 1 (this table) is only the CONNECTION: the trader supplies their OWN
-    Discord bot token (stored Fernet-encrypted, like broker credentials) plus the
-    follower channel to watch. Reading messages, parsing alerts, placing orders
-    and mirroring are later phases and do NOT live here.
     """
 
     __tablename__ = "discord_alert_sources"
+    __table_args__ = (
+        # One source per (user, channel). Re-adding a channel a trader already
+        # watches would double every alert into the pipeline — two sources means
+        # two ingest rows for one Discord message, and the per-source
+        # idempotency key can't see across them.
+        UniqueConstraint("user_id", "channel_id", name="uq_discord_source_user_channel"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -36,22 +52,43 @@ class DiscordAlertSource(Base, TimestampMixin):
     )
     label: Mapped[str] = mapped_column(String(120), nullable=False)
 
-    # Fernet-encrypted JSON holding the trader's Discord BOT token
-    # ({"bot_token": "..."}). Never stored or returned in plaintext — same
-    # pattern as broker_account.encrypted_credentials.
-    encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
-
-    # Discord identifiers. channel_id is the trader's OWN follower channel we
-    # read; guild_id (their server) and channel_name are captured at verify time
-    # for display.
+    # Discord identifiers, parsed from the channel URL the trader pastes
+    # (https://discord.com/channels/<guild_id>/<channel_id>). Names are display
+    # only and are backfilled by the listener once it has the channel open.
     guild_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    guild_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     channel_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     channel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
-    # Trader on/off for THIS source. Later ingestion only reads enabled sources.
+    # Fernet-encrypted Playwright storage_state JSON for the trader's Discord
+    # Web session. NULL until the one-time headed login is completed, which is
+    # why status starts at "needs_login". Never leaves the backend except to the
+    # listener service over its authenticated internal endpoint.
+    encrypted_session: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_captured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Trader on/off for THIS source. The listener only opens enabled sources.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    # "pending" until first verify; "connected" when the bot token + channel
-    # check out against Discord; "error" (+ last_error) when they don't.
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    # Connection lifecycle, written by the listener service:
+    #   needs_login  — no session stored yet (or it expired / was revoked)
+    #   connecting   — browser context starting, channel not yet confirmed open
+    #   connected    — channel open, MutationObserver attached, heartbeats flowing
+    #   disconnected — cleanly stopped (source disabled, or graceful shutdown)
+    #   error        — failed to open or stay on the channel; see last_error
+    status: Mapped[str] = mapped_column(String(20), default="needs_login", nullable=False)
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Liveness + observability for the Sources UI. last_heartbeat_at proves the
+    # watcher is alive even on a quiet channel (where last_message_at goes stale
+    # for legitimate reasons); last_seen_message_id is the newest Discord
+    # snowflake we ingested, used to resume without re-reading the backlog.
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_seen_message_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
