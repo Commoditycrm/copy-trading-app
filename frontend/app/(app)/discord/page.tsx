@@ -1177,18 +1177,6 @@ function StepHeader({ n, icon, title }: { n: number; icon: React.ReactNode; titl
   return (
     <div className="flex items-center gap-2.5">
       <span
-        className="inline-flex items-center justify-center rounded-lg text-[11px] font-semibold"
-        style={{
-          width: 22,
-          height: 22,
-          background: "var(--accent-glow)",
-          color: "var(--accent-2)",
-          border: "1px solid rgba(44,147,197,0.35)",
-        }}
-      >
-        {n}
-      </span>
-      <span
         className="inline-flex items-center gap-1.5 text-sm font-semibold"
         style={{ color: "var(--text)" }}
       >
