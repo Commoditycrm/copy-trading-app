@@ -53,11 +53,20 @@ DEFAULT_QUANTITY = Decimal(1)
 _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 
 # $TSLA 375 CALL 0DTE @0.95   /   $AAPL 330 CALL 09/04 @1.00
+#   AAPL $350 CALL 09/02        (no price — a market entry)
+#
+# The "$" floats: some channels put it on the ticker, some on the strike, some
+# on both. Allow it in either position rather than assuming one house style.
+#
+# The entry price is OPTIONAL, but then an EXPIRY is required — see _is_entry().
+# Without that rule this pattern would also swallow "$TSLA 375c +43%", turning a
+# running P&L update into a BUY order.
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
+    rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
-    rf"@\s*\$?(?P<price>{_NUM})\b(?P<trailing>[\s,;].*)?$",
+    rf"(?:@\s*\$?(?P<price>{_NUM})\b)?"
+    rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
 )
 
@@ -65,7 +74,7 @@ _ENTRY_RE = re.compile(
 _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
+    rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
@@ -81,7 +90,7 @@ _EXIT_RE = re.compile(
 # so they are recognised explicitly and NOT traded.
 _UPDATE_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
+    rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE | re.DOTALL,
@@ -98,9 +107,9 @@ class CompactAlertParser(Parser):
         # Update lines are claimed too, so parse() can report WHY they aren't
         # traded rather than letting them fall through as generic chatter.
         return any(
-            _ENTRY_RE.match(ln)
+            _UPDATE_RE.match(ln)
             or (_has_marker(ln) and _EXIT_RE.match(ln))
-            or _UPDATE_RE.match(ln)
+            or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln)))
             for ln in self._lines(message)
         )
 
@@ -116,13 +125,15 @@ class CompactAlertParser(Parser):
                     sig, err = self._exit(m, message)
                     (signals.append(sig) if sig else errors.append(err))
                 continue
-            m = _ENTRY_RE.match(line)
-            if m:
-                sig, err = self._entry(m, message)
-                (signals.append(sig) if sig else errors.append(err))
-                continue
+            # Updates are checked FIRST: "$TSLA 375c +43%" would otherwise
+            # satisfy the (now price-optional) entry pattern and become a BUY.
             if _UPDATE_RE.match(line):
                 saw_update = True
+                continue
+            m = _ENTRY_RE.match(line)
+            if m and _is_entry(m):
+                sig, err = self._entry(m, message)
+                (signals.append(sig) if sig else errors.append(err))
 
         if signals:
             return ParseResult.parsed_many(signals)
@@ -205,6 +216,19 @@ class CompactAlertParser(Parser):
             ),
             None,
         )
+
+
+def _is_entry(m: re.Match) -> bool:
+    """Is this contract line actually an instruction to open a position?
+
+    A price makes it unambiguous. Without one, an EXPIRY is what separates a
+    real entry ("AAPL $350 CALL 09/02") from a bare mention of a contract — and
+    a trailing signed percentage means it's a P&L update, never an entry.
+    """
+    if not (m.group("price") or m.group("exp")):
+        return False
+    trailing = (m.group("trailing") or "").strip()
+    return not re.match(rf"^[+\-−]\s*(?:{_NUM})\s*%", trailing)
 
 
 def _has_marker(line: str) -> bool:
