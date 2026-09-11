@@ -11,7 +11,7 @@ Two audiences share this module, and the split matters:
     ``DiscordAssignmentOut`` is the ONE place a decrypted session crosses a wire.
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -40,6 +40,15 @@ class DiscordSourceUpdateIn(BaseModel):
 
     label: str | None = Field(default=None, min_length=1, max_length=120)
     is_enabled: bool | None = None
+
+    # Active window. "always" | "market" | "extended" | "custom".
+    schedule_mode: str | None = Field(default=None, pattern=r"^(always|market|extended|custom)$")
+    schedule_start: time | None = None
+    schedule_end: time | None = None
+    schedule_timezone: str | None = Field(default=None, max_length=64)
+    # Mon=0 … Sun=6. Empty means weekdays.
+    schedule_days: list[int] | None = Field(default=None, max_length=7)
+
     # Repoint this source at a different channel. Allowed WITHOUT re-uploading a
     # session, because the stored session authenticates the Discord ACCOUNT, not
     # one channel — any channel that account can already open is reachable with
@@ -86,6 +95,14 @@ class DiscordSourceOut(BaseModel):
     last_message_at: datetime | None
     last_seen_message_id: str | None
     created_at: datetime
+
+    # Active window, plus a human-readable summary for the card.
+    schedule_mode: str
+    schedule_start: time | None
+    schedule_end: time | None
+    schedule_timezone: str | None
+    schedule_days: list[int]
+    schedule_summary: str = "Always"
 
     # Derived, not a column — the API layer fills this in from the encrypted
     # session via ``describe_session``. It needs a default because
@@ -282,3 +299,62 @@ class DiscordPairCompleteIn(BaseModel):
     code: str = Field(min_length=6, max_length=20)
     upload_token: str = Field(min_length=16, max_length=200)
     storage_state: dict[str, Any]
+
+
+class DiscordSignalOut(BaseModel):
+    """A parsed Discord alert, shaped for the Order History "Discord" tab.
+
+    Display only. These are readings of what an alert SAID — no order exists
+    behind them, and ``status`` reflects how far the message got in the
+    pipeline, not a broker state. ``order_id`` stays null until execution is
+    wired up.
+    """
+
+    # Unique per ROW. One message can carry several trades, so the message id
+    # alone isn't a key.
+    row_key: str
+    id: uuid.UUID
+    source_id: uuid.UUID
+    source_label: str
+    channel_name: str | None
+
+    discord_message_id: str
+    author: str | None
+    posted_at: datetime | None
+    created_at: datetime
+    # The original text, kept alongside the reading so a wrong parse is
+    # immediately obvious in the UI.
+    content: str
+    embeds: list[Any]
+
+    # received | ignored | parsed | invalid | order_created | order_failed
+    status: str
+    status_reason: str | None
+
+    # Flattened from parsed_signal for the table; null when not PARSED.
+    action: str | None = None
+    asset_type: str | None = None
+    symbol: str | None = None
+    option_type: str | None = None
+    strike: str | None = None
+    expiration: str | None = None
+    quantity: str | None = None
+    order_type: str | None = None
+    limit_price: str | None = None
+    is_partial_close: bool = False
+    remaining_quantity: str | None = None
+    original_quantity: str | None = None
+    position_closed: bool = False
+    # The alert named a contract but no expiry (typical of exit alerts); it must
+    # be resolved from the open position, never guessed.
+    expiry_unspecified: bool = False
+    source_action: str | None = None
+
+    # Figures the alert REPORTED, not computed by us.
+    notional: str | None = None
+    pnl_amount: str | None = None
+    pnl_percent: str | None = None
+    total_pnl_amount: str | None = None
+    total_pnl_percent: str | None = None
+
+    order_id: uuid.UUID | None = None
