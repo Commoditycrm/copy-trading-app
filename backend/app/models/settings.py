@@ -58,6 +58,25 @@ class TraderSettings(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False,
     )
 
+    # ── Discord alert INBOUND handling ───────────────────────────────────────
+    # How parsed alerts from ANY connected Discord channel are handled:
+    #
+    #   manual — the trader accepts or rejects each one in Order History
+    #   auto   — a successful parse is treated as approved, ready for execution
+    #
+    # One setting for the whole account rather than per channel: it expresses how
+    # much the trader trusts automation in general, and splitting it per channel
+    # made it easy to leave one feed on auto by accident.
+    #
+    # Defaults to MANUAL. This decides whether an alert can one day reach a
+    # broker unattended, so the safe option has to be the one you get by default.
+    #
+    # NOTE this is the INBOUND feature, unrelated to discord_webhook_url /
+    # discord_alerts_enabled above, which broadcast the trader's own fills OUT.
+    discord_execution_mode: Mapped[str] = mapped_column(
+        String(10), default="manual", server_default="manual", nullable=False,
+    )
+
     user = relationship("User", back_populates="trader_settings")
 
 
