@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models.discord_alert_source import DiscordAlertSource
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
+from app.services.discord_parsers import ParsedMessage, ParseStatus, parse_message
 from app.services import events
 from app.services.redis_client import get_sync_redis
 
@@ -158,6 +159,7 @@ def _persist(db: Session, source: DiscordAlertSource, raw: dict[str, Any]) -> Di
         embeds=list(raw.get("embeds") or []),
         status=DiscordMessageStatus.RECEIVED,
     )
+    _apply_parse(row)
     try:
         with db.begin_nested():
             db.add(row)
@@ -165,6 +167,49 @@ def _persist(db: Session, source: DiscordAlertSource, raw: dict[str, Any]) -> Di
     except IntegrityError:
         return None
     return row
+
+
+def _apply_parse(row: DiscordMessage) -> None:
+    """Read the message and record what it says.
+
+    Parsing at intake rather than in a later worker keeps the stored row and its
+    reading in one transaction, so a message can never be visible without a
+    verdict on it. Parsing is pure — no network, no broker, no order — so it
+    costs nothing to do here.
+
+    NOTHING is executed as a result. A parsed signal is a reading of what the
+    message SAYS; validation, risk checks and execution are separate stages.
+    """
+    try:
+        result = parse_message(
+            ParsedMessage(
+                content=row.content or "",
+                embeds=list(row.embeds or []),
+                author=row.author,
+                posted_at=row.posted_at,
+            )
+        )
+    except Exception:  # noqa: BLE001
+        # A parser bug must never cost us the message itself — the row stays at
+        # RECEIVED and can be re-read once the parser is fixed.
+        log.exception("discord_ingest: parse failed for message=%s", row.discord_message_id)
+        return
+
+    if result.status is ParseStatus.PARSED and result.signals:
+        row.status = DiscordMessageStatus.PARSED
+        row.parsed_signals = [sig.as_dict() for sig in result.signals]
+        # Primary, for single-trade rendering; the full list is above.
+        row.parsed_signal = row.parsed_signals[0]
+        row.status_reason = (
+            f"{len(result.signals)} trades in this alert"
+            if len(result.signals) > 1 else None
+        )
+    elif result.status is ParseStatus.INVALID:
+        row.status = DiscordMessageStatus.INVALID
+        row.status_reason = (result.reason or "couldn't be read as a trade")[:480]
+    else:
+        row.status = DiscordMessageStatus.IGNORED
+        row.status_reason = (result.reason or "not a trade alert")[:480]
 
 
 def ingest_batch(

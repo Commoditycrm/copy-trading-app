@@ -61,9 +61,24 @@ type DiscordSource = {
   last_seen_message_id: string | null;
   created_at: string;
   session: SessionInfo;
+  // Active window: always | market | extended | custom
+  schedule_mode: string;
+  schedule_start: string | null;
+  schedule_end: string | null;
+  schedule_timezone: string | null;
+  schedule_days: number[];
+  schedule_summary: string;
+};
+
+const SCHEDULE_LABEL: Record<string, string> = {
+  always: "Always on",
+  market: "US market hours",
+  extended: "US extended hours",
+  custom: "Custom hours",
 };
 
 const STATUS_LABEL: Record<string, string> = {
+  off_schedule: "Outside hours",
   needs_login: "Sign-in needed",
   connecting: "Connecting",
   connected: "Connected",
@@ -164,6 +179,47 @@ export default function DiscordPage() {
     } catch (e) {
       setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, is_enabled: !next } : x)));
       notify.fromError(e, "Could not update");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function setSchedule(s: DiscordSource, mode: string) {
+    setBusyId(s.id);
+    try {
+      const body: Record<string, unknown> = { schedule_mode: mode };
+      if (mode === "custom" && !s.schedule_start) {
+        // Seed a sane first window so "custom" is never a schedule that
+        // matches nothing the moment it's selected.
+        body.schedule_start = "09:30:00";
+        body.schedule_end = "16:00:00";
+        body.schedule_timezone = "America/New_York";
+      }
+      const updated = await api<DiscordSource>(`/api/discord-sources/${s.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      });
+      setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+    } catch (e) {
+      notify.fromError(e, "Could not update the schedule");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function setCustomWindow(s: DiscordSource, field: "start" | "end", value: string) {
+    setBusyId(s.id);
+    try {
+      const updated = await api<DiscordSource>(`/api/discord-sources/${s.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          [`schedule_${field}`]: `${value}:00`,
+          schedule_timezone: s.schedule_timezone || "America/New_York",
+        }),
+      });
+      setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+    } catch (e) {
+      notify.fromError(e, "Could not update the window");
     } finally {
       setBusyId(null);
     }
@@ -574,6 +630,55 @@ export default function DiscordPage() {
                     </button>
                   </div>
                 )}
+
+                {/* Active window — outside it, no session is held open */}
+                <div className="flex items-center gap-2 flex-wrap text-xs">
+                  <span style={{ color: "var(--muted)" }}>Watch:</span>
+                  <select
+                    value={s.schedule_mode}
+                    disabled={busyId === s.id}
+                    onChange={(e) => setSchedule(s, e.target.value)}
+                    className="rounded-md border px-2 py-1 bg-transparent focus-ring"
+                    style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                  >
+                    {Object.entries(SCHEDULE_LABEL).map(([v, label]) => (
+                      <option key={v} value={v} style={{ background: "var(--surface, #111)" }}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+
+                  {s.schedule_mode === "custom" && (
+                    <>
+                      <input
+                        type="time"
+                        defaultValue={(s.schedule_start || "09:30:00").slice(0, 5)}
+                        disabled={busyId === s.id}
+                        onBlur={(e) => setCustomWindow(s, "start", e.target.value)}
+                        className="rounded-md border px-2 py-1 bg-transparent focus-ring"
+                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                      />
+                      <span style={{ color: "var(--muted)" }}>to</span>
+                      <input
+                        type="time"
+                        defaultValue={(s.schedule_end || "16:00:00").slice(0, 5)}
+                        disabled={busyId === s.id}
+                        onBlur={(e) => setCustomWindow(s, "end", e.target.value)}
+                        className="rounded-md border px-2 py-1 bg-transparent focus-ring"
+                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                      />
+                      <span style={{ color: "var(--muted)" }}>
+                        {s.schedule_timezone || "America/New_York"}
+                      </span>
+                    </>
+                  )}
+
+                  {s.schedule_mode !== "always" && (
+                    <span style={{ color: "var(--warn, #b45309)" }}>
+                      · alerts posted outside these hours are not received
+                    </span>
+                  )}
+                </div>
 
                 <div className="text-xs flex gap-4 flex-wrap" style={{ color: "var(--muted)" }}>
                   <span>Last message: {relativeTime(s.last_message_at)}</span>

@@ -127,6 +127,24 @@ class DiscordMessage(Base, TimestampMixin):
     # past", "insufficient buying power").
     status_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # What the parser read out of this message, as
+    # ``services.discord_parsers.TradeSignal.as_dict`` — action, symbol, strike,
+    # expiry, quantity, price. NULL unless status is PARSED.
+    #
+    # Stored denormalised rather than re-parsed on read: the parser will change,
+    # and the audit trail has to show what we ACTUALLY understood at the time,
+    # not what today's code would make of the same text.
+    parsed_signal: Mapped[dict[str, Any] | None] = mapped_column(
+        _JSON, nullable=True
+    )
+    # EVERY signal read from this message. Alert channels routinely post a block
+    # of exits in one message ("✂️ $SPY 769c" / "✂️ $SPY 770c"), and keeping only
+    # the first would silently drop real trades. ``parsed_signal`` above stays as
+    # the primary for single-trade rendering; this is the complete list.
+    parsed_signals: Mapped[list[Any]] = mapped_column(
+        _JSON, default=list, server_default="[]", nullable=False
+    )
+
     # Set once this message produces an order (step 6). Nullable + SET NULL so
     # deleting an order never destroys the message that caused it.
     order_id: Mapped[uuid.UUID | None] = mapped_column(

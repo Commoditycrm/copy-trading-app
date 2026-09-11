@@ -55,6 +55,7 @@ from app.schemas.discord import (
     DiscordPairClaimOut,
     DiscordPairCompleteIn,
     DiscordPairOut,
+    DiscordSignalOut,
     DiscordIngestOut,
     DiscordListenerStatusIn,
     DiscordMessageBatchIn,
@@ -65,7 +66,7 @@ from app.schemas.discord import (
     DiscordSourceOut,
     DiscordSourceUpdateIn,
 )
-from app.services import discord_ingest, discord_login, discord_pairing, events
+from app.services import discord_ingest, discord_login, discord_pairing, discord_schedule, events
 from app.services.discord_session import (
     DiscordSessionError,
     decrypt_session,
@@ -125,6 +126,12 @@ def _to_out(src: DiscordAlertSource) -> DiscordSourceOut:
     so the default is never what the caller actually sees.
     """
     out = DiscordSourceOut.model_validate(src)
+    out.schedule_summary = discord_schedule.describe(
+        mode=src.schedule_mode,
+        start=src.schedule_start,
+        end=src.schedule_end,
+        timezone=src.schedule_timezone,
+    )
     out.session = DiscordSessionInfo(
         **describe_session(src.encrypted_session, src.session_captured_at)
     )
@@ -183,6 +190,113 @@ def create_source(
     return _to_out(src)
 
 
+@router.get("/signals/page", response_model=Page[DiscordSignalOut])
+def list_signals(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+    status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None, description="Symbol substring"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Page[DiscordSignalOut]:
+    """Parsed Discord alerts across ALL of this trader's sources, newest first.
+
+    Powers the "Discord" tab in Order History. Display only — these are readings
+    of what alerts said, not orders. Defaults to hiding non-trade chatter, since
+    a channel is mostly chatter and an unfiltered list would bury the alerts.
+    """
+    joined = (
+        select(DiscordMessage, DiscordAlertSource)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id)
+        .where(DiscordMessage.user_id == user.id)
+    )
+    if status_filter and status_filter != "all":
+        try:
+            joined = joined.where(DiscordMessage.status == DiscordMessageStatus(status_filter))
+        except ValueError:
+            raise HTTPException(400, f"invalid_status: {status_filter}")
+    else:
+        # "All" still means all TRADE-ish messages — plain chatter isn't an
+        # order-history row.
+        joined = joined.where(
+            DiscordMessage.status != DiscordMessageStatus.IGNORED
+        )
+    if search:
+        joined = joined.where(DiscordMessage.content.ilike(f"%{search}%"))
+
+    total = db.execute(
+        select(func.count()).select_from(joined.subquery())
+    ).scalar_one()
+    rows = db.execute(
+        joined.order_by(DiscordMessage.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+
+    # One ROW PER TRADE, not per message: a message carrying two exits is two
+    # rows, because that's what the trader needs to see. `total` stays a message
+    # count — paging on an expanded count would need a different query shape and
+    # the discrepancy is only visible on multi-trade alerts.
+    items: list[DiscordSignalOut] = []
+    for m, src in rows:
+        signals = list(m.parsed_signals or ([m.parsed_signal] if m.parsed_signal else []))
+        if not signals:
+            items.append(_signal_out(m, src, {}, 0))
+            continue
+        for idx, sig in enumerate(signals):
+            items.append(_signal_out(m, src, sig or {}, idx))
+
+    return Page[DiscordSignalOut](
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _signal_out(
+    m: DiscordMessage, src: DiscordAlertSource, sig: dict, idx: int = 0
+) -> DiscordSignalOut:
+    """Flatten a message + ONE of its parsed signals into a table row."""
+    return DiscordSignalOut(
+        # A message with several trades produces several rows, so the row key
+        # has to distinguish them.
+        row_key=f"{m.id}:{idx}",
+        id=m.id,
+        source_id=src.id,
+        source_label=src.label,
+        channel_name=src.channel_name,
+        discord_message_id=m.discord_message_id,
+        author=m.author,
+        posted_at=m.posted_at,
+        created_at=m.created_at,
+        content=m.content or "",
+        embeds=list(m.embeds or []),
+        status=m.status.value if hasattr(m.status, "value") else str(m.status),
+        status_reason=m.status_reason,
+        action=sig.get("action"),
+        asset_type=sig.get("asset_type"),
+        symbol=sig.get("symbol"),
+        option_type=sig.get("option_type"),
+        strike=sig.get("strike"),
+        expiration=sig.get("expiration"),
+        quantity=sig.get("quantity"),
+        order_type=sig.get("order_type"),
+        limit_price=sig.get("limit_price"),
+        is_partial_close=bool(sig.get("is_partial_close")),
+        remaining_quantity=sig.get("remaining_quantity"),
+        original_quantity=sig.get("original_quantity"),
+        position_closed=bool(sig.get("position_closed")),
+        source_action=sig.get("source_action"),
+        notional=sig.get("notional"),
+        pnl_amount=sig.get("pnl_amount"),
+        pnl_percent=sig.get("pnl_percent"),
+        total_pnl_amount=sig.get("total_pnl_amount"),
+        total_pnl_percent=sig.get("total_pnl_percent"),
+        order_id=m.order_id,
+        expiry_unspecified=bool(sig.get("expiry_unspecified")),
+    )
+
+
 @router.patch("/{source_id}", response_model=DiscordSourceOut)
 def update_source(
     source_id: uuid.UUID,
@@ -218,6 +332,18 @@ def update_source(
                 "connecting" if (src.encrypted_session and src.is_enabled) else
                 "disconnected" if not src.is_enabled else "needs_login"
             )
+    if payload.schedule_mode is not None:
+        src.schedule_mode = payload.schedule_mode
+    if payload.schedule_start is not None:
+        src.schedule_start = payload.schedule_start
+    if payload.schedule_end is not None:
+        src.schedule_end = payload.schedule_end
+    if payload.schedule_timezone is not None:
+        src.schedule_timezone = payload.schedule_timezone or None
+    if payload.schedule_days is not None:
+        # Ignore junk rather than reject: an out-of-range day would otherwise
+        # make the whole window unsatisfiable and silently stop alerts.
+        src.schedule_days = sorted({d for d in payload.schedule_days if 0 <= d <= 6})
     if payload.is_enabled is not None and payload.is_enabled != src.is_enabled:
         src.is_enabled = payload.is_enabled
         # Reflect the intent immediately so the UI doesn't show a stale
@@ -509,6 +635,29 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
     out: list[DiscordAssignmentOut] = []
     dirty = False
     for src in rows:
+        # Outside its active window a source is simply withheld; the listener's
+        # reconcile then closes the watcher, exactly as if it had been disabled.
+        # This is the ONLY place the schedule is enforced — there is no scheduler
+        # and no listener-side clock to drift.
+        if not discord_schedule.in_window(
+            mode=src.schedule_mode,
+            start=src.schedule_start,
+            end=src.schedule_end,
+            timezone=src.schedule_timezone,
+            days=list(src.schedule_days or []),
+        ):
+            if src.status not in ("off_schedule", "needs_login"):
+                src.status = "off_schedule"
+                src.last_error = None
+                dirty = True
+            continue
+
+        # Back inside the window — clear the off-schedule marker so the card
+        # doesn't sit on a stale label until the watcher reports in.
+        if src.status == "off_schedule":
+            src.status = "connecting"
+            dirty = True
+
         try:
             state = decrypt_session(src.encrypted_session or "")
         except (ValueError, TypeError):
