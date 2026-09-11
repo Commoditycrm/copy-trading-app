@@ -26,6 +26,11 @@ export type AppEvent =
       position_sl_pct: string | null;
       broker: string;
     }
+  /** Fired by the Discord listener intake when new alerts land for this
+   *  trader. Drives the live refresh of Order History's Discord tab. */
+  | { type: "discord.message_received"; source_id: string; count: number }
+  /** Connection state of one Discord source changed. */
+  | { type: "discord.source_status"; source_id: string; status: string; error: string | null }
   /** Fired when an admin toggles a trader's Sell-All access — the trader's
    *  client re-fetches /me so the suite shows/hides live. */
   | { type: "access.sell_all_changed"; enabled: boolean };

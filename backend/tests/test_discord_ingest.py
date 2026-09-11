@@ -405,6 +405,16 @@ def test_record_status_truncates_an_overlong_error():
 # attribute to read for it. Getting that wrong 500s every list/create/update
 # response — which is exactly what happened — so the shape is pinned here.
 
+class _FakeAccount:
+    """The connected Discord account a source reads with. The session lives
+    HERE, not on the source — one sign-in covers every channel it can read."""
+
+    def __init__(self, session_token=None, captured_at=None):
+        self.id = uuid.uuid4()
+        self.encrypted_session = session_token
+        self.session_captured_at = captured_at
+
+
 class _FakeRow(_FakeSource):
     """A source row with the full column set the response model reads."""
 
@@ -415,8 +425,7 @@ class _FakeRow(_FakeSource):
         self.guild_name = None
         self.is_enabled = True
         self.created_at = _T0
-        self.encrypted_session = session_token
-        self.session_captured_at = captured_at
+        self.account = _FakeAccount(session_token, captured_at)
         # Schedule columns — mirrored from the model so the response schema can
         # be validated against this stand-in the way it would a real row.
         self.schedule_mode = "always"
@@ -471,3 +480,51 @@ def test_repointing_a_channel_resets_the_high_water_mark():
 
     assert src.last_seen_message_id is None
     assert src.channel_name is None
+
+
+# ── Account-level sessions ───────────────────────────────────────────────────
+# A Discord session authenticates an ACCOUNT, not a channel. These pin the
+# behaviour that follows from that: connect once, and every channel that account
+# can read is covered — no second sign-in.
+
+def test_channels_sharing_an_account_share_its_session():
+    """The point of the whole model: a second channel added to a connected
+    account is live immediately, with no sign-in of its own."""
+    from app.api.discord_sources import _to_out
+
+    account = _FakeAccount(encrypt_session(_state()), datetime.now(timezone.utc))
+    a, b = _FakeRow(), _FakeRow()
+    a.account = b.account = account
+
+    assert _to_out(a).session.present is True
+    assert _to_out(b).session.present is True
+
+
+def test_a_channel_with_no_account_reports_no_session():
+    """A channel whose account was removed must read as disconnected, not
+    inherit a stale 'connected' from somewhere."""
+    from app.api.discord_sources import _to_out
+
+    row = _FakeRow()
+    row.account = None
+    out = _to_out(row)
+    assert out.session.present is False
+    assert out.session.cookie_count == 0
+
+
+def test_revoking_an_account_session_affects_every_channel_on_it():
+    """Sign-out revokes the ACCOUNT's session. Leaving a sibling channel marked
+    connected would imply a per-channel login that no longer exists."""
+    from app.api.discord_sources import _to_out
+
+    account = _FakeAccount(encrypt_session(_state()), datetime.now(timezone.utc))
+    a, b = _FakeRow(), _FakeRow()
+    a.account = b.account = account
+    assert _to_out(a).session.present and _to_out(b).session.present
+
+    # What clear_session does to the account.
+    account.encrypted_session = None
+    account.session_captured_at = None
+
+    assert _to_out(a).session.present is False
+    assert _to_out(b).session.present is False
