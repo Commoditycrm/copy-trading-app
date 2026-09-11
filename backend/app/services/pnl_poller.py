@@ -632,22 +632,32 @@ def _enforce_one(acct: BrokerAccount) -> None:
         now_utc = datetime.now(timezone.utc)
         invalidate_trader_id: uuid.UUID | None = None
 
-        # ── Auto-resume next-UTC-day for daily-limit pauses ──────────────
+        # ── Auto-resume next-ET-day for daily-limit pauses ───────────────
         # The three daily kill switches (daily_loss_limit,
         # daily_profit_limit, max_account_pct_per_day, plus their _pct
         # variants) stamp `pnl_auto_paused_at` when they trip. This block
-        # checks whether that stamp is from a prior UTC day and, if so,
-        # flips copy_enabled back on and clears the stamp. Auto-liquidation
+        # checks whether that stamp is from a prior ET *market* day and, if
+        # so, flips copy_enabled back on and clears the stamp. Auto-liquidation
         # (auto_liquidation_limit) uses a DIFFERENT column
         # (`auto_liquidated_at`) and is intentionally not affected here —
         # liquidation stays sticky until the subscriber manually re-enables
         # copy from Settings. That separation lets us bring back daily
         # auto-resume without re-introducing it for the liquidation case.
+        #
+        # Boundary is ET, not UTC: the loss/profit checks below measure the
+        # broker's trading day (Alpaca `todays_pl = equity − last_equity`,
+        # last_equity = the prior ET market close) and the Calendar is ET. At
+        # 00:00 UTC (8pm ET) the ET day hasn't rolled, so a UTC-day resume
+        # would flip copy on then re-trip the still-standing loss on the same
+        # tick — a resume/re-pause flip-flop. Keying resume off the ET day
+        # lines it up with when todays_pl actually resets.
+        from app.services import market_hours as _mh  # noqa: PLC0415
+        now_et = _mh.now_et()
         paused_at = s.pnl_auto_paused_at
         if paused_at is not None:
             if paused_at.tzinfo is None:
                 paused_at = paused_at.replace(tzinfo=timezone.utc)
-            if paused_at.astimezone(timezone.utc).date() < now_utc.date():
+            if paused_at.astimezone(_mh.ET).date() < now_et.date():
                 s.copy_enabled = True
                 s.pnl_auto_paused_at = None
                 audit.record(
@@ -671,7 +681,7 @@ def _enforce_one(acct: BrokerAccount) -> None:
                         user_id=s.user_id,
                         type="copy.auto_resumed_next_day",
                         message=(
-                            "Copy trading resumed automatically for the new UTC "
+                            "Copy trading resumed automatically for the new "
                             "trading day. It was paused yesterday by one of your "
                             "daily risk limits."
                         ),

@@ -407,12 +407,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
         {/* Summary strip */}
         <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
-          <SummaryTile label="Realized P&L · Today"
+          <SummaryTile label="P&L · Today"
             tone={todayRealized == null ? "neutral" : todayRealized > 0 ? "good" : todayRealized < 0 ? "bad" : "neutral"}
             node={todayRealized == null
               ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
               : <AnimatedNumber value={todayRealized} format={fmtSignedUsd} className="num" />}
-            sub="Closed today" />
+            sub="Matches Calendar" />
           <SummaryTile label="Unrealized P&L" tone={summary.pnl > 0 ? "good" : summary.pnl < 0 ? "bad" : "neutral"}
             node={<AnimatedNumber value={summary.pnl} format={fmtSignedUsd} className="num" />}
             sub="On open positions" />
