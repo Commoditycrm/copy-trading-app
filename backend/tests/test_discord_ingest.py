@@ -256,7 +256,11 @@ def test_a_message_is_stored_even_when_the_queue_is_down(db, monkeypatch):
     assert report.rejected == []          # NOT rejected — we kept it
     row = db.execute(select(DiscordMessage)).scalar_one()
     assert row.discord_message_id == "100"
-    assert row.status is DiscordMessageStatus.RECEIVED
+    # Parsing runs at intake, so the row carries a verdict rather than sitting
+    # at RECEIVED. This fixture ("BUY AAPL 250C", no expiry) is correctly
+    # INVALID — the durability claim under test is that the row EXISTS.
+    assert row.status is DiscordMessageStatus.INVALID
+    assert row.content == "BUY AAPL 250C"
 
 
 def test_duplicate_is_stopped_by_the_database_not_a_cache(db, redis):
@@ -413,6 +417,13 @@ class _FakeRow(_FakeSource):
         self.created_at = _T0
         self.encrypted_session = session_token
         self.session_captured_at = captured_at
+        # Schedule columns — mirrored from the model so the response schema can
+        # be validated against this stand-in the way it would a real row.
+        self.schedule_mode = "always"
+        self.schedule_start = None
+        self.schedule_end = None
+        self.schedule_timezone = None
+        self.schedule_days = []
 
 
 def test_response_serialises_a_source_with_no_session():
