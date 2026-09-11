@@ -112,6 +112,10 @@ export default function DiscordPage() {
   const [loginFor, setLoginFor] = useState<DiscordSource | null>(null);
   const [login, setLogin] = useState<LoginSession | null>(null);
   // Desktop Connector pairing — the primary way to connect a Discord account.
+  // Account-wide handling of parsed alerts. Manual until the server says
+  // otherwise — never assume the permissive mode while loading.
+  const [execMode, setExecMode] = useState<string>("manual");
+  const [modeBusy, setModeBusy] = useState(false);
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
 
@@ -121,7 +125,15 @@ export default function DiscordPage() {
 
   async function load() {
     try {
-      setSources(await api<DiscordSource[]>("/api/discord-sources"));
+      // Channels and the account-wide alert-handling mode are fetched together:
+      // the mode is part of the page's state, and loading it separately left the
+      // card showing the default until something else happened to refresh it.
+      const [list, settings] = await Promise.all([
+        api<DiscordSource[]>("/api/discord-sources"),
+        api<{ execution_mode: string }>("/api/discord-sources/settings"),
+      ]);
+      setSources(list);
+      setExecMode(settings.execution_mode);
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
     }
@@ -205,6 +217,26 @@ export default function DiscordPage() {
       notify.fromError(e, "Could not update the schedule");
     } finally {
       setBusyId(null);
+    }
+  }
+
+  async function setExecutionMode(mode: string) {
+    setModeBusy(true);
+    try {
+      const next = await api<{ execution_mode: string }>("/api/discord-sources/settings", {
+        method: "PATCH",
+        body: JSON.stringify({ execution_mode: mode }),
+      });
+      setExecMode(next.execution_mode);
+      notify.success(
+        mode === "auto"
+          ? "Parsed alerts will be approved automatically"
+          : "You'll review each alert before it's approved"
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not change the mode");
+    } finally {
+      setModeBusy(false);
     }
   }
 
@@ -803,6 +835,80 @@ export default function DiscordPage() {
           </form>
 
         
+          {/* Step 3 — what happens to a parsed alert. Account-wide: it says how
+              much you trust automation in general, not something that differs
+              per feed. */}
+          <div className="card p-5 space-y-3.5">
+            <StepHeader n={3} icon={<ScanLine size={14} />} title="Alert handling" />
+
+            <div className="space-y-2">
+              {[
+                {
+                  value: "manual",
+                  label: "Review each alert",
+                  detail: "Accept or reject every alert in Order History.",
+                },
+                {
+                  value: "auto",
+                  label: "Auto-approve",
+                  detail: "Parsed alerts are marked ready for execution straight away.",
+                },
+              ].map(({ value, label, detail }) => {
+                const active = execMode === value;
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    disabled={modeBusy}
+                    onClick={() => setExecutionMode(value)}
+                    className="w-full text-left rounded-xl px-3.5 py-3 transition-colors disabled:opacity-60"
+                    style={{
+                      background: active ? "var(--accent-glow)" : "var(--panel-2)",
+                      border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="inline-flex items-center justify-center rounded-full shrink-0"
+                        style={{
+                          width: 14, height: 14,
+                          border: `1px solid ${active ? "var(--accent-2)" : "var(--border-strong)"}`,
+                          background: active ? "var(--accent-2)" : "transparent",
+                        }}
+                      >
+                        {active && (
+                          <span
+                            className="inline-block rounded-full"
+                            style={{ width: 5, height: 5, background: "var(--accent-ink)" }}
+                          />
+                        )}
+                      </span>
+                      <span
+                        className="text-[12.5px] font-semibold"
+                        style={{ color: active ? "var(--accent-2)" : "var(--text)" }}
+                      >
+                        {label}
+                      </span>
+                    </div>
+                    <p
+                      className="text-[11px] mt-1 leading-snug pl-[22px]"
+                      style={{ color: "var(--muted)" }}
+                    >
+                      {detail}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+
+            <p
+              className="text-[11px] leading-relaxed"
+              style={{ color: "var(--muted)", borderTop: "1px solid var(--border)", paddingTop: 10 }}
+            >
+              Applies to alerts from every connected channel, from now on. Nothing is sent to a
+              broker in either mode yet.
+            </p>
+          </div>
         </aside>
       </div>
 

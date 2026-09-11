@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import app.services.discord_ingest as ingest
-from app.models.discord_message import DiscordMessage, DiscordMessageStatus
+from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.services.discord_session import (
     DiscordSessionError,
     describe_session,
@@ -558,3 +558,82 @@ def test_status_without_a_baseline_leaves_the_mark_alone(redis):
 
     ingest.record_status(src, "connected")
     assert src.last_seen_message_id == "1546891132070404120"
+
+
+# ── Auto / manual execution mode ─────────────────────────────────────────────
+# Whether an alert is cleared for execution without a human looking at it. The
+# tests below are the guard rails on that.
+
+def _alert():
+    return _msg("900", content="$TSLA 375 CALL 0DTE @0.95")
+
+
+def test_manual_mode_leaves_a_parsed_alert_awaiting_the_trader(db, redis):
+    src = _FakeSource()
+    ingest.ingest_batch(db, src, [_alert()], auto_approve=False)
+
+    row = db.execute(select(DiscordMessage)).scalar_one()
+    assert row.status is DiscordMessageStatus.PARSED
+    assert row.decision is SignalDecision.PENDING
+    assert row.decided_at is None
+
+
+def test_auto_mode_approves_a_parsed_alert_immediately(db, redis):
+    src = _FakeSource()
+    ingest.ingest_batch(db, src, [_alert()], auto_approve=True)
+
+    row = db.execute(select(DiscordMessage)).scalar_one()
+    assert row.decision is SignalDecision.APPROVED
+    assert row.decision_mode == "auto"
+    assert row.decided_at is not None
+
+
+def test_an_unreadable_alert_is_never_approved_even_in_auto_mode():
+    """The most important guard here. Auto mode approves a SIGNAL, not a
+    message — an alert we couldn't read has no signal behind it, and approving
+    one would mean clearing an unknown trade for execution."""
+    eng = create_engine("sqlite:///:memory:")
+    DiscordMessage.__table__.create(eng)
+    with Session(eng) as db:
+        src = _FakeSource()
+        # Names a call but no strike — parses to INVALID.
+        ingest.ingest_batch(
+            db, src, [_msg("901", content="BUY AAPL CALL SEP 18 @ 2.15")], auto_approve=True
+        )
+
+        row = db.execute(select(DiscordMessage)).scalar_one()
+        assert row.status is DiscordMessageStatus.INVALID
+        assert row.decision is None
+
+
+def test_chatter_is_never_approved_in_auto_mode():
+    eng = create_engine("sqlite:///:memory:")
+    DiscordMessage.__table__.create(eng)
+    with Session(eng) as db:
+        src = _FakeSource()
+        ingest.ingest_batch(db, src, [_msg("902", content="gm everyone")], auto_approve=True)
+
+        row = db.execute(select(DiscordMessage)).scalar_one()
+        assert row.status is DiscordMessageStatus.IGNORED
+        assert row.decision is None
+
+
+def test_the_default_is_manual(db, redis):
+    """A caller that doesn't pass the mode must get the SAFE behaviour, never a
+    silent auto-approval."""
+    src = _FakeSource()
+    ingest.ingest_batch(db, src, [_alert()])   # no auto_approve given
+
+    row = db.execute(select(DiscordMessage)).scalar_one()
+    assert row.decision is SignalDecision.PENDING
+
+
+def test_the_mode_that_applied_is_recorded_on_the_alert(db, redis):
+    """The account setting can be switched later; the audit trail has to show
+    which mode actually applied when this alert arrived."""
+    src = _FakeSource()
+    ingest.ingest_batch(db, src, [_alert()], auto_approve=True)
+    row = db.execute(select(DiscordMessage)).scalar_one()
+
+    src.execution_mode = "manual"      # changed afterwards
+    assert row.decision_mode == "auto"  # unchanged

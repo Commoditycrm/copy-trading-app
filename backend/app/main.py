@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -353,9 +354,20 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to close redis client cleanly")
 
+    # When this process started. Exposed because a stale backend is invisible
+    # from the outside — code changes silently don't apply, and the symptom
+    # looks like a bug in whatever you're testing rather than "it isn't running
+    # yet". Cheap to include, and it makes "did you restart?" answerable.
+    _started_at = datetime.now(timezone.utc)
+
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True, "disclaimer": DISCLAIMER}
+        return {
+            "ok": True,
+            "started_at": _started_at.isoformat(),
+            "uptime_seconds": int((datetime.now(timezone.utc) - _started_at).total_seconds()),
+            "disclaimer": DISCLAIMER,
+        }
 
     return app
 
