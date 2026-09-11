@@ -4,7 +4,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
-import { ArrowDown, ArrowUp, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
@@ -66,6 +66,9 @@ type DiscordSignal = {
   quantity: string | null;
   order_type: string | null;
   limit_price: string | null;
+  decision: string | null;
+  decided_at: string | null;
+  decision_mode: string | null;
   is_partial_close: boolean;
   remaining_quantity: string | null;
   original_quantity: string | null;
@@ -94,6 +97,17 @@ type DiscordSignal = {
  *  is what suppresses the Cancel action on the row. */
 function signalToOrder(sig: DiscordSignal): Order {
   const failed = sig.status === "invalid" || sig.status === "order_failed";
+  // The trader's decision outranks the parse status once one exists:
+  //   rejected -> "rejected"   (declined; nothing may act on it)
+  //   approved -> "accepted"   (cleared for execution — the hand-off point)
+  //   pending  -> "pending"    (awaiting review in manual mode)
+  const status: OrderStatus = failed
+    ? "rejected"
+    : sig.decision === "rejected"
+      ? "rejected"
+      : sig.decision === "approved"
+        ? "accepted"
+        : "pending";
   return {
     id: sig.row_key,
     parent_order_id: null,
@@ -110,13 +124,17 @@ function signalToOrder(sig: DiscordSignal): Order {
     option_expiry: sig.expiration,
     option_strike: sig.strike,
     option_right: (sig.option_type === "PUT" ? "put" : sig.option_type === "CALL" ? "call" : null) as OptionRight | null,
-    status: (failed ? "rejected" : "pending") as OrderStatus,
+    status,
     broker_order_id: null,
     filled_quantity: "0",
     filled_avg_price: null,
     submitted_at: sig.posted_at,
     closed_at: null,
-    reject_reason: failed ? sig.status_reason : null,
+    reject_reason: failed
+      ? sig.status_reason
+      : sig.decision === "rejected"
+        ? "Rejected by you"
+        : null,
     created_at: sig.created_at,
     // Left null on purpose: the alert's P&L belongs to whoever posted it, not
     // to this trader. Showing it under "Realized P&L" would claim otherwise.
@@ -528,6 +546,25 @@ export default function TradesPage() {
   // Load Discord alerts only while that tab is open. They're a separate
   // endpoint (and a separate concept) from the order grid, so they don't ride
   // along with /api/trades/page.
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+
+  async function decideSignal(rowKey: string, accept: boolean) {
+    const sig = signals.find((x) => x.row_key === rowKey);
+    if (!sig) return;
+    setDecidingId(rowKey);
+    try {
+      await api(`/api/discord-sources/signals/${sig.id}/decision?accept=${accept}`, {
+        method: "POST",
+      });
+      notify.success(accept ? "Approved — ready for execution" : "Alert rejected");
+      await loadSignals(false);
+    } catch (e) {
+      notify.fromError(e, "Could not record that decision");
+    } finally {
+      setDecidingId(null);
+    }
+  }
+
   const loadSignals = useCallback(async (showSpinner = true) => {
     if (showSpinner) setSignalsLoading(true);
     try {
@@ -556,6 +593,9 @@ export default function TradesPage() {
   // table — same columns, same row renderer, same sorting.
   const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
   const isLoading = tab === "discord" ? signalsLoading : loading;
+  // Row id -> the alert behind it, so the Actions cell can reach the decision
+  // state that the Order shape has no field for.
+  const signalById = new Map(signals.map((sig) => [sig.row_key, sig]));
 
   const tabCounts: Record<StatusTab, number> = {
     all: s ? s.total : 0,
@@ -952,6 +992,30 @@ export default function TradesPage() {
                       </td>
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
+                          {/* Manual-mode Discord alerts are decided here. Only
+                              shown while a decision is still open — an approved
+                              or rejected alert is terminal, because re-deciding
+                              it would misrepresent what was cleared at the time
+                              it mattered. */}
+                          {tab === "discord" && signalById.get(o.id)?.decision === "pending" && (
+                            <>
+                              <button
+                                disabled={decidingId === o.id}
+                                onClick={() => decideSignal(o.id, true)}
+                                className="btn-primary px-3 py-1 text-xs inline-flex items-center gap-1.5 disabled:opacity-60"
+                                title="Approve — marks this alert ready for execution"
+                              >
+                                {decidingId === o.id ? <Spinner /> : <Check size={12} />} Accept
+                              </button>
+                              <button
+                                disabled={decidingId === o.id}
+                                onClick={() => decideSignal(o.id, false)}
+                                className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5 disabled:opacity-60"
+                              >
+                                <X size={12} /> Reject
+                              </button>
+                            </>
+                          )}
                           {canCancel && (
                             <button
                               disabled={actingFor?.id === o.id}
@@ -1000,7 +1064,13 @@ export default function TradesPage() {
                               </div>
                             </>
                           )}
-                          {!canCancel && !canClose && (
+                          {tab === "discord" && signalById.get(o.id)?.decision === "approved" && (
+                            <span className="text-xs" style={{ color: "var(--good)" }}>
+                              Ready for execution
+                            </span>
+                          )}
+                          {!canCancel && !canClose &&
+                            !(tab === "discord" && signalById.get(o.id)?.decision) && (
                             <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
                           )}
                         </div>
