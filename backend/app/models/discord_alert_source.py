@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, Time, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -71,6 +71,33 @@ class DiscordAlertSource(Base, TimestampMixin):
 
     # Trader on/off for THIS source. The listener only opens enabled sources.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # ── Active window ────────────────────────────────────────────────────────
+    # When to actually hold a browser session open for this channel. Outside the
+    # window the assignment is withheld and the listener closes the watcher, so
+    # a trader following US options alerts isn't holding a live Discord session
+    # at 3am. Enforced in the assignments query, NOT in the listener — see
+    # services/discord_schedule.py.
+    #
+    # Default "always" so every source created before this existed is unchanged.
+    #
+    # NOTE the real trade-off: alerts posted outside the window are NOT ingested,
+    # because nothing is connected to observe them.
+    schedule_mode: Mapped[str] = mapped_column(
+        String(16), default="always", server_default="always", nullable=False,
+    )
+    # Only meaningful for schedule_mode == "custom". end < start is a window that
+    # crosses midnight (e.g. 22:00-06:00), which is handled explicitly.
+    schedule_start: Mapped[time | None] = mapped_column(Time, nullable=True)
+    schedule_end: Mapped[time | None] = mapped_column(Time, nullable=True)
+    # IANA name (e.g. "America/New_York"). An unresolvable value falls back to
+    # ET rather than taking the source offline — a typo must not silently stop
+    # alerts. The "market"/"extended" modes are always ET regardless.
+    schedule_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Days the window applies to, Mon=0 … Sun=6. Empty/NULL means weekdays.
+    schedule_days: Mapped[list[int]] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), default=list, server_default="[]", nullable=False,
+    )
 
     # Connection lifecycle, written by the listener service:
     #   needs_login  — no session stored yet (or it expired / was revoked)
