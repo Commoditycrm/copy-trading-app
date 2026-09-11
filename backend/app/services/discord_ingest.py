@@ -298,6 +298,7 @@ def record_status(
     error: str | None = None,
     channel_name: str | None = None,
     guild_name: str | None = None,
+    baseline_message_id: str | None = None,
 ) -> None:
     """Apply a listener-reported connection state to the source row.
 
@@ -310,6 +311,13 @@ def record_status(
     if source.last_error:
         source.last_error = source.last_error[:480]
     source.last_heartbeat_at = datetime.now(timezone.utc)
+    # Where watching began. Connecting a channel means "watch it from here", so
+    # the history above this point is never ingested. Only ever set once — a
+    # later attach must not move it BACKWARDS, or that older stretch would
+    # suddenly become eligible and flood the pipeline with history.
+    if baseline_message_id and _is_newer(baseline_message_id, source.last_seen_message_id):
+        source.last_seen_message_id = baseline_message_id
+
     # Names are display-only and only known once the channel is actually open,
     # so the listener backfills them opportunistically.
     if channel_name:

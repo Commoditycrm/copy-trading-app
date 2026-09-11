@@ -186,6 +186,9 @@ class DiscordListenerStatusIn(BaseModel):
     error: str | None = Field(default=None, max_length=500)
     channel_name: str | None = Field(default=None, max_length=200)
     guild_name: str | None = Field(default=None, max_length=200)
+    # Where watching started, sent once on a channel's first attach. Existing
+    # history below this point is deliberately never ingested.
+    baseline_message_id: str | None = Field(default=None, max_length=40, pattern=r"^\d+$")
 
 
 # ── Stored messages (audit trail) ────────────────────────────────────────────

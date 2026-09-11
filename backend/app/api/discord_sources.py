@@ -816,6 +816,7 @@ def listener_status(
         error=payload.error,
         channel_name=payload.channel_name,
         guild_name=payload.guild_name,
+        baseline_message_id=payload.baseline_message_id,
     )
     db.commit()
 

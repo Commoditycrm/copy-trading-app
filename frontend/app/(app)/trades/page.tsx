@@ -16,7 +16,17 @@ import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
 import Pagination from "@/components/Pagination";
-import type { Order, OrderStatus, Position, TradeStats, User } from "@/lib/types";
+import type {
+  InstrumentType,
+  OptionRight,
+  Order,
+  OrderSide,
+  OrderStatus,
+  OrderType,
+  Position,
+  TradeStats,
+  User,
+} from "@/lib/types";
 
 const OPEN_STATUSES: OrderStatus[] = ["pending", "submitted", "accepted", "partially_filled"];
 
@@ -70,40 +80,50 @@ type DiscordSignal = {
   total_pnl_percent: string | null;
 };
 
-/** Money as the alert stated it, with sign preserved. */
-function signedMoney(v: string | null): { text: string; positive: boolean } | null {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
+
+
+/** A parsed Discord alert, shaped as an Order so it renders in the SAME grid
+ *  as everything else — no parallel table, no Discord-only columns.
+ *
+ *  Status mapping is the one judgement call: a parsed alert is not a broker
+ *  state. `parsed` becomes "pending" (accepted by us, not yet sent — which is
+ *  exactly what it is), and `invalid` becomes "rejected" carrying the parser's
+ *  reason. Once execution ships, real orders replace this mapping entirely.
+ *
+ *  `broker_account_id` is deliberately null: no broker order exists, and that
+ *  is what suppresses the Cancel action on the row. */
+function signalToOrder(sig: DiscordSignal): Order {
+  const failed = sig.status === "invalid" || sig.status === "order_failed";
   return {
-    text: `${n < 0 ? "−" : "+"}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
-    positive: n >= 0,
-  };
+    id: sig.row_key,
+    parent_order_id: null,
+    broker_account_id: null,
+    instrument_type: (sig.asset_type === "OPTION" ? "option" : "stock") as InstrumentType,
+    symbol: sig.symbol ?? "—",
+    side: (sig.action === "SELL" ? "sell" : "buy") as OrderSide,
+    order_type: (sig.order_type === "MARKET" ? "market" : "limit") as OrderType,
+    quantity: sig.quantity ?? "0",
+    limit_price: sig.limit_price,
+    stop_price: null,
+    take_profit_price: null,
+    stop_loss_price: null,
+    option_expiry: sig.expiration,
+    option_strike: sig.strike,
+    option_right: (sig.option_type === "PUT" ? "put" : sig.option_type === "CALL" ? "call" : null) as OptionRight | null,
+    status: (failed ? "rejected" : "pending") as OrderStatus,
+    broker_order_id: null,
+    filled_quantity: "0",
+    filled_avg_price: null,
+    submitted_at: sig.posted_at,
+    closed_at: null,
+    reject_reason: failed ? sig.status_reason : null,
+    created_at: sig.created_at,
+    // Left null on purpose: the alert's P&L belongs to whoever posted it, not
+    // to this trader. Showing it under "Realized P&L" would claim otherwise.
+    realized_pnl: null,
+  } as Order;
 }
 
-const SIGNAL_STATUS: Record<string, { label: string; tone: string }> = {
-  parsed: { label: "Parsed", tone: "var(--accent)" },
-  invalid: { label: "Not readable", tone: "var(--warn, #b45309)" },
-  received: { label: "Received", tone: "var(--muted)" },
-  ignored: { label: "Not a trade", tone: "var(--muted)" },
-  order_created: { label: "Order created", tone: "var(--good, #16a34a)" },
-  order_failed: { label: "Order failed", tone: "var(--danger, #b91c1c)" },
-};
-
-/** The contract as the alert described it, e.g. "AAPL $250 CALL 09/18". */
-function contractLabel(s: DiscordSignal): string {
-  if (!s.symbol) return "—";
-  if (s.asset_type !== "OPTION") return s.symbol;
-  const strike = s.strike ? `$${Number(s.strike).toLocaleString()}` : "";
-  // An exit alert names no expiry — say so rather than rendering a blank that
-  // reads like missing data.
-  const exp = s.expiration
-    ? s.expiration.slice(5).replace("-", "/")
-    : s.expiry_unspecified
-      ? "(open position)"
-      : "";
-  return [s.symbol, strike, s.option_type, exp].filter(Boolean).join(" ");
-}
 
 function fmt(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined) return "—";
@@ -532,6 +552,11 @@ export default function TradesPage() {
     loadSignals();
   }, [tab, loadSignals]);
 
+  // One grid for every tab. The Discord tab swaps the data source, not the
+  // table — same columns, same row renderer, same sorting.
+  const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
+  const isLoading = tab === "discord" ? signalsLoading : loading;
+
   const tabCounts: Record<StatusTab, number> = {
     all: s ? s.total : 0,
     working: s ? s.working : 0,
@@ -768,156 +793,9 @@ export default function TradesPage() {
         </div>
       </div>
 
-      {/* Discord alerts render their own table: they're parsed READINGS of
-          channel messages, not orders, and forcing them into the order grid's
-          columns would imply an order exists behind each one. */}
-      {tab === "discord" ? (
-        <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
-          <div
-            className="px-4 py-2 text-xs flex items-center gap-2"
-            style={{ borderBottom: "1px solid var(--border)", color: "var(--muted)" }}
-          >
-            <span
-              className="inline-block rounded-full"
-              style={{ width: 6, height: 6, background: "var(--accent)" }}
-            />
-            Alerts read from your connected Discord channels.{" "}
-            <strong style={{ color: "var(--text-2)" }}>No orders are placed from these.</strong>
-          </div>
-          <div className="overflow-auto flex-1 min-h-0">
-            <table className="min-w-full text-sm">
-              <thead
-                className="sticky top-0 z-10"
-                style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}
-              >
-                <tr>
-                  {["Time", "Source", "Action", "Contract", "Qty", "Price", "Value", "P&L", "Status"].map((h) => (
-                    <th
-                      key={h}
-                      className="text-left font-medium px-4 py-2.5 whitespace-nowrap"
-                      style={{ color: "var(--muted)" }}
-                    >
-                      {h}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {signalsLoading && (
-                  <tr><td colSpan={9} className="px-4 py-10 text-center" style={{ color: "var(--muted)" }}>
-                    Loading…
-                  </td></tr>
-                )}
-                {!signalsLoading && signals.length === 0 && (
-                  <tr><td colSpan={9} className="px-4 py-10 text-center" style={{ color: "var(--muted)" }}>
-                    No Discord alerts yet. Connect a channel under{" "}
-                    <a href="/discord" className="underline">Discord</a> to start reading them.
-                  </td></tr>
-                )}
-                {!signalsLoading && signals.map((sig) => {
-                  const st = SIGNAL_STATUS[sig.status] ?? { label: sig.status, tone: "var(--muted)" };
-                  const when = sig.posted_at || sig.created_at;
-                  // The alert's own words — the embed title is where these
-                  // channels put the trade, so prefer it over empty content.
-                  const alertText =
-                    sig.embeds?.[0]?.title || sig.content || sig.embeds?.[0]?.description || "—";
-                  return (
-                    <tr key={sig.row_key} style={{ borderTop: "1px solid var(--border)" }}>
-                      <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-                        {new Date(when).toLocaleString(undefined, {
-                          month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-                        })}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-                        {sig.channel_name ? `#${sig.channel_name}` : sig.source_label}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap font-medium">
-                        {sig.action ? (
-                          <span style={{ color: sig.action === "BUY" ? "var(--good, #16a34a)" : "var(--danger, #b91c1c)" }}>
-                            {sig.action}
-                            {sig.is_partial_close && (
-                              <span
-                                className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded"
-                                style={{ background: "var(--panel-2)", color: "var(--warn, #b45309)" }}
-                                title={
-                                  sig.remaining_quantity
-                                    ? `Partial close — ${sig.remaining_quantity} still open`
-                                    : "Partial close"
-                                }
-                              >
-                                PARTIAL
-                              </span>
-                            )}
-                          </span>
-                        ) : (
-                          <span style={{ color: "var(--muted)" }}>—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
-                        {contractLabel(sig)}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-                        {sig.quantity ?? "—"}
-                        {sig.original_quantity && (
-                          <span style={{ color: "var(--muted)" }}> of {sig.original_quantity}</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-                        {sig.limit_price ? `$${sig.limit_price}` : sig.order_type === "MARKET" ? "MKT" : "—"}
-                      </td>
-                      {/* Value = the notional the card stated on an open. */}
-                      <td className="px-4 py-2.5 whitespace-nowrap tabular-nums" style={{ color: "var(--text-2)" }}>
-                        {sig.notional
-                          ? `$${Number(sig.notional).toLocaleString(undefined, { maximumFractionDigits: 2 })}`
-                          : "—"}
-                      </td>
-                      {/* P&L as REPORTED by the alert — never recomputed. */}
-                      <td className="px-4 py-2.5 whitespace-nowrap tabular-nums">
-                        {(() => {
-                          const pnl = signedMoney(sig.pnl_amount);
-                          if (!pnl) return <span style={{ color: "var(--muted)" }}>—</span>;
-                          const tone = pnl.positive ? "var(--good, #16a34a)" : "var(--danger, #b91c1c)";
-                          const total = signedMoney(sig.total_pnl_amount);
-                          return (
-                            <span style={{ color: tone }}>
-                              {pnl.text}
-                              {sig.pnl_percent && (
-                                <span style={{ opacity: 0.75 }}> ({Number(sig.pnl_percent) > 0 ? "+" : ""}{sig.pnl_percent}%)</span>
-                              )}
-                              {sig.position_closed && total && (
-                                <div className="text-[11px]" style={{ color: "var(--muted)" }}>
-                                  total {total.text}
-                                  {sig.total_pnl_percent ? ` (${Number(sig.total_pnl_percent) > 0 ? "+" : ""}${sig.total_pnl_percent}%)` : ""}
-                                </div>
-                              )}
-                            </span>
-                          );
-                        })()}
-                      </td>
-                      <td className="px-4 py-2.5 whitespace-nowrap" title={alertText}>
-                        <span style={{ color: st.tone }}>{st.label}</span>
-                        {sig.position_closed && (
-                          <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>closed</span>
-                        )}
-                        {sig.status_reason && (
-                          <div className="text-[11px]" style={{ color: "var(--muted)" }} title={sig.status_reason}>
-                            {sig.status_reason.length > 40
-                              ? `${sig.status_reason.slice(0, 40)}…`
-                              : sig.status_reason}
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ) : (
       <div className="card overflow-hidden flex flex-col flex-1 min-h-0" style={{ borderRadius: 10 }}>
         <div className="overflow-auto flex-1 min-h-0">
-          <table className={`min-w-full text-sm ${!loading && rows.length === 0 ? "h-full" : ""}`}>
+          <table className={`min-w-full text-sm ${!isLoading && gridRows.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
                 <Th label="Symbol" sortKey="symbol" />
@@ -939,14 +817,14 @@ export default function TradesPage() {
               </tr>
             </thead>
             <tbody>
-              {loading && Array.from({ length: 6 }).map((_, i) => (
+              {isLoading && Array.from({ length: 6 }).map((_, i) => (
                 <tr key={`sk-${i}`} className="border-t" style={{ borderColor: "var(--border)" }}>
                   {Array.from({ length: COLSPAN }).map((__, j) => (
                     <td key={j} className="px-5 py-3.5"><div className="skeleton h-4 w-full" style={{ minWidth: 44 }} /></td>
                   ))}
                 </tr>
               ))}
-              {!loading && rows.length === 0 && (
+              {!isLoading && gridRows.length === 0 && (
                 <tr>
                   <td colSpan={COLSPAN} className="px-3 align-middle text-center">
                     <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
@@ -959,7 +837,7 @@ export default function TradesPage() {
                   </td>
                 </tr>
               )}
-              {!loading && rows.map(o => {
+              {!isLoading && gridRows.map(o => {
                 const isOpen = OPEN_STATUSES.includes(o.status);
                 // Cancel is available for genuinely-working orders that aren't
                 // already FULLY filled. We key off the order's own fill — NOT
@@ -1227,10 +1105,10 @@ export default function TradesPage() {
             </tbody>
           </table>
         </div>
-        {!loading && total > 0 && (
+        {!isLoading && (tab === "discord" ? signalsTotal : total) > 0 && (
           <div className="px-4 py-2" style={{ borderTop: "1px solid var(--border)" }}>
             <Pagination
-              total={total}
+              total={tab === "discord" ? signalsTotal : total}
               limit={limit}
               offset={offset}
               onChange={setOffset}
@@ -1241,7 +1119,6 @@ export default function TradesPage() {
           </div>
         )}
       </div>
-      )}
     </div>
   );
 }

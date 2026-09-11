@@ -85,6 +85,7 @@ class BackendClient:
         error: str | None = None,
         channel_name: str | None = None,
         guild_name: str | None = None,
+        baseline_message_id: str | None = None,
     ) -> None:
         """Report connection state / heartbeat. Best-effort: a dropped status
         update must never take down the watcher it describes."""
@@ -95,6 +96,8 @@ class BackendClient:
             payload["channel_name"] = channel_name
         if guild_name:
             payload["guild_name"] = guild_name
+        if baseline_message_id:
+            payload["baseline_message_id"] = baseline_message_id
         try:
             resp = await self._client.post(
                 f"{self._base}/api/discord-sources/internal/status", json=payload

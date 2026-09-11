@@ -528,3 +528,33 @@ def test_revoking_an_account_session_affects_every_channel_on_it():
 
     assert _to_out(a).session.present is False
     assert _to_out(b).session.present is False
+
+
+# ── Watch-from baseline ──────────────────────────────────────────────────────
+# Connecting a channel means "watch it from here", not "import its history".
+
+def test_the_baseline_is_recorded_on_a_first_attach(redis):
+    src = _FakeSource()
+    assert src.last_seen_message_id is None
+
+    ingest.record_status(src, "connected", baseline_message_id="1546891132070404120")
+    assert src.last_seen_message_id == "1546891132070404120"
+
+
+def test_the_baseline_never_moves_backwards(redis):
+    """A later attach reporting an older baseline would make that whole stretch
+    of history eligible again and flood the pipeline with old alerts."""
+    src = _FakeSource()
+    src.last_seen_message_id = "1546891132070404120"
+
+    ingest.record_status(src, "connected", baseline_message_id="1500000000000000000")
+    assert src.last_seen_message_id == "1546891132070404120"
+
+
+def test_status_without_a_baseline_leaves_the_mark_alone(redis):
+    """Routine heartbeats must not disturb where watching started."""
+    src = _FakeSource()
+    src.last_seen_message_id = "1546891132070404120"
+
+    ingest.record_status(src, "connected")
+    assert src.last_seen_message_id == "1546891132070404120"
