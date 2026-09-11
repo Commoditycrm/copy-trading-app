@@ -3,7 +3,7 @@ from datetime import datetime, time
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, Time, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
 
@@ -24,12 +24,9 @@ class DiscordAlertSource(Base, TimestampMixin):
     authentication, permission, MFA or rate-limit mechanism is bypassed — we
     observe rendered messages in a session the trader established themselves.
 
-    ``encrypted_session`` holds the Fernet-encrypted Playwright storage state
-    (cookies + localStorage) captured during a one-time headed login the trader
-    performs on their OWN machine — Kopyaa never sees their password or MFA code.
-    Same encryption-at-rest treatment as broker credentials
-    (``broker_account.encrypted_credentials``); it is NEVER returned to the
-    frontend or written to logs.
+    The Discord session itself lives on ``DiscordAccount`` — it authenticates an
+    ACCOUNT, not a channel, so one sign-in covers every channel that account can
+    read. This row only records WHICH channel to watch and when.
 
     Deliberately SEPARATE from the OUTBOUND webhook broadcast
     (``TraderSettings.discord_webhook_url`` / ``discord_alerts_enabled``, which
@@ -60,13 +57,18 @@ class DiscordAlertSource(Base, TimestampMixin):
     channel_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     channel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
-    # Fernet-encrypted Playwright storage_state JSON for the trader's Discord
-    # Web session. NULL until the one-time headed login is completed, which is
-    # why status starts at "needs_login". Never leaves the backend except to the
-    # listener service over its authenticated internal endpoint.
-    encrypted_session: Mapped[str | None] = mapped_column(Text, nullable=True)
-    session_captured_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+    # Which connected Discord account reads this channel. The session lives on
+    # the ACCOUNT (models/discord_account.py), so connecting once covers every
+    # channel that account can see — adding a second channel never asks the
+    # trader to sign in again.
+    #
+    # Nullable + SET NULL so removing an account leaves its channels and their
+    # message history intact; they simply need an account re-attached.
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("discord_accounts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     # Trader on/off for THIS source. The listener only opens enabled sources.
@@ -119,3 +121,5 @@ class DiscordAlertSource(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     last_seen_message_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    account = relationship("DiscordAccount", back_populates="sources")

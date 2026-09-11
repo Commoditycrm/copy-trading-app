@@ -412,6 +412,15 @@ export default function TradesPage() {
   }, [search]);
 
   useEventStream((evt) => {
+    // New Discord alerts arrive asynchronously from the listener, so the tab
+    // has to react rather than only fetching on mount. Refetch WITHOUT the
+    // spinner — a burst of alerts shouldn't make the table flicker.
+    if (evt.type === "discord.message_received") {
+      if (tab === "discord") loadSignals(false);
+      // Not on the tab: keep the count badge honest without a round-trip.
+      else setSignalsTotal((n) => n + (evt.count ?? 1));
+      return;
+    }
     if (
       evt.type !== "order.placed" &&
       evt.type !== "order.copy_submitted" &&
@@ -499,27 +508,29 @@ export default function TradesPage() {
   // Load Discord alerts only while that tab is open. They're a separate
   // endpoint (and a separate concept) from the order grid, so they don't ride
   // along with /api/trades/page.
+  const loadSignals = useCallback(async (showSpinner = true) => {
+    if (showSpinner) setSignalsLoading(true);
+    try {
+      const p = await api<{ items: DiscordSignal[]; total: number }>(
+        `/api/discord-sources/signals/page?limit=${limit}&offset=${offset}` +
+          (search ? `&search=${encodeURIComponent(search)}` : "")
+      );
+      setSignals(p.items);
+      setSignalsTotal(p.total);
+    } catch {
+      // Inbound Discord is off in some environments (503) — an empty tab is
+      // the right outcome there, not an error toast on the orders page.
+      setSignals([]);
+      setSignalsTotal(0);
+    } finally {
+      if (showSpinner) setSignalsLoading(false);
+    }
+  }, [limit, offset, search]);
+
   useEffect(() => {
     if (tab !== "discord") return;
-    let cancelled = false;
-    setSignalsLoading(true);
-    (async () => {
-      try {
-        const p = await api<{ items: DiscordSignal[]; total: number }>(
-          `/api/discord-sources/signals/page?limit=${limit}&offset=${offset}` +
-            (search ? `&search=${encodeURIComponent(search)}` : "")
-        );
-        if (!cancelled) { setSignals(p.items); setSignalsTotal(p.total); }
-      } catch {
-        // Inbound Discord is off in some environments (503) — an empty tab is
-        // the right outcome there, not an error toast on the orders page.
-        if (!cancelled) { setSignals([]); setSignalsTotal(0); }
-      } finally {
-        if (!cancelled) setSignalsLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [tab, limit, offset, search]);
+    loadSignals();
+  }, [tab, loadSignals]);
 
   const tabCounts: Record<StatusTab, number> = {
     all: s ? s.total : 0,
