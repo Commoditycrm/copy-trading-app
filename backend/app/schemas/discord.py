@@ -224,6 +224,14 @@ class DiscordMessageOut(BaseModel):
 
 # ── QR login (connecting a Discord account without a terminal) ───────────────
 
+class DiscordDecisionOut(BaseModel):
+    """Result of accepting or rejecting one alert."""
+
+    id: uuid.UUID
+    decision: str
+    decided_at: datetime | None
+
+
 class DiscordLoginOut(BaseModel):
     """State of a QR login attempt, polled by the frontend.
 
@@ -334,6 +342,17 @@ class DiscordSignalOut(BaseModel):
     status: str
     status_reason: str | None
 
+    # Where the channel stands on this alert:
+    #   pending  — parsed, waiting for the trader (manual mode)
+    #   approved — cleared for execution (auto mode, or accepted)
+    #   rejected — the trader declined it
+    #   null     — never became a signal, so there's nothing to decide
+    decision: str | None = None
+    decided_at: datetime | None = None
+    # The mode that applied to THIS alert, which may differ from the channel's
+    # current setting.
+    decision_mode: str | None = None
+
     # Flattened from parsed_signal for the table; null when not PARSED.
     action: str | None = None
     asset_type: str | None = None
@@ -361,3 +380,15 @@ class DiscordSignalOut(BaseModel):
     total_pnl_percent: str | None = None
 
     order_id: uuid.UUID | None = None
+
+
+class DiscordSettingsOut(BaseModel):
+    """Account-wide handling of inbound Discord alerts."""
+
+    # "manual" — accept or reject each alert in Order History
+    # "auto"   — a successful parse is approved immediately
+    execution_mode: str
+
+
+class DiscordSettingsIn(BaseModel):
+    execution_mode: str = Field(pattern=r"^(auto|manual)$")

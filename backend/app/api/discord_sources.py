@@ -42,7 +42,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
-from app.models.discord_message import DiscordMessage, DiscordMessageStatus
+from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.models.user import User
 from app.schemas.pagination import Page
 from app.schemas.discord import (
@@ -55,6 +55,9 @@ from app.schemas.discord import (
     DiscordPairClaimIn,
     DiscordPairClaimOut,
     DiscordPairCompleteIn,
+    DiscordDecisionOut,
+    DiscordSettingsIn,
+    DiscordSettingsOut,
     DiscordPairOut,
     DiscordSignalOut,
     DiscordIngestOut,
@@ -110,6 +113,19 @@ def require_listener_token(
         raise HTTPException(503, "discord_listener_not_configured")
     if not secrets.compare_digest(x_kopyaa_listener_token or "", expected):
         raise HTTPException(401, "invalid_listener_token")
+
+
+def _auto_approve(db: Session, user_id: uuid.UUID) -> bool:
+    """Is this trader's Discord execution mode set to auto?
+
+    One setting for the whole account. Defaults to manual when no settings row
+    exists — an alert must never be cleared for execution because a row was
+    missing.
+    """
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user_id)
+    return bool(ts and (ts.discord_execution_mode or "manual").lower() == "auto")
 
 
 def _primary_account(db: Session, user: User, *, create: bool = False) -> DiscordAccount | None:
@@ -325,6 +341,9 @@ def _signal_out(
         embeds=list(m.embeds or []),
         status=m.status.value if hasattr(m.status, "value") else str(m.status),
         status_reason=m.status_reason,
+        decision=(m.decision.value if m.decision else None),
+        decided_at=m.decided_at,
+        decision_mode=m.decision_mode,
         action=sig.get("action"),
         asset_type=sig.get("asset_type"),
         symbol=sig.get("symbol"),
@@ -347,6 +366,45 @@ def _signal_out(
         order_id=m.order_id,
         expiry_unspecified=bool(sig.get("expiry_unspecified")),
     )
+
+
+# NOTE: registered BEFORE "/{source_id}" on purpose — FastAPI matches in
+# registration order, and a literal segment must win over the UUID converter.
+@router.get("/settings", response_model=DiscordSettingsOut)
+def get_discord_settings(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> DiscordSettingsOut:
+    """Account-wide handling of inbound Discord alerts."""
+    return DiscordSettingsOut(
+        execution_mode="auto" if _auto_approve(db, user.id) else "manual"
+    )
+
+
+@router.patch("/settings", response_model=DiscordSettingsOut)
+def update_discord_settings(
+    payload: DiscordSettingsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> DiscordSettingsOut:
+    """Switch between reviewing every alert and auto-approving parsed ones.
+
+    Applies to alerts arriving from now on. Decisions already recorded keep the
+    mode that applied at the time — switching to auto must not retroactively
+    approve alerts the trader never saw.
+    """
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user.id)
+    if ts is None:
+        ts = TraderSettings(user_id=user.id)
+        db.add(ts)
+    ts.discord_execution_mode = payload.execution_mode
+    db.commit()
+    log.info("discord: execution mode set to %s for user=%s", payload.execution_mode, user.id)
+    return DiscordSettingsOut(execution_mode=payload.execution_mode)
 
 
 @router.patch("/{source_id}", response_model=DiscordSourceOut)
@@ -595,6 +653,51 @@ def clear_session(
     return _to_out(src)
 
 
+@router.post("/signals/{message_id}/decision", response_model=DiscordDecisionOut)
+def decide_signal(
+    message_id: uuid.UUID,
+    accept: bool = Query(..., description="true = approve for execution, false = reject"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> DiscordDecisionOut:
+    """Accept or reject one parsed alert (manual mode).
+
+    Approving is the hand-off point broker execution will plug into later —
+    nothing is sent to a broker today, the alert is simply marked ready.
+
+    Only a PARSED alert can be decided on. Chatter and unreadable messages have
+    no signal behind them, and approving one would mean approving nothing.
+    """
+    msg = db.get(DiscordMessage, message_id)
+    if msg is None or msg.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if msg.status is not DiscordMessageStatus.PARSED:
+        raise HTTPException(409, "alert_has_no_signal")
+    # Terminal by design: re-deciding an executed alert would misrepresent what
+    # was actually approved at the time it mattered.
+    if msg.decision is SignalDecision.REJECTED and accept:
+        raise HTTPException(409, "already_rejected")
+
+    msg.decision = SignalDecision.APPROVED if accept else SignalDecision.REJECTED
+    msg.decision_mode = "manual"
+    msg.decided_at = datetime.now(timezone.utc)
+    db.commit()
+
+    log.info(
+        "discord: alert %s %s by user=%s",
+        message_id, "approved" if accept else "rejected", user.id,
+    )
+    events.publish(
+        user.id,
+        {"type": "discord.signal_decided", "message_id": str(msg.id),
+         "decision": msg.decision.value},
+    )
+    return DiscordDecisionOut(
+        id=msg.id, decision=msg.decision.value, decided_at=msg.decided_at
+    )
+
+
 @router.get("/{source_id}/messages", response_model=Page[DiscordMessageOut])
 def list_messages(
     source_id: uuid.UUID,
@@ -785,7 +888,9 @@ def listener_messages(
         )
 
     batch = [m.model_dump() for m in payload.messages if m.channel_id == src.channel_id]
-    report = discord_ingest.ingest_batch(db, src, batch)
+    report = discord_ingest.ingest_batch(
+        db, src, batch, auto_approve=_auto_approve(db, src.user_id)
+    )
     for mid in wrong:
         report.rejected.append({"message_id": mid, "reason": "channel_mismatch"})
     db.commit()
