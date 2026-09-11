@@ -20,12 +20,16 @@
  *
  * BACKLOG HANDLING
  * ----------------
- * Opening a channel renders its recent history all at once. Emitting that as
- * "new" on every reconnect would flood the pipeline, but suppressing it wholesale
- * would silently drop alerts that arrived while the listener was down. So we take
- * the snowflake of the last message the backend already ingested and emit exactly
- * the backlog newer than it. Overlap is harmless — the backend de-duplicates on
- * (source_id, message_id).
+ * Opening a channel renders its recent history all at once. What we do with it
+ * depends on whether this channel has ever been read before:
+ *
+ *   FIRST attach (no lastSeenMessageId) — emit NOTHING. Connecting a channel
+ *     means "watch it from now on", not "import its history". The highest
+ *     rendered snowflake is reported instead, so it becomes the baseline.
+ *
+ *   RECONNECT (lastSeenMessageId known) — emit exactly the backlog newer than
+ *     it, so alerts posted while the listener was down aren't lost. Overlap is
+ *     harmless: the backend de-duplicates on (source_id, message_id).
  */
 (config) => {
   const { channelId, lastSeenMessageId, flushMs } = config;
@@ -43,6 +47,12 @@
   // (from step 3) unique constraint are the real duplicate guards.
   const emitted = new Set();
   const EMITTED_CAP = 5000;
+
+  // Highest snowflake seen in the rendered history. On a first attach this
+  // becomes the channel's starting point, so the next reconnect resumes from
+  // here rather than re-suppressing (and therefore missing) anything posted in
+  // between.
+  let highestBacklog = null;
 
   // Content we last saw per message, so an in-place edit can be told apart from
   // a re-render of identical text. Discord alert channels edit posts in place
@@ -221,15 +231,22 @@
       return;
     }
 
-    if (fromBacklog && lastSeen !== null) {
-      // Only the part of the history the backend hasn't ingested yet.
-      let snowflake;
+    if (fromBacklog) {
+      let snowflake = null;
       try {
         snowflake = BigInt(msg.message_id);
       } catch (err) {
         return;
       }
-      if (snowflake <= lastSeen) {
+      // Track the newest thing already on screen, whether or not we emit it —
+      // this is what the baseline is read from.
+      if (highestBacklog === null || snowflake > highestBacklog) {
+        highestBacklog = snowflake;
+      }
+      // Never read before: the whole visible history predates the connection,
+      // so none of it is ours to ingest.
+      // Read before: only the part newer than what the backend already has.
+      if (lastSeen === null || snowflake <= lastSeen) {
         remember(msg.message_id);
         contentSeen.set(msg.message_id, msg.content);
         return;
@@ -284,6 +301,10 @@
 
   // Report liveness: the presence of the message list is what "connected"
   // means. Read by the Python side, which turns it into a heartbeat.
+  // Newest message already on screen when we attached. Read once by the Python
+  // side to set a channel's starting point.
+  window.__kopyaaBaseline = () => (highestBacklog === null ? null : highestBacklog.toString());
+
   window.__kopyaaHealth = () => ({
     attached: !!window.__kopyaaObserver,
     messageNodes: document.querySelectorAll(`li[id^="${MESSAGE_ID_PREFIX}"]`).length,
