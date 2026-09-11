@@ -447,47 +447,29 @@ def _capture_exit_snapshot(db: Session, user_id: uuid.UUID, items: list[dict]) -
     return snap
 
 
-@router.get("/snapshots/latest")
-def latest_sell_all_snapshot(
-    snapshot_id: uuid.UUID | None = Query(
-        default=None,
-        description="Load a SPECIFIC snapshot from the history. Omit for the current (active/newest) one.",
-    ),
-    db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
-) -> dict:
-    """One Sell-All snapshot with each position's live re-entry status
-    (filled / working / pending / expired) + current price and a summary count.
-    Omit `snapshot_id` for the current (active) snapshot; pass it to open any
-    snapshot from the history. Null if none / not found."""
-    if snapshot_id is not None:
-        snap = db.get(SellAllSnapshot, snapshot_id)
-        if snap is None or snap.user_id != user.id:
-            return {"snapshot": None}
-    else:
-        snap = db.execute(
-            select(SellAllSnapshot)
-            .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
-            .order_by(SellAllSnapshot.created_at.desc())
-            .limit(1)
-        ).scalars().first()
-    if not snap:
-        return {"snapshot": None}
-
-    # Best-effort live price per stock symbol for the "current market price"
-    # column (Alpaca get_stock_latest_price; None if unavailable).
-    adapter = None
+def _snapshot_adapter(db: Session, user: User):
+    """Best-effort broker adapter for a user's connected account — used for the
+    live Current price / PDC columns. None when nothing is connected or creds
+    won't decrypt (the detail then shows "—" instead of erroring)."""
     acct = db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == user.id, BrokerAccount.connection_status == "connected",
         )
     ).scalars().first()
-    if acct is not None:
-        try:
-            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-        except Exception:  # noqa: BLE001
-            adapter = None
+    if acct is None:
+        return None
+    try:
+        return adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    except Exception:  # noqa: BLE001
+        return None
 
+
+def _snapshot_detail(db: Session, snap: SellAllSnapshot, adapter, today_et: date) -> dict:
+    """Turn one snapshot row into the priced detail the Snapshot page renders:
+    each position's live re-entry status (filled / working / pending / expired),
+    current price, PDC, and a summary count. `adapter` may be None (prices show
+    "—"); `today_et` decides option expiry. Shared by the `latest` and `today`
+    endpoints so both price identically."""
     def _current(p: dict) -> str | None:
         """Live price for the Current Price column. Stocks use the stock quote;
         options use the OCC bid/ask mid (Alpaca OPRA). Best-effort — "—" when a
@@ -540,14 +522,11 @@ def latest_sell_all_snapshot(
     # distinct "expired" status so the row disables Re-Enter and Re-Enter All
     # skips it. Expired = expiry strictly before today ET (it's still tradeable
     # ON the expiry date until close).
-    from app.services import market_hours as _mh  # noqa: PLC0415
-    _today_et = _mh.now_et().date()
-
     def _is_expired_option(pos: dict) -> bool:
         if pos.get("instrument_type") != "option" or not pos.get("option_expiry"):
             return False
         try:
-            return date.fromisoformat(pos["option_expiry"]) < _today_et
+            return date.fromisoformat(pos["option_expiry"]) < today_et
         except (ValueError, TypeError):
             return False
 
@@ -581,12 +560,68 @@ def latest_sell_all_snapshot(
         "pending": sum(1 for x in positions if x["reentry_status"] == "pending"),
         "expired": sum(1 for x in positions if x["reentry_status"] == "expired"),
     }
-    return {"snapshot": {
+    return {
         "id": str(snap.id),
         "created_at": snap.created_at.isoformat(),
         "positions": positions,
         "summary": summary,
-    }}
+    }
+
+
+@router.get("/snapshots/latest")
+def latest_sell_all_snapshot(
+    snapshot_id: uuid.UUID | None = Query(
+        default=None,
+        description="Load a SPECIFIC snapshot from the history. Omit for the current (active/newest) one.",
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_sell_all_access),
+) -> dict:
+    """One Sell-All snapshot with each position's live re-entry status
+    (filled / working / pending / expired) + current price and a summary count.
+    Omit `snapshot_id` for the current (active) snapshot; pass it to open any
+    snapshot from the history. Null if none / not found."""
+    if snapshot_id is not None:
+        snap = db.get(SellAllSnapshot, snapshot_id)
+        if snap is None or snap.user_id != user.id:
+            return {"snapshot": None}
+    else:
+        snap = db.execute(
+            select(SellAllSnapshot)
+            .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.active.is_(True))
+            .order_by(SellAllSnapshot.created_at.desc())
+            .limit(1)
+        ).scalars().first()
+    if not snap:
+        return {"snapshot": None}
+    from app.services import market_hours as _mh  # noqa: PLC0415
+    adapter = _snapshot_adapter(db, user)
+    return {"snapshot": _snapshot_detail(db, snap, adapter, _mh.now_et().date())}
+
+
+@router.get("/snapshots/today")
+def today_sell_all_snapshots(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_sell_all_access),
+) -> dict:
+    """Every snapshot taken TODAY (ET), newest first, each fully priced like the
+    `latest` endpoint. The Snapshot page shows these stacked so a fresh Exit
+    doesn't hide the earlier ones — the whole day stays on screen. History
+    (`/snapshots`) is unaffected: each snapshot is still its own record."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+    from app.services import market_hours as _mh  # noqa: PLC0415
+    now_et = _mh.now_et()
+    today_et = now_et.date()
+    day_start_utc = datetime(today_et.year, today_et.month, today_et.day, tzinfo=_mh.ET).astimezone(timezone.utc)
+    snaps = db.execute(
+        select(SellAllSnapshot)
+        .where(SellAllSnapshot.user_id == user.id, SellAllSnapshot.created_at >= day_start_utc)
+        .order_by(SellAllSnapshot.created_at.desc())
+    ).scalars().all()
+    # Guard against a clock/tz edge landing a snapshot on the wrong side.
+    snaps = [s for s in snaps if s.created_at.astimezone(_mh.ET).date() == today_et]
+    adapter = _snapshot_adapter(db, user)   # built once for the whole day
+    return {"snapshots": [_snapshot_detail(db, s, adapter, today_et) for s in snaps]}
 
 
 @router.get("/snapshots")
