@@ -52,7 +52,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models.discord_alert_source import DiscordAlertSource
-from app.models.discord_message import DiscordMessage, DiscordMessageStatus
+from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.services.discord_parsers import ParsedMessage, ParseStatus, parse_message
 from app.services import events
 from app.services.redis_client import get_sync_redis
@@ -136,7 +136,9 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, default=str, separators=(",", ":"))
 
 
-def _persist(db: Session, source: DiscordAlertSource, raw: dict[str, Any]) -> DiscordMessage | None:
+def _persist(
+    db: Session, source: DiscordAlertSource, raw: dict[str, Any], *, auto_approve: bool
+) -> DiscordMessage | None:
     """Insert the raw message. Returns None if it's already on record.
 
     The uniqueness decision is made by the DATABASE, not by a prior SELECT: a
@@ -159,7 +161,7 @@ def _persist(db: Session, source: DiscordAlertSource, raw: dict[str, Any]) -> Di
         embeds=list(raw.get("embeds") or []),
         status=DiscordMessageStatus.RECEIVED,
     )
-    _apply_parse(row)
+    _apply_parse(row, auto_approve=auto_approve)
     try:
         with db.begin_nested():
             db.add(row)
@@ -169,8 +171,8 @@ def _persist(db: Session, source: DiscordAlertSource, raw: dict[str, Any]) -> Di
     return row
 
 
-def _apply_parse(row: DiscordMessage) -> None:
-    """Read the message and record what it says.
+def _apply_parse(row: DiscordMessage, *, auto_approve: bool) -> None:
+    """Read the message, record what it says, and set its decision state.
 
     Parsing at intake rather than in a later worker keeps the stored row and its
     reading in one transaction, so a message can never be visible without a
@@ -204,23 +206,43 @@ def _apply_parse(row: DiscordMessage) -> None:
             f"{len(result.signals)} trades in this alert"
             if len(result.signals) > 1 else None
         )
+
+        # A successful parse under AUTO mode is approved on the spot — that is
+        # what auto means. Under MANUAL it waits for the trader.
+        #
+        # The mode is captured on the row because a channel can be switched
+        # afterwards, and the audit trail has to show which mode actually
+        # applied to THIS alert, not whichever is set today.
+        row.decision = SignalDecision.APPROVED if auto_approve else SignalDecision.PENDING
+        row.decision_mode = "auto" if auto_approve else "manual"
+        row.decided_at = datetime.now(timezone.utc) if auto_approve else None
     elif result.status is ParseStatus.INVALID:
         row.status = DiscordMessageStatus.INVALID
         row.status_reason = (result.reason or "couldn't be read as a trade")[:480]
+        # No signal, so nothing to decide on — even in auto mode. An unreadable
+        # alert must never become approved.
+        row.decision = None
     else:
         row.status = DiscordMessageStatus.IGNORED
         row.status_reason = (result.reason or "not a trade alert")[:480]
+        row.decision = None
 
 
 def ingest_batch(
     db: Session,
     source: DiscordAlertSource,
     messages: Iterable[dict[str, Any]],
+    *,
+    auto_approve: bool = False,
 ) -> IngestReport:
     """Persist a batch from the listener, then queue whatever was new.
 
     Order matters: the message is stored BEFORE it's handed to the pipeline, so
     the original survives whatever parsing or execution does with it later.
+
+    ``auto_approve`` is the trader's Discord execution mode, resolved by the
+    caller. It defaults to False so a caller that forgets to pass it gets the
+    manual (safe) behaviour rather than silently clearing alerts for execution.
 
     Caller (the API route) owns the transaction and commits. Never raises on a
     single bad message — one malformed entry is recorded in ``rejected`` and the
@@ -238,7 +260,7 @@ def ingest_batch(
             report.rejected.append({"message_id": "", "reason": "missing_message_id"})
             continue
 
-        row = _persist(db, source, raw)
+        row = _persist(db, source, raw, auto_approve=auto_approve)
         if row is None:
             report.duplicates.append(message_id)
             continue

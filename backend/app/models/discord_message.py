@@ -37,6 +37,24 @@ class DiscordMessageStatus(str, enum.Enum):
     ORDER_FAILED = "order_failed"
 
 
+class SignalDecision(str, enum.Enum):
+    """Whether a parsed alert is cleared to be traded.
+
+    Deliberately SEPARATE from ``DiscordMessageStatus``: that records what we
+    understood the message to say, this records what the trader decided to do
+    about it. Keeping them apart means re-parsing can never silently revoke an
+    approval, and an approval can never disguise a bad parse.
+    """
+
+    # Parsed, waiting for the trader (manual mode).
+    PENDING = "pending"
+    # Cleared for execution — either auto mode, or the trader accepted it.
+    # This is the hand-off point broker execution will plug into later.
+    APPROVED = "approved"
+    # The trader declined it. Terminal; nothing downstream may act on it.
+    REJECTED = "rejected"
+
+
 class DiscordMessage(Base, TimestampMixin):
     """One message observed in a watched Discord channel.
 
@@ -144,6 +162,21 @@ class DiscordMessage(Base, TimestampMixin):
     parsed_signals: Mapped[list[Any]] = mapped_column(
         _JSON, default=list, server_default="[]", nullable=False
     )
+
+    # The trader's call on a PARSED alert. NULL for anything that never became a
+    # signal (chatter, unreadable messages) — there is nothing to decide on.
+    decision: Mapped[SignalDecision | None] = mapped_column(
+        Enum(SignalDecision, name="discord_signal_decision",
+             values_callable=lambda e: [m.value for m in e]),
+        nullable=True,
+        index=True,
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # How the decision was reached: "auto" (parsed under auto mode) or "manual"
+    # (the trader accepted/rejected it). Recorded per MESSAGE because a channel's
+    # mode can change afterwards, and the audit trail has to show the mode that
+    # actually applied at the time.
+    decision_mode: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Set once this message produces an order (step 6). Nullable + SET NULL so
     # deleting an order never destroys the message that caused it.
