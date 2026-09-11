@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
+import { Hash, Radio, ScanLine, Receipt, ShieldCheck, Clock, Eye, PlugZap, Check, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -77,6 +78,15 @@ const SCHEDULE_LABEL: Record<string, string> = {
   custom: "Custom hours",
 };
 
+const STATUS_TONE: Record<string, string> = {
+  connected: "var(--good)",
+  connecting: "var(--accent-2)",
+  needs_login: "var(--warn, #b45309)",
+  error: "var(--bad)",
+  off_schedule: "var(--muted)",
+  disconnected: "var(--muted)",
+};
+
 const STATUS_LABEL: Record<string, string> = {
   off_schedule: "Outside hours",
   needs_login: "Sign-in needed",
@@ -85,15 +95,6 @@ const STATUS_LABEL: Record<string, string> = {
   disconnected: "Off",
   error: "Error",
 };
-
-function relativeTime(iso: string | null): string {
-  if (!iso) return "never";
-  const secs = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
-  if (secs < 60) return `${Math.floor(secs)}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
-}
 
 export default function DiscordPage() {
   const [user, setUser] = useState<User | null>(null);
@@ -396,7 +397,7 @@ export default function DiscordPage() {
 
   if (user.role !== "trader") {
     return (
-      <div className="max-w-[820px] mx-auto">
+      <div className="max-w-[820px]">
         <div className="card p-8 text-center text-sm" style={{ color: "var(--muted)" }}>
           Connecting a Discord alert channel is a trader feature — it reads a channel you connect and
           (later) places its alerts as trades on your account.
@@ -405,11 +406,19 @@ export default function DiscordPage() {
     );
   }
 
+  // The Connect card acts on the first channel still waiting for a sign-in, so
+  // the button always has an unambiguous target rather than asking the trader
+  // to pick one.
+  const needsConnect = sources.find((x) => !x.session.present) ?? null;
+  // The session lives on the Discord ACCOUNT, so any channel reporting one
+  // means the account is connected and every channel is covered.
+  const accountConnected = sources.some((x) => x.session.present);
+
   const inputCls = "w-full rounded-lg border px-3 py-2 text-sm bg-transparent focus-ring";
   const inputStyle = { borderColor: "var(--border)", color: "var(--text)" } as const;
 
   return (
-    <div className="max-w-[820px] mx-auto space-y-4 pb-12">
+    <div className="max-w-[1200px] space-y-4 pb-12">
       <input
         ref={fileRef}
         type="file"
@@ -418,294 +427,383 @@ export default function DiscordPage() {
         onChange={onSessionFile}
       />
 
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight" style={{ color: "var(--text)" }}>
-          Discord
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          Watch a Discord channel for trade alerts and (in an upcoming release) place the matching
-          trades on your connected broker. Kopyaa reads the channel as <strong>you</strong> — only
-          channels your own Discord account can already open.
-        </p>
-        <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>
-          This is separate from the alert <strong>broadcast</strong> (Settings), which posts{" "}
-          <em>your</em> fills out to a channel.
-        </p>
-      </div>
-
-      {/* How it works — lead with where the credentials go, since that's the question */}
-      <div className="card p-5" style={{ background: "var(--surface-2, transparent)" }}>
-        <h3 className="text-sm font-semibold mb-2" style={{ color: "var(--text)" }}>
-          How it works
-        </h3>
-        <p className="text-sm" style={{ color: "var(--text-2)" }}>
-          You sign in to Discord yourself, in a real browser window on your own machine. Your password
-          and 2FA code go straight to Discord — Kopyaa never sees them. You then hand us only the
-          resulting <strong>session</strong>, which we store encrypted and use to keep the channel open
-          and watch for new messages in real time.
-        </p>
+      {/* ── Feature introduction ───────────────────────────────────────────
+          Traders arrive here with no idea what this does. Lead with the whole
+          pipeline in one glance, then the guarantees, before asking them to
+          connect anything. */}
+      <div className="relative overflow-hidden card p-5">
+        {/* Soft accent wash — depth without a heavy gradient behind text. */}
         <div
-          className="text-xs mt-3 flex items-center gap-2 flex-wrap"
-          style={{ color: "var(--muted)" }}
-        >
-          <span className="chip">You sign in to Discord</span>
-          <span aria-hidden>──session──▶</span>
-          <span className="chip">Kopyaa (encrypted)</span>
-          <span aria-hidden>──watches──▶</span>
-          <span className="chip">#channel</span>
+          aria-hidden
+          className="absolute -top-20 -right-14 w-60 h-60 rounded-full pointer-events-none"
+          style={{ background: "var(--accent-glow)", filter: "blur(48px)", opacity: 0.55 }}
+        />
+        <div className="relative">
+          <div className="flex items-center gap-2">
+            <span
+              className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-1 rounded-full"
+              style={{
+                background: "var(--panel-2)",
+                color: "var(--accent-2)",
+                border: "1px solid var(--border)",
+              }}
+            >
+              <Radio size={11} /> Live alert copying
+            </span>
+          </div>
+
+          <h1
+            className="text-[21px] leading-tight font-semibold tracking-tight mt-2.5"
+            style={{ color: "var(--text)" }}
+          >
+            Turn a Discord channel into trade signals
+          </h1>
+          <p className="text-[13px] leading-relaxed mt-1.5 max-w-[680px]" style={{ color: "var(--text-2)" }}>
+            Kopyaa watches an alert channel you already follow, reads each message the moment
+            it&apos;s posted, and turns the ones that describe a trade into structured signals
+            you can review in Order History.
+          </p>
+
+          {/* The pipeline, in one line. */}
+          <div className="mt-4 flex items-stretch gap-2 flex-wrap">
+            <PipelineStep
+              icon={<Hash size={15} />}
+              title="Discord channel"
+              detail="Any channel your Discord account can open"
+            />
+            <PipelineArrow />
+            <PipelineStep
+              icon={<Radio size={15} />}
+              title="Read live"
+              detail="Detected the instant it renders"
+            />
+            <PipelineArrow />
+            <PipelineStep
+              icon={<ScanLine size={15} />}
+              title="Parsed"
+              detail="Symbol, strike, expiry, size, price"
+            />
+            <PipelineArrow />
+            <PipelineStep
+              icon={<Receipt size={15} />}
+              title="Place orders"
+              detail="On your connected broker"
+              accent
+              soon
+            />
+          </div>
         </div>
       </div>
 
-      {/* Add form */}
-      <form onSubmit={addSource} className="card p-5 space-y-3">
-        <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>
-          Add a channel to watch
-        </h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
-              Name this source
-            </label>
-            <input
-              className={`${inputCls} mt-1.5`}
-              style={inputStyle}
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              placeholder="e.g. OptionHaven Alerts"
-              required
-            />
-          </div>
-          <div>
-            <label className="text-xs font-medium" style={{ color: "var(--muted)" }}>
-              Channel link
-            </label>
-            <input
-              className={`${inputCls} mt-1.5`}
-              style={inputStyle}
-              value={channelUrl}
-              onChange={(e) => setChannelUrl(e.target.value)}
-              placeholder="https://discord.com/channels/…/…"
-              required
-            />
-          </div>
-        </div>
-        <p className="text-[11px]" style={{ color: "var(--muted)" }}>
-          Open the channel in Discord and copy the address from your browser&apos;s address bar.
-        </p>
-        <div className="flex justify-end">
-          <button
-            type="submit"
-            disabled={adding}
-            className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-1.5 disabled:opacity-60"
+      {/* Channel list beside the actions that feed it. */}
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-4 items-start">
+        <div className="min-w-0 space-y-4">
+        {/* Watched channels — one row per source. Everything about a channel
+            lives in its row: identity, live state, when it runs, and what you
+            can do to it. */}
+        <div className="card overflow-hidden">
+          <div
+            className="flex items-center justify-between px-5 py-3.5"
+            style={{ borderBottom: "1px solid var(--border)" }}
           >
-            {adding && <Spinner />} Add channel
-          </button>
-        </div>
-      </form>
-
-      {/* Connected channels */}
-      <div className="card p-5">
-        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text)" }}>
-          Watched channels{" "}
-          {sources.length > 0 && <span style={{ color: "var(--muted)" }}>({sources.length})</span>}
-        </h3>
-        {sources.length === 0 ? (
-          <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
-            No channels yet. Add one above, then connect your Discord session.
-          </p>
-        ) : (
-          <div className="flex flex-col divide-y" style={{ borderColor: "var(--border)" }}>
-            {sources.map((s) => (
-              <div key={s.id} className="py-3 first:pt-0 last:pb-0 space-y-2">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className="text-sm font-medium truncate"
-                      style={{ color: "var(--text)" }}
-                    >
-                      {s.label}
-                    </div>
-                    <div className="text-xs truncate" style={{ color: "var(--muted)" }}>
-                      {s.guild_name ? `${s.guild_name} · ` : ""}
-                      {s.channel_name ? `#${s.channel_name}` : `Channel ${s.channel_id}`}
-                    </div>
-                  </div>
-
-                  <span
-                    className={
-                      s.status === "connected"
-                        ? "chip chip-good"
-                        : s.status === "error"
-                          ? "chip chip-bad"
-                          : "chip"
-                    }
-                  >
-                    <span
-                      className="inline-block rounded-full"
-                      style={{ width: 6, height: 6, background: "currentColor" }}
-                    />
-                    {STATUS_LABEL[s.status] ?? s.status}
-                  </span>
-
-                  <label
-                    className="flex items-center gap-2 text-xs cursor-pointer select-none"
-                    title="Enable/disable this source"
-                  >
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 cursor-pointer"
-                      style={{ accentColor: "var(--accent)" }}
-                      checked={s.is_enabled}
-                      disabled={busyId === s.id}
-                      onChange={(e) => toggleEnabled(s, e.target.checked)}
-                    />
-                    <span style={{ color: "var(--text-2)" }}>{s.is_enabled ? "On" : "Off"}</span>
-                  </label>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditingId(editingId === s.id ? null : s.id);
-                      setEditUrl("");
-                    }}
-                    disabled={busyId === s.id}
-                    className="btn-ghost px-3 py-1.5 text-xs disabled:opacity-60"
-                    title="Point this source at a different channel — keeps your Discord session"
-                  >
-                    Change channel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => startPairing(s)}
-                    disabled={busyId === s.id}
-                    className={`${s.session.present ? "btn-ghost" : "btn-primary"} px-3 py-1.5 text-xs disabled:opacity-60`}
-                  >
-                    {s.session.present ? "Reconnect Discord" : "Connect Discord"}
-                  </button>
-                  {s.session.present && (
-                    <button
-                      type="button"
-                      onClick={() => clearSession(s)}
-                      disabled={busyId === s.id}
-                      className="btn-ghost px-3 py-1.5 text-xs disabled:opacity-60"
-                      title="Forget the stored Discord session but keep this channel configured"
-                    >
-                      Sign out
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => deleteSource(s)}
-                    disabled={busyId === s.id}
-                    className="btn-danger-soft px-3 py-1.5 text-xs disabled:opacity-60"
-                  >
-                    Remove
-                  </button>
-                </div>
-
-                {editingId === s.id && (
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <input
-                      className={inputCls}
-                      style={{ ...inputStyle, maxWidth: 420 }}
-                      value={editUrl}
-                      onChange={(e) => setEditUrl(e.target.value)}
-                      placeholder="https://discord.com/channels/…/…"
-                      autoFocus
-                    />
-                    <button
-                      type="button"
-                      onClick={() => saveChannel(s)}
-                      disabled={busyId === s.id || !editUrl.trim()}
-                      className="btn-primary px-3 py-1.5 text-xs disabled:opacity-60"
-                    >
-                      {busyId === s.id ? <Spinner /> : "Save"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEditingId(null)}
-                      className="btn-ghost px-3 py-1.5 text-xs"
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                )}
-
-                {/* Active window — outside it, no session is held open */}
-                <div className="flex items-center gap-2 flex-wrap text-xs">
-                  <span style={{ color: "var(--muted)" }}>Watch:</span>
-                  <select
-                    value={s.schedule_mode}
-                    disabled={busyId === s.id}
-                    onChange={(e) => setSchedule(s, e.target.value)}
-                    className="rounded-md border px-2 py-1 bg-transparent focus-ring"
-                    style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                  >
-                    {Object.entries(SCHEDULE_LABEL).map(([v, label]) => (
-                      <option key={v} value={v} style={{ background: "var(--surface, #111)" }}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-
-                  {s.schedule_mode === "custom" && (
-                    <>
-                      <input
-                        type="time"
-                        defaultValue={(s.schedule_start || "09:30:00").slice(0, 5)}
-                        disabled={busyId === s.id}
-                        onBlur={(e) => setCustomWindow(s, "start", e.target.value)}
-                        className="rounded-md border px-2 py-1 bg-transparent focus-ring"
-                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                      />
-                      <span style={{ color: "var(--muted)" }}>to</span>
-                      <input
-                        type="time"
-                        defaultValue={(s.schedule_end || "16:00:00").slice(0, 5)}
-                        disabled={busyId === s.id}
-                        onBlur={(e) => setCustomWindow(s, "end", e.target.value)}
-                        className="rounded-md border px-2 py-1 bg-transparent focus-ring"
-                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                      />
-                      <span style={{ color: "var(--muted)" }}>
-                        {s.schedule_timezone || "America/New_York"}
-                      </span>
-                    </>
-                  )}
-
-                  {s.schedule_mode !== "always" && (
-                    <span style={{ color: "var(--warn, #b45309)" }}>
-                      · alerts posted outside these hours are not received
-                    </span>
-                  )}
-                </div>
-
-                <div className="text-xs flex gap-4 flex-wrap" style={{ color: "var(--muted)" }}>
-                  <span>Last message: {relativeTime(s.last_message_at)}</span>
-                  <span>Heartbeat: {relativeTime(s.last_heartbeat_at)}</span>
-                  <span>
-                    Session:{" "}
-                    {s.session.present
-                      ? `active${s.session.age_days !== null ? ` · ${s.session.age_days}d old` : ""}`
-                      : "not connected"}
-                  </span>
-                </div>
-
-                {s.status === "error" && s.last_error && (
-                  <div className="text-xs" style={{ color: "var(--danger, #b91c1c)" }}>
-                    {s.last_error}
-                  </div>
-                )}
-                {s.status === "needs_login" && (
-                  <div className="text-xs" style={{ color: "var(--warn, #b45309)" }}>
-                    Discord needs you to sign in again — run the login helper and upload the new
-                    session.
-                  </div>
-                )}
-              </div>
-            ))}
+            <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>
+              Watched channels
+            </h3>
+            {sources.length > 0 && (
+              <span
+                className="text-[11px] px-2 py-0.5 rounded-full"
+                style={{ background: "var(--panel-2)", color: "var(--muted)" }}
+              >
+                {sources.length}
+              </span>
+            )}
           </div>
-        )}
+
+          {sources.length === 0 ? (
+            <div className="px-5 py-10 text-center">
+              <div
+                className="mx-auto flex items-center justify-center rounded-xl mb-3"
+                style={{
+                  width: 40, height: 40,
+                  background: "var(--panel-2)", border: "1px solid var(--border)",
+                }}
+              >
+                <Hash size={18} style={{ color: "var(--muted)" }} />
+              </div>
+              <p className="text-sm" style={{ color: "var(--text-2)" }}>No channels yet</p>
+              <p className="text-[12px] mt-1" style={{ color: "var(--muted)" }}>
+                Add one on the right, then connect your Discord account.
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col">
+              {sources.map((s, i) => {
+                const tone = STATUS_TONE[s.status] ?? "var(--muted)";
+                return (
+                  <div
+                    key={s.id}
+                    className="px-5 py-4 space-y-3"
+                    style={{ borderTop: i === 0 ? "none" : "1px solid var(--border)" }}
+                  >
+                    {/* Identity + live state */}
+                    <div className="flex items-start gap-3">
+                      <div
+                        className="flex items-center justify-center rounded-xl shrink-0"
+                        style={{
+                          width: 34, height: 34,
+                          background: "var(--panel-2)", border: "1px solid var(--border)",
+                        }}
+                      >
+                        <Hash size={15} style={{ color: tone }} />
+                      </div>
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span
+                            className="text-sm font-semibold truncate"
+                            style={{ color: "var(--text)" }}
+                          >
+                            {s.label}
+                          </span>
+                          <span
+                            className="inline-flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded-full"
+                            style={{
+                              color: tone,
+                              background: "var(--panel-2)",
+                              border: "1px solid var(--border)",
+                            }}
+                          >
+                            <span
+                              className="inline-block rounded-full"
+                              style={{ width: 5, height: 5, background: tone }}
+                            />
+                            {STATUS_LABEL[s.status] ?? s.status}
+                          </span>
+                        </div>
+                        <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--muted)" }}>
+                          {s.guild_name ? `${s.guild_name} · ` : ""}
+                          {s.channel_name ? `#${s.channel_name}` : `Channel ${s.channel_id}`}
+                        </div>
+                      </div>
+
+                      {/* On/off for this channel */}
+                      <label
+                        className="flex items-center gap-2 text-[11px] cursor-pointer select-none shrink-0"
+                        title={s.is_enabled ? "Monitoring on" : "Monitoring off"}
+                      >
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 cursor-pointer"
+                          style={{ accentColor: "var(--accent)" }}
+                          checked={s.is_enabled}
+                          disabled={busyId === s.id}
+                          onChange={(e) => toggleEnabled(s, e.target.checked)}
+                        />
+                        <span style={{ color: "var(--text-2)" }}>{s.is_enabled ? "On" : "Off"}</span>
+                      </label>
+                    </div>
+
+                    {/* When to watch — pills, so the choice is visible rather
+                        than hidden behind a dropdown. */}
+                    <div className="flex items-center gap-2 flex-wrap pl-[46px]">
+                      <span className="text-[11px]" style={{ color: "var(--muted)" }}>Watch</span>
+                      {/* Separate pills rather than one segmented block — each
+                          option reads as its own choice, and the selected one
+                          stands alone instead of being a lighter patch inside a
+                          shared container. */}
+                      {Object.entries(SCHEDULE_LABEL).map(([value, label]) => {
+                        const active = s.schedule_mode === value;
+                        return (
+                          <button
+                            key={value}
+                            type="button"
+                            disabled={busyId === s.id}
+                            onClick={() => setSchedule(s, value)}
+                            className="px-3 py-1 text-[11px] font-medium rounded-full transition-colors disabled:opacity-60"
+                            style={{
+                              background: active ? "var(--accent-glow)" : "transparent",
+                              border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                              color: active ? "var(--accent-2)" : "var(--muted)",
+                            }}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+
+                      {s.schedule_mode === "custom" && (
+                        <>
+                          <input
+                            type="time"
+                            defaultValue={(s.schedule_start || "09:30:00").slice(0, 5)}
+                            disabled={busyId === s.id}
+                            onBlur={(e) => setCustomWindow(s, "start", e.target.value)}
+                            className="rounded-md border px-2 py-1 text-[11px] bg-transparent focus-ring"
+                            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                          />
+                          <span className="text-[11px]" style={{ color: "var(--muted)" }}>to</span>
+                          <input
+                            type="time"
+                            defaultValue={(s.schedule_end || "16:00:00").slice(0, 5)}
+                            disabled={busyId === s.id}
+                            onBlur={(e) => setCustomWindow(s, "end", e.target.value)}
+                            className="rounded-md border px-2 py-1 text-[11px] bg-transparent focus-ring"
+                            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                          />
+                          {/* <span className="text-[11px]" style={{ color: "var(--muted)" }}>
+                            {s.schedule_timezone || "America/New_York"}
+                          </span> */}
+                        </>
+                      )}
+
+                      {/* {s.schedule_mode !== "always" && (
+                        <span className="text-[11px]" style={{ color: "var(--warn, #b45309)" }}>
+                          alerts outside these hours aren&apos;t received
+                        </span>
+                      )} */}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-1.5 flex-wrap pl-[46px]">
+                      <button
+                        type="button"
+                        onClick={() => { setEditingId(editingId === s.id ? null : s.id); setEditUrl(""); }}
+                        disabled={busyId === s.id}
+                        className="btn-ghost px-2.5 py-1 text-[11px] disabled:opacity-60"
+                        title="Point this source at a different channel — keeps your Discord session"
+                      >
+                        Change channel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => startPairing(s)}
+                        disabled={busyId === s.id}
+                        className="btn-ghost px-2.5 py-1 text-[11px] disabled:opacity-60"
+                      >
+                        {s.session.present ? "Reconnect" : "Connect Discord"}
+                      </button>
+                      {s.session.present && (
+                        <button
+                          type="button"
+                          onClick={() => clearSession(s)}
+                          disabled={busyId === s.id}
+                          className="btn-ghost px-2.5 py-1 text-[11px] disabled:opacity-60"
+                          title="Sign this Discord account out — affects every channel it reads"
+                        >
+                          Sign out
+                        </button>
+                      )}
+                      {/* Icon only — it sits apart from the safe actions, and a
+                          word-sized "Remove" gave a destructive action the same
+                          visual weight as everything else in the row. */}
+                      <button
+                        type="button"
+                        onClick={() => deleteSource(s)}
+                        disabled={busyId === s.id}
+                        className="btn-danger-soft p-1.5 rounded-md disabled:opacity-60 ml-auto inline-flex items-center"
+                        title="Remove this channel and its stored messages"
+                        aria-label="Remove channel"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+
+                    {/* Inline channel repoint */}
+                    {editingId === s.id && (
+                      <div className="flex items-center gap-2 flex-wrap pl-[46px]">
+                        <input
+                          className={inputCls}
+                          style={{ ...inputStyle, maxWidth: 360 }}
+                          value={editUrl}
+                          onChange={(e) => setEditUrl(e.target.value)}
+                          placeholder="https://discord.com/channels/…/…"
+                          autoFocus
+                        />
+                        <button
+                          type="button"
+                          onClick={() => saveChannel(s)}
+                          disabled={busyId === s.id || !editUrl.trim()}
+                          className="btn-primary px-3 py-1.5 text-[11px] disabled:opacity-60"
+                        >
+                          {busyId === s.id ? <Spinner /> : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingId(null)}
+                          className="btn-ghost px-3 py-1.5 text-[11px]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Anything that needs the trader's attention */}
+                    {s.status === "error" && s.last_error && (
+                      <div className="text-[11px] pl-[46px]" style={{ color: "var(--bad)" }}>
+                        {s.last_error}
+                      </div>
+                    )}
+                    {s.status === "needs_login" && (
+                      <div className="text-[11px] pl-[46px]" style={{ color: "var(--warn, #b45309)" }}>
+                        Waiting for a Discord sign-in — connect once on the right.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        </div>
+
+        {/* Sidebar: the two things you DO, in order. Sticky so they stay put
+            while a long channel list scrolls. */}
+        <aside className="space-y-4 lg:sticky lg:top-4">
+          {/* Step 1 — add a channel */}
+          <form onSubmit={addSource} className="card p-5 space-y-3.5">
+            <StepHeader n={1} icon={<Hash size={14} />} title="Add a channel" />
+            <div className="space-y-3">
+              <div>
+                <label className="text-[11px] font-medium" style={{ color: "var(--muted)" }}>
+                  Name this source
+                </label>
+                <input
+                  className={`${inputCls} mt-1.5`}
+                  style={inputStyle}
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  placeholder="e.g. OptionHaven Alerts"
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] font-medium" style={{ color: "var(--muted)" }}>
+                  Channel link
+                </label>
+                <input
+                  className={`${inputCls} mt-1.5`}
+                  style={inputStyle}
+                  value={channelUrl}
+                  onChange={(e) => setChannelUrl(e.target.value)}
+                  placeholder="https://discord.com/channels/…/…"
+                  required
+                />
+                <p className="text-[11px] mt-1.5 leading-snug" style={{ color: "var(--muted)" }}>
+                  Open the channel in Discord and copy the address from your browser.
+                </p>
+              </div>
+            </div>
+            <button
+              type="submit"
+              disabled={adding}
+              className="btn-primary w-full py-2 text-sm inline-flex items-center justify-center gap-1.5 disabled:opacity-60"
+            >
+              {adding && <Spinner />} Add channel
+            </button>
+          </form>
+
+        
+        </aside>
       </div>
 
       {/* Connector pairing dialog — the primary way to connect Discord */}
@@ -723,23 +821,16 @@ export default function DiscordPage() {
             <h3 className="text-base font-semibold" style={{ color: "var(--text)" }}>
               Connect Discord
             </h3>
-            <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-              {pairFor.label}
-            </p>
+            <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>{pairFor.label}</p>
 
-            <ol
-              className="text-sm mt-5 space-y-2 list-decimal pl-5 text-left"
-              style={{ color: "var(--text-2)" }}
-            >
-              <li>
-                Open the <strong>Kopyaa Connector</strong> app on your computer.
-              </li>
+            <ol className="text-sm mt-5 space-y-2 list-decimal pl-5 text-left" style={{ color: "var(--text-2)" }}>
+              <li>Open the <strong>Kopyaa Connector</strong> app on your computer.</li>
               <li>Enter this code:</li>
             </ol>
 
             <div
               className="mt-3 mx-auto rounded-xl py-4 font-mono tracking-[0.2em] text-2xl"
-              style={{ background: "var(--surface-2, #1a1d23)", color: "var(--text)" }}
+              style={{ background: "var(--panel-2)", color: "var(--text)" }}
             >
               {pair ? pair.code : "…"}
             </div>
@@ -747,11 +838,7 @@ export default function DiscordPage() {
               Expires in 10 minutes · single use
             </p>
 
-            <ol
-              className="text-sm mt-4 space-y-2 list-decimal pl-5 text-left"
-              style={{ color: "var(--text-2)" }}
-              start={3}
-            >
+            <ol className="text-sm mt-4 space-y-2 list-decimal pl-5 text-left" style={{ color: "var(--text-2)" }} start={3}>
               <li>Sign in to Discord in the browser window it opens.</li>
             </ol>
 
@@ -759,9 +846,7 @@ export default function DiscordPage() {
               {pair?.status === "claimed" ? (
                 <strong>Connector found — waiting for you to sign in…</strong>
               ) : pair?.status === "failed" ? (
-                <span style={{ color: "var(--danger, #b91c1c)" }}>
-                  {pair.error || "Connection failed."}
-                </span>
+                <span style={{ color: "var(--bad)" }}>{pair.error || "Connection failed."}</span>
               ) : (
                 <span style={{ color: "var(--muted)" }}>Waiting for the Connector…</span>
               )}
@@ -781,11 +866,7 @@ export default function DiscordPage() {
                 Cancel
               </button>
               {pair?.status === "failed" && (
-                <button
-                  type="button"
-                  onClick={() => startPairing(pairFor)}
-                  className="btn-primary px-4 py-2 text-sm"
-                >
+                <button type="button" onClick={() => startPairing(pairFor)} className="btn-primary px-4 py-2 text-sm">
                   New code
                 </button>
               )}
@@ -808,7 +889,7 @@ export default function DiscordPage() {
         </div>
       )}
 
-      {/* QR sign-in dialog */}
+      {/* QR sign-in dialog — fallback when the Connector isn't available */}
       {loginFor && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
@@ -823,16 +904,13 @@ export default function DiscordPage() {
             <h3 className="text-base font-semibold" style={{ color: "var(--text)" }}>
               Connect Discord
             </h3>
-            <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-              {loginFor.label}
-            </p>
+            <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>{loginFor.label}</p>
 
             <div
               className="mt-5 mx-auto flex items-center justify-center rounded-xl"
               style={{ width: 220, height: 220, background: "#fff" }}
             >
               {login?.qr_image ? (
-                // Discord rotates this code; the poll above swaps in a fresh one.
                 <img
                   src={login.qr_image}
                   alt="Discord login QR code"
@@ -850,9 +928,7 @@ export default function DiscordPage() {
               {login?.status === "scanned" ? (
                 <strong>Scanned — now approve the sign-in on your phone.</strong>
               ) : login?.status === "failed" ? (
-                <span style={{ color: "var(--danger, #b91c1c)" }}>
-                  {login.error || "Sign-in failed."}
-                </span>
+                <span style={{ color: "var(--bad)" }}>{login.error || "Sign-in failed."}</span>
               ) : (
                 <>
                   Open <strong>Discord on your phone</strong> → tap your avatar →{" "}
@@ -871,11 +947,7 @@ export default function DiscordPage() {
                 Cancel
               </button>
               {login?.status === "failed" && (
-                <button
-                  type="button"
-                  onClick={() => startLogin(loginFor)}
-                  className="btn-primary px-4 py-2 text-sm"
-                >
+                <button type="button" onClick={() => startLogin(loginFor)} className="btn-primary px-4 py-2 text-sm">
                   Try again
                 </button>
               )}
@@ -896,36 +968,127 @@ export default function DiscordPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
 
-      {/* Setup instructions */}
-      <div className="card p-5">
-        <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text)" }}>
-          Connecting your Discord session
-        </h3>
-        <ol className="text-sm space-y-2 list-decimal pl-5" style={{ color: "var(--text-2)" }}>
-          <li>
-            Open the alert channel in Discord and copy the link from your address bar, then
-            add it above.
-          </li>
-          <li>
-            Click <strong>Connect Discord</strong>. Kopyaa shows a pairing code.
-          </li>
-          <li>
-            Open the <strong>Kopyaa Connector</strong> app and enter that code.
-          </li>
-          <li>
-            Sign in to Discord in the browser window it opens — on your own computer, as
-            you normally would.
-          </li>
-          <li>That&apos;s it. Monitoring starts automatically.</li>
-        </ol>
-        <p className="text-[11px] mt-3" style={{ color: "var(--muted)" }}>
-          Kopyaa only reads channels your Discord account can already open, and never posts or
-          interacts as you. You can revoke access at any time with <strong>Sign out</strong> here, or
-          by logging out of that session in Discord. Reading alerts and placing trades roll out in
-          later updates.
-        </p>
+
+/** One stage of the pipeline strip. */
+function PipelineStep({
+  icon,
+  title,
+  detail,
+  accent = false,
+  soon = false,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  detail: string;
+  accent?: boolean;
+  /** Marks a stage that isn't live yet. The strip describes the finished
+   *  pipeline, and a trader who assumes their alerts already reach their broker
+   *  would stop watching them — so an unbuilt stage has to say so. */
+  soon?: boolean;
+}) {
+  return (
+    <div
+      className="flex-1 min-w-[132px] rounded-xl px-3 py-2.5"
+      style={{
+        background: accent ? "var(--accent-glow)" : "var(--panel-2)",
+        border: `1px solid ${accent ? "rgba(44,147,197,0.35)" : "var(--border)"}`,
+      }}
+    >
+      <div
+        className="flex items-center gap-1.5 text-[13px] font-medium"
+        style={{ color: accent ? "var(--accent-2)" : "var(--text)" }}
+      >
+        {icon}
+        {title}
+        {soon && (
+          <span
+            className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full tracking-wide"
+            style={{ background: "var(--panel-2)", color: "var(--muted)" }}
+          >
+            SOON
+          </span>
+        )}
       </div>
+      <div className="text-[10.5px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+        {detail}
+      </div>
+    </div>
+  );
+}
+
+/** Chevron between pipeline stages. Hidden once the strip wraps, where a
+ *  horizontal arrow would point at the wrong thing. */
+function PipelineArrow() {
+  return (
+    <div
+      aria-hidden
+      className="hidden sm:flex items-center self-center"
+      style={{ color: "var(--muted)" }}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <path d="M5 12h14M13 6l6 6-6 6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </div>
+  );
+}
+
+/** One reassurance tile. */
+function Assurance({
+  icon,
+  title,
+  body,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  body: string;
+}) {
+  return (
+    <div
+      className="rounded-xl px-3 py-2.5"
+      style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+    >
+      <div
+        className="flex items-center gap-1.5 text-[12px] font-semibold"
+        style={{ color: "var(--text)" }}
+      >
+        <span style={{ color: "var(--accent-2)" }}>{icon}</span>
+        {title}
+      </div>
+      <p className="text-[11px] mt-1 leading-snug" style={{ color: "var(--muted)" }}>
+        {body}
+      </p>
+    </div>
+  );
+}
+
+
+/** Numbered heading tying the sidebar cards into an ordered flow. */
+function StepHeader({ n, icon, title }: { n: number; icon: React.ReactNode; title: string }) {
+  return (
+    <div className="flex items-center gap-2.5">
+      <span
+        className="inline-flex items-center justify-center rounded-lg text-[11px] font-semibold"
+        style={{
+          width: 22,
+          height: 22,
+          background: "var(--accent-glow)",
+          color: "var(--accent-2)",
+          border: "1px solid rgba(44,147,197,0.35)",
+        }}
+      >
+        {n}
+      </span>
+      <span
+        className="inline-flex items-center gap-1.5 text-sm font-semibold"
+        style={{ color: "var(--text)" }}
+      >
+        <span style={{ color: "var(--accent-2)" }}>{icon}</span>
+        {title}
+      </span>
     </div>
   );
 }
