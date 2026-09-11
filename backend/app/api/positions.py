@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
