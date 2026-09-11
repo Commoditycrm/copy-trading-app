@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_trader
 from app.config import get_settings
 from app.database import get_db
+from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
 from app.models.user import User
@@ -111,6 +112,48 @@ def require_listener_token(
         raise HTTPException(401, "invalid_listener_token")
 
 
+def _primary_account(db: Session, user: User, *, create: bool = False) -> DiscordAccount | None:
+    """This trader's Discord account, created on demand.
+
+    One account covers every channel it can read — which is the whole point of
+    moving the session off the source. Traders with two Discord accounts get a
+    second row, but the common case never has to choose.
+    """
+    acct = db.execute(
+        select(DiscordAccount)
+        .where(DiscordAccount.user_id == user.id)
+        .order_by(DiscordAccount.created_at.asc())
+    ).scalars().first()
+    if acct is None and create:
+        acct = DiscordAccount(user_id=user.id, label="Discord account", status="needs_login")
+        db.add(acct)
+        db.flush()
+    return acct
+
+
+def _store_session(db: Session, src: DiscordAlertSource, state: dict) -> DiscordAccount | None:
+    """Attach a captured session to the channel's ACCOUNT and bring every
+    channel that account reads online.
+
+    All three capture routes (Connector pairing, QR, manual upload) funnel
+    through here so none of them can drift back to per-channel sessions.
+    """
+    acct = src.account
+    if acct is None:
+        return None
+    acct.encrypted_session = encrypt_session(state)
+    acct.session_captured_at = datetime.now(timezone.utc)
+    acct.status = "connected"
+    acct.last_error = None
+    for sibling in acct.sources:
+        if sibling.is_enabled and sibling.status in ("needs_login", "error"):
+            # 'connecting', not 'connected': only the listener actually opening
+            # the channel proves Discord still accepts the session.
+            sibling.status = "connecting"
+            sibling.last_error = None
+    return acct
+
+
 def _get_owned(db: Session, user: User, source_id: uuid.UUID) -> DiscordAlertSource:
     src = db.get(DiscordAlertSource, source_id)
     if src is None or src.user_id != user.id:
@@ -132,8 +175,12 @@ def _to_out(src: DiscordAlertSource) -> DiscordSourceOut:
         end=src.schedule_end,
         timezone=src.schedule_timezone,
     )
+    acct = src.account
     out.session = DiscordSessionInfo(
-        **describe_session(src.encrypted_session, src.session_captured_at)
+        **describe_session(
+            acct.encrypted_session if acct else None,
+            acct.session_captured_at if acct else None,
+        )
     )
     return out
 
@@ -169,13 +216,18 @@ def create_source(
     except DiscordSessionError as exc:
         raise HTTPException(400, f"invalid_channel_url: {exc}")
 
+    # Attach to the trader's Discord account. If it's already connected the new
+    # channel is live immediately — no second sign-in.
+    acct = _primary_account(db, user, create=True)
+    connected = bool(acct and acct.encrypted_session)
     src = DiscordAlertSource(
         user_id=user.id,
+        account_id=acct.id if acct else None,
         label=payload.label.strip(),
         guild_id=guild_id,
         channel_id=channel_id,
         is_enabled=True,
-        status="needs_login",
+        status="connecting" if connected else "needs_login",
     )
     db.add(src)
     try:
@@ -326,10 +378,11 @@ def update_source(
             src.last_seen_message_id = None
             src.last_message_at = None
             src.last_error = None
-            # The session is unaffected — it authenticates the account, not the
-            # channel — so a source that had one goes straight back to connecting.
+            # The session lives on the account, so repointing a channel never
+            # costs a sign-in.
+            has_session = bool(src.account and src.account.encrypted_session)
             src.status = (
-                "connecting" if (src.encrypted_session and src.is_enabled) else
+                "connecting" if (has_session and src.is_enabled) else
                 "disconnected" if not src.is_enabled else "needs_login"
             )
     if payload.schedule_mode is not None:
@@ -351,7 +404,7 @@ def update_source(
         # listener reconciles within its poll interval and writes the real state.
         if not payload.is_enabled:
             src.status = "disconnected"
-        elif src.encrypted_session:
+        elif src.account and src.account.encrypted_session:
             src.status = "connecting"
         else:
             src.status = "needs_login"
@@ -387,15 +440,11 @@ def upload_session(
     except DiscordSessionError as exc:
         raise HTTPException(400, f"invalid_session: {exc}")
 
-    src.encrypted_session = encrypt_session(state)
-    src.session_captured_at = datetime.now(timezone.utc)
-    src.last_error = None
-    # 'connecting' rather than 'connected': the session is stored, but only the
-    # listener actually opening the channel proves Discord still accepts it.
-    src.status = "connecting" if src.is_enabled else "disconnected"
+    if _store_session(db, src, state) is None:
+        raise HTTPException(409, "source_has_no_account")
     db.commit()
     db.refresh(src)
-    log.info("discord: session stored for source=%s user=%s", src.id, user.id)
+    log.info("discord: session stored on account for source=%s user=%s", src.id, user.id)
     return _to_out(src)
 
 
@@ -529,9 +578,18 @@ def clear_session(
     because the assignment disappears.
     """
     src = _get_owned(db, user, source_id)
-    src.encrypted_session = None
-    src.session_captured_at = None
-    src.status = "needs_login"
+    # Signing out revokes the ACCOUNT's session, so every channel read with it
+    # goes offline together — anything else would imply per-channel logins that
+    # no longer exist.
+    acct = src.account
+    if acct is not None:
+        acct.encrypted_session = None
+        acct.session_captured_at = None
+        acct.status = "needs_login"
+        for sibling in acct.sources:
+            sibling.status = "needs_login"
+    else:
+        src.status = "needs_login"
     db.commit()
     db.refresh(src)
     return _to_out(src)
@@ -625,9 +683,11 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
     """
     rows = list(
         db.execute(
-            select(DiscordAlertSource).where(
+            select(DiscordAlertSource)
+            .join(DiscordAccount, DiscordAccount.id == DiscordAlertSource.account_id)
+            .where(
                 DiscordAlertSource.is_enabled.is_(True),
-                DiscordAlertSource.encrypted_session.is_not(None),
+                DiscordAccount.encrypted_session.is_not(None),
             )
         ).scalars()
     )
@@ -658,16 +718,20 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
             src.status = "connecting"
             dirty = True
 
+        acct = src.account
         try:
-            state = decrypt_session(src.encrypted_session or "")
+            state = decrypt_session(acct.encrypted_session or "")
         except (ValueError, TypeError):
             log.warning(
-                "discord: undecryptable session for source=%s — marking needs_login", src.id
+                "discord: undecryptable session on account=%s — marking needs_login",
+                acct.id if acct else None,
             )
-            src.encrypted_session = None
-            src.session_captured_at = None
+            if acct is not None:
+                acct.encrypted_session = None
+                acct.session_captured_at = None
+                acct.status = "needs_login"
+                acct.last_error = "Stored Discord session could not be read. Please sign in again."
             src.status = "needs_login"
-            src.last_error = "Stored Discord session could not be read. Please sign in again."
             dirty = True
             continue
         out.append(
@@ -833,10 +897,9 @@ def listener_login_complete(
         discord_login.finish(session_id, error=str(exc))
         raise HTTPException(400, f"invalid_session: {exc}")
 
-    src.encrypted_session = encrypt_session(state)
-    src.session_captured_at = datetime.now(timezone.utc)
-    src.last_error = None
-    src.status = "connecting" if src.is_enabled else "disconnected"
+    if _store_session(db, src, state) is None:
+        discord_login.finish(session_id, error="This channel has no Discord account.")
+        raise HTTPException(409, "source_has_no_account")
     db.commit()
 
     discord_login.finish(session_id)
@@ -896,14 +959,19 @@ def complete_pairing(payload: DiscordPairCompleteIn, db: Session = Depends(get_d
         discord_pairing.finish(session["code"], error=str(exc))
         raise HTTPException(400, f"invalid_session: {exc}")
 
-    src.encrypted_session = encrypt_session(state)
-    src.session_captured_at = datetime.now(timezone.utc)
-    src.last_error = None
-    src.status = "connecting" if src.is_enabled else "disconnected"
+    # Store on the ACCOUNT, then bring every channel it reads online at once —
+    # that is what makes one sign-in cover all of them.
+    acct = _store_session(db, src, state)
+    if acct is None:
+        discord_pairing.finish(session["code"], error="This channel has no Discord account.")
+        raise HTTPException(409, "source_has_no_account")
     db.commit()
 
     discord_pairing.finish(session["code"])
-    log.info("discord: connector paired session for source=%s", src.id)
+    log.info(
+        "discord: connector paired account=%s (%d channel(s) now live)",
+        acct.id, len(acct.sources),
+    )
     events.publish(
         src.user_id, {"type": "discord.login_complete", "source_id": str(src.id)}
     )
