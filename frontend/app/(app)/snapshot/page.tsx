@@ -81,10 +81,11 @@ function positionLabel(p: SnapPos): string {
 //  pct_reference — a resting limit % below the previous day close (PDC)
 //  at_exit       — a resting limit % below the recorded exit price (0% = at exit)
 //  trailing      — a trailing-stop BUY at a trail % (stock only)
+//  trail_down    — a buy LIMIT that ratchets DOWN as the price falls (stock only)
 //  limit         — an exact $ limit price (per-row only)
-type ReChoice = "market" | "pct_current" | "pct_reference" | "at_exit" | "trailing" | "limit";
+type ReChoice = "market" | "pct_current" | "pct_reference" | "at_exit" | "trailing" | "trail_down" | "limit";
 const isPctChoice = (c: ReChoice) => c === "pct_current" || c === "pct_reference" || c === "at_exit";
-const takesPct = (c: ReChoice) => isPctChoice(c) || c === "trailing";
+const takesPct = (c: ReChoice) => isPctChoice(c) || c === "trailing" || c === "trail_down";
 const choiceBasis = (c: ReChoice) =>
   c === "pct_reference" ? "reference" : c === "at_exit" ? "exit" : "current";
 
@@ -186,6 +187,9 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
         if (globalChoice === "trailing") {
           const d = parseFloat(globalDisc);
           if (!isNaN(d) && d > 0 && d <= 100) params.set("trail_percent", String(d));
+        } else if (globalChoice === "trail_down") {
+          const d = parseFloat(globalDisc);
+          if (!isNaN(d) && d > 0 && d <= 100) params.set("trail_down_percent", String(d));
         } else if (globalChoice !== "market") {
           params.set("basis", choiceBasis(globalChoice));
           const d = parseFloat(globalDisc);
@@ -197,6 +201,8 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
         const v = parseFloat(rowVal[scope] ?? "");
         if (choice === "trailing") {
           if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_percent", String(v));
+        } else if (choice === "trail_down") {
+          if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_down_percent", String(v));
         } else if (choice === "limit") {
           if (!isNaN(v) && v > 0) params.set("limit_price", String(v));
         } else if (choice !== "market") {
@@ -261,12 +267,13 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
               <option value="pct_reference">% below PDC</option>
               <option value="at_exit">% below Exit</option>
               <option value="trailing">Trailing %</option>
+              <option value="trail_down">Trail down %</option>
             </select>
             {takesPct(globalChoice) && (
               <div className="inline-flex items-center gap-0.5">
                 <PercentInput min="0" max="100" step="0.5" value={globalDisc}
-                       onChange={(e) => setGlobalDisc(e.target.value)} placeholder={globalChoice === "trailing" ? "trail" : "%"}
-                       aria-label={globalChoice === "trailing" ? "Trail percent for Re-Enter All" : "Discount percent for Re-Enter All"}
+                       onChange={(e) => setGlobalDisc(e.target.value)} placeholder={globalChoice === "trailing" || globalChoice === "trail_down" ? "trail" : "%"}
+                       aria-label={globalChoice === "trailing" ? "Trail percent for Re-Enter All" : globalChoice === "trail_down" ? "Trail-down percent for Re-Enter All" : "Discount percent for Re-Enter All"}
                        className="w-10 text-xs outline-none text-center"
                        style={{ background: "transparent", border: "none", color: "var(--text)" }} />
                 <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>
@@ -323,7 +330,7 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
                 const targetPx =
                   choice === "at_exit"
                     ? (basisPx != null ? basisPx * (1 - (rvValid ? rv : 0) / 100) : null)
-                    : (isPct && rvValid && basisPx != null ? basisPx * (1 - rv / 100) : null);
+                    : ((isPct || choice === "trail_down") && rvValid && basisPx != null ? basisPx * (1 - rv / 100) : null);
                 const pctVsExit =
                   exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
                 return (
@@ -377,6 +384,7 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
                             <option value="pct_reference" disabled={p.instrument_type === "option"}>% below PDC</option>
                             <option value="at_exit">% below Exit</option>
                             <option value="trailing" disabled={p.instrument_type === "option"}>Trailing %</option>
+                            <option value="trail_down" disabled={p.instrument_type === "option"}>Trail down %</option>
                             <option value="limit">Limit $</option>
                           </select>
                           {(takesPct(choice) || choice === "limit") && (
@@ -386,8 +394,8 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
                               <PercentInput min="0" max={choice === "limit" ? undefined : 100} step={choice === "limit" ? 0.01 : 0.5}
                                      value={rowVal[rowKey] ?? ""} disabled={!canReenter}
                                      onChange={(e) => setRowVal((m) => ({ ...m, [rowKey]: e.target.value }))}
-                                     placeholder={choice === "limit" ? "price" : choice === "trailing" ? "trail" : "%"}
-                                     aria-label={`${choice === "limit" ? "Limit price" : choice === "trailing" ? "Trail percent" : "Percent below"} for ${p.symbol}`}
+                                     placeholder={choice === "limit" ? "price" : (choice === "trailing" || choice === "trail_down") ? "trail" : "%"}
+                                     aria-label={`${choice === "limit" ? "Limit price" : choice === "trailing" ? "Trail percent" : choice === "trail_down" ? "Trail-down percent" : "Percent below"} for ${p.symbol}`}
                                      className="w-14 text-xs py-0.5 outline-none"
                                      style={{ background: "transparent", border: "none", color: "var(--text)" }} />
                               {choice !== "limit" && <span className="text-[9px]" style={{ color: "var(--muted)" }}>%</span>}
