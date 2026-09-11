@@ -738,6 +738,10 @@ def re_enter_from_snapshot(
         default=None, gt=0, le=100,
         description="Re-enter as a TRAILING-STOP order at this trail % instead of market/limit (stock only; options fall back to market). Wins over discount_percent/limit_price.",
     ),
+    trail_down_percent: Decimal | None = Query(
+        default=None, gt=0, le=100,
+        description="'Trail down': rest a BUY LIMIT this % below the live price, then re-price it lower as the stock falls (ratchets DOWN only). Stock only; managed by trail_down_monitor. Wins over discount_percent/limit_price.",
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(require_sell_all_access),
 ) -> dict:
@@ -848,12 +852,34 @@ def re_enter_from_snapshot(
             # Alpaca can't trail options, so an option here falls through to a
             # limit/market re-buy.
             use_trail = trail_percent is not None and trail_percent > 0 and is_buy and is_stock
+            # "Trail down": a managed BUY LIMIT resting trail_down_percent below
+            # the live price; trail_down_monitor ratchets it lower as the stock
+            # falls. STOCK-only (needs a live stock quote to re-price). Broker
+            # sees a plain limit — the ratchet is ours.
+            use_trail_down = (
+                not use_trail and trail_down_percent is not None
+                and trail_down_percent > 0 and is_buy and is_stock
+            )
             # Limit re-buy (BUY side). Works for stocks AND options now: an
             # explicit Limit $, or a % below the chosen basis (live/PDC/exit).
             # For options only 'current' (option bid/ask mid) and 'exit' (the
             # recorded exit price) are priceable — PDC returns None → market.
             if use_trail:
                 use_limit, limit_val = False, None
+            elif use_trail_down:
+                # Initial limit = trail_down_percent below the live price. If we
+                # can't quote it, fall back to a plain market re-buy.
+                live_px = _basis_price({**p, "instrument_type": "stock"}) if basis == "current" else None
+                if live_px is None:
+                    try:
+                        fn = getattr(adapter, "get_stock_latest_price", None)
+                        live_px = fn(p["symbol"]) if fn else None
+                    except Exception:  # noqa: BLE001
+                        live_px = None
+                if live_px is not None and live_px > 0:
+                    use_limit, limit_val = True, (live_px * (Decimal(1) - trail_down_percent / Decimal(100))).quantize(Decimal("0.01"))
+                else:
+                    use_trail_down, use_limit, limit_val = False, False, None
             elif limit_price is not None and is_buy:
                 use_limit, limit_val = True, limit_price
             elif is_buy and (disc > 0 or basis == "exit"):
@@ -880,6 +906,10 @@ def re_enter_from_snapshot(
                 db, user, payload, acct.id, background, request,
                 skip_fanout=True, resolve_wash_trade=False,
             )
+            # Tag the row so trail_down_monitor re-prices it. The order itself is
+            # a plain limit at the broker.
+            if use_trail_down:
+                order.trail_down_percent = trail_down_percent
             placed.append({
                 "symbol": p["symbol"], "side": side.value, "qty": str(abs(qty)),
                 "order_type": payload.order_type.value,

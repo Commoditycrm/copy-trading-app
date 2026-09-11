@@ -142,6 +142,7 @@ def create_app() -> FastAPI:
     # thread can be signalled to exit cleanly when uvicorn shuts down.
     shutdown_event = threading.Event()
     scheduler_thread: threading.Thread | None = None
+    trail_down_thread: threading.Thread | None = None
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
@@ -309,6 +310,18 @@ def create_app() -> FastAPI:
             daemon=True,
         )
         scheduler_thread.start()
+
+        # "Trail down" re-entry monitor: re-prices resting buy limits lower as
+        # the stock falls. Same daemon/shutdown model as the retry scheduler.
+        nonlocal trail_down_thread
+        from app.services import trail_down_monitor
+        trail_down_thread = threading.Thread(
+            target=trail_down_monitor.poll_loop,
+            kwargs={"shutdown_check": shutdown_event.is_set},
+            name="trail-down-monitor",
+            daemon=True,
+        )
+        trail_down_thread.start()
 
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
