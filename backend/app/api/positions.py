@@ -423,19 +423,45 @@ def _snap_key(p: dict) -> tuple:
     return (p["symbol"], p.get("option_expiry"), p.get("option_strike"), p.get("option_right"))
 
 
-def _capture_exit_snapshot(db: Session, user_id: uuid.UUID, items: list[dict]) -> "SellAllSnapshot | None":
-    """History model: each exit event (an Exit-All sweep or a single close) is
-    its OWN snapshot. Deactivate the prior active one and create a fresh snapshot
-    holding just this event's positions (deduped within the event by contract
-    identity). Older snapshots are retained — their Re-Entry badges survive and
-    the user can still re-enter or delete them from the snapshot list."""
+def _capture_exit_snapshot(
+    db: Session, user_id: uuid.UUID, items: list[dict], new_event: bool = True,
+) -> "SellAllSnapshot | None":
+    """Record exited positions into a re-entry snapshot.
+
+    ``new_event=True`` (an Exit-All sweep) always starts a FRESH snapshot: it
+    deactivates the prior active one and creates a new active snapshot holding
+    just this sweep's positions. ``new_event=False`` (a single position close)
+    instead APPENDS to today's active snapshot so closing positions one-by-one
+    groups into one snapshot rather than fragmenting into a snapshot per order;
+    it only starts a new one when there's no active snapshot from today. Items
+    are deduped by contract identity. Older snapshots are retained — their
+    Re-Entry badges survive and they stay in the snapshot history."""
     if not items:
         return None
-    for s in db.execute(
+
+    active = db.execute(
         select(SellAllSnapshot).where(
             SellAllSnapshot.user_id == user_id, SellAllSnapshot.active.is_(True)
-        )
-    ).scalars().all():
+        ).order_by(SellAllSnapshot.created_at.desc())
+    ).scalars().all()
+
+    # A single close joins today's current snapshot instead of spawning its own.
+    if not new_event and active:
+        from app.services import market_hours as _mh  # noqa: PLC0415
+        today_et = _mh.now_et().date()
+        snap = active[0]
+        if snap.created_at.astimezone(_mh.ET).date() == today_et:
+            for s in active[1:]:
+                s.active = False
+            by_key = {_snap_key(it): it for it in snap.positions}
+            for it in items:
+                by_key[_snap_key(it)] = it   # add / refresh this contract
+            snap.positions = list(by_key.values())   # reassign so JSONB persists
+            db.flush()
+            return snap
+
+    # New event (Exit-All), or no usable active snapshot: start a fresh one.
+    for s in active:
         s.active = False
     by_key: dict = {}
     for it in items:
@@ -1359,6 +1385,8 @@ def close_position(
     # same as Exit All. Record the CLOSED quantity (partial closes included).
     closed_item = _snapshot_item(pos)
     closed_item["quantity"] = str(close_qty if pos.quantity > 0 else -close_qty)
-    _capture_exit_snapshot(db, user.id, [closed_item])
+    # Single close joins today's current snapshot (don't fragment into one
+    # snapshot per order). Exit-All still starts its own.
+    _capture_exit_snapshot(db, user.id, [closed_item], new_event=False)
     db.commit()
     return order
