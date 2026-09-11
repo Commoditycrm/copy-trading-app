@@ -107,6 +107,12 @@ class Order(Base, TimestampMixin):
     trail_percent: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
     trail_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
 
+    # "Trail down" re-entry: a MANAGED buy LIMIT (order_type == LIMIT, side BUY)
+    # whose limit trail_down_monitor re-prices this % below the falling live
+    # price — ratcheting DOWN only, never up. Set only on such orders; NULL
+    # everywhere else. The broker just sees a plain limit; the ratchet is ours.
+    trail_down_percent: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+
     # Bracket-order legs attached to a parent entry. Both NULL = plain
     # order; both set = bracket (Alpaca OrderClass.BRACKET on supported
     # brokers). Mirror children inherit these prices verbatim — multipliers
