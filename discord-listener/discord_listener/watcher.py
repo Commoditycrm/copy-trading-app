@@ -186,6 +186,8 @@ class ChannelWatcher:
         await self._await_channel()
         await self._inject_observer()
 
+        await self._set_baseline()
+
         names = await self._read_names()
         await self._client.post_status(
             self.source_id,
@@ -234,6 +236,37 @@ class ChannelWatcher:
                 "lastSeenMessageId": self._last_seen,
                 "flushMs": self._config.flush_ms,
             },
+        )
+
+    async def _set_baseline(self) -> None:
+        """On a channel's FIRST attach, record where watching started.
+
+        Connecting a channel means "watch it from here", not "import its
+        history" — so the observer emits none of the rendered backlog. But the
+        starting point has to be persisted, or the next reconnect would suppress
+        the backlog again and lose anything posted while we were away.
+
+        Only ever set when the channel has no mark yet; it is never moved
+        backwards.
+        """
+        if self._last_seen:
+            return
+        try:
+            baseline = await self._page.evaluate(
+                "() => (window.__kopyaaBaseline ? window.__kopyaaBaseline() : null)"
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("source=%s baseline unavailable", self.source_id, exc_info=True)
+            return
+        if not baseline:
+            return
+        self._last_seen = str(baseline)
+        await self._client.post_status(
+            self.source_id, "connected", baseline_message_id=self._last_seen
+        )
+        log.info(
+            "source=%s watching from message %s onward (existing history skipped)",
+            self.source_id, self._last_seen,
         )
 
     async def _read_names(self) -> dict[str, str | None]:
