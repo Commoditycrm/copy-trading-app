@@ -125,8 +125,9 @@ class GenericTextParser(Parser):
                     asset_type=AssetType.STOCK,
                     symbol=symbol,
                     quantity=qty,
-                    order_type=OrderKind.MARKET if is_market else OrderKind.LIMIT,
+                    order_type=OrderKind.LIMIT,
                     limit_price=None if is_market else price,
+                    limit_price_unspecified=is_market or price is None,
                     source_action=action_m.group(0).upper(),
                     parser=self.name,
                 )
@@ -165,8 +166,9 @@ class GenericTextParser(Parser):
                 strike=strike,
                 expiration=expiry,
                 quantity=qty,
-                order_type=OrderKind.MARKET if is_market else OrderKind.LIMIT,
+                order_type=OrderKind.LIMIT,
                 limit_price=None if is_market else price,
+                limit_price_unspecified=is_market or price is None,
                 source_action=action_m.group(0).upper(),
                 parser=self.name,
             )

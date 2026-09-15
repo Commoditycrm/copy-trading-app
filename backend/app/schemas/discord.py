@@ -373,6 +373,9 @@ class DiscordSignalOut(BaseModel):
     # The alert named ONLY a symbol ("META -> 100%") — the whole contract has to
     # come from the open position.
     contract_unspecified: bool = False
+    # Always a limit order; True when the price still has to come from the live
+    # quote because the alert didn't state one.
+    limit_price_unspecified: bool = False
     source_action: str | None = None
 
     # Figures the alert REPORTED, not computed by us.
@@ -391,7 +394,11 @@ class DiscordSettingsOut(BaseModel):
     # "manual" — accept or reject each alert in Order History
     # "auto"   — a successful parse is approved immediately
     execution_mode: str
+    # False — paper: validate and record, never send to the broker
+    # True  — live: approved alerts place real orders
+    live_trading: bool = False
 
 
 class DiscordSettingsIn(BaseModel):
-    execution_mode: str = Field(pattern=r"^(auto|manual)$")
+    execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
+    live_trading: bool | None = None
