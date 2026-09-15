@@ -97,6 +97,22 @@ _UPDATE_RE = re.compile(
 )
 
 
+# "META -> 100%"  /  "NVDA -> -100%"  /  "TSLA → 25%"
+#
+# A close reported as a symbol and a result, with NO contract details at all.
+# The percentage is the trade's P&L, not a fraction to sell — "-100%" only makes
+# sense as a loss, since you cannot close minus one hundred percent of a
+# position. Which contract it refers to has to come from what the account
+# actually holds.
+_CLOSE_ARROW_RE = re.compile(
+    rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s*"
+    rf"(?:->|=>|–>|—>|\u2192|\u27a1)\s*"
+    rf"(?P<sign>[+\-−])?\s*(?P<pct>{_NUM})\s*%"
+    rf"(?P<trailing>[\s,;].*)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 class CompactAlertParser(Parser):
     name = "compact_alert"
 
@@ -108,6 +124,7 @@ class CompactAlertParser(Parser):
         # traded rather than letting them fall through as generic chatter.
         return any(
             _UPDATE_RE.match(ln)
+            or _CLOSE_ARROW_RE.match(ln)
             or (_has_marker(ln) and _EXIT_RE.match(ln))
             or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln)))
             for ln in self._lines(message)
@@ -129,6 +146,11 @@ class CompactAlertParser(Parser):
             # satisfy the (now price-optional) entry pattern and become a BUY.
             if _UPDATE_RE.match(line):
                 saw_update = True
+                continue
+            m = _CLOSE_ARROW_RE.match(line)
+            if m:
+                sig, err = self._close_arrow(m)
+                (signals.append(sig) if sig else errors.append(err))
                 continue
             m = _ENTRY_RE.match(line)
             if m and _is_entry(m):
@@ -175,6 +197,41 @@ class CompactAlertParser(Parser):
                 order_type=OrderKind.LIMIT if price else OrderKind.MARKET,
                 limit_price=price,
                 source_action="ENTRY",
+                parser=self.name,
+            ),
+            None,
+        )
+
+    def _close_arrow(self, m: re.Match):
+        """"META -> 100%" — close the position in this symbol.
+
+        Only the symbol is known. Strike, call/put and expiry are all absent, so
+        the contract is flagged ``contract_unspecified`` and must be resolved
+        from the open position before this could ever be executed. Guessing which
+        contract was meant would be the worst possible failure here — selling a
+        position the trader never intended to close.
+        """
+        pct = to_decimal(m.group("pct"))
+        if pct is not None and m.group("sign") in ("-", "−"):
+            pct = -pct
+
+        return (
+            TradeSignal(
+                action=SignalAction.SELL,
+                # These channels trade options; the position lookup settles it
+                # either way, and nothing acts on this field before then.
+                asset_type=AssetType.OPTION,
+                symbol=m.group("symbol").upper(),
+                option_type=None,
+                strike=None,
+                expiration=None,
+                expiry_unspecified=True,
+                contract_unspecified=True,
+                quantity=None,          # sized from the position, not the alert
+                order_type=OrderKind.MARKET,
+                pnl_percent=pct,
+                position_closed=True,
+                source_action="CLOSE",
                 parser=self.name,
             ),
             None,
