@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
 from fastapi import (
@@ -51,6 +52,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
+from app.models.order import Order
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.models.user import User
 from app.schemas.pagination import Page
@@ -320,14 +322,30 @@ def list_signals(
     # rows, because that's what the trader needs to see. `total` stays a message
     # count — paging on an expanded count would need a different query shape and
     # the discrepancy is only visible on multi-trade alerts.
+    # Sizing is account-wide, so read it once rather than per row.
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user.id)
+    multiplier = (ts.discord_quantity_multiplier if ts else 1) or 1
+
+    # Actual order quantities for rows that already placed one — the real figure
+    # beats any recomputation.
+    order_ids = [m.order_id for m, _ in rows if m.order_id]
+    placed: dict = {}
+    if order_ids:
+        placed = {
+            o.id: o.quantity
+            for o in db.execute(select(Order).where(Order.id.in_(order_ids))).scalars()
+        }
+
     items: list[DiscordSignalOut] = []
     for m, src in rows:
         signals = list(m.parsed_signals or ([m.parsed_signal] if m.parsed_signal else []))
         if not signals:
-            items.append(_signal_out(m, src, {}, 0))
+            items.append(_signal_out(m, src, {}, 0, multiplier, placed))
             continue
         for idx, sig in enumerate(signals):
-            items.append(_signal_out(m, src, sig or {}, idx))
+            items.append(_signal_out(m, src, sig or {}, idx, multiplier, placed))
 
     return Page[DiscordSignalOut](
         items=items,
@@ -337,8 +355,29 @@ def list_signals(
     )
 
 
+def _effective_quantity(m: DiscordMessage, sig: dict, multiplier: int, placed: dict) -> str | None:
+    """What will actually be traded, as distinct from what the alert said.
+
+    Order of preference: the real order if one was placed, then the alert's size
+    scaled by the multiplier. A close returns None — its size comes from the
+    position held, which isn't knowable here.
+    """
+    if m.order_id and m.order_id in placed:
+        return str(placed[m.order_id])
+    if (sig.get("action") or "").upper() == "SELL":
+        return None
+    raw = sig.get("quantity")
+    if raw in (None, ""):
+        return None
+    try:
+        return str(int(Decimal(str(raw)) * max(1, multiplier)))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _signal_out(
-    m: DiscordMessage, src: DiscordAlertSource, sig: dict, idx: int = 0
+    m: DiscordMessage, src: DiscordAlertSource, sig: dict, idx: int = 0,
+    multiplier: int = 1, placed: dict | None = None,
 ) -> DiscordSignalOut:
     """Flatten a message + ONE of its parsed signals into a table row."""
     return DiscordSignalOut(
@@ -367,6 +406,7 @@ def _signal_out(
         strike=sig.get("strike"),
         expiration=sig.get("expiration"),
         quantity=sig.get("quantity"),
+        effective_quantity=_effective_quantity(m, sig, multiplier, placed or {}),
         order_type=sig.get("order_type"),
         limit_price=sig.get("limit_price"),
         is_partial_close=bool(sig.get("is_partial_close")),
@@ -401,6 +441,11 @@ def get_discord_settings(
     return DiscordSettingsOut(
         execution_mode="auto" if _auto_approve(db, user.id) else "manual",
         live_trading=bool(ts and ts.discord_live_trading),
+        quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
+        max_per_contract=(
+            str(ts.discord_max_per_contract)
+            if ts and ts.discord_max_per_contract is not None else None
+        ),
     )
 
 
@@ -425,6 +470,20 @@ def update_discord_settings(
         db.add(ts)
     if payload.execution_mode is not None:
         ts.discord_execution_mode = payload.execution_mode
+    if payload.quantity_multiplier is not None:
+        ts.discord_quantity_multiplier = payload.quantity_multiplier
+    if payload.max_per_contract is not None:
+        raw = payload.max_per_contract.strip()
+        if not raw:
+            ts.discord_max_per_contract = None       # cleared
+        else:
+            try:
+                value = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, "invalid_max_per_contract")
+            if value <= 0:
+                raise HTTPException(400, "max_per_contract must be positive")
+            ts.discord_max_per_contract = value
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
         log.warning(
@@ -435,6 +494,11 @@ def update_discord_settings(
     return DiscordSettingsOut(
         execution_mode=ts.discord_execution_mode,
         live_trading=bool(ts.discord_live_trading),
+        quantity_multiplier=ts.discord_quantity_multiplier or 1,
+        max_per_contract=(
+            str(ts.discord_max_per_contract)
+            if ts.discord_max_per_contract is not None else None
+        ),
     )
 
 
@@ -705,9 +769,17 @@ def _execute_signal(
     if discord_execution.already_executed(msg):
         return  # one alert, one order
 
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts_for_sizing = db.get(TraderSettings, user.id)
+    sizing = discord_execution.Sizing(
+        multiplier=(ts_for_sizing.discord_quantity_multiplier if ts_for_sizing else 1) or 1,
+        max_per_contract=(ts_for_sizing.discord_max_per_contract if ts_for_sizing else None),
+    )
+
     signal = msg.parsed_signal or {}
     try:
-        resolved = discord_execution.resolve(db, user, signal)
+        resolved = discord_execution.resolve(db, user, signal, sizing)
     except discord_execution.ExecutionRefused as exc:
         discord_execution.mark_failed(msg, str(exc))
         log.info("discord: alert %s not placed — %s", msg.id, exc)
@@ -717,10 +789,7 @@ def _execute_signal(
         log.exception("discord: resolve failed for alert %s", msg.id)
         return
 
-    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
-
-    ts = db.get(TraderSettings, user.id)
-    live = bool(ts and ts.discord_live_trading)
+    live = bool(ts_for_sizing and ts_for_sizing.discord_live_trading)
     detail = " · ".join(f"{k}={v}" for k, v in resolved.resolutions.items())
 
     if not live:
