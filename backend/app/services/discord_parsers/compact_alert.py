@@ -294,8 +294,11 @@ class CompactAlertParser(Parser):
                 expiry_unspecified=True,
                 contract_unspecified=True,
                 quantity=None,          # sized from the position, not the alert
-                order_type=OrderKind.LIMIT,
-                limit_price_unspecified=True,
+                # Exits go to market. A limit sell can sit unfilled while
+                # the position moves against you — and "close this" means
+                # get out, not get out at a price.
+                order_type=OrderKind.MARKET,
+                limit_price=None,
                 pnl_percent=pct,
                 position_closed=True,
                 source_action="CLOSE",
@@ -332,9 +335,11 @@ class CompactAlertParser(Parser):
                 expiration=expiry,
                 expiry_unspecified=unspecified,
                 quantity=DEFAULT_QUANTITY,
-                order_type=OrderKind.LIMIT,
-                limit_price_unspecified=price is None,
-                limit_price=price,
+                # Exits go to market. A limit sell can sit unfilled while
+                # the position moves against you — and "close this" means
+                # get out, not get out at a price.
+                order_type=OrderKind.MARKET,
+                limit_price=None,
                 pnl_percent=pct,
                 source_action="TRIM",
                 parser=self.name,

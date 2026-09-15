@@ -91,9 +91,26 @@ def test_a_complete_buy_resolves_to_an_order(monkeypatch):
     assert r.is_closing is False
 
 
-def test_orders_are_always_limit(monkeypatch):
+def test_entries_are_limit_orders(monkeypatch):
     _wire(monkeypatch, _Adapter())
     assert ex.resolve(None, _User(), _signal()).payload.order_type.value == "limit"
+
+
+def test_closes_are_market_orders(monkeypatch):
+    """An unfilled exit is worse than a slightly worse fill — a limit sell can
+    sit while the position moves against you."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos()]))
+    r = ex.resolve(None, _User(), _signal(action="SELL", limit_price="2.50"))
+    assert r.payload.order_type.value == "market"
+    assert r.payload.limit_price is None
+
+
+def test_a_close_needs_no_quote(monkeypatch):
+    """Market closes removed a failure mode: an exit used to be refused when no
+    live quote was available."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos()], quote=None))
+    r = ex.resolve(None, _User(), _signal(action="SELL", limit_price=None))
+    assert r.payload.order_type.value == "market"
 
 
 # ── close intent: the SELL_TO_OPEN trap ──────────────────────────────────────
@@ -190,10 +207,12 @@ def test_a_missing_price_comes_from_the_live_quote(monkeypatch):
     assert "limit_price" in r.resolutions
 
 
-def test_a_close_without_a_price_uses_the_bid(monkeypatch):
+def test_a_close_carries_no_limit_price_at_all(monkeypatch):
+    """Closes are market orders, so no price is derived even when a quote
+    exists."""
     _wire(monkeypatch, _Adapter(positions=[_Pos()], quote={"bid": "2.00", "ask": "2.20"}))
     r = ex.resolve(None, _User(), _signal(action="SELL", limit_price=None))
-    assert r.payload.limit_price == Decimal("2.00")
+    assert r.payload.limit_price is None
 
 
 def test_no_price_and_no_quote_is_refused(monkeypatch):
@@ -399,3 +418,61 @@ def test_the_ceiling_does_not_apply_to_stock(monkeypatch):
         ex.Sizing(max_per_contract=Decimal("100")),
     )
     assert r.payload.quantity == Decimal("1")
+
+
+def test_contract_type_is_read_from_the_enum_value_not_its_repr():
+    """Alpaca's ContractType stringifies as "ContractType.PUT", so reading the
+    first character of str() made every contract look like a call — puts were
+    rejected outright and calls skipped the call/put check."""
+    class _Enum:
+        value = "put"
+
+        def __str__(self):
+            return "ContractType.PUT"
+
+    class _C:
+        type = _Enum()
+
+    assert ex._contract_type(_C()) == "P"
+
+
+def test_contract_type_still_works_for_plain_strings():
+    class _C:
+        type = "call"
+
+    assert ex._contract_type(_C()) == "C"
+
+
+def test_a_put_alert_matches_a_put_contract(monkeypatch):
+    """The end-to-end case that was failing: "$SPY 759 PUT" against a chain that
+    contains that put."""
+    class _PutEnum:
+        value = "put"
+
+        def __str__(self):
+            return "ContractType.PUT"
+
+    class _PutContract:
+        strike_price = "759"
+        type = _PutEnum()
+        expiration_date = FUTURE
+
+    _wire(monkeypatch, _ChainAdapter(contracts=[_PutContract()]))
+    r = ex.resolve(None, _User(), _signal(strike="759", option_type="PUT"))
+    assert r.payload.option_strike == Decimal("759")
+    assert r.payload.option_right.value == "put"
+
+
+def test_a_call_alert_is_still_rejected_when_only_puts_exist(monkeypatch):
+    """The mirror of the bug: calls must no longer match puts."""
+    class _PutEnum:
+        value = "put"
+
+    class _PutContract:
+        strike_price = "100"
+        type = _PutEnum()
+        expiration_date = FUTURE
+
+    _wire(monkeypatch, _ChainAdapter(contracts=[_PutContract()]))
+    with pytest.raises(ex.ExecutionRefused, match="has no \\$100 call"):
+        ex.resolve(None, _User(), _signal())
