@@ -94,6 +94,19 @@
     if (!el) return "";
     const clone = el.cloneNode(true);
     clone.querySelectorAll('time, [class*="timestamp"], [class*="edited"]').forEach((n) => n.remove());
+
+    /* Discord renders emoji as <img alt="✂️">, not as text. innerText returns
+     * NOTHING for an image, so every emoji silently vanished from the message —
+     * which meant an alert like "✂️ $MSFT 100c +366%" reached the parser as
+     * "$MSFT 100c +366%" and was read as a price update instead of a sell.
+     *
+     * Put the character back from the alt attribute. Custom server emoji use
+     * ":name:" as their alt, which is equally the right thing to preserve. */
+    clone.querySelectorAll("img[alt]").forEach((img) => {
+      const alt = img.getAttribute("alt") || "";
+      img.replaceWith(document.createTextNode(alt));
+    });
+
     return (clone.innerText || clone.textContent || "").trim();
   }
 

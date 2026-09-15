@@ -85,6 +85,15 @@ class TradeSignal:
     # The expiry must then be resolved from the OPEN POSITION at execution time,
     # never guessed here. Display shows the contract without a date.
     expiry_unspecified: bool = False
+    # True when the alert named ONLY a symbol ("META -> 100%") — no strike, no
+    # call/put, no expiry. The entire contract has to come from the open
+    # position; there is nothing here to identify it with.
+    #
+    # Deliberately distinct from expiry_unspecified: that one still pins the
+    # contract to a strike and a right, so a position lookup has something to
+    # match on. This one is a close instruction with no contract at all, and
+    # must never be executed against a guess about which position was meant.
+    contract_unspecified: bool = False
     # The card explicitly said the position is now flat.
     position_closed: bool = False
 
@@ -130,6 +139,7 @@ class TradeSignal:
             ),
             "position_closed": self.position_closed,
             "expiry_unspecified": self.expiry_unspecified,
+            "contract_unspecified": self.contract_unspecified,
             "source_action": self.source_action,
             "parser": self.parser,
         }

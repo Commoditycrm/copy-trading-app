@@ -74,6 +74,7 @@ type DiscordSignal = {
   original_quantity: string | null;
   position_closed: boolean;
   expiry_unspecified: boolean;
+  contract_unspecified: boolean;
   source_action: string | null;
   // Figures the alert itself reported.
   notional: string | null;
@@ -973,6 +974,22 @@ export default function TradesPage() {
                         <span className="inline-flex items-center gap-1.5">
                           <PositionIcon kind={orderKind(o)} />
                           {orderSymbolLabel(o)}
+                          {/* A symbol-only close ("META -> 100%") names no
+                              contract. Say so, rather than letting a bare
+                              ticker read like a resolved stock order. */}
+                          {tab === "discord" &&
+                            signalById.get(o.id)?.contract_unspecified && (
+                            <span
+                              className="chip"
+                              style={{
+                                background: "var(--panel-2)", color: "var(--muted)",
+                                borderColor: "transparent", fontSize: 10,
+                              }}
+                              title="The alert named only a symbol — the contract must be resolved from your open position"
+                            >
+                              open position
+                            </span>
+                          )}
                           {o.is_reentry && (
                             <span
                               className="chip font-semibold"
