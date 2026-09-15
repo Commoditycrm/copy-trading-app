@@ -123,7 +123,11 @@ class AlertCardParser(Parser):
                     asset_type=AssetType.STOCK,
                     symbol=stock.group("symbol").upper(),
                     quantity=qty,
-                    order_type=OrderKind.LIMIT,
+                    # Exits go to market — see compact_alert. A limit sell can sit
+                # unfilled while the position moves against you.
+                order_type=(
+                    OrderKind.MARKET if action is SignalAction.SELL else OrderKind.LIMIT
+                ),
                 limit_price_unspecified=price is None,
                     limit_price=price,
                     source_action=source_action,
@@ -149,7 +153,11 @@ class AlertCardParser(Parser):
                     strike=strike,
                     expiration=expiry,
                     quantity=qty,
-                    order_type=OrderKind.LIMIT,
+                    # Exits go to market — see compact_alert. A limit sell can sit
+                # unfilled while the position moves against you.
+                order_type=(
+                    OrderKind.MARKET if action is SignalAction.SELL else OrderKind.LIMIT
+                ),
                 limit_price_unspecified=price is None,
                     limit_price=price,
                     source_action=source_action,
