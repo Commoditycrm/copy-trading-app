@@ -64,6 +64,7 @@ type DiscordSignal = {
   strike: string | null;
   expiration: string | null;
   quantity: string | null;
+  effective_quantity: string | null;
   order_type: string | null;
   limit_price: string | null;
   decision: string | null;
@@ -118,7 +119,9 @@ function signalToOrder(sig: DiscordSignal): Order {
     symbol: sig.symbol ?? "—",
     side: (sig.action === "SELL" ? "sell" : "buy") as OrderSide,
     order_type: (sig.order_type === "MARKET" ? "market" : "limit") as OrderType,
-    quantity: sig.quantity ?? "0",
+    // What will actually be traded (alert size x multiplier, or the placed
+    // order's real quantity) — not what the alert literally said.
+    quantity: sig.effective_quantity ?? sig.quantity ?? "0",
     limit_price: sig.limit_price,
     stop_price: null,
     take_profit_price: null,
@@ -1034,13 +1037,28 @@ export default function TradesPage() {
                         {/* A close alert that names no contract also names no
                             size — it means "close what you hold". Rendering 0
                             reads as "sell nothing", which is the opposite. */}
-                        {tab === "discord" && signalById.get(o.id)?.quantity == null ? (
+                        {tab === "discord" && signalById.get(o.id)?.effective_quantity == null ? (
                           <span style={{ color: "var(--muted)" }} title="Size comes from your open position">
                             —
                           </span>
-                        ) : (
-                          fmtQty(o.quantity)
-                        )}
+                        ) : (() => {
+                          const sig = tab === "discord" ? signalById.get(o.id) : undefined;
+                          const scaled =
+                            sig && sig.quantity && sig.effective_quantity &&
+                            sig.quantity !== sig.effective_quantity;
+                          return (
+                            <span
+                              title={scaled ? `Alert said ${sig!.quantity}; sized by your multiplier` : undefined}
+                            >
+                              {fmtQty(o.quantity)}
+                              {scaled && (
+                                <span className="ml-1 text-[10px]" style={{ color: "var(--muted)" }}>
+                                  ({sig!.quantity}×)
+                                </span>
+                              )}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
