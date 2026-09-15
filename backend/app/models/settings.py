@@ -77,6 +77,30 @@ class TraderSettings(Base, TimestampMixin):
         String(10), default="manual", server_default="manual", nullable=False,
     )
 
+    # ── Discord alert sizing ─────────────────────────────────────────────────
+    # How many contracts to trade per alert, as a multiple of the alert's own
+    # size (which is 1 for the compact formats that state none).
+    #
+    # Independent of the copy-trading multiplier on SubscriberSettings — a
+    # trader can follow someone at 1x while sizing Discord alerts differently,
+    # and conflating the two would make one silently change the other.
+    #
+    # Applies to ENTRIES only. A close always sells the position actually held;
+    # multiplying an exit would either strand size or try to sell more than
+    # exists.
+    discord_quantity_multiplier: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False,
+    )
+
+    # Ceiling on the dollar value of a single Discord order (quantity x price x
+    # 100 for options). Unlike SubscriberSettings.max_per_contract — which is
+    # display-only — this one is ENFORCED: quantity is reduced to fit, and an
+    # alert whose single contract already exceeds it is refused rather than
+    # trimmed to zero. NULL = no ceiling.
+    discord_max_per_contract: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+
     # Whether approved Discord alerts actually reach the broker.
     #
     #   False (default) — PAPER: the full pipeline runs, validation and all, and
