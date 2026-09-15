@@ -75,6 +75,7 @@ type DiscordSignal = {
   position_closed: boolean;
   expiry_unspecified: boolean;
   contract_unspecified: boolean;
+  limit_price_unspecified: boolean;
   source_action: string | null;
   // Figures the alert itself reported.
   notional: string | null;
@@ -889,7 +890,10 @@ export default function TradesPage() {
                 const orderQty = Number(o.quantity) || 0;
                 const filledQty = Number(o.filled_quantity) || 0;
                 const fullyFilled = orderQty > 0 && filledQty >= orderQty;
-                const canCancel = isOpen && !fullyFilled;
+                // Discord rows are parsed alerts, not broker orders — there is
+                // nothing at a broker to cancel. Their only actions are Accept
+                // and Reject.
+                const canCancel = tab !== "discord" && isOpen && !fullyFilled;
                 // No more Close buttons in Order History — close lives on the
                 // Trade Panel's Open Positions table now.
                 const canClose = false;

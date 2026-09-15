@@ -32,7 +32,16 @@ import secrets
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -70,7 +79,14 @@ from app.schemas.discord import (
     DiscordSourceOut,
     DiscordSourceUpdateIn,
 )
-from app.services import discord_ingest, discord_login, discord_pairing, discord_schedule, events
+from app.services import (
+    discord_execution,
+    discord_ingest,
+    discord_login,
+    discord_pairing,
+    discord_schedule,
+    events,
+)
 from app.services.discord_session import (
     DiscordSessionError,
     decrypt_session,
@@ -366,6 +382,7 @@ def _signal_out(
         order_id=m.order_id,
         expiry_unspecified=bool(sig.get("expiry_unspecified")),
         contract_unspecified=bool(sig.get("contract_unspecified")),
+        limit_price_unspecified=bool(sig.get("limit_price_unspecified")),
     )
 
 
@@ -378,8 +395,12 @@ def get_discord_settings(
     _: None = Depends(_require_feature),
 ) -> DiscordSettingsOut:
     """Account-wide handling of inbound Discord alerts."""
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user.id)
     return DiscordSettingsOut(
-        execution_mode="auto" if _auto_approve(db, user.id) else "manual"
+        execution_mode="auto" if _auto_approve(db, user.id) else "manual",
+        live_trading=bool(ts and ts.discord_live_trading),
     )
 
 
@@ -402,10 +423,19 @@ def update_discord_settings(
     if ts is None:
         ts = TraderSettings(user_id=user.id)
         db.add(ts)
-    ts.discord_execution_mode = payload.execution_mode
+    if payload.execution_mode is not None:
+        ts.discord_execution_mode = payload.execution_mode
+    if payload.live_trading is not None:
+        ts.discord_live_trading = payload.live_trading
+        log.warning(
+            "discord: LIVE TRADING %s for user=%s",
+            "ENABLED" if payload.live_trading else "disabled", user.id,
+        )
     db.commit()
-    log.info("discord: execution mode set to %s for user=%s", payload.execution_mode, user.id)
-    return DiscordSettingsOut(execution_mode=payload.execution_mode)
+    return DiscordSettingsOut(
+        execution_mode=ts.discord_execution_mode,
+        live_trading=bool(ts.discord_live_trading),
+    )
 
 
 @router.patch("/{source_id}", response_model=DiscordSourceOut)
@@ -654,9 +684,92 @@ def clear_session(
     return _to_out(src)
 
 
+def _execute_signal(
+    db: Session,
+    user: User,
+    msg: DiscordMessage,
+    background: BackgroundTasks,
+    request: Request,
+) -> None:
+    """Place an approved alert, or record why it couldn't be.
+
+    Runs the SAME validation in paper and live mode — that's the point of paper
+    mode. The only difference is the final broker call, so a parser proven in
+    paper has been proven against the real checks, not a simplified path.
+
+    Never raises: a refusal or a broker error is recorded on the alert, because
+    a failed order must not also fail the request that approved it (in auto mode
+    that request is the listener's message intake, and failing it would stall
+    the whole feed).
+    """
+    if discord_execution.already_executed(msg):
+        return  # one alert, one order
+
+    signal = msg.parsed_signal or {}
+    try:
+        resolved = discord_execution.resolve(db, user, signal)
+    except discord_execution.ExecutionRefused as exc:
+        discord_execution.mark_failed(msg, str(exc))
+        log.info("discord: alert %s not placed — %s", msg.id, exc)
+        return
+    except Exception as exc:  # noqa: BLE001
+        discord_execution.mark_failed(msg, f"Couldn't prepare the order: {exc}")
+        log.exception("discord: resolve failed for alert %s", msg.id)
+        return
+
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user.id)
+    live = bool(ts and ts.discord_live_trading)
+    detail = " · ".join(f"{k}={v}" for k, v in resolved.resolutions.items())
+
+    if not live:
+        # Paper: everything above ran for real; only the broker call is skipped.
+        discord_execution.mark_failed(
+            msg,
+            "Paper mode — not sent to the broker. Would have placed: "
+            f"{resolved.payload.side.value.upper()} {resolved.payload.quantity} "
+            f"{resolved.payload.symbol} @ {resolved.payload.limit_price}"
+            + (f" ({detail})" if detail else ""),
+        )
+        msg.status = DiscordMessageStatus.PARSED   # not a failure — nothing was attempted
+        log.info("discord: alert %s validated in paper mode", msg.id)
+        return
+
+    from app.api.trades import _place_trader_order  # noqa: PLC0415 — avoid a cycle
+
+    try:
+        order = _place_trader_order(
+            db, user, resolved.payload, resolved.broker_account_id,
+            background, request,
+            # Closes go through the close path so the order is marked is_closing
+            # — without it an option SELL becomes SELL_TO_OPEN and is rejected,
+            # or opens a naked short.
+            resolve_wash_trade=resolved.is_closing,
+        )
+    except HTTPException as exc:
+        discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
+        log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
+        return
+    except Exception as exc:  # noqa: BLE001
+        discord_execution.mark_failed(msg, f"Order placement failed: {exc}")
+        log.exception("discord: placement raised for alert %s", msg.id)
+        return
+
+    discord_execution.mark_executed(msg, order.id)
+    log.info("discord: alert %s placed as order %s%s", msg.id, order.id,
+             f" ({detail})" if detail else "")
+    events.publish(
+        user.id,
+        {"type": "discord.order_placed", "message_id": str(msg.id), "order_id": str(order.id)},
+    )
+
+
 @router.post("/signals/{message_id}/decision", response_model=DiscordDecisionOut)
 def decide_signal(
     message_id: uuid.UUID,
+    background: BackgroundTasks,
+    request: Request,
     accept: bool = Query(..., description="true = approve for execution, false = reject"),
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
@@ -683,6 +796,12 @@ def decide_signal(
     msg.decision = SignalDecision.APPROVED if accept else SignalDecision.REJECTED
     msg.decision_mode = "manual"
     msg.decided_at = datetime.now(timezone.utc)
+
+    # Approving IS the instruction to trade — placing it here, in the same
+    # request, means the trader gets the outcome immediately rather than
+    # discovering it later in a list.
+    if accept:
+        _execute_signal(db, user, msg, background, request)
     db.commit()
 
     log.info(
@@ -861,6 +980,8 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
 )
 def listener_messages(
     payload: DiscordMessageBatchIn,
+    background: BackgroundTasks,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> DiscordIngestOut:
     """Accept a batch of observed messages, de-duplicate, and queue them.
@@ -889,9 +1010,18 @@ def listener_messages(
         )
 
     batch = [m.model_dump() for m in payload.messages if m.channel_id == src.channel_id]
-    report = discord_ingest.ingest_batch(
-        db, src, batch, auto_approve=_auto_approve(db, src.user_id)
-    )
+    auto = _auto_approve(db, src.user_id)
+    report = discord_ingest.ingest_batch(db, src, batch, auto_approve=auto)
+
+    # Auto mode: a parse IS the approval, so place it now. Each alert is handled
+    # independently — one refusal must not stop the others in the batch.
+    if auto and report.accepted:
+        owner = db.get(User, src.user_id)
+        if owner is not None:
+            for msg in report.stored:
+                if msg.decision is SignalDecision.APPROVED:
+                    _execute_signal(db, owner, msg, background, request)
+
     for mid in wrong:
         report.rejected.append({"message_id": mid, "reason": "channel_mismatch"})
     db.commit()

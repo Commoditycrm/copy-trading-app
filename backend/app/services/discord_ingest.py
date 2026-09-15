@@ -75,6 +75,9 @@ class IngestReport:
 
     # Stored durably. This is what "we took responsibility for it" means.
     accepted: list[str] = field(default_factory=list)
+    # The rows we actually stored, so the caller can act on them (auto-mode
+    # execution) without re-querying by message id.
+    stored: list[Any] = field(default_factory=list)
     # Already on record — the normal outcome of a reconnect or backlog replay.
     duplicates: list[str] = field(default_factory=list)
     # NOT taken: nothing was stored and the message is gone unless re-observed.
@@ -272,6 +275,7 @@ def ingest_batch(
             report.queue_failed.append(message_id)
 
         report.accepted.append(message_id)
+        report.stored.append(row)
         ts = row.posted_at
         if ts and (newest_ts is None or ts > newest_ts):
             newest_ts = ts
