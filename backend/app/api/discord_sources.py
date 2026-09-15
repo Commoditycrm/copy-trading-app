@@ -365,6 +365,7 @@ def _signal_out(
         total_pnl_percent=sig.get("total_pnl_percent"),
         order_id=m.order_id,
         expiry_unspecified=bool(sig.get("expiry_unspecified")),
+        contract_unspecified=bool(sig.get("contract_unspecified")),
     )
 
 

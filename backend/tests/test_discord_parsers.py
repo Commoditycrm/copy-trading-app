@@ -413,3 +413,72 @@ def test_a_year_boundary_still_rolls_forward():
     posted = datetime(2026, 12, 28, tzinfo=timezone.utc)
     r = parse_message(ParsedMessage(content="$SPY 600 CALL 01/02 @1.00", posted_at=posted))
     assert r.signal.expiration == date(2027, 1, 2)
+
+
+# ── Symbol-only closes: "META -> 100%" ───────────────────────────────────────
+# A close reported as a ticker and a result. The percentage is the trade's P&L,
+# not a fraction to sell — "-100%" only makes sense as a loss.
+
+@pytest.mark.parametrize("body", ["META -> 100%", "META → 100%", "$META -> 100%", "META => 100%"])
+def test_an_arrow_close_is_a_sell(body):
+    r = parse_message(text(body))
+    assert r.status is ParseStatus.PARSED
+    s = r.signal
+    assert (s.action.value, s.symbol) == ("SELL", "META")
+    assert s.pnl_percent == Decimal("100")
+
+
+def test_a_negative_arrow_close_is_a_loss_not_a_fraction():
+    """"NVDA -> -100%" is a total loss. Reading the number as "close -100% of
+    the position" is meaningless, which is what settles the ambiguity."""
+    s = parse_message(text("NVDA -> -100%")).signal
+    assert s.pnl_percent == Decimal("-100")
+    assert s.action.value == "SELL"
+
+
+def test_an_arrow_close_leaves_the_whole_contract_unresolved():
+    """Only the symbol is known. Strike, call/put and expiry must all come from
+    the open position — guessing which contract was meant would sell one the
+    trader never intended to close."""
+    s = parse_message(text("TSLA -> 25%")).signal
+    assert s.contract_unspecified is True
+    assert s.expiry_unspecified is True
+    assert (s.strike, s.option_type, s.expiration) == (None, None, None)
+
+
+def test_an_arrow_close_states_no_quantity():
+    """Size comes from the position held, never from the alert."""
+    assert parse_message(text("META -> 100%")).signal.quantity is None
+
+
+def test_arrow_closes_are_marked_as_full_closes():
+    s = parse_message(text("META -> 100%")).signal
+    assert s.position_closed is True
+    assert s.source_action == "CLOSE"
+
+
+def test_a_block_of_arrow_closes_reads_every_line():
+    r = parse_message(text("META -> 100%\nNVDA -> -100%\nTSLA -> 25%"))
+    assert len(r.signals) == 3
+    assert [x.symbol for x in r.signals] == ["META", "NVDA", "TSLA"]
+
+
+def test_scissors_closes_still_pin_the_contract():
+    """The scissors format DOES name strike and right, so it must not be
+    downgraded to a symbol-only close — a position lookup has more to match on."""
+    s = parse_message(text("✂️ $SPY 762c +210%")).signal
+    assert s.contract_unspecified is False
+    assert s.strike == Decimal("762")
+    assert s.option_type.value == "CALL"
+    assert s.expiry_unspecified is True
+
+
+def test_an_arrow_close_is_not_confused_with_a_price_update():
+    """"$TSLA 375c +43%" names a contract and is an update, not a close."""
+    r = parse_message(text("$TSLA 375c +43%"))
+    assert r.status is ParseStatus.IGNORED
+
+
+@pytest.mark.parametrize("body", ["META -> the moon", "up -> 100", "-> 50%"])
+def test_arrow_chatter_is_not_a_close(body):
+    assert parse_message(text(body)).status is not ParseStatus.PARSED
