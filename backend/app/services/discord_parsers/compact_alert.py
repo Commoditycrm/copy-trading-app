@@ -113,6 +113,26 @@ _CLOSE_ARROW_RE = re.compile(
 )
 
 
+# "Adding $MSFT 100c @1.90"  /  "Add $TSLA 375c"  /  "Adding $SPY"
+#
+# An instruction to increase a position the trader ALREADY holds. That's what
+# makes the expiry optional here in a way it isn't for a fresh entry: the
+# contract is the one already open, so a missing expiry is resolved from the
+# position rather than being a parse failure.
+#
+# Requires an explicit contract or a "$" ticker so prose like "leave room to add
+# in case they want a bit more of a bounce" isn't read as an order.
+_ADD_RE = re.compile(
+    rf"^\s*(?:ADD|ADDING)\s+"
+    rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
+    rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
+    rf"\s*(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:@\s*\$?(?P<price>{_NUM})\b)?"
+    rf"(?P<trailing>[\s,;].*)?$",
+    re.IGNORECASE,
+)
+
+
 class CompactAlertParser(Parser):
     name = "compact_alert"
 
@@ -125,6 +145,7 @@ class CompactAlertParser(Parser):
         return any(
             _UPDATE_RE.match(ln)
             or _CLOSE_ARROW_RE.match(ln)
+            or (_ADD_RE.match(ln) and _is_add(_ADD_RE.match(ln)))
             or (_has_marker(ln) and _EXIT_RE.match(ln))
             or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln)))
             for ln in self._lines(message)
@@ -146,6 +167,11 @@ class CompactAlertParser(Parser):
             # satisfy the (now price-optional) entry pattern and become a BUY.
             if _UPDATE_RE.match(line):
                 saw_update = True
+                continue
+            m = _ADD_RE.match(line)
+            if m and _is_add(m):
+                sig, err = self._add(m, message)
+                (signals.append(sig) if sig else errors.append(err))
                 continue
             m = _CLOSE_ARROW_RE.match(line)
             if m:
@@ -197,6 +223,44 @@ class CompactAlertParser(Parser):
                 order_type=OrderKind.LIMIT if price else OrderKind.MARKET,
                 limit_price=price,
                 source_action="ENTRY",
+                parser=self.name,
+            ),
+            None,
+        )
+
+    def _add(self, m: re.Match, message: ParsedMessage):
+        """"Adding $MSFT 100c @1.90" — buy more of a position already held.
+
+        Unlike a fresh entry, a missing expiry is fine: the contract is the one
+        already open, so it's resolved from the position rather than guessed. A
+        bare "Adding $MSFT" leaves the whole contract unresolved, same as a
+        symbol-only close.
+        """
+        symbol = m.group("dsymbol") or m.group("symbol")
+        strike = to_decimal(m.group("strike")) if m.group("strike") else None
+        right = _right(m.group("right")) if m.group("right") else None
+
+        expiry, unspecified, err = _read_expiry(m.group("exp"), message, allow_missing=True)
+        if err:
+            return None, err
+
+        price = to_decimal(m.group("price"))
+        return (
+            TradeSignal(
+                action=SignalAction.BUY,
+                asset_type=AssetType.OPTION,
+                symbol=symbol.upper(),
+                option_type=right,
+                strike=strike,
+                expiration=expiry,
+                expiry_unspecified=unspecified,
+                # No strike/right stated ⇒ the contract itself has to come from
+                # the open position.
+                contract_unspecified=strike is None or right is None,
+                quantity=DEFAULT_QUANTITY,
+                order_type=OrderKind.LIMIT if price else OrderKind.MARKET,
+                limit_price=price,
+                source_action="ADD",
                 parser=self.name,
             ),
             None,
@@ -286,6 +350,12 @@ def _is_entry(m: re.Match) -> bool:
         return False
     trailing = (m.group("trailing") or "").strip()
     return not re.match(rf"^[+\-−]\s*(?:{_NUM})\s*%", trailing)
+
+
+def _is_add(m: re.Match) -> bool:
+    """Guard against prose. An add needs either a "$" ticker or an explicit
+    contract — "leave room to add in case they want a bounce" has neither."""
+    return bool(m.group("dsymbol") or (m.group("strike") and m.group("right")))
 
 
 def _has_marker(line: str) -> bool:

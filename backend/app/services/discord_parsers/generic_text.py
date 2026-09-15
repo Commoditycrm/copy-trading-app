@@ -68,6 +68,7 @@ _NOT_TICKERS = {
     "LONG", "SHORT", "CLOSE", "CLOSED", "CLOSING", "EXIT", "TRIM", "ADD", "ENTER", "LOTS",
     "CONTRACTS", "SHARES", "OPEN", "TP", "SL", "RISKY", "LOTTO", "SWING", "DAY",
     "TRIMMING", "TRIMMED", "CLOSING", "ENTERING", "ENTERED", "ADDING", "ADDED",
+    "HERE", "MORE", "AGAIN", "BACK", "SOON", "JUST", "ANOTHER",
     "SOON", "NOW", "HERE", "OUT", "IN", "ALL", "SOME", "MORE", "AT", "TO", "THE",
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT", "OCT", "NOV", "DEC",
 }
@@ -91,7 +92,11 @@ class GenericTextParser(Parser):
 
         symbol = self._symbol(upper)
         if not symbol:
-            return ParseResult.invalid("couldn't find a ticker in the alert")
+            # An action word with no ticker is chatter ("adding more here",
+            # "closing soon"), not a malformed order. INVALID is reserved for
+            # things that genuinely look like an instruction, so the review
+            # queue stays worth reading.
+            return ParseResult.ignored("mentions trading but names no ticker")
 
         price_m = _PRICE_RE.search(text)
         price = to_decimal(price_m.group("price")) if price_m else None
