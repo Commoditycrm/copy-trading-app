@@ -370,6 +370,9 @@ class DiscordSignalOut(BaseModel):
     # The alert named a contract but no expiry (typical of exit alerts); it must
     # be resolved from the open position, never guessed.
     expiry_unspecified: bool = False
+    # The alert named ONLY a symbol ("META -> 100%") — the whole contract has to
+    # come from the open position.
+    contract_unspecified: bool = False
     source_action: str | None = None
 
     # Figures the alert REPORTED, not computed by us.
