@@ -77,6 +77,20 @@ class TraderSettings(Base, TimestampMixin):
         String(10), default="manual", server_default="manual", nullable=False,
     )
 
+    # Whether approved Discord alerts actually reach the broker.
+    #
+    #   False (default) — PAPER: the full pipeline runs, validation and all, and
+    #                     the outcome is recorded, but NOTHING is sent to the
+    #                     broker. This is how a parser is proven safe.
+    #   True            — LIVE: approved alerts place real orders.
+    #
+    # Separate from discord_execution_mode on purpose. That decides WHO approves
+    # (you, or automatically); this decides whether an approval spends money.
+    # A trader experimenting with auto-approve must not discover it was live.
+    discord_live_trading: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     user = relationship("User", back_populates="trader_settings")
 
 

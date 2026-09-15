@@ -1,0 +1,313 @@
+"""Tests for turning an approved Discord alert into a broker order.
+
+Almost every test here asserts a REFUSAL. That's the point: parsing decides what
+a message said, this layer decides whether there's enough certainty to put real
+money behind it. The asymmetry drives the design — skipping a real alert costs a
+missed trade, guessing costs a real position in the wrong contract.
+"""
+import os
+import sys
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import app.services.discord_execution as ex
+from app.models.order import OptionRight
+
+TODAY = datetime.now(timezone.utc).date()
+FUTURE = TODAY + timedelta(days=7)
+
+
+class _Pos:
+    def __init__(self, symbol="MSFT", strike="100", right=OptionRight.CALL,
+                 expiry=None, qty="5"):
+        self.symbol = symbol
+        self.option_strike = Decimal(strike)
+        self.option_right = right
+        self.option_expiry = expiry or FUTURE
+        self.quantity = Decimal(qty)
+
+
+class _Adapter:
+    def __init__(self, positions=None, quote=None, raises=False):
+        self._positions = positions or []
+        self._quote = quote
+        self._raises = raises
+
+    def get_positions(self):
+        if self._raises:
+            raise RuntimeError("broker unreachable")
+        return self._positions
+
+    def get_option_quote(self, occ):
+        return self._quote
+
+
+class _Acct:
+    def __init__(self):
+        self.id = uuid.uuid4()
+        self.user_id = uuid.uuid4()
+        self.connection_status = "connected"
+        self.encrypted_credentials = "x"
+
+
+class _User:
+    def __init__(self):
+        self.id = uuid.uuid4()
+
+
+def _wire(monkeypatch, adapter, accounts=None):
+    """Point the module at fake broker plumbing."""
+    acct = _Acct()
+    monkeypatch.setattr(ex, "adapter_for", lambda a, c: adapter)
+    monkeypatch.setattr(ex, "decrypt_json", lambda c: {})
+    monkeypatch.setattr(ex, "_broker_account", lambda db, user: (accounts or acct))
+    return acct
+
+
+def _signal(**over):
+    base = {
+        "action": "BUY", "asset_type": "OPTION", "symbol": "MSFT",
+        "strike": "100", "option_type": "CALL", "expiration": FUTURE.isoformat(),
+        "quantity": "1", "order_type": "LIMIT", "limit_price": "1.90",
+    }
+    base.update(over)
+    return base
+
+
+# ── the happy path ───────────────────────────────────────────────────────────
+
+def test_a_complete_buy_resolves_to_an_order(monkeypatch):
+    _wire(monkeypatch, _Adapter())
+    r = ex.resolve(None, _User(), _signal())
+    assert r.payload.side.value == "buy"
+    assert r.payload.symbol == "MSFT"
+    assert r.payload.quantity == Decimal("1")
+    assert r.payload.limit_price == Decimal("1.90")
+    assert r.is_closing is False
+
+
+def test_orders_are_always_limit(monkeypatch):
+    _wire(monkeypatch, _Adapter())
+    assert ex.resolve(None, _User(), _signal()).payload.order_type.value == "limit"
+
+
+# ── close intent: the SELL_TO_OPEN trap ──────────────────────────────────────
+
+def test_a_sell_is_marked_as_a_close(monkeypatch):
+    """An alert-channel SELL is always an exit. Without this the order goes to
+    the broker as SELL_TO_OPEN — rejected at best, a naked short at worst."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos()]))
+    r = ex.resolve(None, _User(), _signal(action="SELL", limit_price="2.50"))
+    assert r.is_closing is True
+
+
+def test_a_close_sizes_from_the_position_not_the_alert(monkeypatch):
+    """The author's size is theirs. Selling fewer than you hold strands the
+    remainder; selling more is rejected or opens a short."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos(qty="5")]))
+    r = ex.resolve(None, _User(), _signal(action="SELL", quantity="1", limit_price="2.50"))
+    assert r.payload.quantity == Decimal("5")
+    assert "quantity" in r.resolutions
+
+
+def test_closing_something_you_dont_hold_is_refused(monkeypatch):
+    _wire(monkeypatch, _Adapter(positions=[]))
+    with pytest.raises(ex.ExecutionRefused, match="no matching position|hold no position"):
+        ex.resolve(None, _User(), _signal(action="SELL", limit_price="2.50"))
+
+
+# ── resolving an incomplete contract ─────────────────────────────────────────
+
+def test_a_missing_expiry_is_taken_from_the_open_position(monkeypatch):
+    """"✂️ $MSFT 100c" names no expiry — the held contract supplies it."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos(expiry=FUTURE)]))
+    r = ex.resolve(None, _User(), _signal(action="SELL", expiration=None, limit_price="2.50"))
+    assert r.payload.option_expiry == FUTURE
+    assert "expiration" in r.resolutions
+
+
+def test_a_symbol_only_close_resolves_the_whole_contract(monkeypatch):
+    """"META -> 100%" names nothing but the ticker."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos(symbol="META", strike="300")]))
+    r = ex.resolve(None, _User(), _signal(
+        action="SELL", symbol="META", strike=None, option_type=None,
+        expiration=None, limit_price="2.50",
+    ))
+    assert r.payload.option_strike == Decimal("300")
+
+
+def test_an_ambiguous_close_is_refused(monkeypatch):
+    """Two open contracts fit the alert. Picking one is a coin flip on which
+    position to trade."""
+    _wire(monkeypatch, _Adapter(positions=[
+        _Pos(symbol="META", strike="300"), _Pos(symbol="META", strike="310"),
+    ]))
+    with pytest.raises(ex.ExecutionRefused, match="doesn't say which"):
+        ex.resolve(None, _User(), _signal(
+            action="SELL", symbol="META", strike=None, option_type=None,
+            expiration=None, limit_price="2.50",
+        ))
+
+
+def test_an_unresolvable_contract_is_refused(monkeypatch):
+    _wire(monkeypatch, _Adapter(positions=[]))
+    with pytest.raises(ex.ExecutionRefused, match="no matching position"):
+        ex.resolve(None, _User(), _signal(
+            action="SELL", strike=None, option_type=None, expiration=None, limit_price="2.50",
+        ))
+
+
+# ── expiry ───────────────────────────────────────────────────────────────────
+
+def test_an_expired_contract_is_refused(monkeypatch):
+    """The parser deliberately keeps a recently-past date rather than rolling it
+    a year forward — this is the check that catches it."""
+    _wire(monkeypatch, _Adapter())
+    past = (TODAY - timedelta(days=3)).isoformat()
+    with pytest.raises(ex.ExecutionRefused, match="expired"):
+        ex.resolve(None, _User(), _signal(expiration=past))
+
+
+def test_todays_expiry_is_allowed(monkeypatch):
+    """0DTE is the whole point of these channels."""
+    _wire(monkeypatch, _Adapter())
+    r = ex.resolve(None, _User(), _signal(expiration=TODAY.isoformat()))
+    assert r.payload.option_expiry == TODAY
+
+
+# ── pricing ──────────────────────────────────────────────────────────────────
+
+def test_a_missing_price_comes_from_the_live_quote(monkeypatch):
+    _wire(monkeypatch, _Adapter(quote={"bid": "2.00", "ask": "2.20"}))
+    r = ex.resolve(None, _User(), _signal(limit_price=None))
+    # A BUY prices through the ask so the limit still fills.
+    assert r.payload.limit_price == Decimal("2.20")
+    assert "limit_price" in r.resolutions
+
+
+def test_a_close_without_a_price_uses_the_bid(monkeypatch):
+    _wire(monkeypatch, _Adapter(positions=[_Pos()], quote={"bid": "2.00", "ask": "2.20"}))
+    r = ex.resolve(None, _User(), _signal(action="SELL", limit_price=None))
+    assert r.payload.limit_price == Decimal("2.00")
+
+
+def test_no_price_and_no_quote_is_refused(monkeypatch):
+    """Inventing a limit would be guessing the level to trade at."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    with pytest.raises(ex.ExecutionRefused, match="no live quote"):
+        ex.resolve(None, _User(), _signal(limit_price=None))
+
+
+# ── broker plumbing ──────────────────────────────────────────────────────────
+
+def test_a_broker_read_failure_is_refused_not_treated_as_flat(monkeypatch):
+    """A failed position read must never look like "no position" — that would
+    turn a close into an opening short."""
+    _wire(monkeypatch, _Adapter(positions=[], raises=True))
+    with pytest.raises(ex.ExecutionRefused, match="Couldn't read your positions"):
+        ex.resolve(None, _User(), _signal(action="SELL", limit_price="2.50"))
+
+
+def test_an_alert_with_no_quantity_is_refused(monkeypatch):
+    _wire(monkeypatch, _Adapter())
+    with pytest.raises(ex.ExecutionRefused, match="no quantity"):
+        ex.resolve(None, _User(), _signal(quantity=None))
+
+
+# ── idempotency ──────────────────────────────────────────────────────────────
+
+class _Msg:
+    def __init__(self, order_id=None, status=None):
+        self.order_id = order_id
+        self.status = status
+        self.status_reason = None
+
+
+def test_an_alert_that_already_placed_an_order_is_never_replaced():
+    """The decision endpoint and the auto path can both reach an approved alert.
+    One alert, one order."""
+    from app.models.discord_message import DiscordMessageStatus
+
+    assert ex.already_executed(_Msg(order_id=uuid.uuid4())) is True
+    assert ex.already_executed(_Msg(status=DiscordMessageStatus.ORDER_CREATED)) is True
+    assert ex.already_executed(_Msg()) is False
+
+
+# ── The contract must actually exist ─────────────────────────────────────────
+# An alert can name a date no option expires on. Alpaca answers "asset not
+# found", which tells the trader nothing — these turn that into a specific
+# message BEFORE an order is sent.
+
+class _Contract:
+    def __init__(self, strike, cp="call", expiry=None):
+        self.strike_price = str(strike)
+        self.type = cp
+        self.expiration_date = expiry or FUTURE
+
+
+class _ChainAdapter(_Adapter):
+    def __init__(self, contracts=None, by_window=None, **kw):
+        super().__init__(**kw)
+        self._contracts = contracts
+        self._by_window = by_window or {}
+
+    def list_option_contracts(self, underlying, expiry_gte, expiry_lte, limit=0):
+        if expiry_gte != expiry_lte:                 # the "nearby expiries" probe
+            return self._by_window.get("near", [])
+        return self._contracts if self._contracts is not None else []
+
+
+def test_an_expiry_with_no_contracts_is_refused_before_placing(monkeypatch):
+    """"10/10" was a Saturday — nothing expires then."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[]))
+    with pytest.raises(ex.ExecutionRefused, match="no options expiring"):
+        ex.resolve(None, _User(), _signal())
+
+
+def test_the_refusal_names_the_weekday_and_suggests_real_expiries(monkeypatch):
+    near = [_Contract(100, expiry=FUTURE), _Contract(100, expiry=FUTURE + timedelta(days=7))]
+    _wire(monkeypatch, _ChainAdapter(contracts=[], by_window={"near": near}))
+    with pytest.raises(ex.ExecutionRefused) as exc:
+        ex.resolve(None, _User(), _signal())
+    msg = str(exc.value)
+    assert FUTURE.strftime("%A") in msg          # the weekday asked for
+    assert "Nearest expiries" in msg
+
+
+def test_a_strike_that_doesnt_exist_is_refused(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(105), _Contract(110)]))
+    with pytest.raises(ex.ExecutionRefused, match="has no \\$100 call"):
+        ex.resolve(None, _User(), _signal())
+
+
+def test_a_real_contract_passes_the_chain_check(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100), _Contract(105)]))
+    assert ex.resolve(None, _User(), _signal()).payload.option_strike == Decimal("100")
+
+
+def test_a_call_alert_is_not_satisfied_by_a_put_at_the_same_strike(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100, cp="put")]))
+    with pytest.raises(ex.ExecutionRefused, match="has no \\$100 call"):
+        ex.resolve(None, _User(), _signal())
+
+
+def test_a_chain_lookup_failure_does_not_block_the_order(monkeypatch):
+    """The broker still validates on its side. A failed chain read is not
+    evidence the contract is bad, so it must not refuse a valid order."""
+    class _Broken(_Adapter):
+        def list_option_contracts(self, **kw):
+            raise RuntimeError("chain endpoint down")
+
+    _wire(monkeypatch, _Broken())
+    assert ex.resolve(None, _User(), _signal()).payload.symbol == "MSFT"
+
+
+def test_an_adapter_without_chain_support_is_skipped(monkeypatch):
+    """Only Alpaca implements the chain today; other brokers must still work."""
+    _wire(monkeypatch, _Adapter())          # no list_option_contracts
+    assert ex.resolve(None, _User(), _signal()).payload.symbol == "MSFT"
