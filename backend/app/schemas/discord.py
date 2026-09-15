@@ -361,6 +361,13 @@ class DiscordSignalOut(BaseModel):
     strike: str | None = None
     expiration: str | None = None
     quantity: str | None = None
+    # What will actually be traded, as opposed to what the alert said:
+    #   - the placed order's quantity once one exists
+    #   - otherwise the alert's quantity x the sizing multiplier
+    #   - null for a close, which sizes from the position held
+    # `quantity` above stays as the alert stated it — that's the audit trail and
+    # must not shift when a setting changes.
+    effective_quantity: str | None = None
     order_type: str | None = None
     limit_price: str | None = None
     is_partial_close: bool = False
@@ -397,8 +404,15 @@ class DiscordSettingsOut(BaseModel):
     # False — paper: validate and record, never send to the broker
     # True  — live: approved alerts place real orders
     live_trading: bool = False
+    # Contracts per alert, as a multiple of the alert's own size (1..10).
+    quantity_multiplier: int = 1
+    # Dollar ceiling on a single Discord order; null = no ceiling.
+    max_per_contract: str | None = None
 
 
 class DiscordSettingsIn(BaseModel):
     execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
     live_trading: bool | None = None
+    quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
+    # Sent as a string so an empty field can clear it; "" or null = no ceiling.
+    max_per_contract: str | None = None

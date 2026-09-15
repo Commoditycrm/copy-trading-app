@@ -38,6 +38,13 @@ type Pairing = {
   error: string | null;
 };
 
+type DiscordSettings = {
+  execution_mode: string;
+  live_trading: boolean;
+  quantity_multiplier: number;
+  max_per_contract: string | null;
+};
+
 type LoginSession = {
   session_id: string;
   // pending | starting | awaiting_scan | scanned | complete | failed
@@ -118,6 +125,11 @@ export default function DiscordPage() {
   const [modeBusy, setModeBusy] = useState(false);
   // Paper until the server says otherwise — never show "live" optimistically.
   const [liveTrading, setLiveTrading] = useState(false);
+  const [qtyMultiplier, setQtyMultiplier] = useState(1);
+  const [maxPerContract, setMaxPerContract] = useState("");
+  // What the server currently holds, as distinct from what's in the box —
+  // lets Save disable itself when nothing has changed.
+  const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
 
@@ -132,13 +144,15 @@ export default function DiscordPage() {
       // card showing the default until something else happened to refresh it.
       const [list, settings] = await Promise.all([
         api<DiscordSource[]>("/api/discord-sources"),
-        api<{ execution_mode: string; live_trading: boolean }>(
-          "/api/discord-sources/settings"
-        ),
+        api<DiscordSettings>("/api/discord-sources/settings"),
       ]);
       setSources(list);
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
+      setQtyMultiplier(settings.quantity_multiplier || 1);
+      setMaxPerContract(settings.max_per_contract ?? "");
+      setSavedMaxPerContract(settings.max_per_contract ?? "");
+      setSavedMaxPerContract(settings.max_per_contract ?? "");
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
     }
@@ -241,6 +255,24 @@ export default function DiscordPage() {
       );
     } catch (e) {
       notify.fromError(e, "Could not change the mode");
+    } finally {
+      setModeBusy(false);
+    }
+  }
+
+  async function saveSizing(patch: Record<string, unknown>) {
+    setModeBusy(true);
+    try {
+      const r = await api<DiscordSettings>("/api/discord-sources/settings", {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      });
+      setQtyMultiplier(r.quantity_multiplier || 1);
+      setMaxPerContract(r.max_per_contract ?? "");
+      setSavedMaxPerContract(r.max_per_contract ?? "");
+      notify.success("Saved");
+    } catch (e) {
+      notify.fromError(e, "Could not save that setting");
     } finally {
       setModeBusy(false);
     }
@@ -814,6 +846,235 @@ export default function DiscordPage() {
             </div>
           )}
         </div>
+
+        {/* Alert handling — what happens to an alert once it's parsed.
+            Sits below the channel list because it's account-wide policy, not a
+            per-channel control, and it needs the width for three side-by-side
+            decisions. */}
+        <div className="card overflow-hidden">
+          <div
+            className="flex items-center justify-between px-5 py-3.5"
+            style={{ borderBottom: "1px solid var(--border)" }}
+          >
+            <div className="flex items-center gap-2">
+              <ScanLine size={15} style={{ color: "var(--accent-2)" }} />
+              <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>
+                Alert handling
+              </h3>
+            </div>
+            <span
+              className="text-[11px] px-2 py-0.5 rounded-full"
+              style={{
+                background: liveTrading ? "var(--bad-soft)" : "var(--panel-2)",
+                color: liveTrading ? "var(--bad)" : "var(--muted)",
+              }}
+            >
+              {liveTrading ? "LIVE" : "Paper"}
+            </span>
+          </div>
+
+          <div className="p-5 space-y-5">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            {/* 1 — who approves */}
+            <div className="space-y-2.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wide"
+                   style={{ color: "var(--muted)" }}>
+                Approval
+              </div>
+              {[
+                { value: "manual", label: "Review each alert",
+                  detail: "Accept or reject in Order History." },
+                { value: "auto", label: "Auto-approve",
+                  detail: "Parsed alerts go straight through." },
+              ].map(({ value, label, detail }) => {
+                const active = execMode === value;
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    disabled={modeBusy}
+                    onClick={() => setExecutionMode(value)}
+                    className="w-full text-left rounded-xl px-3.5 py-2.5 transition-colors disabled:opacity-60"
+                    style={{
+                      background: active ? "var(--accent-glow)" : "var(--panel-2)",
+                      border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <RadioDot active={active} />
+                      <span className="text-[12.5px] font-semibold"
+                            style={{ color: active ? "var(--accent-2)" : "var(--text)" }}>
+                        {label}
+                      </span>
+                    </div>
+                    <p className="text-[11px] mt-0.5 leading-snug pl-[22px]"
+                       style={{ color: "var(--muted)" }}>
+                      {detail}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* 3 — does it spend money */}
+            <div className="space-y-2.5"
+                 style={{ borderLeft: "1px solid var(--border)", paddingLeft: 20 }}>
+              <div className="text-[11px] font-semibold uppercase tracking-wide"
+                   style={{ color: "var(--muted)" }}>
+                Execution
+              </div>
+
+              {[
+                { live: false, label: "Paper", detail: "Validated and recorded. Nothing reaches your broker." },
+                { live: true, label: "Live", detail: "Approved alerts place REAL orders." },
+              ].map(({ live, label, detail }) => {
+                const active = liveTrading === live;
+                const danger = live && active;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    disabled={modeBusy}
+                    onClick={() => setLiveTrading_(live)}
+                    className="w-full text-left rounded-xl px-3.5 py-2.5 transition-colors disabled:opacity-60"
+                    style={{
+                      background: danger
+                        ? "var(--bad-soft)"
+                        : active ? "var(--accent-glow)" : "var(--panel-2)",
+                      border: `1px solid ${
+                        danger ? "rgba(255,107,107,0.35)"
+                        : active ? "rgba(44,147,197,0.45)" : "var(--border)"
+                      }`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <RadioDot active={active} tone={danger ? "var(--bad)" : undefined} />
+                      <span className="text-[12.5px] font-semibold"
+                            style={{ color: danger ? "var(--bad)" : active ? "var(--accent-2)" : "var(--text)" }}>
+                        {label}
+                      </span>
+                    </div>
+                    <p className="text-[11px] mt-0.5 leading-snug pl-[22px]"
+                       style={{ color: "var(--muted)" }}>
+                      {detail}
+                    </p>
+                  </button>
+                );
+              })}
+
+              <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                Applies to every connected channel, from now on.
+              </p>
+            </div>
+            </div>
+
+            {/* Sizing spans the full width: the multiplier is ten options and
+                needs the room, and it applies to whatever the two choices above
+                decide rather than being a third peer to them. */}
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 18 }}>
+            {/* 2 — how big. Both controls on one row: they answer the same
+                question (how much exposure per alert) and reading them together
+                is how you judge whether the pair is sane. */}
+            <div className="space-y-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wide"
+                   style={{ color: "var(--muted)" }}>
+                Sizing
+              </div>
+
+              <div className="flex gap-4 flex-wrap items-stretch">
+                {/* Contracts per alert */}
+                <div
+                  className="rounded-xl px-4 py-3 flex-1"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 330 }}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                      Contracts per alert
+                    </label>
+                    <span className="text-[11px] tabular-nums" style={{ color: "var(--accent-2)" }}>
+                      {qtyMultiplier}x
+                    </span>
+                  </div>
+                  <div className="flex gap-1 mt-2 flex-wrap">
+                    {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => {
+                      const active = qtyMultiplier === n;
+                      return (
+                        <button
+                          key={n}
+                          type="button"
+                          disabled={modeBusy}
+                          onClick={() => saveSizing({ quantity_multiplier: n })}
+                          className="text-[11px] font-semibold rounded-lg transition-colors disabled:opacity-60"
+                          style={{
+                            width: 28, height: 28,
+                            background: active ? "var(--accent-glow)" : "transparent",
+                            border: `1px solid ${active ? "rgba(44,147,197,0.5)" : "var(--border)"}`,
+                            color: active ? "var(--accent-2)" : "var(--muted)",
+                          }}
+                        >
+                          {n}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                    Entries only — a close always sells the position you hold.
+                  </p>
+                </div>
+
+                {/* Max per contract */}
+                <div
+                  className="rounded-xl px-4 py-3 flex-1"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                      Max per contract
+                    </label>
+                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
+                      {savedMaxPerContract ? `$${savedMaxPerContract}` : "No limit"}
+                    </span>
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
+                            style={{ color: "var(--muted)" }}>$</span>
+                      <input
+                        type="number"
+                        min="1"
+                        step="50"
+                        placeholder="No limit"
+                        value={maxPerContract}
+                        disabled={modeBusy}
+                        onChange={(e) => setMaxPerContract(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveSizing({ max_per_contract: maxPerContract });
+                        }}
+                        className="w-full rounded-lg border pl-7 pr-3 py-1.5 text-sm bg-transparent focus-ring"
+                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                      />
+                    </div>
+                    {/* Explicit save: typing a number shouldn't commit a risk
+                        limit the moment focus moves. */}
+                    <button
+                      type="button"
+                      disabled={modeBusy || maxPerContract === savedMaxPerContract}
+                      onClick={() => saveSizing({ max_per_contract: maxPerContract })}
+                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                    >
+                      {modeBusy ? <Spinner /> : "Save"}
+                    </button>
+                  </div>
+                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                    Skips an entry when one contract&apos;s value (premium × 100) is above this.
+                    Options only — closes always go through.
+                  </p>
+                </div>
+              </div>
+            </div>
+            </div>
+          </div>
+        </div>
         </div>
 
         {/* Sidebar: the two things you DO, in order. Sticky so they stay put
@@ -863,120 +1124,6 @@ export default function DiscordPage() {
           </form>
 
         
-          {/* Step 3 — what happens to a parsed alert. Account-wide: it says how
-              much you trust automation in general, not something that differs
-              per feed. */}
-          <div className="card p-5 space-y-3.5">
-            <StepHeader n={3} icon={<ScanLine size={14} />} title="Alert handling" />
-
-            <div className="space-y-2">
-              {[
-                {
-                  value: "manual",
-                  label: "Review each alert",
-                  detail: "Accept or reject every alert in Order History.",
-                },
-                {
-                  value: "auto",
-                  label: "Auto-approve",
-                  detail: "Parsed alerts are marked ready for execution straight away.",
-                },
-              ].map(({ value, label, detail }) => {
-                const active = execMode === value;
-                return (
-                  <button
-                    key={value}
-                    type="button"
-                    disabled={modeBusy}
-                    onClick={() => setExecutionMode(value)}
-                    className="w-full text-left rounded-xl px-3.5 py-3 transition-colors disabled:opacity-60"
-                    style={{
-                      background: active ? "var(--accent-glow)" : "var(--panel-2)",
-                      border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
-                    }}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span
-                        className="inline-flex items-center justify-center rounded-full shrink-0"
-                        style={{
-                          width: 14, height: 14,
-                          border: `1px solid ${active ? "var(--accent-2)" : "var(--border-strong)"}`,
-                          background: active ? "var(--accent-2)" : "transparent",
-                        }}
-                      >
-                        {active && (
-                          <span
-                            className="inline-block rounded-full"
-                            style={{ width: 5, height: 5, background: "var(--accent-ink)" }}
-                          />
-                        )}
-                      </span>
-                      <span
-                        className="text-[12.5px] font-semibold"
-                        style={{ color: active ? "var(--accent-2)" : "var(--text)" }}
-                      >
-                        {label}
-                      </span>
-                    </div>
-                    <p
-                      className="text-[11px] mt-1 leading-snug pl-[22px]"
-                      style={{ color: "var(--muted)" }}
-                    >
-                      {detail}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Paper vs live. Kept visually separate from the approve-mode
-                choice above because it answers a different question: that one
-                decides WHO approves, this decides whether an approval spends
-                money. */}
-            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="text-[12.5px] font-semibold" style={{ color: "var(--text)" }}>
-                    {liveTrading ? "Live trading" : "Paper trading"}
-                  </div>
-                  <p className="text-[11px] mt-1 leading-snug" style={{ color: "var(--muted)" }}>
-                    {liveTrading
-                      ? "Approved alerts place REAL orders on your broker."
-                      : "Alerts are fully validated and recorded, but nothing reaches your broker."}
-                  </p>
-                </div>
-                <label
-                  className="flex items-center gap-2 text-[11px] cursor-pointer select-none shrink-0"
-                  title={liveTrading ? "Switch back to paper" : "Enable live trading"}
-                >
-                  <input
-                    type="checkbox"
-                    className="h-4 w-4 cursor-pointer"
-                    style={{ accentColor: liveTrading ? "var(--bad)" : "var(--accent)" }}
-                    checked={liveTrading}
-                    disabled={modeBusy}
-                    onChange={(e) => setLiveTrading_(e.target.checked)}
-                  />
-                  <span style={{ color: liveTrading ? "var(--bad)" : "var(--muted)" }}>
-                    {liveTrading ? "LIVE" : "Paper"}
-                  </span>
-                </label>
-              </div>
-
-              {liveTrading && (
-                <div
-                  className="mt-2.5 rounded-lg px-3 py-2 text-[11px] leading-snug"
-                  style={{ background: "var(--bad-soft)", color: "var(--bad)" }}
-                >
-                  Real orders are being placed from Discord alerts on this account.
-                </div>
-              )}
-            </div>
-
-            <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
-              Both settings apply to every connected channel, from now on.
-            </p>
-          </div>
         </aside>
       </div>
 
@@ -1252,5 +1399,30 @@ function StepHeader({ n, icon, title }: { n: number; icon: React.ReactNode; titl
         {title}
       </span>
     </div>
+  );
+}
+
+
+/** Radio glyph used by the Alert handling choices. Named RadioDot to
+ *  avoid colliding with lucide's Radio icon, used in the intro card. */
+function RadioDot({ active, tone }: { active: boolean; tone?: string }) {
+  const color = tone ?? "var(--accent-2)";
+  return (
+    <span
+      className="inline-flex items-center justify-center rounded-full shrink-0"
+      style={{
+        width: 14,
+        height: 14,
+        border: `1px solid ${active ? color : "var(--border-strong)"}`,
+        background: active ? color : "transparent",
+      }}
+    >
+      {active && (
+        <span
+          className="inline-block rounded-full"
+          style={{ width: 5, height: 5, background: "var(--accent-ink)" }}
+        />
+      )}
+    </span>
   );
 }
