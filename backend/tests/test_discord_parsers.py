@@ -482,3 +482,70 @@ def test_an_arrow_close_is_not_confused_with_a_price_update():
 @pytest.mark.parametrize("body", ["META -> the moon", "up -> 100", "-> 50%"])
 def test_arrow_chatter_is_not_a_close(body):
     assert parse_message(text(body)).status is not ParseStatus.PARSED
+
+
+# ── "Adding" — buying more of a position already held ────────────────────────
+# The distinction from a fresh entry is what makes the expiry optional: the
+# contract is the one already open, so a missing expiry is resolved from the
+# position rather than being a parse failure.
+
+@pytest.mark.parametrize(
+    "body",
+    ["Adding $MSFT 100c @1.90", "Add $MSFT 100c @1.90", "adding $MSFT 100c @1.90"],
+)
+def test_adding_is_a_buy(body):
+    r = parse_message(text(body))
+    assert r.status is ParseStatus.PARSED
+    s = r.signal
+    assert (s.action.value, s.symbol, s.strike) == ("BUY", "MSFT", Decimal("100"))
+    assert s.source_action == "ADD"
+
+
+def test_adding_resolves_the_expiry_from_the_open_position():
+    """A fresh entry without an expiry is INVALID; an add isn't, because the
+    contract is one the trader already holds."""
+    s = parse_message(text("Adding $MSFT 100c @1.90")).signal
+    assert s.expiration is None
+    assert s.expiry_unspecified is True
+
+
+def test_adding_with_a_stated_expiry_uses_it():
+    s = parse_message(text("Adding $MSFT 100 CALL 10/10 @1.90")).signal
+    assert s.expiration == date(2026, 10, 10)
+    assert s.expiry_unspecified is False
+
+
+def test_adding_a_bare_symbol_leaves_the_whole_contract_unresolved():
+    s = parse_message(text("Adding $MSFT")).signal
+    assert (s.action.value, s.symbol) == ("BUY", "MSFT")
+    assert s.contract_unspecified is True
+
+
+def test_adding_carries_the_limit_price_when_stated():
+    s = parse_message(text("Adding $MSFT 100c @1.90")).signal
+    assert s.limit_price == Decimal("1.90")
+    assert s.order_type.value == "LIMIT"
+
+
+def test_an_add_without_a_price_is_a_market_order():
+    assert parse_message(text("adding $SPY 762c")).signal.order_type.value == "MARKET"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Leave room to add incase the want a bit more of a bounce",
+        "Adding more here",
+        "might add later",
+    ],
+)
+def test_prose_about_adding_is_not_an_order(body):
+    """The word "add" appears constantly in commentary. An order needs a $ticker
+    or an explicit contract — otherwise this parser would trade on chatter."""
+    assert parse_message(text(body)).status is not ParseStatus.PARSED
+
+
+def test_prose_about_adding_is_ignored_not_invalid():
+    """INVALID is for things that look like an instruction. Commentary must not
+    fill the review queue."""
+    assert parse_message(text("Adding more here")).status is ParseStatus.IGNORED
