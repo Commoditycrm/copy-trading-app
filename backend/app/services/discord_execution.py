@@ -114,8 +114,14 @@ def resolve(
     quantity = _resolve_quantity(
         signal, positions, strike, right, expiry, is_closing, sizing, resolutions
     )
-    limit_price = _resolve_limit_price(
-        signal, adapter, symbol, strike, right, expiry, side, resolutions
+    # Exits go to market so they always fill; entries are limit so they never
+    # pay through a wide spread. A market close also removes a failure mode —
+    # it no longer needs a live quote to be placeable.
+    limit_price = (
+        None if is_closing
+        else _resolve_limit_price(
+            signal, adapter, symbol, strike, right, expiry, side, resolutions
+        )
     )
     # The dollar cap needs the price, so it's applied once both are known.
     if not is_closing:
@@ -127,9 +133,10 @@ def resolve(
         instrument_type=InstrumentType.OPTION if is_option else InstrumentType.STOCK,
         symbol=symbol,
         side=side,
-        # Always LIMIT — see the parser. A market order on a thin option fills
-        # at whatever is resting, which can be far from the alerted price.
-        order_type=OrderType.LIMIT,
+        # MARKET to close, LIMIT to open. An alert saying "close this" means
+        # get out, not get out at a price — and an unfilled exit is worse than
+        # a slightly worse fill.
+        order_type=OrderType.MARKET if is_closing else OrderType.LIMIT,
         quantity=quantity,
         limit_price=limit_price,
         option_expiry=expiry,
@@ -244,19 +251,33 @@ def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: dat
     want_cp = "C" if right is OptionRight.CALL else "P"
     for c in contracts:
         c_strike = _dec(getattr(c, "strike_price", None))
-        c_type = str(getattr(c, "type", "") or "")[:1].upper()
-        if c_strike == strike and c_type == want_cp:
+        if c_strike == strike and _contract_type(c) == want_cp:
             return
 
     strikes = sorted({
         _dec(getattr(c, "strike_price", None)) for c in contracts
-        if str(getattr(c, "type", "") or "")[:1].upper() == want_cp
+        if _contract_type(c) == want_cp
     } - {None})
     nearest = _nearest(strikes, strike)
     hint = f" Nearest strikes: {', '.join(str(x) for x in nearest)}." if nearest else ""
     raise ExecutionRefused(
         f"{symbol} {expiry} has no ${strike} {want_cp == 'C' and 'call' or 'put'}.{hint}"
     )
+
+
+def _contract_type(contract: Any) -> str:
+    """"C" or "P" for an option contract from the chain.
+
+    Alpaca returns an enum whose str() is "ContractType.PUT", so reading the
+    first character of str() classified EVERY contract as a call — puts matched
+    nothing and were rejected, while calls matched anything at the right strike
+    and skipped the call/put check entirely. Prefer .value, which is "call"/
+    "put", and fall back to the raw value for adapters that return a plain
+    string.
+    """
+    raw = getattr(contract, "type", "") or ""
+    value = getattr(raw, "value", raw)
+    return str(value)[:1].upper()
 
 
 def _nearby_expiries(adapter: Any, symbol: str, wanted: date) -> list[str]:

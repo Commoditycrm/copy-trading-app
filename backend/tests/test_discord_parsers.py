@@ -567,16 +567,32 @@ def test_prose_about_adding_is_ignored_not_invalid():
     [
         "$TSLA 375 CALL 0DTE @0.95",     # entry with a price
         "AAPL $350 CALL 09/18",          # entry without one
-        "✂️ $MSFT 100c +366%",           # close
-        "META -> 100%",                  # symbol-only close
         "Adding $MSFT 100c @1.90",       # add
         "adding $SPY 762c",              # add without a price
         "BUY AAPL 250C SEP18 MARKET",    # explicitly says MARKET
     ],
 )
-def test_every_alert_shape_produces_a_limit_order(body):
+def test_entries_are_limit_orders(body):
+    """A limit on the way in — never pay through a wide spread on a thin
+    option, even when the alert says MARKET."""
     s = parse_message(text(body)).signal
     assert s.order_type.value == "LIMIT", body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "✂️ $MSFT 100c +366%",           # scissors close
+        "META -> 100%",                  # symbol-only close
+        "STC AAPL 250C SEP18 @ 3.10",    # free-text close, price stated
+    ],
+)
+def test_exits_are_market_orders(body):
+    """An exit has to fill. A limit sell can sit unfilled while the position
+    moves against you, and "close this" means get out — not get out at a
+    price."""
+    s = parse_message(text(body)).signal
+    assert s.order_type.value == "MARKET", body
 
 
 def test_a_stated_price_becomes_the_limit():
@@ -585,9 +601,9 @@ def test_a_stated_price_becomes_the_limit():
     assert s.limit_price_unspecified is False
 
 
-def test_a_missing_price_is_flagged_rather_than_invented():
-    """A close never states a price. Making one up would be a guess at the
-    level to trade — it has to come from the live quote instead."""
-    s = parse_message(text("✂️ $MSFT 100c +366%")).signal
+def test_an_entry_without_a_price_is_flagged_rather_than_invented():
+    """Making a limit up would be a guess at the level to trade — it has to come
+    from the live quote at execution instead."""
+    s = parse_message(text("AAPL $350 CALL 09/18")).signal
     assert s.limit_price is None
     assert s.limit_price_unspecified is True

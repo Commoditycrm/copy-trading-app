@@ -125,7 +125,11 @@ class GenericTextParser(Parser):
                     asset_type=AssetType.STOCK,
                     symbol=symbol,
                     quantity=qty,
-                    order_type=OrderKind.LIMIT,
+                    # Exits go to market — see compact_alert. A limit sell can sit
+                # unfilled while the position moves against you.
+                order_type=(
+                    OrderKind.MARKET if action is SignalAction.SELL else OrderKind.LIMIT
+                ),
                     limit_price=None if is_market else price,
                     limit_price_unspecified=is_market or price is None,
                     source_action=action_m.group(0).upper(),
@@ -166,7 +170,11 @@ class GenericTextParser(Parser):
                 strike=strike,
                 expiration=expiry,
                 quantity=qty,
-                order_type=OrderKind.LIMIT,
+                # Exits go to market — see compact_alert. A limit sell can sit
+                # unfilled while the position moves against you.
+                order_type=(
+                    OrderKind.MARKET if action is SignalAction.SELL else OrderKind.LIMIT
+                ),
                 limit_price=None if is_market else price,
                 limit_price_unspecified=is_market or price is None,
                 source_action=action_m.group(0).upper(),
