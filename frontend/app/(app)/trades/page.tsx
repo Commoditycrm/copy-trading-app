@@ -970,6 +970,31 @@ export default function TradesPage() {
                       }}
                     >
                       <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>
+                        {/* Which channel an alert came from, under the symbol
+                            rather than in its own column — it applies only to
+                            Discord rows, and a dedicated column would sit empty
+                            for every real order. */}
+                        {tab === "discord" && (() => {
+                          const sig = signalById.get(o.id);
+                          if (!sig) return null;
+                          // The name the trader gave this source when adding it,
+                          // not Discord's channel name — it's what they'll
+                          // recognise, and it stays stable if the channel is
+                          // renamed or the source is repointed elsewhere.
+                          return (
+                            <div
+                              className="text-[11px] font-normal mb-0.5 truncate"
+                              style={{ color: "var(--muted)", maxWidth: 200 }}
+                              title={
+                                sig.channel_name
+                                  ? `${sig.source_label} · #${sig.channel_name}`
+                                  : sig.source_label
+                              }
+                            >
+                              {sig.source_label}
+                            </div>
+                          );
+                        })()}
                         {/* gap-1.5 = 6px between glyph and symbol. */}
                         <span className="inline-flex items-center gap-1.5">
                           <PositionIcon kind={orderKind(o)} />
@@ -1001,7 +1026,18 @@ export default function TradesPage() {
                           )}
                         </span>
                       </td>
-                      <td className="px-5 py-3.5 num">{fmtQty(o.quantity)}</td>
+                      <td className="px-5 py-3.5 num">
+                        {/* A close alert that names no contract also names no
+                            size — it means "close what you hold". Rendering 0
+                            reads as "sell nothing", which is the opposite. */}
+                        {tab === "discord" && signalById.get(o.id)?.quantity == null ? (
+                          <span style={{ color: "var(--muted)" }} title="Size comes from your open position">
+                            —
+                          </span>
+                        ) : (
+                          fmtQty(o.quantity)
+                        )}
+                      </td>
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
                           {o.side}
