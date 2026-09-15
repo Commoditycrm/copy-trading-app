@@ -49,6 +49,14 @@ class ExecutionRefused(Exception):
 
 
 @dataclass
+class Sizing:
+    """The trader's Discord sizing policy, resolved by the caller."""
+
+    multiplier: int = 1
+    max_per_contract: Decimal | None = None
+
+
+@dataclass
 class Resolved:
     """A signal turned into something placeable."""
 
@@ -61,12 +69,15 @@ class Resolved:
     resolutions: dict[str, str]
 
 
-def resolve(db: Session, user: User, signal: dict[str, Any]) -> Resolved:
+def resolve(
+    db: Session, user: User, signal: dict[str, Any], sizing: "Sizing | None" = None
+) -> Resolved:
     """Turn a parsed signal into a concrete order, or refuse with a reason.
 
     Raises :class:`ExecutionRefused` for anything that can't be placed safely.
     """
     resolutions: dict[str, str] = {}
+    sizing = sizing or Sizing()
 
     acct = _broker_account(db, user)
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
@@ -100,10 +111,17 @@ def resolve(db: Session, user: User, signal: dict[str, Any]) -> Resolved:
     else:
         strike = right = expiry = None
 
-    quantity = _resolve_quantity(signal, positions, strike, right, expiry, is_closing, resolutions)
+    quantity = _resolve_quantity(
+        signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+    )
     limit_price = _resolve_limit_price(
         signal, adapter, symbol, strike, right, expiry, side, resolutions
     )
+    # The dollar cap needs the price, so it's applied once both are known.
+    if not is_closing:
+        quantity = _apply_max_per_contract(
+            quantity, limit_price, is_option, sizing, resolutions
+        )
 
     payload = PlaceOrderIn(
         instrument_type=InstrumentType.OPTION if is_option else InstrumentType.STOCK,
@@ -275,7 +293,9 @@ def _check_expiry(expiry: date | None) -> None:
         raise ExecutionRefused(f"That contract expired on {expiry}.")
 
 
-def _resolve_quantity(signal, positions, strike, right, expiry, is_closing, resolutions) -> Decimal:
+def _resolve_quantity(
+    signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+) -> Decimal:
     """How many contracts.
 
     A CLOSE always sizes from the position held, never from the alert — the
@@ -298,6 +318,42 @@ def _resolve_quantity(signal, positions, strike, right, expiry, is_closing, reso
     qty = _dec(signal.get("quantity"))
     if qty is None or qty <= 0:
         raise ExecutionRefused("The alert states no quantity.")
+
+    # Scale the ENTRY. Closes returned above and are never multiplied — an exit
+    # sells what is held, whatever the alert or the multiplier say.
+    multiplier = max(1, int(sizing.multiplier or 1))
+    if multiplier > 1:
+        scaled = qty * multiplier
+        resolutions["quantity"] = f"{scaled} ({qty} x {multiplier} multiplier)"
+        return scaled
+    return qty
+
+
+def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) -> Decimal:
+    """Skip an entry whose contract costs more than the trader's ceiling.
+
+    Mirrors SubscriberSettings.max_per_contract exactly: the test is on a SINGLE
+    contract's value (premium x 100), and failing it skips the entry outright
+    rather than trimming quantity to fit.
+
+    Skipping rather than trimming is the deliberate part. A limit like this says
+    "contracts this expensive aren't for me" — a size judgement, not a budget to
+    spend down. Trimming would quietly take the trade anyway at a size the
+    trader never chose.
+
+    Options only, and never applied to a close: you must always be able to exit
+    a position you already hold.
+    """
+    cap = sizing.max_per_contract
+    if cap is None or cap <= 0 or not is_option or limit_price is None or limit_price <= 0:
+        return qty
+
+    per_contract = limit_price * Decimal(100)
+    if per_contract > cap:
+        raise ExecutionRefused(
+            f"A single contract is worth ${per_contract:.2f}, above your "
+            f"${cap:.2f} max per contract."
+        )
     return qty
 
 

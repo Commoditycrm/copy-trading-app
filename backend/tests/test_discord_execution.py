@@ -311,3 +311,91 @@ def test_an_adapter_without_chain_support_is_skipped(monkeypatch):
     """Only Alpaca implements the chain today; other brokers must still work."""
     _wire(monkeypatch, _Adapter())          # no list_option_contracts
     assert ex.resolve(None, _User(), _signal()).payload.symbol == "MSFT"
+
+
+# ── Sizing: multiplier and the per-order dollar ceiling ──────────────────────
+
+def test_the_multiplier_scales_an_entry(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(None, _User(), _signal(quantity="1"), ex.Sizing(multiplier=3))
+    assert r.payload.quantity == Decimal("3")
+    assert r.resolutions["quantity"] == "3 (1 x 3 multiplier)"
+
+
+def test_the_multiplier_never_scales_a_close(monkeypatch):
+    """An exit sells the position actually held. Multiplying it would either
+    strand size or try to sell more than exists."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="5")]))
+    r = ex.resolve(
+        None, _User(), _signal(action="SELL", quantity="1", limit_price="2.50"),
+        ex.Sizing(multiplier=10),
+    )
+    assert r.payload.quantity == Decimal("5")       # the position, not 1 x 10
+
+
+def test_a_multiplier_of_one_is_the_default(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    assert ex.resolve(None, _User(), _signal()).payload.quantity == Decimal("1")
+
+
+def test_an_affordable_contract_is_not_resized(monkeypatch):
+    """The limit is a judgement on contract PRICE, not a budget to spend down —
+    so an affordable contract goes through at full size."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="5"),      # $1.90 x 100 = $190 each
+        ex.Sizing(max_per_contract=Decimal("500")),
+    )
+    assert r.payload.quantity == Decimal("5")
+
+
+def test_an_expensive_contract_skips_the_entry(monkeypatch):
+    """$9.00 x 100 = $900, above a $500 ceiling. Matches
+    SubscriberSettings.max_per_contract: skip the entry, don't trim it."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="max per contract"):
+        ex.resolve(
+            None, _User(), _signal(limit_price="9.00"),
+            ex.Sizing(max_per_contract=Decimal("500")),
+        )
+
+
+def test_the_ceiling_is_per_contract_not_per_order(monkeypatch):
+    """10 contracts at $190 each is $1,900 of order value, but each CONTRACT is
+    under the $500 ceiling — so it goes through untouched."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1"),
+        ex.Sizing(multiplier=10, max_per_contract=Decimal("500")),
+    )
+    assert r.payload.quantity == Decimal("10")
+
+
+def test_no_ceiling_means_no_limit(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(None, _User(), _signal(quantity="7"), ex.Sizing(max_per_contract=None))
+    assert r.payload.quantity == Decimal("7")
+
+
+def test_the_ceiling_never_blocks_a_close(monkeypatch):
+    """You must be able to exit a position you already hold, whatever it costs —
+    a ceiling that blocked closes would trap the trader in a trade."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="9")]))
+    r = ex.resolve(
+        None, _User(), _signal(action="SELL", limit_price="9.00"),
+        ex.Sizing(max_per_contract=Decimal("100")),
+    )
+    assert r.payload.quantity == Decimal("9")
+
+
+def test_the_ceiling_does_not_apply_to_stock(monkeypatch):
+    """Options only, matching SubscriberSettings.max_per_contract — a share
+    price isn't a contract value."""
+    _wire(monkeypatch, _Adapter())
+    r = ex.resolve(
+        None, _User(),
+        _signal(asset_type="STOCK", strike=None, option_type=None,
+                expiration=None, limit_price="250"),
+        ex.Sizing(max_per_contract=Decimal("100")),
+    )
+    assert r.payload.quantity == Decimal("1")
