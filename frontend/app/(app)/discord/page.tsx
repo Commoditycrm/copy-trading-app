@@ -116,6 +116,8 @@ export default function DiscordPage() {
   // otherwise — never assume the permissive mode while loading.
   const [execMode, setExecMode] = useState<string>("manual");
   const [modeBusy, setModeBusy] = useState(false);
+  // Paper until the server says otherwise — never show "live" optimistically.
+  const [liveTrading, setLiveTrading] = useState(false);
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
 
@@ -130,10 +132,13 @@ export default function DiscordPage() {
       // card showing the default until something else happened to refresh it.
       const [list, settings] = await Promise.all([
         api<DiscordSource[]>("/api/discord-sources"),
-        api<{ execution_mode: string }>("/api/discord-sources/settings"),
+        api<{ execution_mode: string; live_trading: boolean }>(
+          "/api/discord-sources/settings"
+        ),
       ]);
       setSources(list);
       setExecMode(settings.execution_mode);
+      setLiveTrading(!!settings.live_trading);
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
     }
@@ -223,11 +228,12 @@ export default function DiscordPage() {
   async function setExecutionMode(mode: string) {
     setModeBusy(true);
     try {
-      const next = await api<{ execution_mode: string }>("/api/discord-sources/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ execution_mode: mode }),
-      });
+      const next = await api<{ execution_mode: string; live_trading: boolean }>(
+        "/api/discord-sources/settings",
+        { method: "PATCH", body: JSON.stringify({ execution_mode: mode }) }
+      );
       setExecMode(next.execution_mode);
+      setLiveTrading(!!next.live_trading);
       notify.success(
         mode === "auto"
           ? "Parsed alerts will be approved automatically"
@@ -235,6 +241,28 @@ export default function DiscordPage() {
       );
     } catch (e) {
       notify.fromError(e, "Could not change the mode");
+    } finally {
+      setModeBusy(false);
+    }
+  }
+
+  async function setLiveTrading_(next: boolean) {
+    // Turning this ON starts spending real money, so it asks first. Turning it
+    // OFF is always safe and never prompts.
+    if (next && !window.confirm(
+      "Enable live trading?\n\nApproved Discord alerts will place REAL orders on your " +
+      "connected broker. Make sure the parser is behaving the way you expect in paper first."
+    )) return;
+    setModeBusy(true);
+    try {
+      const r = await api<{ execution_mode: string; live_trading: boolean }>(
+        "/api/discord-sources/settings",
+        { method: "PATCH", body: JSON.stringify({ live_trading: next }) }
+      );
+      setLiveTrading(!!r.live_trading);
+      notify.success(next ? "Live trading enabled" : "Back to paper — nothing reaches your broker");
+    } catch (e) {
+      notify.fromError(e, "Could not change that");
     } finally {
       setModeBusy(false);
     }
@@ -901,12 +929,52 @@ export default function DiscordPage() {
               })}
             </div>
 
-            <p
-              className="text-[11px] leading-relaxed"
-              style={{ color: "var(--muted)", borderTop: "1px solid var(--border)", paddingTop: 10 }}
-            >
-              Applies to alerts from every connected channel, from now on. Nothing is sent to a
-              broker in either mode yet.
+            {/* Paper vs live. Kept visually separate from the approve-mode
+                choice above because it answers a different question: that one
+                decides WHO approves, this decides whether an approval spends
+                money. */}
+            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-[12.5px] font-semibold" style={{ color: "var(--text)" }}>
+                    {liveTrading ? "Live trading" : "Paper trading"}
+                  </div>
+                  <p className="text-[11px] mt-1 leading-snug" style={{ color: "var(--muted)" }}>
+                    {liveTrading
+                      ? "Approved alerts place REAL orders on your broker."
+                      : "Alerts are fully validated and recorded, but nothing reaches your broker."}
+                  </p>
+                </div>
+                <label
+                  className="flex items-center gap-2 text-[11px] cursor-pointer select-none shrink-0"
+                  title={liveTrading ? "Switch back to paper" : "Enable live trading"}
+                >
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 cursor-pointer"
+                    style={{ accentColor: liveTrading ? "var(--bad)" : "var(--accent)" }}
+                    checked={liveTrading}
+                    disabled={modeBusy}
+                    onChange={(e) => setLiveTrading_(e.target.checked)}
+                  />
+                  <span style={{ color: liveTrading ? "var(--bad)" : "var(--muted)" }}>
+                    {liveTrading ? "LIVE" : "Paper"}
+                  </span>
+                </label>
+              </div>
+
+              {liveTrading && (
+                <div
+                  className="mt-2.5 rounded-lg px-3 py-2 text-[11px] leading-snug"
+                  style={{ background: "var(--bad-soft)", color: "var(--bad)" }}
+                >
+                  Real orders are being placed from Discord alerts on this account.
+                </div>
+              )}
+            </div>
+
+            <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+              Both settings apply to every connected channel, from now on.
             </p>
           </div>
         </aside>
