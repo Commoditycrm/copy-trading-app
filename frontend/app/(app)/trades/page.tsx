@@ -104,13 +104,18 @@ function signalToOrder(sig: DiscordSignal): Order {
   //   rejected -> "rejected"   (declined; nothing may act on it)
   //   approved -> "accepted"   (cleared for execution — the hand-off point)
   //   pending  -> "pending"    (awaiting review in manual mode)
-  const status: OrderStatus = failed
-    ? "rejected"
-    : sig.decision === "rejected"
-      ? "rejected"
-      : sig.decision === "approved"
-        ? "accepted"
-        : "pending";
+  const status: OrderStatus =
+    // An alert that produced a real order takes that order's own state; the
+    // decision is history at that point.
+    sig.status === "order_created"
+      ? "submitted"
+      : failed
+        ? "rejected"
+        : sig.decision === "rejected"
+          ? "rejected"
+          : sig.decision === "approved"
+            ? "accepted"
+            : "pending";
   return {
     id: sig.row_key,
     parent_order_id: null,
@@ -1139,11 +1144,36 @@ export default function TradesPage() {
                               </div>
                             </>
                           )}
-                          {tab === "discord" && signalById.get(o.id)?.decision === "approved" && (
-                            <span className="text-xs" style={{ color: "var(--good)" }}>
-                              Ready for execution
-                            </span>
-                          )}
+                          {tab === "discord" && (() => {
+                            const sig = signalById.get(o.id);
+                            if (!sig || sig.decision !== "approved") return null;
+                            // An approved alert can still fail to place. Saying
+                            // "ready for execution" next to a REJECTED status
+                            // reads as queued when it's actually finished.
+                            if (sig.status === "order_failed") {
+                              return (
+                                <span
+                                  className="text-xs"
+                                  style={{ color: "var(--bad)" }}
+                                  title={sig.status_reason ?? undefined}
+                                >
+                                  Not placed
+                                </span>
+                              );
+                            }
+                            if (sig.status === "order_created") {
+                              return (
+                                <span className="text-xs" style={{ color: "var(--good)" }}>
+                                  Order placed
+                                </span>
+                              );
+                            }
+                            return (
+                              <span className="text-xs" style={{ color: "var(--good)" }}>
+                                Ready for execution
+                              </span>
+                            );
+                          })()}
                           {!canCancel && !canClose &&
                             !(tab === "discord" && signalById.get(o.id)?.decision) && (
                             <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
