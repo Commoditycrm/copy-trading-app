@@ -94,6 +94,15 @@ class TradeSignal:
     # match on. This one is a close instruction with no contract at all, and
     # must never be executed against a guess about which position was meant.
     contract_unspecified: bool = False
+    # Discord alerts are ALWAYS placed as limit orders (never market), but an
+    # alert often states no price — a close like "✂️ $SPY 762c +210%" never
+    # does. The order type is LIMIT regardless and this flags that the price
+    # itself must come from the live quote at execution.
+    #
+    # Reuse copy_engine._marketable_option_limit() for that: it already derives
+    # a marketable limit from the current bid/ask, which is what makes a limit
+    # close actually fill rather than sit.
+    limit_price_unspecified: bool = False
     # The card explicitly said the position is now flat.
     position_closed: bool = False
 
@@ -140,6 +149,7 @@ class TradeSignal:
             "position_closed": self.position_closed,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
+            "limit_price_unspecified": self.limit_price_unspecified,
             "source_action": self.source_action,
             "parser": self.parser,
         }

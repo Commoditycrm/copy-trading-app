@@ -136,10 +136,14 @@ def test_quantity_is_read_when_stated():
     assert parse_message(text("BUY 5 AAPL 250C SEP18 @ 2.15")).signal.quantity == Decimal("5")
 
 
-def test_market_orders_carry_no_limit_price():
+def test_discord_alerts_are_always_limit_orders():
+    """Every alert is placed as a LIMIT, even one that says MARKET. A market
+    order on a thin option contract fills at whatever is there — which on a
+    wide spread can be far from the alerted price."""
     r = parse_message(text("BUY AAPL 250C SEP18 MARKET"))
-    assert r.signal.order_type.value == "MARKET"
+    assert r.signal.order_type.value == "LIMIT"
     assert r.signal.limit_price is None
+    assert r.signal.limit_price_unspecified is True
 
 
 def test_sell_words_are_read_as_sells():
@@ -527,8 +531,13 @@ def test_adding_carries_the_limit_price_when_stated():
     assert s.order_type.value == "LIMIT"
 
 
-def test_an_add_without_a_price_is_a_market_order():
-    assert parse_message(text("adding $SPY 762c")).signal.order_type.value == "MARKET"
+def test_an_add_without_a_price_is_still_a_limit_order():
+    """No price stated, so the limit has to come from the live quote at
+    execution — but the order type is never market."""
+    s = parse_message(text("adding $SPY 762c")).signal
+    assert s.order_type.value == "LIMIT"
+    assert s.limit_price is None
+    assert s.limit_price_unspecified is True
 
 
 @pytest.mark.parametrize(
@@ -549,3 +558,36 @@ def test_prose_about_adding_is_ignored_not_invalid():
     """INVALID is for things that look like an instruction. Commentary must not
     fill the review queue."""
     assert parse_message(text("Adding more here")).status is ParseStatus.IGNORED
+
+
+# ── Always limit, never market ───────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "$TSLA 375 CALL 0DTE @0.95",     # entry with a price
+        "AAPL $350 CALL 09/18",          # entry without one
+        "✂️ $MSFT 100c +366%",           # close
+        "META -> 100%",                  # symbol-only close
+        "Adding $MSFT 100c @1.90",       # add
+        "adding $SPY 762c",              # add without a price
+        "BUY AAPL 250C SEP18 MARKET",    # explicitly says MARKET
+    ],
+)
+def test_every_alert_shape_produces_a_limit_order(body):
+    s = parse_message(text(body)).signal
+    assert s.order_type.value == "LIMIT", body
+
+
+def test_a_stated_price_becomes_the_limit():
+    s = parse_message(text("$TSLA 375 CALL 0DTE @0.95")).signal
+    assert s.limit_price == Decimal("0.95")
+    assert s.limit_price_unspecified is False
+
+
+def test_a_missing_price_is_flagged_rather_than_invented():
+    """A close never states a price. Making one up would be a guess at the
+    level to trade — it has to come from the live quote instead."""
+    s = parse_message(text("✂️ $MSFT 100c +366%")).signal
+    assert s.limit_price is None
+    assert s.limit_price_unspecified is True
