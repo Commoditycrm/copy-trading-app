@@ -2,7 +2,8 @@
 
     BUY        → open the position, start counting
     1st SELL   → do NOT exit; arm a trailing stop to protect the gain
-    2nd SELL   → close the position
+    2nd SELL   → trim: sell part of the position, re-anchor the trail on the rest
+    3rd SELL   → close whatever is left
 
 So an exit alert is not self-contained: the same message is a "protect" or an
 "exit" depending on the position's history. That history lives in
@@ -36,7 +37,8 @@ log = logging.getLogger(__name__)
 
 # What a sell alert should do, decided by the guard.
 ARM_TRAIL = "arm_trail"     # first sell — protect, don't exit
-CLOSE = "close"             # second sell — get out
+TRIM = "trim"               # second sell — take some off, keep protecting the rest
+CLOSE = "close"             # third sell — get out of what remains
 OPEN = "open"               # a buy
 
 
@@ -114,9 +116,9 @@ def on_sell(
             option_strike=strike,
             option_right=(right.value if right else None),
             option_expiry=expiry,
-            # Counted as the second sell so this exits rather than arming a
-            # trail on a position we know nothing about.
-            sell_count=2,
+            # Counted past the trim step so this exits outright rather than
+            # arming or trimming a position we know nothing about.
+            sell_count=3,
         )
         db.add(guard)
         db.flush()
@@ -136,8 +138,60 @@ def on_sell(
         )
         return SellDecision(action=ARM_TRAIL, guard=guard, trail_percent=trail_percent)
 
+    if guard.sell_count == 2:
+        # Trim. The trail stays armed on what's left — the caller re-anchors it
+        # once it knows the live mark.
+        log.info("discord guard: second sell for %s — trimming", symbol)
+        return SellDecision(action=TRIM, guard=guard, trail_percent=guard.trail_percent)
+
     log.info("discord guard: sell #%s for %s — closing", guard.sell_count, symbol)
     return SellDecision(action=CLOSE, guard=guard)
+
+
+def trim_quantity(held: Decimal, multiplier: int) -> Decimal | None:
+    """How much to sell on a trim, or None if this should be a close instead.
+
+    The trader trims one contract, so we trim one scaled by our multiplier —
+    the slice we take matches the slice they took. At 2x their 1-of-3 becomes
+    our 2-of-6.
+
+    Returns None when the trim would take the whole position: there would be
+    nothing left to protect, which makes it a close, not a trim. Letting it
+    through as a trim would leave an armed guard on an empty position.
+    """
+    size = Decimal(max(1, int(multiplier or 1)))
+    if size >= held:
+        return None
+    return size
+
+
+def rollback_sell(guard: DiscordPositionGuard) -> None:
+    """Undo the count bump from a sell alert whose order never made it.
+
+    Only meaningful for a trim. If a trim's order is rejected, the position is
+    untouched, so consuming the trim step would mean the next alert closes the
+    whole position instead of taking the slice the trader asked for. Counting a
+    step the broker never performed loses it silently.
+
+    A failed CLOSE is deliberately not rolled back: every later alert is a close
+    anyway, so there is nothing to preserve.
+    """
+    guard.sell_count = max(0, (guard.sell_count or 0) - 1)
+
+
+def re_anchor(guard: DiscordPositionGuard, price: Decimal | None) -> bool:
+    """Move the trail's anchor up to ``price``. Ratchets — never down.
+
+    A trim says "protect more", so the stop may rise but must not fall. The peak
+    is what the retrace is measured from, so lowering it would hand back gains
+    the trader had already locked in. Returns whether the anchor actually moved.
+    """
+    if price is None or price <= 0:
+        return False
+    if guard.peak_price is not None and price <= guard.peak_price:
+        return False
+    guard.peak_price = price
+    return True
 
 
 def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
@@ -161,6 +215,6 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 
 
 __all__ = [
-    "ARM_TRAIL", "CLOSE", "OPEN", "SellDecision",
-    "armed", "find", "on_buy", "on_sell", "retire",
+    "ARM_TRAIL", "CLOSE", "OPEN", "TRIM", "SellDecision",
+    "armed", "find", "on_buy", "on_sell", "re_anchor", "retire", "rollback_sell", "trim_quantity",
 ]

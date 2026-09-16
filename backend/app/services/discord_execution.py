@@ -67,6 +67,9 @@ class Resolved:
     # audit trail: expiry from a held position, size from a position, price from
     # a live quote.
     resolutions: dict[str, str]
+    # Live mid for the contract, when one was available. Not used to price the
+    # order — exits go to market — but a trim re-anchors its trailing stop here.
+    mark_price: Decimal | None = None
 
 
 def resolve(
@@ -123,6 +126,15 @@ def resolve(
             signal, adapter, symbol, strike, right, expiry, side, resolutions
         )
     )
+    # A close is priced at market, but a TRIM still needs a number to move its
+    # trailing stop to. Best-effort: a missing quote must not make an exit
+    # unplaceable, which is exactly why the order itself doesn't depend on it.
+    mark_price: Decimal | None = None
+    if is_closing and is_option and strike:
+        quote = _quote(adapter, symbol, strike, right, expiry)
+        if quote:
+            mark_price = (quote[0] + quote[1]) / Decimal(2)
+
     # The dollar cap needs the price, so it's applied once both are known.
     if not is_closing:
         quantity = _apply_max_per_contract(
@@ -148,6 +160,7 @@ def resolve(
         broker_account_id=acct.id,
         is_closing=is_closing,
         resolutions=resolutions,
+        mark_price=mark_price,
     )
 
 

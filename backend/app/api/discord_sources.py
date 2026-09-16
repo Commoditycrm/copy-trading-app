@@ -819,19 +819,25 @@ def _execute_signal(
     detail = " · ".join(f"{k}={v}" for k, v in resolved.resolutions.items())
 
     # An exit alert means different things depending on the position's history:
-    # the FIRST arms a trailing stop, the SECOND closes. Decided before placing
-    # anything, because the first sell places no order at all.
+    # the FIRST arms a trailing stop, the SECOND trims and re-anchors it, the
+    # THIRD closes what's left. Decided before placing anything, because the
+    # first sell places no order at all.
     p = resolved.payload
+    is_trim = False
+    trim_guard = None
     if resolved.is_closing:
         decision = guards.on_sell(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
             trail_percent=(ts_for_sizing.discord_trail_percent if ts_for_sizing else Decimal("20")),
         )
-        if decision.action == guards.ARM_TRAIL:
+        action = decision.action
+
+        if action == guards.ARM_TRAIL:
+            guards.re_anchor(decision.guard, resolved.mark_price)
             msg.status = DiscordMessageStatus.PARSED
             msg.status_reason = (
                 f"First exit alert — {decision.trail_percent}% trailing stop armed on "
-                f"{p.symbol}. The next exit alert closes the position."
+                f"{p.symbol}. The next exit alert trims the position."
             )
             log.info("discord: trail armed for %s (alert %s)", p.symbol, msg.id)
             events.publish(
@@ -840,6 +846,29 @@ def _execute_signal(
                  "symbol": p.symbol, "trail_percent": str(decision.trail_percent)},
             )
             return
+
+        if action == guards.TRIM:
+            # resolve() sized this as a full close, so payload.quantity is the
+            # whole position. Trim the trader's one contract scaled by our
+            # multiplier, so the slice we take matches the slice they took.
+            held = Decimal(str(p.quantity))
+            trim_qty = guards.trim_quantity(held, sizing.multiplier)
+            if trim_qty is None:
+                # Nothing would be left to protect, so this is simply a close.
+                action = guards.CLOSE
+                log.info(
+                    "discord: a trim would take the whole %s position (%s held) — closing instead",
+                    p.symbol, held,
+                )
+            else:
+                is_trim = True
+                trim_guard = decision.guard
+                p.quantity = trim_qty
+                moved = guards.re_anchor(decision.guard, resolved.mark_price)
+                detail += (" · " if detail else "") + (
+                    f"trim={trim_qty} of {held}"
+                    + (f", trail re-anchored to {resolved.mark_price}" if moved else "")
+                )
 
     if not live:
         # Paper: everything above ran for real; only the broker call is skipped.
@@ -864,19 +893,29 @@ def _execute_signal(
             # — without it an option SELL becomes SELL_TO_OPEN and is rejected,
             # or opens a naked short.
             resolve_wash_trade=resolved.is_closing,
+            # A trim closes part of the position and keeps the rest, so the
+            # subscriber fanout must not treat it as the trader leaving.
+            partial_close=is_trim,
         )
     except HTTPException as exc:
+        if trim_guard is not None:
+            # The slice was never sold, so don't spend the trim step on it.
+            guards.rollback_sell(trim_guard)
         discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
         log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
         return
     except Exception as exc:  # noqa: BLE001
+        if trim_guard is not None:
+            guards.rollback_sell(trim_guard)
         discord_execution.mark_failed(msg, f"Order placement failed: {exc}")
         log.exception("discord: placement raised for alert %s", msg.id)
         return
 
     # A filled entry starts the trail-then-exit sequence for this contract; a
-    # completed exit retires it.
-    if resolved.is_closing:
+    # completed exit retires it. A TRIM is the exception: part of the position
+    # is still open and still protected, so its guard stays live — retiring it
+    # would drop the trailing stop and restart the count from zero.
+    if resolved.is_closing and not is_trim:
         existing = guards.find(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
         )
