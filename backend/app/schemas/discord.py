@@ -408,11 +408,14 @@ class DiscordSettingsOut(BaseModel):
     quantity_multiplier: int = 1
     # Dollar ceiling on a single Discord order; null = no ceiling.
     max_per_contract: str | None = None
+    # Retrace from the peak that closes a position after its first exit alert.
+    trail_percent: str = "20"
 
 
 class DiscordSettingsIn(BaseModel):
     execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
     live_trading: bool | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
+    trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None

@@ -360,6 +360,22 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                     Order.stop_loss_price.isnot(None),
                 ).limit(1)
             ).scalar_one_or_none() is not None
+
+            # A Discord position with an armed (emulated) trailing stop is also
+            # trader-side work. Without this the gate would skip the account and
+            # the trail would never be enforced.
+            if not has_setup:
+                from app.models.discord_position_guard import (  # noqa: PLC0415
+                    DiscordPositionGuard,
+                )
+
+                has_setup = db.execute(
+                    _select(DiscordPositionGuard.id).where(
+                        DiscordPositionGuard.user_id == user_id,
+                        DiscordPositionGuard.closed_at.is_(None),
+                        DiscordPositionGuard.armed_at.isnot(None),
+                    ).limit(1)
+                ).scalar_one_or_none() is not None
             # Also tick if Discord trade-alerts are on — the trader tick sweeps
             # newly-filled orders to the webhook (see _enforce_one_trader), a
             # periodic backstop to the real-time listener + page-sync emits.
@@ -496,6 +512,91 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
         })
 
 
+
+def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
+    """Advance emulated trailing stops on Discord positions.
+
+    Armed by the FIRST sell alert on a position; this is what actually watches
+    the price and exits on a retrace. Emulated because Alpaca rejects
+    trailing-stop orders on options (see trailing_stop_close.py), which is what
+    Discord alerts almost always are.
+
+    Best-effort and fully isolated: a failure here must not stop the option-SL
+    monitor that follows it.
+    """
+    from app.brokers import adapter_for  # noqa: PLC0415
+    from app.models.order import (  # noqa: PLC0415
+        InstrumentType, OrderSide, OrderType,
+    )
+    from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
+    from app.services import discord_trailing_stop  # noqa: PLC0415
+    from app.services.crypto import decrypt_json  # noqa: PLC0415
+
+    try:
+        with SessionLocal() as db:
+            from app.services import discord_position_guard as _guards  # noqa: PLC0415
+
+            if not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
+                return  # nothing armed for this trader
+
+            live_acct = db.get(BrokerAccount, acct.id)
+            if live_acct is None:
+                return
+            adapter = adapter_for(live_acct, decrypt_json(live_acct.encrypted_credentials))
+
+            def _close(pos, guard) -> None:
+                """Exit at market — a stop that fires has to fill."""
+                from app.api.trades import _place_trader_order  # noqa: PLC0415
+                from app.models.user import User  # noqa: PLC0415
+                from fastapi import BackgroundTasks  # noqa: PLC0415
+
+                trader = db.get(User, acct.user_id)
+                payload = PlaceOrderIn(
+                    instrument_type=(
+                        InstrumentType.OPTION if pos.option_strike is not None
+                        else InstrumentType.STOCK
+                    ),
+                    symbol=pos.symbol.upper(),
+                    side=OrderSide.SELL,
+                    order_type=OrderType.MARKET,
+                    quantity=abs(pos.quantity),
+                    option_expiry=pos.option_expiry,
+                    option_strike=pos.option_strike,
+                    option_right=pos.option_right,
+                )
+                _place_trader_order(
+                    db, trader, payload, live_acct.id,
+                    BackgroundTasks(), _PollerRequest(),
+                    # A close, so the order is marked is_closing and the option
+                    # SELL goes out as SELL_TO_CLOSE.
+                    resolve_wash_trade=True,
+                )
+
+            closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close)
+            db.commit()
+            if closed:
+                log.info(
+                    "pnl_poller: %d Discord trailing stop(s) fired for user=%s",
+                    closed, acct.user_id,
+                )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "pnl_poller: discord trailing stop sweep failed for user=%s", acct.user_id
+        )
+
+
+class _PollerRequest:
+    """Stand-in for the FastAPI Request that _place_trader_order audits against.
+
+    There is no HTTP request behind a poller tick, and the only thing the
+    placement path uses it for is client_ip(). Supplying an empty headers map
+    and no client yields a null IP, which is the honest value here.
+    """
+
+    headers: dict = {}
+    client = None
+
+
 def _enforce_one_trader(acct: BrokerAccount) -> None:
     """Trader-side tick: run the option SL price monitor and publish
     any triggered closes. Lightweight wrapper because the monitor
@@ -507,6 +608,8 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
     from app.services.trader_bracket_monitor import (  # noqa: PLC0415
         enforce_trader_option_sl,
     )
+
+    _enforce_discord_trailing_stops(acct)
 
     # Discord: for a Discord-enabled trader, periodically pull their latest fills
     # and broadcast any new ones — a path-independent backstop so alerts fire
