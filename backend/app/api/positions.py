@@ -374,26 +374,27 @@ _REENTRY_WORKING = {
 }
 
 
-def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None]":
-    """(status, reentry_price) for a snapshot item.
+def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None, str | None]":
+    """(status, reentry_price, filled_at) for a snapshot item.
       status: 'filled' / 'working' / 'pending' (see below).
       reentry_price: what we re-entered at — the FILL price when filled, the
                      resting LIMIT price when working, else None.
+      filled_at: ISO time the buy-back filled (order.closed_at), else None.
     'filled'  — the buy-back filled; the position is back.
     'working' — a buy-back is resting (waiting to fill).
     'pending' — never re-entered, or the last attempt canceled/expired/rejected —
                 so it still NEEDS a (re-)entry (only 'pending' items get placed)."""
     oid = item.get("reentry_order_id")
     if not oid:
-        return "pending", None
+        return "pending", None, None
     o = db.get(Order, uuid.UUID(oid))
     if o is None:
-        return "pending", None
+        return "pending", None, None
     if o.status == OrderStatus.FILLED:
-        return "filled", o.filled_avg_price
+        return "filled", o.filled_avg_price, (o.closed_at.isoformat() if o.closed_at else None)
     if o.status in _REENTRY_WORKING:
-        return "working", o.limit_price   # resting at this limit (None for market)
-    return "pending", None  # canceled / expired / rejected → re-enter allowed again
+        return "working", o.limit_price, None   # resting at this limit (None for market)
+    return "pending", None, None  # canceled / expired / rejected → re-enter allowed again
 
 
 def _reentry_status(db: Session, item: dict) -> str:
@@ -557,7 +558,7 @@ def _snapshot_detail(db: Session, snap: SellAllSnapshot, adapter, today_et: date
 
     positions = []
     for p in snap.positions:
-        st, reentry_price = _reentry_info(db, p)
+        st, reentry_price, reentry_filled_at = _reentry_info(db, p)
         # Overlay expiry only on a not-yet-re-entered row; a filled/working one
         # keeps its status (it already has an order).
         if st == "pending" and _is_expired_option(p):
@@ -570,6 +571,7 @@ def _snapshot_detail(db: Session, snap: SellAllSnapshot, adapter, today_et: date
             "current_price": _current(p),
             "pdc": _pdc(p["symbol"], p["instrument_type"]),           # previous day close
             "reentry_price": str(reentry_price) if reentry_price is not None else None,
+            "reentry_filled_at": reentry_filled_at,                   # when the buy-back filled
             "default_mode": p.get("default_mode", "market"),          # default re-entry chosen at exit
             "default_value": p.get("default_value"),
             "default_basis": p.get("default_basis"),
