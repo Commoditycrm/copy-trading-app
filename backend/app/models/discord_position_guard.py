@@ -17,7 +17,8 @@ class DiscordPositionGuard(Base, TimestampMixin):
 
         BUY          → open the position, start counting
         1st SELL     → don't exit; arm a trailing stop to protect the gain
-        2nd SELL     → close the position
+        2nd SELL     → trim part of the position; re-anchor the trail on the rest
+        3rd SELL     → close whatever is left
 
     So an exit alert means different things depending on what came before it,
     and that history has to live somewhere. A row here is created by the BUY and
@@ -55,7 +56,7 @@ class DiscordPositionGuard(Base, TimestampMixin):
     option_expiry: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     # How many SELL alerts this position has taken. 0 = just opened, 1 = trailing
-    # stop armed, 2+ = closing.
+    # stop armed, 2 = trimmed once (trail still live on the remainder), 3+ = closing.
     sell_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     # Trail as a positive percent (20 = exit on a 20% retrace from the peak).
