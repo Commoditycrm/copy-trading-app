@@ -70,6 +70,9 @@ class Resolved:
     # Live mid for the contract, when one was available. Not used to price the
     # order — exits go to market — but a trim re-anchors its trailing stop here.
     mark_price: Decimal | None = None
+    # What the broker says this position averaged in at. Used only as a fallback
+    # reference for a position the trim ladder never saw open.
+    position_entry_price: Decimal | None = None
 
 
 def resolve(
@@ -130,10 +133,22 @@ def resolve(
     # trailing stop to. Best-effort: a missing quote must not make an exit
     # unplaceable, which is exactly why the order itself doesn't depend on it.
     mark_price: Decimal | None = None
-    if is_closing and is_option and strike:
-        quote = _quote(adapter, symbol, strike, right, expiry)
-        if quote:
-            mark_price = (quote[0] + quote[1]) / Decimal(2)
+    position_entry_price: Decimal | None = None
+    if is_closing:
+        held_pos = next(
+            (p for p in positions
+             if p.option_strike == strike and p.option_right == right
+             and p.option_expiry == expiry),
+            None,
+        )
+        if held_pos is not None:
+            position_entry_price = _dec(getattr(held_pos, "avg_entry_price", None))
+            # The broker's own mark, when it has one, beats a synthesised mid.
+            mark_price = _dec(getattr(held_pos, "current_price", None))
+        if mark_price is None and is_option and strike:
+            quote = _quote(adapter, symbol, strike, right, expiry)
+            if quote:
+                mark_price = (quote[0] + quote[1]) / Decimal(2)
 
     # The dollar cap needs the price, so it's applied once both are known.
     if not is_closing:
@@ -161,6 +176,7 @@ def resolve(
         is_closing=is_closing,
         resolutions=resolutions,
         mark_price=mark_price,
+        position_entry_price=position_entry_price,
     )
 
 
@@ -234,6 +250,25 @@ def _resolve_contract(signal: dict, positions: list, resolutions: dict):
     return held.option_strike, held.option_right, held.option_expiry
 
 
+# Index options are FILED under the index root but TRADE under their own.
+# Alpaca lists SPXW260916C07585000 in SPX's chain, not SPXW's — asking for the
+# SPXW chain returns nothing at all, which reads as "this contract doesn't
+# exist" when in fact only the lookup key was wrong. The OCC symbol we place
+# with is unaffected: it keeps the root the alert used, which is the one the
+# contract actually carries.
+_CHAIN_ROOTS = {
+    "SPXW": "SPX",      # weekly S&P 500
+    "NDXP": "NDX",      # PM-settled Nasdaq-100
+    "RUTW": "RUT",      # weekly Russell 2000
+    "VIXW": "VIX",      # weekly VIX
+}
+
+
+def _chain_root(symbol: str) -> str:
+    """The root to look a chain up under, which is not always the trading root."""
+    return _CHAIN_ROOTS.get(symbol.upper(), symbol.upper())
+
+
 def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: date) -> None:
     """Verify the option chain actually lists this contract.
 
@@ -243,9 +278,10 @@ def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: dat
     """
     if not hasattr(adapter, "list_option_contracts"):
         return
+    root = _chain_root(symbol)
     try:
         contracts = adapter.list_option_contracts(
-            underlying=symbol, expiry_gte=expiry, expiry_lte=expiry, limit=2000
+            underlying=root, expiry_gte=expiry, expiry_lte=expiry, limit=2000
         )
     except Exception:  # noqa: BLE001
         # A chain lookup failure is not evidence the contract is bad. Let the
@@ -254,7 +290,7 @@ def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: dat
         return
 
     if not contracts:
-        near = _nearby_expiries(adapter, symbol, expiry)
+        near = _nearby_expiries(adapter, root, expiry)
         hint = f" Nearest expiries: {', '.join(near)}." if near else ""
         raise ExecutionRefused(
             f"{symbol} has no options expiring {expiry} "

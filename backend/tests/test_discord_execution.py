@@ -476,3 +476,52 @@ def test_a_call_alert_is_still_rejected_when_only_puts_exist(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_PutContract()]))
     with pytest.raises(ex.ExecutionRefused, match="has no \\$100 call"):
         ex.resolve(None, _User(), _signal())
+
+
+# ── index options are filed under a different root than they trade under ─────
+
+def test_an_index_weekly_looks_up_the_chain_under_its_index_root(monkeypatch):
+    """SPXW260916C07585000 is listed in SPX's chain, not SPXW's. Asking for the
+    SPXW chain returns nothing, which reads as "no such contract" when only the
+    lookup key was wrong — a real alert was rejected this way."""
+    asked = {}
+
+    class _Chain(_Adapter):
+        def list_option_contracts(self, underlying=None, **kw):
+            asked["underlying"] = underlying
+            if underlying != "SPX":
+                return []
+            c = type("C", (), {"strike_price": Decimal("7585"),
+                               "type": type("T", (), {"value": "call"})()})()
+            return [c]
+
+    _wire(monkeypatch, _Chain())
+    r = ex.resolve(None, _User(), _signal(
+        symbol="SPXW", strike="7585", limit_price="39.47",
+        expiration=FUTURE.isoformat()))
+
+    assert asked["underlying"] == "SPX"          # looked up under the index root
+    assert r.payload.symbol == "SPXW"            # but trades under its own
+
+
+def test_an_ordinary_symbol_keeps_its_own_chain_root(monkeypatch):
+    asked = {}
+
+    class _Chain(_Adapter):
+        def list_option_contracts(self, underlying=None, **kw):
+            asked["underlying"] = underlying
+            c = type("C", (), {"strike_price": Decimal("100"),
+                               "type": type("T", (), {"value": "call"})()})()
+            return [c]
+
+    _wire(monkeypatch, _Chain())
+    ex.resolve(None, _User(), _signal())
+    assert asked["underlying"] == "MSFT"
+
+
+def test_the_chain_root_map_covers_the_common_index_weeklies():
+    assert ex._chain_root("SPXW") == "SPX"
+    assert ex._chain_root("NDXP") == "NDX"
+    assert ex._chain_root("RUTW") == "RUT"
+    assert ex._chain_root("spxw") == "SPX"       # case-insensitive
+    assert ex._chain_root("AAPL") == "AAPL"      # untouched
