@@ -57,12 +57,12 @@ function fmtMoney(v: string | null): string {
   return Number.isFinite(n) ? `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : String(v);
 }
 
-/** ISO timestamp → local "7:18 pm"; "—" when absent. */
+/** ISO timestamp → ET "7:18 PM" (market time, like Order History); "—" absent. */
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
 }
 
 /** Option expiry "YYYY-MM-DD" → "10 Jul 26"; "—" for stocks / no expiry. */
@@ -245,7 +245,7 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
       {/* Per-snapshot header: when it was taken + status counts. */}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="text-sm font-semibold" style={{ color: "var(--text-2)" }}>
-          <span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+          <span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET
           <span style={{ color: "var(--muted)" }}> · {snap.summary.total} order{snap.summary.total === 1 ? "" : "s"}</span>
         </div>
         <div className="text-sm">
@@ -312,7 +312,7 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Previous day's market close price">PDC</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="When the re-entry filled">Fill Time</th>
+                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="When the re-entry filled (US Eastern / market time)">Fill Time (ET)</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Current price vs exit price, as a %">%</th>
                 <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>

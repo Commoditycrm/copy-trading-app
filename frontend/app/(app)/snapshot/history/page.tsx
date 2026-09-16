@@ -110,7 +110,7 @@ export default function SnapshotHistoryPage() {
                     className="cursor-pointer transition-colors hover:brightness-110"
                     style={{ borderBottom: "1px solid var(--border)" }}>
                   <td className="px-4 py-3 text-sm">
-                    {new Date(s.created_at).toLocaleString()}
+                    {new Date(s.created_at).toLocaleString("en-US", { timeZone: "America/New_York", timeZoneName: "short" })}
                     {s.active && (
                       <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-full align-middle"
                             style={{ background: "var(--good-soft)", color: "var(--good)" }}>current</span>
