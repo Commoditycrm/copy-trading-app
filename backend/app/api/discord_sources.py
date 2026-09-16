@@ -83,6 +83,7 @@ from app.schemas.discord import (
 )
 from app.services import (
     discord_execution,
+    discord_position_guard as guards,
     discord_ingest,
     discord_login,
     discord_pairing,
@@ -131,6 +132,20 @@ def require_listener_token(
         raise HTTPException(503, "discord_listener_not_configured")
     if not secrets.compare_digest(x_kopyaa_listener_token or "", expected):
         raise HTTPException(401, "invalid_listener_token")
+
+
+def _plain(value) -> str | None:
+    """Decimal -> the shortest exact string a human would write.
+
+    Numeric(9,4) round-trips as "20.0000", which reads like precision that isn't
+    meaningful for a percentage or a dollar cap. normalize() alone would give
+    "2E+1", so format with 'f' to keep it positional.
+    """
+    if value is None:
+        return None
+    from decimal import Decimal as _D  # noqa: PLC0415
+
+    return format(_D(str(value)).normalize(), "f")
 
 
 def _auto_approve(db: Session, user_id: uuid.UUID) -> bool:
@@ -442,10 +457,8 @@ def get_discord_settings(
         execution_mode="auto" if _auto_approve(db, user.id) else "manual",
         live_trading=bool(ts and ts.discord_live_trading),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
-        max_per_contract=(
-            str(ts.discord_max_per_contract)
-            if ts and ts.discord_max_per_contract is not None else None
-        ),
+        max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
+        trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
     )
 
 
@@ -484,6 +497,15 @@ def update_discord_settings(
             if value <= 0:
                 raise HTTPException(400, "max_per_contract must be positive")
             ts.discord_max_per_contract = value
+    if payload.trail_percent is not None:
+        try:
+            trail = Decimal(payload.trail_percent.strip())
+        except (InvalidOperation, ValueError, AttributeError):
+            raise HTTPException(400, "invalid_trail_percent")
+        # A zero/negative trail would never trigger; above 100 is meaningless.
+        if not (0 < trail <= 100):
+            raise HTTPException(400, "trail_percent must be between 0 and 100")
+        ts.discord_trail_percent = trail
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
         log.warning(
@@ -495,10 +517,8 @@ def update_discord_settings(
         execution_mode=ts.discord_execution_mode,
         live_trading=bool(ts.discord_live_trading),
         quantity_multiplier=ts.discord_quantity_multiplier or 1,
-        max_per_contract=(
-            str(ts.discord_max_per_contract)
-            if ts.discord_max_per_contract is not None else None
-        ),
+        max_per_contract=_plain(ts.discord_max_per_contract),
+        trail_percent=_plain(ts.discord_trail_percent) or "20",
     )
 
 
@@ -792,6 +812,29 @@ def _execute_signal(
     live = bool(ts_for_sizing and ts_for_sizing.discord_live_trading)
     detail = " · ".join(f"{k}={v}" for k, v in resolved.resolutions.items())
 
+    # An exit alert means different things depending on the position's history:
+    # the FIRST arms a trailing stop, the SECOND closes. Decided before placing
+    # anything, because the first sell places no order at all.
+    p = resolved.payload
+    if resolved.is_closing:
+        decision = guards.on_sell(
+            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
+            trail_percent=(ts_for_sizing.discord_trail_percent if ts_for_sizing else Decimal("20")),
+        )
+        if decision.action == guards.ARM_TRAIL:
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                f"First exit alert — {decision.trail_percent}% trailing stop armed on "
+                f"{p.symbol}. The next exit alert closes the position."
+            )
+            log.info("discord: trail armed for %s (alert %s)", p.symbol, msg.id)
+            events.publish(
+                user.id,
+                {"type": "discord.trail_armed", "message_id": str(msg.id),
+                 "symbol": p.symbol, "trail_percent": str(decision.trail_percent)},
+            )
+            return
+
     if not live:
         # Paper: everything above ran for real; only the broker call is skipped.
         discord_execution.mark_failed(
@@ -824,6 +867,19 @@ def _execute_signal(
         discord_execution.mark_failed(msg, f"Order placement failed: {exc}")
         log.exception("discord: placement raised for alert %s", msg.id)
         return
+
+    # A filled entry starts the trail-then-exit sequence for this contract; a
+    # completed exit retires it.
+    if resolved.is_closing:
+        existing = guards.find(
+            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
+        )
+        if existing is not None:
+            guards.retire(db, existing, "closed by exit alert")
+    else:
+        guards.on_buy(
+            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
+        )
 
     discord_execution.mark_executed(msg, order.id)
     log.info("discord: alert %s placed as order %s%s", msg.id, order.id,
