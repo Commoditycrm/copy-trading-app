@@ -86,6 +86,9 @@ class UserOut(BaseModel):
     # admin Traders page reads this to render the Sell-All On/Off toggle — without
     # it the toggle always renders Off after a reload.
     sell_all_access: bool = False
+    # Admin-controlled access to the inbound Discord alert-copying feature. The
+    # admin Traders page reads this to render the Discord On/Off toggle.
+    discord_enabled: bool = False
     # True when the user has any currently-hidden orders or P&L snapshot days —
     # drives the "Hidden" badge on the admin Traders page (computed in list_users).
     has_hidden: bool = False
@@ -99,6 +102,10 @@ class RoleChangeIn(BaseModel):
 
 
 class SellAllAccessIn(BaseModel):
+    enabled: bool
+
+
+class DiscordEnabledIn(BaseModel):
     enabled: bool
 
 
@@ -600,6 +607,32 @@ def set_sell_all_access(
     from app.services import events  # noqa: PLC0415
     events.publish(user.id, {"type": "access.sell_all_changed", "enabled": payload.enabled})
     return {"ok": True, "user_id": str(user_id), "sell_all_access": payload.enabled}
+
+
+@router.patch("/users/{user_id}/discord-enabled")
+def set_discord_enabled(
+    user_id: uuid.UUID,
+    payload: DiscordEnabledIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """Allow-list a trader for the inbound Discord alert-copying feature. The
+    Discord page + nav entry and every /api/discord-sources route stay hidden +
+    API-blocked until enabled here. Toggled from Admin -> Traders."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+    if user.role != UserRole.TRADER:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="discord_enabled only applies to traders"
+        )
+    user.discord_enabled = payload.enabled
+    db.commit()
+    log.info("admin set discord_enabled=%s for %s", payload.enabled, user.email)
+    # Push to the trader's SSE channel so the Discord nav entry appears/hides live.
+    from app.services import events  # noqa: PLC0415
+    events.publish(user.id, {"type": "access.discord_changed", "enabled": payload.enabled})
+    return {"ok": True, "user_id": str(user_id), "discord_enabled": payload.enabled}
 
 
 @router.patch("/users/{user_id}/business-name")

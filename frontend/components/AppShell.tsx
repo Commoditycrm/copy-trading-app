@@ -366,6 +366,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       api<User>("/api/auth/me").then(setUser).catch(() => {});
       return;
     }
+    // Admin flipped this trader's Discord access — re-fetch so the Discord nav
+    // entry appears/disappears live (no page refresh).
+    if (e?.type === "access.discord_changed") {
+      api<User>("/api/auth/me").then(setUser).catch(() => {});
+      return;
+    }
     if (e?.type === "pnl.tick") {
       if (typeof e.copy_enabled === "boolean") {
         setSubCopy(prev => prev ? { ...prev, copy_enabled: e.copy_enabled } : prev);
@@ -578,7 +584,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // The Snapshot page is part of the admin-gated Sell-All suite — hide its nav
   // entry unless the trader is allow-listed.
   const nav = (user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER)
-    .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access);
+    .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access)
+    .filter((item) => item.href !== "/discord" || !!user.discord_enabled);
   const displayName = user.display_name || user.email.split("@")[0];
   // App wordmark: trader sees their own business_name; subscriber sees
   // the business_name of the trader they follow (loaded via /api/settings/subscriber

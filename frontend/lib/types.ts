@@ -22,6 +22,10 @@ export interface User {
   /** Admin-controlled access to the Sell-All / Snapshot / Re-entry suite.
    *  Trader-only; off unless an admin allow-lists the user. */
   sell_all_access: boolean;
+  /** Admin-controlled access to the inbound Discord alert-copying feature.
+   *  Trader-only; off unless an admin allow-lists the user. Gates both the
+   *  Discord nav entry and the /discord route. */
+  discord_enabled: boolean;
   /** Whether the user has confirmed their email. Soft-enforced: unverified
    *  users can still use the app, but see a "verify your email" banner. */
   email_verified: boolean;
