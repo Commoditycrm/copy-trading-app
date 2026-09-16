@@ -293,7 +293,9 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
       {/* Per-snapshot header: when it was taken + status counts. */}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="text-sm font-semibold" style={{ color: "var(--text-2)" }}>
-          <span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET
+          {merged
+            ? <span style={{ color: "var(--muted)" }}>Today</span>
+            : <><span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET</>}
           <span style={{ color: "var(--muted)" }}> · {snap.summary.total} order{snap.summary.total === 1 ? "" : "s"}</span>
         </div>
         <div className="text-sm">
