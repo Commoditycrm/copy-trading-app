@@ -355,8 +355,9 @@ def close_all_positions(
 
     snapshot_id = None
     if snapshot_positions:
-        # Add these to the active re-entry basket (shared with individual closes).
-        snap = _capture_exit_snapshot(db, user.id, snapshot_positions)
+        # Join today's snapshot (one per day) so the whole day is a single table,
+        # not a separate one per Exit-All. Individual closes append the same way.
+        snap = _capture_exit_snapshot(db, user.id, snapshot_positions, new_event=False)
         db.commit()
         snapshot_id = str(snap.id) if snap else None
 
@@ -429,14 +430,12 @@ def _capture_exit_snapshot(
 ) -> "SellAllSnapshot | None":
     """Record exited positions into a re-entry snapshot.
 
-    ``new_event=True`` (an Exit-All sweep) always starts a FRESH snapshot: it
-    deactivates the prior active one and creates a new active snapshot holding
-    just this sweep's positions. ``new_event=False`` (a single position close)
-    instead APPENDS to today's active snapshot so closing positions one-by-one
-    groups into one snapshot rather than fragmenting into a snapshot per order;
-    it only starts a new one when there's no active snapshot from today. Items
-    are deduped by contract identity. Older snapshots are retained — their
-    Re-Entry badges survive and they stay in the snapshot history."""
+    ``new_event=False`` (the default flow for both Exit-All and single closes)
+    APPENDS to today's active snapshot, so the whole day's exits collect into ONE
+    snapshot / one table rather than fragmenting per exit; it only starts a new
+    snapshot when there's no active one from today (i.e. the first exit of a new
+    day). ``new_event=True`` forces a fresh snapshot instead. Items are deduped by
+    contract identity. Older days' snapshots are retained in the history."""
     if not items:
         return None
 
