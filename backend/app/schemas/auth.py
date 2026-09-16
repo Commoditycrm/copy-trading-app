@@ -216,5 +216,7 @@ class UserOut(BaseModel):
     email_verified: bool = True
     # Admin-controlled access to the Sell-All / Snapshot / Re-entry suite.
     sell_all_access: bool = False
+    # Admin-controlled access to the inbound Discord alert-copying feature.
+    discord_enabled: bool = False
 
     model_config = {"from_attributes": True}

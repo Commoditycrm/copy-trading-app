@@ -680,7 +680,11 @@ export default function TradesPage() {
       {/* Toolbar: tabs (trader) + symbol search */}
       <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
         <div className="flex gap-2 items-center flex-wrap">
-          {STATUS_TABS.map(({ key, label }) => {
+          {STATUS_TABS
+            // Discord is an admin-enabled, opt-in trader feature — hide the tab
+            // unless this trader is allow-listed (mirrors the nav + /discord gate).
+            .filter(({ key }) => key !== "discord" || !!user?.discord_enabled)
+            .map(({ key, label }) => {
             const active = tab === key;
             const count = tabCounts[key];
             return (
