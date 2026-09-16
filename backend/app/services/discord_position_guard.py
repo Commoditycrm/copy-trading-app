@@ -1,13 +1,20 @@
 """What a SELL alert means depends on what came before it.
 
-    BUY        → open the position, start counting
-    1st SELL   → do NOT exit; arm a trailing stop to protect the gain
-    2nd SELL   → trim: sell part of the position, re-anchor the trail on the rest
-    3rd SELL   → close whatever is left
+    BUY        → open the position, remember what it cost
+    1st SELL   → only if up enough: sell half, stop the rest below entry
+    2nd SELL   → sell half of what's left; that stop moves to break-even
+    3rd SELL   → exit everything left
 
-So an exit alert is not self-contained: the same message is a "protect" or an
-"exit" depending on the position's history. That history lives in
+So an exit alert is not self-contained: the same message trims, protects or
+exits depending on the position's history. That history lives in
 ``DiscordPositionGuard``, one row per open contract.
+
+── Everything is measured from the ENTRY price ─────────────────────────────────
+Not the live mark. A ladder keyed to the current price would move under itself:
+each trim would reset the reference, so "25% below" would mean something
+different on every rung and a falling position could ratchet its own stop down.
+Keyed to entry, the levels are fixed the moment the position opens, and adding
+to it later never moves a stop that is already protecting it.
 
 ── The trail is emulated for options ────────────────────────────────────────────
 Alpaca's options API rejects trailing-stop orders (see trailing_stop_close.py),
@@ -25,9 +32,9 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_ as sa_or, select
 from sqlalchemy.orm import Session
 
 from app.models.discord_position_guard import DiscordPositionGuard
@@ -36,17 +43,159 @@ from app.models.order import OptionRight
 log = logging.getLogger(__name__)
 
 # What a sell alert should do, decided by the guard.
-ARM_TRAIL = "arm_trail"     # first sell — protect, don't exit
-TRIM = "trim"               # second sell — take some off, keep protecting the rest
-CLOSE = "close"             # third sell — get out of what remains
+# How the quantity being sold leaves.
+MARKET = "market"           # sell it now
+TRAIL = "trail"             # let it ride, exit on a dollar give-back
+NONE = "none"               # nothing is being sold on this rung
 OPEN = "open"               # a buy
 
 
 @dataclass
-class SellDecision:
-    action: str
-    guard: DiscordPositionGuard
-    trail_percent: Decimal | None = None
+class TrimConfig:
+    """The trader's ladder settings, resolved by the caller."""
+
+    profit_gate_pct: Decimal = Decimal("20")    # 1st trim only runs above this
+    stop_pct: Decimal = Decimal("25")           # 1st trim's stop, below entry
+    price_threshold: Decimal = Decimal("0.90")  # above this, exits trail
+    trail_amount: Decimal = Decimal("0.25")     # dollar give-back that triggers
+
+
+@dataclass
+class TrimPlan:
+    """What this exit alert should do. ``sell_qty`` of 0 means nothing leaves."""
+
+    rung: int
+    guard: "DiscordPositionGuard"
+    sell_qty: Decimal = Decimal(0)
+    exit_style: str = NONE
+    trail_amount: Decimal | None = None
+    new_stop_price: Decimal | None = None
+    retire: bool = False
+    note: str = ""
+
+
+def _half(held: Decimal) -> Decimal:
+    """Half a position, rounded UP to a whole contract.
+
+    Rounding up rather than down keeps a trim from being a no-op: half of one
+    contract rounds to zero, and an alert that sells nothing while still
+    consuming a rung would walk the trader down the ladder without ever
+    reducing the position. The caller treats "sold everything" as a close.
+    """
+    return (held / Decimal(2)).to_integral_value(rounding=ROUND_CEILING)
+
+
+def plan_exit(
+    guard: DiscordPositionGuard,
+    held: Decimal,
+    mark: Decimal | None,
+    cfg: TrimConfig,
+) -> TrimPlan:
+    """Work out this alert's rung and what it does. Mutates ``guard``.
+
+    The rung always advances, even when the trim itself does nothing. An alert
+    that arrives below the profit gate is still the trader's first exit signal,
+    so the next one has to read as the second — otherwise a quiet position could
+    take an unlimited number of "first" alerts and never progress.
+    """
+    rung = (guard.sell_count or 0) + 1
+    guard.sell_count = rung
+    entry = guard.entry_price
+
+    if held <= 0:
+        return TrimPlan(rung=rung, guard=guard, retire=True,
+                        note="nothing held")
+
+    # ── rung 3 and beyond: everything goes ──────────────────────────────────
+    if rung >= 3:
+        style, amount = _exit_style(entry, cfg)
+        return TrimPlan(
+            rung=rung, guard=guard, sell_qty=held, exit_style=style,
+            trail_amount=amount, retire=(style == MARKET),
+            note=f"final exit of {held}",
+        )
+
+    # ── rung 1: gated on profit, and only ever sells at market ──────────────
+    if rung == 1:
+        if entry is None or entry <= 0 or mark is None or mark <= 0:
+            return TrimPlan(
+                rung=rung, guard=guard,
+                note="no entry price or live mark — cannot measure profit",
+            )
+        gain_pct = (mark - entry) / entry * Decimal(100)
+        if gain_pct <= cfg.profit_gate_pct:
+            return TrimPlan(
+                rung=rung, guard=guard,
+                note=(f"up {gain_pct.quantize(Decimal('0.01'))}%, "
+                      f"under the {cfg.profit_gate_pct}% gate — nothing sold"),
+            )
+        sell = _half(held)
+        stop = entry * (Decimal(1) - cfg.stop_pct / Decimal(100))
+        return TrimPlan(
+            rung=rung, guard=guard, sell_qty=sell, exit_style=MARKET,
+            new_stop_price=(None if sell >= held else _armable_stop(stop, mark)),
+            retire=(sell >= held),
+            note=(f"up {gain_pct.quantize(Decimal('0.01'))}% — sold {sell} of {held}"
+                  + ("" if sell >= held else f", stop {stop.quantize(Decimal('0.0001'))}")),
+        )
+
+    # ── rung 2: half of what's left, remainder held at break-even ───────────
+    sell = _half(held)
+    style, amount = _exit_style(entry, cfg)
+    return TrimPlan(
+        rung=rung, guard=guard, sell_qty=sell, exit_style=style,
+        trail_amount=amount,
+        # Break-even on whatever is still held — but only if the position is
+        # actually above it. Nothing left to protect if this rung takes it all.
+        new_stop_price=(None if sell >= held else _armable_stop(entry, mark)),
+        retire=(sell >= held and style == MARKET),
+        note=f"sold {sell} of {held}, stop to break-even",
+    )
+
+
+def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
+    """A stop is only a stop if the price is still above it.
+
+    Setting one at or below the current mark doesn't protect anything — the
+    enforcer reads it as already breached and flattens the position on its next
+    tick. That turns "move the stop to break-even" into "sell everything now"
+    whenever the position happens to be underwater, which is exactly when the
+    trader least wants to be forced out.
+
+    Returning None leaves whatever stop was already there, so a trim can tighten
+    protection but never trigger an exit by itself.
+    """
+    if stop is None or mark is None:
+        return stop
+    return stop if stop < mark else None
+
+
+def _exit_style(entry: Decimal | None, cfg: TrimConfig) -> tuple[str, Decimal | None]:
+    """Trail an expensive contract out; take a cheap one to market.
+
+    A contract worth less than the threshold has little room left to give back —
+    trailing it risks watching the remaining value evaporate for the sake of a
+    move it can no longer make. Above the threshold there's enough left to be
+    worth riding.
+    """
+    if entry is not None and entry > cfg.price_threshold:
+        return TRAIL, cfg.trail_amount
+    return MARKET, None
+
+
+def arm_trail(guard: DiscordPositionGuard, qty: Decimal, amount: Decimal,
+              mark: Decimal | None) -> None:
+    """Park ``qty`` on a trailing exit instead of selling it now."""
+    guard.trail_qty = qty
+    guard.trail_amount = amount
+    guard.peak_price = mark
+    guard.armed_at = datetime.now(timezone.utc)
+
+
+def clear_trail(guard: DiscordPositionGuard) -> None:
+    guard.trail_qty = None
+    guard.trail_amount = None
+    guard.peak_price = None
 
 
 def _match(q, user_id, symbol, strike, right, expiry):
@@ -70,16 +219,22 @@ def find(db: Session, user_id: uuid.UUID, symbol: str, strike, right, expiry):
 def on_buy(
     db: Session, user_id: uuid.UUID, symbol: str,
     strike: Decimal | None, right: OptionRight | None, expiry: date | None,
+    entry_price: Decimal | None = None,
 ) -> DiscordPositionGuard:
-    """Record that a position is open and reset its sell count.
+    """Record that a position is open and remember what it cost.
 
-    Adding to an existing position does NOT reset the count — an "Adding" alert
-    increases size, it doesn't start the trail-then-exit sequence over. Resetting
-    would mean a second sell after an add merely re-arms the stop instead of
-    closing, leaving the trader in a position they asked twice to leave.
+    Adding to an existing position does NOT reset the rung or re-price the
+    entry. An "Adding" alert increases size; it doesn't restart the ladder, and
+    it must not move a stop that is already protecting the position. Re-pricing
+    on every add would let a position that kept averaging up quietly raise its
+    own stop-loss under a trader who never asked for that.
     """
     guard = find(db, user_id, symbol, strike, right, expiry)
     if guard is not None:
+        if guard.entry_price is None and entry_price is not None:
+            # First price we've managed to learn for a position we were already
+            # tracking — better than never having a reference at all.
+            guard.entry_price = entry_price
         return guard
 
     guard = DiscordPositionGuard(
@@ -89,109 +244,25 @@ def on_buy(
         option_right=(right.value if right else None),
         option_expiry=expiry,
         sell_count=0,
+        entry_price=entry_price,
     )
     db.add(guard)
     db.flush()
-    log.info("discord guard: opened for %s %s %s %s", symbol, strike, right, expiry)
+    log.info("discord guard: opened for %s %s %s %s at %s",
+             symbol, strike, right, expiry, entry_price)
     return guard
 
 
-def on_sell(
-    db: Session, user_id: uuid.UUID, symbol: str,
-    strike: Decimal | None, right: OptionRight | None, expiry: date | None,
-    trail_percent: Decimal,
-) -> SellDecision:
-    """Decide what this sell alert should do, and record it.
+def rollback_exit(guard: DiscordPositionGuard) -> None:
+    """Undo the rung bump from an exit whose order never made it.
 
-    No guard at all means we never saw the opening buy — a position opened
-    elsewhere, or one from before this feature. Treat that as a CLOSE: the
-    trader asked to exit, and refusing because we lack history would leave them
-    holding something they tried to sell.
-    """
-    guard = find(db, user_id, symbol, strike, right, expiry)
-    if guard is None:
-        guard = DiscordPositionGuard(
-            user_id=user_id,
-            symbol=symbol.upper(),
-            option_strike=strike,
-            option_right=(right.value if right else None),
-            option_expiry=expiry,
-            # Counted past the trim step so this exits outright rather than
-            # arming or trimming a position we know nothing about.
-            sell_count=3,
-        )
-        db.add(guard)
-        db.flush()
-        log.info("discord guard: sell with no known entry for %s — closing", symbol)
-        return SellDecision(action=CLOSE, guard=guard)
-
-    guard.sell_count = (guard.sell_count or 0) + 1
-
-    if guard.sell_count == 1:
-        # Capture the trail NOW so a later settings change can't move the stop
-        # on a position already being protected.
-        guard.trail_percent = trail_percent
-        guard.armed_at = datetime.now(timezone.utc)
-        log.info(
-            "discord guard: first sell for %s — arming %s%% trail",
-            symbol, trail_percent,
-        )
-        return SellDecision(action=ARM_TRAIL, guard=guard, trail_percent=trail_percent)
-
-    if guard.sell_count == 2:
-        # Trim. The trail stays armed on what's left — the caller re-anchors it
-        # once it knows the live mark.
-        log.info("discord guard: second sell for %s — trimming", symbol)
-        return SellDecision(action=TRIM, guard=guard, trail_percent=guard.trail_percent)
-
-    log.info("discord guard: sell #%s for %s — closing", guard.sell_count, symbol)
-    return SellDecision(action=CLOSE, guard=guard)
-
-
-def trim_quantity(held: Decimal, multiplier: int) -> Decimal | None:
-    """How much to sell on a trim, or None if this should be a close instead.
-
-    The trader trims one contract, so we trim one scaled by our multiplier —
-    the slice we take matches the slice they took. At 2x their 1-of-3 becomes
-    our 2-of-6.
-
-    Returns None when the trim would take the whole position: there would be
-    nothing left to protect, which makes it a close, not a trim. Letting it
-    through as a trim would leave an armed guard on an empty position.
-    """
-    size = Decimal(max(1, int(multiplier or 1)))
-    if size >= held:
-        return None
-    return size
-
-
-def rollback_sell(guard: DiscordPositionGuard) -> None:
-    """Undo the count bump from a sell alert whose order never made it.
-
-    Only meaningful for a trim. If a trim's order is rejected, the position is
-    untouched, so consuming the trim step would mean the next alert closes the
-    whole position instead of taking the slice the trader asked for. Counting a
-    step the broker never performed loses it silently.
-
-    A failed CLOSE is deliberately not rolled back: every later alert is a close
-    anyway, so there is nothing to preserve.
+    Nothing was sold, so consuming the rung would walk the trader down the
+    ladder for a trim the broker refused — their next alert would jump to the
+    step after the one that failed. Any stop this rung set is dropped too, since
+    it was priced for a position size that never happened.
     """
     guard.sell_count = max(0, (guard.sell_count or 0) - 1)
-
-
-def re_anchor(guard: DiscordPositionGuard, price: Decimal | None) -> bool:
-    """Move the trail's anchor up to ``price``. Ratchets — never down.
-
-    A trim says "protect more", so the stop may rise but must not fall. The peak
-    is what the retrace is measured from, so lowering it would hand back gains
-    the trader had already locked in. Returns whether the anchor actually moved.
-    """
-    if price is None or price <= 0:
-        return False
-    if guard.peak_price is not None and price <= guard.peak_price:
-        return False
-    guard.peak_price = price
-    return True
+    clear_trail(guard)
 
 
 def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
@@ -202,19 +273,24 @@ def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
 
 
 def armed(db: Session) -> list[DiscordPositionGuard]:
-    """Every live guard with an emulated trail to enforce."""
+    """Every live guard with something to enforce — a stop level, a trailing
+    exit, or both."""
     return list(
         db.execute(
             select(DiscordPositionGuard).where(
                 DiscordPositionGuard.closed_at.is_(None),
-                DiscordPositionGuard.armed_at.is_not(None),
                 DiscordPositionGuard.stop_order_id.is_(None),   # native stops are the broker's job
+                sa_or(
+                    DiscordPositionGuard.stop_price.is_not(None),
+                    DiscordPositionGuard.trail_qty.is_not(None),
+                ),
             )
         ).scalars()
     )
 
 
 __all__ = [
-    "ARM_TRAIL", "CLOSE", "OPEN", "TRIM", "SellDecision",
-    "armed", "find", "on_buy", "on_sell", "re_anchor", "retire", "rollback_sell", "trim_quantity",
+    "MARKET", "NONE", "OPEN", "TRAIL", "TrimConfig", "TrimPlan",
+    "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
+    "retire", "rollback_exit",
 ]

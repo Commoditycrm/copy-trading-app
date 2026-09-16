@@ -140,6 +140,12 @@ def require_listener_token(
         raise HTTPException(401, "invalid_listener_token")
 
 
+def _setting(ts, name: str, default: str) -> Decimal:
+    """A Decimal setting, falling back when the row or column is unset."""
+    raw = getattr(ts, name, None) if ts is not None else None
+    return Decimal(str(raw)) if raw is not None else Decimal(default)
+
+
 def _plain(value) -> str | None:
     """Decimal -> the shortest exact string a human would write.
 
@@ -465,6 +471,10 @@ def get_discord_settings(
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
+        trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
+        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
+        trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
     )
 
 
@@ -512,6 +522,29 @@ def update_discord_settings(
         if not (0 < trail <= 100):
             raise HTTPException(400, "trail_percent must be between 0 and 100")
         ts.discord_trail_percent = trail
+    # Ladder thresholds. Each is a positive number; the two percentages are
+    # additionally capped at 100, where they stop meaning anything.
+    for field, column, cap in (
+        ("trim_profit_gate_pct", "discord_trim_profit_gate_pct", Decimal(100)),
+        ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100)),
+        ("trim_price_threshold", "discord_trim_price_threshold", None),
+        ("trim_trail_amount", "discord_trim_trail_amount", None),
+    ):
+        raw = getattr(payload, field, None)
+        if raw is None:
+            continue
+        try:
+            value = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError, AttributeError):
+            raise HTTPException(400, f"invalid_{field}")
+        if value <= 0 or (cap is not None and value > cap):
+            raise HTTPException(
+                400,
+                f"{field} must be greater than 0"
+                + (f" and no more than {cap}" if cap is not None else ""),
+            )
+        setattr(ts, column, value)
+
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
         log.warning(
@@ -525,6 +558,10 @@ def update_discord_settings(
         quantity_multiplier=ts.discord_quantity_multiplier or 1,
         max_per_contract=_plain(ts.discord_max_per_contract),
         trail_percent=_plain(ts.discord_trail_percent) or "20",
+        trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
+        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
+        trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
     )
 
 
@@ -818,57 +855,82 @@ def _execute_signal(
     live = bool(ts_for_sizing and ts_for_sizing.discord_live_trading)
     detail = " · ".join(f"{k}={v}" for k, v in resolved.resolutions.items())
 
-    # An exit alert means different things depending on the position's history:
-    # the FIRST arms a trailing stop, the SECOND trims and re-anchors it, the
-    # THIRD closes what's left. Decided before placing anything, because the
-    # first sell places no order at all.
+    # An exit alert is a rung on a ladder, not a flatten. The first sells half
+    # and stops the rest below entry, the second halves again and lifts that
+    # stop to break-even, the third exits what's left. Decided before placing
+    # anything, because a rung can legitimately place no order at all.
     p = resolved.payload
     is_trim = False
     trim_guard = None
     if resolved.is_closing:
-        decision = guards.on_sell(
-            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
-            trail_percent=(ts_for_sizing.discord_trail_percent if ts_for_sizing else Decimal("20")),
+        cfg = guards.TrimConfig(
+            profit_gate_pct=_setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
+            stop_pct=_setting(ts_for_sizing, "discord_trim_stop_pct", "25"),
+            price_threshold=_setting(ts_for_sizing, "discord_trim_price_threshold", "0.90"),
+            trail_amount=_setting(ts_for_sizing, "discord_trim_trail_amount", "0.25"),
         )
-        action = decision.action
+        guard = guards.find(
+            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
+        )
+        if guard is None:
+            # A position the ladder never saw open — opened by hand, or before
+            # this feature. Start it on rung one against the broker's own cost
+            # basis rather than refusing: the trader is asking to work out of
+            # something they hold, and we have a usable reference for it.
+            guard = guards.on_buy(
+                db, user.id, p.symbol, p.option_strike, p.option_right,
+                p.option_expiry, entry_price=resolved.position_entry_price,
+            )
+        elif guard.entry_price is None and resolved.position_entry_price is not None:
+            guard.entry_price = resolved.position_entry_price
 
-        if action == guards.ARM_TRAIL:
-            guards.re_anchor(decision.guard, resolved.mark_price)
+        # resolve() sized this as a full close, so payload.quantity is the
+        # whole position — which is exactly what the ladder measures against.
+        held = Decimal(str(p.quantity))
+        plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
+
+        if plan.new_stop_price is not None:
+            guard.stop_price = plan.new_stop_price
+        if plan.retire:
+            guards.retire(db, guard, f"trim {plan.rung}: {plan.note}"[:120])
+
+        # Nothing leaves on this rung — a gate that didn't open, or a position
+        # that's already gone. Record why and stop here.
+        if plan.sell_qty <= 0:
             msg.status = DiscordMessageStatus.PARSED
-            msg.status_reason = (
-                f"First exit alert — {decision.trail_percent}% trailing stop armed on "
-                f"{p.symbol}. The next exit alert trims the position."
-            )
-            log.info("discord: trail armed for %s (alert %s)", p.symbol, msg.id)
-            events.publish(
-                user.id,
-                {"type": "discord.trail_armed", "message_id": str(msg.id),
-                 "symbol": p.symbol, "trail_percent": str(decision.trail_percent)},
-            )
+            msg.status_reason = f"Exit alert {plan.rung} — {plan.note}."
+            log.info("discord: exit %s for %s — %s", plan.rung, p.symbol, plan.note)
+            events.publish(user.id, {
+                "type": "discord.trim_skipped", "message_id": str(msg.id),
+                "symbol": p.symbol, "rung": plan.rung, "reason": plan.note,
+            })
             return
 
-        if action == guards.TRIM:
-            # resolve() sized this as a full close, so payload.quantity is the
-            # whole position. Trim the trader's one contract scaled by our
-            # multiplier, so the slice we take matches the slice they took.
-            held = Decimal(str(p.quantity))
-            trim_qty = guards.trim_quantity(held, sizing.multiplier)
-            if trim_qty is None:
-                # Nothing would be left to protect, so this is simply a close.
-                action = guards.CLOSE
-                log.info(
-                    "discord: a trim would take the whole %s position (%s held) — closing instead",
-                    p.symbol, held,
-                )
-            else:
-                is_trim = True
-                trim_guard = decision.guard
-                p.quantity = trim_qty
-                moved = guards.re_anchor(decision.guard, resolved.mark_price)
-                detail += (" · " if detail else "") + (
-                    f"trim={trim_qty} of {held}"
-                    + (f", trail re-anchored to {resolved.mark_price}" if moved else "")
-                )
+        # An expensive contract rides a trailing give-back instead of going out
+        # now. Nothing is placed today; the poller exits it when it gives back.
+        if plan.exit_style == guards.TRAIL:
+            guards.arm_trail(guard, plan.sell_qty, plan.trail_amount, resolved.mark_price)
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                f"Exit alert {plan.rung} — {plan.sell_qty} of {held} {p.symbol} "
+                f"armed to exit on a ${_plain(plan.trail_amount)} trailing give-back."
+                + (f" Stop on the rest moved to {_plain(plan.new_stop_price)}."
+                   if plan.new_stop_price is not None else "")
+            )
+            log.info("discord: exit %s armed trailing exit of %s %s",
+                     plan.rung, plan.sell_qty, p.symbol)
+            events.publish(user.id, {
+                "type": "discord.trail_armed", "message_id": str(msg.id),
+                "symbol": p.symbol, "quantity": str(plan.sell_qty),
+                "trail_amount": str(plan.trail_amount),
+            })
+            return
+
+        # Market exit of this rung's slice.
+        p.quantity = plan.sell_qty
+        is_trim = not plan.retire
+        trim_guard = guard if is_trim else None
+        detail += (" · " if detail else "") + f"trim {plan.rung}: {plan.note}"
 
     if not live:
         # Paper: everything above ran for real; only the broker call is skipped.
@@ -900,13 +962,13 @@ def _execute_signal(
     except HTTPException as exc:
         if trim_guard is not None:
             # The slice was never sold, so don't spend the trim step on it.
-            guards.rollback_sell(trim_guard)
+            guards.rollback_exit(trim_guard)
         discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
         log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
         return
     except Exception as exc:  # noqa: BLE001
         if trim_guard is not None:
-            guards.rollback_sell(trim_guard)
+            guards.rollback_exit(trim_guard)
         discord_execution.mark_failed(msg, f"Order placement failed: {exc}")
         log.exception("discord: placement raised for alert %s", msg.id)
         return
@@ -923,7 +985,11 @@ def _execute_signal(
             guards.retire(db, existing, "closed by exit alert")
     else:
         guards.on_buy(
-            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
+            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
+            # What the ladder measures against. The limit we bid is the best
+            # reference available at placement; a fill can only be better, and
+            # an exit alert backfills from the broker if this is ever missing.
+            entry_price=p.limit_price,
         )
 
     discord_execution.mark_executed(msg, order.id)
