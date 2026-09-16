@@ -215,6 +215,18 @@ class Order(Base, TimestampMixin):
     is_closing: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
+    # A close that does NOT flatten the position — a Discord trim sells part and
+    # keeps the rest. Both flags are set: it IS a close (so the sell is marked
+    # SELL_TO_CLOSE and the subscriber's close-side clamp applies), but the
+    # trader has not left the name.
+    #
+    # The copy engine needs the distinction. It reads a trader close as "their
+    # accumulation window is over" and cancels the subscriber's still-working
+    # entry on that contract — correct on a real exit, wrong on a trim, where it
+    # would strand the subscriber out of a trade the trader is still in.
+    is_partial_close: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
 
     # The subscriber's copy-size multiplier applied when this mirror was scaled
     # (quantity = floor(trader_qty × copy_multiplier)). Recorded at fanout time

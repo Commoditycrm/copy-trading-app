@@ -1,8 +1,9 @@
-"""Tests for the trail-then-close behaviour of Discord sell alerts.
+"""Tests for the trail-then-trim-then-close behaviour of Discord sell alerts.
 
     BUY        → open, start counting
     1st SELL   → arm a trailing stop, do NOT exit
-    2nd SELL   → close
+    2nd SELL   → trim part of the position, re-anchor the trail on the rest
+    3rd SELL   → close what's left
 
 The same message means different things depending on history, so most of these
 assert the SEQUENCE rather than a single call.
@@ -53,23 +54,68 @@ def test_the_first_sell_arms_a_trail_instead_of_closing(db):
     assert d.guard.armed_at is not None
 
 
-def test_the_second_sell_closes(db):
+def test_the_second_sell_trims_rather_than_closing(db):
     u = uuid.uuid4()
     guards.on_buy(db, **_contract(u))
     guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
     d = guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
 
-    assert d.action == guards.CLOSE
+    assert d.action == guards.TRIM
     assert d.guard.sell_count == 2
+    # The trail armed by the first sell must survive the trim — the remainder
+    # is still protected.
+    assert d.guard.armed_at is not None
+    assert d.trail_percent == TRAIL
 
 
-def test_further_sells_keep_closing(db):
-    """A third alert must not re-arm — the trader is still asking to be out."""
+def test_the_third_sell_closes(db):
     u = uuid.uuid4()
     guards.on_buy(db, **_contract(u))
     for _ in range(2):
         guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
+    d = guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
+
+    assert d.action == guards.CLOSE
+    assert d.guard.sell_count == 3
+
+
+def test_further_sells_keep_closing(db):
+    """A fourth alert must not re-arm — the trader is still asking to be out."""
+    u = uuid.uuid4()
+    guards.on_buy(db, **_contract(u))
+    for _ in range(3):
+        guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
     assert guards.on_sell(db, **_contract(u), trail_percent=TRAIL).action == guards.CLOSE
+
+
+# ── re-anchoring the trail at a trim ─────────────────────────────────────────
+
+def test_re_anchor_raises_the_peak(db):
+    g = DiscordPositionGuard(user_id=uuid.uuid4(), symbol="MSFT", peak_price=Decimal("3.00"))
+    assert guards.re_anchor(g, Decimal("4.00")) is True
+    assert g.peak_price == Decimal("4.00")
+
+
+def test_re_anchor_never_lowers_the_peak(db):
+    """A trim protects more, never less. Lowering the anchor would hand back
+    profit the trader had already locked in."""
+    g = DiscordPositionGuard(user_id=uuid.uuid4(), symbol="MSFT", peak_price=Decimal("10.00"))
+    assert guards.re_anchor(g, Decimal("9.00")) is False
+    assert g.peak_price == Decimal("10.00")
+
+
+def test_re_anchor_sets_an_unset_peak(db):
+    g = DiscordPositionGuard(user_id=uuid.uuid4(), symbol="MSFT", peak_price=None)
+    assert guards.re_anchor(g, Decimal("2.50")) is True
+    assert g.peak_price == Decimal("2.50")
+
+
+def test_re_anchor_ignores_a_missing_or_zero_mark(db):
+    """A quote lookup that failed must not move the stop."""
+    g = DiscordPositionGuard(user_id=uuid.uuid4(), symbol="MSFT", peak_price=Decimal("5.00"))
+    assert guards.re_anchor(g, None) is False
+    assert guards.re_anchor(g, Decimal("0")) is False
+    assert g.peak_price == Decimal("5.00")
 
 
 def test_a_sell_with_no_known_entry_closes_immediately(db):
@@ -89,7 +135,9 @@ def test_adding_to_a_position_does_not_reset_the_sequence(db):
     guards.on_sell(db, **_contract(u), trail_percent=TRAIL)   # armed
     guards.on_buy(db, **_contract(u))                          # an "Adding" alert
 
-    assert guards.on_sell(db, **_contract(u), trail_percent=TRAIL).action == guards.CLOSE
+    # The sequence advanced (ARM → TRIM) rather than restarting. A reset would
+    # show up here as a second ARM_TRAIL.
+    assert guards.on_sell(db, **_contract(u), trail_percent=TRAIL).action == guards.TRIM
 
 
 def test_each_contract_is_counted_separately(db):
@@ -230,3 +278,75 @@ def test_an_unarmed_position_is_not_trailed(db):
     guards.on_buy(db, **_contract(u))
     closed = []
     assert trail.enforce(db, u, _Adapter([_Pos("1.00")]), lambda p, g: closed.append(g)) == 0
+
+
+# ── how much a trim takes ────────────────────────────────────────────────────
+
+def test_a_trim_scales_with_the_multiplier():
+    """The trader trims one contract; at 2x we hold twice as much, so we trim
+    two. The slice we take matches the slice they took."""
+    assert guards.trim_quantity(Decimal(6), 2) == Decimal(2)
+    assert guards.trim_quantity(Decimal(3), 1) == Decimal(1)
+    assert guards.trim_quantity(Decimal(30), 10) == Decimal(10)
+
+
+def test_a_trim_that_would_take_everything_is_a_close():
+    """Nothing left to protect means this isn't a trim. Returning a size here
+    would leave an armed guard on an empty position."""
+    assert guards.trim_quantity(Decimal(2), 2) is None     # exactly the whole position
+    assert guards.trim_quantity(Decimal(1), 2) is None     # more than is held
+    assert guards.trim_quantity(Decimal(1), 1) is None
+
+
+def test_a_trim_never_sizes_below_one():
+    """A missing or nonsense multiplier must not produce a zero-quantity order."""
+    assert guards.trim_quantity(Decimal(5), 0) == Decimal(1)
+    assert guards.trim_quantity(Decimal(5), None) == Decimal(1)
+
+
+def test_a_trim_always_leaves_something_behind():
+    """The property that matters: after a trim the position is smaller but not
+    empty, for every multiplier the settings allow."""
+    for held in range(2, 40):
+        for mult in range(1, 11):
+            qty = guards.trim_quantity(Decimal(held), mult)
+            if qty is not None:
+                assert 0 < qty < held, f"held={held} mult={mult} -> {qty}"
+
+
+# ── a trim whose order never placed ──────────────────────────────────────────
+
+def test_a_failed_trim_gives_its_step_back(db):
+    """If the broker rejects the trim, nothing was sold — so the next alert must
+    still be a trim, not a close. Counting a step the broker never performed
+    would silently skip it."""
+    u = uuid.uuid4()
+    guards.on_buy(db, **_contract(u))
+    guards.on_sell(db, **_contract(u), trail_percent=TRAIL)          # 1st: armed
+    d = guards.on_sell(db, **_contract(u), trail_percent=TRAIL)      # 2nd: trim
+    assert d.action == guards.TRIM
+
+    guards.rollback_sell(d.guard)                                     # order rejected
+    assert d.guard.sell_count == 1                                    # back to armed
+
+    # The retry is a trim again, not a close.
+    assert guards.on_sell(db, **_contract(u), trail_percent=TRAIL).action == guards.TRIM
+
+
+def test_rollback_keeps_the_trail_armed(db):
+    """A rolled-back trim must not disarm the stop — the full position is still
+    open and still needs protecting."""
+    u = uuid.uuid4()
+    guards.on_buy(db, **_contract(u))
+    guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
+    d = guards.on_sell(db, **_contract(u), trail_percent=TRAIL)
+    guards.rollback_sell(d.guard)
+
+    assert d.guard.armed_at is not None
+    assert d.guard.trail_percent == TRAIL
+
+
+def test_rollback_never_goes_negative(db):
+    g = DiscordPositionGuard(user_id=uuid.uuid4(), symbol="MSFT", sell_count=0)
+    guards.rollback_sell(g)
+    assert g.sell_count == 0

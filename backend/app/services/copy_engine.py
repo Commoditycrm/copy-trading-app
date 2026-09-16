@@ -202,6 +202,10 @@ class _PendingMirror:
     # traded, since our own quote can diverge from the trader's venue pre-market
     # (see _to_immediate_close / _ext_hours_limit_price). None when not filled.
     trader_fill_price: Decimal | None = None
+    # True when the trader's close only TRIMMED their position. The trader is
+    # still in the name, so their accumulation window is not over and the
+    # subscriber's working entry on this contract must be left alone.
+    trader_partial_close: bool = False
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -783,8 +787,19 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
             # has left. The trader has now exited, so their accumulation window is
             # over: cancel any leftover same-contract working entry before placing
             # the close. (Skip if the race path above already cancelled it.)
-            if not cancelled_working_entry:
+            #
+            # A TRIM is the exception: the trader sold part and is still in the
+            # name, so their accumulation window is NOT over. Cancelling the
+            # subscriber's working entry here would strand them OUT of a trade the
+            # trader still holds — the opposite of the stranding this guards
+            # against. The close itself still goes out, clamped as usual.
+            if not cancelled_working_entry and not item.trader_partial_close:
                 _cancel_subscriber_conflicts(item)
+            elif item.trader_partial_close:
+                log.info(
+                    "copy: trader trimmed %s — leaving subscriber %s working entry alone",
+                    req.symbol, item.subscriber_user_id,
+                )
         elif req.instrument_type in (InstrumentType.STOCK, InstrumentType.OPTION):
             # NOT a close, but the trader has FILLED — so this is an ENTRY the
             # trader just got into. Force the subscriber's entry to fill at market
@@ -2765,6 +2780,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # not even on Alpaca stocks. Subscribers receive plain
             # entries; the trader manages their own exits.
             pending.append(_PendingMirror(
+                trader_partial_close=bool(getattr(trader_order, "is_partial_close", False)),
                 child_order_id=child.id,
                 subscriber_user_id=sub.user_id,
                 broker_account_id=acct.id,
