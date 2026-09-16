@@ -108,6 +108,37 @@ class TraderSettings(Base, TimestampMixin):
         Numeric(9, 4), default=Decimal("20"), server_default="20", nullable=False,
     )
 
+    # ── Trim ladder ─────────────────────────────────────────────────────────
+    # A Discord exit alert works a position down in three steps rather than
+    # flattening it. Every threshold here is measured against the position's
+    # ORIGINAL entry price, never the live mark, so the ladder doesn't drift as
+    # the price moves:
+    #
+    #   1st alert — only if up by discord_trim_profit_gate_pct; sell half, then
+    #               protect the rest with a stop discord_trim_stop_pct below entry
+    #   2nd alert — sell half of what's left; the remainder's stop moves to
+    #               break-even (entry)
+    #   3rd alert — exit everything left
+    #
+    # On the 2nd and 3rd alerts the quantity being sold leaves via a trailing
+    # stop when entry was above discord_trim_price_threshold — a cheap contract
+    # isn't worth trailing, it's worth being out of.
+    discord_trim_profit_gate_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("20"), server_default="20", nullable=False,
+    )
+    discord_trim_stop_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("25"), server_default="25", nullable=False,
+    )
+    # Entry price above which an exit trails instead of going to market.
+    discord_trim_price_threshold: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), default=Decimal("0.90"), server_default="0.90", nullable=False,
+    )
+    # Trail as an absolute DOLLAR give-back, not a percent: exit once the price
+    # falls this far from its peak.
+    discord_trim_trail_amount: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), default=Decimal("0.25"), server_default="0.25", nullable=False,
+    )
+
     # Whether approved Discord alerts actually reach the broker.
     #
     #   False (default) — PAPER: the full pipeline runs, validation and all, and

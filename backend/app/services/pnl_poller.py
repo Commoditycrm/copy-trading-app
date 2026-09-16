@@ -514,12 +514,12 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
 
 
 def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
-    """Advance emulated trailing stops on Discord positions.
+    """Advance the stops and trailing exits a Discord trim left behind.
 
-    Armed by the FIRST sell alert on a position; this is what actually watches
-    the price and exits on a retrace. Emulated because Alpaca rejects
-    trailing-stop orders on options (see trailing_stop_close.py), which is what
-    Discord alerts almost always are.
+    Set by the trim ladder: a stop level under what's still held, and sometimes
+    a slice riding a trailing give-back instead of having gone out at market.
+    Emulated because Alpaca rejects trailing-stop orders on options (see
+    trailing_stop_close.py), which is what Discord alerts almost always are.
 
     Best-effort and fully isolated: a failure here must not stop the option-SL
     monitor that follows it.
@@ -544,8 +544,12 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                 return
             adapter = adapter_for(live_acct, decrypt_json(live_acct.encrypted_credentials))
 
-            def _close(pos, guard) -> None:
-                """Exit at market — a stop that fires has to fill."""
+            def _close(pos, guard, quantity) -> None:
+                """Exit at market — a stop that fires has to fill.
+
+                ``quantity`` is what this protection covers: the whole position
+                for a stop-out, or just the earmarked slice for a trailing exit.
+                """
                 from app.api.trades import _place_trader_order  # noqa: PLC0415
                 from app.models.user import User  # noqa: PLC0415
                 from fastapi import BackgroundTasks  # noqa: PLC0415
@@ -559,7 +563,7 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                     symbol=pos.symbol.upper(),
                     side=OrderSide.SELL,
                     order_type=OrderType.MARKET,
-                    quantity=abs(pos.quantity),
+                    quantity=abs(Decimal(str(quantity))),
                     option_expiry=pos.option_expiry,
                     option_strike=pos.option_strike,
                     option_right=pos.option_right,

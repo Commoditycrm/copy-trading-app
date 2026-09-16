@@ -411,6 +411,17 @@ class DiscordSettingsOut(BaseModel):
     # Retrace from the peak that closes a position after its first exit alert.
     trail_percent: str = "20"
 
+    # ── the exit ladder ─────────────────────────────────────────────────────
+    # All measured against the position's ENTRY price, never the live mark.
+    # Minimum gain before the FIRST exit alert trims anything.
+    trim_profit_gate_pct: str = "20"
+    # How far below entry the first trim's stop sits.
+    trim_stop_pct: str = "25"
+    # Entry price above which an exit trails instead of going to market.
+    trim_price_threshold: str = "0.90"
+    # Dollar give-back from the peak that triggers a trailing exit.
+    trim_trail_amount: str = "0.25"
+
 
 class DiscordSettingsIn(BaseModel):
     execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
@@ -419,3 +430,9 @@ class DiscordSettingsIn(BaseModel):
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None
+    # Ladder thresholds. Strings for the same reason the others are: one
+    # validation path for "what the user typed", not two.
+    trim_profit_gate_pct: str | None = None
+    trim_stop_pct: str | None = None
+    trim_price_threshold: str | None = None
+    trim_trail_amount: str | None = None
