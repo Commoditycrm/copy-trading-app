@@ -1097,7 +1097,7 @@ export default function DiscordPage() {
                   </p>
                 </div>
 
-                {/* Trailing stop — what the FIRST exit alert arms. */}
+                {/* Trailing stop — armed by the 1st exit alert, kept through the 2nd (trim). */}
                 <div
                   className="rounded-xl px-4 py-3 flex-1"
                   style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
@@ -1139,8 +1139,8 @@ export default function DiscordPage() {
                     </button>
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    The first exit alert arms this instead of selling. The next exit alert closes
-                    the position.
+                    The first exit alert arms this instead of selling. The second trims part of
+                    the position and keeps the stop on the rest. The third closes what&rsquo;s left.
                   </p>
                 </div>
               </div>

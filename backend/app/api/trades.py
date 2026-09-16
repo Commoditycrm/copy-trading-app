@@ -777,6 +777,7 @@ def _place_trader_order(
     request: Request,
     skip_fanout: bool = False,
     resolve_wash_trade: bool = False,
+    partial_close: bool = False,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -925,6 +926,10 @@ def _place_trader_order(
         # the flag propagates to the subscriber mirror (which uses it to gate the
         # close-side quantity clamp and the copy-engine conflict-resolve retry).
         is_closing=resolve_wash_trade,
+        # A trim is a close that leaves the position open. The copy engine reads
+        # this to keep from cancelling a subscriber's working entry on a contract
+        # the trader is still in.
+        is_partial_close=bool(partial_close and resolve_wash_trade),
         fanned_out_to_subscribers=will_fanout,
         trader_submitted_at=trader_submitted_at,
     )
