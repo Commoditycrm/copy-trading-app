@@ -37,6 +37,13 @@ class User(Base, TimestampMixin):
     sell_all_access: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false(), nullable=False
     )
+    # Discord inbound alert-copying access gate. Trader-only feature, allow-listed
+    # by an admin (PATCH /api/admin/users/{id}/discord-enabled). Off by default —
+    # the Discord page + nav entry and every /api/discord-sources route stay
+    # hidden + API-blocked until an admin enables this for the trader.
+    discord_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     # Email verification (soft-enforced): unverified users can still log in,
     # but the app nags them with a banner until they confirm. Existing rows
     # were grandfathered to True by the migration.

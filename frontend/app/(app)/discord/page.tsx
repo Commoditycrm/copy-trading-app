@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Hash, Radio, ScanLine, Receipt, ShieldCheck, Clock, Eye, PlugZap, Check, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -105,6 +106,7 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export default function DiscordPage() {
+  const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
   const [sources, setSources] = useState<DiscordSource[]>([]);
   const [loading, setLoading] = useState(true);
@@ -167,8 +169,16 @@ export default function DiscordPage() {
     (async () => {
       try {
         const u = await api<User>("/api/auth/me");
+        // Discord is an opt-in, admin-enabled trader feature. Anyone without it
+        // (subscribers, or traders not allow-listed) is bounced to the dashboard
+        // so typing /discord directly can't reach the page. The nav entry is
+        // hidden the same way in AppShell.
+        if (u.role !== "trader" || !u.discord_enabled) {
+          router.replace("/dashboard");
+          return;
+        }
         setUser(u);
-        if (u.role === "trader") await load();
+        await load();
       } catch (e) {
         notify.fromError(e, "Failed to load");
       } finally {

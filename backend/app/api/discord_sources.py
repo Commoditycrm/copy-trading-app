@@ -104,15 +104,21 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/discord-sources", tags=["discord-sources"])
 
 
-def _require_feature() -> None:
-    """503 when the inbound Discord feature is switched off.
+def _require_feature(user: User = Depends(require_trader)) -> None:
+    """Gate every trader Discord route two ways:
 
-    Without this, a trader could connect a source in an environment that has no
-    listener container, then watch it sit at 'connecting' forever with no
-    explanation. Off is the default.
+    - 503 when the inbound Discord feature is switched off environment-wide
+      (no listener container), so a trader can't connect a source that would
+      sit at 'connecting' forever with no explanation.
+    - 403 when THIS trader isn't allow-listed for Discord. It's an opt-in,
+      admin-enabled feature (PATCH /api/admin/users/{id}/discord-enabled); off
+      by default, so non-enabled traders are API-blocked here even if they hit
+      the endpoints directly.
     """
     if not get_settings().discord_listener_enabled:
         raise HTTPException(503, "discord_listener_disabled")
+    if not user.discord_enabled:
+        raise HTTPException(403, "discord_not_enabled")
 
 
 def require_listener_token(

@@ -14,6 +14,8 @@ interface AdminUser {
   is_active: boolean;
   /** Admin allow-list for the Snapshot / Snapshot / Re-entry suite. */
   sell_all_access: boolean;
+  /** Admin allow-list for the inbound Discord alert-copying feature. */
+  discord_enabled: boolean;
   /** True when this trader has any currently-hidden orders / P&L days. */
   has_hidden: boolean;
   created_at: string;
@@ -39,6 +41,23 @@ export default function AdminTradersPage() {
       setTraders(ts => ts.map(x => x.id === t.id ? { ...x, sell_all_access: enabled } : x));
     } catch (e) {
       notify.fromError(e, "Could not update Snapshot access");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function toggleDiscord(t: AdminUser) {
+    const enabled = !t.discord_enabled;
+    setBusy(t.id);
+    try {
+      await api(`/api/admin/users/${t.id}/discord-enabled`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled }),
+      });
+      notify.success(`Discord ${enabled ? "enabled" : "disabled"} for ${t.email}`);
+      setTraders(ts => ts.map(x => x.id === t.id ? { ...x, discord_enabled: enabled } : x));
+    } catch (e) {
+      notify.fromError(e, "Could not update Discord access");
     } finally {
       setBusy(null);
     }
@@ -100,14 +119,14 @@ export default function AdminTradersPage() {
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                {["Trader", "Business", "Status", "Snapshot Access", "P&L", "Joined", ""].map(h => (
+                {["Trader", "Business", "Status", "Snapshot Access", "Discord Access", "P&L", "Joined", ""].map(h => (
                   <th key={h} className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {filtered.length === 0 ? (
-                <tr><td colSpan={7} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>No traders match.</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>No traders match.</td></tr>
               ) : (
                 filtered.map((t, i) => (
                   <tr
@@ -153,6 +172,31 @@ export default function AdminTradersPage() {
                           background: t.sell_all_access ? "#fff" : "var(--muted)",
                         }} />
                         {t.sell_all_access ? "ON" : "OFF"}
+                      </button>
+                    </td>
+                    {/* Discord access toggle — same ON/OFF pill as Snapshot.
+                        stopPropagation so it doesn't open the trader detail row. */}
+                    <td className="px-4 py-3">
+                      <button
+                        type="button"
+                        disabled={busy === t.id}
+                        onClick={(e) => { e.stopPropagation(); toggleDiscord(t); }}
+                        title={t.discord_enabled
+                          ? "Discord enabled — click to disable"
+                          : "Discord disabled — click to enable"}
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full transition-colors disabled:opacity-50"
+                        style={{
+                          background: t.discord_enabled ? "var(--good)" : "var(--panel-2)",
+                          color: t.discord_enabled ? "#fff" : "var(--muted)",
+                          border: `1px solid ${t.discord_enabled ? "var(--good)" : "var(--border)"}`,
+                          cursor: busy === t.id ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        <span style={{
+                          width: 7, height: 7, borderRadius: "9999px",
+                          background: t.discord_enabled ? "#fff" : "var(--muted)",
+                        }} />
+                        {t.discord_enabled ? "ON" : "OFF"}
                       </button>
                     </td>
                     {/* Hide P&L — opens the hide/unhide modal; stopPropagation so
