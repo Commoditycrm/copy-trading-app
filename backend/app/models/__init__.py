@@ -6,6 +6,7 @@ from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.dashboard_metrics import LoadTestRun, TestResult
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
+from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
 from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.notification import Notification
@@ -23,6 +24,7 @@ __all__ = [
     "DailyRealizedPnlSnapshot",
     "DiscordAccount",
     "DiscordAlertSource",
+    "DiscordPositionGuard",
     "DiscordMessage",
     "DiscordMessageStatus",
     "Fill",

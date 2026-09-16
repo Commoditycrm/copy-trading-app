@@ -101,6 +101,13 @@ class TraderSettings(Base, TimestampMixin):
         Numeric(20, 2), nullable=True,
     )
 
+    # Trail used when a Discord position's stop is armed by its FIRST sell
+    # alert: a positive percent retrace from the best price seen (20 = exit if
+    # it gives back 20% of the peak).
+    discord_trail_percent: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("20"), server_default="20", nullable=False,
+    )
+
     # Whether approved Discord alerts actually reach the broker.
     #
     #   False (default) — PAPER: the full pipeline runs, validation and all, and

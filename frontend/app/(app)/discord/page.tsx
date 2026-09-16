@@ -43,6 +43,7 @@ type DiscordSettings = {
   live_trading: boolean;
   quantity_multiplier: number;
   max_per_contract: string | null;
+  trail_percent: string;
 };
 
 type LoginSession = {
@@ -130,6 +131,8 @@ export default function DiscordPage() {
   // What the server currently holds, as distinct from what's in the box —
   // lets Save disable itself when nothing has changed.
   const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
+  const [trailPct, setTrailPct] = useState("20");
+  const [savedTrailPct, setSavedTrailPct] = useState("20");
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
 
@@ -152,6 +155,8 @@ export default function DiscordPage() {
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
+      setTrailPct(settings.trail_percent ?? "20");
+      setSavedTrailPct(settings.trail_percent ?? "20");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
@@ -270,6 +275,8 @@ export default function DiscordPage() {
       setQtyMultiplier(r.quantity_multiplier || 1);
       setMaxPerContract(r.max_per_contract ?? "");
       setSavedMaxPerContract(r.max_per_contract ?? "");
+      setTrailPct(r.trail_percent ?? "20");
+      setSavedTrailPct(r.trail_percent ?? "20");
       notify.success("Saved");
     } catch (e) {
       notify.fromError(e, "Could not save that setting");
@@ -869,63 +876,22 @@ export default function DiscordPage() {
                 color: liveTrading ? "var(--bad)" : "var(--muted)",
               }}
             >
-              {liveTrading ? "LIVE" : "Paper"}
+              {liveTrading ? "LIVE" : "Test mode"}
             </span>
           </div>
 
           <div className="p-5 space-y-5">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            {/* 1 — who approves */}
+            {/* 1 — does it spend money (Execution comes first so Approval,
+                which is only meaningful in Live, reads as the follow-on step) */}
             <div className="space-y-2.5">
-              <div className="text-[11px] font-semibold uppercase tracking-wide"
-                   style={{ color: "var(--muted)" }}>
-                Approval
-              </div>
-              {[
-                { value: "manual", label: "Review each alert",
-                  detail: "Accept or reject in Order History." },
-                { value: "auto", label: "Auto-approve",
-                  detail: "Parsed alerts go straight through." },
-              ].map(({ value, label, detail }) => {
-                const active = execMode === value;
-                return (
-                  <button
-                    key={value}
-                    type="button"
-                    disabled={modeBusy}
-                    onClick={() => setExecutionMode(value)}
-                    className="w-full text-left rounded-xl px-3.5 py-2.5 transition-colors disabled:opacity-60"
-                    style={{
-                      background: active ? "var(--accent-glow)" : "var(--panel-2)",
-                      border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
-                    }}
-                  >
-                    <div className="flex items-center gap-2">
-                      <RadioDot active={active} />
-                      <span className="text-[12.5px] font-semibold"
-                            style={{ color: active ? "var(--accent-2)" : "var(--text)" }}>
-                        {label}
-                      </span>
-                    </div>
-                    <p className="text-[11px] mt-0.5 leading-snug pl-[22px]"
-                       style={{ color: "var(--muted)" }}>
-                      {detail}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* 3 — does it spend money */}
-            <div className="space-y-2.5"
-                 style={{ borderLeft: "1px solid var(--border)", paddingLeft: 20 }}>
               <div className="text-[11px] font-semibold uppercase tracking-wide"
                    style={{ color: "var(--muted)" }}>
                 Execution
               </div>
 
               {[
-                { live: false, label: "Paper", detail: "Validated and recorded. Nothing reaches your broker." },
+                { live: false, label: "Test mode", detail: "Validated and recorded. Nothing reaches your broker." },
                 { live: true, label: "Live", detail: "Approved alerts place REAL orders." },
               ].map(({ live, label, detail }) => {
                 const active = liveTrading === live;
@@ -965,6 +931,56 @@ export default function DiscordPage() {
               <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
                 Applies to every connected channel, from now on.
               </p>
+            </div>
+
+            {/* 2 — who approves. Only meaningful when Execution is Live; in
+                Paper mode nothing reaches a broker, so the approval choice is
+                moot and both options are disabled. */}
+            <div className="space-y-2.5"
+                 style={{ borderLeft: "1px solid var(--border)", paddingLeft: 20 }}>
+              <div className="text-[11px] font-semibold uppercase tracking-wide"
+                   style={{ color: "var(--muted)" }}>
+                Approval
+              </div>
+              {[
+                { value: "manual", label: "Review each alert",
+                  detail: "Accept or reject in Order History." },
+                { value: "auto", label: "Auto-approve",
+                  detail: "Parsed alerts go straight through." },
+              ].map(({ value, label, detail }) => {
+                const active = execMode === value;
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    disabled={modeBusy || !liveTrading}
+                    onClick={() => setExecutionMode(value)}
+                    className="w-full text-left rounded-xl px-3.5 py-2.5 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{
+                      background: active ? "var(--accent-glow)" : "var(--panel-2)",
+                      border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <RadioDot active={active} />
+                      <span className="text-[12.5px] font-semibold"
+                            style={{ color: active ? "var(--accent-2)" : "var(--text)" }}>
+                        {label}
+                      </span>
+                    </div>
+                    <p className="text-[11px] mt-0.5 leading-snug pl-[22px]"
+                       style={{ color: "var(--muted)" }}>
+                      {detail}
+                    </p>
+                  </button>
+                );
+              })}
+
+              {!liveTrading && (
+                <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                  Available once Execution is set to Live.
+                </p>
+              )}
             </div>
             </div>
 
@@ -1068,6 +1084,53 @@ export default function DiscordPage() {
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
                     Skips an entry when one contract&apos;s value (premium × 100) is above this.
                     Options only — closes always go through.
+                  </p>
+                </div>
+
+                {/* Trailing stop — what the FIRST exit alert arms. */}
+                <div
+                  className="rounded-xl px-4 py-3 flex-1"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                      Trailing stop
+                    </label>
+                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
+                      {savedTrailPct}%
+                    </span>
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    <div className="relative flex-1">
+                      <input
+                        type="number"
+                        min="1"
+                        max="100"
+                        step="5"
+                        value={trailPct}
+                        disabled={modeBusy}
+                        onChange={(e) => setTrailPct(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveSizing({ trail_percent: trailPct });
+                        }}
+                        className="w-full rounded-lg border pl-3 pr-7 py-1.5 text-sm bg-transparent focus-ring"
+                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                      />
+                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm"
+                            style={{ color: "var(--muted)" }}>%</span>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={modeBusy || trailPct === savedTrailPct}
+                      onClick={() => saveSizing({ trail_percent: trailPct })}
+                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                    >
+                      {modeBusy ? <Spinner /> : "Save"}
+                    </button>
+                  </div>
+                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                    The first exit alert arms this instead of selling. The next exit alert closes
+                    the position.
                   </p>
                 </div>
               </div>
