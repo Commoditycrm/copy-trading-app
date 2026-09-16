@@ -45,6 +45,10 @@ type DiscordSettings = {
   quantity_multiplier: number;
   max_per_contract: string | null;
   trail_percent: string;
+  trim_profit_gate_pct: string;
+  trim_stop_pct: string;
+  trim_price_threshold: string;
+  trim_trail_amount: string;
 };
 
 type LoginSession = {
@@ -105,6 +109,21 @@ const STATUS_LABEL: Record<string, string> = {
   error: "Error",
 };
 
+type LadderField = {
+  key: string;
+  label: string;
+  step: string;
+  prefix?: string;
+  suffix?: string;
+};
+
+const LADDER_FIELDS: LadderField[] = [
+  { key: "trim_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
+  { key: "trim_stop_pct", label: "1st stop below entry", suffix: "%", step: "5" },
+  { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
+  { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
+];
+
 export default function DiscordPage() {
   const router = useRouter();
   const [user, setUser] = useState<User | null>(null);
@@ -133,8 +152,11 @@ export default function DiscordPage() {
   // What the server currently holds, as distinct from what's in the box —
   // lets Save disable itself when nothing has changed.
   const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
-  const [trailPct, setTrailPct] = useState("20");
-  const [savedTrailPct, setSavedTrailPct] = useState("20");
+  const [ladder, setLadder] = useState<Record<string, string>>({
+    trim_profit_gate_pct: "20", trim_stop_pct: "25",
+    trim_price_threshold: "0.90", trim_trail_amount: "0.25",
+  });
+  const [savedLadder, setSavedLadder] = useState<Record<string, string>>(ladder);
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
 
@@ -157,8 +179,14 @@ export default function DiscordPage() {
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
-      setTrailPct(settings.trail_percent ?? "20");
-      setSavedTrailPct(settings.trail_percent ?? "20");
+      const nextLadder = {
+        trim_profit_gate_pct: settings.trim_profit_gate_pct ?? "20",
+        trim_stop_pct: settings.trim_stop_pct ?? "25",
+        trim_price_threshold: settings.trim_price_threshold ?? "0.90",
+        trim_trail_amount: settings.trim_trail_amount ?? "0.25",
+      };
+      setLadder(nextLadder);
+      setSavedLadder(nextLadder);
       setSavedMaxPerContract(settings.max_per_contract ?? "");
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
@@ -275,6 +303,8 @@ export default function DiscordPage() {
     }
   }
 
+  const ladderDirty = LADDER_FIELDS.some((f) => ladder[f.key] !== savedLadder[f.key]);
+
   async function saveSizing(patch: Record<string, unknown>) {
     setModeBusy(true);
     try {
@@ -285,8 +315,14 @@ export default function DiscordPage() {
       setQtyMultiplier(r.quantity_multiplier || 1);
       setMaxPerContract(r.max_per_contract ?? "");
       setSavedMaxPerContract(r.max_per_contract ?? "");
-      setTrailPct(r.trail_percent ?? "20");
-      setSavedTrailPct(r.trail_percent ?? "20");
+      const nextLadder = {
+        trim_profit_gate_pct: r.trim_profit_gate_pct ?? "20",
+        trim_stop_pct: r.trim_stop_pct ?? "25",
+        trim_price_threshold: r.trim_price_threshold ?? "0.90",
+        trim_trail_amount: r.trim_trail_amount ?? "0.25",
+      };
+      setLadder(nextLadder);
+      setSavedLadder(nextLadder);
       notify.success("Saved");
     } catch (e) {
       notify.fromError(e, "Could not save that setting");
@@ -1097,51 +1133,88 @@ export default function DiscordPage() {
                   </p>
                 </div>
 
-                {/* Trailing stop — armed by the 1st exit alert, kept through the 2nd (trim). */}
+                {/* The exit ladder. Every level is measured from the position's
+                    ENTRY price, so these are fixed the moment it opens. */}
                 <div
                   className="rounded-xl px-4 py-3 flex-1"
                   style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
-                      Trailing stop
+                      Exit ladder
                     </label>
-                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-                      {savedTrailPct}%
+                    <span className="text-[11px]" style={{ color: "var(--muted)" }}>
+                      measured from entry price
                     </span>
                   </div>
-                  <div className="flex gap-2 mt-2">
-                    <div className="relative flex-1">
-                      <input
-                        type="number"
-                        min="1"
-                        max="100"
-                        step="5"
-                        value={trailPct}
-                        disabled={modeBusy}
-                        onChange={(e) => setTrailPct(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") saveSizing({ trail_percent: trailPct });
-                        }}
-                        className="w-full rounded-lg border pl-3 pr-7 py-1.5 text-sm bg-transparent focus-ring"
-                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                      />
-                      <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm"
-                            style={{ color: "var(--muted)" }}>%</span>
-                    </div>
+
+                  <div className="grid grid-cols-2 gap-2 mt-2">
+                    {LADDER_FIELDS.map((f) => (
+                      <div key={f.key}>
+                        <label
+                          className="block text-[10px] mb-1"
+                          style={{ color: "var(--muted)" }}
+                          htmlFor={`ladder-${f.key}`}
+                        >
+                          {f.label}
+                        </label>
+                        <div className="relative">
+                          {f.prefix && (
+                            <span
+                              className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
+                              style={{ color: "var(--muted)" }}
+                            >
+                              {f.prefix}
+                            </span>
+                          )}
+                          <input
+                            id={`ladder-${f.key}`}
+                            type="number"
+                            min="0"
+                            step={f.step}
+                            value={ladder[f.key]}
+                            disabled={modeBusy}
+                            onChange={(e) =>
+                              setLadder((l) => ({ ...l, [f.key]: e.target.value }))
+                            }
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") saveSizing({ [f.key]: ladder[f.key] });
+                            }}
+                            className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
+                            style={{
+                              borderColor: "var(--border)",
+                              color: "var(--text)",
+                              paddingLeft: f.prefix ? 22 : 12,
+                              paddingRight: f.suffix ? 22 : 12,
+                            }}
+                          />
+                          {f.suffix && (
+                            <span
+                              className="absolute right-3 top-1/2 -translate-y-1/2 text-sm"
+                              style={{ color: "var(--muted)" }}
+                            >
+                              {f.suffix}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center gap-2 mt-2">
                     <button
                       type="button"
-                      disabled={modeBusy || trailPct === savedTrailPct}
-                      onClick={() => saveSizing({ trail_percent: trailPct })}
+                      disabled={modeBusy || !ladderDirty}
+                      onClick={() => saveSizing(ladder)}
                       className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
                     >
                       {modeBusy ? <Spinner /> : "Save"}
                     </button>
+                    <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                      1st exit alert sells half, but only above the gate. 2nd sells half of
+                      what&rsquo;s left and moves the stop to break-even. 3rd exits the rest.
+                    </p>
                   </div>
-                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    The first exit alert arms this instead of selling. The second trims part of
-                    the position and keeps the stop on the rest. The third closes what&rsquo;s left.
-                  </p>
                 </div>
               </div>
             </div>

@@ -1,19 +1,24 @@
-"""Enforce emulated trailing stops on Discord positions.
+"""Enforces what a Discord trim left behind: a stop level, a trailing exit, or both.
 
-Armed by the FIRST sell alert on a position (see discord_position_guard). Each
-tick: read the live price, raise the recorded peak, and close the position when
-it has given back ``trail_percent`` from that peak.
+Neither rests at the broker. Alpaca's options API rejects trailing stops
+outright, and the codebase already emulates option stop-losses rather than
+parking them as resting orders, so both live here and are advanced by the P&L
+poller against live prices.
 
-── Why this is emulated ─────────────────────────────────────────────────────────
-Alpaca rejects trailing-stop orders on options, and Discord alerts are almost
-entirely options. A native stop would rest at the broker; this one only exists
-while the poller runs, so a restart mid-session means the trail is only enforced
-again from the next tick. The peak survives (it's on the row), so the stop
-resumes where it left off rather than re-anchoring — which would silently widen
-it.
+That has one consequence worth stating plainly: these stops only exist while the
+poller is running. A native stop sits at the broker and survives our downtime;
+these do not.
 
-Runs off pnl_poller, alongside position_enforcer, so it inherits the same 5s
-cadence and per-user broker session rather than opening its own.
+Two protections can be live on the same position at once, and they mean
+different things:
+
+  ``stop_price``  a hard floor under EVERYTHING still held. If it breaks, the
+                  whole position leaves and the guard retires.
+  ``trail_qty``   a slice already earmarked to leave, riding a trailing give-back
+                  of ``trail_amount`` instead of having gone out at market.
+
+The floor is checked first. If the position has broken its stop there is no
+sense letting a slice keep riding — the trader wanted out below that price.
 """
 from __future__ import annotations
 
@@ -22,18 +27,46 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.models.discord_position_guard import DiscordPositionGuard
 from app.services import discord_position_guard as guards
 
 log = logging.getLogger(__name__)
 
 
-def enforce(db: Session, user_id, adapter, close_position) -> int:
-    """Advance every armed trail for this user. Returns how many were closed.
+def _key_of_position(p) -> tuple:
+    return (
+        (p.symbol or "").upper(),
+        p.option_strike,
+        (p.option_right.value if getattr(p.option_right, "value", None) else p.option_right),
+        p.option_expiry,
+    )
 
-    ``close_position(position, guard)`` is injected so this module never places
-    orders itself — the caller owns that, and can route it through the same path
-    everything else uses.
+
+def _key_of_guard(g) -> tuple:
+    return (
+        (g.symbol or "").upper(),
+        g.option_strike,
+        (g.option_right.value if getattr(g.option_right, "value", None) else g.option_right),
+        g.option_expiry,
+    )
+
+
+def _current_price(pos) -> Decimal | None:
+    raw = getattr(pos, "current_price", None)
+    if raw is None:
+        return None
+    try:
+        price = Decimal(str(raw))
+    except Exception:  # noqa: BLE001
+        return None
+    return price if price > 0 else None
+
+
+def enforce(db: Session, user_id, adapter, close_position) -> int:
+    """Advance every protection this trader has live. Returns how many fired.
+
+    ``close_position(position, guard, quantity)`` is injected so this module
+    never places orders itself — the caller owns that, and routes it through the
+    same path everything else uses.
     """
     rows = [g for g in guards.armed(db) if g.user_id == user_id]
     if not rows:
@@ -43,11 +76,11 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
         positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
         # A failed read is not a reason to exit anything. Skip the tick.
-        log.warning("discord trail: position read failed for user=%s", user_id, exc_info=True)
+        log.warning("discord stops: position read failed for user=%s", user_id, exc_info=True)
         return 0
 
     by_contract = {_key_of_position(p): p for p in positions}
-    closed = 0
+    fired = 0
 
     for guard in rows:
         pos = by_contract.get(_key_of_guard(guard))
@@ -57,67 +90,59 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             continue
 
         price = _current_price(pos)
-        if price is None or price <= 0:
+        if price is None:
             continue    # no usable mark this tick
+
+        held = abs(Decimal(str(pos.quantity)))
+        if held <= 0:
+            guards.retire(db, guard, "position no longer held")
+            continue
+
+        # ── the floor, first ────────────────────────────────────────────────
+        stop = guard.stop_price
+        if stop is not None and price <= stop:
+            log.info("discord stops: %s at %s broke its %s stop — closing %s",
+                     guard.symbol, price, stop, held)
+            try:
+                close_position(pos, guard, held)
+            except Exception:  # noqa: BLE001
+                # Leave it armed so the next tick tries again — an exit that
+                # failed once must not be forgotten.
+                log.exception("discord stops: stop-out failed for %s", guard.symbol)
+                continue
+            guards.retire(db, guard, f"stop hit at {price} (stop {stop})")
+            fired += 1
+            continue
+
+        # ── then the trailing slice ─────────────────────────────────────────
+        qty = guard.trail_qty
+        amount = guard.trail_amount
+        if qty is None or amount is None or amount <= 0:
+            continue
 
         peak = guard.peak_price
         if peak is None or price > peak:
             guard.peak_price = price
-            continue    # a new high can't also be a retrace
+            continue    # a new high can't also be a give-back
 
-        trail = guard.trail_percent or Decimal(0)
-        if trail <= 0:
-            continue
-        trigger = peak * (Decimal(1) - trail / Decimal(100))
-        if price > trigger:
-            continue
+        if price > peak - amount:
+            continue    # still inside the trail
 
-        log.info(
-            "discord trail: %s retraced to %s from peak %s (%s%% trail) — closing",
-            guard.symbol, price, peak, trail,
-        )
+        sell = min(qty, held)
+        log.info("discord stops: %s gave back %s from %s — trailing out %s",
+                 guard.symbol, amount, peak, sell)
         try:
-            close_position(pos, guard)
+            close_position(pos, guard, sell)
         except Exception:  # noqa: BLE001
-            # Leave the guard armed so the next tick tries again — an exit that
-            # failed once must not be forgotten.
-            log.exception("discord trail: close failed for %s", guard.symbol)
+            log.exception("discord stops: trailing exit failed for %s", guard.symbol)
             continue
-        guards.retire(db, guard, f"trailing stop hit ({trail}% from {peak})")
-        closed += 1
 
-    return closed
+        guards.clear_trail(guard)
+        fired += 1
+        if sell >= held:
+            guards.retire(db, guard, f"trailing exit filled at {price} (peak {peak})")
 
-
-def _key_of_position(p) -> tuple:
-    return (
-        (p.symbol or "").upper(),
-        p.option_strike,
-        p.option_right.value if p.option_right else None,
-        p.option_expiry,
-    )
-
-
-def _key_of_guard(g: DiscordPositionGuard) -> tuple:
-    return (g.symbol.upper(), g.option_strike, g.option_right, g.option_expiry)
-
-
-def _current_price(pos) -> Decimal | None:
-    """Live price per contract/share.
-
-    Prefers the broker's own current_price; falls back to deriving it from
-    market value, which some adapters populate when current_price is absent.
-    """
-    if pos.current_price is not None:
-        return Decimal(str(pos.current_price))
-    qty = Decimal(str(pos.quantity or 0))
-    if pos.market_value is not None and qty != 0:
-        per_unit = Decimal(str(pos.market_value)) / abs(qty)
-        # Options quote per share but are valued per contract (x100).
-        if pos.option_strike is not None:
-            per_unit = per_unit / Decimal(100)
-        return per_unit
-    return None
+    return fired
 
 
 __all__ = ["enforce"]
