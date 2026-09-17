@@ -50,7 +50,20 @@ def _key_of_guard(g) -> tuple:
     )
 
 
-def _current_price(pos) -> Decimal | None:
+def _current_price(pos, user_id=None) -> Decimal | None:
+    """The price this position is being judged at.
+
+    A hand-pinned price wins when the feature is switched on, which is how the
+    ladder gets tested without waiting for the market. It is off by default and
+    must stay off in production — see services/price_override.
+    """
+    if user_id is not None:
+        from app.services import price_override  # noqa: PLC0415
+        pinned = price_override.apply_to(user_id, pos)
+        if pinned is not None:
+            log.info("discord stops: using pinned price %s for %s", pinned, pos.symbol)
+            return pinned
+
     raw = getattr(pos, "current_price", None)
     if raw is None:
         return None
@@ -89,7 +102,7 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             guards.retire(db, guard, "position no longer held")
             continue
 
-        price = _current_price(pos)
+        price = _current_price(pos, user_id)
         if price is None:
             continue    # no usable mark this tick
 
