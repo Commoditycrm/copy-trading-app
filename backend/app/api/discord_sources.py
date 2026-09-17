@@ -1,6 +1,6 @@
 """Inbound Discord alert sources — STEP 2: connection + real-time listener.
 
-A trader connects a Discord channel that Kopyaa monitors for trade alerts. This
+A trader connects a Discord channel that Kopyya monitors for trade alerts. This
 router manages the connection lifecycle and serves as the boundary the
 ``discord-listener`` container talks to. It does NOT parse trades, validate
 signals, or place orders — those are steps 4-6, and keeping them out of here is
@@ -9,7 +9,7 @@ deliberate: a message is only data until the parser has looked at it.
 ── Ingestion model ──────────────────────────────────────────────────────────────
 We monitor Discord Web as the trader's OWN logged-in account, reading only the
 channels that account can already legitimately open. The trader signs in
-themselves in a real browser (password + MFA never touch Kopyaa) and we store the
+themselves in a real browser (password + MFA never touch Kopyya) and we store the
 resulting session, Fernet-encrypted. Nothing here bypasses Discord
 authentication, permissions, MFA or rate limiting. This replaces the step-1
 bot-token + Channel-Following model, which could not reach the third-party alert
@@ -780,7 +780,7 @@ def upload_session(
 ) -> DiscordSourceOut:
     """Store the Discord Web session captured by the login helper.
 
-    Kopyaa never performs the login: the trader signs in themselves in a real
+    Kopyya never performs the login: the trader signs in themselves in a real
     browser window, typing their password and MFA code into Discord. What
     arrives here is only the resulting storage state, which we validate for
     shape and encrypt before it touches the database.
@@ -810,7 +810,7 @@ def start_login(
 
     The listener picks the request up on its next poll, opens Discord's own login
     page and captures the QR. The trader scans it with the Discord mobile app and
-    approves on their phone — their password and MFA never touch Kopyaa.
+    approves on their phone — their password and MFA never touch Kopyya.
     """
     src = _get_owned(db, user, source_id)
     # Refuse to hammer Discord's login page. Back-to-back attempts are what earn
@@ -880,7 +880,7 @@ def start_pairing(
     user: User = Depends(require_trader),
     _: None = Depends(_require_feature),
 ) -> DiscordPairOut:
-    """Mint a pairing code for the Kopyaa Connector desktop app.
+    """Mint a pairing code for the Kopyya Connector desktop app.
 
     The trader reads this code off their screen and types it into the Connector,
     which signs them into Discord in a real browser on their own machine and
@@ -1520,7 +1520,7 @@ def listener_login_complete(
 
 # ── Desktop Connector: pairing endpoints ────────────────────────────────────
 #
-# These are reached by the Connector app, which has no Kopyaa login. They are
+# These are reached by the Connector app, which has no Kopyya login. They are
 # authenticated by the pairing code itself (single-use, short-lived, and shown
 # only to the source's owner) plus the upload token handed back on claim.
 # Deliberately NOT behind require_listener_token: the Connector runs on a
