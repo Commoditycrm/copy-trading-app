@@ -337,6 +337,20 @@ def create_app() -> FastAPI:
             daemon=True,
         ).start()
 
+        # Discord entry reprice: a buy alert placed as a LIMIT can rest unfilled
+        # while the contract moves, turning a good alert into a missed trade.
+        # Gives such an entry ONE attempt at a higher price. Gated on the same
+        # feature switch as the rest of inbound Discord, so an environment
+        # without the feature never starts it.
+        if get_settings().discord_listener_enabled:
+            from app.services import discord_reprice
+            threading.Thread(
+                target=discord_reprice.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="discord-reprice",
+                daemon=True,
+            ).start()
+
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
         # Signal the retry scheduler to exit at its next poll tick. We

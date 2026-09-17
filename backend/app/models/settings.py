@@ -139,6 +139,19 @@ class TraderSettings(Base, TimestampMixin):
         Numeric(18, 4), default=Decimal("0.25"), server_default="0.25", nullable=False,
     )
 
+    # ── Chasing an entry that didn't fill ───────────────────────────────────
+    # A Discord buy is placed at the price the alert named. If the contract moves
+    # before we get there, that limit rests and the trade is missed. After
+    # discord_reprice_after_seconds an unfilled entry gets ONE more attempt,
+    # discord_reprice_pct above the ORIGINAL limit — not above the current ask,
+    # so what it can overpay stays bounded by the alert's own price.
+    discord_reprice_after_seconds: Mapped[int] = mapped_column(
+        Integer, default=30, server_default="30", nullable=False,
+    )
+    discord_reprice_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("10"), server_default="10", nullable=False,
+    )
+
     # Whether approved Discord alerts actually reach the broker.
     #
     #   False (default) — PAPER: the full pipeline runs, validation and all, and
