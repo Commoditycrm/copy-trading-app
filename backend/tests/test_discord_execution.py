@@ -210,8 +210,10 @@ def test_a_missing_price_comes_from_the_live_quote(monkeypatch):
 
 
 def test_a_close_carries_no_limit_price_at_all(monkeypatch):
-    """Closes are market orders, so no price is derived even when a quote
-    exists."""
+    """In session, closes are market orders, so no price is derived even when a
+    quote exists. Pinned to the regular session on purpose — without that this
+    test passes or fails depending on the wall clock."""
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: True)
     _wire(monkeypatch, _Adapter(positions=[_Pos()], quote={"bid": "2.00", "ask": "2.20"}))
     r = ex.resolve(None, _User(), _signal(action="SELL", limit_price=None))
     assert r.payload.limit_price is None
@@ -582,3 +584,51 @@ def test_a_pin_is_ignored_while_the_feature_is_off(monkeypatch):
 
     assert ex.resolve(None, user, _signal(action="SELL")).mark_price == Decimal("1.00")
     po._MEM.clear()
+
+
+# ── exits outside the regular session ────────────────────────────────────────
+
+def test_an_option_exit_outside_regular_hours_becomes_a_marketable_limit(monkeypatch):
+    """Alpaca rejects option MARKET orders outside 09:30-16:00 ET, so a plain
+    market exit fails exactly when an alert arrives pre- or post-market. Pricing
+    through the bid fills like a market order and is accepted."""
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: False)
+    pos = _Pos()
+    pos.current_price = Decimal("2.00")
+    _wire(monkeypatch, _Adapter(positions=[pos], quote={"bid": "2.00", "ask": "2.20"}))
+
+    r = ex.resolve(None, _User(), _signal(action="SELL"))
+    assert r.payload.order_type.value == "limit"
+    assert r.payload.limit_price == Decimal("1.80")      # through the mark
+    assert "outside regular hours" in r.resolutions.get("exit", "")
+
+
+def test_an_option_exit_during_regular_hours_stays_a_market_order(monkeypatch):
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: True)
+    _wire(monkeypatch, _Adapter(positions=[_Pos()], quote={"bid": "2.00", "ask": "2.20"}))
+
+    r = ex.resolve(None, _User(), _signal(action="SELL"))
+    assert r.payload.order_type.value == "market"
+    assert r.payload.limit_price is None
+
+
+def test_an_off_session_exit_with_no_mark_falls_back_to_market(monkeypatch):
+    """Refusing here would block an exit the trader asked for, on a technicality
+    we might be wrong about. Let the broker be the judge."""
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: False)
+    pos = _Pos()
+    pos.current_price = None                             # broker has no mark either
+    _wire(monkeypatch, _Adapter(positions=[pos], quote=None))
+
+    r = ex.resolve(None, _User(), _signal(action="SELL"))
+    assert r.payload.order_type.value == "market"
+
+
+def test_entries_are_unaffected_by_the_session(monkeypatch):
+    """Only exits were market orders. A buy was always a limit and must stay one."""
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: False)
+    _wire(monkeypatch, _Adapter(quote={"bid": "1.80", "ask": "2.00"}))
+
+    r = ex.resolve(None, _User(), _signal())
+    assert r.payload.order_type.value == "limit"
+    assert r.payload.limit_price == Decimal("1.90")      # the alert's own price
