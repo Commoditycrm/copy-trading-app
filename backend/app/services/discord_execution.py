@@ -150,6 +150,24 @@ def resolve(
             if quote:
                 mark_price = (quote[0] + quote[1]) / Decimal(2)
 
+        # A hand-pinned price wins over anything the broker says. The exit
+        # ladder measures the profit gate and anchors its trails against this
+        # number, so pinning it is what lets a sell alert be tested against a
+        # price you chose rather than whatever the market is doing. Off by
+        # default and gated on its own flag — see services/price_override.
+        from app.services import price_override  # noqa: PLC0415
+
+        pinned = price_override.get_pin(
+            user.id,
+            price_override.contract_key(symbol, strike, right, expiry),
+        )
+        if pinned is not None:
+            log.info(
+                "discord_execution: using pinned price %s for %s (broker said %s)",
+                pinned, symbol, mark_price,
+            )
+            mark_price = pinned
+
     # The dollar cap needs the price, so it's applied once both are known.
     if not is_closing:
         quantity = _apply_max_per_contract(

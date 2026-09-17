@@ -206,6 +206,15 @@ class Settings(BaseSettings):
     # every internal endpoint outright (they 503), which is the safe default:
     # an unset secret must never mean "no auth required".
     discord_listener_token: str = ""
+    # ── Simulated prices (TESTING ONLY) ───────────────────────────────────
+    # Lets a trader pin a contract's price by hand so the Discord trim ladder's
+    # stops and trailing exits can be exercised without waiting for the market
+    # to move. OFF by default and it must STAY off in production: a pinned price
+    # feeds the real enforcement path, so it can place REAL orders at a price
+    # that does not exist. It is a way to test order placement without market
+    # movement, not a way to test without consequences.
+    discord_price_override_enabled: bool = False
+
     # Cap on a single intake batch from the listener. The observer flushes in
     # small batches; anything larger is a malformed or hostile payload.
     discord_ingest_max_batch: int = 50
