@@ -39,6 +39,11 @@ type Pairing = {
   error: string | null;
 };
 
+// releases/latest always resolves to the newest Connector build.
+const CONNECTOR_RELEASES = "https://github.com/Commoditycrm/kopyya-connector/releases/latest/download";
+const CONNECTOR_WINDOWS = `${CONNECTOR_RELEASES}/Kopyya-Connector-Windows.exe`;
+const CONNECTOR_MAC = `${CONNECTOR_RELEASES}/Kopyya-Connector-macOS.zip`;
+
 type DiscordSettings = {
   execution_mode: string;
   live_trading: boolean;
@@ -1291,7 +1296,21 @@ export default function DiscordPage() {
             <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>{pairFor.label}</p>
 
             <ol className="text-sm mt-5 space-y-2 list-decimal pl-5 text-left" style={{ color: "var(--text-2)" }}>
-              <li>Open the <strong>Kopyya Connector</strong> app on your computer.</li>
+              <li>
+                Open the <strong>Kopyya Connector</strong> app on your computer.
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <a href={CONNECTOR_WINDOWS} className="btn-primary px-3 py-1.5 text-xs">
+                    Download for Windows
+                  </a>
+                  <a href={CONNECTOR_MAC} className="btn-ghost px-3 py-1.5 text-xs">
+                    Download for Mac
+                  </a>
+                </div>
+                <p className="text-[11px] mt-1.5" style={{ color: "var(--muted)" }}>
+                  Needs Google Chrome. If Windows says &ldquo;Windows protected your PC&rdquo;, click
+                  More info &rarr; Run anyway. On a Mac, right-click the app and choose Open.
+                </p>
+              </li>
               <li>Enter this code:</li>
             </ol>
 
