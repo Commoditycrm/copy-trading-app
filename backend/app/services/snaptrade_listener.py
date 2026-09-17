@@ -1146,6 +1146,89 @@ def _derived_contract_net(db, subscriber_id: uuid.UUID, key) -> Decimal:
     return net
 
 
+def _relink_orphaned_mirror_ids(
+    subscriber_id: uuid.UUID, broker_account_id: uuid.UUID, feed_orders: list
+) -> None:
+    """Adopt the SnapTrade feed's order id onto a mirror whose stored
+    broker_order_id never appears in the feed (SnapTrade returns one id at place
+    time and lists the order under a DIFFERENT id in the orders feed). Without
+    this the fill can never be matched and the mirror stays SUBMITTED forever.
+
+    Acts ONLY when a (contract, side) pair maps exactly ONE orphaned working
+    mirror to exactly ONE unlinked feed order — so a fill can never be attached
+    to the wrong order. Anything ambiguous is left untouched for the next sweep."""
+    from app.brokers.snaptrade import parse_snaptrade_order_symbol  # noqa: PLC0415
+
+    feed_by_id: dict[str, Any] = {}
+    for o in feed_orders:
+        fid = str(_attr(o, "brokerage_order_id", "id", default="") or "")
+        if fid:
+            feed_by_id.setdefault(fid, o)
+    if not feed_by_id:
+        return
+
+    with SessionLocal() as db:
+        rows = list(db.execute(
+            select(Order).where(
+                Order.user_id == subscriber_id,
+                Order.broker_account_id == broker_account_id,
+                Order.broker_order_id.is_not(None),
+            )
+        ).scalars())
+        our_ids = {r.broker_order_id for r in rows}
+        orphans = [
+            r for r in rows
+            if r.parent_order_id is not None
+            and r.status in _WORKING_STATUSES
+            and r.broker_order_id not in feed_by_id
+        ]
+        if not orphans:
+            return
+
+        # One orphaned mirror per (contract, side) → candidate for adoption.
+        orphans_by_key: dict[tuple, list[Order]] = {}
+        for r in orphans:
+            key = (
+                _contract_key(r.symbol, r.instrument_type, r.option_expiry,
+                              r.option_strike, r.option_right),
+                r.side,
+            )
+            orphans_by_key.setdefault(key, []).append(r)
+
+        # Feed orders not already linked to one of our rows, keyed the same way.
+        feed_by_key: dict[tuple, list[str]] = {}
+        for fid, o in feed_by_id.items():
+            if fid in our_ids:
+                continue
+            try:
+                parsed = parse_snaptrade_order_symbol(o)
+            except Exception:  # noqa: BLE001
+                continue
+            side = _BUY if "BUY" in str(_attr(o, "action", default="")).upper() else _SELL
+            key = (
+                _contract_key(parsed["symbol"], parsed["instrument_type"],
+                              parsed["option_expiry"], parsed["option_strike"],
+                              parsed["option_right"]),
+                side,
+            )
+            feed_by_key.setdefault(key, []).append(fid)
+
+        adopted = 0
+        for key, cand_orphans in orphans_by_key.items():
+            cand_feed = feed_by_key.get(key, [])
+            if len(cand_orphans) == 1 and len(cand_feed) == 1:
+                mirror = cand_orphans[0]
+                mirror.broker_order_id = cand_feed[0]
+                adopted += 1
+                log.info(
+                    "snaptrade subscriber reconcile: relinked mirror %s (%s %s) to "
+                    "feed id %s — its place-time id was absent from the orders feed",
+                    mirror.id, mirror.symbol, mirror.side.value, cand_feed[0],
+                )
+        if adopted:
+            db.commit()
+
+
 def _reconcile_one_subscriber_account(
     subscriber_id: uuid.UUID, broker_account_id: uuid.UUID
 ) -> None:
@@ -1171,6 +1254,13 @@ def _reconcile_one_subscriber_account(
     orders = adapter.list_recent_activities()
     if not orders:
         return
+    # Heal id drift before matching: SnapTrade lists an order in the orders feed
+    # under a DIFFERENT id than the one returned at place time, so a mirror can
+    # carry a broker_order_id that never appears in the feed — its fill can then
+    # never be matched and it stays SUBMITTED forever (prod: 49 stuck mirrors).
+    # Adopt the feed's id onto such an orphaned mirror, but ONLY when the
+    # (contract, side) pair is unambiguous, so we can never mis-link a fill.
+    _relink_orphaned_mirror_ids(subscriber_id, broker_account_id, orders)
     # Broker's live net per contract — the guardrail the recovery path checks
     # against so a recovered close can never push our net PAST what the broker
     # actually holds (the phantom-short regression).
