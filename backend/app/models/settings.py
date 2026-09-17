@@ -94,9 +94,9 @@ class TraderSettings(Base, TimestampMixin):
 
     # Ceiling on the dollar value of a single Discord order (quantity x price x
     # 100 for options). Unlike SubscriberSettings.max_per_contract — which is
-    # display-only — this one is ENFORCED: quantity is reduced to fit, and an
-    # alert whose single contract already exceeds it is refused rather than
-    # trimmed to zero. NULL = no ceiling.
+    # display-only — this one is ENFORCED: an entry whose cost exceeds the
+    # ceiling is SKIPPED entirely, never trimmed to a smaller size. NULL = no
+    # ceiling.
     discord_max_per_contract: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )

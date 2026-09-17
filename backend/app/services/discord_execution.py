@@ -466,7 +466,7 @@ def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side, r
     # with a cap. Same reasoning as copy_engine._marketable_option_limit.
     price = (ask if side is OrderSide.BUY else bid).quantize(Decimal("0.01"))
     if price <= 0:
-        raise ExecutionRefused("The live quote for that contract is unusable (zero/!).")
+        raise ExecutionRefused("The live quote for that contract is unusable (zero or negative).")
     resolutions["limit_price"] = f"{price} (marketable limit from the live quote)"
     return price
 

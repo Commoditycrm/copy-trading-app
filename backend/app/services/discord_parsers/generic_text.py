@@ -140,10 +140,13 @@ class GenericTextParser(Parser):
         # Partial option details are the dangerous case: enough to look like a
         # trade, not enough to identify the contract. Refuse rather than fill in
         # the gap.
-        # Reserve INVALID for messages that genuinely look like an instruction.
-        # Prose such as "SPY calls hit 1.25 again" mentions options without
-        # asking for anything, and flagging it INVALID would fill the review
-        # queue with commentary rather than real parse failures.
+        # Reserve INVALID for messages that genuinely look like an instruction
+        # (a $ticker, a price, or a quantity). A command that names only half a
+        # contract — e.g. "BUY AAPL 250 STRIKE SEP 18" (a strike but no call/
+        # put) — is IGNORED, not INVALID, so partial commentary doesn't fill the
+        # review queue with false parse failures. (Prose with no action word,
+        # like "SPY calls hit 1.25 again", never reaches here — matches() screens
+        # it out first and it resolves to "not a trade alert".)
         looks_like_an_instruction = f"${symbol}" in upper or price is not None or qty is not None
         if strike is None:
             if not looks_like_an_instruction:
