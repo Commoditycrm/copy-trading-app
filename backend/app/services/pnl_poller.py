@@ -801,6 +801,18 @@ def _enforce_one(acct: BrokerAccount) -> None:
             profit_pct_dollars is not None and todays_pl >= profit_pct_dollars
         )
 
+        # Daily P&L limits only apply DURING the regular session. Outside it the
+        # broker's todays_pl can still reflect the PRIOR day — Alpaca resets its
+        # trading day at market open, not ET midnight — so the 00:00 ET auto-
+        # resume above would flip copy back on and this block would instantly
+        # re-pause it on yesterday's P&L (a resume/re-pause flip-flop that left
+        # the subscriber's copy stuck OFF until a manual toggle). Gating the P&L
+        # hits to the regular session lets the resume stick; at the real open
+        # todays_pl has reset and the limits apply fresh. Budget caps below use
+        # our own ET-aligned todays_trading_value, so they're unaffected.
+        if not _mh.in_regular_session(now_et):
+            hit_loss = hit_profit = hit_loss_pct = hit_profit_pct = False
+
         hit_pct = (
             pct_limit_dollars is not None and todays_trading_value >= pct_limit_dollars
         )

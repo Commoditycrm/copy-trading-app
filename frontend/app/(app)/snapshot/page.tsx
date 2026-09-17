@@ -29,6 +29,8 @@ interface SnapPos {
   pdc: string | null;           // previous day's market close / share
   reentry_price: string | null; // fill price (filled) or resting limit (working)
   reentry_filled_at: string | null; // ISO time the buy-back filled (filled only)
+  _sid?: string; // (client) owning snapshot id, set when today's snapshots are merged into one table
+  _idx?: number; // (client) row index within its owning snapshot
   default_mode: "market" | "pct" | "limit"; // re-entry default chosen at exit
   default_value: string | null;
   default_basis: "current" | "reference" | "exit" | null; // basis for a "pct" default
@@ -57,12 +59,12 @@ function fmtMoney(v: string | null): string {
   return Number.isFinite(n) ? `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : String(v);
 }
 
-/** ISO timestamp → local "7:18 pm"; "—" when absent. */
+/** ISO timestamp → ET "7:18 PM" (market time, like Order History); "—" absent. */
 function fmtTime(iso: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
 }
 
 /** Option expiry "YYYY-MM-DD" → "10 Jul 26"; "—" for stocks / no expiry. */
@@ -98,13 +100,53 @@ const takesPct = (c: ReChoice) => isPctChoice(c) || c === "trailing" || c === "t
 const choiceBasis = (c: ReChoice) =>
   c === "pct_reference" ? "reference" : c === "at_exit" ? "exit" : "current";
 
+/** Turn a re-entry choice + its value into the re-enter query params (basis /
+ *  discount / trail / trail-down / limit). No snapshot_id/index — the caller
+ *  adds those. */
+function choiceParams(choice: ReChoice, valueStr: string): URLSearchParams {
+  const params = new URLSearchParams();
+  const v = parseFloat(valueStr ?? "");
+  if (choice === "trailing") {
+    if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_percent", String(v));
+  } else if (choice === "trail_down") {
+    if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_down_percent", String(v));
+  } else if (choice === "limit") {
+    if (!isNaN(v) && v > 0) params.set("limit_price", String(v));
+  } else if (choice !== "market") {
+    params.set("basis", choiceBasis(choice));
+    if (!isNaN(v) && v > 0 && v <= 100) params.set("discount_percent", String(v));
+  }
+  return params;
+}
+
+/** Flatten today's snapshots into ONE table: every row keeps its owning
+ *  snapshot id + index (_sid/_idx) so Re-Enter / delete still target the right
+ *  underlying snapshot. Newest snapshot's rows first. */
+function mergeToday(snaps: Snapshot[]): Snapshot {
+  const positions: SnapPos[] = snaps.flatMap((s) =>
+    s.positions.map((p, idx) => ({ ...p, _sid: s.id, _idx: idx })));
+  const summary = { total: positions.length, filled: 0, working: 0, pending: 0, expired: 0 };
+  for (const p of positions) {
+    if (p.reentry_status === "filled") summary.filled++;
+    else if (p.reentry_status === "working") summary.working++;
+    else if (p.reentry_status === "expired") summary.expired++;
+    else summary.pending++;
+  }
+  return {
+    id: "today",
+    created_at: snaps[snaps.length - 1]?.created_at ?? new Date().toISOString(),
+    positions,
+    summary,
+  };
+}
+
 /**
  * One snapshot, fully self-contained: its own table, Re-Enter All bar, per-row
  * Re-Enter / delete, and re-entry state. `initial` seeds it (from the today
  * feed) so the page doesn't double-fetch; it still reloads itself live on order
  * events. All Re-Enter / delete calls target this snapshot's id + row index.
  */
-function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: Snapshot }) {
+function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; initial?: Snapshot; merged?: boolean }) {
   const [snap, setSnap] = useState<Snapshot | null>(initial ?? null);
   const [loading, setLoading] = useState(!initial);
   const [globalChoice, setGlobalChoice] = useState<Exclude<ReChoice, "limit">>("pct_current");
@@ -142,15 +184,23 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
 
   const load = useCallback(async () => {
     try {
-      const r = await api<{ snapshot: Snapshot | null }>(`/api/positions/snapshots/latest?snapshot_id=${snapshotId}`);
-      setSnap(r.snapshot);
-      if (r.snapshot) prefill(r.snapshot);
+      if (merged) {
+        // The whole day in one table: pull today's snapshots and flatten them.
+        const r = await api<{ snapshots: Snapshot[] }>("/api/positions/snapshots/today");
+        const m = mergeToday(r.snapshots);
+        setSnap(m.positions.length ? m : null);
+        if (m.positions.length) prefill(m);
+      } else {
+        const r = await api<{ snapshot: Snapshot | null }>(`/api/positions/snapshots/latest?snapshot_id=${snapshotId}`);
+        setSnap(r.snapshot);
+        if (r.snapshot) prefill(r.snapshot);
+      }
     } catch (e) {
       notify.fromError(e, "Could not load snapshot");
     } finally {
       setLoading(false);
     }
-  }, [snapshotId, prefill]);
+  }, [snapshotId, prefill, merged]);
 
   // Seed prefill from `initial`; fetch fresh if we weren't handed one.
   useEffect(() => {
@@ -173,9 +223,12 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
   async function deleteRow(index: number) {
     if (!snap) return;
     if (!confirm("Remove this order from the snapshot? This only clears the re-entry record — it won't touch any order already placed.")) return;
+    const row = snap.positions[index];
+    const sid = row?._sid ?? snap.id;         // merged table → the row's own snapshot
+    const idx = row?._idx ?? index;
     setBusy("delrow:" + index);
     try {
-      await api(`/api/positions/snapshots/${snap.id}/positions/${index}`, { method: "DELETE" });
+      await api(`/api/positions/snapshots/${sid}/positions/${idx}`, { method: "DELETE" });
       notify.success("Removed from snapshot.");
       setRowChoice({}); setRowVal({});   // indices shift after a removal — re-prefill fresh
       await load();
@@ -189,43 +242,38 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
   async function reEnter(scope: "all" | string) {
     if (!snap) return;
     setBusy(scope);
+    let placed = 0, failed = 0;
+    const post = async (params: URLSearchParams) => {
+      const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
+        `/api/positions/re-enter?${params.toString()}`, { method: "POST" },
+      );
+      placed += res.placed_count; failed += res.failed_count;
+    };
     try {
-      const params = new URLSearchParams();
-      params.set("snapshot_id", snap.id);
       if (scope === "all") {
-        if (globalChoice === "trailing") {
-          const d = parseFloat(globalDisc);
-          if (!isNaN(d) && d > 0 && d <= 100) params.set("trail_percent", String(d));
-        } else if (globalChoice === "trail_down") {
-          const d = parseFloat(globalDisc);
-          if (!isNaN(d) && d > 0 && d <= 100) params.set("trail_down_percent", String(d));
-        } else if (globalChoice !== "market") {
-          params.set("basis", choiceBasis(globalChoice));
-          const d = parseFloat(globalDisc);
-          if (!isNaN(d) && d > 0 && d <= 100) params.set("discount_percent", String(d));
+        const vp = choiceParams(globalChoice, globalDisc);
+        // Merged (today) table: re-enter pending rows grouped by their own
+        // snapshot. Single snapshot: one call.
+        const sids = merged
+          ? Array.from(new Set(snap.positions.filter(p => p.reentry_status === "pending").map(p => p._sid).filter(Boolean) as string[]))
+          : [snap.id];
+        for (const sid of sids) {
+          const params = new URLSearchParams(vp);
+          params.set("snapshot_id", sid);
+          await post(params);
         }
       } else {
-        params.set("index", scope);
-        const choice = rowChoice[scope] ?? "market";
-        const v = parseFloat(rowVal[scope] ?? "");
-        if (choice === "trailing") {
-          if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_percent", String(v));
-        } else if (choice === "trail_down") {
-          if (!isNaN(v) && v > 0 && v <= 100) params.set("trail_down_percent", String(v));
-        } else if (choice === "limit") {
-          if (!isNaN(v) && v > 0) params.set("limit_price", String(v));
-        } else if (choice !== "market") {
-          params.set("basis", choiceBasis(choice));
-          if (!isNaN(v) && v > 0 && v <= 100) params.set("discount_percent", String(v));
-        }
+        const row = snap.positions[Number(scope)];
+        const sid = row?._sid ?? snap.id;
+        const idx = row?._idx ?? Number(scope);
+        const params = choiceParams(rowChoice[scope] ?? "market", rowVal[scope] ?? "");
+        params.set("snapshot_id", sid);
+        params.set("index", String(idx));
+        await post(params);
       }
-      const res = await api<{ placed_count: number; skipped_count: number; failed_count: number }>(
-        `/api/positions/re-enter?${params.toString()}`,
-        { method: "POST" },
-      );
-      if (res.placed_count === 0 && res.failed_count === 0) notify.info("Nothing new to re-enter.");
-      else if (res.failed_count === 0) notify.success(`Re-entered ${res.placed_count} order${res.placed_count === 1 ? "" : "s"}.`);
-      else notify.warn(`Re-entered ${res.placed_count}; ${res.failed_count} failed — check Order History.`);
+      if (placed === 0 && failed === 0) notify.info("Nothing new to re-enter.");
+      else if (failed === 0) notify.success(`Re-entered ${placed} order${placed === 1 ? "" : "s"}.`);
+      else notify.warn(`Re-entered ${placed}; ${failed} failed — check Order History.`);
       await load();
     } catch (e) {
       notify.fromError(e, "Re-enter failed");
@@ -245,7 +293,9 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
       {/* Per-snapshot header: when it was taken + status counts. */}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="text-sm font-semibold" style={{ color: "var(--text-2)" }}>
-          <span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+          {merged
+            ? <span style={{ color: "var(--muted)" }}>Today</span>
+            : <><span style={{ color: "var(--muted)" }}>Taken </span>{new Date(snap.created_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" })} ET</>}
           <span style={{ color: "var(--muted)" }}> · {snap.summary.total} order{snap.summary.total === 1 ? "" : "s"}</span>
         </div>
         <div className="text-sm">
@@ -312,7 +362,7 @@ function SnapshotBlock({ snapshotId, initial }: { snapshotId: string; initial?: 
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Previous day's market close price">PDC</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="When the re-entry filled">Fill Time</th>
+                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="When the re-entry filled (US Eastern / market time)">Fill Time (ET)</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
                 <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Current price vs exit price, as a %">%</th>
                 <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>
@@ -504,7 +554,7 @@ export default function SnapshotPage() {
           <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
             {idParam
               ? <>A single snapshot from your history. Re-enter any order individually or all at once.</>
-              : <>Every snapshot you&apos;ve taken <b>today</b>, newest first — each Exit keeps its own, so nothing disappears. Re-enter any order at market, or a % below its exit price.</>}
+              : <>Everything you&apos;ve exited <b>today</b>, in one table — every Exit adds to it, so nothing disappears. Re-enter any order at market, or a % below its exit price.</>}
           </p>
           <Link href="/snapshot/history" className="text-sm font-medium inline-block mt-1.5" style={{ color: "var(--accent)" }}>
             View snapshot history →
@@ -528,10 +578,8 @@ export default function SnapshotPage() {
           automatically, and you can re-enter it here. <Link href="/snapshot/history" style={{ color: "var(--accent)" }}>Browse history →</Link>
         </div>
       ) : (
-        // All of today's snapshots, stacked newest first.
-        <div className="space-y-8">
-          {today.map((s) => <SnapshotBlock key={s.id} snapshotId={s.id} initial={s} />)}
-        </div>
+        // All of today's exits in ONE table (each row still targets its own snapshot).
+        <SnapshotBlock merged snapshotId="today" initial={mergeToday(today)} />
       )}
     </div>
   );
