@@ -43,6 +43,7 @@ from fastapi import (
     Request,
     status,
 )
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -84,6 +85,7 @@ from app.schemas.discord import (
 from app.services import (
     discord_execution,
     discord_position_guard as guards,
+    price_override,
     discord_ingest,
     discord_login,
     discord_pairing,
@@ -301,6 +303,139 @@ def create_source(
         raise HTTPException(409, "channel_already_connected")
     db.refresh(src)
     return _to_out(src)
+
+
+# ── simulated prices (testing only) ─────────────────────────────────────────
+# Lets a trader pin a contract's price so the trim ladder's stops and trailing
+# exits can be exercised against a quiet market. Gated on its own flag, OFF by
+# default, because a pinned price feeds the REAL enforcement path: a pin below a
+# stop places a REAL order, filled at the REAL price, not the pinned one.
+
+class PinnedPositionOut(BaseModel):
+    """One open position, with whatever the ladder currently knows about it."""
+
+    key: str
+    symbol: str
+    option_strike: str | None = None
+    option_right: str | None = None
+    option_expiry: str | None = None
+    quantity: str
+    broker_price: str | None = None
+    pinned_price: str | None = None
+    entry_price: str | None = None
+    stop_price: str | None = None
+    trail_qty: str | None = None
+    trail_amount: str | None = None
+    peak_price: str | None = None
+    rung: int = 0
+
+
+class PinIn(BaseModel):
+    key: str
+    # Empty or null clears the pin and hands the position back to the broker.
+    price: str | None = None
+
+
+def _require_pin_feature(user: User = Depends(require_trader)) -> None:
+    if not price_override.enabled():
+        raise HTTPException(503, "price_override_disabled")
+
+
+@router.get("/simulated-prices", response_model=list[PinnedPositionOut])
+def list_simulated_prices(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _f: None = Depends(_require_feature),
+    _p: None = Depends(_require_pin_feature),
+) -> list[PinnedPositionOut]:
+    """Open positions, their live price, and any pin standing on them."""
+    from app.brokers import adapter_for  # noqa: PLC0415
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.services.crypto import decrypt_json  # noqa: PLC0415
+
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is None:
+        return []
+
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    try:
+        positions = adapter.get_positions()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Couldn't read positions: {exc}") from exc
+
+    out: list[PinnedPositionOut] = []
+    for pos in positions:
+        key = price_override.contract_key(
+            pos.symbol, pos.option_strike,
+            getattr(pos, "option_right", None), pos.option_expiry,
+        )
+        right = getattr(pos.option_right, "value", pos.option_right)
+        guard = guards.find(
+            db, user.id, pos.symbol, pos.option_strike,
+            pos.option_right, pos.option_expiry,
+        )
+        out.append(PinnedPositionOut(
+            key=key,
+            symbol=pos.symbol,
+            option_strike=_plain(pos.option_strike),
+            option_right=right,
+            option_expiry=pos.option_expiry.isoformat() if pos.option_expiry else None,
+            quantity=_plain(pos.quantity) or "0",
+            broker_price=_plain(getattr(pos, "current_price", None)),
+            pinned_price=_plain(price_override.get_pin(user.id, key)),
+            entry_price=_plain(guard.entry_price) if guard else None,
+            stop_price=_plain(guard.stop_price) if guard else None,
+            trail_qty=_plain(guard.trail_qty) if guard else None,
+            trail_amount=_plain(guard.trail_amount) if guard else None,
+            peak_price=_plain(guard.peak_price) if guard else None,
+            rung=(guard.sell_count or 0) if guard else 0,
+        ))
+    return out
+
+
+@router.post("/simulated-prices", response_model=list[PinnedPositionOut])
+def set_simulated_price(
+    payload: PinIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _f: None = Depends(_require_feature),
+    _p: None = Depends(_require_pin_feature),
+) -> list[PinnedPositionOut]:
+    """Pin or clear one contract's price, then hand back the refreshed list."""
+    raw = (payload.price or "").strip()
+    if not raw:
+        price_override.clear_pin(user.id, payload.key)
+        log.info("discord: price pin cleared for %s by %s", payload.key, user.id)
+    else:
+        try:
+            value = price_override.set_pin(user.id, payload.key, raw)
+        except ValueError as exc:
+            raise HTTPException(400, f"Price {exc}.") from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        log.warning(
+            "discord: PRICE PINNED %s = %s for user=%s — enforcement will act on this",
+            payload.key, value, user.id,
+        )
+    return list_simulated_prices(db, user, None, None)
+
+
+@router.delete("/simulated-prices", status_code=status.HTTP_204_NO_CONTENT)
+def clear_simulated_prices(
+    user: User = Depends(require_trader),
+    _f: None = Depends(_require_feature),
+    _p: None = Depends(_require_pin_feature),
+):
+    # No `-> None` annotation: with `from __future__ import annotations`
+    # FastAPI resolves it as a response model and rejects it on a 204.
+    """Drop every pin this trader has — the way back to real prices."""
+    n = price_override.clear_all(user.id)
+    log.info("discord: cleared %d price pin(s) for user=%s", n, user.id)
 
 
 @router.get("/signals/page", response_model=Page[DiscordSignalOut])

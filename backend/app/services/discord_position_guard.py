@@ -116,6 +116,8 @@ def plan_exit(
         )
 
     # ── rung 1: gated on profit, and only ever sells at market ──────────────
+    # The gate is inclusive — "market >= 1.2 x fill" trims AT the threshold,
+    # not only past it.
     if rung == 1:
         if entry is None or entry <= 0 or mark is None or mark <= 0:
             return TrimPlan(
@@ -123,14 +125,20 @@ def plan_exit(
                 note="no entry price or live mark — cannot measure profit",
             )
         gain_pct = (mark - entry) / entry * Decimal(100)
-        if gain_pct <= cfg.profit_gate_pct:
+        stop = entry * (Decimal(1) - cfg.stop_pct / Decimal(100))
+        if gain_pct < cfg.profit_gate_pct:
+            # The gate decides whether to SELL, not whether to protect. The
+            # position is open either way, so it gets its stop either way —
+            # otherwise an alert that arrives early leaves the trader holding
+            # an unprotected position until the next one happens to come.
             return TrimPlan(
                 rung=rung, guard=guard,
+                new_stop_price=_armable_stop(stop, mark),
                 note=(f"up {gain_pct.quantize(Decimal('0.01'))}%, "
-                      f"under the {cfg.profit_gate_pct}% gate — nothing sold"),
+                      f"under the {cfg.profit_gate_pct}% gate — nothing sold, "
+                      f"stop set at {stop.quantize(Decimal('0.0001'))}"),
             )
         sell = _half(held)
-        stop = entry * (Decimal(1) - cfg.stop_pct / Decimal(100))
         return TrimPlan(
             rung=rung, guard=guard, sell_qty=sell, exit_style=MARKET,
             new_stop_price=(None if sell >= held else _armable_stop(stop, mark)),

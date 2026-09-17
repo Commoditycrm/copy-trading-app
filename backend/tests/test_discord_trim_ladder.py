@@ -47,12 +47,14 @@ def test_first_trim_sells_half_when_well_in_profit():
     assert plan.retire is False
 
 
-def test_first_trim_does_nothing_below_the_gate():
+def test_first_trim_sells_nothing_below_the_gate_but_still_protects():
+    """The gate decides whether to SELL, not whether to protect. An alert that
+    arrives early must not leave the position unstopped until the next one."""
     g = _guard(entry="2.00")
     plan = guards.plan_exit(g, Decimal(4), Decimal("2.20"), CFG)   # +10%
 
     assert plan.sell_qty == Decimal(0)
-    assert plan.new_stop_price is None
+    assert plan.new_stop_price == Decimal("1.50")                  # 25% below entry
     assert "under the" in plan.note
 
 
@@ -68,10 +70,16 @@ def test_a_skipped_first_trim_still_burns_the_rung():
     assert plan.sell_qty == Decimal(2)                             # rung 2 has no gate
 
 
-def test_exactly_at_the_gate_does_not_trim():
-    """'Above 20%' is strict — 20.0% is not above it."""
+def test_exactly_at_the_gate_does_trim():
+    """The gate is inclusive: "market >= 1.2 x fill" trims AT the threshold."""
     g = _guard(entry="2.00")
     plan = guards.plan_exit(g, Decimal(4), Decimal("2.40"), CFG)   # exactly +20%
+    assert plan.sell_qty == Decimal(2)
+
+
+def test_just_under_the_gate_does_not_trim():
+    g = _guard(entry="2.00")
+    plan = guards.plan_exit(g, Decimal(4), Decimal("2.39"), CFG)
     assert plan.sell_qty == Decimal(0)
 
 

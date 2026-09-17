@@ -158,23 +158,26 @@ def test_an_alert_under_the_gate_sells_nothing_but_still_advances(db):
 
     plan, sold = L.alert("0.52")                 # +4%, under the gate
     assert (plan.rung, sold, L.held) == (1, Decimal(0), Decimal(4))
-    assert L.guard.stop_price is None            # nothing armed
+    assert L.guard.stop_price == Decimal("0.375")   # protected even so
 
     plan, sold = L.alert("0.52")                 # rung 2 has no gate
     assert (plan.rung, sold, L.held) == (2, Decimal(2), Decimal(2))
 
 
 def test_an_underwater_ladder_never_stops_itself_out(db):
-    """The production failure: bought at 2.30, marking 1.95. A break-even stop
-    would be breached the moment it was set and flatten everything."""
+    """The production failure: bought at 2.30, marking 1.95. Rung 1's stop sits
+    at 1.725, safely under the mark — but rung 2 wants break-even at 2.30, which
+    is ABOVE it. Setting that would be breached on the spot and flatten
+    everything, which is exactly what happened in production."""
     L = _Ladder(db, Decimal("2.30"), 4)
 
     _, sold = L.alert("1.95")                    # under the gate
     assert (sold, L.held) == (Decimal(0), Decimal(4))
+    assert L.guard.stop_price == Decimal("1.725")    # a real stop, below the mark
 
     plan, sold = L.alert("1.95")                 # rung 2 trims
     assert plan.sell_qty == Decimal(2)           # the trim still happens
-    assert L.guard.stop_price is None            # but no self-triggering stop
+    assert L.guard.stop_price == Decimal("1.725")    # break-even REFUSED; 1.725 holds
 
     assert L.tick("1.95") == Decimal(0)          # and the enforcer exits nothing
     assert L.guard.closed_at is None
