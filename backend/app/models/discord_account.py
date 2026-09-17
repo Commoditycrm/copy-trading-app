@@ -20,7 +20,7 @@ class DiscordAccount(Base, TimestampMixin):
     when they were all the same account.
 
     ``encrypted_session`` is the Fernet-encrypted Playwright storage state
-    captured on the trader's own machine by the Kopyaa Connector. Same treatment
+    captured on the trader's own machine by the Kopyya Connector. Same treatment
     as broker credentials: never returned to the frontend, never logged, and
     handed out only to the listener over its authenticated internal endpoint.
     """

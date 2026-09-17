@@ -1,4 +1,4 @@
-"""Pairing codes that let the Kopyaa Connector desktop app attach a Discord
+"""Pairing codes that let the Kopyya Connector desktop app attach a Discord
 session to a source.
 
 Why this exists
@@ -15,10 +15,10 @@ which is what CAPTCHAs are for.
 
 What a pairing code is for
 --------------------------
-The Connector is a separate program with no Kopyaa login. It needs to know which
+The Connector is a separate program with no Kopyya login. It needs to know which
 source to attach a session to, and prove it's allowed to. The code does both:
 
-    Kopyaa UI  ──create()──▶  KPY-4F2A-9C1D   (shown only to the signed-in owner)
+    Kopyya UI  ──create()──▶  KPY-4F2A-9C1D   (shown only to the signed-in owner)
     Connector  ──claim()───▶  {source_id, upload_token}
     Connector  ──complete()▶  the captured session, encrypted onto the source
 
