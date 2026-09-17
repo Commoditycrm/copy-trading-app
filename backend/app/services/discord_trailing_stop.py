@@ -112,7 +112,10 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             continue
 
         # ── the floor, first ────────────────────────────────────────────────
-        stop = guard.stop_price
+        # Skipped when a real order rests at the broker for this level: it will
+        # fire on its own, and enforcing here as well would sell the same
+        # contracts twice.
+        stop = None if guard.stop_order_id else guard.stop_price
         if stop is not None and price <= stop:
             log.info("discord stops: %s at %s broke its %s stop — closing %s",
                      guard.symbol, price, stop, held)
