@@ -513,6 +513,26 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
 
 
 
+def _bid_for(adapter, pos) -> "Decimal | None":
+    """Current bid for a held option, or None. Never raises — a missing quote
+    means we fall back to a market order, not that we skip the exit."""
+    try:
+        from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+
+        if not hasattr(adapter, "get_option_quote"):
+            return None
+        occ = build_occ_symbol(
+            pos.symbol.upper(), pos.option_expiry, pos.option_strike,
+            getattr(pos.option_right, "value", pos.option_right),
+        )
+        snap = adapter.get_option_quote(occ)
+        raw = (snap or {}).get("bid")
+        return Decimal(str(raw)) if raw is not None else None
+    except Exception:  # noqa: BLE001
+        log.warning("discord stops: quote lookup failed for %s", pos.symbol, exc_info=True)
+        return None
+
+
 def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
     """Advance the stops and trailing exits a Discord trim left behind.
 
@@ -555,14 +575,33 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                 from fastapi import BackgroundTasks  # noqa: PLC0415
 
                 trader = db.get(User, acct.user_id)
+                is_option = pos.option_strike is not None
+
+                # Alpaca rejects option MARKET orders outside the regular
+                # session, so a stop that fires pre- or post-market would fail
+                # exactly when it matters. Price a marketable limit through the
+                # bid instead — it fills like a market order and is accepted.
+                order_type, limit_price = OrderType.MARKET, None
+                if is_option and not market_hours.in_regular_session():
+                    bid = _bid_for(adapter, pos)
+                    if bid is not None and bid > 0:
+                        order_type = OrderType.LIMIT
+                        limit_price = (bid * Decimal("0.98")).quantize(Decimal("0.01")) or bid
+                    else:
+                        log.warning(
+                            "discord stops: no quote to price an off-session exit "
+                            "for %s — sending market and letting the broker judge",
+                            pos.symbol,
+                        )
+
                 payload = PlaceOrderIn(
                     instrument_type=(
-                        InstrumentType.OPTION if pos.option_strike is not None
-                        else InstrumentType.STOCK
+                        InstrumentType.OPTION if is_option else InstrumentType.STOCK
                     ),
                     symbol=pos.symbol.upper(),
                     side=OrderSide.SELL,
-                    order_type=OrderType.MARKET,
+                    order_type=order_type,
+                    limit_price=limit_price,
                     quantity=abs(Decimal(str(quantity))),
                     option_expiry=pos.option_expiry,
                     option_strike=pos.option_strike,
