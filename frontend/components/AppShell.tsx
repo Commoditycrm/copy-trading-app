@@ -141,6 +141,7 @@ const NAV_TRADER = [
   { href: "/performance", label: "Performance", Icon: IconActivity },
   { href: "/brokers", label: "Broker", Icon: IconLink },
   { href: "/discord", label: "Discord", Icon: IconDiscord },
+  { href: "/simulated-prices", label: "Simulated Prices", Icon: IconActivity },
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 const NAV_SUBSCRIBER = [
@@ -585,7 +586,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // entry unless the trader is allow-listed.
   const nav = (user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER)
     .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access)
-    .filter((item) => item.href !== "/discord" || !!user.discord_enabled);
+    .filter((item) => !item.href.startsWith("/discord") || !!user.discord_enabled)
+    // Testing-only screen for the Discord ladder — same gate, and hidden
+    // entirely unless a trader is allow-listed for Discord.
+    .filter((item) => item.href !== "/simulated-prices" || !!user.discord_enabled);
   const displayName = user.display_name || user.email.split("@")[0];
   // App wordmark: trader sees their own business_name; subscriber sees
   // the business_name of the trader they follow (loaded via /api/settings/subscriber
