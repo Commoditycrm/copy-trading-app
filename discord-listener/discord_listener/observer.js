@@ -95,6 +95,23 @@
     const clone = el.cloneNode(true);
     clone.querySelectorAll('time, [class*="timestamp"], [class*="edited"]').forEach((n) => n.remove());
 
+    /* A REPLY renders the message it answers above the reply itself. Left in,
+     * that quoted text is read as part of the alert — and since traders post
+     * exits as replies to their own entry, the captured text became
+     *
+     *     "$SPY 762 CALL 0DTE @0.87  ✂️ $SPY 762c +20%"
+     *
+     * which the parser matches as an ENTRY (the buy pattern comes first) and
+     * places a duplicate BUY. The exit is lost entirely, and the failure is
+     * silent: an order appears, just the wrong one.
+     *
+     * The quoted preview is its own element, so removing it leaves exactly what
+     * the author typed. Both selectors are Discord's; class names are hashed in
+     * their bundle, so match on the stable substring. */
+    clone
+      .querySelectorAll('[id^="message-reply-context"], [class*="repliedMessage"]')
+      .forEach((n) => n.remove());
+
     /* Discord renders emoji as <img alt="✂️">, not as text. innerText returns
      * NOTHING for an image, so every emoji silently vanished from the message —
      * which meant an alert like "✂️ $MSFT 100c +366%" reached the parser as

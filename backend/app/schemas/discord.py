@@ -422,6 +422,12 @@ class DiscordSettingsOut(BaseModel):
     # Dollar give-back from the peak that triggers a trailing exit.
     trim_trail_amount: str = "0.25"
 
+    # ── chasing an entry that didn't fill ───────────────────────────────────
+    # Seconds an unfilled buy rests before its one repriced attempt.
+    reprice_after_seconds: int = 30
+    # How far above the ORIGINAL limit that attempt is priced.
+    reprice_pct: str = "10"
+
 
 class DiscordSettingsIn(BaseModel):
     execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
@@ -436,3 +442,5 @@ class DiscordSettingsIn(BaseModel):
     trim_stop_pct: str | None = None
     trim_price_threshold: str | None = None
     trim_trail_amount: str | None = None
+    reprice_after_seconds: int | None = Field(default=None, ge=5, le=600)
+    reprice_pct: str | None = None
