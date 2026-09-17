@@ -72,7 +72,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -513,6 +513,66 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
 
 
 
+def _make_stop_placer(db, live_acct, acct, guard):
+    """Place a real STOP sell for this contract, routed through the normal order
+    path so it is tracked, audited and fanned out like any other order."""
+    def _place(quantity, stop_price):
+        from app.api.trades import _place_trader_order  # noqa: PLC0415
+        from app.models.order import (  # noqa: PLC0415
+            InstrumentType, OptionRight, OrderSide, OrderType,
+        )
+        from app.models.user import User  # noqa: PLC0415
+        from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
+        from fastapi import BackgroundTasks  # noqa: PLC0415
+
+        right = guard.option_right
+        payload = PlaceOrderIn(
+            instrument_type=(
+                InstrumentType.OPTION if guard.option_strike is not None
+                else InstrumentType.STOCK
+            ),
+            symbol=guard.symbol.upper(),
+            side=OrderSide.SELL,
+            order_type=OrderType.STOP,
+            quantity=quantity,
+            # Options quote in cents. A sub-cent stop is rejected outright
+            # ("stop price must be limited to 2 decimal places"), so round here
+            # as well as at the source — this is the last point before the broker.
+            stop_price=Decimal(str(stop_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+            option_expiry=guard.option_expiry,
+            option_strike=guard.option_strike,
+            option_right=OptionRight(right) if right else None,
+        )
+        order = _place_trader_order(
+            db, db.get(User, acct.user_id), payload, live_acct.id,
+            BackgroundTasks(), _PollerRequest(),
+            resolve_wash_trade=True,      # a close, so option SELLs go SELL_TO_CLOSE
+        )
+        return order.id
+    return _place
+
+
+def _make_stop_canceller(db, adapter):
+    """Cancel a resting stop by our order id, and mark the row cancelled."""
+    def _cancel(order_id):
+        from app.models.order import Order, OrderStatus  # noqa: PLC0415
+
+        order = db.get(Order, order_id)
+        if order is None:
+            return
+        if order.broker_order_id:
+            try:
+                adapter.cancel_order(order.broker_order_id)
+            except Exception:  # noqa: BLE001
+                # Already gone at the broker is the usual reason, and it means
+                # the same thing we wanted: nothing is resting any more.
+                log.warning(
+                    "discord stop: broker cancel failed for %s", order_id, exc_info=True
+                )
+        order.status = OrderStatus.CANCELED
+    return _cancel
+
+
 def _bid_for(adapter, pos) -> "Decimal | None":
     """Current bid for a held option, or None. Never raises — a missing quote
     means we fall back to a market order, not that we skip the exit."""
@@ -614,6 +674,48 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                     # SELL goes out as SELL_TO_CLOSE.
                     resolve_wash_trade=True,
                 )
+
+            # Keep a REAL stop order resting at the broker for each protected
+            # position. Reconciled every tick rather than placed once, so it
+            # survives partial fills, a trim that changed the size, a stop
+            # cancelled by hand, or a restart midway through.
+            from app.services import discord_stop_orders  # noqa: PLC0415
+            from app.services import discord_position_guard as _g  # noqa: PLC0415
+
+            try:
+                positions = adapter.get_positions()
+            except Exception:  # noqa: BLE001
+                positions = None
+                log.warning(
+                    "discord stop: position read failed for user=%s", acct.user_id,
+                    exc_info=True,
+                )
+
+            if positions is not None:
+                by_key = {
+                    (
+                        (p.symbol or "").upper(), p.option_strike,
+                        getattr(p.option_right, "value", p.option_right), p.option_expiry,
+                    ): p
+                    for p in positions
+                }
+                for guard in [g for g in _g.armed(db) if g.user_id == acct.user_id]:
+                    pos = by_key.get((
+                        (guard.symbol or "").upper(), guard.option_strike,
+                        guard.option_right, guard.option_expiry,
+                    ))
+                    held = abs(Decimal(str(pos.quantity))) if pos is not None else Decimal(0)
+                    try:
+                        discord_stop_orders.reconcile(
+                            db, guard, held,
+                            place_stop=_make_stop_placer(db, live_acct, acct, guard),
+                            cancel_stop=_make_stop_canceller(db, adapter),
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "discord stop: reconcile failed for %s", guard.symbol
+                        )
+                db.commit()
 
             closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close)
             db.commit()
