@@ -124,12 +124,12 @@ def test_first_trim_sells_half_and_sets_the_stop(harness, placed):
     assert placed["partial_close"] is True            # subscribers must not flatten
 
 
-def test_below_the_gate_places_no_order_at_all(harness, placed):
+def test_below_the_gate_places_no_order_but_does_set_the_stop(harness, placed):
     db, user, msg, guard, _ = harness(held=4, rung=0, mark="2.10")   # +5%
     _run(db, user, msg)
 
-    assert placed == {}
-    assert guard.stop_price is None
+    assert placed == {}                          # nothing sold
+    assert guard.stop_price == Decimal("1.50")   # but the position is protected
     assert msg.status is DiscordMessageStatus.PARSED
     assert "gate" in msg.status_reason
 

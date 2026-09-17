@@ -30,6 +30,8 @@ class _Pos:
         self.option_right = right
         self.option_expiry = expiry or FUTURE
         self.quantity = Decimal(qty)
+        self.current_price = None
+        self.avg_entry_price = None
 
 
 class _Adapter:
@@ -525,3 +527,58 @@ def test_the_chain_root_map_covers_the_common_index_weeklies():
     assert ex._chain_root("RUTW") == "RUT"
     assert ex._chain_root("spxw") == "SPX"       # case-insensitive
     assert ex._chain_root("AAPL") == "AAPL"      # untouched
+
+
+# ── simulated prices reach the exit ladder ───────────────────────────────────
+
+def test_a_pinned_price_overrides_the_brokers_mark_on_an_exit(monkeypatch):
+    """The ladder's profit gate and trail anchor both key off the mark. Pinning
+    it is the whole point of the testing screen — without this, a sell alert is
+    still judged against whatever the market happens to be doing."""
+    from app.services import price_override as po
+    monkeypatch.setattr(po, "enabled", lambda: True)
+    monkeypatch.setattr(po, "_redis", lambda: None)
+    po._MEM.clear()
+
+    user = _User()
+    pos = _Pos(qty="4")
+    _wire(monkeypatch, _Adapter(positions=[pos]))
+    pos.current_price = Decimal("1.00")          # what the broker says
+
+    po.set_pin(user.id, po.contract_key("MSFT", Decimal("100"), OptionRight.CALL, FUTURE), "7.77")
+    r = ex.resolve(None, user, _signal(action="SELL"))
+
+    assert r.mark_price == Decimal("7.77")
+    po._MEM.clear()
+
+
+def test_without_a_pin_the_broker_mark_stands(monkeypatch):
+    from app.services import price_override as po
+    monkeypatch.setattr(po, "enabled", lambda: True)
+    monkeypatch.setattr(po, "_redis", lambda: None)
+    po._MEM.clear()
+
+    pos = _Pos(qty="4")
+    pos.current_price = Decimal("1.00")
+    _wire(monkeypatch, _Adapter(positions=[pos]))
+    assert ex.resolve(None, _User(), _signal(action="SELL")).mark_price == Decimal("1.00")
+
+
+def test_a_pin_is_ignored_while_the_feature_is_off(monkeypatch):
+    """Default-off has to hold on this path too, or a stale pin could silently
+    decide a real trim on a production box."""
+    from app.services import price_override as po
+    monkeypatch.setattr(po, "_redis", lambda: None)
+    po._MEM.clear()
+
+    user = _User()
+    pos = _Pos(qty="4")
+    pos.current_price = Decimal("1.00")
+    _wire(monkeypatch, _Adapter(positions=[pos]))
+
+    monkeypatch.setattr(po, "enabled", lambda: True)
+    po.set_pin(user.id, po.contract_key("MSFT", Decimal("100"), OptionRight.CALL, FUTURE), "7.77")
+    monkeypatch.setattr(po, "enabled", lambda: False)
+
+    assert ex.resolve(None, user, _signal(action="SELL")).mark_price == Decimal("1.00")
+    po._MEM.clear()
