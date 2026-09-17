@@ -348,7 +348,9 @@ def realized_pnl_by_day(
     mirrors_only: bool = False,
 ) -> dict[date, tuple[Decimal, int]]:
     """Returns {day: (realized_pnl, trade_count)}. trade_count is the number of
-    closing fills on that day.
+    distinct closing ORDERS on that day — a single order that the broker fills in
+    several partial fills counts once, so the calendar's "N trades" matches what
+    the user placed rather than the raw fill count.
 
     Source of truth is the `fills` table. For freshly filled orders whose
     detailed Fill rows haven't synced from the broker's activity feed yet,
@@ -406,7 +408,12 @@ def realized_pnl_by_day(
 
     bucket_tz = _tz_or_market(tz_name)
     open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
-    daily: dict[date, tuple[Decimal, int]] = defaultdict(lambda: (Decimal(0), 0))
+    # Realized P&L per day, and the set of CLOSING ORDER ids per day. trade_count
+    # is len(that set): a closing order that the broker fills in several partial
+    # fills is ONE trade, not one per fill — counting fills made the calendar
+    # show more "trades" than the user placed.
+    daily_pnl: dict[date, Decimal] = defaultdict(Decimal)
+    closing_orders: dict[date, set[uuid.UUID]] = defaultdict(set)
 
     for filled_at, fill_qty, fill_price, order in timeline:
         key = _instrument_key(order)
@@ -433,8 +440,8 @@ def realized_pnl_by_day(
                     if lot.qty == 0:
                         open_lots[key].popleft()
                 if start is None or day >= start:
-                    cur_pnl, cur_n = daily[day]
-                    daily[day] = (cur_pnl + pnl, cur_n + 1)
+                    daily_pnl[day] += pnl
+                    closing_orders[day].add(order.id)
                 if qty > 0:
                     open_lots[key].append(_Lot(qty=qty, price=price))
             else:
@@ -451,14 +458,17 @@ def realized_pnl_by_day(
                     if lot.qty == 0:
                         open_lots[key].popleft()
                 if start is None or day >= start:
-                    cur_pnl, cur_n = daily[day]
-                    daily[day] = (cur_pnl + pnl, cur_n + 1)
+                    daily_pnl[day] += pnl
+                    closing_orders[day].add(order.id)
                 if qty > 0:
                     open_lots[key].append(_Lot(qty=-qty, price=price))
             else:
                 open_lots[key].append(_Lot(qty=-qty, price=price))
 
-    return dict(daily)
+    return {
+        d: (daily_pnl.get(d, Decimal(0)), len(closing_orders[d]))
+        for d in closing_orders
+    }
 
 
 def realized_pnl_by_order(
