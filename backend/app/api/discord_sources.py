@@ -610,6 +610,10 @@ def get_discord_settings(
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
+        reprice_after_seconds=(
+            getattr(ts, "discord_reprice_after_seconds", None) or 30 if ts else 30
+        ),
+        reprice_pct=_plain(_setting(ts, "discord_reprice_pct", "10")),
     )
 
 
@@ -664,6 +668,7 @@ def update_discord_settings(
         ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100)),
         ("trim_price_threshold", "discord_trim_price_threshold", None),
         ("trim_trail_amount", "discord_trim_trail_amount", None),
+        ("reprice_pct", "discord_reprice_pct", Decimal(100)),
     ):
         raw = getattr(payload, field, None)
         if raw is None:
@@ -679,6 +684,9 @@ def update_discord_settings(
                 + (f" and no more than {cap}" if cap is not None else ""),
             )
         setattr(ts, column, value)
+
+    if payload.reprice_after_seconds is not None:
+        ts.discord_reprice_after_seconds = payload.reprice_after_seconds
 
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
@@ -697,6 +705,10 @@ def update_discord_settings(
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
+        reprice_after_seconds=(
+            getattr(ts, "discord_reprice_after_seconds", None) or 30 if ts else 30
+        ),
+        reprice_pct=_plain(_setting(ts, "discord_reprice_pct", "10")),
     )
 
 
