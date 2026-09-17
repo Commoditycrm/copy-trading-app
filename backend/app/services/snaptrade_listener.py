@@ -1153,6 +1153,21 @@ def _reconcile_one_subscriber_account(
     if creds is None:
         return
     adapter = SnapTradeAdapter(creds)
+    # Direct per-order status refresh (get_order) FIRST, so a fill flips
+    # SUBMITTED -> FILLED even when the activities feed has aged past it — the
+    # activities window is short, so long-stuck mirror orders (e.g. a Webull
+    # entry that filled days ago) never recover from the feed alone. This is the
+    # same broker-agnostic refresh the Alpaca / direct-Webull reconcilers run.
+    try:
+        from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
+        with SessionLocal() as db:
+            acct = db.get(BrokerAccount, broker_account_id)
+            if acct is not None and acct.connection_status == "connected":
+                _refresh_open_orders(db, acct, adapter)
+                db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("snaptrade subscriber reconcile: direct order refresh failed for %s", broker_account_id)
+
     orders = adapter.list_recent_activities()
     if not orders:
         return
