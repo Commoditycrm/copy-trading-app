@@ -61,7 +61,7 @@ class DiscordSessionIn(BaseModel):
     """Upload of a Playwright ``storage_state`` captured by the login helper.
 
     The trader signs into Discord themselves in a real browser window — password
-    and MFA are typed by them, into Discord, and never reach Kopyaa. What lands
+    and MFA are typed by them, into Discord, and never reach Kopyya. What lands
     here is the resulting session, which we validate and immediately encrypt.
     """
 
@@ -280,7 +280,7 @@ class DiscordLoginCompleteIn(BaseModel):
 
 class DiscordPairOut(BaseModel):
     """A pairing code, shown to the source's owner so they can type it into the
-    Kopyaa Connector. Never carries the upload token."""
+    Kopyya Connector. Never carries the upload token."""
 
     code: str                      # display form: KPY-4F2A-9C1D
     # pending | claimed | complete | failed

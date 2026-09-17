@@ -1,4 +1,4 @@
-"""Tests for Kopyaa Connector pairing codes.
+"""Tests for Kopyya Connector pairing codes.
 
 A pairing code authorises writing a Discord session onto a source, so the
 properties that matter are: single use, per-source, expiring, and useless
