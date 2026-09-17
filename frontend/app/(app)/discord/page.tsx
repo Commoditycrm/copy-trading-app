@@ -12,7 +12,7 @@ import type { User } from "@/lib/types";
 /**
  * Discord — INBOUND alert-copying (Step 2: connection + real-time listener).
  *
- * Kopyaa monitors Discord Web as the trader's OWN logged-in account, reading
+ * Kopyya monitors Discord Web as the trader's OWN logged-in account, reading
  * only the channels that account can already legitimately open. The trader signs
  * in themselves with the login helper — their password and MFA code go straight
  * to Discord and never reach us — and uploads only the resulting session, which
@@ -604,7 +604,7 @@ export default function DiscordPage() {
             Turn a Discord channel into trade signals
           </h1>
           <p className="text-[13px] leading-relaxed mt-1.5 max-w-[680px]" style={{ color: "var(--text-2)" }}>
-            Kopyaa watches an alert channel you already follow, reads each message the moment
+            Kopyya watches an alert channel you already follow, reads each message the moment
             it&apos;s posted, and turns the ones that describe a trade into structured signals
             you can review in Order History.
           </p>
@@ -1291,7 +1291,7 @@ export default function DiscordPage() {
             <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>{pairFor.label}</p>
 
             <ol className="text-sm mt-5 space-y-2 list-decimal pl-5 text-left" style={{ color: "var(--text-2)" }}>
-              <li>Open the <strong>Kopyaa Connector</strong> app on your computer.</li>
+              <li>Open the <strong>Kopyya Connector</strong> app on your computer.</li>
               <li>Enter this code:</li>
             </ol>
 
@@ -1320,7 +1320,7 @@ export default function DiscordPage() {
             </div>
 
             <p className="text-[11px] mt-3" style={{ color: "var(--muted)" }}>
-              You sign in on your own computer, in your own browser. Kopyaa never sees your
+              You sign in on your own computer, in your own browser. Kopyya never sees your
               Discord password or 2FA code — only the resulting session, stored encrypted.
             </p>
 
@@ -1405,7 +1405,7 @@ export default function DiscordPage() {
             </div>
 
             <p className="text-[11px] mt-3" style={{ color: "var(--muted)" }}>
-              You sign in on your own device. Kopyaa never sees your Discord password or
+              You sign in on your own device. Kopyya never sees your Discord password or
               2FA code — only the resulting session, stored encrypted.
             </p>
 
