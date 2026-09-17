@@ -228,6 +228,13 @@ class Order(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False
     )
 
+    # When a Discord entry was repriced after failing to fill. Set once and only
+    # once — it is what keeps the retry to a single attempt rather than a chase,
+    # since the scanner only considers rows where this is NULL.
+    discord_repriced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # The subscriber's copy-size multiplier applied when this mirror was scaled
     # (quantity = floor(trader_qty × copy_multiplier)). Recorded at fanout time
     # so we retain the ENTRY multiplier even if the subscriber changes it after
