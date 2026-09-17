@@ -34,6 +34,7 @@ from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.orm import Session, aliased, selectinload
 
 from app.api.deps import get_db, require_admin
+from app.models.audit_log import AuditLog
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.dashboard_metrics import LoadTestRun, TestResult
@@ -1840,3 +1841,81 @@ def send_test_sms(
     ok = send_sms(payload.to, payload.body)
     log.info("admin sent test SMS to=%s ok=%s", payload.to, ok)
     return {"ok": ok, "to": payload.to}
+
+
+# ── Copy-trading ON/OFF log ──────────────────────────────────────────────────
+# Static audit actions → (state, source, reason). copy.auto_paused_<reason> is
+# matched by prefix (the reason is a dynamic suffix).
+_COPY_STATIC = {
+    "copy.auto_resumed_next_day":          ("ON",  "System", "New trading day (auto-resume)"),
+    "subscriber.auto_liquidated_position": ("OFF", "System", "Auto-liquidation"),
+    "copy.auto_liquidated_take_profit":    ("OFF", "System", "Auto-liquidation (take profit)"),
+    "trader.copy_paused":                  ("OFF", "Trader", "Trader paused copying (master switch)"),
+    "trader.copy_resumed":                 ("ON",  "Trader", "Trader resumed copying (master switch)"),
+}
+_COPY_PAUSE_REASON = {
+    "daily_loss_limit":         "Daily loss limit hit",
+    "daily_profit_limit":       "Daily profit target hit",
+    "daily_loss_limit_pct":     "Daily loss limit (%) hit",
+    "daily_profit_limit_pct":   "Daily profit target (%) hit",
+    "max_account_pct_per_day":  "Daily trading cap (%) reached",
+    "max_account_usd_per_day":  "Daily trading cap ($) reached",
+}
+
+
+@router.get("/copy-log")
+def admin_copy_log(
+    email: str | None = Query(default=None, description="Filter to one user by (partial) email."),
+    limit: int = Query(default=200, ge=1, le=1000),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Copy-trading ON/OFF timeline from the audit log — every enable/disable
+    event with WHEN it happened, the new STATE (on/off), WHY, and WHO did it:
+    the user themselves (manual toggle), the trader's master switch, or the
+    SYSTEM (a daily loss/profit/cap limit, or an auto-liquidation)."""
+    q = (
+        select(AuditLog, User.email)
+        .join(User, User.id == AuditLog.actor_user_id, isouter=True)
+        .where(
+            or_(
+                AuditLog.action.in_(list(_COPY_STATIC.keys()) + ["subscriber.copy_toggled"]),
+                AuditLog.action.like("copy.auto_paused_%"),
+            )
+        )
+        .order_by(AuditLog.created_at.desc())
+    )
+    if email:
+        q = q.where(User.email.ilike(f"%{email}%"))
+    rows = db.execute(q.limit(limit)).all()
+
+    events: list[dict] = []
+    for a, user_email in rows:
+        action = a.action
+        meta = a.metadata_json or {}
+        detail = None
+        if action == "subscriber.copy_toggled":
+            on = bool(meta.get("copy_enabled"))
+            state, source = ("ON" if on else "OFF"), "User"
+            reason = "Turned on manually" if on else "Turned off manually"
+        elif action in _COPY_STATIC:
+            state, source, reason = _COPY_STATIC[action]
+        elif action.startswith("copy.auto_paused_"):
+            key = action[len("copy.auto_paused_"):]
+            state, source = "OFF", "System"
+            reason = _COPY_PAUSE_REASON.get(key, key.replace("_", " "))
+            pl = meta.get("todays_pl")
+            if pl is not None:
+                detail = f"today's P&L ${pl}"
+        else:
+            continue
+        events.append({
+            "at": a.created_at.isoformat(),
+            "user_id": str(a.actor_user_id) if a.actor_user_id else None,
+            "user_email": user_email,
+            "state": state,
+            "source": source,
+            "reason": reason,
+            "detail": detail,
+        })
+    return {"events": events}
