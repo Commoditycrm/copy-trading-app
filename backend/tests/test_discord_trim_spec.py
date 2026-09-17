@@ -101,7 +101,7 @@ def test_the_full_ladder_walks_four_contracts_to_zero(db):
 
     plan, sold = L.alert("1.00")                 # +100%, clears the gate
     assert (plan.rung, sold, L.held) == (1, Decimal(2), Decimal(2))
-    assert L.guard.stop_price == Decimal("0.375")    # 25% below 0.50
+    assert L.guard.stop_price == Decimal("0.37")    # 25% below 0.50
 
     plan, sold = L.alert("1.10")
     assert (plan.rung, sold, L.held) == (2, Decimal(1), Decimal(1))
@@ -144,10 +144,10 @@ def test_an_expensive_contract_leaves_via_its_trailing_stops(db):
 def test_the_first_trims_stop_protects_the_remainder(db):
     L = _Ladder(db, CHEAP, 4)
     L.alert("1.00")
-    assert L.guard.stop_price == Decimal("0.375")
+    assert L.guard.stop_price == Decimal("0.37")
 
     assert L.tick("0.40") == Decimal(0)          # above the stop — holds
-    assert L.tick("0.37") == Decimal(2)          # broke it — the rest goes
+    assert L.tick("0.36") == Decimal(2)          # broke it — the rest goes
     assert L.guard.closed_at is not None
 
 
@@ -158,7 +158,7 @@ def test_an_alert_under_the_gate_sells_nothing_but_still_advances(db):
 
     plan, sold = L.alert("0.52")                 # +4%, under the gate
     assert (plan.rung, sold, L.held) == (1, Decimal(0), Decimal(4))
-    assert L.guard.stop_price == Decimal("0.375")   # protected even so
+    assert L.guard.stop_price == Decimal("0.37")   # protected even so
 
     plan, sold = L.alert("0.52")                 # rung 2 has no gate
     assert (plan.rung, sold, L.held) == (2, Decimal(2), Decimal(2))
@@ -173,11 +173,11 @@ def test_an_underwater_ladder_never_stops_itself_out(db):
 
     _, sold = L.alert("1.95")                    # under the gate
     assert (sold, L.held) == (Decimal(0), Decimal(4))
-    assert L.guard.stop_price == Decimal("1.725")    # a real stop, below the mark
+    assert L.guard.stop_price == Decimal("1.72")    # a real stop, below the mark
 
     plan, sold = L.alert("1.95")                 # rung 2 trims
     assert plan.sell_qty == Decimal(2)           # the trim still happens
-    assert L.guard.stop_price == Decimal("1.725")    # break-even REFUSED; 1.725 holds
+    assert L.guard.stop_price == Decimal("1.72")    # break-even REFUSED; 1.725 holds
 
     assert L.tick("1.95") == Decimal(0)          # and the enforcer exits nothing
     assert L.guard.closed_at is None

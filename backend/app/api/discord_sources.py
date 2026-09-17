@@ -142,6 +142,38 @@ def require_listener_token(
         raise HTTPException(401, "invalid_listener_token")
 
 
+def _cancel_stop_order(db: Session, user: User):
+    """Cancel one of this trader's resting stop orders, by our order id.
+
+    Used to free the contracts a stop reserves before an exit is placed. A
+    broker cancel that fails because the order is already gone is the outcome we
+    wanted anyway, so it is logged rather than raised.
+    """
+    def _cancel(order_id) -> None:
+        from app.brokers import adapter_for  # noqa: PLC0415
+        from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+        from app.models.order import Order, OrderStatus  # noqa: PLC0415
+        from app.services.crypto import decrypt_json  # noqa: PLC0415
+
+        order = db.get(Order, order_id)
+        if order is None:
+            return
+        if order.broker_order_id:
+            acct = db.get(BrokerAccount, order.broker_account_id)
+            if acct is not None:
+                try:
+                    adapter_for(acct, decrypt_json(acct.encrypted_credentials)).cancel_order(
+                        order.broker_order_id
+                    )
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "discord: stop cancel failed for order %s", order_id, exc_info=True
+                    )
+        order.status = OrderStatus.CANCELED
+
+    return _cancel
+
+
 def _setting(ts, name: str, default: str) -> Decimal:
     """A Decimal setting, falling back when the row or column is unset."""
     raw = getattr(ts, name, None) if ts is not None else None
@@ -1072,6 +1104,16 @@ def _execute_signal(
                 "trail_amount": str(plan.trail_amount),
             })
             return
+
+        # A resting stop RESERVES the contracts it covers, so the broker would
+        # reject this exit for insufficient quantity. Release it first; the
+        # poller re-places a correctly sized stop on whatever is left.
+        if guard.stop_order_id:
+            from app.services import discord_stop_orders  # noqa: PLC0415
+
+            discord_stop_orders.release(
+                db, guard, _cancel_stop_order(db, user)
+            )
 
         # Market exit of this rung's slice.
         p.quantity = plan.sell_qty

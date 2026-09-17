@@ -161,6 +161,21 @@ def plan_exit(
     )
 
 
+# Brokers quote options in cents. entry x 0.75 routinely lands on a fraction of
+# one (2.70 -> 2.0250), which Alpaca rejects outright: "stop price must be
+# limited to 2 decimal places". Round DOWN so the rounding never tightens a stop
+# the trader didn't ask to tighten.
+_TICK = Decimal("0.01")
+
+
+def _to_tick(price: Decimal | None) -> Decimal | None:
+    if price is None:
+        return None
+    from decimal import ROUND_DOWN  # noqa: PLC0415
+
+    return price.quantize(_TICK, rounding=ROUND_DOWN)
+
+
 def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     """A stop is only a stop if the price is still above it.
 
@@ -173,6 +188,7 @@ def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     Returning None leaves whatever stop was already there, so a trim can tighten
     protection but never trigger an exit by itself.
     """
+    stop = _to_tick(stop)
     if stop is None or mark is None:
         return stop
     return stop if stop < mark else None
@@ -287,7 +303,9 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
         db.execute(
             select(DiscordPositionGuard).where(
                 DiscordPositionGuard.closed_at.is_(None),
-                DiscordPositionGuard.stop_order_id.is_(None),   # native stops are the broker's job
+                # Guards WITH a broker stop are included on purpose: the stop
+                # still has to be reconciled each tick against the quantity
+                # actually held, and cancelled when the position goes away.
                 sa_or(
                     DiscordPositionGuard.stop_price.is_not(None),
                     DiscordPositionGuard.trail_qty.is_not(None),
