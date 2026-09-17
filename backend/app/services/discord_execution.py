@@ -38,6 +38,7 @@ from app.models.discord_message import DiscordMessage, DiscordMessageStatus, Sig
 from app.models.order import InstrumentType, OptionRight, OrderSide, OrderType
 from app.models.user import User
 from app.schemas.order import PlaceOrderIn
+from app.services import market_hours
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -121,14 +122,55 @@ def resolve(
         signal, positions, strike, right, expiry, is_closing, sizing, resolutions
     )
     # Exits go to market so they always fill; entries are limit so they never
-    # pay through a wide spread. A market close also removes a failure mode —
-    # it no longer needs a live quote to be placeable.
-    limit_price = (
-        None if is_closing
-        else _resolve_limit_price(
+    # pay through a wide spread.
+    #
+    # Outside the regular session that inverts: Alpaca rejects option MARKET
+    # orders with "options market orders are only allowed during market hours",
+    # so an exit alert arriving pre- or post-market would simply fail. There we
+    # price a MARKETABLE limit through the book instead — SELL at the bid — which
+    # fills like a market order but is accepted. This mirrors what the copy
+    # engine already does for subscriber closes (_marketable_option_limit).
+    exit_off_session = (
+        is_closing and is_option and not market_hours.in_regular_session()
+    )
+    limit_price = None
+    if not is_closing:
+        limit_price = _resolve_limit_price(
             signal, adapter, symbol, strike, right, expiry, side, resolutions
         )
-    )
+    elif exit_off_session:
+        # What the contract is worth right now. The broker's own mark on the
+        # held position is the most reliable source — Alpaca exposes no option
+        # quote endpoint, so _quote() returns nothing there.
+        held_now = next(
+            (pp for pp in positions
+             if pp.option_strike == strike and pp.option_right == right
+             and pp.option_expiry == expiry),
+            None,
+        )
+        ref = _dec(getattr(held_now, "current_price", None)) if held_now else None
+        if ref is None:
+            quote = _quote(adapter, symbol, strike, right, expiry)
+            ref = quote[0] if quote else None
+        if ref and ref > 0:
+            # Priced THROUGH the market so it crosses immediately — a resting
+            # exit is worse than a slightly worse fill.
+            limit_price = (ref * Decimal("0.90")).quantize(Decimal("0.01"))
+            if limit_price <= 0:
+                limit_price = Decimal("0.01")
+            resolutions["exit"] = (
+                f"marketable limit {limit_price} from a {ref} mark "
+                f"(outside regular hours)"
+            )
+        else:
+            # Nothing to price against. Leave it a market order and let the
+            # broker be the judge — refusing here would block an exit the trader
+            # asked for on a technicality we may be wrong about.
+            exit_off_session = False
+            log.warning(
+                "discord_execution: no mark to price an off-session exit for %s",
+                symbol,
+            )
     # A close is priced at market, but a TRIM still needs a number to move its
     # trailing stop to. Best-effort: a missing quote must not make an exit
     # unplaceable, which is exactly why the order itself doesn't depend on it.
@@ -181,7 +223,9 @@ def resolve(
         # MARKET to close, LIMIT to open. An alert saying "close this" means
         # get out, not get out at a price — and an unfilled exit is worse than
         # a slightly worse fill.
-        order_type=OrderType.MARKET if is_closing else OrderType.LIMIT,
+        order_type=(
+            OrderType.LIMIT if (not is_closing or exit_off_session) else OrderType.MARKET
+        ),
         quantity=quantity,
         limit_price=limit_price,
         option_expiry=expiry,
