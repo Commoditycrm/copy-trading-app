@@ -313,6 +313,10 @@ class AlpacaAdapter(BrokerAdapter):
     # to place a trailing stop on stock positions where possible.
     supports_trailing_stop = True
 
+    # Pre/post-market on Alpaca is LIMIT-only (+ extended_hours=True); a plain
+    # MARKET order can't trade then and just queues for 09:30.
+    requires_extended_hours_limit = True
+
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Atomic price/qty change in place. Alpaca returns a NEW order id for the
         replacement and terminates the old one; on failure the original order is
