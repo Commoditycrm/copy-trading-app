@@ -28,6 +28,29 @@ def _et(h, m):
     return datetime(2026, 7, 23, h, m, tzinfo=ET)
 
 
+try:
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _restore_copy_engine_helpers():
+        """Undo the module-level monkeypatching these tests do.
+
+        Several tests below replace ``ce._needs_extended_hours_limit`` /
+        ``ce._alpaca_regular_session`` outright to force a branch without
+        depending on the wall clock. That mutation is GLOBAL and was never undone
+        under pytest (only the ``__main__`` runner restored it), so whichever
+        file ran next inherited a helper pinned to a constant — which is exactly
+        how tests/test_webull_marketable_pricing.py started failing in the full
+        suite while passing on its own."""
+        orig_ext = ce._needs_extended_hours_limit
+        orig_rs = ce._alpaca_regular_session
+        yield
+        ce._needs_extended_hours_limit = orig_ext
+        ce._alpaca_regular_session = orig_rs
+except ImportError:      # standalone run — the __main__ block restores instead
+    pass
+
+
 # ── market_hours windows ──────────────────────────────────────────────────────
 
 def test_in_extended_hours_windows():
@@ -78,7 +101,7 @@ def test_marketable_limit_prices_through_last():
 
 def test_stock_extended_hours_routes_ext_limit(monkeypatched=None):
     """Pre-market on Alpaca → marketable LIMIT + extended_hours=True."""
-    ce._alpaca_extended_hours = lambda adapter: True   # force the ext-hours branch
+    ce._needs_extended_hours_limit = lambda adapter: True   # force the ext-hours branch
     out = ce._to_immediate_close(_AlpacaLike(Decimal("4.00")), _mk_stock(OrderSide.BUY))
     assert out.order_type == OrderType.LIMIT
     assert out.extended_hours is True
@@ -87,7 +110,7 @@ def test_stock_extended_hours_routes_ext_limit(monkeypatched=None):
 
 def test_stock_regular_hours_stays_market():
     """Regular hours (or non-Alpaca) → plain MARKET, unchanged behavior."""
-    ce._alpaca_extended_hours = lambda adapter: False
+    ce._needs_extended_hours_limit = lambda adapter: False
     out = ce._to_immediate_close(_AlpacaLike(Decimal("4.00")), _mk_stock(OrderSide.SELL))
     assert out.order_type == OrderType.MARKET
     assert out.extended_hours is False
@@ -101,7 +124,7 @@ def test_non_forced_limit_mirror_gets_ext_hours_flag():
     from app.brokers.base import BrokerOrderResult
     from app.models.order import OrderStatus
 
-    ce._alpaca_extended_hours = lambda adapter: True
+    ce._needs_extended_hours_limit = lambda adapter: True
     placed = {}
 
     class _Adapter:
@@ -197,6 +220,11 @@ def test_option_market_no_quote_falls_back_to_marketable_limit():
 
     class _Item:
         trader_filled = False        # skip the forced-close block; exercise the place fallback
+        # The real _PendingMirror always carries this; the marketable-limit
+        # fallback reads it as the price anchor when the adapter has no quote.
+        # Here the adapter DOES quote, so the value is unused — but omitting the
+        # field would make the stub diverge from the dataclass.
+        trader_fill_price = None
         adapter = _Adapter()
         subscriber_user_id = uuid.uuid4()
         broker_account_id = uuid.uuid4()
@@ -216,7 +244,7 @@ def test_option_market_no_quote_falls_back_to_marketable_limit():
 
 def test_ext_hours_limit_anchors_to_trader_fill_not_local_quote():
     """Pre-market BUY: limit is trader_fill × (1 + cap), NOT our stale last-trade."""
-    ce._alpaca_extended_hours = lambda adapter: True
+    ce._needs_extended_hours_limit = lambda adapter: True
     # Our local quote is a stale $3.09; the trader actually filled at $4.95.
     out = ce._to_immediate_close(
         _AlpacaLike(Decimal("3.09")), _mk_stock(OrderSide.BUY),
@@ -230,7 +258,7 @@ def test_ext_hours_limit_anchors_to_trader_fill_not_local_quote():
 
 def test_ext_hours_sell_anchors_below_trader_fill():
     """Pre-market SELL: limit is trader_fill × (1 − cap) so it's marketable."""
-    ce._alpaca_extended_hours = lambda adapter: True
+    ce._needs_extended_hours_limit = lambda adapter: True
     out = ce._to_immediate_close(
         _AlpacaLike(Decimal("9.00")), _mk_stock(OrderSide.SELL),
         trader_ref_price=Decimal("5.00"),
@@ -241,7 +269,7 @@ def test_ext_hours_sell_anchors_below_trader_fill():
 
 def test_ext_hours_falls_back_to_local_quote_without_anchor():
     """No trader fill price → fall back to the local marketable-limit (unchanged)."""
-    ce._alpaca_extended_hours = lambda adapter: True
+    ce._needs_extended_hours_limit = lambda adapter: True
     out = ce._to_immediate_close(_AlpacaLike(Decimal("4.00")), _mk_stock(OrderSide.BUY))
     assert out.order_type == OrderType.LIMIT
     assert out.limit_price == Decimal("4.04")   # 4.00 × 1.01, the old behavior
@@ -250,7 +278,7 @@ def test_ext_hours_falls_back_to_local_quote_without_anchor():
 def test_regular_hours_entry_still_market_with_anchor_ignored():
     """Regular hours: still a MARKET order — the anchor must NOT turn it into a
     limit (the option-close market fix must stay intact)."""
-    ce._alpaca_extended_hours = lambda adapter: False
+    ce._needs_extended_hours_limit = lambda adapter: False
     out = ce._to_immediate_close(
         _AlpacaLike(Decimal("3.09")), _mk_stock(OrderSide.BUY),
         trader_ref_price=Decimal("4.95"),
@@ -261,7 +289,7 @@ def test_regular_hours_entry_still_market_with_anchor_ignored():
 
 if __name__ == "__main__":
     # Preserve/restore the monkeypatched helpers so ordering doesn't matter.
-    _orig = ce._alpaca_extended_hours
+    _orig = ce._needs_extended_hours_limit
     _orig_rs = ce._alpaca_regular_session
     try:
         for name, fn in sorted(globals().items()):
@@ -269,6 +297,6 @@ if __name__ == "__main__":
                 fn()
                 print(f"PASS  {name}")
     finally:
-        ce._alpaca_extended_hours = _orig
+        ce._needs_extended_hours_limit = _orig
         ce._alpaca_regular_session = _orig_rs
     print("\nAll extended-hours tests passed.")
