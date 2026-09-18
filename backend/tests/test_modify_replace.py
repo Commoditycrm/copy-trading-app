@@ -32,11 +32,19 @@ ce._MODIFY_PLACE_BACKOFF_S = 0  # don't actually sleep in the retry loop
 
 
 class _OldCh:
-    """Stand-in for the old mirror Order row — _modify_place_one only reads .id
-    and .broker_order_id off it."""
-    def __init__(self):
+    """Stand-in for the old mirror Order row.
+
+    _modify_place_one reads only .id and .broker_order_id. The force-fill path
+    ALSO reads .quantity and .filled_quantity — that is its double-buy guard,
+    which sizes the replacement to the true unfilled remainder. This stub fell
+    behind that change and every force-fill test blew up on the missing
+    attribute, so the guard has been running untested.
+    """
+    def __init__(self, quantity="5", filled_quantity="0"):
         self.id = uuid.uuid4()
         self.broker_order_id = "old-broker-id"
+        self.quantity = Decimal(quantity)
+        self.filled_quantity = Decimal(filled_quantity)
 
 
 def _result(bkr_id="new-broker-id"):
@@ -118,18 +126,36 @@ def test_replace_failure_keeps_old_order():
 
 class _CancelPlaceAdapter:
     """No in-place replace (SnapTrade/IBKR shape). place_order raises a conflict
-    ``fail_first`` times to simulate the share-release lag, then succeeds."""
+    ``fail_first`` times to simulate the share-release lag, then succeeds.
+
+    ``final_filled`` is what a post-cancel get_order reports the order ended up
+    filling. The force-fill path re-reads that after cancelling, because a
+    cancel being ACCEPTED does not mean zero filled — an async cancel can race a
+    fill, and placing the full size on top would double the subscriber.
+    """
     supports_replace = False
-    def __init__(self, fail_first=0, cancel_result=True):
+    def __init__(self, fail_first=0, cancel_result=True, final_filled=None):
         self.fail_first = fail_first
         self.cancel_result = cancel_result
+        self.final_filled = final_filled
         self.place_calls = 0
+        self.placed_quantities = []
         self.cancelled = False
     def cancel_order(self, broker_order_id):
         self.cancelled = True
         return self.cancel_result
+    def get_order(self, broker_order_id):
+        if self.final_filled is None:
+            raise RuntimeError("no post-cancel read available")
+        return BrokerOrderResult(
+            broker_order_id=broker_order_id,
+            status=OrderStatus.CANCELED,
+            submitted_at=None,
+            filled_quantity=Decimal(self.final_filled),
+        )
     def place_order(self, req):
         self.place_calls += 1
+        self.placed_quantities.append(req.quantity)
         if self.place_calls <= self.fail_first:
             raise _Conflict()
         return _result()
@@ -250,8 +276,14 @@ def test_replace_non_chain_error_does_not_retry():
 # held_for_orders bounce stranded the subscriber long (prod RDGT 2026-08-10,
 # ~2h until a manual close). Now it retries the place, same as the modify path.
 
-def _run_ff(adapter):
-    old = _OldCh()
+# Don't actually sleep through the post-cancel settle in tests.
+ce._FORCE_FILL_SETTLE_S = 0
+
+
+def _run_ff(adapter, old=None):
+    """Returns (old_id, new_id, resp, err, meta) — meta carries the fill the
+    guard observed and the request it actually placed."""
+    old = old or _OldCh()
     new_id = uuid.uuid4()
     return ce._force_fill_cancel_then_place((old, adapter, _req(), new_id))
 
@@ -259,8 +291,8 @@ def _run_ff(adapter):
 def test_force_fill_retries_through_share_release_race():
     """First place bounces on 'insufficient qty', the retry succeeds → the forced
     close goes through instead of leaving the subscriber holding."""
-    ad = _CancelPlaceAdapter(fail_first=2)
-    _old, _new, resp, err = _run_ff(ad)
+    ad = _CancelPlaceAdapter(fail_first=2, final_filled="0")
+    _old, _new, resp, err, _meta = _run_ff(ad)
     assert ad.cancelled and ad.place_calls == 3
     assert resp is not None and err is None
 
@@ -269,17 +301,101 @@ def test_force_fill_bails_when_cancel_is_noop():
     """cancel returned False (already terminal / likely filled) → never place a
     replacement (would double the position)."""
     ad = _CancelPlaceAdapter(cancel_result=False)
-    _old, _new, resp, err = _run_ff(ad)
+    _old, _new, resp, err, _meta = _run_ff(ad)
     assert ad.place_calls == 0
     assert resp is None and err == "cancel_noop_already_terminal"
 
 
 def test_force_fill_gives_up_after_budget():
     """Race never clears within budget → place_failed (not an infinite loop)."""
-    ad = _CancelPlaceAdapter(fail_first=99)
-    _old, _new, resp, err = _run_ff(ad)
+    ad = _CancelPlaceAdapter(fail_first=99, final_filled="0")
+    _old, _new, resp, err, _meta = _run_ff(ad)
     assert ad.place_calls == ce._MODIFY_PLACE_ATTEMPTS
     assert resp is None and err.startswith("place_failed")
+
+
+# ── the double-buy guard (prod MSFT 2026-08) ──────────────────────────────────
+# A cancel being ACCEPTED does not mean zero filled: Alpaca's cancel is async and
+# a marketable-limit mirror can fill inside that window. Placing the full mirror
+# size on top then DOUBLES the subscriber — a 5-share mirror filled 4 while a
+# fresh 5 went on, leaving ~2x. So the path re-reads the order after a settle and
+# places only the TRUE remainder. These tests had no coverage at all: the stubs
+# they depend on had drifted, so all three force-fill tests errored out before
+# reaching the guard.
+
+def test_partial_fill_during_cancel_places_only_the_remainder():
+    """The MSFT shape: mirror of 5, 4 filled while the cancel was in flight →
+    place 1, not 5."""
+    ad = _CancelPlaceAdapter(final_filled="4")
+    _old, _new, resp, err, meta = _run_ff(ad, _OldCh(quantity="5"))
+    assert err is None and resp is not None
+    assert ad.placed_quantities == [Decimal("1")]
+    assert meta["already"] == Decimal("4")
+
+
+def test_fully_filled_during_cancel_places_nothing():
+    """The whole mirror filled in the cancel window — anything placed here is
+    pure duplication."""
+    ad = _CancelPlaceAdapter(final_filled="5")
+    _old, _new, resp, err, meta = _run_ff(ad, _OldCh(quantity="5"))
+    assert ad.place_calls == 0
+    assert resp is None and err == "cancel_but_filled"
+    assert meta["already"] == Decimal("5")
+
+
+def test_a_fill_already_known_to_our_row_is_honoured():
+    """The guard takes the LARGER of our stored fill and the broker's re-read, so
+    a stale broker response can't resurrect quantity we know already filled."""
+    ad = _CancelPlaceAdapter(final_filled="0")
+    _old, _new, _resp, err, meta = _run_ff(
+        ad, _OldCh(quantity="5", filled_quantity="3"),
+    )
+    assert err is None
+    assert ad.placed_quantities == [Decimal("2")]
+    assert meta["already"] == Decimal("3")
+
+
+def test_broker_reporting_more_filled_than_our_row_wins():
+    ad = _CancelPlaceAdapter(final_filled="4")
+    _old, _new, _resp, err, meta = _run_ff(
+        ad, _OldCh(quantity="5", filled_quantity="1"),
+    )
+    assert err is None
+    assert ad.placed_quantities == [Decimal("1")]
+    assert meta["already"] == Decimal("4")
+
+
+def test_unreadable_post_cancel_state_falls_back_to_our_row():
+    """get_order failing must not abort the forced close — we size from what we
+    know and still get the subscriber out."""
+    ad = _CancelPlaceAdapter(final_filled=None)   # get_order raises
+    _old, _new, resp, err, _meta = _run_ff(
+        ad, _OldCh(quantity="5", filled_quantity="2"),
+    )
+    assert err is None and resp is not None
+    assert ad.placed_quantities == [Decimal("3")]
+
+
+def test_unfilled_mirror_places_the_full_size():
+    """The ordinary case — nothing filled, so the whole mirror is forced."""
+    ad = _CancelPlaceAdapter(final_filled="0")
+    _old, _new, _resp, err, _meta = _run_ff(ad, _OldCh(quantity="5"))
+    assert err is None
+    assert ad.placed_quantities == [Decimal("5")]
+
+
+def test_a_failed_cancel_never_places():
+    """Cancel raised → the order's state is unknown, so placing could double.
+    (WebullAdapter.cancel_order raises for exactly this reason when it cannot
+    confirm the outcome.)"""
+    class _RaisingCancel(_CancelPlaceAdapter):
+        def cancel_order(self, broker_order_id):
+            raise RuntimeError("webull cancel: state could not be confirmed")
+    ad = _RaisingCancel()
+    _old, _new, resp, err, meta = _run_ff(ad)
+    assert ad.place_calls == 0
+    assert resp is None and err.startswith("cancel_failed")
+    assert meta is None
 
 
 # ── AlpacaAdapter.replace_order builds a valid ReplaceOrderRequest ────────────
