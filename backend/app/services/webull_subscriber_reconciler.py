@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
+from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.brokers import adapter_for
 from app.database import SessionLocal
@@ -39,7 +42,6 @@ from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
 
-_RECONCILE_INTERVAL_S = 30.0
 _WORKING_STATUSES = (
     OrderStatus.PENDING,
     OrderStatus.SUBMITTED,
@@ -47,6 +49,32 @@ _WORKING_STATUSES = (
     OrderStatus.PARTIALLY_FILLED,
 )
 _task: "asyncio.Task | None" = None
+
+# Monotonic timestamp of the earliest time each account may be polled again.
+# The loop ticks at the FAST interval and uses this to skip accounts that are
+# not due — the same shape as pnl_poller's _next_due_at.
+_next_due_at: dict[uuid.UUID, float] = {}
+
+
+def _intervals() -> tuple[float, float, float]:
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    return (
+        float(s.webull_subscriber_sync_interval_s),
+        float(s.webull_subscriber_sync_idle_interval_s),
+        float(s.webull_subscriber_sync_fast_window_s),
+    )
+
+
+def _is_hot(newest: "datetime | None", window_s: float) -> bool:
+    """True when this account has order activity recent enough to be worth the
+    fast cadence. `newest` is the most recent submit/create time among its
+    working orders."""
+    if newest is None:
+        return False
+    if newest.tzinfo is None:                      # SQLite in tests stores naive
+        newest = newest.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - newest).total_seconds() <= window_s
 
 
 def start_webull_subscriber_reconciler() -> None:
@@ -62,9 +90,11 @@ def start_webull_subscriber_reconciler() -> None:
         log.warning("webull subscriber reconciler: no running loop; not starting")
         return
     _task = loop.create_task(_run())
+    fast, idle, window = _intervals()
     log.info(
-        "webull subscriber fill reconciler: started (interval=%.0fs)",
-        _RECONCILE_INTERVAL_S,
+        "webull subscriber fill reconciler: started "
+        "(fast=%.0fs for %.0fs after activity, idle=%.0fs)",
+        fast, window, idle,
     )
 
 
@@ -88,7 +118,7 @@ async def _run() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("webull subscriber fill reconciler: tick failed")
-        await asyncio.sleep(_RECONCILE_INTERVAL_S)
+        await asyncio.sleep(_intervals()[0])
 
 
 def _reconcile_once() -> None:
@@ -119,30 +149,58 @@ def _reconcile_once() -> None:
     # Local import avoids any import cycle at module load.
     from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
 
+    fast_s, idle_s, window_s = _intervals()
+
     with SessionLocal() as db:
-        working_acct_ids = (
-            select(Order.broker_account_id)
+        # Accounts with pending work, plus the most recent activity on each —
+        # that timestamp is what decides the cadence below.
+        newest_by_acct = (
+            select(
+                Order.broker_account_id.label("acct_id"),
+                func.max(
+                    func.coalesce(Order.submitted_at, Order.created_at)
+                ).label("newest"),
+            )
             .where(
                 Order.status.in_(_WORKING_STATUSES),
                 Order.broker_order_id.is_not(None),
                 Order.broker_account_id.is_not(None),
             )
-            .distinct()
+            .group_by(Order.broker_account_id)
+            .subquery()
         )
-        acct_ids = [
-            a.id for a in db.execute(
-                select(BrokerAccount)
-                .join(User, User.id == BrokerAccount.user_id)
-                .where(
-                    BrokerAccount.broker == BrokerName.WEBULL,
-                    BrokerAccount.connection_status == "connected",
-                    # Complement of the listener rule in services.listeners:
-                    # traders stream their own fills, everyone else is polled.
-                    User.role != UserRole.TRADER,
-                    BrokerAccount.id.in_(working_acct_ids),
-                )
-            ).scalars()
-        ]
+        candidates = db.execute(
+            select(BrokerAccount.id, newest_by_acct.c.newest)
+            .join(User, User.id == BrokerAccount.user_id)
+            .join(newest_by_acct, newest_by_acct.c.acct_id == BrokerAccount.id)
+            .where(
+                BrokerAccount.broker == BrokerName.WEBULL,
+                BrokerAccount.connection_status == "connected",
+                # Complement of the listener rule in services.listeners:
+                # traders stream their own fills, everyone else is polled.
+                User.role != UserRole.TRADER,
+            )
+        ).all()
+
+    # Adaptive cadence. A mirror is forced to market or a marketable limit, so it
+    # fills within seconds of placement — that is the window worth spending
+    # Webull's tight budget on (~10 requests / 30s per app_key, shared with the
+    # order calls themselves). An order still working after that is a quiet
+    # resting limit, where 30s of lag costs nothing and the slots are better left
+    # for the copy engine.
+    now = time.monotonic()
+    acct_ids: list[uuid.UUID] = []
+    for acct_id, newest in candidates:
+        if now < _next_due_at.get(acct_id, 0.0):
+            continue
+        acct_ids.append(acct_id)
+        _next_due_at[acct_id] = now + (
+            fast_s if _is_hot(newest, window_s) else idle_s
+        )
+    # Drop accounts that no longer have working orders so the map can't grow.
+    live = {a for a, _ in candidates}
+    for gone in [a for a in _next_due_at if a not in live]:
+        _next_due_at.pop(gone, None)
 
     for acct_id in acct_ids:
         try:
