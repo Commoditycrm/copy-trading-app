@@ -76,9 +76,10 @@ def _account(db, user_id, broker=BrokerName.WEBULL, status="connected") -> uuid.
 
 
 def _order(db, acct_id, user_id, *, parent=None, bracket_parent=None,
-           status=OrderStatus.SUBMITTED, boid="WB1"):
+           status=OrderStatus.SUBMITTED, boid="WB1", submitted_at=None):
     o = Order(
         id=uuid.uuid4(), user_id=user_id, broker_account_id=acct_id,
+        submitted_at=submitted_at,
         parent_order_id=parent, bracket_parent_id=bracket_parent,
         bracket_leg=("sl" if bracket_parent else None),
         instrument_type=InstrumentType.STOCK, symbol="AAPL",
@@ -341,6 +342,118 @@ def test_batch_results_are_applied_to_the_rows():
     rows = db.query(Order).filter(Order.broker_account_id == acct).all()
     assert all(r.status == OrderStatus.FILLED for r in rows)
     assert all(r.filled_quantity == Decimal("1") for r in rows)
+
+
+# ── adaptive cadence ────────────────────────────────────────────────────────
+# Webull's budget is ~10 requests / 30s per app_key, SHARED with the order calls
+# themselves. A flat 5s sweep claims 6 of those 10, and claims them at exactly
+# the moment a trade needs them — an order is "working" precisely while the copy
+# engine is placing and closing. Modelled worst case for a contentious close:
+# 6 (sweep) + 1.5 (P&L poller) + 5 (position read, place, cancel, re-place,
+# re-read) = 12.5, and the calls that lose that race are the ORDER ones.
+#
+# So the cadence follows the value: a mirror is forced to market or a marketable
+# limit, so it fills within seconds of placement and that window is worth
+# spending budget on. Anything still working afterwards is a quiet resting limit
+# where 30s of lag costs nothing.
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _reset_schedule():
+    webull_rec._next_due_at.clear()
+
+
+def _fixed_intervals(fast=5.0, idle=30.0, window=90.0):
+    saved = webull_rec._intervals
+    webull_rec._intervals = lambda: (fast, idle, window)
+    return saved
+
+
+def test_recent_order_gets_the_fast_cadence():
+    _reset_schedule()
+    saved = _fixed_intervals()
+    try:
+        db = _make_session()
+        acct = _account(db, _SUB)
+        _order(db, acct, _SUB, parent=uuid.uuid4(),
+               submitted_at=datetime.now(timezone.utc))
+        import time as _t
+        before = _t.monotonic()
+        assert _selected(webull_rec, db) == [acct]
+        gap = webull_rec._next_due_at[acct] - before
+        assert 4.0 <= gap <= 6.0, gap          # fast interval
+    finally:
+        webull_rec._intervals = saved
+
+
+def test_stale_order_drops_to_the_idle_cadence():
+    """A limit that has been resting for ten minutes is not about to surprise
+    us; its slots are better left for the copy engine."""
+    _reset_schedule()
+    saved = _fixed_intervals()
+    try:
+        db = _make_session()
+        acct = _account(db, _SUB)
+        _order(db, acct, _SUB, parent=uuid.uuid4(),
+               submitted_at=datetime.now(timezone.utc) - timedelta(minutes=10))
+        import time as _t
+        before = _t.monotonic()
+        assert _selected(webull_rec, db) == [acct]
+        gap = webull_rec._next_due_at[acct] - before
+        assert 29.0 <= gap <= 31.0, gap        # idle interval
+    finally:
+        webull_rec._intervals = saved
+
+
+def test_an_account_not_yet_due_is_skipped():
+    """The loop ticks at the fast interval, so without this every tick would
+    poll every account and the cadence would mean nothing."""
+    _reset_schedule()
+    saved = _fixed_intervals()
+    try:
+        db = _make_session()
+        acct = _account(db, _SUB)
+        _order(db, acct, _SUB, parent=uuid.uuid4(),
+               submitted_at=datetime.now(timezone.utc))
+        assert _selected(webull_rec, db) == [acct]   # first tick polls
+        assert _selected(webull_rec, db) == []       # immediate re-tick does not
+    finally:
+        webull_rec._intervals = saved
+
+
+def test_schedule_entry_is_dropped_once_nothing_is_working():
+    """_next_due_at is module state on a long-running loop; it must not grow
+    unboundedly as accounts come and go."""
+    _reset_schedule()
+    saved = _fixed_intervals()
+    try:
+        db = _make_session()
+        acct = _account(db, _SUB)
+        o = _order(db, acct, _SUB, parent=uuid.uuid4(),
+                   submitted_at=datetime.now(timezone.utc))
+        _selected(webull_rec, db)
+        assert acct in webull_rec._next_due_at
+        o.status = OrderStatus.FILLED
+        db.commit()
+        _selected(webull_rec, db)
+        assert acct not in webull_rec._next_due_at
+    finally:
+        webull_rec._intervals = saved
+
+
+def test_an_order_with_no_submitted_at_still_schedules():
+    """created_at is the fallback — a PENDING row placed but not yet submitted
+    must not be treated as undateable and skipped."""
+    _reset_schedule()
+    saved = _fixed_intervals()
+    try:
+        db = _make_session()
+        acct = _account(db, _SUB)
+        _order(db, acct, _SUB, parent=uuid.uuid4(), status=OrderStatus.PENDING)
+        assert _selected(webull_rec, db) == [acct]
+        assert acct in webull_rec._next_due_at
+    finally:
+        webull_rec._intervals = saved
 
 
 if __name__ == "__main__":
