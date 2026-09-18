@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     # BROKER_CONCURRENCY_SNAPTRADE. Without this field the code fell back to the
     # default 32, which is far above SnapTrade's place limit.
     broker_concurrency_snaptrade: int = 3
+    # Direct Webull. NOT set low like SnapTrade above, and the difference is the
+    # point: SnapTrade's throttle applies to OUR one integration, so every
+    # subscriber's mirror draws on a single shared budget and concurrency has to
+    # be squeezed. Webull's limits are per app_key, and each subscriber connects
+    # their OWN key — so mirrors for different subscribers never contend, and
+    # squeezing this would just serialise independent accounts and slow the
+    # fanout for no benefit. Contention only arises if ONE account has several
+    # mirrors in flight at once (a force-fill sweep), which this still bounds.
+    # Exists mainly so the knob is discoverable and tunable if real 429s show up.
+    broker_concurrency_webull: int = 32
     # Copy safety: when a trader's SELL reaches a subscriber who holds NOTHING to
     # close (and has no working entry), placing it would open a NAKED SHORT.
     # SnapTrade rejects that naturally ("no matching position"), but Alpaca will
@@ -140,6 +150,21 @@ class Settings(BaseSettings):
     # 2026-07-29: our quote ~3.09 vs the trader's 4.95 fill). The percent also caps
     # how far we chase. REGULAR-hours orders are unaffected — they still go MARKET.
     mirror_ext_hours_slippage_pct: float = 3.0
+    # Fallback pricing for a forced OPTION close/entry when we have NO usable
+    # quote for the contract. The mirror is priced through the TRADER's own fill
+    # by this percent (a SELL offers trader_fill × (1 − pct/100), a BUY bids
+    # × (1 + pct/100)) so it is marketable where it actually traded.
+    #
+    # Without this the order kept the TRADER's limit price and simply rested
+    # unfilled — the subscriber stayed in a position the trader had exited. That
+    # is the normal case on any broker with no option-quote API (direct Webull),
+    # and the gap case on brokers that have one (a quote outage, a contract the
+    # feed doesn't cover).
+    #
+    # Wider than the stock/extended-hours percent above because option books are
+    # wider; this is a CEILING on how far we chase, not a price we expect to pay.
+    # A quote, when we have one, always wins over this.
+    mirror_option_close_slippage_pct: float = 5.0
     # ── End-of-day subscriber safety auto-close ───────────────────────────
     # At 15:55 ET (5 minutes before the 16:00 US close) the worker market-closes
     # every subscriber's SAME-DAY-EXPIRY (0DTE) option positions, and the fanout
