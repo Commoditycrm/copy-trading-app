@@ -139,6 +139,29 @@ class Settings(BaseSettings):
     # So we fail fast instead and let the caller retry. Both must be positive
     # integers (the SDK validates), and the loop always sleeps one interval
     # before re-checking, so this pair costs ~2s and two checks.
+    # ── Subscriber mirror fill-sync cadence (direct Webull) ──────────────
+    # How fast we learn that a subscriber's mirror filled. Subscribers get no
+    # live listener, so this sweep IS the fill signal: until it runs, close
+    # detection (which reads filled_quantity) is blind and a deferred close
+    # cannot fire.
+    #
+    # Adaptive, because a flat fast interval does not fit in Webull's budget
+    # (~10 requests / 30s per app_key, shared across every endpoint). At 5s the
+    # sweep alone claims 6 of those 10 — and it would claim them at exactly the
+    # moment a trade needs them, since an order is "working" precisely while the
+    # copy engine is placing and closing. Modelled worst case for a contentious
+    # close: 6 (sweep) + 1.5 (P&L poller) + 5 (position read, place, cancel,
+    # re-place, re-read) = 12.5. Over the cap, and the calls that would lose the
+    # race are the ORDER ones.
+    #
+    # So poll fast only while it pays. A mirror is forced to market or a
+    # marketable limit, so it fills within seconds of being placed — the fast
+    # window covers that, and anything still resting afterwards is a quiet limit
+    # where 30s of lag costs nothing.
+    webull_subscriber_sync_interval_s: float = 5.0
+    webull_subscriber_sync_idle_interval_s: float = 30.0
+    # How long after an order appears/changes the account counts as "hot".
+    webull_subscriber_sync_fast_window_s: float = 90.0
     webull_token_check_duration_seconds: int = 1
     webull_token_check_interval_seconds: int = 2
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
