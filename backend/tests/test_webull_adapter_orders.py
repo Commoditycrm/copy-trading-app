@@ -631,6 +631,80 @@ def test_orders_snapshot_skips_rows_without_a_client_order_id():
     assert a.get_orders_snapshot() == {}
 
 
+# ── REAL order payloads, captured live (2026-09-18) ─────────────────────────
+# Webull spells the filled quantity DIFFERENTLY per endpoint, and both are live:
+#
+#   /openapi/trade/order/detail   -> {"orders": [{"status", "filled_quantity"}]}
+#   Query Day Orders              -> {"orders": [{"items": [{"order_status",
+#                                                            "filled_qty"}]}]}
+#
+# Only the second spelling was handled, so a detail read of a filled order
+# returned status=FILLED with filled_quantity=0. That pairing is poison for the
+# copy path: _closeable_quantity sums filled_quantity, so the subscriber looked
+# FLAT while holding the position, the mirror SELL was stamped is_closing=False
+# and went out as SELL_TO_OPEN, and Webull refused it —
+# OPENAPI_POSITION_ORDER_INTENT_MISMATCH, "Close intent mismatches position
+# direction". You cannot open a short in a contract you are already long.
+
+_LIVE_DETAIL_BODY = {
+    "client_order_id": "936f745b047a48b38bc2a2e79e0b1a07",
+    "combo_order_id": "6SIGOV6G6RKO7CN4E1L14KLJI9",
+    "combo_type": "NORMAL",
+    "orders": [{
+        "client_order_id": "936f745b047a48b38bc2a2e79e0b1a07",
+        "order_id": "6SIGOV6G6RKO7CN4E1L14KLJI9",
+        "status": "FILLED",
+        "instrument_type": "OPTION",
+        "side": "BUY",
+        "position_intent": "BUY_TO_OPEN",
+        "order_type": "MARKET",
+        "total_quantity": "2",
+        "filled_quantity": "2",
+        "filled_price": "0.15",
+        "time_in_force": "DAY",
+        "legs": [{"symbol": "NIO", "option_type": "CALL",
+                  "option_expire_date": "2026-09-18", "strike_price": "3.50"}],
+    }],
+}
+
+
+def test_live_order_detail_reads_the_fill():
+    """The regression: status parsed, quantity did not."""
+    a = _adapter()
+    a._trade_client = lambda: _FakeTrade(_FakeResp(200, _LIVE_DETAIL_BODY))  # type: ignore[method-assign]
+    res = a.get_order("936f745b047a48b38bc2a2e79e0b1a07")
+    assert res.status == OrderStatus.FILLED
+    assert res.filled_quantity == Decimal("2")     # was 0 — the whole bug
+    assert res.filled_avg_price == Decimal("0.15")
+
+
+def test_live_order_detail_is_recognised_as_an_option():
+    a = _adapter()
+    parsed = a._fetch_detail(_FakeTrade(_FakeResp(200, _LIVE_DETAIL_BODY)), "c")
+    assert parsed is not None and parsed[1] is True      # is_option
+
+
+def test_day_orders_spelling_still_reads_the_fill():
+    """The OTHER endpoint uses filled_qty inside items[]. Both must work — the
+    batch snapshot reads this one, get_order reads the other."""
+    a = _adapter()
+    a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(200, {  # type: ignore[method-assign]
+        "hasNext": False, "pageSize": 10,
+        "orders": [{
+            "order_id": "4RH6IN2QHG3BEH9M16582E0PM9",
+            "client_order_id": "dc38e53e2b784430a15baad985bb64b4",
+            "combo_type": "NORMAL",
+            "items": [{"category": "US_OPTION", "order_status": "FILLED",
+                       "filled_qty": "2", "filled_price": "0.15",
+                       "qty": "2", "side": "BUY", "symbol": "NIO"}],
+        }],
+    })))
+    snap = a.get_orders_snapshot()
+    got = snap["dc38e53e2b784430a15baad985bb64b4"]
+    assert got.status == OrderStatus.FILLED
+    assert got.filled_quantity == Decimal("2")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
