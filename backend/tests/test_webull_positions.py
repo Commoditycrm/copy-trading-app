@@ -274,6 +274,105 @@ def test_buy_to_close_reads_a_short_option_position():
     assert live_closeable_quantity(a, req) == Decimal("2")
 
 
+# ── the REAL payload, captured from a live account (2026-09-18) ─────────────
+# Everything above was written against inferred field names. This is the actual
+# response, verbatim, and it caught the one that mattered: Webull calls the
+# strike `option_exercise_price` on a position leg — not `strike_price`, which is
+# the ORDER-side spelling _build_option_order uses. The parser missed it, strike
+# came back None, the row failed term resolution and get_positions skipped it.
+#
+# Symptom: the Positions page showed nothing while the account held a contract,
+# and live_closeable_quantity returned 0 — which is how a mirror SELL goes out as
+# SELL_TO_OPEN and the broker rejects it. Keep this fixture verbatim; it is the
+# only thing here that is evidence rather than assumption.
+_LIVE_POSITION_BODY = [
+    {
+        "currency": "USD",
+        "quantity": "2",
+        "cost": "30.00",
+        "proportion": "1.0000",
+        "legs": [
+            {
+                "symbol": "NIO",
+                "cost": "0.15",
+                "proportion": "1.0000",
+                "leg_id": "81I49DTBIG560A3Q2SLVITMHM9",
+                "instrument_type": "OPTION",
+                "last_price": "0.15",
+                "unrealized_profit_loss": "0.00",
+                "day_profit_loss": "-10.57",
+                "day_realized_profit_loss": "-10.57",
+                "option_type": "CALL",
+                "option_expire_date": "2026-09-18",
+                "option_exercise_price": "3.5",
+                "option_contract_multiplier": "100",
+                "option_contract_deliverable": "100",
+                "expiration_type": "PM",
+            }
+        ],
+        "position_id": "81I49DTBIG560A3Q2SLVITMHM9",
+        "symbol": "NIO",
+        "option_strategy": "SINGLE",
+        "instrument_type": "OPTION",
+        "cost_price": "0.15",
+        "last_price": "0.15",
+        "market_value": "30.00",
+        "unrealized_profit_loss": "0.00",
+        "unrealized_profit_loss_rate": "0.0000",
+        "day_profit_loss": "-10.57",
+        "day_realized_profit_loss": "-10.57",
+    }
+]
+
+
+def test_live_payload_parses_every_field():
+    a = _adapter_returning(_LIVE_POSITION_BODY)
+    [p] = a.get_positions()
+    assert p.instrument_type == InstrumentType.OPTION
+    assert p.symbol == "NIO"
+    assert p.quantity == Decimal("2")
+    assert p.option_expiry == date(2026, 9, 18)
+    assert p.option_strike == Decimal("3.5")        # option_exercise_price
+    assert p.option_right == OptionRight.CALL
+    assert p.avg_entry_price == Decimal("0.15")
+    assert p.current_price == Decimal("0.15")
+    assert p.market_value == Decimal("30.00")
+    assert p.unrealized_pnl == Decimal("0.00")
+    assert p.cost_basis == Decimal("30.00")          # `cost`, not cost_basis
+    # position_id, not the bare ticker — a ticker is not unique across the
+    # option contracts of one underlying.
+    assert p.broker_symbol == "81I49DTBIG560A3Q2SLVITMHM9"
+
+
+def test_live_payload_is_closeable_by_the_copy_engine():
+    """The regression in the terms the copy engine cares about: this returned 0
+    before the fix, which is how a mirror SELL goes out as SELL_TO_OPEN."""
+    a = _adapter_returning(_LIVE_POSITION_BODY)
+    req = _close_req(symbol="NIO", expiry=date(2026, 9, 18),
+                     strike=Decimal("3.5"), right=OptionRight.CALL)
+    assert live_closeable_quantity(a, req) == Decimal("2")
+
+
+def test_live_payload_does_not_match_a_neighbouring_strike():
+    """3.5 must not satisfy a close for 4.0 — the clamp depends on it."""
+    a = _adapter_returning(_LIVE_POSITION_BODY)
+    req = _close_req(symbol="NIO", expiry=date(2026, 9, 18),
+                     strike=Decimal("4.0"), right=OptionRight.CALL)
+    assert live_closeable_quantity(a, req) == Decimal("0")
+
+
+def test_order_side_strike_spelling_still_works():
+    """strike_price is what our own order payloads use; both spellings must
+    resolve, since _option_terms reads order-shaped rows too."""
+    a = _adapter_returning({"holdings": [{
+        "symbol": "AAPL", "category": "US_OPTION", "quantity": "1",
+        "strike_price": "220", "option_expire_date": "2026-06-19",
+        "option_type": "CALL",
+    }]})
+    [p] = a.get_positions()
+    assert p.option_strike == Decimal("220")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
