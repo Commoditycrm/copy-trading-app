@@ -2309,7 +2309,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             return d
         with SessionLocal() as session:
             for acct in session.execute(
-                select(BrokerAccount).where(BrokerAccount.user_id.in_(sub_user_ids))
+                select(BrokerAccount).where(
+                    BrokerAccount.user_id.in_(sub_user_ids),
+                    # Same rule as the per-subscriber path below — see the note
+                    # there. Applied in SQL so the batched path doesn't carry
+                    # unusable rows through the fanout at all.
+                    BrokerAccount.connection_status == "connected",
+                )
             ).scalars():
                 # Detach so the BrokerAccount survives past the session
                 # close — we read attributes (encrypted_credentials,
@@ -2556,6 +2562,27 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if (use_batch and not is_close_only)
             else await cache.get_broker_accounts(db, sub.user_id)
         )
+        # Only accounts we can actually trade on. A broker connection that is not
+        # `connected` cannot place an order — and nothing in the app moves an
+        # account back INTO that state on its own (the only writes of this column
+        # set it to "connected", on a successful connect), so such a row is dead
+        # until the subscriber reconnects. Attempting it anyway produced a
+        # REJECTED mirror plus a copy.rejected notification — and an SMS for
+        # anyone opted in — on EVERY trader trade, forever.
+        #
+        # Measured on QA before this filter: of 155 mirrors placed on
+        # non-connected accounts over 30 days, 155 were rejected. Not one filled,
+        # which is what makes skipping them safe rather than a silent pause —
+        # they were never going to fill.
+        #
+        # Note the deliberate contrast with services.balance_sync, which refuses
+        # to FLIP this column on an auth error precisely so a misclassification
+        # can't stop someone's copying. That restraint is why a row sitting here
+        # is trustworthy: it got there by an explicit disconnect, not a guess.
+        sub_accounts = [
+            a for a in sub_accounts
+            if getattr(a, "connection_status", "connected") == "connected"
+        ]
         if not sub_accounts:
             results.append(FanoutResult(
                 subscriber_user_id=sub.user_id,
