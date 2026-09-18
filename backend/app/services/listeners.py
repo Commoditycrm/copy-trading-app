@@ -4,9 +4,10 @@ Callers (FastAPI lifespan, /api/brokers connect/disconnect, etc.) talk to
 this module instead of importing ``trade_listener`` / ``ibkr_listener`` /
 ``snaptrade_listener`` directly. Routing is by ``BrokerName``.
 
-Direct Webull integration has been removed — users connect Webull through
-SnapTrade (which lands as ``BrokerName.SNAPTRADE`` rows handled by
-``snaptrade_listener``).
+Webull is reachable two ways and they are NOT the same path: a DIRECT
+connection (``BrokerName.WEBULL`` → ``webull_listener``, gated by
+``settings.webull_direct_enabled``), or through the SnapTrade aggregator
+(``BrokerName.SNAPTRADE`` → ``snaptrade_listener``).
 
 Status reads are unified: ``listener_state.get_status`` returns the live
 state regardless of which broker actually drives it. All backends share
@@ -258,12 +259,6 @@ async def run_reconciler(interval_s: float = 10.0) -> None:
 # Backwards-compat re-export — some call sites still import get_status from
 # trade_listener. listener_state is the source of truth now.
 get_status = listener_state.get_status
-
-
-# Brokers that actually run a listener task. WEBULL (dormant — historical
-# rows only) and FAKE have none, so reconcile() ignores them — otherwise it
-# would try to (re)start a non-existent listener on every tick.
-_LISTENED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.IBKR)
 
 
 def _fetch_desired() -> dict[uuid.UUID, tuple[uuid.UUID, BrokerName]]:
