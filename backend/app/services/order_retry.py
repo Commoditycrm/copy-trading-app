@@ -176,28 +176,6 @@ def is_replace_chain_pending_error(exc: Exception) -> bool:
     )
 
 
-_NO_POSITION_RE = re.compile(r"position.*not.*found|no.*position", re.I)
-_LIQUIDATION_ONLY_RE = re.compile(
-    r"liquidat(?:e|es|ed|ing|ion)|option trading restriction|can only.*close.*exist", re.I
-)
-
-
-def is_no_position_close_error(exc: Exception) -> bool:
-    """True when the broker rejected a CLOSE claiming there's no position to
-    close. SnapTrade's order-placement view can lag its positions view (right
-    after an entry fills), so a close fired promptly is rejected 'no position'
-    even though the subscriber holds it. Prod AAPL $337.5 2026-09: closes were
-    REJECTED 'no matching position' while the broker held 3 — subscribers stranded
-    long. Transient: a short wait + retry clears it once SnapTrade's order view
-    catches up. The caller re-confirms the live held qty first, so a GENUINELY
-    flat account is never retried (it raises position_already_flat instead).
-
-    Matches the same text clean_broker_error normalizes to 'No matching position
-    to close', and EXCLUDES the (non-transient) 'liquidation only' restriction."""
-    m = str(exc)
-    return bool(_NO_POSITION_RE.search(m)) and not _LIQUIDATION_ONLY_RE.search(m)
-
-
 def live_closeable_quantity(
     adapter: BrokerAdapter, req: BrokerOrderRequest
 ) -> "Decimal | None":
