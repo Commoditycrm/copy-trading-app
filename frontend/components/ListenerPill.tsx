@@ -51,6 +51,31 @@ const STATE_COLOR: Record<ListenerStatus["state"], string> = {
   no_broker: "#94a3b8",
 };
 
+/* The maps above are typed against the union so a state added to ListenerStatus
+ * can't be forgotten here. At RUNTIME, though, `state` is whatever the API sent:
+ * the backend types it as a bare string (listener_state.ListenerState = str),
+ * persists it in Redis and mirrors it over SSE, so this component can be handed
+ * a value it has never heard of — a state added server-side, a stale Redis
+ * mirror, or simply a browser running an older bundle than the API it is talking
+ * to.
+ *
+ * That last one is not hypothetical: `no_broker` was added to the backend and
+ * this map in the same commit, so a cached pre-that-commit chunk looked it up,
+ * got undefined, and threw on `label.toLowerCase()`. This pill renders inside
+ * AppShell's header, so the crash took down EVERY page rather than one badge.
+ * Look the values up through these helpers — an unknown state should degrade to
+ * a neutral chip, never white-screen the app. */
+const UNKNOWN_LABEL = "Unknown";
+const UNKNOWN_COLOR = "#94a3b8";
+
+function labelFor(state: string): string {
+  return (STATE_LABEL as Record<string, string>)[state] ?? UNKNOWN_LABEL;
+}
+
+function colorFor(state: string): string {
+  return (STATE_COLOR as Record<string, string>)[state] ?? UNKNOWN_COLOR;
+}
+
 function fmtRel(iso: string | null): string {
   if (!iso) return "never";
   const ms = Date.now() - new Date(iso).getTime();
@@ -103,8 +128,8 @@ export function ListenerPill({ role }: Props) {
   }, [sse.state]);
 
   const s = status?.state ?? "disconnected";
-  const color = STATE_COLOR[s];
-  const label = STATE_LABEL[s];
+  const color = colorFor(s);
+  const label = labelFor(s);
   // Both roles now describe THEIR OWN broker.
   const prefix = "Broker";
 
