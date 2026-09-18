@@ -248,7 +248,16 @@ def _option_terms(
                 "expirationDate", "expire_date", "expireDate", "exp_date", "expiry",
             ))
         if strike is None:
-            strike = _dec(_first(src, "strike_price", "strikePrice", "strike"))
+            # option_exercise_price is what Webull ACTUALLY sends on a position
+            # leg — confirmed against a live account (2026-09-18). The
+            # strike_price spellings below are the ORDER-side naming, which is
+            # what _build_option_order writes; they are kept because the same
+            # helper reads order-shaped payloads too.
+            strike = _dec(_first(
+                src, "option_exercise_price", "optionExercisePrice",
+                "exercise_price", "exercisePrice",
+                "strike_price", "strikePrice", "strike",
+            ))
         if right is None:
             right = _as_right(_first(
                 src, "option_type", "optionType", "option_right", "put_call",
@@ -707,8 +716,12 @@ class WebullAdapter(BrokerAdapter):
             direction = str(_first(p, "direction", "side", "position_side") or "").upper()
             if direction in ("SHORT", "SELL") and qty > 0:
                 qty = -qty
+            # position_id is Webull's unique handle for this holding; the bare
+            # ticker is the last resort because it is not unique across the
+            # option contracts of one underlying.
             broker_symbol = str(
-                _first(p, "instrument_id", "broker_symbol", "symbol") or sym
+                _first(p, "instrument_id", "position_id", "broker_symbol", "symbol")
+                or sym
             )
 
             expiry = strike = right = None
@@ -738,7 +751,7 @@ class WebullAdapter(BrokerAdapter):
                 current_price=_dec(_first(p, "last_price", "market_price", "price")),
                 market_value=_dec(_first(p, "market_value", "market_val")),
                 unrealized_pnl=_dec(_first(p, "unrealized_pnl", "unrealized_profit_loss", "open_pnl")),
-                cost_basis=_dec(_first(p, "cost_basis", "total_cost")),
+                cost_basis=_dec(_first(p, "cost_basis", "total_cost", "cost")),
                 option_expiry=expiry,
                 option_strike=strike,
                 option_right=right,
