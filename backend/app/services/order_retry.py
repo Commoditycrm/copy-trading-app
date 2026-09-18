@@ -102,6 +102,30 @@ def is_order_conflict_error(exc: Exception) -> bool:
     )
 
 
+# A throttle, in every spelling our brokers use. Compiled once; matched
+# case-insensitively against the exception text.
+#
+#   throttl…                 SnapTrade ("Request was throttled. Expected
+#                            available in 1 second.")
+#   too[ _-]many[ _-]requests / rate[ _-]limit
+#                            word-separator-agnostic on purpose: Webull's SDK
+#                            surfaces the code UNDERSCORED (TOO_MANY_REQUESTS),
+#                            which the old literal " ".join spellings missed.
+#   <status|code|http> 429   the numeric form, but ONLY when it follows one of
+#                            those tokens. A bare \b429\b would also match a
+#                            price or quantity inside an unrelated rejection
+#                            ("...for 429.50"), and a false positive here
+#                            RE-PLACES the order — so the number has to be
+#                            positionally identifiable as a status.
+_RATE_LIMIT_RE = re.compile(
+    r"throttl"
+    r"|too[\s_-]*many[\s_-]*requests"
+    r"|rate[\s_-]*limit"
+    r"|(?:status_code|status|code|http)[\"']?\s*[:=]?\s*[\"']?429\b",
+    re.I,
+)
+
+
 def is_rate_limit_error(exc: Exception) -> bool:
     """True when the broker THROTTLED the request (HTTP 429 / 'Request was
     throttled'), as opposed to rejecting the order on its merits.
@@ -112,16 +136,22 @@ def is_rate_limit_error(exc: Exception) -> bool:
     under our per-broker concurrency cap, and the throttle self-clears in ~1s
     ('Expected available in 1 second'). Prod QQQ 2026-08-11: a subscriber's
     closing SELL was 429'd and — with no inline retry — went straight to REJECTED,
-    stranding them long until a manual close. We retry the throttle instead."""
-    m = str(exc).lower()
-    return (
-        "request was throttled" in m
-        or "throttled" in m
-        or "too many requests" in m
-        or "rate limit" in m
-        or "'status_code': 429" in m
-        or '"status_code": 429' in m
-    )
+    stranding them long until a manual close. We retry the throttle instead.
+
+    Webull direct throttles the same way and was NOT matched here before. Its SDK
+    raises every non-2xx as a ``ServerException`` whose text is
+    ``"HTTP Status: 429, Code: TOO_MANY_REQUESTS, Msg: ..., RequestID: ..."`` —
+    underscored, and with the status spelled ``HTTP Status:`` rather than
+    ``status_code``, so none of the old literals fired. Its trade endpoints are
+    capped tightly (~10 requests / 30s per app id, shared across every account
+    under one app_key), so a throttled mirror CLOSE is an ordinary occurrence,
+    not an edge case: without the inline retry it went straight to REJECTED and
+    left the subscriber holding a position the trader had already exited.
+
+    Deliberately NOT matched: Webull's ``VERIFY_FAILURE_EXCEED_LIMIT`` auth
+    lockout. That is a credentials problem, not a throttle — retrying it inline
+    would hammer the auth endpoint and deepen the lockout."""
+    return bool(_RATE_LIMIT_RE.search(str(exc)))
 
 
 def is_replace_chain_pending_error(exc: Exception) -> bool:
