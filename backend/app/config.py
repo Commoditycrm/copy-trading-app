@@ -122,6 +122,25 @@ class Settings(BaseSettings):
     # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
     # 4s also works (7.5 / 30s). Don't go below 3.5s.
     webull_poll_interval_seconds: float = 5.0
+    # ── Webull token authorisation wait ──────────────────────────────────
+    # Webull's SDK creates an access token in PENDING status and then BLOCKS,
+    # polling until the account owner authorises it in their Webull app. Its own
+    # defaults are a 300-second wait polling every 5s — five minutes of a thread
+    # sitting inside whatever called it.
+    #
+    # Nothing here wants that. On the connect path it blocks an HTTP request the
+    # browser and reverse proxy will both abandon long before it returns, so the
+    # user gets a spinner that never resolves and no instruction. In the
+    # background paths it is just as pointless: the listener already retries with
+    # backoff, the fill reconciler runs every 30s, and the poller retries each
+    # cycle — every one of them recovers on its own the moment the token is
+    # approved.
+    #
+    # So we fail fast instead and let the caller retry. Both must be positive
+    # integers (the SDK validates), and the loop always sleeps one interval
+    # before re-checking, so this pair costs ~2s and two checks.
+    webull_token_check_duration_seconds: int = 1
+    webull_token_check_interval_seconds: int = 2
     # Cache TTLs (seconds) — short by design; invalidated on writes too.
     cache_ttl_subscribers: int = 60
     cache_ttl_broker_accounts: int = 300

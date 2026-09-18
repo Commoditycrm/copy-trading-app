@@ -385,7 +385,16 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> An
         cached = _trade_clients.get(app_key)
         if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
             return cached[0]
-        api_client = ApiClient(app_key, app_secret, region_id)
+        from app.config import get_settings  # noqa: PLC0415
+        _s = get_settings()
+        api_client = ApiClient(
+            app_key, app_secret, region_id,
+            # Don't inherit the SDK's 5-minute block waiting for the owner to
+            # authorise the token — see the config comment. Fail fast; every
+            # caller here retries.
+            token_check_duration_seconds=_s.webull_token_check_duration_seconds,
+            token_check_interval_seconds=_s.webull_token_check_interval_seconds,
+        )
         _suppress_sdk_file_logger(api_client)
         set_per_account_token_dir(api_client, app_key)   # isolate token per app_key
         client = TradeClient(api_client)   # token flow runs HERE — once per TTL
