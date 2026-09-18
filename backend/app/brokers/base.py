@@ -150,6 +150,23 @@ class BrokerAdapter(ABC):
     # copy-engine modify path checks the flag and falls back to cancel+place.
     supports_replace: bool = False
 
+    # Whether this broker REFUSES to trade a plain MARKET order in the pre/post
+    # market session, so a mirror that must fill during extended hours has to be
+    # re-routed as an explicitly-flagged marketable LIMIT instead.
+    #
+    # True for the direct integrations that gate the session at the order level:
+    #   * Alpaca — extended hours needs order_type=LIMIT + extended_hours=True;
+    #   * Webull direct — a MARKET order is forced to support_trading_session
+    #     CORE (see WebullAdapter._session), so it just queues until 09:30.
+    # False for aggregator-routed accounts (SnapTrade), where the upstream broker
+    # handles the session itself and a MARKET order trades extended hours
+    # natively — re-routing those to a limit would only make them miss.
+    #
+    # Consumed by copy_engine._needs_extended_hours_limit, which pairs it with
+    # the current clock. Default False so a broker that hasn't been checked is
+    # never handed an extended-hours order it can't honour.
+    requires_extended_hours_limit: bool = False
+
     # Whether this adapter can place a native TRAILING_STOP order. The Sell-All /
     # close flow checks this per position: when True (and the instrument is
     # eligible — most brokers offer trailing stops on stocks only), it closes the

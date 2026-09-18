@@ -203,6 +203,434 @@ def test_get_order_maps_status():
     assert res.broker_order_id == "c" and res.filled_quantity == Decimal("0")
 
 
+# ── market data (drives marketable-limit pricing) ───────────────────────────
+# Webull gates quotes behind a SEPARATE entitlement from trading, so these
+# methods are best-effort by contract: every caller treats None as "leave the
+# order alone" and falls back to trader-anchored pricing. What must hold is that
+# a GOOD response is parsed, a BAD one degrades quietly, and an ENTITLEMENT
+# failure stops us spending a doomed HTTP call per mirror on every fanout.
+import app.brokers.webull as wb  # noqa: E402
+
+
+def _reset_quote_backoff():
+    with wb._quotes_disabled_lock:
+        wb._quotes_disabled_until.clear()
+
+
+class _FakeMarketData:
+    def __init__(self, resp, raises=None):
+        self._resp, self._raises = resp, raises
+        self.calls = 0
+
+    def get_snapshot(self, symbols, category, **kw):
+        self.calls += 1
+        if self._raises:
+            raise self._raises
+        return self._resp
+
+    def get_option_snapshot(self, symbols, category):
+        self.calls += 1
+        if self._raises:
+            raise self._raises
+        return self._resp
+
+
+class _FakeDataClient:
+    def __init__(self, resp, raises=None):
+        md = _FakeMarketData(resp, raises)
+        self.market_data = md
+        self.option_market_data = md
+
+
+def _quote_adapter(resp, raises=None):
+    _reset_quote_backoff()
+    a = _adapter()
+    a._data_client = lambda: _FakeDataClient(resp, raises)  # type: ignore[method-assign]
+    return a
+
+
+def test_stock_latest_price_parses_snapshot():
+    a = _quote_adapter(_FakeResp(200, {"data": [{"symbol": "AAPL", "last_price": "187.42"}]}))
+    assert a.get_stock_latest_price("aapl") == Decimal("187.42")
+
+
+def test_stock_latest_price_accepts_a_bare_list_body():
+    a = _quote_adapter(_FakeResp(200, [{"symbol": "AAPL", "close": "12.5"}]))
+    assert a.get_stock_latest_price("AAPL") == Decimal("12.5")
+
+
+def test_stock_latest_price_none_on_non_200():
+    assert _quote_adapter(_FakeResp(500, None)).get_stock_latest_price("AAPL") is None
+
+
+def test_option_quote_parses_flat_bid_ask():
+    a = _quote_adapter(_FakeResp(200, {"data": [
+        {"symbol": "AAPL260619C00220000", "bid_price": "3.00", "ask_price": "3.20"},
+    ]}))
+    assert a.get_option_latest_quote("AAPL260619C00220000") == (Decimal("3.00"), Decimal("3.20"))
+
+
+def test_option_quote_parses_nested_depth_lists():
+    """Some shapes return top-of-book inside bid/ask ladders."""
+    a = _quote_adapter(_FakeResp(200, {"data": [{
+        "bid_list": [{"price": "1.05", "size": "10"}],
+        "ask_list": [{"price": "1.15", "size": "8"}],
+    }]}))
+    assert a.get_option_latest_quote("AAPL260619C00220000") == (Decimal("1.05"), Decimal("1.15"))
+
+
+def test_option_quote_one_sided_book():
+    a = _quote_adapter(_FakeResp(200, {"data": [{"bid_price": "1.05"}]}))
+    bid, ask = a.get_option_latest_quote("AAPL260619C00220000")
+    assert bid == Decimal("1.05") and ask is None
+
+
+def test_option_quote_none_pair_when_unavailable():
+    assert _quote_adapter(_FakeResp(200, {"data": []})).get_option_latest_quote("X") == (None, None)
+
+
+def test_entitlement_failure_suppresses_further_quote_calls():
+    """An app_key without the Market Data entitlement must not cost one failed
+    request per mirror — a 50-subscriber option close would fire 50 of them."""
+    _reset_quote_backoff()
+    a = _adapter()
+    client = _FakeDataClient(None, raises=RuntimeError(
+        "HTTP Status: 403, Code: NO_PERMISSION, Msg: market data not subscribed"
+    ))
+    a._data_client = lambda: client  # type: ignore[method-assign]
+
+    assert a.get_option_latest_quote("AAPL260619C00220000") == (None, None)
+    assert client.option_market_data.calls == 1
+    # Second and third attempts short-circuit before touching the SDK.
+    assert a.get_option_latest_quote("AAPL260619C00220000") == (None, None)
+    assert a.get_stock_latest_price("AAPL") is None
+    assert client.option_market_data.calls == 1
+    _reset_quote_backoff()
+
+
+def test_transient_failure_does_not_suppress_quotes():
+    """A blip must NOT disable quotes — only an entitlement-shaped failure does,
+    or one timeout would blind us for the whole backoff window."""
+    _reset_quote_backoff()
+    a = _adapter()
+    client = _FakeDataClient(None, raises=RuntimeError("read timed out"))
+    a._data_client = lambda: client  # type: ignore[method-assign]
+
+    assert a.get_stock_latest_price("AAPL") is None
+    assert a.get_stock_latest_price("AAPL") is None
+    assert client.market_data.calls == 2     # still trying
+    _reset_quote_backoff()
+
+
+def test_quote_failures_never_raise():
+    """Callers price orders with these; an exception escaping would fail the
+    mirror instead of degrading it."""
+    _reset_quote_backoff()
+    a = _adapter()
+    a._data_client = lambda: (_ for _ in ()).throw(ImportError("no SDK"))  # type: ignore[method-assign]
+    assert a.get_stock_latest_price("AAPL") is None
+    assert a.get_option_latest_quote("AAPL260619C00220000") == (None, None)
+    _reset_quote_backoff()
+
+
+# ── account listing (the connect-time picker) ───────────────────────────────
+# One Webull app_key reaches EVERY account under the login — Cash, Margin, IRA,
+# Futures — and which one we trade is decided purely by the account_id in the
+# stored credentials. That id is not the account number shown anywhere in the
+# Webull app, so the old free-text field asked users to guess: a real-but-wrong
+# id verifies cleanly and then every mirror order trades in the wrong account
+# with nothing to flag it. list_accounts feeds the picker that replaces it.
+
+class _FakeAccountOps:
+    def __init__(self, accounts_resp, balance_resp=None):
+        self._accounts = accounts_resp
+        self._balance = balance_resp
+        self.balance_calls = []
+
+    def get_account_list(self):
+        return self._accounts
+
+    def get_account_balance(self, account_id):
+        self.balance_calls.append(account_id)
+        if isinstance(self._balance, Exception):
+            raise self._balance
+        return self._balance
+
+
+class _FakeTradeAccounts:
+    def __init__(self, ops):
+        self.account_v2 = ops
+
+
+_ACCOUNTS_BODY = [
+    {"account_id": "ACC-CASH", "account_number": "8XX111", "account_type": "CASH"},
+    {"account_id": "ACC-MARGIN", "account_number": "8XX222", "account_type": "MARGIN"},
+]
+
+
+def _accounts_adapter(accounts_body, balance_body=None, account_id="ACC-CASH"):
+    a = WebullAdapter(
+        {"app_key": "k", "app_secret": "s", "account_id": account_id, "region_id": "us"}
+    )
+    ops = _FakeAccountOps(_FakeResp(200, accounts_body), balance_body)
+    a._trade_client = lambda: _FakeTradeAccounts(ops)  # type: ignore[method-assign]
+    a._ops = ops  # type: ignore[attr-defined]
+    return a
+
+
+def test_list_accounts_returns_every_account():
+    a = _accounts_adapter(_ACCOUNTS_BODY)
+    out = a.list_accounts()
+    assert [x["account_id"] for x in out] == ["ACC-CASH", "ACC-MARGIN"]
+    assert out[0]["account_number"] == "8XX111"
+    assert out[1]["account_type"] == "MARGIN"
+
+
+def test_list_accounts_with_balances_labels_the_funded_one():
+    """Equity is the whole point: it is what lets a user tell their funded
+    account from an empty Futures or unfunded Cash one."""
+    a = _accounts_adapter(
+        _ACCOUNTS_BODY,
+        _FakeResp(200, {
+            "total_net_liquidation_value": "5200.75",
+            "total_asset_currency": "USD",
+            "account_currency_assets": [{"buying_power": "10400.00"}],
+        }),
+    )
+    out = a.list_accounts(with_balances=True)
+    assert out[0]["total_equity"] == Decimal("5200.75")
+    assert out[0]["buying_power"] == Decimal("10400.00")
+    assert out[0]["currency"] == "USD"
+
+
+def test_list_accounts_survives_a_failed_balance_read():
+    """An account whose balance can't be read is still offered — just without
+    figures. Dropping it would hide the very account they meant to pick."""
+    a = _accounts_adapter(_ACCOUNTS_BODY, RuntimeError("balance unavailable"))
+    out = a.list_accounts(with_balances=True)
+    assert len(out) == 2
+    assert out[0]["total_equity"] is None
+
+
+def test_list_accounts_skips_rows_without_an_id():
+    a = _accounts_adapter([{"account_number": "no-id"}, *_ACCOUNTS_BODY])
+    assert len(a.list_accounts()) == 2
+
+
+def test_list_accounts_raises_on_a_bad_response():
+    a = WebullAdapter({"app_key": "k", "app_secret": "s", "account_id": "x"})
+    a._trade_client = lambda: _FakeTradeAccounts(  # type: ignore[method-assign]
+        _FakeAccountOps(_FakeResp(401, None))
+    )
+    try:
+        a.list_accounts()
+    except RuntimeError:
+        return
+    raise AssertionError("expected a RuntimeError for a non-200 account list")
+
+
+# ── verify_connection surfaces the number, not the opaque id ────────────────
+def test_verify_connection_reports_the_human_readable_account_number():
+    """broker_account_number is display-only, and showing the number the user
+    recognises from the Webull app is how they notice a mislink at a glance."""
+    a = _accounts_adapter(_ACCOUNTS_BODY, account_id="ACC-MARGIN")
+    info = a.verify_connection()
+    assert info.broker_account_id == "8XX222"
+    assert info.supports_fractional is False
+
+
+def test_verify_connection_falls_back_to_the_id_when_no_number():
+    a = _accounts_adapter([{"account_id": "ACC-ONLY"}], account_id="ACC-ONLY")
+    assert a.verify_connection().broker_account_id == "ACC-ONLY"
+
+
+def test_verify_connection_rejects_an_id_these_keys_cannot_trade():
+    a = _accounts_adapter(_ACCOUNTS_BODY, account_id="ACC-NOPE")
+    try:
+        a.verify_connection()
+    except RuntimeError as exc:
+        assert "ACC-NOPE" in str(exc)
+        assert "ACC-CASH" in str(exc)   # the message lists what IS available
+        return
+    raise AssertionError("expected a RuntimeError for an unknown account_id")
+
+
+# ── cancel_order's True/False contract ──────────────────────────────────────
+# This is not a logging nicety. copy_engine._force_fill_cancel_then_place places
+# a full-size REPLACEMENT on any True, so reporting True for an order that had
+# already FILLED doubles the subscriber's position. False means "already
+# terminal, place nothing"; an unresolvable state must RAISE, never return True.
+
+class _FakeCancelOps:
+    """order_v3 / order_v2 double. `details` is the sequence of get_order_detail
+    responses to hand back, one per call."""
+
+    def __init__(self, details, cancel_resp):
+        self._details = list(details)
+        self._cancel = cancel_resp
+        self.cancels = 0
+
+    def get_order_detail(self, account_id, coid):
+        return self._details.pop(0) if self._details else _FakeResp(500, None)
+
+    def cancel_order(self, account_id, coid):
+        self.cancels += 1
+        return self._cancel
+
+    def cancel_option(self, account_id, coid):
+        self.cancels += 1
+        return self._cancel
+
+
+class _FakeCancelTrade:
+    def __init__(self, ops):
+        self.order_v3 = ops
+        self.order_v2 = ops
+
+
+def _cancel_adapter(details, cancel_resp=None):
+    a = _adapter()
+    ops = _FakeCancelOps(details, cancel_resp or _FakeResp(200, {}))
+    a._trade_client = lambda: _FakeCancelTrade(ops)  # type: ignore[method-assign]
+    a._ops = ops  # type: ignore[attr-defined]
+    return a
+
+
+def _detail(status):
+    return _FakeResp(200, {"category": "US_STOCK", "items": [{"order_status": status}]})
+
+
+def test_cancel_returns_false_for_an_already_filled_order():
+    a = _cancel_adapter([_detail("FILLED")])
+    assert a.cancel_order("c1") is False
+    assert a._ops.cancels == 0        # nothing to cancel, so nothing was sent
+
+
+def test_cancel_returns_true_for_a_live_order():
+    a = _cancel_adapter([_detail("SUBMITTED")])
+    assert a.cancel_order("c1") is True
+
+
+def test_unreadable_order_that_turns_out_filled_returns_false():
+    """The regression. The first read fails, the cancel returns 200 anyway — and
+    the order had already filled. Returning True here is what doubles the
+    position, so the outcome is CONFIRMED by re-reading."""
+    a = _cancel_adapter([_FakeResp(500, None), _detail("FILLED")])
+    assert a.cancel_order("c1") is False
+
+
+def test_unreadable_order_that_was_live_returns_true():
+    a = _cancel_adapter([_FakeResp(500, None), _detail("CANCELLED")])
+    assert a.cancel_order("c1") is True
+
+
+def test_unconfirmable_cancel_raises_rather_than_claiming_success():
+    """Cancel accepted but the order still can't be read (a throttle, most
+    likely — the same reason the first read failed). 'Unknown' must not be
+    reported as True: the caller's failure path leaves the mirror alone, which
+    is the safe outcome."""
+    a = _cancel_adapter([_FakeResp(500, None), _FakeResp(500, None)])
+    try:
+        a.cancel_order("c1")
+    except RuntimeError as exc:
+        assert "could not be confirmed" in str(exc)
+        return
+    raise AssertionError("expected a RuntimeError when the state can't be confirmed")
+
+
+# ── place_order validates the BODY, not just the status line ────────────────
+def test_place_accepts_the_documented_success_body():
+    a = _adapter()
+    a._assert_place_accepted(
+        _FakeResp(200, {"client_order_id": "c1", "order_id": "WB99"}), "c1",
+    )   # must not raise
+
+
+def test_place_rejects_a_200_carrying_an_error_code():
+    """A batch place endpoint can return 200 with a per-order failure. Treating
+    that as success writes a SUBMITTED row whose broker_order_id doesn't exist —
+    the reconciler can never resolve it and close-detection thinks the
+    subscriber holds a position they never opened."""
+    a = _adapter()
+    try:
+        a._assert_place_accepted(
+            _FakeResp(200, [{"error_code": "INSUFFICIENT_BUYING_POWER",
+                             "msg": "not enough cash"}]), "c1",
+        )
+    except RuntimeError as exc:
+        assert "INSUFFICIENT_BUYING_POWER" in str(exc)
+        return
+    raise AssertionError("expected a RuntimeError for an error body")
+
+
+def test_place_accepts_an_unfamiliar_body_rather_than_failing_the_order():
+    """Conservative about shapes we don't recognise: a Webull response change
+    should degrade to a log line, not refuse every order."""
+    a = _adapter()
+    a._assert_place_accepted(_FakeResp(200, {"something": "new"}), "c1")
+
+
+def test_place_still_raises_on_a_non_200():
+    a = _adapter()
+    try:
+        a._assert_place_accepted(_FakeResp(400, {"msg": "bad"}), "c1")
+    except RuntimeError:
+        return
+    raise AssertionError("expected a RuntimeError for a non-200 place")
+
+
+# ── batch order snapshot (one call instead of N) ────────────────────────────
+class _FakeListOps:
+    def __init__(self, resp):
+        self._resp = resp
+        self.calls = 0
+
+    def list_today_orders(self, account_id, page_size=10):
+        self.calls += 1
+        return self._resp
+
+
+class _FakeListTrade:
+    def __init__(self, ops):
+        self.order = ops
+
+
+def test_orders_snapshot_keys_by_our_client_order_id():
+    """We key every order we place by our own client_order_id, and that is what
+    the broker_order_id column holds — so the snapshot must too."""
+    a = _adapter()
+    a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(200, {  # type: ignore[method-assign]
+        "orders": [
+            {"order_id": "WB1", "client_order_id": "c1",
+             "items": [{"order_status": "FILLED", "filled_qty": "2",
+                        "filled_price": "10.50"}]},
+            {"order_id": "WB2", "client_order_id": "c2",
+             "items": [{"order_status": "SUBMITTED", "filled_qty": "0"}]},
+        ]
+    })))
+    snap = a.get_orders_snapshot()
+    assert set(snap) == {"c1", "c2"}
+    assert snap["c1"].status == OrderStatus.FILLED
+    assert snap["c1"].filled_quantity == Decimal("2")
+    assert snap["c1"].filled_avg_price == Decimal("10.50")
+    assert snap["c2"].status == OrderStatus.SUBMITTED
+
+
+def test_orders_snapshot_is_empty_on_failure_not_raising():
+    """Best-effort by contract — the caller falls back to per-order reads."""
+    a = _adapter()
+    a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(429, None)))  # type: ignore[method-assign]
+    assert a.get_orders_snapshot() == {}
+
+
+def test_orders_snapshot_skips_rows_without_a_client_order_id():
+    a = _adapter()
+    a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(200, {  # type: ignore[method-assign]
+        "orders": [{"order_id": "WB9", "items": [{"order_status": "FILLED"}]}]
+    })))
+    assert a.get_orders_snapshot() == {}
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
