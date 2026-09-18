@@ -108,9 +108,23 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     BrokerName.ALPACA: 10.0,
     BrokerName.SNAPTRADE: 60.0,
     # Direct Webull authenticates with each subscriber's OWN app_key, so its
-    # quota is per-account (not a shared platform pool like SnapTrade) — safe to
-    # poll at the Alpaca-like 10s cadence with no concurrency semaphore.
-    BrokerName.WEBULL: 10.0,
+    # quota is per-account rather than a shared platform pool like SnapTrade —
+    # which is why it needs no concurrency semaphore. But per-account does NOT
+    # mean generous, and this entry was originally set to Alpaca's 10s on that
+    # reasoning: Alpaca allows ~200 requests/min per account, Webull about 20
+    # (~10 per 30s), and Webull's is shared across EVERY endpoint that key
+    # touches — balance, positions, order reads, placement, cancellation.
+    #
+    # At 10s the poller alone claimed 3 of those ~10 slots per window, and a
+    # single tick can make two or three calls (the P&L read, the copy-bracket
+    # fill refresh, the option-SL position read), so it could consume the entire
+    # budget before a single order was placed. Confirmed live on 2026-09-18: two
+    # ordinary back-to-back reads against a freshly connected account returned
+    # 429 TOO_MANY_REQUESTS immediately, because the poller had already spent the
+    # window. Matching SnapTrade's 60s leaves the budget for trading, which is
+    # what actually needs it — a subscriber's daily-limit kill switches do not
+    # need six evaluations a minute.
+    BrokerName.WEBULL: 60.0,
 }
 
 
