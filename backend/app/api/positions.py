@@ -125,8 +125,16 @@ def list_positions(
                     option_strike=p.option_strike,
                     option_right=p.option_right,
                 ))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # Best-effort: one broker's outage shouldn't blank the whole table.
+            # But it must not be SILENT either — this swallows everything, so a
+            # throttle, a decrypt failure or an adapter raise all render as "no
+            # positions", which is indistinguishable from a flat account and
+            # leaves nothing to debug from. Log which account and why.
+            log.warning(
+                "positions: skipping account %s (%s) — %s",
+                acct.id, acct.broker.value, str(exc)[:300], exc_info=True,
+            )
             continue
     return out
 

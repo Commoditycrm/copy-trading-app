@@ -924,7 +924,10 @@ class WebullAdapter(BrokerAdapter):
                 status=_STATUS_MAP.get(status_raw, OrderStatus.SUBMITTED),
                 submitted_at=now,
                 filled_quantity=(
-                    _dec(_first(leg, "filled_qty", "filledQty", "cumulative_quantity"))
+                    # Query Day Orders uses filled_qty; the order-detail endpoint
+                    # uses filled_quantity. Accept both — see _fetch_detail.
+                    _dec(_first(leg, "filled_qty", "filled_quantity", "filledQty",
+                                "cumulative_quantity"))
                     or Decimal(0)
                 ),
                 filled_avg_price=_dec(
@@ -1132,9 +1135,23 @@ class WebullAdapter(BrokerAdapter):
             or _first(order, "order_status", "status") or ""
         ).upper()
         status = _STATUS_MAP.get(status_raw, OrderStatus.SUBMITTED)
+        # Webull spells this DIFFERENTLY per endpoint, and both spellings are
+        # live — confirmed against a real account (2026-09-18):
+        #   /openapi/trade/order/detail  → orders[].filled_quantity
+        #   Query Day Orders             → items[].filled_qty
+        # Only the second was listed here, so a detail read of a filled order
+        # returned status=FILLED with filled_quantity=0. That combination is
+        # poison for the copy path: _closeable_quantity sums filled_quantity, so
+        # the subscriber looked FLAT while actually holding the position, the
+        # mirror SELL was stamped is_closing=False and went out as SELL_TO_OPEN,
+        # and Webull refused it with
+        # OPENAPI_POSITION_ORDER_INTENT_MISMATCH "Close intent mismatches
+        # position direction" — i.e. you cannot open a short in a contract you
+        # are already long. Check both spellings everywhere.
         filled_qty = (
-            _dec(_first(leg, "filled_qty", "filledQty", "cumulative_quantity"))
-            or _dec(_first(order, "filled_qty", "filledQty"))
+            _dec(_first(leg, "filled_quantity", "filled_qty", "filledQuantity",
+                        "filledQty", "cumulative_quantity"))
+            or _dec(_first(order, "filled_quantity", "filled_qty", "filledQty"))
             or Decimal(0)
         )
         filled_px = (
