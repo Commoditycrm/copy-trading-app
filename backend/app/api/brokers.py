@@ -3,8 +3,11 @@
 Supported brokers
 -----------------
 - **Alpaca** (direct): paste API key + secret. Realtime via WebSocket.
-- **Webull** (direct, unofficial): username + password + MFA + 6-digit
-  trade PIN. Realtime via 2s polling (see app/services/webull_listener.py).
+- **Webull** (direct, OFFICIAL OpenAPI): app_key + app_secret from
+  developer.webull.com, plus the account to trade — picked from
+  ``POST /api/brokers/webull/accounts`` rather than typed. Realtime via a
+  gRPC trade-event stream with a REST poll backstop (see
+  app/services/webull_listener.py). Gated by ``webull_direct_enabled``.
 - **SnapTrade** (aggregator): hosted-portal OAuth flow. ~20 brokers via
   a single integration. Realtime via 5s polling — SnapTrade itself polls
   the upstream broker, so faster polling on our side buys nothing.
@@ -20,8 +23,9 @@ attached.
 
 Flow
 ----
-1. ``POST /api/brokers/webull/start-mfa``  (Webull only)
-       Trigger Webull to send the user an MFA code. Stateless.
+1. ``POST /api/brokers/webull/accounts``  (Webull only)
+       Exchange the API keys for the list of accounts they can trade, so
+       the user PICKS one. Persists nothing.
 2. ``POST /api/brokers/snaptrade/start``  (SnapTrade only)
        Register the SnapTrade user (idempotent — deletes+recreates on
        conflict) and return the hosted connection portal URL.
@@ -41,6 +45,7 @@ Flow
        Remove the connection. For SnapTrade, also removes the
        authorization on SnapTrade's side as a best-effort cleanup.
 """
+import hashlib
 import json
 import logging
 import uuid
@@ -48,7 +53,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user
@@ -58,8 +63,6 @@ from app.brokers.webull import WebullAdapter  # lazy SDK import inside its metho
 from app.brokers.ibkr import IBKRAdapter
 from app.brokers import snaptrade as snap
 from app.brokers.snaptrade import SnapTradeAdapter
-# Direct Webull integration removed — users connect Webull via SnapTrade
-# instead, which lands as broker=snaptrade rows handled by snaptrade_listener.
 from app.config import get_settings
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -69,8 +72,10 @@ from app.schemas.broker import (
     BrokerAccountSettingsIn,
     ConnectBrokerIn,
     FinishSnaptradeIn,
+    ListWebullAccountsIn,
     StartSnaptradeIn,
     StartSnaptradeOut,
+    WebullAccountOut,
 )
 from app.services import audit, balance_sync, cache, listeners, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
@@ -258,6 +263,45 @@ def _register_or_reset_snaptrade_user(user_id: uuid.UUID) -> str:
             ) from exc2
 
 
+def _user_broker_lock_key(user_id: uuid.UUID) -> int:
+    """Stable signed 64-bit key for ``pg_advisory_xact_lock``, derived from the
+    user id. Every endpoint that replaces this user's broker connection hashes
+    to the SAME key, so they serialise against each other — a /finish racing a
+    direct connect is just as dangerous as two of either.
+
+    blake2b, NOT Python's ``hash()``: string hashing is salted per process, so a
+    ``hash()``-derived key differs between uvicorn workers and the lock would
+    only serialise requests that happened to land on the same one. The web tier
+    runs ``--workers N``, so that is exactly the case this must cover.
+    """
+    digest = hashlib.blake2b(f"broker_connect:{user_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def _lock_user_brokers(db: Session, user_id: uuid.UUID) -> None:
+    """Serialise this user's broker-connection mutations for the rest of THIS
+    transaction (released automatically on commit/rollback).
+
+    Why it matters: connecting is replace-on-connect, so two concurrent calls
+    both read "no existing row" (or both evict), and the user ends up with TWO
+    BrokerAccount rows. The copy engine iterates a subscriber's accounts with no
+    dedup, so two rows means EVERY trader trade is mirrored TWICE onto the same
+    brokerage account. A double-click on Connect, a retried request, or React
+    Strict Mode double-firing an effect is enough to cause it.
+
+    No-ops outside PostgreSQL — advisory locks are a PG feature, and the SQLite
+    used in tests is single-connection anyway.
+    """
+    try:
+        if db.get_bind().dialect.name != "postgresql":
+            return
+    except Exception:  # noqa: BLE001 — no bind resolvable; nothing to lock against
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:k)"), {"k": _user_broker_lock_key(user_id)}
+    )
+
+
 def _evict_existing_brokers(
     db: Session, user: User, request: Request
 ) -> None:
@@ -440,13 +484,16 @@ def snaptrade_finish(
     SnapTrade authorization — each with its own polling listener
     double-processing every trade. The advisory lock serialises per-
     user so the second call sees the first's row and short-circuits.
-    Released automatically on commit/rollback."""
-    from sqlalchemy import text
+    Released automatically on commit/rollback.
 
+    It shares ONE key with the direct-connect endpoint (_lock_user_brokers), so
+    a /finish racing a direct connect serialises too — previously each derived
+    its own key and the two could interleave freely. That key is also blake2b
+    now: this used to hash the user id with Python's ``hash()``, which is salted
+    per process, so the key differed between uvicorn workers and the lock only
+    ever serialised requests that landed on the same one."""
     _ensure_snaptrade_configured()
-    # pg_advisory_xact_lock takes a bigint; hash to 63-bit positive int.
-    lock_key = hash(("snaptrade-finish", str(user.id))) & 0x7FFFFFFFFFFFFFFF
-    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+    _lock_user_brokers(db, user.id)
 
     # If a SnapTrade BrokerAccount already exists for this user, the
     # other concurrent /finish call already ran. Return that row
@@ -639,8 +686,52 @@ def _attr_safe(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
-# Direct Webull MFA-start endpoint removed — users connect Webull via
-# SnapTrade now. See the SnapTrade portal flow below.
+@router.post("/webull/accounts", response_model=list[WebullAccountOut])
+def list_webull_accounts(
+    payload: ListWebullAccountsIn,
+    user: User = Depends(current_user),
+) -> list[dict[str, Any]]:
+    """Step 1 of the direct-Webull connect: list the accounts these API keys can
+    trade, so the user PICKS the one to link.
+
+    Why this endpoint exists. A Webull app_key reaches EVERY account under that
+    login — Cash, Margin, IRA, Futures — and which one we trade is decided purely
+    by the ``account_id`` in the stored credentials. That id is not the account
+    number shown anywhere in the Webull app, so the previous free-text field
+    asked users to guess: a real-but-wrong id passes ``verify_connection``
+    cleanly, and from then on every mirror order trades in the wrong account with
+    nothing to flag it. Balances come back with the list because equity is what
+    actually distinguishes a funded account from an empty one.
+
+    Nothing is persisted here. The keys are used for this call and discarded;
+    they are only stored (encrypted) if the user goes on to connect.
+
+    Side benefit: this is also where Webull's first-time token/2FA challenge now
+    surfaces — before any connect attempt, and well before anything could touch
+    the user's existing broker.
+    """
+    if not get_settings().webull_direct_enabled:
+        raise HTTPException(
+            400, "Direct Webull is not enabled on this server "
+                 "(webull_direct_enabled is off).",
+        )
+    creds = {
+        "app_key": payload.app_key.strip(),
+        "app_secret": payload.app_secret.strip(),
+        "region_id": (payload.region_id or "us").strip() or "us",
+    }
+    try:
+        accounts = WebullAdapter(creds).list_accounts(with_balances=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("webull list_accounts failed for user %s", user.id, exc_info=True)
+        raise HTTPException(400, f"broker_error: {exc}") from exc
+    if not accounts:
+        raise HTTPException(
+            400,
+            "These Webull API keys authenticated but returned no tradable "
+            "accounts. Check that the key is enabled for the Trading API.",
+        )
+    return accounts
 
 
 @router.post("", response_model=BrokerAccountOut, status_code=status.HTTP_201_CREATED)
@@ -658,15 +749,8 @@ def connect(
     # _credentials_for below, so this stays fully inert with the flag off.
     creds = _credentials_for(payload, user.id)
 
-    # Enforce one-broker-per-user BEFORE building the new row so the
-    # audit ordering reads naturally (replaced → connected).
-    _evict_existing_brokers(db, user, request)
-
     # Build an unsaved row so we can run verify_connection() against it.
-    # Don't persist if the broker rejects — keeps ghost rows out of the
-    # UI. Note: for Webull, login_with_mfa above already hit the network,
-    # so verify_connection is mostly a safety check that the just-
-    # received session tokens really work.
+    # Don't persist if the broker rejects — keeps ghost rows out of the UI.
     acct = BrokerAccount(
         user_id=user.id,
         broker=payload.broker,
@@ -677,6 +761,14 @@ def connect(
         connection_status="pending",
     )
 
+    # VERIFY BEFORE EVICTING. A failed connect must leave the user's EXISTING
+    # broker exactly as it was. It previously didn't: _evict_existing_brokers ran
+    # first and the failure handler's db.commit() (written to persist the audit
+    # row) also committed those pending DELETEs — so a rejected attempt silently
+    # disconnected the working broker and copy trading stopped with a
+    # "skipped_no_broker". Direct Webull made that routine rather than rare: its
+    # first connect normally fails while the user approves the 2FA push in the
+    # Webull app, and the retry is the one that succeeds.
     try:
         info = adapter_for(acct, creds).verify_connection()
         acct.broker_account_number = info.broker_account_id
@@ -685,6 +777,9 @@ def connect(
         # Pull balance immediately so the UI doesn't have a blank row.
         _refresh_balance_into(acct, creds)
     except Exception as exc:  # noqa: BLE001
+        # Drop anything this request touched before writing the audit row, so
+        # the commit below can only ever persist the audit itself.
+        db.rollback()
         audit.record(
             db, actor_user_id=user.id, action="broker.connect_failed",
             metadata={"broker": payload.broker.value, "error": str(exc)[:480]},
@@ -692,6 +787,26 @@ def connect(
         )
         db.commit()
         raise HTTPException(400, f"broker_error: {exc}")
+
+    # Verified — only NOW is it safe to replace what they already had.
+    #
+    # Everything from here to the commit is the critical section: two concurrent
+    # connects that both get past this point leave the user with TWO
+    # BrokerAccount rows, and the copy engine mirrors every trade once PER ROW —
+    # so the subscriber's account gets doubled on every trade. Take the per-user
+    # lock so the second request waits, then evicts the first's row and replaces
+    # it (last writer wins, exactly one account either way).
+    #
+    # Deliberately locked HERE rather than at the top of the handler: locking
+    # before verify_connection would hold a DB connection across the broker
+    # round-trip, which for Webull includes the token/2FA flow and can run for
+    # seconds. Verification has no side effects, so letting both requests verify
+    # and serialising only the write is both safe and cheap.
+    _lock_user_brokers(db, user.id)
+
+    # One-broker-per-user; evicting here (before the broker.connected audit
+    # below) keeps the audit trail reading naturally: replaced → connected.
+    _evict_existing_brokers(db, user, request)
 
     db.add(acct)
     db.flush()

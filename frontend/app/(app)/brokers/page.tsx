@@ -11,7 +11,7 @@ import { emitBrokerChanged } from "@/lib/traderSync";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
-import type { BrokerAccount, BrokerName } from "@/lib/types";
+import type { BrokerAccount, BrokerName, WebullAccount } from "@/lib/types";
 
 /** Per-broker presentation metadata — drives the picker tiles, the
  *  connected-account avatar, and the latency badge. Keeping it in one
@@ -283,12 +283,24 @@ export default function BrokersPage() {
   const [apiSecret, setApiSecret] = useState("");
   const [paper, setPaper] = useState(false);   // default Live
 
-  // Direct Webull (official OpenAPI) — the trader's own API keys, stored
-  // encrypted like Alpaca. Powers the real-time gRPC trade signal.
+  // Direct Webull (official OpenAPI) — the user's own API keys, stored
+  // encrypted like Alpaca. Powers the real-time gRPC trade signal for a trader,
+  // and mirror execution for a subscriber.
   const [webullLabel, setWebullLabel] = useState("");
   const [webullAppKey, setWebullAppKey] = useState("");
   const [webullAppSecret, setWebullAppSecret] = useState("");
   const [webullAccountId, setWebullAccountId] = useState("");
+  // Accounts fetched from the keys. One app_key reaches EVERY account under the
+  // Webull login (Cash / Margin / IRA / Futures) and account_id is not the
+  // number shown in the app — so this is picked, never typed. Typing it meant a
+  // real-but-wrong id verified cleanly and then every mirror order traded in the
+  // wrong account.
+  const [webullAccounts, setWebullAccounts] = useState<WebullAccount[] | null>(null);
+  const [webullFetching, setWebullFetching] = useState(false);
+  // Manual entry stays available as an escape hatch: the account list needs
+  // Webull's token/2FA challenge to be approved first, and a user stuck on that
+  // should still be able to proceed if they know their id.
+  const [webullManualId, setWebullManualId] = useState(false);
 
   // SnapTrade form state — much smaller because the actual auth happens
   // on SnapTrade's hosted portal. We collect a label, optionally a
@@ -435,6 +447,7 @@ export default function BrokersPage() {
   function resetConnectForms() {
     setLabel(""); setApiKey(""); setApiSecret(""); setPaper(false);
     setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId("");
+    setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
     setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
@@ -489,6 +502,33 @@ export default function BrokersPage() {
       notify.fromError(e, "Alpaca connect failed");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function fetchWebullAccounts() {
+    setWebullFetching(true);
+    try {
+      const accts = await api<WebullAccount[]>("/api/brokers/webull/accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          app_key: webullAppKey.trim(),
+          app_secret: webullAppSecret.trim(),
+          region_id: "us",
+        }),
+      });
+      setWebullAccounts(accts);
+      setWebullManualId(false);
+      // Preselect only when there's no ambiguity to resolve.
+      setWebullAccountId(accts.length === 1 ? accts[0].account_id : "");
+      if (accts.length > 1) {
+        notify.success(`Found ${accts.length} accounts — pick the one to trade`);
+      }
+    } catch (e) {
+      // The usual first-time cause is Webull's 2FA push not being approved yet.
+      notify.fromError(e, "Couldn't list your Webull accounts");
+      setWebullManualId(true);
+    } finally {
+      setWebullFetching(false);
     }
   }
 
@@ -817,9 +857,10 @@ export default function BrokersPage() {
             </div>
             <p className="text-xs" style={{ color: "var(--muted)" }}>
               From <a href="https://developer.webull.com" target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--accent)" }}>developer.webull.com</a>:
-              {" "}Trading API → Retail Individual → obtain your API key, then paste your
-              {" "}app key, app secret, and account ID below. On first connect, approve the
-              {" "}2FA prompt in your Webull app.
+              {" "}Trading API → Retail Individual → obtain your API key. Paste the key and
+              {" "}secret below, then load your accounts and pick the one to trade.
+              {" "}Webull sends a 2FA prompt to your phone the first time — approve it, then
+              {" "}try again.
             </p>
             <form onSubmit={connectWebull} className="space-y-3">
               <div>
@@ -836,11 +877,78 @@ export default function BrokersPage() {
                   <input type="password" className="w-full p-2.5 font-mono text-sm" placeholder="your Webull app_secret" aria-label="Webull app secret" value={webullAppSecret} onChange={e => setWebullAppSecret(e.target.value)} required />
                 </div>
               </div>
+              {/* Account selection. One app_key reaches every account under the
+                  Webull login, and the id is not the number shown in the app —
+                  so it is PICKED from the broker, never typed. */}
               <div>
-                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Account ID</label>
-                <input type="text" className="w-full p-2.5 font-mono text-sm" placeholder="Webull account_id (not the account number)" aria-label="Webull account ID" value={webullAccountId} onChange={e => setWebullAccountId(e.target.value)} required />
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Account to trade</label>
+
+                {!webullAccounts && !webullManualId && (
+                  <button
+                    type="button"
+                    className="btn-ghost px-3 py-2 text-sm inline-flex items-center gap-2"
+                    disabled={webullFetching || !webullAppKey.trim() || !webullAppSecret.trim()}
+                    onClick={fetchWebullAccounts}
+                  >
+                    <span>Load my accounts</span>
+                    {webullFetching && <Spinner />}
+                  </button>
+                )}
+
+                {webullAccounts && (
+                  <>
+                    <select
+                      className="w-full p-2.5 text-sm"
+                      aria-label="Webull account to trade"
+                      value={webullAccountId}
+                      onChange={e => setWebullAccountId(e.target.value)}
+                      required
+                    >
+                      <option value="">Select an account…</option>
+                      {webullAccounts.map(a => {
+                        const equity = a.total_equity != null
+                          ? ` · ${fmtMoney(a.total_equity, a.currency)}`
+                          : "";
+                        const type = a.account_type ? ` · ${a.account_type}` : "";
+                        return (
+                          <option key={a.account_id} value={a.account_id}>
+                            {a.account_number || a.account_id}{type}{equity}
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <p className="text-[11px] mt-1.5" style={{ color: "var(--faint)" }}>
+                      Every order copied to you trades in this account. Check the
+                      balance matches the account you fund — a Webull login often
+                      has several.
+                    </p>
+                  </>
+                )}
+
+                {webullManualId && (
+                  <>
+                    <input
+                      type="text"
+                      className="w-full p-2.5 font-mono text-sm"
+                      placeholder="Webull account_id (not the account number)"
+                      aria-label="Webull account ID"
+                      value={webullAccountId}
+                      onChange={e => setWebullAccountId(e.target.value)}
+                      required
+                    />
+                    <button
+                      type="button"
+                      className="text-[11px] underline mt-1.5"
+                      style={{ color: "var(--accent)" }}
+                      onClick={() => { setWebullManualId(false); setWebullAccountId(""); }}
+                    >
+                      Load my accounts instead
+                    </button>
+                  </>
+                )}
               </div>
-              <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
+
+              <button disabled={busy || !webullAccountId.trim()} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
                 <span>Connect</span>
                 {busy && <Spinner />}
               </button>

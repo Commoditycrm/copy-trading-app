@@ -60,6 +60,20 @@ export interface FollowRequest {
 
 export type BrokerName = "alpaca" | "webull" | "snaptrade" | "ibkr";
 
+/** One selectable Webull account, from POST /api/brokers/webull/accounts.
+ *  A single Webull app_key reaches every account under the login (Cash /
+ *  Margin / IRA / Futures), and `account_id` is not the number shown in the
+ *  Webull app — so the connect flow makes the user PICK one. The balance is
+ *  what tells a funded account apart from an empty one. */
+export interface WebullAccount {
+  account_id: string;
+  account_number: string | null;
+  account_type: string | null;
+  currency: string | null;
+  total_equity: string | null;
+  buying_power: string | null;
+}
+
 export interface BrokerAccount {
   id: string;
   broker: BrokerName;
