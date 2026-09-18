@@ -105,6 +105,30 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
         )
     ).scalars())
 
+    # Batch fast path. Adapters that can return every recent order in ONE call
+    # expose get_orders_snapshot; we prefer it over per-order reads whenever
+    # there's more than one order to check. This matters on brokers with tight
+    # per-key rate limits (direct Webull: ~10 requests / 30s, and this sweep runs
+    # every 30s) — without it, an account with several working orders spends its
+    # whole budget here and the throttled reads fail silently in the loop below,
+    # leaving fills unsynced with nothing in the logs to say so.
+    #
+    # Strictly an optimisation: anything the snapshot doesn't cover (an order
+    # from a previous day, a page overflow, a failed call) still goes through
+    # get_order exactly as before.
+    snapshot: dict[str, Any] | None = None
+    if len(open_orders) > 1:
+        _batch = getattr(adapter, "get_orders_snapshot", None)
+        if _batch is not None:
+            try:
+                snapshot = _batch() or None
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "fills_sync: batch order snapshot failed for %s — falling back "
+                    "to per-order reads", acct.id, exc_info=True,
+                )
+                snapshot = None
+
     refreshed = 0
     # Bracket exit legs that flip to FILLED here closed a position. Subscribers
     # have no real-time fill listener, so this poll-driven sync is the only
@@ -117,12 +141,14 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
     dead_entries: list[Order] = []
     _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
     for order in open_orders:
-        try:
-            res = adapter.get_order(order.broker_order_id)
-        except Exception:  # noqa: BLE001
-            # Order may have been cancelled at the broker side or the id is
-            # stale — don't fail the whole sync over one bad lookup.
-            continue
+        res = snapshot.get(order.broker_order_id) if snapshot else None
+        if res is None:
+            try:
+                res = adapter.get_order(order.broker_order_id)
+            except Exception:  # noqa: BLE001
+                # Order may have been cancelled at the broker side or the id is
+                # stale — don't fail the whole sync over one bad lookup.
+                continue
         prev_status = order.status
         changed = False
         if res.status != order.status:

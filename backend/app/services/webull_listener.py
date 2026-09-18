@@ -3,8 +3,10 @@
 Streams a master trader's order events from Webull's OpenAPI over gRPC (~0.2s
 from fill to us, vs SnapTrade's minutes) and — once out of shadow mode — hands
 each new order to ``copy_engine.fanout_threadsafe`` exactly like
-``snaptrade_listener`` does. Subscribers still EXECUTE via SnapTrade; this only
-replaces the trader-side DETECTION signal.
+``snaptrade_listener`` does. This module is the trader-side DETECTION signal
+only; where a subscriber's mirror is EXECUTED is independent of it (a subscriber
+on direct Webull executes through ``app.brokers.webull``, with fills synced by
+``services.webull_subscriber_reconciler``).
 
 Public interface mirrors ``snaptrade_listener`` / ``trade_listener`` so
 ``services.listeners`` can drive it identically: ``bind_loop``,
@@ -73,13 +75,22 @@ _generation: dict[uuid.UUID, int] = {}
 # paths dedup by broker_order_id in _persist_and_fanout, so running them
 # together never double-fires. State is keyed by trader like the stream:
 _poll_tasks: dict[uuid.UUID, asyncio.Task] = {}
-# order_ids that already existed when the poller started — the trader's
-# earlier-in-day activity, which we must NOT replay as fresh signals.
+# order_ids that already existed when the poller started and that we decided are
+# HISTORY — never to be replayed as fresh signals. See _build_poll_baseline for
+# what does and does not land in here; it is deliberately narrower than "every
+# order visible on the first cycle".
 _poll_baseline: dict[uuid.UUID, set[str]] = {}
 # order_id → last status we acted on (post-baseline), so we only process a
 # genuine new order or a status transition (submit → fill → cancel), not the
 # same unchanged row every cycle.
 _poll_status: dict[uuid.UUID, dict[str, str]] = {}
+
+# How far back an UNSEEN order can have been placed and still be treated as live
+# rather than history when the poller starts. Sized for a deploy/restart: the
+# worker is down for seconds, and a trade placed in that gap should still reach
+# subscribers. Anything older is genuinely earlier-in-day activity — replaying it
+# would mirror trades whose price has long moved.
+_POLL_CATCHUP_WINDOW_S = 180.0
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
@@ -336,42 +347,29 @@ def _map_order_type(s: str | None) -> OrderType:
 # fetch_token_from_server, a network call to Webull's auth endpoint). Building a
 # fresh client on EVERY poll cycle (every 5s) hammered that endpoint → 429s,
 # repeated 2FA challenges, and eventually a VERIFY_FAILURE_EXCEED_LIMIT lockout
-# that stopped order detection entirely. So we build ONE client per app_key and
-# reuse it across cycles; the token flow then runs once per TTL, not every poll.
-_TRADE_CLIENT_TTL_S = 1800.0  # rebuild every 30 min to refresh auth
-_trade_clients: dict[str, tuple[Any, datetime]] = {}
-_trade_client_lock = threading.Lock()
+# that stopped order detection entirely. So ONE client per app_key is built and
+# reused; the token flow then runs once per TTL, not every poll.
+#
+# The cache lives in app.brokers.webull and is SHARED with the adapter. This
+# module used to keep an identical one of its own, which meant a trader's
+# app_key ran the token flow twice per TTL — pure extra load on the very
+# endpoint whose rate limit caused the lockout above — and left two places to
+# reason about auth.
 
 
 def _webull_trade_client(creds: dict[str, Any]):
-    from webull.core.client import ApiClient  # noqa: PLC0415
-    from webull.trade.trade_client import TradeClient  # noqa: PLC0415
-    app_key = creds["app_key"]
-    now = datetime.now(timezone.utc)
-    with _trade_client_lock:
-        cached = _trade_clients.get(app_key)
-        if cached is not None and (now - cached[1]).total_seconds() < _TRADE_CLIENT_TTL_S:
-            return cached[0]
-        from app.brokers.webull import set_per_account_token_dir  # noqa: PLC0415
-        api_client = ApiClient(app_key, creds["app_secret"], creds.get("region_id", "us"))
-        # Stop the SDK writing ./webull_trade_sdk.log — the container root FS is
-        # read-only (Errno 30). _init_logger skips its file handler when a logger
-        # is already marked set. See app/brokers/webull.py:_suppress_sdk_file_logger.
-        api_client._stream_logger_set = True  # noqa: SLF001
-        # Per-app_key token file so multiple traders' Webull accounts don't
-        # collide on the shared token.txt (→ 417 INVALID_TOKEN).
-        set_per_account_token_dir(api_client, app_key)
-        client = TradeClient(api_client)   # token flow runs HERE — once per TTL
-        _trade_clients[app_key] = (client, now)
-        return client
+    from app.brokers.webull import trade_client_for  # noqa: PLC0415
+    return trade_client_for(
+        creds["app_key"], creds["app_secret"], creds.get("region_id", "us"),
+    )
 
 
 def _invalidate_trade_client(creds: dict[str, Any]) -> None:
     """Drop the cached client so the next call rebuilds it (re-auths). Call only
     on AUTH failures — NOT on 429s (a 429 means throttled, not bad auth;
     rebuilding would re-hit the token endpoint and make throttling worse)."""
-    with _trade_client_lock:
-        _trade_clients.pop(creds.get("app_key"), None)
+    from app.brokers.webull import invalidate_trade_client  # noqa: PLC0415
+    invalidate_trade_client(creds.get("app_key"))
 
 
 def _resolve_option_contract(
@@ -725,6 +723,110 @@ def _rest_order_to_payload(o: dict) -> dict | None:
     }
 
 
+def _build_poll_baseline(
+    trader_user_id: uuid.UUID, orders: list[dict]
+) -> tuple[set[str], dict[str, str]]:
+    """Classify the orders visible on the poller's FIRST cycle.
+
+    Returns ``(baseline, prefingerprints)``:
+      * ``baseline``        — order_ids to treat as HISTORY and never replay;
+      * ``prefingerprints`` — order_ids whose broker state already matches what
+        we have stored, pre-seeded into the seen-map so this cycle does no work
+        for them (a LATER change still flips the fingerprint and is processed).
+
+    The poller restarts on every worker deploy, crash and listener reconcile —
+    not just once a day — so "baseline everything currently on screen" was far
+    too blunt. It silently dropped two classes of live work:
+
+      1. An order we ALREADY have a row for that is still WORKING. Baselining it
+         meant its later fill transition was never processed: the trader's limit
+         filled, but ``force_fill_mirrors_to_market`` never fired, so every
+         subscriber's mirror stayed a resting limit while the trader was out.
+         These can never cause a spurious fanout — ``_persist_and_fanout`` finds
+         the existing row and takes the UPDATE path — so they are never history.
+
+      2. An order placed DURING the restart. The worker is typically down for
+         seconds; a trade in that gap should still reach subscribers. Unseen
+         orders placed within ``_POLL_CATCHUP_WINDOW_S`` are let through; older
+         ones stay suppressed, because replaying a trade from hours ago would
+         mirror it at a price that has long moved.
+
+    Why the prefingerprints matter as much as the baseline: without them, every
+    restart would re-run the handler over every known order. That is not just
+    wasted commits — for a still-WORKING order, ``_persist_and_fanout``'s modify
+    branch compares the payload's terms against the stored row and, on any
+    difference, fires a cancel-and-replace across EVERY subscriber mirror. Seeding
+    the fingerprint for orders whose status already agrees keeps the restart
+    quiet while leaving genuinely-stale rows (filled while we were down) to be
+    healed on this very cycle.
+
+    Anything we cannot date is treated as history — the conservative reading, and
+    the pre-existing behaviour.
+    """
+    ids = [str(o.get("order_id")) for o in orders if o.get("order_id")]
+    if not ids:
+        return set(), {}
+
+    # What we already have for this trader: broker_order_id → our stored status.
+    stored: dict[str, OrderStatus] = {}
+    try:
+        with SessionLocal() as db:
+            for boid, status in db.execute(
+                select(Order.broker_order_id, Order.status).where(
+                    Order.user_id == trader_user_id,
+                    Order.parent_order_id.is_(None),
+                    Order.broker_order_id.in_(ids),
+                )
+            ).all():
+                if boid:
+                    stored[str(boid)] = status
+    except Exception:  # noqa: BLE001
+        # If we can't read our own history, suppress everything on screen — the
+        # old behaviour, and the safe direction (a missed mirror beats replaying
+        # a whole day of trades).
+        log.exception(
+            "webull-poll[%s] baseline: could not load known orders; "
+            "treating all %d visible order(s) as history",
+            trader_user_id, len(ids),
+        )
+        return set(ids), {}
+
+    now = datetime.now(timezone.utc)
+    baseline: set[str] = set()
+    pre: dict[str, str] = {}
+    in_sync = stale = caught_up = 0
+
+    for o in orders:
+        oid = str(o.get("order_id") or "")
+        if not oid:
+            continue
+        payload = _rest_order_to_payload(o)
+
+        if oid in stored:
+            # (1) Already tracked. Never history. Quiet unless it moved on us.
+            if payload is not None and _map_status(payload.get("order_status")) == stored[oid]:
+                pre[oid] = _order_fingerprint(payload)
+                in_sync += 1
+            else:
+                stale += 1          # broker moved while we were down → heal it now
+            continue
+
+        # (2) Never seen. Live only if it was placed during the restart gap.
+        placed = _parse_wb_time((payload or {}).get("place_time"))
+        if placed is not None and (now - placed).total_seconds() <= _POLL_CATCHUP_WINDOW_S:
+            caught_up += 1
+            continue
+        baseline.add(oid)
+
+    log.info(
+        "webull-poll[%s] primed baseline: %d history / %d tracked-in-sync / "
+        "%d tracked-stale (syncing now) / %d unseen within %.0fs (carried live)",
+        trader_user_id, len(baseline), in_sync, stale, caught_up,
+        _POLL_CATCHUP_WINDOW_S,
+    )
+    return baseline, pre
+
+
 async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     """Pull the trader's Webull orders on a short interval and hand any NEW
     order or status transition to _on_order_event (shadow/live routing + dedup
@@ -772,15 +874,21 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
                 await asyncio.sleep(gap)
 
-            # First cycle: record what already exists as the baseline (history)
-            # and fan nothing out.
+            # First cycle: decide which of the orders already on screen are
+            # HISTORY (never to be replayed) and which are live work we should
+            # keep tracking. Everything not baselined falls through to the normal
+            # per-order handling below on this very cycle.
             if trader_user_id not in _poll_baseline:
-                _poll_baseline[trader_user_id] = {
-                    str(o.get("order_id")) for o in orders if o.get("order_id")
-                }
-                log.info("webull-poll[%s] primed baseline with %d existing order(s)",
-                         trader_user_id, len(_poll_baseline[trader_user_id]))
-                continue  # the per-account gaps already paced this cycle
+                _baseline, _pre = await asyncio.to_thread(
+                    _build_poll_baseline, trader_user_id, orders,
+                )
+                _poll_baseline[trader_user_id] = _baseline
+                # Orders already in sync with us start "seen", so this cycle
+                # does no work for them; a later change still flips their
+                # fingerprint and is processed normally. setdefault because
+                # stop_listener can clear this map while the classify above is
+                # still off-loop.
+                _poll_status.setdefault(trader_user_id, {}).update(_pre)
 
             baseline = _poll_baseline[trader_user_id]
             seen = _poll_status[trader_user_id]
@@ -905,6 +1013,22 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         return
 
     _generation[trader_user_id] = _generation.get(trader_user_id, 0) + 1
+
+    # Shadow mode is the DEFAULT, and its symptom — the trader's fills are
+    # detected and logged but never mirrored — is indistinguishable from a broken
+    # integration unless you already know to look for it. Say so once, loudly, at
+    # every listener start rather than only per-event at INFO.
+    #
+    # Scope note for whoever reads this in the logs: shadow gates the TRADER-side
+    # persist+fanout only. A SUBSCRIBER executing mirrors on their own direct
+    # Webull account is unaffected by this flag.
+    if _shadow():
+        log.warning(
+            "webull-listener[%s] SHADOW MODE: this trader's orders will be "
+            "detected and logged but NOT persisted and NOT mirrored to "
+            "subscribers. Set WEBULL_DIRECT_SHADOW_MODE=false to go live.",
+            trader_user_id,
+        )
 
     def _spawn() -> None:
         task = loop.create_task(_run_listener(trader_user_id, broker_account_id))
