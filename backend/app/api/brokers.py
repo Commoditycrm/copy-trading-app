@@ -686,6 +686,38 @@ def _attr_safe(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _webull_error_message(exc: BaseException) -> str:
+    """Turn a Webull SDK failure into something the user can act on.
+
+    The one that matters is the token handshake. Webull issues an access token in
+    PENDING status and it stays unusable until the ACCOUNT OWNER authorises it
+    from their Webull app — until then every call fails with a raw
+    ``ERROR_INIT_TOKEN ... status:PENDING``, which tells the user nothing about
+    what they are supposed to do. This is not an edge case; it is what happens on
+    every first connect.
+    """
+    raw = str(exc)
+    low = raw.lower()
+    if "error_init_token" in low or "status not verified" in low or "pending" in low:
+        return (
+            "Webull needs you to authorise this API key before it can be used. "
+            "Open the Webull app, approve the pending API/token authorisation "
+            "request, then try again here. (The key stays in PENDING status "
+            "until you do.)"
+        )
+    if "error_check_token" in low and ("invalid" in low or "expired" in low):
+        return (
+            "Webull rejected this API token as invalid or expired. Generate a "
+            "fresh key at developer.webull.com and reconnect."
+        )
+    if "unauthorized" in low or "invalid credentials" in low or "401" in raw:
+        return (
+            "Webull rejected these credentials. Check the app key and secret are "
+            "copied exactly, and that the key is enabled for the Trading API."
+        )
+    return f"broker_error: {raw}"
+
+
 @router.post("/webull/accounts", response_model=list[WebullAccountOut])
 def list_webull_accounts(
     payload: ListWebullAccountsIn,
@@ -724,7 +756,7 @@ def list_webull_accounts(
         accounts = WebullAdapter(creds).list_accounts(with_balances=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("webull list_accounts failed for user %s", user.id, exc_info=True)
-        raise HTTPException(400, f"broker_error: {exc}") from exc
+        raise HTTPException(400, _webull_error_message(exc)) from exc
     if not accounts:
         raise HTTPException(
             400,
@@ -786,7 +818,11 @@ def connect(
             ip_address=client_ip(request),
         )
         db.commit()
-        raise HTTPException(400, f"broker_error: {exc}")
+        raise HTTPException(
+            400,
+            _webull_error_message(exc) if payload.broker == BrokerName.WEBULL
+            else f"broker_error: {exc}",
+        )
 
     # Verified — only NOW is it safe to replace what they already had.
     #

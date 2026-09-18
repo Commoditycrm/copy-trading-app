@@ -155,17 +155,48 @@ def test_refused_when_direct_webull_is_disabled():
     raise AssertionError("expected a 400 when webull_direct_enabled is off")
 
 
-def test_bad_keys_surface_as_a_400():
-    """Including the first-connect case where Webull's 2FA push hasn't been
-    approved yet — the user needs the broker's own message to know what to do."""
+def test_bad_keys_surface_as_an_actionable_400():
+    """Raw SDK text tells the user nothing. Rejected credentials should name the
+    two things they can actually check."""
     with _Patched(RuntimeError("HTTP Status: 401, Code: UNAUTHORIZED, Msg: ")):
         try:
             brokers_api.list_webull_accounts(_payload(), _User())
         except HTTPException as exc:
             assert exc.status_code == 400
-            assert "UNAUTHORIZED" in str(exc.detail)
+            detail = str(exc.detail)
+            assert "app key and secret" in detail and "Trading API" in detail
             return
     raise AssertionError("expected a 400 for rejected credentials")
+
+
+def test_unapproved_token_tells_the_user_to_authorise_in_the_app():
+    """THE first-connect case. Webull issues the token in PENDING status and it
+    stays unusable until the owner authorises it in their Webull app; until then
+    every call fails with a raw 'ERROR_INIT_TOKEN ... status:PENDING' that says
+    nothing about what to do. This is the normal path, not an edge case."""
+    with _Patched(RuntimeError(
+        "ERROR_INIT_TOKEN init_token status not verified error. "
+        "token:ab**cd expires:1 status:PENDING"
+    )):
+        try:
+            brokers_api.list_webull_accounts(_payload(), _User())
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            assert "Webull app" in detail and "authoris" in detail
+            assert "ERROR_INIT_TOKEN" not in detail   # not the raw SDK dump
+            return
+    raise AssertionError("expected a 400 for an unapproved token")
+
+
+def test_an_unrecognised_error_still_passes_the_broker_text_through():
+    """Only known shapes are translated — anything else must stay debuggable."""
+    with _Patched(RuntimeError("some unmapped webull failure")):
+        try:
+            brokers_api.list_webull_accounts(_payload(), _User())
+        except HTTPException as exc:
+            assert "some unmapped webull failure" in str(exc.detail)
+            return
+    raise AssertionError("expected a 400")
 
 
 def test_authenticated_but_no_accounts_is_an_explicit_error():
