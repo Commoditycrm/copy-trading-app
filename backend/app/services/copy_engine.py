@@ -52,7 +52,6 @@ from app.services.crypto import decrypt_json
 from app.services.order_retry import (
     classify_error,
     clean_broker_error,
-    is_no_position_close_error,
     is_order_conflict_error,
     is_rate_limit_error,
     is_replace_chain_pending_error,
@@ -937,13 +936,7 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
                     return item.adapter.place_order(limit_req)
                 except Exception as exc2:  # noqa: BLE001
                     exc = exc2  # fall through to the remaining handling with the new error
-        # A CLOSE gets the resolve/retry path for a same-contract conflict AND for
-        # a "no position to close" rejection — SnapTrade's order view can lag its
-        # positions view, so a promptly-fired close is refused even though the
-        # subscriber holds it. The live-held re-confirm below never retries a
-        # genuinely flat account (it raises position_already_flat instead).
-        lagged_no_position = req.is_closing and is_no_position_close_error(exc)
-        if not (req.is_closing and (is_order_conflict_error(exc) or lagged_no_position)):
+        if not (req.is_closing and is_order_conflict_error(exc)):
             raise
 
         # Guard: never cancel a protective STOP to place a conflicting take-profit.
@@ -985,15 +978,8 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
 
         # Also cancel any of our OWN working orders reserving the position.
         cancelled = _cancel_subscriber_conflicts(item)
-        # Retry when: we shrank an oversized order, we cancelled a blocker, OR the
-        # broker said "no position" while our positions read CONFIRMS a live
-        # holding (live > 0) — the SnapTrade order-vs-positions lag, which the
-        # short-wait retry loop below clears. A genuinely flat account already
-        # raised position_already_flat above, so it never reaches here.
-        if not reclamped and not cancelled and not (
-            lagged_no_position and live is not None and live > 0
-        ):
-            raise  # nothing actionable — retry won't help
+        if not reclamped and not cancelled:
+            raise  # neither an oversized qty nor a cancellable order — retry won't help
 
         last_exc: BaseException = exc
         for _ in range(3):
