@@ -16,11 +16,14 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
     """Construct an adapter for the broker_account using its decrypted credentials.
 
     Note: ``BrokerName.WEBULL`` routes to the direct-Webull adapter ONLY when
-    ``settings.webull_direct_enabled`` is on (the real-time gRPC trade-signal
-    integration). With the flag off — the default — WEBULL accounts stay inert
-    and this raises, exactly as before; users connect Webull via SnapTrade
-    (``BrokerName.SNAPTRADE``). The SDK is imported lazily so it's only needed
-    where direct Webull is actually used.
+    ``settings.webull_direct_enabled`` is on. That adapter now serves BOTH roles
+    — a trader's real-time fill signal AND a subscriber's mirror execution — so
+    with the flag on it is on the live order path, not just a read.
+
+    With the flag off (the default) WEBULL accounts stay inert and this raises;
+    Webull is then reachable only through the SnapTrade aggregator, which lands
+    as ``BrokerName.SNAPTRADE`` rows. The SDK is imported lazily so it's only
+    needed where direct Webull is actually used.
     """
     if broker_account.broker == BrokerName.ALPACA:
         return AlpacaAdapter(credentials)
