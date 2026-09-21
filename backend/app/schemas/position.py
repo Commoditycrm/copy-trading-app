@@ -28,6 +28,31 @@ class PositionOut(BaseModel):
     option_right: OptionRight | None
 
 
+class UnreachableAccount(BaseModel):
+    """A broker account whose positions could NOT be read this request.
+
+    Exists so the caller can tell "this account holds nothing" from "we could
+    not ask". Those used to be indistinguishable: a failed read was swallowed
+    and the endpoint returned 200 with the account simply absent, which the UI
+    rendered as a flat account. On 2026-09-21 that showed subscribers an empty
+    positions table whenever Webull answered 429 — they appeared to hold
+    nothing while holding real positions."""
+    broker_account_id: uuid.UUID
+    broker: str
+    label: str | None = None
+    # Short, user-safe reason. Never the raw exception: it can carry ids.
+    detail: str
+
+
+class PositionsPayload(BaseModel):
+    """Detailed form of GET /api/positions (``?detail=1``).
+
+    The bare-list form stays the default so existing callers are untouched;
+    only the UI that needs to SAY something about a failure opts in."""
+    positions: list[PositionOut]
+    unreachable: list[UnreachableAccount] = []
+
+
 class ClosePositionIn(BaseModel):
     """Close (or partially close) an open position by placing a reverse-side
     order. Quantity defaults to the full position size."""

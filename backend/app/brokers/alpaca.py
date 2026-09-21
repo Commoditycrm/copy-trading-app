@@ -349,7 +349,7 @@ class AlpacaAdapter(BrokerAdapter):
 
     # ── positions ─────────────────────────────────────────────────────────
 
-    def get_positions(self) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
         """Return currently held positions. Alpaca returns one row per symbol
         per account (net qty). asset_class distinguishes stock vs option."""
         raw = self._c().get_all_positions() or []

@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { motion } from "framer-motion";
-import { ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
@@ -12,7 +12,7 @@ import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { BrokerAccount, Order, Position } from "@/lib/types";
+import type { BrokerAccount, Order, Position, PositionsPayload, UnreachableAccount } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -101,6 +101,10 @@ export interface OpenPositionsTableHandle {
   refresh: () => Promise<void>;
 }
 
+/** Order statuses that mean "still live at the broker" — something can still
+ *  fill, so the positions view can still change. */
+const WORKING_STATUSES = new Set(["pending", "submitted", "accepted", "partially_filled"]);
+
 export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string; fillHeight?: boolean }>(
   function OpenPositionsTable({ className, fillHeight }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
@@ -109,6 +113,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [orders, setOrders] = useState<Order[]>(() => getSnapshot<PosSnap>(POS_KEY)?.orders ?? []);
     // Today's realized P&L (market tz), fetched alongside positions for the
     // summary strip. null until the first fetch lands.
+    // Broker accounts whose positions could not be read on the last refresh.
+    // Rendered as a banner: an empty table with no explanation reads as "you
+    // hold nothing", which is exactly the wrong thing to tell someone whose
+    // broker just failed to answer.
+    const [unreachable, setUnreachable] = useState<UnreachableAccount[]>([]);
     const [todayRealized, setTodayRealized] = useState<number | null>(null);
     // Total account value = sum of total_equity across broker accounts (same
     // source as the dashboard "Total equity" KPI). null until first fetch.
@@ -136,23 +145,46 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       return qty > 0 ? qty : null;
     }
 
+    // Monotonic id for in-flight refreshes. Without it, two overlapping
+    // refreshes both write state and the one that RESOLVES last wins — which
+    // can be the older request, silently replacing fresh data with stale.
+    const reqSeq = useRef(0);
+    // True while any order is still live at the broker. Drives the early exit
+    // from the staggered refresh schedule below.
+    const workingRef = useRef(false);
+
     const refresh = useCallback(async () => {
+      const seq = ++reqSeq.current;
       try {
-        const [pos, ords, realized, brokers] = await Promise.all([
-          api<Position[]>("/api/positions"),
+        const [payload, ords, realized, brokers] = await Promise.all([
+          // ?detail=1 returns { positions, unreachable } so a broker that
+          // failed to answer is distinguishable from one holding nothing.
+          api<PositionsPayload>("/api/positions?detail=1"),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
           api<{ realized_pnl: number }>("/api/positions/today-realized").catch(() => null),
           api<BrokerAccount[]>("/api/brokers").catch(() => [] as BrokerAccount[]),
         ]);
+        // A newer refresh already landed — drop this one rather than undo it.
+        if (seq !== reqSeq.current) return;
+        const pos = payload.positions ?? [];
+        const down = payload.unreachable ?? [];
         setPositions(pos);
         setOrders(ords);
+        setUnreachable(down);
+        workingRef.current = ords.some((o) => WORKING_STATUSES.has(o.status));
         if (realized) setTodayRealized(realized.realized_pnl);
         setTotalEquity(brokers.reduce((acc, b) => acc + (Number(b.total_equity) || 0), 0));
-        setSnapshot<PosSnap>(POS_KEY, { positions: pos, orders: ords });
+        // Never persist a KNOWN-INCOMPLETE view. The snapshot seeds initial
+        // state on return nav, so caching a truncated read makes one failed
+        // broker call look like a flat account long after it recovered.
+        if (down.length === 0) {
+          setSnapshot<PosSnap>(POS_KEY, { positions: pos, orders: ords });
+        }
       } catch (e) {
+        if (seq !== reqSeq.current) return;
         notify.fromError(e, "failed to load positions");
       } finally {
-        setLoading(false);
+        if (seq === reqSeq.current) setLoading(false);
       }
     }, []);
 
@@ -201,7 +233,15 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       ) return;
       clearTimers();
       for (const ms of SCHEDULE_MS) {
-        ssTimers.current.push(setTimeout(() => { refresh(); }, ms));
+        ssTimers.current.push(setTimeout(async () => {
+          await refresh();
+          // The stagger exists to catch a fill we get no SSE for. Once nothing
+          // is working any more there is nothing left to catch, so cancel the
+          // rest instead of firing them blind. Each one costs a broker call,
+          // and on Webull four of them arriving together is what triggers the
+          // 429 that blanks this table in the first place.
+          if (!workingRef.current) clearTimers();
+        }, ms));
       }
     });
     useEffect(() => () => { clearTimers(); }, [clearTimers]);
@@ -405,6 +445,35 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
+        {/* A broker we could not read. Without this the table just renders
+            fewer rows — indistinguishable from holding nothing, which is what
+            made a transient Webull 429 look like a vanished portfolio. */}
+        {unreachable.length > 0 && (
+          <div
+            role="status"
+            className="mb-3 flex items-start gap-2 rounded-lg px-3 py-2.5 text-sm"
+            style={{
+              background: "var(--warn-soft, var(--panel-2))",
+              color: "var(--text)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <AlertTriangle size={16} style={{ color: "var(--warn, var(--muted))", flexShrink: 0, marginTop: 1 }} />
+            <div className="flex flex-col gap-0.5">
+              {unreachable.map((u) => (
+                <div key={u.broker_account_id}>
+                  <span style={{ fontWeight: 600, textTransform: "capitalize" }}>
+                    {u.label || u.broker}
+                  </span>
+                  <span style={{ color: "var(--muted)" }}>{" — "}{u.detail}.</span>
+                  <span style={{ color: "var(--muted)" }}>
+                    {" "}Positions from this account are not shown below.
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {/* Summary strip */}
         <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
           <SummaryTile label="P&L · Today"
@@ -494,14 +563,20 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       <div className="flex flex-col items-center justify-center text-center gap-2 min-h-[240px]" style={{ color: "var(--muted)" }}>
                         <Layers size={28} />
                         <div className="text-sm" style={{ color: "var(--text)" }}>
-                          {positions.length === 0
+                          {positions.length === 0 && unreachable.length > 0
+                            ? "Could not load positions from every broker"
+                            : positions.length === 0
                             ? "No open positions"
                             : search
                               ? `No positions match “${search}”`
                               : filter === "option" ? "No open option positions"
                                 : "No open stock positions"}
                         </div>
-                        <div className="text-xs">Positions appear here once your orders fill.</div>
+                        <div className="text-xs">
+                          {positions.length === 0 && unreachable.length > 0
+                            ? "This is a broker connection problem, not an empty account — see above."
+                            : "Positions appear here once your orders fill."}
+                        </div>
                       </div>
                     </td>
                   </tr>
