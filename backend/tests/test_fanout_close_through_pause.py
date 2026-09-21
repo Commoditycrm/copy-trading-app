@@ -85,6 +85,10 @@ def _fake_place(item):
         submitted_at=datetime.now(timezone.utc),
         filled_quantity=Decimal("0"),
         filled_avg_price=None,
+        # Real adapters return a BrokerOrderResult, which carries the broker's
+        # own execution time (None until it fills). The fake has to match that
+        # shape or it stops standing in for the thing it replaces.
+        filled_at=None,
         bracket_legs=[],
     )
 

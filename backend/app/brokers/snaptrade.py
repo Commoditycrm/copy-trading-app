@@ -82,6 +82,14 @@ _STATUS_IN = {
     "REPLACED":         OrderStatus.SUBMITTED,
 }
 
+# Statuses where SOMETHING traded, so time_updated is a defensible stand-in for
+# an absent time_executed. Deliberately excludes CANCELLED/REJECTED/EXPIRED: on
+# those, time_updated is when the order DIED, and recording that as a fill time
+# would be worse than leaving the field NULL.
+_EXECUTED_STATUSES = frozenset({
+    "EXECUTED", "FILLED", "PARTIAL", "PARTIALLY_FILLED",
+})
+
 # Our → SnapTrade enums for placement.
 _SIDE_OUT = {OrderSide.BUY: "BUY", OrderSide.SELL: "SELL"}
 _TYPE_OUT = {
@@ -1250,6 +1258,16 @@ class SnapTradeAdapter(BrokerAdapter):
             submitted_at=_as_dt(_attr(o, "time_placed", "created_at")) or datetime.now(timezone.utc),
             filled_quantity=_dec_or_none(_attr(o, "filled_units", "filled_quantity")) or Decimal(0),
             filled_avg_price=_dec_or_none(_attr(o, "execution_price", "filled_avg_price")),
+            # SnapTrade's AccountOrderRecord carries time_placed, time_updated
+            # AND time_executed. We read only time_placed, so the execution
+            # timestamp the broker hands us was being dropped and Order History
+            # fell back to our own detection clock. time_updated is the fallback
+            # rather than the primary: it moves on ANY change (a partial fill, a
+            # modify), so it is the moment of the last update, not of the trade.
+            filled_at=_as_dt(_attr(o, "time_executed"))
+            or (_as_dt(_attr(o, "time_updated"))
+                if str(_attr(o, "status", default="")).upper() in _EXECUTED_STATUSES
+                else None),
         )
 
 

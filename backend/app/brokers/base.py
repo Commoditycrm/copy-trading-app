@@ -76,6 +76,10 @@ class BrokerOrderResult:
     submitted_at: datetime
     filled_quantity: Decimal = Decimal(0)
     filled_avg_price: Decimal | None = None
+    # The BROKER's own execution timestamp, when it reports one. None otherwise
+    # — never substitute our clock here, because the entire point of the field
+    # is to be distinguishable from the moment we noticed (Order.closed_at).
+    filled_at: datetime | None = None
     reject_reason: str | None = None
     # Child legs of a native bracket entry (empty for plain orders).
     bracket_legs: tuple[BrokerOrderLeg, ...] = ()
