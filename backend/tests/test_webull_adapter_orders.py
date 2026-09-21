@@ -11,7 +11,7 @@ Or pytest:   pytest tests/test_webull_adapter_orders.py
 """
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -165,21 +165,25 @@ def test_fetch_detail_parses_filled_option_leg():
         "order_id": "WB123", "client_order_id": "c9", "category": "US_OPTION",
         "items": [{
             "order_status": "FILLED", "filled_qty": "2", "filled_price": "0.51",
+            # Webull reports execution time as epoch millis. Order History used
+            # to ignore it and show our detection time instead.
+            "filled_time": 1789741805000,
         }],
     }
     parsed = a._fetch_detail(_FakeTrade(_FakeResp(200, body)), "c9")
     assert parsed is not None
-    _order, is_option, status, filled_qty, filled_px = parsed
+    _order, is_option, status, filled_qty, filled_px, filled_at = parsed
     assert is_option is True
     assert status == OrderStatus.FILLED
     assert filled_qty == Decimal("2") and filled_px == Decimal("0.51")
+    assert filled_at == datetime(2026, 9, 18, 14, 30, 5, tzinfo=timezone.utc)
 
 
 def test_fetch_detail_partial_stock():
     a = _adapter()
     body = {"category": "US_STOCK",
             "items": [{"order_status": "PARTIAL_FILLED", "filled_qty": "1", "filled_price": "10"}]}
-    _o, is_option, status, q, p = a._fetch_detail(_FakeTrade(_FakeResp(200, body)), "c")
+    _o, is_option, status, q, p, _t = a._fetch_detail(_FakeTrade(_FakeResp(200, body)), "c")
     assert is_option is False and status == OrderStatus.PARTIALLY_FILLED
     assert q == Decimal("1") and p == Decimal("10")
 

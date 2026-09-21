@@ -156,6 +156,13 @@ export interface Order {
   filled_quantity: string;
   filled_avg_price: string | null;
   submitted_at: string | null;
+  /** When the BROKER says the trade executed. `closed_at` is when WE
+   *  observed it (every terminal-status write stamps now()), so the two are
+   *  not interchangeable: broker_filled_at -> closed_at IS our detection lag.
+   *  NULL when the broker reports no execution time, and on rows written
+   *  before the column existed — fall back to closed_at and mark it
+   *  approximate rather than showing it as the broker's own time. */
+  broker_filled_at?: string | null;
   closed_at: string | null;
   reject_reason: string | null;
   created_at: string;

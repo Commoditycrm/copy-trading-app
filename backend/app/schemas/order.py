@@ -127,6 +127,14 @@ class OrderOut(BaseModel):
     filled_quantity: Decimal
     filled_avg_price: Decimal | None
     submitted_at: datetime | None
+    # When the BROKER says the trade executed. closed_at, by contrast, is when
+    # WE observed it — every terminal-status write site stamps datetime.now().
+    # Order History needs both: broker_filled_at answers "how fast did my order
+    # fill", and the gap to closed_at answers "how fast did we notice".
+    # NULL where the broker reports no execution time and on rows written before
+    # the column existed — clients must fall back to closed_at and mark it
+    # approximate rather than presenting it as the broker's time.
+    broker_filled_at: datetime | None = None
     closed_at: datetime | None
     reject_reason: str | None
     created_at: datetime

@@ -216,12 +216,49 @@ function orderTypeLabel(t: Order["order_type"]): string {
   }
 }
 
-/** Latest fill timestamp for an order (or closed_at fallback for filled). */
-function lastFillTs(o: Order): string | null {
+/** Below this, the detection lag is noise (clock skew, round-trip) and a
+ *  second line for it would just add clutter to every row. */
+const DETECTION_LAG_FLOOR_MS = 1000;
+
+const APPROX_FILL_TITLE =
+  "Approximate — this broker did not report an execution time, so this is when " +
+  "we detected the fill, not when it traded.";
+
+const DETECTION_LAG_TITLE =
+  "How long AFTER the broker filled it before our sync noticed. Broker latency " +
+  "is the number above; this one is ours.";
+
+/** When an order filled, and whether we actually KNOW that.
+ *
+ *  Two different timestamps used to be conflated here. `closed_at` is written
+ *  by every terminal-status path as now() — the moment WE OBSERVED the fill —
+ *  while the broker's own execution time is a separate thing entirely. The
+ *  column reading "Time Taken to Filled" was computed submitted -> closed_at,
+ *  so on SnapTrade and Webull it was reporting OUR polling latency under a
+ *  label that reads as broker speed. (Alpaca looked right only because it has
+ *  `fills` rows carrying the venue's transaction_time; fills_sync creates
+ *  those for Alpaca alone.)
+ *
+ *  `exact` is the honest bit: false means we are showing detection time
+ *  because no broker timestamp reached us, and the UI says so rather than
+ *  passing it off as the real thing. */
+function fillTiming(o: Order): { at: string | null; exact: boolean; detected: string | null } {
   const lastFillAt = o.fills?.length
     ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
     : null;
-  return lastFillAt ?? (o.status === "filled" ? o.closed_at : null);
+  const detected = o.status === "filled" ? o.closed_at : null;
+  const broker = o.broker_filled_at ?? lastFillAt ?? null;
+  return broker
+    ? { at: broker, exact: true, detected }
+    : { at: detected, exact: false, detected };
+}
+
+/** Milliseconds between the broker's fill and our detection of it, or null when
+ *  either side is unknown or the clocks disagree (negative). */
+function detectionLagMs(brokerAt: string | null, detectedAt: string | null): number | null {
+  if (!brokerAt || !detectedAt) return null;
+  const ms = new Date(detectedAt).getTime() - new Date(brokerAt).getTime();
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
 /** Option expiry rendered as a relative day count ("in 2 days", "Today",
@@ -925,7 +962,8 @@ export default function TradesPage() {
                   : o.status;
                 const statusLabel = placementStatus.replace(/_/g, " ");
                 const st = STATUS_STYLE[placementStatus] ?? STATUS_DEFAULT;
-                const fillTs = lastFillTs(o);
+                const timing = fillTiming(o);
+                const fillTs = timing.at;
                 const submittedTs = o.submitted_at ?? o.created_at;
                 const exp = o.instrument_type === "option" ? fmtExpiresIn(o.option_expiry) : null;
                 // Fill rows, rendered ABOVE the order row (newest event on top).
@@ -1268,11 +1306,47 @@ export default function TradesPage() {
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                         {fmtDateTimeMs(submittedTs, "America/New_York")}
                       </td>
-                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                        {fillTs ? fmtDateTimeMs(fillTs, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                      <td
+                        className="px-5 py-3.5 whitespace-nowrap"
+                        style={{ color: "var(--muted)" }}
+                        title={fillTs && !timing.exact ? APPROX_FILL_TITLE : undefined}
+                      >
+                        {fillTs ? (
+                          <>
+                            {!timing.exact && <span style={{ color: "var(--faint)" }}>~</span>}
+                            {fmtDateTimeMs(fillTs, "America/New_York")}
+                          </>
+                        ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
+                      {/* Fill latency. When the broker gave us its own execution
+                          time we show the REAL fill duration on top and our
+                          detection lag underneath — the two used to be summed
+                          into one number, which made a slow broker and a slow
+                          poller indistinguishable. Without a broker timestamp
+                          the single number IS the detection time, marked '~'. */}
                       <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fillTs ? "var(--text-2)" : "var(--faint)" }}>
-                        {fillTs ? fmtDuration(submittedTs, fillTs) : "—"}
+                        {!fillTs ? "—" : timing.exact ? (
+                          <>
+                            <div>{fmtDuration(submittedTs, fillTs)}</div>
+                            {(() => {
+                              const lag = detectionLagMs(fillTs, timing.detected);
+                              if (lag === null || lag < DETECTION_LAG_FLOOR_MS) return null;
+                              return (
+                                <div
+                                  className="text-xs"
+                                  style={{ color: "var(--faint)" }}
+                                  title={DETECTION_LAG_TITLE}
+                                >
+                                  +{fmtDuration(fillTs, timing.detected)} detect
+                                </div>
+                              );
+                            })()}
+                          </>
+                        ) : (
+                          <span style={{ color: "var(--faint)" }} title={APPROX_FILL_TITLE}>
+                            ~{fmtDuration(submittedTs, fillTs)}
+                          </span>
+                        )}
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
                         {exp ? exp.text : "—"}

@@ -938,6 +938,7 @@ def _insert_order_from_snaptrade(
         filled_avg_price=filled_avg,
         submitted_at=submitted_at,
         is_closing=is_closing,
+        broker_filled_at=_as_dt(_attr(order_obj, "time_executed")),
         closed_at=(
             datetime.now(timezone.utc) if status_enum in (
                 OrderStatus.FILLED, OrderStatus.CANCELED,
@@ -1412,6 +1413,14 @@ def _persist_subscriber_fill(
         fap = _to_dec(_attr(order_obj, "execution_price", "filled_avg_price"))
         if fap is not None and fap != existing.filled_avg_price:
             existing.filled_avg_price = fap
+            changed = True
+        # SnapTrade reports the venue's own execution time as time_executed.
+        # Recording it separately from closed_at (our clock, below) is what
+        # makes "the broker was slow" distinguishable from "we were slow to
+        # notice" — on SnapTrade the second dominates: prod p90 is 22 minutes.
+        bfa = _as_dt(_attr(order_obj, "time_executed"))
+        if bfa is not None and existing.broker_filled_at is None:
+            existing.broker_filled_at = bfa
             changed = True
         if status_enum in _TERMINAL_STATUSES and existing.closed_at is None:
             existing.closed_at = datetime.now(timezone.utc)
