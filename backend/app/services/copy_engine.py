@@ -2987,6 +2987,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             child.broker_accepted_at = resp.submitted_at or datetime.now(timezone.utc)
             child.filled_quantity = resp.filled_quantity
             child.filled_avg_price = resp.filled_avg_price
+            # An order that fills instantly comes back filled on the place
+            # response itself, so capture the broker's execution time here too
+            # — otherwise the fastest fills would be the ones missing it.
+            child.broker_filled_at = resp.filled_at
             # SnapTrade serves CACHED brokerage data, so a mirror can be filled
             # at the broker minutes before SnapTrade admits it (prod p90: 22
             # min). Nudge that connection to re-pull now and read it a few

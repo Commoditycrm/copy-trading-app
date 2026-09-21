@@ -161,6 +161,24 @@ class Order(Base, TimestampMixin):
     filled_avg_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The BROKER's own execution timestamp — when the trade actually happened at
+    # the venue, as the broker reports it. Distinct from closed_at, which every
+    # write site sets to datetime.now() and therefore records when WE NOTICED.
+    #
+    # Those two were conflated: Order History's "Time Taken to Filled" computed
+    # submitted_at -> closed_at, so on SnapTrade and Webull it showed OUR
+    # detection lag, not the broker's fill time. (Alpaca was already correct, by
+    # accident of having Fill rows carrying its activities feed's
+    # transaction_time — fills_sync.sync_account_fills early-returns for every
+    # other broker, so no other broker has Fill rows at all.) With both
+    # timestamps stored, broker_filled_at -> closed_at IS our detection lag,
+    # measurable per order instead of inferred.
+    #
+    # NULL whenever the broker doesn't report one, or for rows written before
+    # this column existed — readers must fall back to closed_at and say so.
+    broker_filled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # ── Copy-trade pipeline lifecycle timestamps (Performance page) ──────

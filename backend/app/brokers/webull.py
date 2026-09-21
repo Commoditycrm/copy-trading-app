@@ -205,6 +205,87 @@ def _as_date(v: Any) -> date | None:
         return None
 
 
+def _as_dt(v: Any) -> "datetime | None":
+    """Webull timestamps arrive as epoch millis (most common), epoch seconds, or
+    an ISO string — sometimes with a trailing 'Z', sometimes naive. Accept all;
+    return None for anything unparseable rather than guessing, because callers
+    store this as the BROKER's authoritative fill time."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().isdigit()):
+        try:
+            ts = float(v)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        if ts > 1e11:       # millis
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    txt = str(v).strip().replace("Z", "+00:00")
+    # Webull also emits "YYYY-MM-DD HH:MM:SS" (space, no T).
+    if len(txt) > 10 and txt[10] == " ":
+        txt = txt[:10] + "T" + txt[11:]
+    try:
+        parsed = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# Every spelling Webull has been seen to use for "when this order filled",
+# across /openapi/trade/order/detail and Query Day Orders. The field-name
+# inconsistency between those two endpoints is established — it is what caused
+# both the strike bug (option_exercise_price) and the zero-fill bug
+# (filled_quantity vs filled_qty) — so this checks the whole family rather than
+# betting on one name. _log_missing_fill_time below makes a miss LOUD instead of
+# silently leaving the column NULL.
+_FILL_TIME_KEYS = (
+    "filled_time", "filledTime",
+    "last_filled_time", "lastFilledTime",
+    "filled_at", "filledAt",
+    "execution_time", "executionTime",
+    "exec_time", "execTime",
+    "trade_time", "tradeTime",
+    "transaction_time", "transactionTime",
+    "update_time", "updateTime",
+    "updated_at", "updatedAt",
+)
+
+
+def _fill_time(leg: dict, order: dict) -> "datetime | None":
+    """The broker's execution timestamp for a filled order: leg first (more
+    specific), then the order envelope."""
+    return (
+        _as_dt(_first(leg, *_FILL_TIME_KEYS))
+        or _as_dt(_first(order, *_FILL_TIME_KEYS))
+    )
+
+
+def _log_missing_fill_time(status: "OrderStatus", filled_at, src: dict) -> None:
+    """A FILLED order with no parseable timestamp means Webull spells the field
+    in a way _FILL_TIME_KEYS doesn't cover. Log the AVAILABLE KEYS so the real
+    name is visible in prod logs — the same method that surfaced
+    option_exercise_price, rather than another round of guessing."""
+    if filled_at is not None or status != OrderStatus.FILLED:
+        return
+    try:
+        keys = sorted(k for k in src if isinstance(k, str))
+    except Exception:  # noqa: BLE001
+        keys = []
+    log.warning(
+        "webull: order reports FILLED but no fill timestamp matched %s — "
+        "Order History will fall back to our detection time for it. "
+        "Keys present on the payload: %s",
+        list(_FILL_TIME_KEYS), keys,
+    )
+
+
 def _as_right(v: Any) -> "OptionRight | None":
     r = str(v or "").strip().upper()
     if r.startswith("C"):
@@ -856,13 +937,14 @@ class WebullAdapter(BrokerAdapter):
             raise RuntimeError(
                 f"webull get_order_detail failed for {broker_order_id}"
             )
-        _body, _is_opt, status, filled_qty, filled_px = detail
+        _body, _is_opt, status, filled_qty, filled_px, filled_at = detail
         return BrokerOrderResult(
             broker_order_id=broker_order_id,
             status=status,
             submitted_at=datetime.now(timezone.utc),
             filled_quantity=filled_qty,
             filled_avg_price=filled_px,
+            filled_at=filled_at,
         )
 
     # How many of today's orders one snapshot call pulls back. Anything beyond
@@ -933,6 +1015,11 @@ class WebullAdapter(BrokerAdapter):
                 filled_avg_price=_dec(
                     _first(leg, "filled_price", "avg_fill_price", "filledPrice")
                 ),
+                filled_at=_fill_time(leg if isinstance(leg, dict) else {}, o),
+            )
+            _log_missing_fill_time(
+                out[coid].status, out[coid].filled_at,
+                leg if isinstance(leg, dict) else o,
             )
         if body.get("hasNext") if isinstance(body, dict) else False:
             log.info(
@@ -961,7 +1048,7 @@ class WebullAdapter(BrokerAdapter):
         trade = self._trade_client()
         detail = self._fetch_detail(trade, broker_order_id)
         if detail is not None:
-            _body, is_option, status, _q, _p = detail
+            _body, is_option, status, _q, _p, _t = detail
             if status in _TERMINAL_STATUSES:
                 return False
             resp = (
@@ -1158,7 +1245,9 @@ class WebullAdapter(BrokerAdapter):
             _dec(_first(leg, "filled_price", "avg_fill_price", "filledPrice", "avgFilledPrice"))
             or _dec(_first(order, "filled_price", "avg_fill_price"))
         )
-        return order, is_option, status, filled_qty, filled_px
+        filled_at = _fill_time(leg if isinstance(leg, dict) else {}, order)
+        _log_missing_fill_time(status, filled_at, leg if isinstance(leg, dict) else order)
+        return order, is_option, status, filled_qty, filled_px, filled_at
 
     def _raise_for_status(self, resp: Any, what: str) -> None:
         if getattr(resp, "status_code", None) != 200:

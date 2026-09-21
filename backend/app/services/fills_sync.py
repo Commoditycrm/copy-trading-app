@@ -191,6 +191,14 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
             )
             order.filled_quantity = order.quantity
             changed = True
+        # The BROKER's own execution time, when it reports one. Kept separate
+        # from closed_at (set below to OUR clock) so the gap between them is a
+        # measurable detection lag rather than an invisible conflation — that
+        # conflation is why Order History's "Time Taken to Filled" was showing
+        # our polling latency on every broker except Alpaca.
+        if res.filled_at is not None and order.broker_filled_at is None:
+            order.broker_filled_at = res.filled_at
+            changed = True
         if res.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED) and order.closed_at is None:
             order.closed_at = datetime.now(timezone.utc)
             changed = True
@@ -398,6 +406,7 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
                 filled_avg_price=price,
                 submitted_at=trade_at,
                 closed_at=trade_at,
+                broker_filled_at=trade_at,
             )
             db.add(order)
             db.flush()
@@ -431,6 +440,14 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             if new_qty >= _dec(order.quantity):
                 order.status = OrderStatus.FILLED
                 order.closed_at = trade_at
+                # Alpaca's activities feed carries the venue's own
+                # transaction_time, so this path has always had the real fill
+                # time — it just lived only on the Fill rows. Mirror it onto the
+                # order so ONE column answers "when did this fill" for every
+                # broker, instead of the frontend having to know that Alpaca
+                # alone has fills to look at.
+                if order.broker_filled_at is None:
+                    order.broker_filled_at = trade_at
             else:
                 order.status = OrderStatus.PARTIALLY_FILLED
 
