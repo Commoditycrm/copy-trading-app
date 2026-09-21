@@ -1229,27 +1229,70 @@ def _relink_orphaned_mirror_ids(
             db.commit()
 
 
-def _reconcile_one_subscriber_account(
-    subscriber_id: uuid.UUID, broker_account_id: uuid.UUID
+def reconcile_subscriber_account(
+    subscriber_id: uuid.UUID,
+    broker_account_id: uuid.UUID,
+    *,
+    adapter: "SnapTradeAdapter | None" = None,
+    light: bool = False,
 ) -> None:
-    creds = _load_creds(subscriber_id, broker_account_id)
-    if creds is None:
-        return
-    adapter = SnapTradeAdapter(creds)
+    """Public entry point for reconciling ONE subscriber account.
+
+    ``light=True`` is the on-placement nudge path (snaptrade_nudge): it runs the
+    activities read ONLY — exactly one SnapTrade call — instead of the sweep's
+    full pass. See _reconcile_one_subscriber_account for what that skips and why
+    skipping it is safe."""
+    _reconcile_one_subscriber_account(
+        subscriber_id, broker_account_id, adapter=adapter, light=light
+    )
+
+
+def _reconcile_one_subscriber_account(
+    subscriber_id: uuid.UUID,
+    broker_account_id: uuid.UUID,
+    *,
+    adapter: "SnapTradeAdapter | None" = None,
+    light: bool = False,
+) -> None:
+    """One account's reconcile.
+
+    LIGHT mode (the on-placement nudge) drops the two expensive halves:
+
+    * ``_refresh_open_orders`` — one ``get_order`` per working order. Its job is
+      rescuing orders that aged OUT of the activities window (a mirror that
+      filled days ago), which by definition is not the freshly-placed order a
+      nudge is chasing.
+    * ``_broker_net_map`` — one ``get_positions``, used solely as the guardrail
+      for the recovery path below. Without it ``broker_reachable`` is False and
+      _persist_subscriber_fill declines every recovery — the conservative
+      direction, and the same thing it does whenever positions are unreadable.
+
+    What survives is the part that matters seconds after placement: read the
+    activities feed, relink id drift, sync status + filled qty. SnapTrade's
+    quota is one shared platform-wide pool, so the difference between one call
+    and four is the difference between a nudge we can afford per mirror and one
+    we cannot.
+    """
+    if adapter is None:
+        creds = _load_creds(subscriber_id, broker_account_id)
+        if creds is None:
+            return
+        adapter = SnapTradeAdapter(creds)
     # Direct per-order status refresh (get_order) FIRST, so a fill flips
     # SUBMITTED -> FILLED even when the activities feed has aged past it — the
     # activities window is short, so long-stuck mirror orders (e.g. a Webull
     # entry that filled days ago) never recover from the feed alone. This is the
     # same broker-agnostic refresh the Alpaca / direct-Webull reconcilers run.
-    try:
-        from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
-        with SessionLocal() as db:
-            acct = db.get(BrokerAccount, broker_account_id)
-            if acct is not None and acct.connection_status == "connected":
-                _refresh_open_orders(db, acct, adapter)
-                db.commit()
-    except Exception:  # noqa: BLE001
-        log.exception("snaptrade subscriber reconcile: direct order refresh failed for %s", broker_account_id)
+    if not light:
+        try:
+            from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
+            with SessionLocal() as db:
+                acct = db.get(BrokerAccount, broker_account_id)
+                if acct is not None and acct.connection_status == "connected":
+                    _refresh_open_orders(db, acct, adapter)
+                    db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("snaptrade subscriber reconcile: direct order refresh failed for %s", broker_account_id)
 
     orders = adapter.list_recent_activities()
     if not orders:
@@ -1263,8 +1306,11 @@ def _reconcile_one_subscriber_account(
     _relink_orphaned_mirror_ids(subscriber_id, broker_account_id, orders)
     # Broker's live net per contract — the guardrail the recovery path checks
     # against so a recovered close can never push our net PAST what the broker
-    # actually holds (the phantom-short regression).
-    broker_net, broker_reachable = _broker_net_map(adapter)
+    # actually holds (the phantom-short regression). Skipped in light mode,
+    # which leaves broker_reachable False and so declines every recovery.
+    broker_net, broker_reachable = (
+        ({}, False) if light else _broker_net_map(adapter)
+    )
     for o in orders:
         broker_order_id = str(_attr(o, "brokerage_order_id", "id", default=""))
         if not broker_order_id:
