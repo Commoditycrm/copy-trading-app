@@ -34,7 +34,12 @@ from app.models.order import InstrumentType, OptionRight, Order, OrderSide, Orde
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
-from app.schemas.position import ClosePositionIn, PositionOut
+from app.schemas.position import (
+    ClosePositionIn,
+    PositionOut,
+    PositionsPayload,
+    UnreachableAccount,
+)
 from app.models.sell_all_snapshot import SellAllSnapshot
 from app.services import trailing_stop_close
 from app.services.crypto import decrypt_json
@@ -77,16 +82,34 @@ class _MinimalRequestShim:
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
-@router.get("", response_model=list[PositionOut])
+@router.get("", response_model=None)
 def list_positions(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
-) -> list[PositionOut]:
+    detail: bool = Query(
+        False,
+        description="Return {positions, unreachable} instead of a bare list.",
+    ),
+) -> "list[PositionOut] | PositionsPayload":
     """Return positions across every connected broker account for the caller.
 
     A position appears once per (broker_account, symbol). Disconnected accounts
-    are skipped silently. Per-account broker failures are skipped silently too —
-    we don't want one flaky broker to break the whole list.
+    are skipped. One broker's outage never blanks the whole list.
+
+    But a skipped account is NOT the same as an empty one, and this endpoint
+    used to report them identically — 200 with the account simply absent. The
+    UI cannot tell those apart, so a failed read rendered as "you hold
+    nothing". That is what showed subscribers an empty positions table whenever
+    Webull answered 429 (prod, 2026-09-21) while they held real positions.
+
+    ``?detail=1`` returns ``{positions, unreachable}`` so the caller can say so.
+    The bare list stays the default: three other callers depend on that shape
+    and none of them needs the distinction.
+
+    One honest limit: this reports accounts whose adapter RAISED. An adapter
+    that swallows its own failure and returns [] — SnapTrade's get_positions
+    does exactly that — still looks flat from here. Fixing that means changing
+    those adapters to raise, which is a larger change than this one.
     """
     accts = db.execute(
         select(BrokerAccount).where(
@@ -96,12 +119,17 @@ def list_positions(
     ).scalars().all()
 
     out: list[PositionOut] = []
+    unreachable: list[UnreachableAccount] = []
     for acct in accts:
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
             prev_close_fn = getattr(adapter, "get_stock_prev_close", None)
-            for p in adapter.get_positions():
+            # Display path: let concurrent readers share one broker call.
+            # Webull rejects simultaneous position reads with 429, and this
+            # endpoint is called up to four times per order event by the
+            # positions table alone, plus the calendar independently.
+            for p in adapter.get_positions(cached_ok=True):
                 # Reference = previous session's market CLOSE for this stock.
                 ref = None
                 if prev_close_fn is not None and p.instrument_type == InstrumentType.STOCK:
@@ -135,8 +163,34 @@ def list_positions(
                 "positions: skipping account %s (%s) — %s",
                 acct.id, acct.broker.value, str(exc)[:300], exc_info=True,
             )
+            unreachable.append(UnreachableAccount(
+                broker_account_id=acct.id,
+                broker=acct.broker.value,
+                label=acct.label,
+                detail=_unreachable_detail(exc),
+            ))
             continue
+    if detail:
+        return PositionsPayload(positions=out, unreachable=unreachable)
     return out
+
+
+def _unreachable_detail(exc: Exception) -> str:
+    """A short, user-safe reason for a failed position read.
+
+    Never the raw exception text — it carries account ids and request ids that
+    have no place in a UI. Throttling gets its own wording because it is
+    transient and self-healing, so the right message is 'retrying', not 'error'.
+    """
+    msg = str(exc)
+    if "429" in msg or "TOO_MANY_REQUESTS" in msg.upper():
+        return "Rate limited by the broker — retrying"
+    low = msg.lower()
+    if "timeout" in low or "timed out" in low:
+        return "Broker timed out — retrying"
+    if "401" in msg or "403" in msg or "unauthor" in low:
+        return "Broker rejected our credentials — reconnect this account"
+    return "Broker unavailable — retrying"
 
 
 @router.get("/today-realized")

@@ -190,8 +190,14 @@ class BrokerAdapter(ABC):
         id for the replacement (Alpaca does)."""
         raise NotImplementedError
 
-    def get_positions(self) -> list[BrokerPosition]:
-        """List currently held positions at this broker account."""
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
+        """List currently held positions at this broker account.
+
+        ``cached_ok`` lets a DISPLAY caller accept a very recent cached read so
+        that simultaneous readers share one request. Adapters are free to ignore
+        it; only Webull implements it today, because Webull is the only broker
+        that rejects concurrent position reads (429). Callers that decide
+        whether to PLACE an order must leave it False."""
         raise NotImplementedError
 
     def get_pnl_snapshot(self) -> dict[str, Any] | None:

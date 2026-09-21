@@ -321,7 +321,7 @@ class IBKRAdapter(BrokerAdapter):
 
     # ── Positions ─────────────────────────────────────────────────────────
 
-    def get_positions(self) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
         out: list[BrokerPosition] = []
         page = 0
         while True:

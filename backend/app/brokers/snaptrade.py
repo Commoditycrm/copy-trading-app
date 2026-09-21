@@ -821,7 +821,7 @@ class SnapTradeAdapter(BrokerAdapter):
 
     # ── positions ─────────────────────────────────────────────────────────
 
-    def get_positions(self) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
         """Return every open position on the account — stocks AND options.
 
         SnapTrade splits these across two endpoints:

@@ -198,7 +198,7 @@ class FakeBrokerAdapter(BrokerAdapter):
         time.sleep(0.05)
         return True
 
-    def get_positions(self) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
         # Test users don't have real positions; the positions page will
         # show empty for fake accounts, which is what we want.
         return []
