@@ -456,6 +456,91 @@ def test_an_order_with_no_submitted_at_still_schedules():
         webull_rec._intervals = saved
 
 
+# ── FILLED must never be written with a zero fill quantity ──────────────────
+# The pairing is self-contradictory (FILLED means the whole order traded) and,
+# worse, unrecoverable: _refresh_open_orders only re-reads NON-terminal orders,
+# so a row written FILLED/0 is terminal, wrong, and never looked at again.
+#
+# It happened for real. Webull spells the field filled_quantity on its
+# order-detail endpoint and filled_qty on Query Day Orders; only the second was
+# handled, so every filled Webull mirror landed FILLED with 0.
+# copy_engine._closeable_quantity sums that column, so the subscriber read as
+# FLAT while holding the position and their next close went out as an OPENING
+# sell — which the broker rejected with
+# OPENAPI_POSITION_ORDER_INTENT_MISMATCH. The parser is fixed; this guard means
+# the NEXT parser gap degrades to a log line instead of a stranded position.
+
+class _StatusOnlyAdapter:
+    """A broker that reports the status but whose fill quantity we fail to
+    parse — i.e. exactly what a field-name miss looks like from here."""
+    def __init__(self, status=OrderStatus.FILLED, filled=Decimal("0")):
+        self._status, self._filled = status, filled
+
+    def get_order(self, boid):
+        from app.brokers.base import BrokerOrderResult
+        from datetime import datetime, timezone
+        return BrokerOrderResult(
+            broker_order_id=boid, status=self._status,
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=self._filled, filled_avg_price=None,
+        )
+
+
+def _refresh_one(db, acct_id, adapter):
+    import app.services.fills_sync as fs
+    return fs._refresh_open_orders(db, db.get(BrokerAccount, acct_id), adapter)
+
+
+def test_filled_with_no_parsed_quantity_falls_back_to_the_order_quantity():
+    db = _make_session()
+    acct = _account(db, _SUB)
+    o = _order(db, acct, _SUB, parent=uuid.uuid4(), boid="c1")
+    o.quantity = Decimal("2"); db.commit()
+
+    _refresh_one(db, acct, _StatusOnlyAdapter())
+    db.commit(); db.refresh(o)
+    assert o.status == OrderStatus.FILLED
+    assert o.filled_quantity == Decimal("2")   # was 0 — the stranding bug
+
+
+def test_a_parsed_quantity_is_always_preferred():
+    """The fallback must never override a real value the broker did give us."""
+    db = _make_session()
+    acct = _account(db, _SUB)
+    o = _order(db, acct, _SUB, parent=uuid.uuid4(), boid="c1")
+    o.quantity = Decimal("5"); db.commit()
+
+    _refresh_one(db, acct, _StatusOnlyAdapter(filled=Decimal("3")))
+    db.commit(); db.refresh(o)
+    assert o.filled_quantity == Decimal("3")   # not 5
+
+
+def test_partially_filled_is_left_alone():
+    """Only FILLED implies the full quantity. A partial genuinely can be 0 so
+    far, and assuming otherwise would invent a position."""
+    db = _make_session()
+    acct = _account(db, _SUB)
+    o = _order(db, acct, _SUB, parent=uuid.uuid4(), boid="c1")
+    o.quantity = Decimal("4"); db.commit()
+
+    _refresh_one(db, acct, _StatusOnlyAdapter(status=OrderStatus.PARTIALLY_FILLED))
+    db.commit(); db.refresh(o)
+    assert o.filled_quantity == Decimal("0")
+
+
+def test_canceled_with_zero_fill_is_left_alone():
+    """A cancelled order legitimately filled nothing."""
+    db = _make_session()
+    acct = _account(db, _SUB)
+    o = _order(db, acct, _SUB, parent=uuid.uuid4(), boid="c1")
+    o.quantity = Decimal("4"); db.commit()
+
+    _refresh_one(db, acct, _StatusOnlyAdapter(status=OrderStatus.CANCELED))
+    db.commit(); db.refresh(o)
+    assert o.status == OrderStatus.CANCELED
+    assert o.filled_quantity == Decimal("0")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

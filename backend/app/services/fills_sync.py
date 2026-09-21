@@ -161,6 +161,36 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
         if res.filled_avg_price is not None and _dec(res.filled_avg_price) != _dec(order.filled_avg_price):
             order.filled_avg_price = res.filled_avg_price
             changed = True
+        # FILLED with a zero fill quantity is self-contradictory — FILLED means
+        # the whole order traded. It means we could not PARSE the quantity out of
+        # the broker's response, and writing it anyway is unrecoverable: this
+        # sweep only re-reads NON-terminal orders, so the row is terminal, wrong,
+        # and never looked at again.
+        #
+        # It is not a theoretical inconsistency. Webull spells the field
+        # filled_quantity on its order-detail endpoint and filled_qty on Query
+        # Day Orders; only the second was handled, so every filled mirror landed
+        # FILLED with 0. copy_engine._closeable_quantity sums that column, so the
+        # subscriber read as FLAT while holding the position and their next close
+        # went out as an OPENING sell, which the broker rejected.
+        #
+        # So trust the status and take the quantity from the order itself — true
+        # by definition of FILLED — and log loudly, because reaching here at all
+        # means a parser needs fixing.
+        if (
+            res.status == OrderStatus.FILLED
+            and _dec(order.filled_quantity) == 0
+            and _dec(order.quantity) > 0
+        ):
+            log.warning(
+                "fills_sync: %s reports order %s FILLED but no fill quantity "
+                "parsed — assuming the full %s. THIS INDICATES A PARSER GAP in "
+                "the adapter's order-detail mapping; fix it rather than relying "
+                "on this fallback.",
+                acct.broker.value, order.broker_order_id, order.quantity,
+            )
+            order.filled_quantity = order.quantity
+            changed = True
         if res.status in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED) and order.closed_at is None:
             order.closed_at = datetime.now(timezone.utc)
             changed = True
