@@ -755,6 +755,12 @@ def update_source(
     src = _get_owned(db, user, source_id)
     if payload.label is not None:
         src.label = payload.label.strip()
+    if payload.percent_means_exit is not None:
+        src.percent_means_exit = payload.percent_means_exit
+        log.info(
+            "discord: source %s percent_means_exit=%s",
+            src.id, payload.percent_means_exit,
+        )
     if payload.channel_url is not None:
         try:
             guild_id, channel_id = parse_channel_url(payload.channel_url)

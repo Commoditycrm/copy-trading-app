@@ -211,6 +211,17 @@ class ParsedMessage:
     author: str | None = None
     posted_at: datetime | None = None
 
+    # House style differs per channel, and the SAME text means opposite things.
+    #
+    # Some channels mark an exit with scissors ("✂️ $SPY 760c +58%") and post
+    # bare percentages as running P&L on a position they still hold — the same
+    # contract reappearing at +24%, +45%, +60%. Others never use scissors and a
+    # percentage IS the trim ("IWM 287P +52%", "AMD 27%").
+    #
+    # Reading a P&L update as an exit would fire three sells for one position,
+    # so this is opt-in per source rather than a global guess.
+    percent_means_exit: bool = False
+
     @property
     def text(self) -> str:
         """Everything readable, newline-joined: content, then each embed's

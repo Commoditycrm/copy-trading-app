@@ -107,6 +107,18 @@ class DiscordAlertSource(Base, TimestampMixin):
     #   connected    — channel open, MutationObserver attached, heartbeats flowing
     #   disconnected — cleanly stopped (source disabled, or graceful shutdown)
     #   error        — failed to open or stay on the channel; see last_error
+    # House style: does a bare percentage mean "I trimmed" or "here's how it's
+    # doing"? The same text means opposite things across channels — some mark
+    # exits with scissors and post percentages as running P&L on a position they
+    # still hold, others write "IWM 287P +52%" as the trim itself.
+    #
+    # Off by default, because the expensive mistake is the wrong direction: a
+    # channel posting the same contract at +24%, +45%, +60% would fire three
+    # exits for one position.
+    percent_means_exit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+
     status: Mapped[str] = mapped_column(String(20), default="needs_login", nullable=False)
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
