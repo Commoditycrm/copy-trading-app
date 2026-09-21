@@ -607,3 +607,103 @@ def test_an_entry_without_a_price_is_flagged_rather_than_invented():
     s = parse_message(text("AAPL $350 CALL 09/18")).signal
     assert s.limit_price is None
     assert s.limit_price_unspecified is True
+
+
+# ── real channel formats, per channel ────────────────────────────────────────
+# Taken from five live channels. The same shape means opposite things across
+# them, which is why percent_means_exit exists.
+
+_POSTED = datetime(2026, 9, 21, 14, 30, tzinfo=timezone.utc)
+
+
+def _p(text: str, *, percent_exit: bool = False):
+    return parse_message(
+        ParsedMessage(content=text, posted_at=_POSTED, percent_means_exit=percent_exit)
+    )
+
+
+@pytest.mark.parametrize(
+    "text,symbol,strike,right",
+    [
+        ("$SPY 760 CALL 0DTE @1.00", "SPY", "760", "CALL"),        # Clint
+        ("$CRWV 81 CALL 10/02 @4.75", "CRWV", "81", "CALL"),       # Swings
+        ("SPY 763c @ .55", "SPY", "763", "CALL"),                  # Zenith
+        ("TSLA 367.5C ODTE @1.28", "TSLA", "367.5", "CALL"),       # Mark
+        ("SPY 760P @here @Sniper 1.2", "SPY", "760", "PUT"),       # Breakdownsniper
+    ],
+)
+def test_every_channels_buy_format_parses(text, symbol, strike, right):
+    sig = _p(text).signal
+    assert sig is not None, text
+    assert sig.action.value == "BUY"
+    assert sig.symbol == symbol
+    assert str(sig.strike) == strike
+    assert sig.option_type.value == right
+
+
+def test_a_price_written_without_its_leading_zero():
+    """"@ .55" is how these channels write 55 cents."""
+    assert _p("SPY 763c @ .55").signal.limit_price == Decimal("0.55")
+
+
+def test_odte_with_the_letter_o_means_same_day():
+    """A common mistype. Reading it as an unknown expiry rejects a valid alert."""
+    assert _p("TSLA 367.5C ODTE @1.28").signal.expiration == _POSTED.date()
+
+
+def test_discord_pings_do_not_hide_the_price():
+    """"@here" looks like an "@price" and used to swallow the real one, leaving
+    the alert unparseable."""
+    assert _p("SPY 760P @here @Sniper 1.2").signal.limit_price == Decimal("1.2")
+
+
+def test_a_buy_with_no_expiry_is_same_day():
+    """Several channels post SPY scalps and never write the date."""
+    assert _p("SPY 763c @ .55").signal.expiration == _POSTED.date()
+
+
+# ── the same text, opposite meanings ─────────────────────────────────────────
+
+@pytest.mark.parametrize("text", ["IWM 287P +52%", "AMD 27%"])
+def test_a_percentage_is_a_trim_where_the_channel_says_so(text):
+    sig = _p(text, percent_exit=True).signal
+    assert sig is not None, text
+    assert sig.action.value == "SELL"
+
+
+@pytest.mark.parametrize("text", ["IWM 287P +52%", "$MSFT 100c +366%"])
+def test_the_same_percentage_is_only_an_update_elsewhere(text):
+    """Off by default. A channel that posts the same contract at +24%, +45%,
+    +60% would otherwise fire three exits for one position."""
+    r = _p(text, percent_exit=False)
+    assert r.signal is None
+    assert "price update" in (r.reason or "")
+
+
+def test_a_named_contract_survives_the_percent_route():
+    sig = _p("IWM 287P +52%", percent_exit=True).signal
+    assert (sig.symbol, str(sig.strike), sig.option_type.value) == ("IWM", "287", "PUT")
+    assert sig.contract_unspecified is False
+
+
+def test_a_bare_ticker_percent_resolves_from_the_position():
+    """"AMD 27%" names no contract, so execution must read it off the holding."""
+    sig = _p("AMD 27%", percent_exit=True).signal
+    assert sig.symbol == "AMD"
+    assert sig.contract_unspecified is True
+
+
+def test_the_percentage_is_the_result_not_a_size():
+    """"+52%" is how the trade did, never "sell 52% of it"."""
+    sig = _p("IWM 287P +52%", percent_exit=True).signal
+    assert sig.quantity is None
+    assert sig.pnl_percent == Decimal("52")
+
+
+def test_prose_is_not_traded_even_on_a_percent_channel():
+    assert _p("AMD 27% of the float is short", percent_exit=True).signal is None
+
+
+def test_scissors_still_work_on_a_percent_channel():
+    sig = _p("✂️ $SPY 760c +58%", percent_exit=True).signal
+    assert sig.action.value == "SELL" and sig.symbol == "SPY"

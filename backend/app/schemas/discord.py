@@ -41,6 +41,10 @@ class DiscordSourceUpdateIn(BaseModel):
     label: str | None = Field(default=None, min_length=1, max_length=120)
     is_enabled: bool | None = None
 
+    # Does a bare percentage mean "I trimmed" on this channel, or "here's how
+    # it's doing"? See DiscordAlertSource.percent_means_exit.
+    percent_means_exit: bool | None = None
+
     # Active window. "always" | "market" | "extended" | "custom".
     schedule_mode: str | None = Field(default=None, pattern=r"^(always|market|extended|custom)$")
     schedule_start: time | None = None
@@ -88,6 +92,7 @@ class DiscordSourceOut(BaseModel):
     guild_id: str | None
     guild_name: str | None
     is_enabled: bool
+    percent_means_exit: bool = False
     # needs_login | connecting | connected | disconnected | error
     status: str
     last_error: str | None
