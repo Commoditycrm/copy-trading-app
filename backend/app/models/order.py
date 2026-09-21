@@ -3,7 +3,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -284,6 +284,16 @@ class Fill(Base):
     """Individual execution against an Order. Source of truth for realized P&L."""
 
     __tablename__ = "fills"
+    # A broker fill is recorded once. Two sync paths racing to insert the same
+    # broker_fill_id created duplicate rows that inflated a position's quantity
+    # and corrupted the realized-P&L FIFO cost basis. Partial (NULL ids — e.g.
+    # synthetic fills — aren't deduped).
+    __table_args__ = (
+        Index(
+            "uq_fills_broker_fill_id", "broker_fill_id", unique=True,
+            postgresql_where=text("broker_fill_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     order_id: Mapped[uuid.UUID] = mapped_column(
