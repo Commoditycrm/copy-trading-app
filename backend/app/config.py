@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # interval instead of polling every 5s (saves API calls / rate-limit
     # headroom). False = no webhook, poller stays at its 5s cadence.
     snaptrade_webhook_enabled: bool = False
+    # On-placement fill nudge for SnapTrade SUBSCRIBER mirrors. SnapTrade serves
+    # cached brokerage data and re-pulls on its own cadence, so a mirror can be
+    # filled at the broker long before our reads can see it (prod p90: 22 min,
+    # and 65% of fills land later than any sweep interval could explain). The
+    # nudge calls force_resync() on that connection right after placement and
+    # reads a few seconds later. Nothing in the system did this for subscribers
+    # before — force_resync was reachable only from the per-TRADER poll loop.
+    # Kill-switch: set false if SnapTrade's shared quota ever gets tight; the
+    # 30s sweep still covers fills, just slower. See services/snaptrade_nudge.
+    snaptrade_fill_nudge_enabled: bool = True
     # asyncio.to_thread() uses the default ThreadPoolExecutor (default size
     # min(32, cpu+4) — way too small for 200 concurrent broker calls). We
     # bump this at startup so all 200 actually run in parallel.
