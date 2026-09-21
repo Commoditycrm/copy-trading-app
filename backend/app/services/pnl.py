@@ -58,6 +58,21 @@ def _instrument_key(o: Order) -> tuple:
     return ("STK", o.symbol)
 
 
+def _dedup_fills(rows):
+    """Yield fills, skipping a repeated broker_fill_id. A duplicate fill row
+    (same broker fill recorded twice by racing sync paths) would double-count a
+    lot and flip FIFO realized P&L. NULL ids are distinct (synthetic fills), so
+    they pass through. Belt-and-braces alongside the unique index on the column."""
+    seen: set[str] = set()
+    for f in rows:
+        bid = f.broker_fill_id
+        if bid is not None:
+            if bid in seen:
+                continue
+            seen.add(bid)
+        yield f
+
+
 def reconstruct_marked_series(
     days: list[date],
     realized_by_day: dict[date, Decimal],
@@ -145,9 +160,9 @@ def today_buy_notional(
 
     order_ids = [o.id for o in orders]
     fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
-    for f in db.execute(
+    for f in _dedup_fills(db.execute(
         select(Fill).where(Fill.order_id.in_(order_ids))
-    ).scalars():
+    ).scalars()):
         fills_by_order[f.order_id].append(f)
 
     total = Decimal(0)
@@ -228,9 +243,9 @@ def today_realized_pnl_bulk(
 
     order_ids = [o.id for o in orders]
     fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
-    for f in db.execute(
+    for f in _dedup_fills(db.execute(
         select(Fill).where(Fill.order_id.in_(order_ids))
-    ).scalars():
+    ).scalars()):
         fills_by_order[f.order_id].append(f)
 
     # Per-user FIFO lot walk. Mirrors realized_pnl_by_day but we only
@@ -388,9 +403,9 @@ def realized_pnl_by_day(
     order_ids = [o.id for o in orders]
     fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
     if order_ids:
-        for f in db.execute(
+        for f in _dedup_fills(db.execute(
             select(Fill).where(Fill.order_id.in_(order_ids))
-        ).scalars():
+        ).scalars()):
             fills_by_order[f.order_id].append(f)
 
     # Flatten to a sortable timeline of (when, qty, price, order). If the order
@@ -493,7 +508,7 @@ def realized_pnl_by_order(
     order_ids = [o.id for o in orders]
     fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
     if order_ids:
-        for f in db.execute(select(Fill).where(Fill.order_id.in_(order_ids))).scalars():
+        for f in _dedup_fills(db.execute(select(Fill).where(Fill.order_id.in_(order_ids))).scalars()):
             fills_by_order[f.order_id].append(f)
 
     timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []

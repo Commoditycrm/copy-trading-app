@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
@@ -411,7 +412,17 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             filled_at=trade_at,
             broker_fill_id=activity_id,
         )
-        db.add(fill)
+        # Insert inside a savepoint so a concurrent sync that already recorded
+        # this fill (unique broker_fill_id) just skips it here instead of failing
+        # the whole batch commit.
+        try:
+            with db.begin_nested():
+                db.add(fill)
+                db.flush()
+        except IntegrityError:
+            skipped += 1
+            existing.add(activity_id)
+            continue
         fills_added += 1
         existing.add(activity_id)
 
