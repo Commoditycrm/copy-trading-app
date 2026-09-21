@@ -492,6 +492,51 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> An
         return client
 
 
+# ── Concurrent position-read coalescing ─────────────────────────────────────
+#
+# Webull refuses SIMULTANEOUS reads of /openapi/assets/positions for one account
+# with 429 TOO_MANY_REQUESTS — and it is not a volume limit. Measured on prod
+# 2026-09-21: rejections 32ms and 129ms apart, at a whole-platform peak under 50
+# requests/min across every user and broker, against a documented 300/min. Two
+# calls landing in the same instant is what it objects to, not the rate.
+#
+# They land together because several independent readers exist: the positions
+# page (which fires FOUR staggered refreshes per order event), the calendar's
+# live-unrealized fetch, and the worker's own sweeps. None of them knows about
+# the others.
+#
+# So collapse them. Callers that only DISPLAY positions pass cached_ok=True and
+# share one HTTP call: the first through the lock fetches, everyone arriving
+# within the TTL reuses the result, and anyone arriving mid-flight blocks on the
+# lock and then reads the fresh value rather than issuing a second request.
+#
+# Deliberately NOT the default. auto_liquidator, position_enforcer and
+# order_retry decide whether to PLACE an order from this read; handing one of
+# them a 2-second-old snapshot risks closing a position that is already closed.
+# Those keep the uncached path — correctness over call count.
+_POSITIONS_TTL_S = 2.0
+_positions_cache: dict[str, "tuple[float, list]"] = {}
+_positions_locks: dict[str, threading.Lock] = {}
+_positions_lock_guard = threading.Lock()
+
+
+def _positions_lock_for(key: str) -> threading.Lock:
+    with _positions_lock_guard:
+        return _positions_locks.setdefault(key, threading.Lock())
+
+
+def invalidate_positions_cache(app_key: str | None, account_id: str | None = None) -> None:
+    """Drop the cached positions for an account. Call after anything that
+    CHANGES the position (a fill, a close) so the next display read is fresh
+    rather than up to _POSITIONS_TTL_S stale."""
+    with _positions_lock_guard:
+        if account_id is None:
+            for k in [k for k in _positions_cache if k.startswith(f"{app_key}:")]:
+                _positions_cache.pop(k, None)
+        else:
+            _positions_cache.pop(f"{app_key}:{account_id}", None)
+
+
 def invalidate_trade_client(app_key: str | None) -> None:
     """Drop the cached client so the next call rebuilds it (re-auths). Call only
     on AUTH failures — NOT on 429s: a throttle means throttled, not bad auth, and
@@ -752,7 +797,29 @@ class WebullAdapter(BrokerAdapter):
             extra={"region_id": self.region_id},
         )
 
-    def get_positions(self) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
+        """Positions for this account.
+
+        ``cached_ok=True`` is for DISPLAY paths only. It serialises concurrent
+        reads for this account and lets them share one HTTP call, because Webull
+        rejects simultaneous position reads with 429 — see the comment on
+        _POSITIONS_TTL_S. Decision paths (liquidation, TP/SL enforcement, retry)
+        must leave it False and read live.
+        """
+        if not cached_ok:
+            return self._fetch_positions()
+        key = f"{self.app_key}:{self.account_id}"
+        with _positions_lock_for(key):
+            hit = _positions_cache.get(key)
+            if hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
+                return hit[1]
+            # A failure is NOT cached: the next caller retries. It is still
+            # serialised by the lock, which is the part that prevents the 429.
+            out = self._fetch_positions()
+            _positions_cache[key] = (time.monotonic(), out)
+            return out
+
+    def _fetch_positions(self) -> list[BrokerPosition]:
         """Live positions for this account.
 
         This is the BROKER-SIDE source of truth for "what does the subscriber

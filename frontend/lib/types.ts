@@ -178,6 +178,27 @@ export interface Order {
   fills: Fill[];
 }
 
+/** A broker account whose positions could NOT be read on this request.
+ *
+ *  Distinct from "this account holds nothing". Before this existed the API
+ *  returned 200 with the failed account simply absent, so the table drew an
+ *  empty view and told the user they were flat while they held real
+ *  positions (prod, 2026-09-21: Webull answering 429 to a position read). */
+export interface UnreachableAccount {
+  broker_account_id: string;
+  broker: string;
+  label: string | null;
+  /** Short, user-safe reason. Sanitised server-side — safe to render. */
+  detail: string;
+}
+
+/** Response of GET /api/positions?detail=1. The bare-list form stays the
+ *  default for the callers that do not need the distinction. */
+export interface PositionsPayload {
+  positions: Position[];
+  unreachable: UnreachableAccount[];
+}
+
 export interface Position {
   broker_account_id: string;
   broker_symbol: string;              // canonical broker id; unique key for the position
