@@ -45,7 +45,7 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
-from app.services import audit, cache, events
+from app.services import audit, cache, events, snaptrade_nudge
 from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
@@ -1295,6 +1295,7 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
                 ch.filled_avg_price = resp.filled_avg_price
                 ch.closed_at = None
                 ch.redis_published_at = datetime.now(timezone.utc)
+                snaptrade_nudge.schedule(ch.user_id, ch.broker_account_id)
                 audit.record(
                     db, actor_user_id=ch.user_id, action="order.mirror_modified",
                     entity_type="order", entity_id=ch.id,
@@ -2015,6 +2016,7 @@ def fire_deferred_closes_for_entry(entry: Order) -> None:
             ch.submitted_at = resp.submitted_at
             ch.retry_at = None
             ch.reject_reason = None
+            snaptrade_nudge.schedule(ch.user_id, ch.broker_account_id)
             audit.record(
                 db, actor_user_id=ch.user_id, action="copy.deferred_close_placed_on_entry_fill",
                 entity_type="order", entity_id=ch.id,
@@ -2985,6 +2987,11 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             child.broker_accepted_at = resp.submitted_at or datetime.now(timezone.utc)
             child.filled_quantity = resp.filled_quantity
             child.filled_avg_price = resp.filled_avg_price
+            # SnapTrade serves CACHED brokerage data, so a mirror can be filled
+            # at the broker minutes before SnapTrade admits it (prod p90: 22
+            # min). Nudge that connection to re-pull now and read it a few
+            # seconds later. No-op for every other broker. See snaptrade_nudge.
+            snaptrade_nudge.schedule(item.subscriber_user_id, item.broker_account_id)
             audit.record(
                 db,
                 actor_user_id=item.subscriber_user_id,
