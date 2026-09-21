@@ -41,7 +41,10 @@ from .base import (
     TradeSignal,
 )
 
-_NUM = r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?"
+# Prices are routinely written without the leading zero — "@ .55", "@.90" —
+# so a bare fraction has to be a number too, or the price is simply missed
+# and the alert falls through as "not a trade".
+_NUM = r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+"
 
 # These alerts never state a size — the channel's convention is one lot, and the
 # platform currently trades exactly one. Kept as a named constant so it's a
@@ -64,8 +67,8 @@ _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
-    rf"(?:@\s*\$?(?P<price>{_NUM})\b)?"
+    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
 )
@@ -75,7 +78,7 @@ _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -97,6 +100,19 @@ _UPDATE_RE = re.compile(
 )
 
 
+# "AMD 27%" — a ticker and a result, with no contract and no arrow.
+#
+# Only meaningful on a source whose house style makes a percentage an exit
+# (percent_means_exit). Anywhere else this shape is chatter, so the pattern is
+# deliberately strict: the line must be ONLY the ticker and the percentage.
+# Allowing trailing prose would turn "AMD 27% of the float is short" into a sell.
+_PCT_BARE_RE = re.compile(
+    rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
+    rf"(?P<sign>[+\-\u2212])?\s*(?P<pct>{_NUM})\s*%\s*$",
+    re.IGNORECASE,
+)
+
+
 # "META -> 100%"  /  "NVDA -> -100%"  /  "TSLA → 25%"
 #
 # A close reported as a symbol and a result, with NO contract details at all.
@@ -113,6 +129,22 @@ _CLOSE_ARROW_RE = re.compile(
 )
 
 
+# Discord pings inside an alert: "@here", "@everyone", "@Sniper", "<@1234>".
+#
+# They matter because they look like a price. "SPY 760P @here @Sniper 1.2" puts
+# the real price bare at the end, and an "@"-anchored price pattern locks onto
+# "@here" instead, finds no number, and the whole alert is read as chatter.
+# Removing the pings leaves "SPY 760P 1.2", which parses.
+#
+# A ping is "@" followed by letters/underscore, or Discord's "<@id>" / "<@&id>"
+# / "<#id>" forms. "@1.28" is untouched, since a price never starts with a letter.
+_MENTION_RE = re.compile(r"<[@#][!&]?\d+>|@[A-Za-z_][\w.\-]*")
+
+
+def _strip_mentions(line: str) -> str:
+    return _MENTION_RE.sub(" ", line)
+
+
 # "Adding $MSFT 100c @1.90"  /  "Add $TSLA 375c"  /  "Adding $SPY"
 #
 # An instruction to increase a position the trader ALREADY holds. That's what
@@ -126,8 +158,8 @@ _ADD_RE = re.compile(
     rf"^\s*(?:ADD|ADDING)\s+"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
-    rf"\s*(?P<exp>0DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
-    rf"(?:@\s*\$?(?P<price>{_NUM})\b)?"
+    rf"\s*(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
 )
@@ -137,13 +169,18 @@ class CompactAlertParser(Parser):
     name = "compact_alert"
 
     def _lines(self, message: ParsedMessage) -> list[str]:
-        return [ln.strip() for ln in message.text.splitlines() if ln.strip()]
+        return [
+            _strip_mentions(ln).strip()
+            for ln in message.text.splitlines()
+            if ln.strip()
+        ]
 
     def matches(self, message: ParsedMessage) -> bool:
         # Update lines are claimed too, so parse() can report WHY they aren't
         # traded rather than letting them fall through as generic chatter.
         return any(
             _UPDATE_RE.match(ln)
+            or (message.percent_means_exit and _PCT_BARE_RE.match(ln))
             or _CLOSE_ARROW_RE.match(ln)
             or (_ADD_RE.match(ln) and _is_add(_ADD_RE.match(ln)))
             or (_has_marker(ln) and _EXIT_RE.match(ln))
@@ -165,9 +202,25 @@ class CompactAlertParser(Parser):
                 continue
             # Updates are checked FIRST: "$TSLA 375c +43%" would otherwise
             # satisfy the (now price-optional) entry pattern and become a BUY.
-            if _UPDATE_RE.match(line):
-                saw_update = True
+            m = _UPDATE_RE.match(line)
+            if m:
+                if message.percent_means_exit:
+                    # This channel writes its trims this way — "IWM 287P +52%"
+                    # with no scissors. The contract is fully named, so it needs
+                    # nothing from the held position.
+                    sig, err = self._pct_exit(m, message, with_contract=True)
+                    (signals.append(sig) if sig else errors.append(err))
+                else:
+                    saw_update = True
                 continue
+            # "AMD 27%" — no contract at all. Same convention, looser shape, so
+            # the contract has to come from what the account actually holds.
+            if message.percent_means_exit:
+                m = _PCT_BARE_RE.match(line)
+                if m:
+                    sig, err = self._pct_exit(m, message, with_contract=False)
+                    (signals.append(sig) if sig else errors.append(err))
+                    continue
             m = _ADD_RE.match(line)
             if m and _is_add(m):
                 sig, err = self._add(m, message)
@@ -307,6 +360,69 @@ class CompactAlertParser(Parser):
             None,
         )
 
+    def _pct_exit(self, m: re.Match, message: ParsedMessage, *, with_contract: bool):
+        """A trim written as a percentage, on a channel whose house style says so.
+
+            with_contract:  "IWM 287P +52%"   — the contract is fully named
+            without:        "AMD 27%"         — only the symbol; resolve from the
+                                                position, like an arrow close
+
+        The percentage is the trade's RESULT, never a fraction to sell. "+52%"
+        is how the call did, not "sell 52% of it" — reading it as a size would
+        sell half a position on a winner and nothing at all on a scratch.
+        """
+        pct = to_decimal(m.group("pct"))
+        if pct is not None and m.group("sign") in ("-", "\u2212"):
+            pct = -pct
+
+        if not with_contract:
+            return (
+                TradeSignal(
+                    action=SignalAction.SELL,
+                    asset_type=AssetType.OPTION,
+                    symbol=m.group("symbol").upper(),
+                    option_type=None,
+                    strike=None,
+                    expiration=None,
+                    expiry_unspecified=True,
+                    contract_unspecified=True,
+                    quantity=None,
+                    order_type=OrderKind.MARKET,
+                    limit_price=None,
+                    pnl_percent=pct,
+                    position_closed=True,
+                    source_action="CLOSE",
+                    parser=self.name,
+                ),
+                None,
+            )
+
+        strike = to_decimal(m.group("strike"))
+        if strike is None or strike <= 0:
+            return None, f"couldn't read the strike in {m.group(0).strip()!r}"
+
+        # No expiry is written in this shape, so it resolves from the position —
+        # the same as a scissors exit.
+        return (
+            TradeSignal(
+                action=SignalAction.SELL,
+                asset_type=AssetType.OPTION,
+                symbol=m.group("symbol").upper(),
+                option_type=_right(m.group("right")),
+                strike=strike,
+                expiration=None,
+                expiry_unspecified=True,
+                quantity=None,
+                order_type=OrderKind.MARKET,
+                limit_price=None,
+                pnl_percent=pct,
+                position_closed=True,
+                source_action="CLOSE",
+                parser=self.name,
+            ),
+            None,
+        )
+
     def _exit(self, m: re.Match, message: ParsedMessage):
         strike = to_decimal(m.group("strike"))
         if strike is None or strike <= 0:
@@ -377,7 +493,9 @@ def _right(raw: str) -> OptionType:
 
 def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool = False):
     """Returns ``(expiry, unspecified, error)``."""
-    if raw and raw.upper() == "0DTE":
+    # "ODTE" with the letter O is a common mistype of "0DTE" and means the same
+    # thing. Reading it as an unknown expiry rejects an otherwise valid alert.
+    if raw and raw.upper() in ("0DTE", "ODTE"):
         # Expires the day it was posted. Resolved against the message's own
         # timestamp, not today, so re-reading an old alert doesn't move it.
         if message.posted_at is None:
@@ -387,7 +505,14 @@ def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool
     if not raw:
         if allow_missing:
             return None, True, None
-        return None, False, "the alert has no expiry"
+        # An ENTRY that names a contract and a price but no expiry is a same-day
+        # trade. Several channels post SPY scalps that way ("SPY 763c @ .55")
+        # and never write the date at all, so refusing them rejects every alert
+        # those channels send. The entry gate still requires a price here, which
+        # is what keeps a bare contract mention from becoming an order.
+        if message.posted_at is not None:
+            return message.posted_at.date(), False, None
+        return None, False, "the alert has no expiry and no timestamp to date it from"
 
     expiry, err = parse_expiry(raw, posted_at=message.posted_at)
     if err:

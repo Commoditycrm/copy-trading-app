@@ -164,7 +164,11 @@ def _persist(
         embeds=list(raw.get("embeds") or []),
         status=DiscordMessageStatus.RECEIVED,
     )
-    _apply_parse(row, auto_approve=auto_approve)
+    _apply_parse(
+        row,
+        auto_approve=auto_approve,
+        percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
+    )
     try:
         with db.begin_nested():
             db.add(row)
@@ -174,7 +178,9 @@ def _persist(
     return row
 
 
-def _apply_parse(row: DiscordMessage, *, auto_approve: bool) -> None:
+def _apply_parse(
+    row: DiscordMessage, *, auto_approve: bool, percent_means_exit: bool = False
+) -> None:
     """Read the message, record what it says, and set its decision state.
 
     Parsing at intake rather than in a later worker keeps the stored row and its
@@ -192,6 +198,8 @@ def _apply_parse(row: DiscordMessage, *, auto_approve: bool) -> None:
                 embeds=list(row.embeds or []),
                 author=row.author,
                 posted_at=row.posted_at,
+                # This channel's house style — see DiscordAlertSource.
+                percent_means_exit=percent_means_exit,
             )
         )
     except Exception:  # noqa: BLE001
