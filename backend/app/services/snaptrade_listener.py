@@ -41,7 +41,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, broker_filters, copy_engine, events, listener_state
+from app.services import audit, broker_filters, copy_engine, events, listener_state, order_intent
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -675,6 +675,33 @@ def _persist_and_fanout(
         # sources, so skip creation — matched updates still flow through above.
         owner = db.get(User, trader_user_id)
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
+            return
+
+        # Before creating a "new external order", check whether this is just OUR
+        # OWN recently-placed order resurfacing under a different feed id.
+        #
+        # SnapTrade has no client-order-id, so the guard the other listeners use
+        # (order_intent.is_app_originated on an echoed client_order_id) cannot
+        # work here — and the broker id is precisely what drifts. The lookup
+        # above therefore misses every time that happens, and we insert a second
+        # parent which fans out AGAIN: two mirrors per subscriber for one trade.
+        # Adopt the feed's id onto the row we already have instead. See
+        # order_intent.adopt_app_placed_order for why adopting beats skipping on
+        # a trader account.
+        _parsed = parse_snaptrade_order_symbol(order_obj)
+        _qty = _order_terms_from_snaptrade(order_obj)[1]
+        adopted = order_intent.adopt_app_placed_order(
+            db, trader_user_id, broker_order_id,
+            symbol=_parsed["symbol"],
+            side=(_BUY if "BUY" in str(_attr(order_obj, "action", default="")).upper() else _SELL),
+            quantity=_qty,
+            instrument_type=_parsed["instrument_type"],
+        )
+        if adopted is not None:
+            # It is ours. Let the normal matched-order path handle this event on
+            # the NEXT poll, now that the ids agree — that path already knows how
+            # to apply status/fill without re-fanning out.
+            db.commit()
             return
 
         order = _insert_order_from_snaptrade(

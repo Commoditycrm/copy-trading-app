@@ -47,7 +47,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import listener_state
+from app.services import listener_state, order_intent
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -561,6 +561,45 @@ def _persist_and_fanout(
 
         if status_enum not in _OPEN_OR_FILLED:
             return
+
+        # Don't re-create an order our OWN app placed. api/trades.py marks the
+        # Order id as app-originated and we pass that id to Webull as the
+        # client_order_id, so it comes back on every event here.
+        #
+        # Without this the dedup above cannot work at all on Webull: we store
+        # OUR client_order_id as broker_order_id (see WebullAdapter.place_order),
+        # while this listener looks the order up by WEBULL's order_id. Two
+        # different identifiers for one order, so the SELECT always misses and
+        # every app-placed order is inserted a SECOND time — then fanned out
+        # again at the bottom of this function, giving each subscriber TWO
+        # mirrors for one trader trade (prod: 4 confirmed double-mirrors).
+        #
+        # The duplicate also loses the contract: this path rebuilds the order
+        # from the feed payload, and when that payload doesn't identify it as an
+        # option the row is typed STOCK with strike/expiry/right NULL. Realized
+        # P&L then multiplies by 1 instead of 100 — an $86 trade displayed as
+        # $0.86 — and the two rows land in different FIFO buckets so the
+        # round-trip may never match at all.
+        #
+        # trade_listener has had this guard since the Alpaca "doubling" bug; it
+        # was never carried across to the other listeners.
+        _coid = payload.get("client_order_id")
+        if _coid:
+            try:
+                # Webull caps client_order_id at 32 chars, so we send the Order
+                # UUID with its dashes stripped — parse the hex form back.
+                _app_oid = uuid.UUID(hex=str(_coid).strip())
+            except (ValueError, TypeError, AttributeError):
+                _app_oid = None
+            if _app_oid is not None and order_intent.is_app_originated(_app_oid):
+                log.info(
+                    "webull-listener[%s] skipping app-originated order "
+                    "(client_order_id=%s, webull order_id=%s) — the Trade Panel "
+                    "owns this order's row and fanout",
+                    trader_user_id, _coid, broker_order_id,
+                )
+                return
+
         owner = db.get(User, trader_user_id)
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
             return
