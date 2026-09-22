@@ -1072,6 +1072,9 @@ def _execute_signal(
         # resolve() sized this as a full close, so payload.quantity is the
         # whole position — which is exactly what the ladder measures against.
         held = Decimal(str(p.quantity))
+        # Before ANY rung is measured: the ladder keys every level off the entry
+        # price, and until the opening order fills that is only the limit we bid.
+        guards.sync_entry_price(db, guard)
         plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
 
         if plan.new_stop_price is not None:
@@ -1181,10 +1184,12 @@ def _execute_signal(
     else:
         guards.on_buy(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
-            # What the ladder measures against. The limit we bid is the best
-            # reference available at placement; a fill can only be better, and
-            # an exit alert backfills from the broker if this is ever missing.
+            # Provisional: the limit we bid is the only reference that exists at
+            # placement. The real fill replaces it via sync_entry_price once the
+            # order fills -- which matters because the +10% reprice can fill
+            # ABOVE this limit, and then it is a price we never paid.
             entry_price=p.limit_price,
+            entry_order_id=order.id,
         )
 
     discord_execution.mark_executed(msg, order.id)

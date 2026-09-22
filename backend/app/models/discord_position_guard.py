@@ -67,7 +67,19 @@ class DiscordPositionGuard(Base, TimestampMixin):
 
     # What the position originally cost: the first BUY's fill price, never
     # re-averaged by later adds. Every percentage in the ladder keys off this.
+    #
+    # Provisional until the opening order fills. It is seeded at PLACEMENT with
+    # the limit we bid, because that is the only reference available then, and
+    # replaced by the real fill via services/discord_position_guard.sync_entry_price.
     entry_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+
+    # The BUY that opened this guard, so the fill price can be adopted from the
+    # right order. Without the link there is no way to tell which of several
+    # orders on the same contract was the opening one. NULL on guards created
+    # before this column, and on positions adopted from the broker.
+    entry_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Hard stop on whatever is still held, as an absolute price. Set below entry
     # by the first trim and lifted to break-even by the second. Emulated, like

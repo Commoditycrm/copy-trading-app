@@ -240,10 +240,52 @@ def find(db: Session, user_id: uuid.UUID, symbol: str, strike, right, expiry):
     ).scalars().first()
 
 
+def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
+    """Adopt the opening order's ACTUAL fill price. Returns True if it moved.
+
+    ``entry_price`` is seeded at placement with the limit we bid, because that
+    is the only reference that exists before the order fills. For a plain limit
+    buy the fill can only be at or better than that, so the seed was pessimistic
+    but safe.
+
+    The +10% entry reprice broke that: it moves the limit ABOVE the alert's
+    price and can fill there, so the seeded value is a price the trader never
+    paid. Left uncorrected the whole ladder shifts -- the -25% stop sits further
+    below the real cost than asked, the profit gate opens early, and the
+    "break-even" stop on rung 2 is set BELOW the fill, which books a loss.
+
+    Only ever adopts the opening order's own fill, so a later add cannot
+    re-average the reference out from under a stop already protecting the
+    position.
+    """
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+
+    if guard.entry_order_id is None:
+        return False
+    order = db.get(Order, guard.entry_order_id)
+    if order is None or order.status not in (
+        OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
+    ):
+        return False
+    filled = order.filled_avg_price
+    if filled is None or Decimal(str(filled)) <= 0:
+        return False
+    filled = Decimal(str(filled))
+    if guard.entry_price is not None and Decimal(str(guard.entry_price)) == filled:
+        return False
+    log.info(
+        "discord guard: %s entry %s -> %s (actual fill)",
+        guard.symbol, guard.entry_price, filled,
+    )
+    guard.entry_price = filled
+    return True
+
+
 def on_buy(
     db: Session, user_id: uuid.UUID, symbol: str,
     strike: Decimal | None, right: OptionRight | None, expiry: date | None,
     entry_price: Decimal | None = None,
+    entry_order_id: uuid.UUID | None = None,
 ) -> DiscordPositionGuard:
     """Record that a position is open and remember what it cost.
 
@@ -269,6 +311,7 @@ def on_buy(
         option_expiry=expiry,
         sell_count=0,
         entry_price=entry_price,
+        entry_order_id=entry_order_id,
     )
     db.add(guard)
     db.flush()
@@ -318,5 +361,5 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
-    "retire", "rollback_exit",
+    "retire", "rollback_exit", "sync_entry_price",
 ]
