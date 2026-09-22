@@ -582,6 +582,11 @@ class WebullAdapter(BrokerAdapter):
     # re-routes such mirrors as flagged marketable limits.
     requires_extended_hours_limit = True
 
+    # Webull replaces a resting order in place, so the Discord entry reprice can
+    # move a limit up without a window where the trader holds nothing. Without
+    # this the reprice is skipped here entirely — see services/discord_reprice.
+    supports_replace = True
+
     def __init__(self, credentials: dict[str, Any]):
         super().__init__(credentials)
         self.app_key = credentials.get("app_key")
@@ -987,6 +992,50 @@ class WebullAdapter(BrokerAdapter):
         # The place response returns only {client_order_id, order_id} — no fill
         # yet. Report SUBMITTED; the subscriber reconciler polls get_order for
         # the fill (exactly like the SnapTrade subscriber path).
+        return BrokerOrderResult(
+            broker_order_id=coid,
+            status=OrderStatus.SUBMITTED,
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=Decimal(0),
+            filled_avg_price=None,
+        )
+
+    def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
+        """Move a resting order to a new price in ONE broker call.
+
+        Webull's OpenAPI replaces in place (order_v3.replace_order for stocks,
+        order_v2.replace_option for options), which matters more here than it
+        looks: the alternative is cancel-then-place, and if the place fails the
+        entry is simply gone. That happened in production — a buy was cancelled
+        30s after placement, the re-place never landed, and the position the
+        trader believed they held did not exist. Every later exit then fired
+        into nothing.
+
+        The identity is unchanged: our broker_order_id IS the client_order_id
+        (see place_order), and a replace keeps it. So callers do not have to
+        re-point anything at a new id the way they do on Alpaca.
+        """
+        if not self.account_id:
+            raise RuntimeError("webull replace_order: no account_id configured")
+        trade = self._trade_client()
+        coid = broker_order_id
+
+        # The modify body is the same shape as the place body — the SDK's
+        # replace takes `modify_orders` exactly where place takes `new_orders` —
+        # and the client_order_id inside it selects the order being replaced.
+        if req.instrument_type == InstrumentType.OPTION:
+            resp = trade.order_v2.replace_option(
+                self.account_id, [self._build_option_order(req, coid)]
+            )
+        else:
+            resp = trade.order_v3.replace_order(
+                self.account_id, [self._build_stock_order(req, coid)]
+            )
+        # Same acceptance check as a place: an HTTP 200 alone is not proof, and
+        # a rejected replace must not read as a successful one — otherwise the
+        # caller believes the price moved when the old order is still resting.
+        self._assert_place_accepted(resp, coid)
+
         return BrokerOrderResult(
             broker_order_id=coid,
             status=OrderStatus.SUBMITTED,
