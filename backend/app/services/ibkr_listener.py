@@ -37,7 +37,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import audit, broker_filters, copy_engine, events, listener_state
+from app.services import audit, broker_filters, copy_engine, events, listener_state, order_intent
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -412,6 +412,27 @@ def _persist_and_fanout(
             OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED,
         ):
             return
+
+        # Don't re-create an order our OWN app placed. api/trades.py marks the
+        # Order id app-originated and IBKRAdapter sends it as the order's cOID,
+        # so it comes back on the activity here. Without this, an app-placed
+        # order whose row hasn't committed yet (or whose broker id we recorded
+        # differently) is inserted a SECOND time and fanned out again, giving
+        # every subscriber two mirrors for one trade. trade_listener has had
+        # this guard since the Alpaca doubling bug; it was never carried across.
+        _coid = _attr(order_obj, "cOID", "clientOrderId", "client_order_id")
+        if _coid:
+            try:
+                _app_oid = uuid.UUID(str(_coid).strip())
+            except (ValueError, TypeError, AttributeError):
+                _app_oid = None
+            if _app_oid is not None and order_intent.is_app_originated(_app_oid):
+                log.info(
+                    "ibkr-listener[%s] skipping app-originated order "
+                    "(cOID=%s, ibkr order=%s) — the Trade Panel owns it",
+                    trader_user_id, _coid, broker_order_id,
+                )
+                return
 
         order = _insert_order_from_ibkr(
             db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
