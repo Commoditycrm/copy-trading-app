@@ -1035,7 +1035,21 @@ def find_placed_order(db, trader_user_id, *ids):
     event to push the fill to the UI. Only the app-originated guard fired,
     which correctly avoided a duplicate row but left the real one stale.
     """
-    wanted = [i for i in ids if i]
+    # Compare BOTH spellings of the client id. Webull caps client_order_id at 32
+    # chars so WebullAdapter sends the Order UUID with its dashes stripped, and
+    # stores that form -- but the day-orders endpoint echoes it back in canonical
+    # dashed form ("f7f6ebe3-104f-..."), while order-history returns the stripped
+    # one. A plain string compare therefore missed on the poll path: the lookup
+    # failed, and once the app-originated marker expired (120s) the listener
+    # inserted the order a SECOND time, rebuilt from the feed -- typed STOCK with
+    # strike/expiry/right NULL, which also breaks realized P&L by a factor of 100.
+    wanted: list[str] = []
+    for i in ids:
+        if not i:
+            continue
+        for form in (i, i.replace("-", "")):
+            if form and form not in wanted:
+                wanted.append(form)
     if not wanted:
         return None
     return db.execute(

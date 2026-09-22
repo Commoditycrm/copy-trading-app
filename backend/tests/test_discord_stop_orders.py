@@ -199,3 +199,52 @@ def test_a_recent_rejection_backs_off_instead_of_retrying_every_tick(db, broker)
 
     assert broker["placed"] == []
     assert "backing off" in out
+
+
+def _rejected_stop_at(db, user_id, when):
+    from app.models.order import (
+        InstrumentType, Order, OrderSide, OrderStatus, OrderType,
+    )
+    db.add(Order(
+        id=uuid.uuid4(), user_id=user_id, symbol="NIO", side=OrderSide.SELL,
+        order_type=OrderType.STOP, instrument_type=InstrumentType.OPTION,
+        option_strike=Decimal("3.5"), quantity=Decimal(4),
+        status=OrderStatus.REJECTED, created_at=when,
+    ))
+    db.commit()
+
+
+def _guard_created(user_id, when):
+    return type("G", (), {
+        "user_id": user_id, "symbol": "NIO",
+        "option_strike": Decimal("3.5"), "option_expiry": None,
+        "created_at": when,
+    })()
+
+
+def test_a_rejection_from_a_previous_position_does_not_block_this_one():
+    """The backoff window is per CONTRACT but a guard is per POSITION. A stop
+    refused for a position that has since closed would otherwise leave the next
+    entry on that contract unprotected for the rest of the window -- live, a
+    fresh NIO entry went 15 minutes with no stop for exactly this reason."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    import app.services.discord_stop_orders as so
+    from app.models.order import Order
+
+    eng = create_engine("sqlite:///:memory:")
+    Order.__table__.create(eng)
+    user = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+
+    with Session(eng) as db:
+        _rejected_stop_at(db, user, now - timedelta(minutes=5))
+
+        # A guard opened AFTER that rejection is a different position.
+        assert so._recently_rejected(db, _guard_created(user, now - timedelta(minutes=1))) is False
+
+        # One opened BEFORE it owns the rejection and must still back off.
+        assert so._recently_rejected(db, _guard_created(user, now - timedelta(minutes=10))) is True
