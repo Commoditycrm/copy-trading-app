@@ -213,3 +213,60 @@ def test_only_this_traders_guards_are_touched(db, closer, sold):
 
     stops.enforce(db, mine.user_id, _Adapter([_Pos("1.40")]), closer)
     assert sold == [Decimal(4)]
+
+
+# ── the poller must not skip an account that has a stop to place ─────────────
+
+def test_a_plain_stop_guard_is_picked_up_by_armed(db):
+    """The skip-idle gate and armed() must agree on what counts as work.
+
+    armed_at is set ONLY when a TRAILING exit is armed, so a guard protected by
+    a plain stop level has it NULL — which is every guard on a contract under
+    the trail threshold, since those trims exit at market. Gating on armed_at
+    skipped exactly the positions that had a stop to place.
+    """
+    g = _guard(db, stop=Decimal("1.50"))
+    g.armed_at = None
+    g.trail_qty = None
+    db.flush()
+
+    picked = [x for x in guards.armed(db) if x.id == g.id]
+    assert picked, "a guard with a stop level but no trail must still be enforced"
+
+
+def test_the_poller_does_not_skip_an_account_with_a_stop_to_place(db, monkeypatch):
+    """Calls the poller's OWN gate, not a copy of its query.
+
+    A mirrored predicate in a test proves nothing: the gate can drift and the
+    mirror drifts with it. This drove a real prod failure — an account with a
+    stop to place was skipped before the reconciler ran, so the order was never
+    placed and the guard was never retired when the position closed.
+    """
+    import app.services.pnl_poller as pp
+    from app.models.user import User, UserRole
+
+    g = _guard(db, stop=Decimal("1.50"))
+    g.armed_at = None            # a plain stop level — no trailing exit
+    g.trail_qty = None
+    db.flush()
+
+    user = type("U", (), {"role": UserRole.TRADER, "id": g.user_id})()
+
+    class _DB:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, model, key):
+            return user if getattr(model, "__name__", "") == "User" else None
+        def execute(self, stmt):
+            # Only the guard query matters here; this schema has no orders
+            # table. Everything else answers "no work", so should_run can only
+            # be True because of the guard predicate — which is the point.
+            if "discord_position_guards" in str(stmt).lower():
+                return db.execute(stmt)
+            return type("R", (), {"scalar_one_or_none": lambda _s: None})()
+
+    monkeypatch.setattr(pp, "SessionLocal", lambda: _DB())
+    role, should_run = pp._account_role(g.user_id)
+
+    assert role == "trader"
+    assert should_run is True, "the poller skipped an account that has a stop to place"
