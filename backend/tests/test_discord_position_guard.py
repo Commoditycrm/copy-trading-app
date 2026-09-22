@@ -232,3 +232,81 @@ def test_the_real_fill_is_what_the_ladder_then_measures():
     assert plan.sell_qty == Decimal(2)
     # 0.165 * 0.75 = 0.12375 -> 0.12 (rounded DOWN to a cent)
     assert plan.new_stop_price == Decimal("0.12")
+
+
+# ── a guard left behind by an entry that never filled ────────────────────────
+
+class _OrderDB(_FakeDB):
+    """FakeDB that also serves DiscordPositionGuard lookups via the real one."""
+
+
+def _guard_row(**kw):
+    base = dict(symbol="NIO", entry_price=Decimal("0.15"), sell_count=0,
+                stop_order_id=None, trail_qty=None, entry_order_id=None)
+    base.update(kw)
+    return DiscordPositionGuard(**base)
+
+
+def test_a_guard_with_no_linked_order_is_not_dormant():
+    """"I cannot tell whether it filled" must not license a re-price -- that is
+    what protects an Adding alert from moving a live position's reference."""
+    assert guards.dormant(_FakeDB(None), _guard_row(entry_order_id=None)) is False
+
+
+def test_a_guard_whose_entry_never_filled_is_dormant():
+    from app.models.order import OrderStatus
+    o = _filled(None, status=OrderStatus.CANCELED)
+    g = _guard_row(entry_order_id=o.id)
+    assert guards.dormant(_FakeDB(o), g) is True
+
+
+def test_a_guard_with_a_filled_entry_is_not_dormant():
+    o = _filled("0.15")
+    g = _guard_row(entry_order_id=o.id)
+    assert guards.dormant(_FakeDB(o), g) is False
+
+
+def test_a_guard_that_has_already_sold_is_not_dormant():
+    """The rung advanced, so something real happened against this position."""
+    from app.models.order import OrderStatus
+    o = _filled(None, status=OrderStatus.CANCELED)
+    g = _guard_row(entry_order_id=o.id, sell_count=1)
+    assert guards.dormant(_FakeDB(o), g) is False
+
+
+def test_a_guard_with_a_resting_stop_is_not_dormant():
+    """A stop resting at the broker is protecting something."""
+    from app.models.order import OrderStatus
+    o = _filled(None, status=OrderStatus.CANCELED)
+    g = _guard_row(entry_order_id=o.id, stop_order_id=uuid.uuid4())
+    assert guards.dormant(_FakeDB(o), g) is False
+
+
+def test_a_guard_with_a_trail_armed_is_not_dormant():
+    from app.models.order import OrderStatus
+    o = _filled(None, status=OrderStatus.CANCELED)
+    g = _guard_row(entry_order_id=o.id, trail_qty=Decimal(1))
+    assert guards.dormant(_FakeDB(o), g) is False
+
+
+def test_a_new_buy_re_seeds_a_guard_left_by_a_cancelled_entry(db):
+    """Live case: four NIO entries were placed and cancelled at 0.16/0.11, then
+    a fifth filled at 0.24. The stale guard still read 0.15, so the first trim's
+    stop went to 0.11 -- -25% of a price never paid -- instead of 0.18."""
+    from app.models.order import OrderStatus
+    u = uuid.uuid4()
+    cancelled = _filled(None, status=OrderStatus.CANCELED)
+    first = guards.on_buy(db, **_contract(u, strike="3.5"),
+                          entry_price=Decimal("0.15"), entry_order_id=cancelled.id)
+    assert first.entry_price == Decimal("0.15")
+
+    # The cancelled entry is the only order the session can resolve.
+    db.get = lambda model, key: (                      # noqa: ARG005
+        cancelled if key == cancelled.id else None
+    )
+    new_order = uuid.uuid4()
+    again = guards.on_buy(db, **_contract(u, strike="3.5"),
+                          entry_price=Decimal("0.24"), entry_order_id=new_order)
+    assert again.id == first.id                     # same contract, same guard
+    assert again.entry_price == Decimal("0.24")     # but re-priced
+    assert again.entry_order_id == new_order
