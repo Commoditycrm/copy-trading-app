@@ -310,3 +310,63 @@ def test_a_new_buy_re_seeds_a_guard_left_by_a_cancelled_entry(db):
     assert again.id == first.id                     # same contract, same guard
     assert again.entry_price == Decimal("0.24")     # but re-priced
     assert again.entry_order_id == new_order
+
+
+# ── a guard must not outlive its position ────────────────────────────────────
+
+def test_a_flat_position_retires_its_guard(db):
+    """A position can leave by a route the ladder never drove -- a manual close,
+    a stop filling at the broker, expiry. The guard then keeps its rung AND its
+    stop level, and the next BUY on that contract inherits both."""
+    u = uuid.uuid4()
+    g = guards.on_buy(db, **_contract(u), entry_price=Decimal("0.24"))
+    g.sell_count = 2
+    g.stop_price = Decimal("0.15")
+
+    assert guards.retire_if_flat(db, g, Decimal(0)) is True
+    assert g.closed_at is not None
+
+
+def test_an_entry_that_has_not_filled_yet_is_not_retired(db):
+    """It reports held == 0 too. Retiring here would drop the ladder before the
+    position even opens."""
+    u = uuid.uuid4()
+    g = guards.on_buy(db, **_contract(u), entry_price=Decimal("0.24"))
+
+    assert guards.retire_if_flat(db, g, Decimal(0)) is False
+    assert g.closed_at is None
+
+
+def test_a_held_position_keeps_its_guard(db):
+    u = uuid.uuid4()
+    g = guards.on_buy(db, **_contract(u), entry_price=Decimal("0.24"))
+    g.sell_count = 1
+    g.stop_price = Decimal("0.18")
+
+    assert guards.retire_if_flat(db, g, Decimal(2)) is False
+    assert g.closed_at is None
+
+
+def test_a_flat_position_with_a_trail_armed_still_retires(db):
+    u = uuid.uuid4()
+    g = guards.on_buy(db, **_contract(u), entry_price=Decimal("1.50"))
+    g.trail_qty = Decimal(1)
+
+    assert guards.retire_if_flat(db, g, Decimal(0)) is True
+    assert g.closed_at is not None
+
+
+def test_a_retired_guard_lets_the_next_buy_start_clean(db):
+    """The point of retiring: a new entry on the same contract gets a FRESH
+    guard -- rung 0, no stop -- instead of the previous position's protection."""
+    u = uuid.uuid4()
+    old = guards.on_buy(db, **_contract(u), entry_price=Decimal("0.15"))
+    old.sell_count = 2
+    old.stop_price = Decimal("0.15")
+    guards.retire_if_flat(db, old, Decimal(0))
+
+    fresh = guards.on_buy(db, **_contract(u), entry_price=Decimal("0.22"))
+    assert fresh.id != old.id
+    assert fresh.entry_price == Decimal("0.22")
+    assert fresh.sell_count == 0
+    assert fresh.stop_price is None
