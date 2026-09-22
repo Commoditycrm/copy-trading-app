@@ -770,3 +770,107 @@ def test_ordinary_orders_still_expire_with_the_session():
             order_type=ot, quantity=Decimal("1"), **extra,
         )
         assert a._build_stock_order(req, "c")["time_in_force"] == "DAY", ot
+
+
+# ── replacing a resting order in place ───────────────────────────────────────
+
+class _ReplaceOrderV3:
+    def __init__(self, store): self.store = store
+    def replace_order(self, account_id, modify_orders, client_combo_order_id=None):
+        self.store.append(("v3.replace_order", account_id, modify_orders))
+        return _replace_ok()
+    def place_order(self, account_id, new_orders, client_combo_order_id=None):
+        self.store.append(("v3.place_order", account_id, new_orders))
+        return _replace_ok()
+    def cancel_order(self, account_id, client_order_id):
+        self.store.append(("v3.cancel_order", account_id, client_order_id))
+        return _replace_ok()
+
+
+class _ReplaceOrderV2:
+    def __init__(self, store): self.store = store
+    def replace_option(self, account_id, modify_orders, client_combo_order_id=None):
+        self.store.append(("v2.replace_option", account_id, modify_orders))
+        return _replace_ok()
+    def place_option(self, account_id, new_orders, client_combo_order_id=None):
+        self.store.append(("v2.place_option", account_id, new_orders))
+        return _replace_ok()
+
+
+def _replace_ok():
+    r = type("R", (), {})()
+    r.status_code = 200
+    r.json = lambda: {"data": [{"client_order_id": "c1", "order_id": "o1"}]}
+    return r
+
+
+class _ReplaceTrade:
+    def __init__(self, store):
+        self.order_v3 = _ReplaceOrderV3(store)
+        self.order_v2 = _ReplaceOrderV2(store)
+
+
+def _wired_replace(monkeypatch):
+    a = _adapter()
+    calls: list = []
+    monkeypatch.setattr(a, "_trade_client", lambda: _ReplaceTrade(calls))
+    monkeypatch.setattr(a, "_assert_place_accepted", lambda resp, coid: None)
+    return a, calls
+
+
+def test_the_adapter_advertises_replace():
+    """discord_reprice only retries where this is true — without it the +10%
+    retry is skipped on Webull entirely."""
+    assert WebullAdapter.supports_replace is True
+
+
+def test_replacing_a_stock_order_uses_replace_not_cancel_and_place(monkeypatch):
+    """Cancel-then-place leaves a window with no order at all. A replace that
+    fails leaves the ORIGINAL resting, which is recoverable."""
+    a, calls = _wired_replace(monkeypatch)
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="AAPL", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal("2"), limit_price=Decimal("2.20"),
+    )
+    res = a.replace_order("c1", req)
+
+    assert [c[0] for c in calls] == ["v3.replace_order"]
+    assert "cancel" not in " ".join(c[0] for c in calls)
+    assert calls[0][2][0]["limit_price"] == "2.20"
+    assert res.broker_order_id == "c1"          # identity is preserved
+
+
+def test_replacing_an_option_order_uses_replace_option(monkeypatch):
+    a, calls = _wired_replace(monkeypatch)
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION, symbol="SPY", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal("2"), limit_price=Decimal("2.20"),
+        option_expiry=date(2026, 9, 25), option_strike=Decimal("771"),
+        option_right=OptionRight.CALL,
+    )
+    a.replace_order("c1", req)
+    assert [c[0] for c in calls] == ["v2.replace_option"]
+    assert calls[0][2][0]["client_order_id"] == "c1"
+
+
+def test_a_rejected_replace_is_not_reported_as_success(monkeypatch):
+    """Otherwise the caller believes the price moved while the old order is
+    still resting at the old one."""
+    a = _adapter()
+    calls: list = []
+    monkeypatch.setattr(a, "_trade_client", lambda: _ReplaceTrade(calls))
+
+    def _boom(resp, coid):
+        raise RuntimeError("webull rejected the replace")
+
+    monkeypatch.setattr(a, "_assert_place_accepted", _boom)
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="AAPL", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal("2"), limit_price=Decimal("2.20"),
+    )
+    try:
+        a.replace_order("c1", req)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a rejected replace was reported as success")
