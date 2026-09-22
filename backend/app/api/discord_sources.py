@@ -396,7 +396,12 @@ def list_simulated_prices(
 
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
     try:
-        positions = adapter.get_positions()
+        # DISPLAY only -- nothing here decides whether to place an order, so it
+        # takes the shared cached read. Webull's quota is ~10 requests per 30s
+        # across EVERY endpoint that key touches, and it answers simultaneous
+        # position reads with 429 outright; this screen refreshes while the
+        # poller and the positions page are reading the same account.
+        positions = adapter.get_positions(cached_ok=True)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Couldn't read positions: {exc}") from exc
 
