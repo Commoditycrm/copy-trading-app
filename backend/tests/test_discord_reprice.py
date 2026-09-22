@@ -81,7 +81,7 @@ def wired(monkeypatch):
                     return order
                 if name == "TraderSettings":
                     return settings
-                return type("A", (), {"encrypted_credentials": "x"})()
+                return type("A", (), {"encrypted_credentials": "x", "broker": "WEBULL"})()
             def commit(self): state["committed"] += 1
             def __enter__(self): return self
             def __exit__(self, *a): return False
@@ -179,18 +179,48 @@ def test_the_ceiling_is_per_contract_not_per_order():
 
 # ── falling back when the broker can't replace ───────────────────────────────
 
-def test_a_broker_without_replace_cancels_and_re_places(wired):
+def test_a_broker_without_atomic_replace_is_left_alone(wired):
+    """Cancel-then-place is not a safe fallback. On Webull a 4-lot buy was
+    cancelled 30s after placement, the re-place never landed, and the position
+    the trader believed they held did not exist — every later trim then fired
+    into nothing. A resting unfilled limit is recoverable; a vanished entry is
+    not."""
     adapter = _Adapter()
     adapter.supports_replace = False
     s = wired(_Order(limit="2.00"), _Settings(), adapter)
 
-    rp.reprice_one(s["order"].id)
-    assert adapter.cancelled == ["brk-1"]          # old one pulled
-    assert adapter.replaced == [Decimal("2.20")]   # new one placed
-    assert s["order"].broker_order_id == "brk-3"
+    out = rp.reprice_one(s["order"].id)
+    assert "skipped" in out
+    assert adapter.cancelled == []                 # nothing pulled
+    assert adapter.replaced == []                  # nothing placed
+    assert s["order"].limit_price == Decimal("2.00")
+    assert s["order"].discord_repriced_at is not None   # not retried in a loop
 
 
 def test_replacing_tracks_the_new_broker_id(wired):
     s = wired(_Order(limit="2.00"), _Settings())
     rp.reprice_one(s["order"].id)
     assert s["order"].broker_order_id == "brk-2"
+
+
+def test_a_broker_with_atomic_replace_still_reprices(wired):
+    """Alpaca can replace in one step, so the feature keeps working there —
+    the guard is about HOW the price is moved, not about disabling the retry."""
+    adapter = _Adapter()
+    adapter.supports_replace = True
+    s = wired(_Order(limit="2.00"), _Settings(), adapter)
+
+    assert rp.reprice_one(s["order"].id) == "repriced to 2.20"
+    assert adapter.replaced == [Decimal("2.20")]
+    assert adapter.cancelled == []              # replaced, never cancelled
+
+
+def test_a_skipped_broker_is_not_retried_every_tick(wired):
+    """Stamping on the skip keeps the scanner from re-examining the same order
+    forever — it is a decision, not a transient failure."""
+    adapter = _Adapter()
+    adapter.supports_replace = False
+    s = wired(_Order(limit="2.00"), _Settings(), adapter)
+
+    rp.reprice_one(s["order"].id)
+    assert rp.reprice_one(s["order"].id) == "already"
