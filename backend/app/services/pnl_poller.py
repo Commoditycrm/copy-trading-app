@@ -109,22 +109,28 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     BrokerName.SNAPTRADE: 60.0,
     # Direct Webull authenticates with each subscriber's OWN app_key, so its
     # quota is per-account rather than a shared platform pool like SnapTrade —
-    # which is why it needs no concurrency semaphore. But per-account does NOT
-    # mean generous, and this entry was originally set to Alpaca's 10s on that
-    # reasoning: Alpaca allows ~200 requests/min per account, Webull about 20
-    # (~10 per 30s), and Webull's is shared across EVERY endpoint that key
-    # touches — balance, positions, order reads, placement, cancellation.
+    # which is why it needs no concurrency semaphore.
     #
-    # At 10s the poller alone claimed 3 of those ~10 slots per window, and a
-    # single tick can make two or three calls (the P&L read, the copy-bracket
-    # fill refresh, the option-SL position read), so it could consume the entire
-    # budget before a single order was placed. Confirmed live on 2026-09-18: two
-    # ordinary back-to-back reads against a freshly connected account returned
-    # 429 TOO_MANY_REQUESTS immediately, because the poller had already spent the
-    # window. Matching SnapTrade's 60s leaves the budget for trading, which is
-    # what actually needs it — a subscriber's daily-limit kill switches do not
-    # need six evaluations a minute.
-    BrokerName.WEBULL: 60.0,
+    # This was 60s, matching SnapTrade, on the belief that Webull allowed ~10
+    # requests per 30s SHARED across every endpoint the key touches, so that
+    # polling would starve order placement. Webull's published limits
+    # (developer.webull.com/apis/docs/rate-limits, Production) say otherwise:
+    #
+    #   Account Positions / Balance / order reads   2/2s      (1 call/s each)
+    #   Place / Replace / Cancel Order            600/60s
+    #
+    # Every endpoint keeps its OWN counter, so reads cannot starve placement at
+    # all, and a read endpoint allows 60 calls a minute rather than 20 across
+    # everything. What the 2026-09-18 "two back-to-back reads 429'd" note really
+    # found is the WINDOW: 2/2s means a third call inside the same two seconds
+    # fails however idle the minute was — so what matters is not bunching calls
+    # to the SAME endpoint, not the cycle length.
+    #
+    # 60s was therefore costing far more than it bought. It is what made a
+    # protective stop take up to a minute to reach the broker after a trim, on a
+    # 0DTE contract that can move a long way in that minute. 15s reads positions
+    # four times a minute against a 60/minute allowance.
+    BrokerName.WEBULL: 15.0,
 }
 
 
@@ -738,6 +744,13 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                             db, guard, held,
                             place_stop=_make_stop_placer(db, live_acct, acct, guard),
                             cancel_stop=_make_stop_canceller(db, adapter),
+                            # If the broker refuses the stop, exit instead of
+                            # holding the position with nothing protecting it.
+                            # Same market exit a fired stop would have taken.
+                            close_position=(
+                                (lambda q, _p=pos, _g=guard: _close(_p, _g, q))
+                                if pos is not None else None
+                            ),
                         )
                         # Reconcile first so a resting stop is CANCELLED on
                         # the way out; retiring the guard alone would leave the
