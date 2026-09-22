@@ -144,3 +144,91 @@ def test_a_retire_reason_is_kept_but_bounded(db):
     g = guards.find(db, **_contract(u))
     guards.retire(db, g, "x" * 400)
     assert len(g.closed_reason) <= 120
+
+
+# ── the entry price is the FILL, not the limit we bid ────────────────────────
+
+class _FakeDB:
+    """Just enough to resolve guard.entry_order_id -> an Order."""
+
+    def __init__(self, order=None):
+        self._order = order
+
+    def get(self, model, key):
+        return self._order if getattr(self._order, "id", None) == key else None
+
+
+def _filled(price, status=None, oid=None):
+    from app.models.order import OrderStatus
+    o = type("O", (), {})()
+    o.id = oid or uuid.uuid4()
+    o.status = status or OrderStatus.FILLED
+    o.filled_avg_price = Decimal(price) if price is not None else None
+    return o
+
+
+def test_the_entry_adopts_the_actual_fill_price():
+    """The seed is the limit we BID. The +10% reprice can fill ABOVE it, and
+    then every level on the ladder is measured from a price never paid: the
+    -25% stop sits deeper than asked and the profit gate opens early."""
+    o = _filled("0.165")
+    g = DiscordPositionGuard(symbol="NIO", entry_price=Decimal("0.15"),
+                             entry_order_id=o.id, sell_count=0)
+
+    assert guards.sync_entry_price(_FakeDB(o), g) is True
+    assert g.entry_price == Decimal("0.165")
+
+
+def test_a_fill_at_the_bid_price_changes_nothing():
+    o = _filled("2.00")
+    g = DiscordPositionGuard(symbol="MSFT", entry_price=Decimal("2.00"),
+                             entry_order_id=o.id, sell_count=0)
+    assert guards.sync_entry_price(_FakeDB(o), g) is False
+    assert g.entry_price == Decimal("2.00")
+
+
+def test_an_unfilled_entry_keeps_the_provisional_price():
+    """A working order has no fill to adopt. Reading 0 (or None) as the entry
+    would put the whole ladder at zero."""
+    from app.models.order import OrderStatus
+    o = _filled(None, status=OrderStatus.SUBMITTED)
+    g = DiscordPositionGuard(symbol="MSFT", entry_price=Decimal("2.00"),
+                             entry_order_id=o.id, sell_count=0)
+    assert guards.sync_entry_price(_FakeDB(o), g) is False
+    assert g.entry_price == Decimal("2.00")
+
+
+def test_a_guard_with_no_opening_order_is_left_alone():
+    """Guards created before this column, and positions adopted from the
+    broker. There is no order to read a fill from."""
+    g = DiscordPositionGuard(symbol="MSFT", entry_price=Decimal("2.00"),
+                             entry_order_id=None, sell_count=0)
+    assert guards.sync_entry_price(_FakeDB(None), g) is False
+    assert g.entry_price == Decimal("2.00")
+
+
+def test_only_the_opening_order_can_re_price_the_entry():
+    """A later add fills at its own price. Adopting that would re-average the
+    reference out from under a stop already protecting the position."""
+    opening = _filled("2.00")
+    later_add = _filled("5.00")
+    g = DiscordPositionGuard(symbol="MSFT", entry_price=Decimal("2.00"),
+                             entry_order_id=opening.id, sell_count=0)
+
+    # The add is the only order the db can see, but it is not the linked one.
+    assert guards.sync_entry_price(_FakeDB(later_add), g) is False
+    assert g.entry_price == Decimal("2.00")
+
+
+def test_the_real_fill_is_what_the_ladder_then_measures():
+    """End to end: a repriced entry that filled at 0.165 must stop at -25% of
+    THAT, not of the 0.15 originally bid."""
+    o = _filled("0.165")
+    g = DiscordPositionGuard(symbol="NIO", entry_price=Decimal("0.15"),
+                             entry_order_id=o.id, sell_count=0)
+    guards.sync_entry_price(_FakeDB(o), g)
+
+    plan = guards.plan_exit(g, Decimal(4), Decimal("0.25"), CFG)
+    assert plan.sell_qty == Decimal(2)
+    # 0.165 * 0.75 = 0.12375 -> 0.12 (rounded DOWN to a cent)
+    assert plan.new_stop_price == Decimal("0.12")
