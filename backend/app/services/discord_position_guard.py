@@ -281,6 +281,29 @@ def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
     return True
 
 
+def retire_if_flat(db: Session, guard: DiscordPositionGuard, held: Decimal) -> bool:
+    """Retire a guard whose position is gone. Returns True if it retired.
+
+    A guard outlives its position whenever the position leaves by a route the
+    ladder did not drive -- a manual close from the positions table, a stop that
+    filled at the broker, an expiry. It then keeps its rung and its stop LEVEL,
+    and the next BUY on that contract inherits both: live, a fresh NIO entry at
+    0.22 was immediately covered by a SELL 4 STOP @ 0.15 carried over from the
+    previous position, off a rung that had already reached 2.
+
+    Only retires a guard that was actually protecting something. An entry that
+    has not filled yet ALSO reports held == 0, and retiring that would drop the
+    ladder before the position even opens.
+    """
+    if held > 0:
+        return False
+    if ((guard.sell_count or 0) <= 0
+            and guard.stop_price is None and guard.trail_qty is None):
+        return False
+    retire(db, guard, f"position flat (rung {guard.sell_count or 0})")
+    return True
+
+
 def dormant(db: Session, guard: DiscordPositionGuard) -> bool:
     """True when this guard is not protecting anything yet.
 
@@ -410,5 +433,5 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
-    "dormant", "retire", "rollback_exit", "sync_entry_price",
+    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price",
 ]
