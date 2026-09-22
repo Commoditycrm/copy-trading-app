@@ -121,7 +121,17 @@ def _recently_rejected(db: Session, guard) -> bool:
     from app.models.order import Order, OrderStatus, OrderType  # noqa: PLC0415
     from sqlalchemy import select  # noqa: PLC0415
 
+    # Never look further back than THIS guard. The window is per contract, and a
+    # guard is per position, so a rejection belonging to a position that has
+    # since closed would otherwise keep the NEXT one unprotected for the rest of
+    # the window -- live, a fresh NIO entry went 15 minutes with no stop because
+    # the previous position's stop had been refused.
     since = datetime.now(timezone.utc) - timedelta(seconds=_REJECT_BACKOFF_S)
+    created = getattr(guard, "created_at", None)
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        since = max(since, created)
     hit = db.execute(
         select(Order.id).where(
             Order.user_id == guard.user_id,
