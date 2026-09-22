@@ -281,6 +281,31 @@ def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
     return True
 
 
+def dormant(db: Session, guard: DiscordPositionGuard) -> bool:
+    """True when this guard is not protecting anything yet.
+
+    Nothing sold, no stop or trail resting, and no opening order that actually
+    filled. In that state the guard describes an INTENT to hold, not a holding,
+    so re-pricing it costs nothing — whereas inheriting its price silently
+    mis-measures the whole ladder for the next position on that contract.
+    """
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+
+    if (guard.sell_count or 0) > 0:
+        return False
+    if guard.stop_order_id is not None or guard.trail_qty is not None:
+        return False
+    if guard.entry_order_id is None:
+        # No link, so we cannot show the position never opened — and "I cannot
+        # tell" must not license a re-price. Guards created before that column
+        # keep the old behaviour and age out on their own.
+        return False
+    order = db.get(Order, guard.entry_order_id)
+    if order is None:
+        return False
+    return order.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+
+
 def on_buy(
     db: Session, user_id: uuid.UUID, symbol: str,
     strike: Decimal | None, right: OptionRight | None, expiry: date | None,
@@ -301,6 +326,30 @@ def on_buy(
             # First price we've managed to learn for a position we were already
             # tracking — better than never having a reference at all.
             guard.entry_price = entry_price
+        elif dormant(db, guard):
+            # This guard describes a position that never opened: its entry was
+            # cancelled or is still working, nothing has been sold off it, and
+            # no stop is resting. A guard is created when the BUY is placed, not
+            # when it fills, so an entry that never fills leaves one behind —
+            # and the next real position on that contract inherits its price.
+            #
+            # That happened live: four NIO entries were placed and cancelled at
+            # 0.16/0.11, then a fifth filled at 0.24. The stale guard still read
+            # 0.15, so the first trim's stop went to 0.11 (-25% of a price never
+            # paid) instead of 0.18. Re-seed rather than inherit.
+            #
+            # Deliberately NOT a general re-price: a guard with a filled entry,
+            # an advanced rung or a resting stop is protecting something real,
+            # and an "Adding" alert must never move that.
+            log.info(
+                "discord guard: re-seeding dormant %s guard %s -> %s "
+                "(previous entry never filled)",
+                symbol, guard.entry_price, entry_price,
+            )
+            guard.entry_price = entry_price
+            guard.entry_order_id = entry_order_id
+        elif guard.entry_order_id is None and entry_order_id is not None:
+            guard.entry_order_id = entry_order_id
         return guard
 
     guard = DiscordPositionGuard(
@@ -361,5 +410,5 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
-    "retire", "rollback_exit", "sync_entry_price",
+    "dormant", "retire", "rollback_exit", "sync_entry_price",
 ]
