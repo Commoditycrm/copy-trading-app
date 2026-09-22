@@ -739,6 +739,10 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                             place_stop=_make_stop_placer(db, live_acct, acct, guard),
                             cancel_stop=_make_stop_canceller(db, adapter),
                         )
+                        # Reconcile first so a resting stop is CANCELLED on
+                        # the way out; retiring the guard alone would leave the
+                        # order behind with nothing tracking it.
+                        _g.retire_if_flat(db, guard, held)
                     except Exception:  # noqa: BLE001
                         log.exception(
                             "discord stop: reconcile failed for %s", guard.symbol
