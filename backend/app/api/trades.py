@@ -768,6 +768,43 @@ def _cancel_conflicting_orders(
     return cancelled
 
 
+def broker_request_for(order: Order, use_native_bracket: bool) -> BrokerOrderRequest:
+    """Translate a persisted Order into the request we hand the broker.
+
+    Extracted so the field list is testable on its own. It was inline, and a
+    field that is simply ABSENT here fails silently: the request dataclass
+    defaults it, the order still places, and only the broker's behaviour is
+    wrong. That is what happened to ``is_closing`` -- see below.
+    """
+    return BrokerOrderRequest(
+        instrument_type=order.instrument_type,
+        symbol=order.symbol,
+        side=order.side,
+        order_type=order.order_type,
+        quantity=order.quantity,
+        limit_price=order.limit_price,
+        stop_price=order.stop_price,
+        trail_percent=order.trail_percent,
+        trail_price=order.trail_price,
+        take_profit_price=order.take_profit_price if use_native_bracket else None,
+        stop_loss_price=order.stop_loss_price if use_native_bracket else None,
+        option_expiry=order.option_expiry,
+        option_strike=order.option_strike,
+        option_right=order.option_right,
+        client_order_id=str(order.id),
+        # Open vs close is a DISTINCT field on Webull and SnapTrade options --
+        # it is not implied by the side. Without it every option SELL placed
+        # through here went out as SELL_TO_OPEN, and Webull refused it with
+        #   OPENAPI_POSITION_ORDER_INTENT_MISMATCH
+        #   "Close intent mismatches position direction"
+        # because you cannot open a short in a contract you are already long.
+        # That silently blocked every Discord trim, every protective stop and
+        # every close from the positions table on those brokers. Alpaca and
+        # IBKR ignore the field, so they are unaffected.
+        is_closing=order.is_closing,
+    )
+
+
 def _place_trader_order(
     db: Session,
     trader: User,
@@ -959,23 +996,7 @@ def _place_trader_order(
     from app.services import order_intent  # noqa: PLC0415
     order_intent.mark_app_originated(order.id)
 
-    broker_req = BrokerOrderRequest(
-        instrument_type=order.instrument_type,
-        symbol=order.symbol,
-        side=order.side,
-        order_type=order.order_type,
-        quantity=order.quantity,
-        limit_price=order.limit_price,
-        stop_price=order.stop_price,
-        trail_percent=order.trail_percent,
-        trail_price=order.trail_price,
-        take_profit_price=order.take_profit_price if use_native_bracket else None,
-        stop_loss_price=order.stop_loss_price if use_native_bracket else None,
-        option_expiry=order.option_expiry,
-        option_strike=order.option_strike,
-        option_right=order.option_right,
-        client_order_id=str(order.id),
-    )
+    broker_req = broker_request_for(order, use_native_bracket)
 
     _broker_t0 = time.perf_counter()
     # Auto-resolve wash-trade rejections on CLOSE orders: if the broker rejects
