@@ -1180,12 +1180,17 @@ def _execute_signal(
     # completed exit retires it. A TRIM is the exception: part of the position
     # is still open and still protected, so its guard stays live — retiring it
     # would drop the trailing stop and restart the count from zero.
-    if resolved.is_closing and not is_trim:
-        existing = guards.find(
-            db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
-        )
-        if existing is not None:
-            guards.retire(db, existing, "closed by exit alert")
+    if resolved.is_closing:
+        # A close never OPENS a guard. It used to fall through to on_buy when it
+        # was a trim (harmless while on_buy ignored an existing guard), but that
+        # now hands the guard the SELL order's id as its entry order -- so the
+        # entry price would later be adopted from the exit's fill.
+        if not is_trim:
+            existing = guards.find(
+                db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
+            )
+            if existing is not None:
+                guards.retire(db, existing, "closed by exit alert")
     else:
         guards.on_buy(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,

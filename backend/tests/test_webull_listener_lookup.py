@@ -80,3 +80,21 @@ def test_no_identifiers_matches_nothing(db):
 
 def test_an_unknown_order_is_not_matched(db):
     assert find_placed_order(db, USER, "SOME_OTHER_OID", uuid.uuid4().hex) is None
+
+
+def test_the_dashed_client_id_from_the_poll_still_matches(db):
+    """Webull caps client_order_id at 32 chars, so we send the UUID with dashes
+    STRIPPED and store that. The day-orders endpoint echoes it back in canonical
+    DASHED form while order-history returns the stripped one. A plain string
+    compare missed on the poll path -- and once the app-originated marker
+    expired (120s) the listener inserted the order a second time, rebuilt from
+    the feed as a STOCK with no strike, which also breaks realized P&L by 100x."""
+    dashed = str(uuid.UUID(hex=OUR_COID))
+    assert "-" in dashed
+    found = find_placed_order(db, USER, WEBULL_OID, dashed)
+    assert found is not None
+    assert found.broker_order_id == OUR_COID
+
+
+def test_a_dashed_id_that_belongs_to_nobody_still_matches_nothing(db):
+    assert find_placed_order(db, USER, "", str(uuid.uuid4())) is None
