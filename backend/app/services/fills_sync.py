@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
-from app.brokers.alpaca import AlpacaAdapter
+from app.brokers.alpaca import AlpacaAdapter, _looks_like_occ, _parse_occ
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.services.crypto import decrypt_json
@@ -315,29 +315,15 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             skipped += 1
             continue
 
-        # OCC option symbols are 21 chars (root padded to 6 + 6 date + 1 cp + 8 strike).
-        # Heuristic: anything 18+ chars with C/P at position -9 is an option.
-        is_option = len(symbol_full) >= 18 and symbol_full[-9] in ("C", "P")
-        if is_option:
-            # Parse OCC: ROOT(6) + YYMMDD(6) + CP(1) + STRIKE*1000(8)
-            # The root might be padded with trailing chars; just split by position.
-            ticker_root = symbol_full[:-15].strip()
-            yymmdd = symbol_full[-15:-9]
-            cp = symbol_full[-9]
-            strike_str = symbol_full[-8:]
-            from datetime import date as _date
-            try:
-                expiry = _date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
-                strike = Decimal(int(strike_str)) / Decimal(1000)
-            except Exception:  # noqa: BLE001
-                skipped += 1
-                continue
-            from app.models.order import OptionRight
+        # Alpaca's activity feed returns the UNPADDED OCC symbol (root + YYMMDD +
+        # C/P + 8-digit strike), so total length tracks the ticker: a 1–2 char
+        # root is only 16–17 chars. Use the shared OCC parser, not a length gate
+        # — a >=18 gate mis-tags short-ticker options (T, VG, MU…) as STOCK and
+        # they lose the 100x contract multiplier in realized P&L.
+        parsed = _parse_occ(symbol_full) if _looks_like_occ(symbol_full) else None
+        if parsed is not None:
+            display_symbol, option_expiry, option_strike, option_right = parsed
             instrument = InstrumentType.OPTION
-            display_symbol = ticker_root
-            option_expiry = expiry
-            option_strike = strike
-            option_right = OptionRight.CALL if cp == "C" else OptionRight.PUT
         else:
             instrument = InstrumentType.STOCK
             display_symbol = symbol_full.upper()
