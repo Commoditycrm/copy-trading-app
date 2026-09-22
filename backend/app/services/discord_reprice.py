@@ -116,6 +116,33 @@ def reprice_one(order_id: uuid.UUID) -> str:
         if order.discord_repriced_at is not None:
             return "already"
 
+        acct_check = db.get(BrokerAccount, order.broker_account_id)
+        if acct_check is None:
+            return "no account"
+
+        # Only reprice where the broker can REPLACE a resting order in one step.
+        #
+        # Without that, the fallback is cancel-then-place — and if the place
+        # fails, the entry is gone with nothing in its stead. That happened on
+        # Webull: a 4-lot buy was cancelled 30s after placement, the re-place
+        # never landed, and the position the trader thought they held did not
+        # exist. Every later trim then fired into nothing.
+        #
+        # A limit that rests unfilled is recoverable; an entry that vanished is
+        # not. So on a broker without atomic replace we leave the order alone.
+        from app.brokers import adapter_for as _adapter_for  # noqa: PLC0415
+        from app.services.crypto import decrypt_json as _decrypt  # noqa: PLC0415
+
+        probe = _adapter_for(acct_check, _decrypt(acct_check.encrypted_credentials))
+        if not getattr(probe, "supports_replace", False):
+            order.discord_repriced_at = datetime.now(timezone.utc)
+            db.commit()
+            log.info(
+                "discord reprice: %s cannot replace atomically — leaving %s resting",
+                acct_check.broker, order.symbol,
+            )
+            return "skipped (no atomic replace)"
+
         ts = db.get(TraderSettings, order.user_id)
         pct = Decimal(str(getattr(ts, "discord_reprice_pct", None) or 10))
         original = Decimal(str(order.limit_price))
@@ -189,15 +216,13 @@ def _replace(adapter, order: Order, new_price: Decimal) -> None:
         option_right=order.option_right,
         client_order_id=str(order.id),
     )
-    if getattr(adapter, "supports_replace", False):
-        result = adapter.replace_order(order.broker_order_id, req)
-        if getattr(result, "broker_order_id", None):
-            order.broker_order_id = result.broker_order_id
-        return
-
-    adapter.cancel_order(order.broker_order_id)
-    result = adapter.place_order(req)
-    order.broker_order_id = result.broker_order_id
+    # reprice_one() has already established the broker can replace atomically.
+    # There is deliberately no cancel-then-place fallback: if the place failed
+    # after the cancel succeeded, the entry would be gone with nothing in its
+    # stead — the failure this whole guard exists to prevent.
+    result = adapter.replace_order(order.broker_order_id, req)
+    if getattr(result, "broker_order_id", None):
+        order.broker_order_id = result.broker_order_id
 
 
 def _tick() -> None:
