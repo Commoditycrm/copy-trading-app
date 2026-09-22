@@ -995,6 +995,14 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
         ):
             raise  # nothing actionable — retry won't help
 
+        # Observability: a pure no-position lag (holding intact, no re-clamp) that
+        # then succeeds leaves no other trace. Log it so the retry path is visible.
+        if lagged_no_position and not reclamped and not cancelled:
+            log.info(
+                "mirror close: broker rejected 'no position' but live holding confirmed "
+                "(%s) for %s — retrying close", live, req.symbol,
+            )
+
         last_exc: BaseException = exc
         for _ in range(3):
             time.sleep(0.5)  # let the broker release the reservation
