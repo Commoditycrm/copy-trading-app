@@ -78,6 +78,7 @@ const NAV = [
   { href: "/admin/load-test",    label: "Load Test",    Icon: IconFlask },
   { href: "/admin/performance",  label: "Performance",  Icon: IconActivity },
   { href: "/admin/daily-pnl",    label: "Daily P&L",    Icon: IconActivity },
+  { href: "/admin/system",       label: "System",       Icon: IconSliders },
   { href: "/admin/api",          label: "API",          Icon: IconSliders },
 ];
 

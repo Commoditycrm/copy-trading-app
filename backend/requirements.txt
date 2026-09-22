@@ -66,3 +66,8 @@ snaptrade-python-sdk==11.0.197
 python-dateutil==2.9.0
 requests-oauthlib>=1.3,<3
 pytz
+# Host telemetry for the admin System → Usage page (api/system.py). Reads live
+# CPU/memory/disk of the Lightsail box — in-container psutil reports host figures
+# (cpu/mem aren't namespaced; the overlay root reflects the host partition), so
+# no docker.sock or host mount is needed.
+psutil==6.1.0
