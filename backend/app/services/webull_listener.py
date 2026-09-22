@@ -34,7 +34,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -461,14 +461,10 @@ def _persist_and_fanout(
         if not broker_filters.should_persist_order(acct_gate, status_enum):
             return
 
-        existing = db.execute(
-            select(Order)
-            .where(Order.broker_order_id == broker_order_id)
-            .where(Order.user_id == trader_user_id)
-            .where(Order.parent_order_id.is_(None))
-            .order_by(Order.created_at.desc())
-            .limit(1)
-        ).scalars().first()
+        existing = find_placed_order(
+            db, trader_user_id,
+            broker_order_id, str(payload.get("client_order_id") or "").strip(),
+        )
 
         if existing is not None:
             was_working = existing.status in _WORKING
@@ -1014,6 +1010,33 @@ def _on_order_event(
 
 
 # ── lifecycle ───────────────────────────────────────────────────────────────
+def find_placed_order(db, trader_user_id, *ids):
+    """Our row for an order this feed just reported, matched on EITHER id.
+
+    Webull gives an order two identifiers and we hold the other one:
+    ``WebullAdapter.place_order`` returns our client_order_id as
+    ``broker_order_id`` (it is the handle every later cancel / replace / read
+    uses), while this feed keys on Webull's own ``order_id``.
+
+    Looking up by the feed's id ALONE meant the SELECT always missed for orders
+    we placed ourselves, so their status was never updated here: the contract
+    filled at the broker and our row sat at SUBMITTED, with no order.placed
+    event to push the fill to the UI. Only the app-originated guard fired,
+    which correctly avoided a duplicate row but left the real one stale.
+    """
+    wanted = [i for i in ids if i]
+    if not wanted:
+        return None
+    return db.execute(
+        select(Order)
+        .where(or_(*[Order.broker_order_id == i for i in wanted]))
+        .where(Order.user_id == trader_user_id)
+        .where(Order.parent_order_id.is_(None))
+        .order_by(Order.created_at.desc())
+        .limit(1)
+    ).scalars().first()
+
+
 async def start_all_listeners() -> None:
     """Spawn a listener for every active TRADER with a connected Webull account.
     No-op unless webull_direct_enabled — so with the flag off this is inert."""
