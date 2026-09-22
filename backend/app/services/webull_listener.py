@@ -332,13 +332,24 @@ def _map_side(s: str | None) -> OrderSide:
 
 
 def _map_order_type(s: str | None) -> OrderType:
+    """Webull's order-type name -> ours. MUST round-trip WebullAdapter's
+    _ORDER_TYPE_MAP, which sends STOP as "STOP_LOSS".
+
+    "STOP_LOSS" was missing while "STOP_LOSS_LIMIT" was handled, so every plain
+    stop fell through to MARKET. The modify branch then saw the order's type as
+    changed and rewrote our own row: a resting protective STOP was stored, and
+    shown, as a MARKET order -- on the very rows where being able to tell those
+    apart matters most. Anything unrecognised still falls back to MARKET.
+    """
     t = str(s or "").upper()
     if t in ("LIMIT", "LMT"):
         return OrderType.LIMIT
-    if t in ("STOP", "STP"):
+    if t in ("STOP", "STP", "STOP_LOSS"):
         return OrderType.STOP
     if t in ("STOP_LIMIT", "STP_LMT", "STOP_LOSS_LIMIT"):
         return OrderType.STOP_LIMIT
+    if t in ("TRAILING_STOP", "TRAILING_STOP_LOSS"):
+        return OrderType.TRAILING_STOP
     return OrderType.MARKET
 
 
