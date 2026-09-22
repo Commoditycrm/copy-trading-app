@@ -1204,6 +1204,20 @@ class WebullAdapter(BrokerAdapter):
             return "BUY_TO_CLOSE" if buy else "SELL_TO_CLOSE"
         return "BUY_TO_OPEN" if buy else "SELL_TO_OPEN"
 
+    @staticmethod
+    def _tif(req: BrokerOrderRequest) -> str:
+        """How long the order should live.
+
+        A STOP exists to protect a position until it triggers, which may be days
+        away — so it has to outlive the session. A DAY stop is silently cancelled
+        at 16:00 ET, leaving the position unprotected overnight and pre-market,
+        which is exactly when a gap happens. Everything else keeps DAY, so a
+        stale entry cannot sit working into the next session.
+        """
+        if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+            return "GTC"
+        return "DAY"
+
     def _build_stock_order(self, req: BrokerOrderRequest, coid: str) -> dict[str, Any]:
         d: dict[str, Any] = {
             "client_order_id": coid,
@@ -1214,7 +1228,10 @@ class WebullAdapter(BrokerAdapter):
             "side": "BUY" if req.side == OrderSide.BUY else "SELL",
             "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
             "quantity": self._fmt_qty(req.quantity),
-            "time_in_force": "DAY",
+            # A STOP protects a position until it triggers, so it must outlive
+            # the session — a DAY stop dies at 16:00 ET and leaves the position
+            # unprotected overnight. Everything else keeps DAY.
+            "time_in_force": self._tif(req),
             "entrust_type": "QTY",
             "support_trading_session": self._session(req),
         }
@@ -1250,7 +1267,10 @@ class WebullAdapter(BrokerAdapter):
             "option_strategy": "SINGLE",
             "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
             "quantity": self._fmt_qty(req.quantity),
-            "time_in_force": "DAY",
+            # A STOP protects a position until it triggers, so it must outlive
+            # the session — a DAY stop dies at 16:00 ET and leaves the position
+            # unprotected overnight. Everything else keeps DAY.
+            "time_in_force": self._tif(req),
             "entrust_type": "QTY",
             "position_intent": intent,
             "side": side,
