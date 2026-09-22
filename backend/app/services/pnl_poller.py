@@ -383,11 +383,25 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                     DiscordPositionGuard,
                 )
 
+                # Must match what discord_position_guard.armed() selects, or the
+                # account is skipped before the work is ever reached.
+                #
+                # armed_at is set ONLY when a TRAILING exit is armed. A guard
+                # protected by a plain stop level has it NULL — which is every
+                # guard on a contract under the trail threshold, since those
+                # trims exit at market. Gating on armed_at therefore skipped
+                # exactly the positions that had a stop to place, and their
+                # guards were never retired when the position closed either.
+                from sqlalchemy import or_ as _or  # noqa: PLC0415
+
                 has_setup = db.execute(
                     _select(DiscordPositionGuard.id).where(
                         DiscordPositionGuard.user_id == user_id,
                         DiscordPositionGuard.closed_at.is_(None),
-                        DiscordPositionGuard.armed_at.isnot(None),
+                        _or(
+                            DiscordPositionGuard.stop_price.isnot(None),
+                            DiscordPositionGuard.trail_qty.isnot(None),
+                        ),
                     ).limit(1)
                 ).scalar_one_or_none() is not None
             # Also tick if Discord trade-alerts are on — the trader tick sweeps
