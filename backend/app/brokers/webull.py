@@ -1020,17 +1020,26 @@ class WebullAdapter(BrokerAdapter):
         trade = self._trade_client()
         coid = broker_order_id
 
-        # The modify body is the same shape as the place body — the SDK's
-        # replace takes `modify_orders` exactly where place takes `new_orders` —
-        # and the client_order_id inside it selects the order being replaced.
-        if req.instrument_type == InstrumentType.OPTION:
-            resp = trade.order_v2.replace_option(
-                self.account_id, [self._build_option_order(req, coid)]
-            )
+        # A modify is NOT a place with a new price. Webull's modify body carries
+        # the order's identity plus only the fields being changed, and an option
+        # leg is named by the broker's own leg id — the contract terms that
+        # identify a leg on a place (symbol/strike/expiry/right) are not
+        # accepted here. Sending the place body cost us a live reprice on
+        # 2026-09-22: a NIO call could not be moved 0.15 -> 0.16 because Webull
+        # answered HTTP 417 OPENAPI_THE_REQUIRED_PARAM_IS_NULL, reading
+        # legs[].id off a leg that carried only descriptors.
+        is_option = req.instrument_type == InstrumentType.OPTION
+        legs = None
+        if is_option:
+            legs = [
+                {"id": leg_id, "quantity": self._fmt_qty(req.quantity)}
+                for leg_id in self._option_leg_ids(trade, coid)
+            ]
+        body = self._build_modify_order(req, coid, legs)
+        if is_option:
+            resp = trade.order_v2.replace_option(self.account_id, [body])
         else:
-            resp = trade.order_v3.replace_order(
-                self.account_id, [self._build_stock_order(req, coid)]
-            )
+            resp = trade.order_v3.replace_order(self.account_id, [body])
         # Same acceptance check as a place: an HTTP 200 alone is not proof, and
         # a rejected replace must not read as a successful one — otherwise the
         # caller believes the price moved when the old order is still resting.
@@ -1329,6 +1338,63 @@ class WebullAdapter(BrokerAdapter):
             d["limit_price"] = self._fmt_price(req.limit_price)
         if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is not None:
             d["stop_price"] = self._fmt_price(req.stop_price)
+        return d
+
+    def _option_leg_ids(self, trade: Any, coid: str) -> list[str]:
+        """Broker leg ids for a resting option order.
+
+        A modify names its legs by ``id``; Get Order Detail returns them at
+        orders[].legs[].id. Raising here is deliberate: the caller then leaves
+        the ORIGINAL order resting rather than replacing it blind, which is the
+        recoverable failure (see replace_order).
+        """
+        try:
+            resp = trade.order_v3.get_order_detail(self.account_id, coid)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"webull replace: could not read order {coid}: {exc}"
+            ) from exc
+        if getattr(resp, "status_code", None) != 200:
+            raise RuntimeError(
+                f"webull replace: could not read order {coid}: {self._error_text(resp)}"
+            )
+        body = resp.json() or {}
+        if not isinstance(body, dict):
+            body = {}
+        orders = body.get("orders") or body.get("items") or []
+        container = orders[0] if orders and isinstance(orders[0], dict) else body
+        legs = container.get("legs") or body.get("legs") or []
+        ids = [
+            str(leg["id"]) for leg in legs
+            if isinstance(leg, dict) and leg.get("id")
+        ]
+        if not ids:
+            raise RuntimeError(
+                f"webull replace: order {coid} reported no option leg ids"
+            )
+        return ids
+
+    def _build_modify_order(
+        self,
+        req: BrokerOrderRequest,
+        coid: str,
+        legs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """The body Webull's modify endpoints accept: the order's identity plus
+        the fields being changed. Everything a place sends to DESCRIBE the
+        instrument belongs to the place body only."""
+        d: dict[str, Any] = {
+            "client_order_id": coid,
+            "quantity": self._fmt_qty(req.quantity),
+            "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
+            "time_in_force": self._tif(req),
+        }
+        if req.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and req.limit_price is not None:
+            d["limit_price"] = self._fmt_price(req.limit_price)
+        if req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and req.stop_price is not None:
+            d["stop_price"] = self._fmt_price(req.stop_price)
+        if legs:
+            d["legs"] = legs
         return d
 
     def _fetch_detail(self, trade: Any, coid: str):

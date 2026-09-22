@@ -785,6 +785,9 @@ class _ReplaceOrderV3:
     def cancel_order(self, account_id, client_order_id):
         self.store.append(("v3.cancel_order", account_id, client_order_id))
         return _replace_ok()
+    def get_order_detail(self, account_id, client_order_id):
+        self.store.append(("v3.get_order_detail", account_id, client_order_id))
+        return _detail_with_leg("LEG1")
 
 
 class _ReplaceOrderV2:
@@ -795,6 +798,15 @@ class _ReplaceOrderV2:
     def place_option(self, account_id, new_orders, client_combo_order_id=None):
         self.store.append(("v2.place_option", account_id, new_orders))
         return _replace_ok()
+
+
+def _detail_with_leg(leg_id):
+    r = type("R", (), {})()
+    r.status_code = 200
+    r.json = lambda: {"orders": [{"client_order_id": "c1", "legs": (
+        [{"id": leg_id, "symbol": "SPY", "quantity": "2"}] if leg_id else []
+    )}]}
+    return r
 
 
 def _replace_ok():
@@ -836,8 +848,14 @@ def test_replacing_a_stock_order_uses_replace_not_cancel_and_place(monkeypatch):
 
     assert [c[0] for c in calls] == ["v3.replace_order"]
     assert "cancel" not in " ".join(c[0] for c in calls)
-    assert calls[0][2][0]["limit_price"] == "2.20"
+    body = calls[0][2][0]
+    assert body["limit_price"] == "2.20"
     assert res.broker_order_id == "c1"          # identity is preserved
+    # A modify carries identity + changed fields only. Webull rejects a place
+    # body here, so the instrument descriptors must NOT be along for the ride.
+    assert body["client_order_id"] == "c1"
+    assert not {"symbol", "instrument_type", "market", "side", "combo_type",
+                "entrust_type", "support_trading_session", "legs"} & set(body)
 
 
 def test_replacing_an_option_order_uses_replace_option(monkeypatch):
@@ -849,8 +867,39 @@ def test_replacing_an_option_order_uses_replace_option(monkeypatch):
         option_right=OptionRight.CALL,
     )
     a.replace_order("c1", req)
-    assert [c[0] for c in calls] == ["v2.replace_option"]
-    assert calls[0][2][0]["client_order_id"] == "c1"
+    # The leg id has to be read back before the modify can name the leg.
+    assert [c[0] for c in calls] == ["v3.get_order_detail", "v2.replace_option"]
+    body = calls[1][2][0]
+    assert body["client_order_id"] == "c1"
+    # Webull names an option leg on a MODIFY by its own id; sending the
+    # contract terms a place uses is what returned
+    # OPENAPI_THE_REQUIRED_PARAM_IS_NULL against the live account.
+    assert body["legs"] == [{"id": "LEG1", "quantity": "2"}]
+    assert not {"option_strategy", "position_intent", "side", "combo_type"} & set(body)
+
+
+def test_an_option_replace_without_a_leg_id_fails_instead_of_guessing(monkeypatch):
+    """No leg id means no modify Webull will accept. Failing leaves the
+    original order resting, which is recoverable; guessing a body that gets
+    rejected burns the retry and leaves the entry unmoved."""
+    a, calls = _wired_replace(monkeypatch)
+    monkeypatch.setattr(
+        a._trade_client().order_v3.__class__, "get_order_detail",
+        lambda self, account_id, coid: _detail_with_leg(None),
+    )
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION, symbol="SPY", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal("2"), limit_price=Decimal("2.20"),
+        option_expiry=date(2026, 9, 25), option_strike=Decimal("771"),
+        option_right=OptionRight.CALL,
+    )
+    try:
+        a.replace_order("c1", req)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a replace with no leg id was reported as success")
+    assert not [c for c in calls if c[0] == "v2.replace_option"]
 
 
 def test_a_rejected_replace_is_not_reported_as_success(monkeypatch):
