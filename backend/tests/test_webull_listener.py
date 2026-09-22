@@ -9,6 +9,7 @@ No SDK, no DB, no network — pure logic:
 Run standalone:  .venv/bin/python tests/test_webull_listener.py
 Or under pytest: pytest tests/test_webull_listener.py
 """
+import math
 import os
 import sys
 import uuid
@@ -103,16 +104,30 @@ def test_parse_wb_time_both_formats():
 
 
 def test_safe_poll_interval_respects_rate_limit():
-    """The effective interval never lets list_today_orders exceed Webull's
-    10-req/30s app-id cap: it floors at 3.5s and scales by account count."""
-    # single account: at least the 3.5s floor
-    assert wl._safe_poll_interval(1) >= 3.5
-    # more accounts ⇒ longer cycle (≥ ~3.3s per account)
-    assert wl._safe_poll_interval(3) >= 3.3 * 3
-    # a cycle at the returned interval stays within 10 calls / 30s
-    for n in (1, 2, 3, 5):
-        calls_per_30s = n * (30.0 / wl._safe_poll_interval(n))
-        assert calls_per_30s <= 10.0 + 1e-9, (n, calls_per_30s)
+    """Webull limits the order-query endpoints to 2 requests per 2 SECONDS.
+
+    It is the window that bites, not the average: evenly spaced calls a gap `g`
+    apart put floor(2/g)+1 of them inside some 2s window, so g must be strictly
+    greater than 1.0s or three land in one window and the last 429s. That is the
+    shape behind the prod incident where the 3rd account of each burst failed
+    every cycle.
+
+    The cap used to be documented here as 10 req/30s shared across endpoints.
+    It is neither shared nor that small -- each endpoint keeps its own counter
+    and 2/2s is 1 call/s sustained -- so the old interval was 3x slower than it
+    needed to be, for nothing.
+    """
+    WINDOW_S, WINDOW_CAP = 2.0, 2
+
+    for n in (1, 2, 3, 5, 10):
+        interval = wl._safe_poll_interval(n)
+        gap = interval / n
+        assert gap > 1.0, (n, gap)
+        in_window = math.floor(WINDOW_S / gap) + 1
+        assert in_window <= WINDOW_CAP, (n, gap, in_window)
+
+    # and it must not have become gratuitously slow in the other direction
+    assert wl._safe_poll_interval(1) <= 6.0
 
 
 def test_order_fingerprint_catches_modify():
@@ -145,3 +160,20 @@ if __name__ == "__main__":
             fn()
             print(f"PASS  {name}")
     print("\nAll webull-listener guard tests passed.")
+
+
+def test_the_day_orders_page_covers_a_busy_session():
+    """30 was enough for a normal day and silently was not for a busy one: one
+    account placed 47 orders in an afternoon of testing, so everything past the
+    page's edge was never seen by the poller -- its fills and cancels never
+    reached the order history. A bigger page costs the SAME single request, so
+    no rate-limit budget is spent widening it."""
+    import inspect
+
+    from app.services import webull_listener as wl
+
+    assert wl._DAYORDERS_PAGE_SIZE >= 100
+    default = inspect.signature(wl._list_today_orders).parameters["page_size"].default
+    assert default == wl._DAYORDERS_PAGE_SIZE, (
+        "the poller must use the widened page, not its own literal"
+    )
