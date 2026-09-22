@@ -119,13 +119,31 @@ def _poll_enabled() -> bool:
     return bool(get_settings().webull_direct_poll_enabled)
 
 
-# Webull's "Query Day Orders" endpoint (our list_today_orders) is limited to
-# 10 requests / 30s PER APP ID — shared across every account under one app_key.
-# That's 1 call / 3s. We poll once per account per cycle, so the safe cycle
-# length scales with account count. Keep a hard floor above 3s and a headroom
-# factor so a burst/retry never crosses the line.
-_DAYORDERS_MIN_INTERVAL_S = 3.5          # per-call floor (>3s ceiling + margin)
-_DAYORDERS_PER_ACCOUNT_S = 3.3           # 30s/10 with ~10% headroom, per account
+# Webull's published limits (developer.webull.com/apis/docs/rate-limits,
+# Production column) for the ORDER-QUERY endpoints this poll uses:
+#
+#   Order History / Open Orders / Order Detail   2/2s
+#   Account Positions / Account Balance          2/2s
+#   Place / Replace / Cancel Order             600/60s
+#
+# Two things here were previously wrong, and both made the poller slower than it
+# needs to be. The limits are NOT "10/30s shared across every endpoint": the docs
+# state each endpoint keeps its OWN counter ("Hitting the limit on one endpoint
+# does not affect others"), and a query endpoint allows 1 call/s sustained —
+# three times the 20/min we assumed. Reads also cannot starve order placement,
+# which is on a separate and far larger counter.
+#
+# What IS real is the BURST shape: 2/2s is a two-second window, so back-to-back
+# calls are what trips it, not the average rate. That is why the per-account
+# calls are still spaced across the cycle rather than fired together (prod, 3
+# accounts, 2026-08-13: the 3rd call of each burst 429'd 32x/hr). Spacing just
+# over 1s per call holds the sustained rate at the cap with headroom.
+#
+# NOTE: those figures document the /trading/... endpoints, while this SDK still
+# calls the older /openapi/... paths, so the margin below is deliberate rather
+# than tuned to the published ceiling.
+_DAYORDERS_MIN_INTERVAL_S = 1.2          # per-call floor (2/2s ⇒ 1/s, +20% margin)
+_DAYORDERS_PER_ACCOUNT_S = 1.2           # spacing between accounts in one cycle
 
 
 def _poll_interval() -> float:
@@ -692,8 +710,19 @@ def _persist_and_fanout(
 
 
 # ── REST poll backstop ───────────────────────────────────────────────────────
-def _list_today_orders(creds: dict[str, Any], account_id: str, page_size: int = 30) -> list[dict]:
-    """One page of the account's orders for today, newest-first. Returns [] on
+# Webull caps this endpoint at 100 per page. 30 was enough for a normal day and
+# silently was not for a busy one: a single account placed 47 orders in an
+# afternoon of testing, so anything past the page's edge was never seen by the
+# poller at all — its fills and cancels simply never landed in the order
+# history. A bigger page costs the SAME one request, so there is no rate-limit
+# reason to keep it small.
+_DAYORDERS_PAGE_SIZE = 100
+
+
+def _list_today_orders(
+    creds: dict[str, Any], account_id: str, page_size: int = _DAYORDERS_PAGE_SIZE,
+) -> list[dict]:
+    """One page of the account's orders for today. Returns [] on
     any failure (the poller just tries again next cycle). Response shape:
     ``{"hasNext":..., "pageSize":..., "orders":[{order_id, client_order_id,
     account_id, items:[{symbol, category, side, order_status, qty, filled_qty,
@@ -907,13 +936,13 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 interval = _safe_poll_interval(len(account_ids))
 
             # Space the per-account calls EVENLY across the cycle instead of
-            # bursting them back-to-back. list_today_orders shares a 10-req/30s
-            # PER-APP-ID budget; a burst of N calls followed by one long sleep
-            # puts >10 calls inside some sliding 30s windows, so the LAST account
-            # in the burst 429'd every cycle (prod Gaurav, 3 accounts — the 3rd
-            # 429'd 32×/hr, 2026-08-13). One call every interval/N (≈3.3s) holds
-            # a steady ~9 calls/30s, under the cap. Per-account poll frequency is
-            # unchanged (still once per `interval`), so detection latency is too.
+            # bursting them back-to-back. The query endpoints are limited 2/2s,
+            # a two-second window — so a burst of N calls followed by one long
+            # sleep trips it even when the AVERAGE rate is well under, and the
+            # last account in the burst 429'd every cycle (prod, 3 accounts —
+            # the 3rd 429'd 32×/hr, 2026-08-13). One call every interval/N keeps
+            # the window under the cap. Per-account poll frequency is unchanged
+            # (still once per `interval`), so detection latency is too.
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:

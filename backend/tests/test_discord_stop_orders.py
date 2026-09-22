@@ -45,8 +45,13 @@ def db():
         def get(self, model, key): return self.rows.get(key)
         def add(self, o): self.rows[o.id] = o
         def execute(self, *a, **k):
-            hit = uuid.uuid4() if self.rejected else None
-            return type("R", (), {"scalar_one_or_none": lambda _s: hit})()
+            # The reconciler reads the broker's REASON for the last refusal, so
+            # the fake has to answer with a row, not just a truthy id.
+            hit = (self.rejected,) if self.rejected else None
+            return type("R", (), {
+                "one_or_none": lambda _s: hit,
+                "scalar_one_or_none": lambda _s: hit and hit[0],
+            })()
     return _DB()
 
 
@@ -210,6 +215,7 @@ def _rejected_stop_at(db, user_id, when):
         order_type=OrderType.STOP, instrument_type=InstrumentType.OPTION,
         option_strike=Decimal("3.5"), quantity=Decimal(4),
         status=OrderStatus.REJECTED, created_at=when,
+        reject_reason="HTTP Status: 417, Code: OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE",
     ))
     db.commit()
 
@@ -248,3 +254,225 @@ def test_a_rejection_from_a_previous_position_does_not_block_this_one():
 
         # One opened BEFORE it owns the rejection and must still back off.
         assert so._recently_rejected(db, _guard_created(user, now - timedelta(minutes=10))) is True
+
+
+# ── a refused stop must not leave the position unprotected ───────────────────
+
+# The REAL exception the placer raises. _place_trader_order marks the row
+# REJECTED and then raises HTTPException(502, "broker_error: ..."), so str() of
+# it begins "502: ". Testing with a hand-written RuntimeError message instead of
+# this wrapper is exactly how a "502" entry in _TRANSIENT_MARKERS shipped and
+# made the whole fallback dead code -- every broker rejection read as transient.
+def _broker_refusal(detail):
+    from fastapi import HTTPException
+    return HTTPException(502, f"broker_error: {detail}")
+
+
+WEBULL_BREACH = _broker_refusal(
+    "HTTP Status: 417, Code: OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE, "
+    "Msg: Stop price must be less than market price for a sell order (0.21), "
+    "RequestID: 184c0ee0-91fa-4b40-96a4-502429401503"
+)
+
+WEBULL_RATE_LIMIT = _broker_refusal(
+    "HTTP Status: 429, Code: TOO_MANY_REQUESTS, Msg: Too many requests"
+)
+
+
+class _StopDB:
+    """Minimal session: resolves the resting stop order and records retirement."""
+
+    def __init__(self, resting=None):
+        self._resting = resting
+        self.added = []
+
+    def get(self, model, key):
+        return self._resting if getattr(self._resting, "id", None) == key else None
+
+    def execute(self, stmt):
+        class _R:
+            def one_or_none(self_inner): return None
+            def scalar_one_or_none(self_inner): return None
+        return _R()
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def flush(self):
+        pass
+
+
+def _stop_guard(**kw):
+    from app.models.discord_position_guard import DiscordPositionGuard
+    base = dict(symbol="NIO", option_strike=Decimal("3.5"), option_expiry=None,
+                stop_price=Decimal("0.24"), stop_order_id=None, trail_qty=None,
+                sell_count=2, user_id=uuid.uuid4())
+    base.update(kw)
+    return DiscordPositionGuard(**base)
+
+
+def _refusing_placer(exc):
+    def _place(qty, price):
+        raise exc
+    return _place
+
+
+def test_a_refused_stop_closes_the_position(monkeypatch):
+    """The refusal says the market is ALREADY through the level, so the stop we
+    asked for would have fired the moment it rested. Closing now is what the
+    stop was for."""
+    import app.services.discord_stop_orders as so
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: None)
+
+    closed = []
+    g = _stop_guard()
+    out = so.reconcile(
+        _StopDB(), g, Decimal(1),
+        place_stop=_refusing_placer(WEBULL_BREACH),
+        cancel_stop=lambda oid: None,
+        close_position=closed.append,
+    )
+    assert closed == [Decimal(1)]
+    assert "closed" in out
+    assert g.closed_at is not None          # the ladder is done with it
+
+
+def test_a_rate_limit_does_not_liquidate(monkeypatch):
+    """A stop refused by a rate limit is not a stop the broker disagrees with.
+    Closing a position over one would be a far worse bug than the one this
+    fixes -- the backoff already handles it."""
+    import app.services.discord_stop_orders as so
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: None)
+
+    from fastapi import HTTPException
+
+    closed = []
+    g = _stop_guard()
+    try:
+        so.reconcile(
+            _StopDB(), g, Decimal(1),
+            place_stop=_refusing_placer(WEBULL_RATE_LIMIT),
+            cancel_stop=lambda oid: None,
+            close_position=closed.append,
+        )
+    except HTTPException:
+        pass
+    else:
+        raise AssertionError("a transient failure should propagate, not close")
+    assert closed == []
+    assert g.closed_at is None
+
+
+def test_a_refusal_while_REPLACING_also_closes(monkeypatch):
+    """The old stop is cancelled first, so a refusal here leaves the position
+    barer than a failed first placement would."""
+    from app.models.order import (
+        InstrumentType, Order, OrderSide, OrderStatus, OrderType,
+    )
+    import app.services.discord_stop_orders as so
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: None)
+
+    resting = Order(
+        id=uuid.uuid4(), user_id=uuid.uuid4(), symbol="NIO",
+        side=OrderSide.SELL, order_type=OrderType.STOP,
+        instrument_type=InstrumentType.OPTION, quantity=Decimal(2),
+        stop_price=Decimal("0.15"), status=OrderStatus.SUBMITTED,
+    )
+    cancelled, closed = [], []
+    g = _stop_guard(stop_order_id=resting.id)
+
+    out = so.reconcile(
+        _StopDB(resting), g, Decimal(1),
+        place_stop=_refusing_placer(WEBULL_BREACH),
+        cancel_stop=cancelled.append,
+        close_position=closed.append,
+    )
+    assert cancelled == [resting.id]        # the old one went first
+    assert closed == [Decimal(1)]
+    assert "closed" in out
+
+
+def test_without_a_close_callback_the_refusal_still_propagates(monkeypatch):
+    """Callers that cannot close (no live position row) must not swallow it."""
+    import app.services.discord_stop_orders as so
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: None)
+    from fastapi import HTTPException
+
+    try:
+        so.reconcile(
+            _StopDB(), _stop_guard(), Decimal(1),
+            place_stop=_refusing_placer(WEBULL_BREACH),
+            cancel_stop=lambda oid: None,
+        )
+    except HTTPException:
+        pass
+    else:
+        raise AssertionError("the refusal was swallowed")
+
+
+def test_the_wrapper_status_code_is_not_read_as_a_transient_failure():
+    """Regression: every broker rejection arrives as HTTPException(502, ...), so
+    a bare "502" marker matched all of them and the close never fired. The
+    RequestID here also embeds 502/429/401 to pin the numeric-substring trap."""
+    import app.services.discord_stop_orders as so
+    assert so._is_transient(str(WEBULL_BREACH)) is False
+
+
+def test_a_brokers_own_code_name_still_reads_as_transient():
+    """Webull writes TOO_MANY_REQUESTS, not "too many requests". The code name
+    has to carry it ALONE -- Webull does not always append readable prose, and
+    a rate limit misread as a refusal would liquidate the position."""
+    import app.services.discord_stop_orders as so
+    assert so._is_transient(str(WEBULL_RATE_LIMIT)) is True
+    code_only = _broker_refusal("HTTP Status: 429, Code: TOO_MANY_REQUESTS")
+    assert so._is_transient(str(code_only)) is True
+
+
+def test_a_position_left_unprotected_by_an_earlier_refusal_is_rescued(db, broker):
+    """The close must not depend on catching the exception as it happens.
+
+    Closing only from the live exception works on the ONE tick that places the
+    order. If anything goes wrong on that tick, the backoff then short-circuits
+    every later tick -- reconcile returns "backing off" before place_stop is
+    ever called -- and the position sits unprotected for the whole window. That
+    is exactly what happened live: a stop was refused at 00:00:44, nothing
+    closed, and every later tick answered "backing off (recent rejection)"
+    while 1 contract stayed open with no stop behind it.
+    """
+    db.rejected = (
+        "HTTP Status: 417, Code: OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE, "
+        "Msg: Stop price must be less than market price for a sell order (0.21)"
+    )
+    closed = []
+    g = _Guard(stop="0.24")
+    out = so.reconcile(
+        db, g, Decimal(1), broker["place"], broker["cancel"],
+        close_position=closed.append,
+    )
+    assert closed == [Decimal(1)], out
+    assert broker["placed"] == []          # no pointless re-place first
+    assert "closed" in out
+    assert g.closed_at is not None
+
+
+def test_a_transient_refusal_still_only_backs_off(db, broker):
+    """Same path, but a rate limit must never liquidate."""
+    db.rejected = "HTTP Status: 429, Code: TOO_MANY_REQUESTS, Msg: Too many requests"
+    closed = []
+    out = so.reconcile(
+        db, _Guard(stop="0.24"), Decimal(1), broker["place"], broker["cancel"],
+        close_position=closed.append,
+    )
+    assert closed == []
+    assert out == "backing off (recent rejection)"
+
+
+def test_a_refusal_with_no_stored_reason_still_backs_off(db, broker):
+    """An empty reject_reason must not read as "never rejected" -- that would
+    send the reconciler back to placing a stop every single tick."""
+    db.rejected = True          # truthy row, no text
+    out = so.reconcile(
+        db, _Guard(stop="0.24"), Decimal(1), broker["place"], broker["cancel"],
+    )
+    assert broker["placed"] == []
+    assert out == "backing off (recent rejection)"
