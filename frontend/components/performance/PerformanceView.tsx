@@ -59,6 +59,11 @@ interface FanoutRow {
   side: string;
   quantity: string;
   instrument_type: string;
+  // Option contract parts, so the trade table can show the full descriptor
+  // (root alone is ambiguous — e.g. "VG" vs "VG C $14 18 Sep 26").
+  option_expiry: string | null;
+  option_strike: string | null;
+  option_right: string | null;
   order_type: string;
   status: string;
   expected_price: string | null;
@@ -164,6 +169,24 @@ function fmtPrice(p: string | number | null | undefined): string {
   const n = Number(p);
   if (!Number.isFinite(n)) return "—";
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** Expiry as "18 Sep 26" (UTC — the expiry is a calendar date, not a moment). */
+function optionExpiryShort(iso: string): string {
+  const d = new Date(iso.length === 10 ? iso + "T00:00:00Z" : iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const mon = d.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+  return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
+}
+
+/** Full contract descriptor for the Trade column — stock → "META"; option →
+ *  "VG C $14 18 Sep 26". Matches the trader panel and admin fanouts export. */
+function contractLabel(f: FanoutRow): string {
+  if (f.instrument_type !== "option") return f.symbol.toUpperCase();
+  const cp = f.option_right === "call" ? "C" : f.option_right === "put" ? "P" : "";
+  const strike = f.option_strike != null && f.option_strike !== "" ? `$${Number(f.option_strike)}` : "";
+  const exp = f.option_expiry ? optionExpiryShort(f.option_expiry) : "";
+  return [f.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
 }
 
 /** Min / mean / max of broker_lag_ms across a parent's subscriber mirrors,
@@ -1495,7 +1518,7 @@ export function PerformanceView({
                         >
                           ▸
                         </span>
-                        {f.symbol}
+                        {contractLabel(f)}
                       </span>
                     </td>
                     <td className="px-2 md:px-3 py-2 md:py-3">
