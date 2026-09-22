@@ -49,12 +49,14 @@ class _Adapter:
     def __init__(self, raises=False):
         self.replaced = []
         self.cancelled = []
+        self.reqs = []
         self._raises = raises
 
     def replace_order(self, broker_order_id, req):
         if self._raises:
             raise RuntimeError("broker refused")
         self.replaced.append(req.limit_price)
+        self.reqs.append(req)
         return type("R", (), {"broker_order_id": "brk-2"})()
 
     def cancel_order(self, broker_order_id):
@@ -224,3 +226,39 @@ def test_a_skipped_broker_is_not_retried_every_tick(wired):
 
     rp.reprice_one(s["order"].id)
     assert rp.reprice_one(s["order"].id) == "already"
+
+
+# ── the replacement's identity ───────────────────────────────────────────────
+
+def test_the_replacement_gets_its_own_client_order_id(wired, monkeypatch):
+    """Alpaca's replace opens a NEW order, and a client_order_id can only be
+    held by one ACTIVE order. Reusing the id the original is still resting
+    under is answered with 422 "client_order_id must be unique" — the reprice
+    is stamped as attempted and silently never lands."""
+    monkeypatch.setattr(
+        "app.services.order_intent.mark_app_originated", lambda oid: None
+    )
+    st = wired(_Order(limit="2.00"), _Settings())
+    rp.reprice_one(st["order"].id)
+
+    sent = st["adapter"].reqs[0].client_order_id
+    assert sent != str(st["order"].id)
+    uuid.UUID(sent)   # the listener parses it as a UUID
+
+
+def test_the_replacement_is_marked_app_originated_before_the_call(wired, monkeypatch):
+    """The broker echoes client_order_id back on its order stream. Without the
+    marker the listener reads the replacement as an EXTERNAL trade and inserts
+    a duplicate parent plus a second fanout — the doubling bug."""
+    marked: list = []
+    monkeypatch.setattr(
+        "app.services.order_intent.mark_app_originated",
+        lambda oid: marked.append((oid, len(st["adapter"].reqs))),
+    )
+    st = wired(_Order(limit="2.00"), _Settings())
+    rp.reprice_one(st["order"].id)
+
+    assert len(marked) == 1
+    marked_id, replaces_so_far = marked[0]
+    assert replaces_so_far == 0          # marked BEFORE the broker call
+    assert str(marked_id) == st["adapter"].reqs[0].client_order_id

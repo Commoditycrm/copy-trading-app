@@ -203,6 +203,24 @@ def _replace(adapter, order: Order, new_price: Decimal) -> None:
     holds nothing, so it is only used where replace is unavailable.
     """
     from app.brokers.base import BrokerOrderRequest  # noqa: PLC0415
+    from app.services import order_intent  # noqa: PLC0415
+
+    # The replacement needs its OWN client_order_id. Alpaca's replace terminates
+    # the old order and opens a new one, and a client_order_id may only be held
+    # by one ACTIVE order — so reusing str(order.id), which the original is
+    # still resting under, is answered with
+    #   422 client_order_id must be unique
+    # and the reprice never lands. (Brokers that replace in place, like Webull,
+    # keep their original id and ignore this field.)
+    #
+    # Mark the new id app-originated BEFORE the call, for the same reason
+    # api/trades.py does at placement: the broker echoes client_order_id back on
+    # its order stream, and without the marker the listener reads the
+    # replacement as an externally-placed trade and inserts a duplicate parent
+    # plus a second fanout. The listener only checks the marker, so this id does
+    # not have to belong to an Order row.
+    new_coid = uuid.uuid4()
+    order_intent.mark_app_originated(new_coid)
 
     req = BrokerOrderRequest(
         instrument_type=order.instrument_type,
@@ -214,7 +232,7 @@ def _replace(adapter, order: Order, new_price: Decimal) -> None:
         option_expiry=order.option_expiry,
         option_strike=order.option_strike,
         option_right=order.option_right,
-        client_order_id=str(order.id),
+        client_order_id=str(new_coid),
     )
     # reprice_one() has already established the broker can replace atomically.
     # There is deliberately no cancel-then-place fallback: if the place failed
