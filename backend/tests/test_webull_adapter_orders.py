@@ -715,3 +715,58 @@ if __name__ == "__main__":
             fn()
             print(f"PASS  {name}")
     print("\nAll webull-adapter order tests passed.")
+
+
+# ── a protective stop has to outlive the session ─────────────────────────────
+
+def test_a_stop_is_gtc_not_day():
+    """A DAY stop is cancelled at 16:00 ET, leaving the position unprotected
+    overnight and pre-market — exactly when a gap happens. A stop exists to
+    protect until it triggers, which may be days away."""
+    a = _adapter()
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="AAPL", side=OrderSide.SELL,
+        order_type=OrderType.STOP, quantity=Decimal("2"), stop_price=Decimal("1.50"),
+    )
+    d = a._build_stock_order(req, "c-stop")
+    assert d["order_type"] == "STOP_LOSS"
+    assert d["time_in_force"] == "GTC"
+
+
+def test_an_option_stop_is_gtc_and_closes():
+    a = _adapter()
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION, symbol="SPY", side=OrderSide.SELL,
+        order_type=OrderType.STOP, quantity=Decimal("2"), stop_price=Decimal("1.50"),
+        option_expiry=date(2026, 9, 25), option_strike=Decimal("771"),
+        option_right=OptionRight.CALL, is_closing=True,
+    )
+    d = a._build_option_order(req, "c-optstop")
+    assert d["order_type"] == "STOP_LOSS"
+    assert d["time_in_force"] == "GTC"
+    assert d["position_intent"] == "SELL_TO_CLOSE"
+    assert d["stop_price"] == "1.50"
+
+
+def test_a_stop_limit_is_also_gtc():
+    a = _adapter()
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="AAPL", side=OrderSide.SELL,
+        order_type=OrderType.STOP_LIMIT, quantity=Decimal("2"),
+        stop_price=Decimal("1.50"), limit_price=Decimal("1.45"),
+    )
+    assert a._build_stock_order(req, "c-sl")["time_in_force"] == "GTC"
+
+
+def test_ordinary_orders_still_expire_with_the_session():
+    """Only stops get GTC. A stale entry must not sit working into the next day."""
+    a = _adapter()
+    for ot, extra in (
+        (OrderType.MARKET, {}),
+        (OrderType.LIMIT, {"limit_price": Decimal("1.50")}),
+    ):
+        req = BrokerOrderRequest(
+            instrument_type=InstrumentType.STOCK, symbol="AAPL", side=OrderSide.BUY,
+            order_type=ot, quantity=Decimal("1"), **extra,
+        )
+        assert a._build_stock_order(req, "c")["time_in_force"] == "DAY", ot

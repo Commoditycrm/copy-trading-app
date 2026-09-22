@@ -191,9 +191,16 @@ class AlpacaAdapter(BrokerAdapter):
             "symbol": sym,
             "qty": qty,
             "side": side,
-            # Complex exits may not fire same-day, so they require GTC.
-            # Plain orders keep DAY (cancel at session close).
-            "time_in_force": TimeInForce.GTC if is_advanced else TimeInForce.DAY,
+            # Complex exits may not fire same-day, so they require GTC. A STOP
+            # is the same case: it exists to protect a position until it is
+            # triggered, and a DAY stop quietly dies at 16:00 ET — leaving the
+            # position unprotected overnight and pre-market, which is precisely
+            # when a gap happens. Plain market/limit orders keep DAY.
+            "time_in_force": (
+                TimeInForce.GTC
+                if (is_advanced or req.order_type in (OrderType.STOP, OrderType.STOP_LIMIT))
+                else TimeInForce.DAY
+            ),
             "client_order_id": req.client_order_id,
         }
         if is_advanced:
