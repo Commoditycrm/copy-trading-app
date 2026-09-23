@@ -40,6 +40,7 @@ class _Settings:
     def __init__(self, live=True):
         self.discord_quantity_multiplier = 1
         self.discord_max_per_contract = None
+        self.discord_max_per_order = None
         self.discord_live_trading = live
         self.discord_trail_percent = Decimal("20")
         self.discord_trim_profit_gate_pct = Decimal("20")
