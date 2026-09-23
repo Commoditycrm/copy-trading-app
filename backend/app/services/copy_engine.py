@@ -514,7 +514,7 @@ def _marketable_stock_limit(adapter: Any, req: BrokerOrderRequest) -> Decimal | 
     return limit if limit > 0 else None
 
 
-def _needs_extended_hours_limit(adapter: Any) -> bool:
+def needs_extended_hours_limit(adapter: Any) -> bool:
     """True when we're in pre/post-market right now AND this broker won't trade a
     plain MARKET order then — so the mirror must be routed as an explicitly
     flagged marketable LIMIT or it simply queues until 09:30.
@@ -732,7 +732,7 @@ def _to_immediate_close(
         # of that stuck BUY was wash-trade-rejected. Route a marketable extended-
         # hours limit so it fills now. Regular hours — and aggregator-routed
         # accounts, which trade extended hours natively — keep MARKET.
-        if _needs_extended_hours_limit(adapter):
+        if needs_extended_hours_limit(adapter):
             px = _ext_hours_limit_price(adapter, req, trader_ref_price)
             if px is not None:
                 return replace(
@@ -920,7 +920,7 @@ def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderRe
         and not req.extended_hours
         and req.take_profit_price is None
         and req.stop_loss_price is None
-        and _needs_extended_hours_limit(item.adapter)
+        and needs_extended_hours_limit(item.adapter)
     ):
         req = replace(req, extended_hours=True)
         item.request = req
