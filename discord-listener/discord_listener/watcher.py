@@ -49,10 +49,14 @@ class ChannelWatcher:
         client: BackendClient,
         config: Config,
         assignment: dict[str, Any],
+        connect_gate: "asyncio.Semaphore | None" = None,
     ) -> None:
         self._browser = browser
         self._client = client
         self._config = config
+        # Shared across every watcher, so attaches queue instead of colliding.
+        # None means "no limit" — used by tests that drive one watcher.
+        self._connect_gate = connect_gate
 
         self.source_id: str = str(assignment["source_id"])
         self.channel_id: str = str(assignment["channel_id"])
@@ -167,6 +171,20 @@ class ChannelWatcher:
         return base * (0.5 + random.random() / 2)
 
     async def _connect(self) -> None:
+        """Attach to the channel. Serialised against other watchers.
+
+        The gate is held for the WHOLE attach — context, page load, observer —
+        because the cost is the Discord client rendering, not any one step. A
+        reconnect queues behind a first attach for the same reason: a channel
+        flapping must not starve the others of the CPU they need to come up.
+        """
+        if self._connect_gate is None:
+            await self._connect_locked()
+            return
+        async with self._connect_gate:
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
         await self._close_context()
         self._context = await self._browser.new_context(
             storage_state=self._storage_state,
