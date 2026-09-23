@@ -632,3 +632,100 @@ def test_entries_are_unaffected_by_the_session(monkeypatch):
     r = ex.resolve(None, _User(), _signal())
     assert r.payload.order_type.value == "limit"
     assert r.payload.limit_price == Decimal("1.90")      # the alert's own price
+
+
+# ── max per ORDER: a ceiling on the whole order's value ──────────────────────
+
+def test_an_order_inside_the_ceiling_goes_through(monkeypatch):
+    """5 contracts at $1.90 x 100 = $950 of order value, under $1,000."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="5"),
+        ex.Sizing(max_per_order=Decimal("1000")),
+    )
+    assert r.payload.quantity == Decimal("5")
+
+
+def test_an_order_at_exactly_the_ceiling_goes_through(monkeypatch):
+    """The rule is "greater than the limit doesn't place" — so the boundary
+    itself trades. $1.90 x 100 x 5 = $950."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="5"),
+        ex.Sizing(max_per_order=Decimal("950")),
+    )
+    assert r.payload.quantity == Decimal("5")
+
+
+def test_an_order_over_the_ceiling_is_skipped_not_trimmed(monkeypatch):
+    """Same choice as the per-contract cap: a ceiling says how much the trader
+    will put into ONE alert, not a budget to spend down. Trimming would take
+    the trade anyway at a size they never chose."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="max per order"):
+        ex.resolve(
+            None, _User(), _signal(quantity="6"),   # $1.90 x 100 x 6 = $1,140
+            ex.Sizing(max_per_order=Decimal("1000")),
+        )
+
+
+def test_the_multiplier_counts_toward_the_order_ceiling(monkeypatch):
+    """The cap is on what actually gets PLACED, so it sees the multiplied size —
+    otherwise a 10x multiplier would spend 10x the stated ceiling."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="max per order"):
+        ex.resolve(
+            None, _User(), _signal(quantity="1"),
+            ex.Sizing(multiplier=10, max_per_order=Decimal("1000")),
+        )
+
+
+def test_no_order_ceiling_means_no_check(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(None, _User(), _signal(quantity="50"), ex.Sizing(max_per_order=None))
+    assert r.payload.quantity == Decimal("50")
+
+
+# ── the two ceilings are independent ─────────────────────────────────────────
+
+def test_a_cheap_contract_can_still_be_too_big_an_order(monkeypatch):
+    """The case the per-contract cap cannot express: each contract is $190,
+    well under a $500 per-contract ceiling, but ten of them is a $1,900 order."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="max per order"):
+        ex.resolve(
+            None, _User(), _signal(quantity="10"),
+            ex.Sizing(max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+        )
+
+
+def test_a_small_order_of_an_expensive_contract_still_fails_per_contract(monkeypatch):
+    """The mirror image: ONE contract at $900 is a $900 order, inside a $1,000
+    order ceiling, but above a $500 per-contract ceiling."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="max per contract"):
+        ex.resolve(
+            None, _User(), _signal(limit_price="9.00", quantity="1"),
+            ex.Sizing(max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+        )
+
+
+def test_both_ceilings_set_and_both_satisfied(monkeypatch):
+    """Neither limit reads the other's value; passing both places the order."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="2"),        # $190 each, $380 total
+        ex.Sizing(max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+    )
+    assert r.payload.quantity == Decimal("2")
+
+
+def test_a_close_is_never_refused_by_the_order_ceiling(monkeypatch):
+    """You must always be able to exit a position you already hold, whatever
+    it is now worth — the same rule the per-contract cap follows."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos()]))
+    r = ex.resolve(
+        None, _User(), _signal(action="SELL", limit_price="2.50"),
+        ex.Sizing(max_per_order=Decimal("10")),   # far below the position's value
+    )
+    assert r.is_closing and r.payload.quantity > 0

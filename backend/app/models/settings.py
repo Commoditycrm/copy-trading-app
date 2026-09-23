@@ -101,6 +101,17 @@ class TraderSettings(Base, TimestampMixin):
         Numeric(20, 2), nullable=True,
     )
 
+    # Ceiling on the WHOLE order's value (quantity x price, x100 for options),
+    # where discord_max_per_contract caps what ONE contract may cost. The two
+    # answer different questions and are deliberately independent: "this
+    # contract is too rich for me" is a judgement about the instrument, "this
+    # order is too big for me" is a judgement about exposure. An alert can
+    # easily pass one and fail the other — ten contracts at $50 is a cheap
+    # contract and a $500 order. NULL = no ceiling.
+    discord_max_per_order: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+
     # Trail used when a Discord position's stop is armed by its FIRST sell
     # alert: a positive percent retrace from the best price seen (20 = exit if
     # it gives back 20% of the peak).

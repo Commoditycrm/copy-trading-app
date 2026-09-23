@@ -55,6 +55,7 @@ class Sizing:
 
     multiplier: int = 1
     max_per_contract: Decimal | None = None
+    max_per_order: Decimal | None = None
 
 
 @dataclass
@@ -212,7 +213,13 @@ def resolve(
 
     # The dollar cap needs the price, so it's applied once both are known.
     if not is_closing:
+        # Independent ceilings, checked in their own right: one is about what a
+        # contract costs, the other about what the order costs. An order can
+        # pass either and fail the other, and neither reads the other's value.
         quantity = _apply_max_per_contract(
+            quantity, limit_price, is_option, sizing, resolutions
+        )
+        quantity = _apply_max_per_order(
             quantity, limit_price, is_option, sizing, resolutions
         )
 
@@ -485,6 +492,43 @@ def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) ->
         raise ExecutionRefused(
             f"A single contract is worth ${per_contract:.2f}, above your "
             f"${cap:.2f} max per contract."
+        )
+    return qty
+
+
+def order_value(qty: Decimal, limit_price: Decimal, is_option: bool) -> Decimal:
+    """What this order costs: quantity x price, x100 for an option contract."""
+    value = qty * limit_price
+    return value * Decimal(100) if is_option else value
+
+
+def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> Decimal:
+    """Skip an entry whose TOTAL cost is above the trader's ceiling.
+
+    Distinct from _apply_max_per_contract, and deliberately so: that one asks
+    what a single contract costs, this one asks what the whole order costs. Ten
+    contracts at $50 is a cheap contract and a $500 order, so an alert can pass
+    either check and fail the other. Neither reads the other's value.
+
+    Skipped rather than trimmed, for the same reason as the per-contract cap: a
+    ceiling like this says how much the trader is willing to put into ONE alert,
+    not a budget to spend down. Trimming would take the trade anyway at a size
+    they never chose.
+
+    Applies to stocks as well as options — an order's value is an order's value
+    — and never to a close: you must always be able to exit what you hold.
+    """
+    cap = sizing.max_per_order
+    if cap is None or cap <= 0 or limit_price is None or limit_price <= 0:
+        return qty
+    if qty is None or qty <= 0:
+        return qty
+
+    total = order_value(Decimal(str(qty)), limit_price, is_option)
+    if total > cap:
+        raise ExecutionRefused(
+            f"This order is worth ${total:.2f}, above your "
+            f"${cap:.2f} max per order."
         )
     return qty
 
