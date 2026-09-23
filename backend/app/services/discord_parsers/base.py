@@ -105,6 +105,12 @@ class TradeSignal:
     limit_price_unspecified: bool = False
     # The card explicitly said the position is now flat.
     position_closed: bool = False
+    # The author flagged this entry as a smaller-conviction one ("light", "not
+    # heavy"). Set from the message text rather than by any one parser, because
+    # the phrasing is the author's habit and appears in every channel format.
+    # Acted on in discord_execution._resolve_quantity: the entry is taken at
+    # HALF the size it otherwise would be.
+    half_size: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -147,6 +153,7 @@ class TradeSignal:
                 str(self.original_quantity) if self.original_quantity is not None else None
             ),
             "position_closed": self.position_closed,
+            "half_size": self.half_size,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,
