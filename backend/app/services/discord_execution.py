@@ -27,7 +27,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -461,11 +461,26 @@ def _resolve_quantity(
     # Scale the ENTRY. Closes returned above and are never multiplied — an exit
     # sells what is held, whatever the alert or the multiplier say.
     multiplier = max(1, int(sizing.multiplier or 1))
-    if multiplier > 1:
-        scaled = qty * multiplier
-        resolutions["quantity"] = f"{scaled} ({qty} x {multiplier} multiplier)"
-        return scaled
-    return qty
+    scaled = qty * multiplier if multiplier > 1 else qty
+    note = f"{qty} x {multiplier} multiplier" if multiplier > 1 else None
+
+    # The author called this one "light" / "not heavy": take half the size we
+    # otherwise would. Applied AFTER the multiplier, so it halves what would
+    # actually have been placed — a size of 4 becomes 2, which is what the
+    # instruction means. Halving the alert's own quantity first would let the
+    # multiplier scale it straight back up.
+    if signal.get("half_size"):
+        halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_FLOOR)
+        # Never round down to nothing. You cannot buy half a contract, and
+        # dropping the trade entirely is not what "smaller" asks for — so a
+        # single contract stays a single contract.
+        halved = max(halved, Decimal(1))
+        note = f"{note} then halved (light)" if note else f"half of {scaled} (light)"
+        scaled = halved
+
+    if note:
+        resolutions["quantity"] = f"{scaled} ({note})"
+    return scaled
 
 
 def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) -> Decimal:

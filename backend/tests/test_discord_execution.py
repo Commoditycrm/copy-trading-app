@@ -729,3 +729,77 @@ def test_a_close_is_never_refused_by_the_order_ceiling(monkeypatch):
         ex.Sizing(max_per_order=Decimal("10")),   # far below the position's value
     )
     assert r.is_closing and r.payload.quantity > 0
+
+
+# ── "light" / "not heavy": take half the size ────────────────────────────────
+
+def test_a_light_entry_is_halved(monkeypatch):
+    """The trader's sizing is 4, the author called it light, so 2 go on."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1", half_size=True),
+        ex.Sizing(multiplier=4),
+    )
+    assert r.payload.quantity == Decimal("2")
+
+
+def test_the_same_alert_without_the_flag_is_full_size(monkeypatch):
+    """Pins that the halving is what changed, not the sizing."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1"), ex.Sizing(multiplier=4),
+    )
+    assert r.payload.quantity == Decimal("4")
+
+
+def test_halving_happens_after_the_multiplier(monkeypatch):
+    """Halving the ALERT's quantity first would let the multiplier scale it
+    straight back up — 1 -> 1 -> x4 = 4, the full size the author said not to
+    take. The instruction is about what actually gets placed."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="3", half_size=True),
+        ex.Sizing(multiplier=4),           # 3 x 4 = 12, halved = 6
+    )
+    assert r.payload.quantity == Decimal("6")
+
+
+def test_a_single_contract_stays_one(monkeypatch):
+    """You cannot buy half a contract, and dropping the trade is not what
+    "smaller" asks for — so the floor is 1, never 0."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1", half_size=True), ex.Sizing(),
+    )
+    assert r.payload.quantity == Decimal("1")
+
+
+def test_an_odd_size_rounds_down(monkeypatch):
+    """5 -> 2, not 3. "Light" asks for less risk, so the rounding goes that way."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="5", half_size=True), ex.Sizing(),
+    )
+    assert r.payload.quantity == Decimal("2")
+
+
+def test_the_reason_is_recorded_for_the_audit_trail(monkeypatch):
+    """A halved order must be explainable later — otherwise it looks like the
+    multiplier silently misfired."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1", half_size=True),
+        ex.Sizing(multiplier=4),
+    )
+    assert "light" in r.resolutions["quantity"]
+
+
+def test_a_close_is_never_halved(monkeypatch):
+    """An exit sells the whole position held, whatever the alert says. Halving
+    one would strand the remainder."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos(qty=Decimal("4"))]))
+    r = ex.resolve(
+        None, _User(), _signal(action="SELL", limit_price="2.50", half_size=True),
+        ex.Sizing(),
+    )
+    assert r.is_closing and r.payload.quantity == Decimal("4")
