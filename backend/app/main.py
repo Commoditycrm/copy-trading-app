@@ -299,6 +299,9 @@ def create_app() -> FastAPI:
             try:
                 from app.services import webull_subscriber_reconciler
                 webull_subscriber_reconciler.start_webull_subscriber_reconciler()
+                # Optional sub-second fills via a per-subscriber gRPC stream that
+                # triggers the reconcile above. No-op while the flag is off.
+                webull_subscriber_reconciler.start_webull_subscriber_streams()
             except Exception:  # noqa: BLE001
                 log.exception("failed to start webull subscriber reconciler")
 
@@ -376,6 +379,7 @@ def create_app() -> FastAPI:
         try:
             from app.services import webull_subscriber_reconciler
             await webull_subscriber_reconciler.stop_webull_subscriber_reconciler()
+            await webull_subscriber_reconciler.stop_webull_subscriber_streams()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop webull subscriber reconciler cleanly")
         try:
