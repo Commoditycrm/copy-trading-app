@@ -135,7 +135,7 @@ def test_the_threshold_is_strict():
 
 def test_the_thresholds_are_configurable():
     cfg = guards.TrimConfig(
-        profit_gate_pct=Decimal("5"), stop_pct=Decimal("10"),
+        trim1=guards.RungConfig(Decimal("5"), Decimal("10")),
         price_threshold=Decimal("5.00"), trail_amount=Decimal("1.00"),
     )
     g = _guard(entry="2.00")
@@ -284,3 +284,109 @@ def test_a_stop_exactly_at_the_mark_is_not_armed():
     """Equal counts as breached — the enforcer exits at <= stop."""
     g = _guard(entry="2.00", rung=1)
     assert guards.plan_exit(g, Decimal(4), Decimal("2.00"), CFG).new_stop_price is None
+
+
+# ── each rung is configured independently ────────────────────────────────────
+
+def _cfg(t1=("20", "25"), t2=("0", "0"), t3=("0", "0")):
+    return guards.TrimConfig(
+        trim1=guards.RungConfig(Decimal(t1[0]), Decimal(t1[1])),
+        trim2=guards.RungConfig(Decimal(t2[0]), Decimal(t2[1])),
+        trim3=guards.RungConfig(Decimal(t3[0]), Decimal(t3[1])),
+        # Cheap contract, so every rung goes to market and the stop is the only
+        # thing under test.
+        price_threshold=Decimal("100"),
+    )
+
+
+def test_each_trim_uses_its_own_gate():
+    """Up 12%: over the 2nd trim's 10% gate, under the 1st trim's 20% one. The
+    same position and the same price, two different answers."""
+    cfg = _cfg(t1=("20", "25"), t2=("10", "0"))
+
+    first = guards.plan_exit(_guard(entry="2.00", rung=0), Decimal(4), Decimal("2.24"), cfg)
+    assert first.sell_qty == Decimal(0)         # gated
+
+    second = guards.plan_exit(_guard(entry="2.00", rung=1), Decimal(4), Decimal("2.24"), cfg)
+    assert second.sell_qty == Decimal(2)        # not gated
+
+
+def test_each_trim_uses_its_own_stop():
+    """Three rungs, three stop distances off the same $2.00 entry."""
+    cfg = _cfg(t1=("0", "25"), t2=("0", "10"), t3=("0", "50"))
+
+    r1 = guards.plan_exit(_guard(entry="2.00", rung=0), Decimal(8), Decimal("3.00"), cfg)
+    assert r1.new_stop_price == Decimal("1.50")     # 25% below
+
+    r2 = guards.plan_exit(_guard(entry="2.00", rung=1), Decimal(8), Decimal("3.00"), cfg)
+    assert r2.new_stop_price == Decimal("1.80")     # 10% below
+
+
+def test_the_third_trims_gate_can_hold_the_position():
+    """Gated, so nothing sells — and the position keeps its stop, at the THIRD
+    trim's distance."""
+    cfg = _cfg(t3=("50", "10"))
+    plan = guards.plan_exit(_guard(entry="2.00", rung=2), Decimal(4), Decimal("2.20"), cfg)
+
+    assert plan.rung == 3
+    assert plan.sell_qty == Decimal(0)
+    assert plan.new_stop_price == Decimal("1.80")   # 10% below entry
+    assert plan.retire is False                      # still holding
+
+
+def test_the_third_trim_exits_everything_once_its_gate_opens():
+    cfg = _cfg(t3=("50", "10"))
+    plan = guards.plan_exit(_guard(entry="2.00", rung=2), Decimal(4), Decimal("3.20"), cfg)
+
+    assert plan.sell_qty == Decimal(4)
+    assert plan.new_stop_price is None               # nothing left to protect
+
+
+def test_changing_one_trim_does_not_move_the_others():
+    """The independence requirement, stated directly."""
+    base = _cfg()
+    changed = _cfg(t1=("90", "90"))
+
+    for rung, held in ((1, 4), (2, 4)):
+        a = guards.plan_exit(_guard(entry="2.00", rung=rung - 1), Decimal(held),
+                             Decimal("3.00"), base)
+        b = guards.plan_exit(_guard(entry="2.00", rung=rung - 1), Decimal(held),
+                             Decimal("3.00"), changed)
+        if rung == 1:
+            assert a.sell_qty != b.sell_qty          # the one we changed
+        else:
+            assert a.sell_qty == b.sell_qty
+            assert a.new_stop_price == b.new_stop_price
+
+
+def test_a_zero_gate_is_no_minimum_not_break_even():
+    """An UNDERWATER position must still trim. Reading a 0 gate as a threshold
+    would make `gain < 0` refuse exactly the exits a losing position needs —
+    and would silently change the 2nd and 3rd trims, which never had a gate."""
+    plan = guards.plan_exit(
+        _guard(entry="2.00", rung=1), Decimal(4), Decimal("1.50"), _cfg()
+    )
+    assert plan.sell_qty == Decimal(2)
+
+
+def test_an_ungated_rung_does_not_need_a_live_mark():
+    """Only a gated rung has to measure profit. Requiring a mark everywhere
+    would block exits that used to go through."""
+    plan = guards.plan_exit(_guard(entry="2.00", rung=1), Decimal(4), None, _cfg())
+    assert plan.sell_qty == Decimal(2)
+
+
+def test_a_gated_rung_without_a_mark_sells_nothing():
+    plan = guards.plan_exit(
+        _guard(entry="2.00", rung=1), Decimal(4), None, _cfg(t2=("10", "0"))
+    )
+    assert plan.sell_qty == Decimal(0)
+    assert "cannot measure profit" in plan.note
+
+
+def test_rungs_past_the_third_reuse_the_thirds_settings():
+    """The ladder has three steps; a fourth alert is a repeat of the last."""
+    cfg = _cfg(t3=("50", "10"))
+    plan = guards.plan_exit(_guard(entry="2.00", rung=3), Decimal(4), Decimal("2.20"), cfg)
+    assert plan.rung == 4
+    assert plan.sell_qty == Decimal(0)               # the 3rd trim's gate held
