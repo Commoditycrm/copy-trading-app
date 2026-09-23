@@ -1281,7 +1281,16 @@ class WebullAdapter(BrokerAdapter):
             "client_order_id": coid,
             "combo_type": "NORMAL",
             "symbol": req.symbol.upper(),
-            "instrument_type": "STOCK",
+            # Webull's own name for an equity. Their documented values are
+            # [EQUITY, OPTION, FUTURES, CRYPTO, EVENT] — "STOCK" is OUR enum's
+            # name for it and is refused outright:
+            #   HTTP 417 INVALID_PARAMETER "Instrument type invalid."
+            # Options were unaffected because their leg already says OPTION,
+            # which is why every Discord option order worked while no stock
+            # order ever placed. Live 2026-09-23: a NIO stock close from the
+            # positions table was rejected while the same sell, entered in the
+            # Webull app, filled.
+            "instrument_type": "EQUITY",
             "market": "US",
             "side": "BUY" if req.side == OrderSide.BUY else "SELL",
             "order_type": self._ORDER_TYPE_MAP.get(req.order_type, "MARKET"),
