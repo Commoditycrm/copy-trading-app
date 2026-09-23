@@ -70,3 +70,133 @@ def test_the_bracket_legs_are_dropped_when_the_broker_cannot_hold_them():
     o.stop_loss_price = Decimal("1")
     assert broker_request_for(o, False).take_profit_price is None
     assert broker_request_for(o, True).take_profit_price == Decimal("5")
+
+
+# ── extended hours: only outside the regular session ─────────────────────────
+
+class _ExtAdapter:
+    """An adapter that needs the flag to trade pre/post-market (Alpaca, Webull)."""
+    requires_extended_hours_limit = True
+
+
+class _PlainAdapter:
+    """One that routes extended hours itself (SnapTrade)."""
+    requires_extended_hours_limit = False
+
+
+def _ext(monkeypatch, *, in_extended: bool, adapter=None):
+    from app.services import copy_engine, market_hours
+    monkeypatch.setattr(market_hours, "in_extended_hours", lambda *a, **k: in_extended)
+    return copy_engine.needs_extended_hours_limit(adapter or _ExtAdapter())
+
+
+def test_the_flag_is_off_during_the_regular_session(monkeypatch):
+    """The guarantee that matters: ordinary market-hours trading and copying
+    behave exactly as before, because the rule simply does not fire."""
+    assert _ext(monkeypatch, in_extended=False) is False
+
+
+def test_the_flag_is_on_in_pre_and_post_market(monkeypatch):
+    assert _ext(monkeypatch, in_extended=True) is True
+
+
+def test_a_broker_that_routes_itself_never_gets_the_flag(monkeypatch):
+    """SnapTrade trades extended hours natively; flagging it would only make
+    the order miss."""
+    assert _ext(monkeypatch, in_extended=True, adapter=_PlainAdapter()) is False
+
+
+def test_a_regular_hours_order_carries_no_flag():
+    assert broker_request_for(_Order(), False).extended_hours is False
+
+
+def test_an_extended_hours_order_carries_the_flag():
+    assert broker_request_for(_Order(), False, extended_hours=True).extended_hours is True
+
+
+def test_the_trader_path_uses_the_same_rule_as_the_copy_path():
+    """The two drifting is what produced a subscriber's mirror filling
+    pre-market while the trader they copy sat unfilled at the same price."""
+    import inspect
+
+    from app.api.trades import _place_trader_order
+
+    src = inspect.getsource(_place_trader_order)
+    assert "needs_extended_hours_limit(adapter)" in src
+
+
+# ── options never trade extended hours ───────────────────────────────────────
+
+def test_an_option_order_never_claims_extended_hours():
+    """US options do not trade outside the regular session, so the request must
+    not say they might. The copy path gates on instrument_type == STOCK; the
+    trader path has to as well or the two disagree."""
+    import inspect
+
+    from app.api.trades import _place_trader_order
+
+    src = inspect.getsource(_place_trader_order)
+    gate = src[src.index("extended_hours=("):]
+    assert "InstrumentType.OPTION" in gate[:300]
+
+
+def test_the_alpaca_adapter_refuses_to_send_it_on_an_option():
+    """Enforced at the adapter too: it is a fact about the market, not a policy
+    a caller should be able to override by passing the flag anyway."""
+    from decimal import Decimal as D
+
+    from app.brokers.alpaca import AlpacaAdapter
+    from app.brokers.base import BrokerOrderRequest
+    from app.models.order import InstrumentType as IT, OptionRight as OR, OrderSide, OrderType
+
+    sent = {}
+
+    class _Client:
+        def submit_order(self, order_data=None, **kw):
+            sent["req"] = order_data
+            raise RuntimeError("stop before the network")
+
+    a = AlpacaAdapter.__new__(AlpacaAdapter)
+    a._c = lambda: _Client()
+
+    req = BrokerOrderRequest(
+        instrument_type=IT.OPTION, symbol="AAPL", side=OrderSide.SELL,
+        order_type=OrderType.LIMIT, quantity=D(1), limit_price=D("2.50"),
+        option_expiry=date(2026, 12, 18), option_strike=D("250"),
+        option_right=OR.CALL, extended_hours=True,      # caller insists
+    )
+    try:
+        a.place_order(req)
+    except RuntimeError:
+        pass
+    assert getattr(sent["req"], "extended_hours", None) is not True
+
+
+def test_a_stock_order_still_sends_it():
+    """The guard must not have disabled the fix it was protecting."""
+    from decimal import Decimal as D
+
+    from app.brokers.alpaca import AlpacaAdapter
+    from app.brokers.base import BrokerOrderRequest
+    from app.models.order import InstrumentType as IT, OrderSide, OrderType
+
+    sent = {}
+
+    class _Client:
+        def submit_order(self, order_data=None, **kw):
+            sent["req"] = order_data
+            raise RuntimeError("stop before the network")
+
+    a = AlpacaAdapter.__new__(AlpacaAdapter)
+    a._c = lambda: _Client()
+
+    req = BrokerOrderRequest(
+        instrument_type=IT.STOCK, symbol="AAPL", side=OrderSide.SELL,
+        order_type=OrderType.LIMIT, quantity=D(1), limit_price=D("338"),
+        extended_hours=True,
+    )
+    try:
+        a.place_order(req)
+    except RuntimeError:
+        pass
+    assert sent["req"].extended_hours is True
