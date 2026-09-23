@@ -55,6 +55,10 @@ class ListenerRunner:
         # throwaway browser context and disposes of itself when it finishes.
         self._logins: dict[str, LoginWorker] = {}
         self._shutdown = asyncio.Event()
+        # Every watcher attaches through this, so channels come up one at a
+        # time instead of all rendering a Discord client at once. See
+        # Config.connect_concurrency for why that mattered in production.
+        self._connect_gate = asyncio.Semaphore(max(1, config.connect_concurrency))
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
@@ -124,7 +128,10 @@ class ListenerRunner:
         for source_id, assignment in wanted.items():
             if source_id in self._watchers:
                 continue
-            watcher = ChannelWatcher(browser, self._client, self._config, assignment)
+            watcher = ChannelWatcher(
+                browser, self._client, self._config, assignment,
+                connect_gate=self._connect_gate,
+            )
             self._watchers[source_id] = watcher
             try:
                 await watcher.start()
