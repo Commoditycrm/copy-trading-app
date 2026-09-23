@@ -642,6 +642,7 @@ def get_discord_settings(
         live_trading=bool(ts and ts.discord_live_trading),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
+        max_per_order=_plain(ts.discord_max_per_order) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
@@ -689,6 +690,18 @@ def update_discord_settings(
             if value <= 0:
                 raise HTTPException(400, "max_per_contract must be positive")
             ts.discord_max_per_contract = value
+    if payload.max_per_order is not None:
+        raw = payload.max_per_order.strip()
+        if not raw:
+            ts.discord_max_per_order = None          # cleared
+        else:
+            try:
+                value = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, "invalid_max_per_order")
+            if value <= 0:
+                raise HTTPException(400, "max_per_order must be positive")
+            ts.discord_max_per_order = value
     if payload.trail_percent is not None:
         try:
             trail = Decimal(payload.trail_percent.strip())
@@ -737,6 +750,7 @@ def update_discord_settings(
         live_trading=bool(ts.discord_live_trading),
         quantity_multiplier=ts.discord_quantity_multiplier or 1,
         max_per_contract=_plain(ts.discord_max_per_contract),
+        max_per_order=_plain(ts.discord_max_per_order),
         trail_percent=_plain(ts.discord_trail_percent) or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
@@ -1028,6 +1042,7 @@ def _execute_signal(
     sizing = discord_execution.Sizing(
         multiplier=(ts_for_sizing.discord_quantity_multiplier if ts_for_sizing else 1) or 1,
         max_per_contract=(ts_for_sizing.discord_max_per_contract if ts_for_sizing else None),
+        max_per_order=(ts_for_sizing.discord_max_per_order if ts_for_sizing else None),
     )
 
     signal = msg.parsed_signal or {}

@@ -411,8 +411,11 @@ class DiscordSettingsOut(BaseModel):
     live_trading: bool = False
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
-    # Dollar ceiling on a single Discord order; null = no ceiling.
+    # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
     max_per_contract: str | None = None
+    # Dollar ceiling on the WHOLE ORDER's value; null = no ceiling. Independent
+    # of max_per_contract — an order can pass either and fail the other.
+    max_per_order: str | None = None
     # Retrace from the peak that closes a position after its first exit alert.
     trail_percent: str = "20"
 
@@ -441,6 +444,7 @@ class DiscordSettingsIn(BaseModel):
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None
+    max_per_order: str | None = None
     # Ladder thresholds. Strings for the same reason the others are: one
     # validation path for "what the user typed", not two.
     trim_profit_gate_pct: str | None = None
