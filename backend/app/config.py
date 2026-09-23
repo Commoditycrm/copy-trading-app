@@ -172,10 +172,6 @@ class Settings(BaseSettings):
     webull_subscriber_sync_idle_interval_s: float = 30.0
     # How long after an order appears/changes the account counts as "hot".
     webull_subscriber_sync_fast_window_s: float = 90.0
-    # Sub-second subscriber fills: run a gRPC event stream per direct-Webull
-    # subscriber that TRIGGERS the fill reconcile on each order event (the poll
-    # stays as the backstop). Default OFF — enable per environment once verified.
-    webull_subscriber_stream_enabled: bool = False
     webull_token_check_duration_seconds: int = 1
     webull_token_check_interval_seconds: int = 2
     # Cache TTLs (seconds) — short by design; invalidated on writes too.

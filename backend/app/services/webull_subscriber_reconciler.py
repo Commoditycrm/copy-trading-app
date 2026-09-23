@@ -146,6 +146,9 @@ def _reconcile_once() -> None:
     which on Webull also matters for the rate limit (its trade endpoints share a
     ~10 req/30s budget per app_key with the trader's own order poller).
     """
+    # Local import avoids any import cycle at module load.
+    from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
+
     fast_s, idle_s, window_s = _intervals()
 
     with SessionLocal() as db:
@@ -208,172 +211,14 @@ def _reconcile_once() -> None:
         _next_due_at.pop(gone, None)
 
     for acct_id in acct_ids:
-        _reconcile_account(acct_id)
-
-
-def _reconcile_account(acct_id: uuid.UUID) -> None:
-    """Refresh one account's open orders from the broker. The single apply path
-    used by BOTH the poll loop and the gRPC stream trigger (below), so a
-    stream-driven refresh and a polled one behave identically. Idempotent."""
-    from app.services.fills_sync import _refresh_open_orders  # noqa: PLC0415
-    try:
-        with SessionLocal() as db:
-            acct = db.get(BrokerAccount, acct_id)
-            if acct is None or acct.connection_status != "connected":
-                return
-            creds = decrypt_json(acct.encrypted_credentials)
-            adapter = adapter_for(acct, creds)
-            _refresh_open_orders(db, acct, adapter)
-            db.commit()
-    except Exception:  # noqa: BLE001
-        log.exception("webull subscriber reconcile: account %s failed", acct_id)
-
-
-# ── Subscriber gRPC event stream (optional, sub-second fills) ────────────────
-# A per-subscriber-account gRPC stream that TRIGGERS _reconcile_account on each
-# order event, so a mirror fill is seen in ~0.2s instead of on the next poll.
-# The poll loop above stays as the backstop; both call the same idempotent
-# _reconcile_account, so a stream-driven refresh and a polled one never conflict.
-# The stream is a low-latency TRIGGER only — it never parses fills itself, so the
-# apply logic stays in one tested place. Gated by webull_subscriber_stream_enabled
-# (default OFF).
-
-_stream_tasks: dict[uuid.UUID, "asyncio.Task"] = {}       # acct_id -> stream task
-_stream_supervisor: "asyncio.Task | None" = None
-# One order emits several events (submit → fill); don't reconcile more than once
-# per this gap — a single refresh already reflects the latest state, and Webull's
-# ~10 req/30s budget is shared with the poll and the copy engine.
-_stream_last_reconcile: dict[uuid.UUID, float] = {}
-_STREAM_DEBOUNCE_S = 1.5
-
-
-def _stream_enabled() -> bool:
-    from app.config import get_settings  # noqa: PLC0415
-    s = get_settings()
-    return bool(s.webull_direct_enabled and s.webull_subscriber_stream_enabled)
-
-
-def _on_subscriber_event(acct_id: uuid.UUID) -> None:
-    """gRPC callback (runs on the stream thread). Debounced trigger of the same
-    reconcile the poll loop runs. _refresh_open_orders self-limits — once the
-    order is terminal there's nothing left to poll, so calls fall to zero."""
-    now = time.monotonic()
-    if now - _stream_last_reconcile.get(acct_id, 0.0) < _STREAM_DEBOUNCE_S:
-        return
-    _stream_last_reconcile[acct_id] = now
-    _reconcile_account(acct_id)
-
-
-async def _run_subscriber_stream(acct_id: uuid.UUID) -> None:
-    """Subscribe to one subscriber account's Webull gRPC event stream; on every
-    event trigger an immediate fill reconcile. Reconnect with backoff — same
-    shape as webull_listener._run_listener."""
-    from app.services.webull_listener import (  # noqa: PLC0415
-        _BACKOFF_INITIAL, _BACKOFF_MAX, _all_account_ids, _build_stoppable_client,
-        _load_creds,
-    )
-    backoff = _BACKOFF_INITIAL
-    client = None
-    while True:
         try:
-            creds = _load_creds(acct_id)
-            if creds is None or not creds.get("app_key"):
-                await asyncio.sleep(30)
-                continue
-            client = await asyncio.to_thread(_build_stoppable_client, creds)
-            client.on_events_message = (
-                lambda et, st, payload, raw, _a=acct_id: _on_subscriber_event(_a)
-            )
-            client.on_log = lambda level, msg, _a=acct_id: log.log(
-                level, "webull-sub-stream[%s] SDK: %s", _a, msg,
-            )
-            account_ids = await asyncio.to_thread(_all_account_ids, creds)
-            log.info("webull-sub-stream[%s] subscribing: %s", acct_id, account_ids)
-            backoff = _BACKOFF_INITIAL
-            # Blocks until the stream ends (stopped, or a non-retryable error).
-            await asyncio.to_thread(client.do_subscribe, account_ids)
-        except asyncio.CancelledError:
-            if client is not None:
-                try:
-                    client.request_stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            log.info("webull-sub-stream[%s] cancelled", acct_id)
-            raise
+            with SessionLocal() as db:
+                acct = db.get(BrokerAccount, acct_id)
+                if acct is None or acct.connection_status != "connected":
+                    continue
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+                _refresh_open_orders(db, acct, adapter)
+                db.commit()
         except Exception:  # noqa: BLE001
-            log.exception("webull-sub-stream[%s] error", acct_id)
-        await asyncio.sleep(backoff)
-        backoff = min(_BACKOFF_MAX, backoff * 2)
-
-
-def _desired_stream_accounts() -> set[uuid.UUID]:
-    """Connected direct-Webull SUBSCRIBER accounts — the same population the poll
-    covers (owner is not a TRADER; traders stream their own fills already)."""
-    with SessionLocal() as db:
-        rows = db.execute(
-            select(BrokerAccount.id)
-            .join(User, User.id == BrokerAccount.user_id)
-            .where(
-                BrokerAccount.broker == BrokerName.WEBULL,
-                BrokerAccount.connection_status == "connected",
-                User.role != UserRole.TRADER,
-            )
-        ).all()
-    return {r[0] for r in rows}
-
-
-async def _supervise_streams() -> None:
-    """Keep a stream task running for each eligible subscriber account: start
-    missing, stop orphaned. Re-checks the flag each pass, so toggling the flag
-    starts/stops streams without a restart. Cheap DB read every 15s, off-loop."""
-    while True:
-        try:
-            desired = (
-                await asyncio.to_thread(_desired_stream_accounts)
-                if _stream_enabled() else set()
-            )
-            loop = asyncio.get_running_loop()
-            for acct_id in desired:
-                t = _stream_tasks.get(acct_id)
-                if t is None or t.done():
-                    _stream_tasks[acct_id] = loop.create_task(_run_subscriber_stream(acct_id))
-            for acct_id in [a for a in _stream_tasks if a not in desired]:
-                t = _stream_tasks.pop(acct_id, None)
-                if t is not None and not t.done():
-                    t.cancel()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            log.exception("webull sub-stream supervisor pass failed")
-        await asyncio.sleep(15)
-
-
-def start_webull_subscriber_streams() -> None:
-    """Spawn the subscriber-stream supervisor. Idempotent, worker-only. Safe to
-    call unconditionally — the supervisor re-checks the flag and runs no streams
-    while it's off."""
-    global _stream_supervisor
-    if _stream_supervisor is not None and not _stream_supervisor.done():
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        log.warning("webull subscriber streams: no running loop; not starting")
-        return
-    _stream_supervisor = loop.create_task(_supervise_streams())
-    log.info("webull subscriber stream supervisor: started (enabled=%s)", _stream_enabled())
-
-
-async def stop_webull_subscriber_streams() -> None:
-    global _stream_supervisor
-    if _stream_supervisor is not None and not _stream_supervisor.done():
-        _stream_supervisor.cancel()
-        try:
-            await _stream_supervisor
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-    _stream_supervisor = None
-    for acct_id in list(_stream_tasks):
-        t = _stream_tasks.pop(acct_id, None)
-        if t is not None and not t.done():
-            t.cancel()
+            log.exception("webull subscriber reconcile: account %s failed", acct_id)
