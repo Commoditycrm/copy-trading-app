@@ -422,6 +422,11 @@ class DiscordSettingsOut(BaseModel):
     # ── the exit ladder ─────────────────────────────────────────────────────
     # All measured against the position's ENTRY price, never the live mark.
     # Minimum gain before the FIRST exit alert trims anything.
+    # Per-trim: each rung's own minimum profit and stop distance.
+    trim2_profit_gate_pct: str = "0"
+    trim2_stop_pct: str = "0"
+    trim3_profit_gate_pct: str = "0"
+    trim3_stop_pct: str = "0"
     trim_profit_gate_pct: str = "20"
     # How far below entry the first trim's stop sits.
     trim_stop_pct: str = "25"
@@ -448,6 +453,10 @@ class DiscordSettingsIn(BaseModel):
     # Ladder thresholds. Strings for the same reason the others are: one
     # validation path for "what the user typed", not two.
     trim_profit_gate_pct: str | None = None
+    trim2_profit_gate_pct: str | None = None
+    trim2_stop_pct: str | None = None
+    trim3_profit_gate_pct: str | None = None
+    trim3_stop_pct: str | None = None
     trim_stop_pct: str | None = None
     trim_price_threshold: str | None = None
     trim_trail_amount: str | None = None
