@@ -825,7 +825,9 @@ def _cancel_conflicting_orders(
     return cancelled
 
 
-def broker_request_for(order: Order, use_native_bracket: bool) -> BrokerOrderRequest:
+def broker_request_for(
+    order: Order, use_native_bracket: bool, extended_hours: bool = False,
+) -> BrokerOrderRequest:
     """Translate a persisted Order into the request we hand the broker.
 
     Extracted so the field list is testable on its own. It was inline, and a
@@ -859,6 +861,18 @@ def broker_request_for(order: Order, use_native_bracket: bool) -> BrokerOrderReq
         # every close from the positions table on those brokers. Alpaca and
         # IBKR ignore the field, so they are unaffected.
         is_closing=order.is_closing,
+        # Pre/post-market, a broker will only TRADE a limit that says so.
+        # Alpaca accepts one without the flag and simply rests it until 09:30;
+        # Webull routes it CORE, which is the same thing. The trader's own
+        # orders never set this while subscriber MIRRORS did, so a pre-market
+        # close sat unfilled next to a subscriber's identical order that filled
+        # (live 2026-09-23: AAPL SELL limit 338 resting with the stock at
+        # 340.52, while the mirror of it filled in the same second).
+        #
+        # False during the regular session and at weekends, so ordinary hours
+        # are untouched. Both adapters ignore it on a MARKET order, which
+        # cannot trade in extended hours anyway.
+        extended_hours=extended_hours,
     )
 
 
@@ -1057,7 +1071,19 @@ def _place_trader_order(
     from app.services import order_intent  # noqa: PLC0415
     order_intent.mark_app_originated(order.id)
 
-    broker_req = broker_request_for(order, use_native_bracket)
+    broker_req = broker_request_for(
+        order, use_native_bracket,
+        # The SAME rule the copy engine applies to mirrors — shared rather than
+        # restated, because the two drifting is exactly what produced a
+        # subscriber filling while the trader they copy did not.
+        # STOCKS only, matching the copy path's own `instrument_type == STOCK`
+        # gate. US options do not trade outside the regular session, so the
+        # request should not claim they might.
+        extended_hours=(
+            order.instrument_type != InstrumentType.OPTION
+            and copy_engine.needs_extended_hours_limit(adapter)
+        ),
+    )
 
     _broker_t0 = time.perf_counter()
     # Auto-resolve wash-trade rejections on CLOSE orders: if the broker rejects

@@ -123,19 +123,19 @@ def test_real_adapters_declare_the_capability_correctly():
 
 def test_needs_ext_hours_limit_is_true_for_webull_in_extended_hours():
     with _ForceExtHours(True):
-        assert ce._needs_extended_hours_limit(_WebullLike()) is True
+        assert ce.needs_extended_hours_limit(_WebullLike()) is True
 
 
 def test_needs_ext_hours_limit_is_false_in_regular_session():
     with _ForceExtHours(False):
-        assert ce._needs_extended_hours_limit(_WebullLike()) is False
+        assert ce.needs_extended_hours_limit(_WebullLike()) is False
 
 
 def test_needs_ext_hours_limit_is_false_for_an_aggregator():
     """SnapTrade's upstream broker trades extended hours itself — re-routing
     would make the order MISS, not fill."""
     with _ForceExtHours(True):
-        assert ce._needs_extended_hours_limit(_AggregatorLike()) is False
+        assert ce.needs_extended_hours_limit(_AggregatorLike()) is False
 
 
 def test_webull_premarket_stock_close_becomes_a_flagged_limit():

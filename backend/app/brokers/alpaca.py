@@ -219,7 +219,16 @@ class AlpacaAdapter(BrokerAdapter):
         # LIMIT with extended_hours=True — never a market or bracket order — so
         # we set it only for a plain limit. Callers convert market→marketable
         # limit before extended hours (see copy_engine._to_immediate_close).
-        if req.extended_hours and req.order_type == OrderType.LIMIT and not is_advanced:
+        # STOCKS only. US options do not trade outside the regular session at
+        # all, so the flag is meaningless on one and Alpaca rejects it. Enforced
+        # here rather than trusted from the caller: it is a fact about the
+        # market, not a policy any caller should be able to override.
+        if (
+            req.extended_hours
+            and req.order_type == OrderType.LIMIT
+            and not is_advanced
+            and req.instrument_type != InstrumentType.OPTION
+        ):
             common["extended_hours"] = True
         # A LIMIT/STOP order with its price missing is unplaceable. Guard
         # explicitly so it fails with a clear, actionable reject reason instead
