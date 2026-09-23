@@ -212,7 +212,28 @@ def reprice_one(order_id: uuid.UUID) -> str:
             "discord reprice: %s unfilled at %s — retrying at %s (+%s%%)",
             order.symbol, original, new_price, pct,
         )
-        return f"repriced to {new_price}"
+
+    # Carry the new price to the subscribers' mirrors, OUTSIDE the session above
+    # so the trader's own row is committed first — the propagation opens its own.
+    #
+    # Nothing else does this. The listeners propagate a trader's modify when they
+    # SEE one on the broker feed, but this reprice is placed by us: the
+    # replacement carries an app-originated marker precisely so the listener
+    # treats it as ours and does not re-detect it. So without an explicit call
+    # the trader chased the price and every subscriber was left resting at the
+    # original limit — the mirror of a trade the trader is no longer trying to
+    # make. Best-effort, and never allowed to turn a successful reprice into a
+    # failure: the trader's own order is already moved.
+    try:
+        from app.services.copy_engine import propagate_modify_to_mirrors  # noqa: PLC0415
+
+        propagate_modify_to_mirrors(order_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "discord reprice: could not carry %s's new price to the mirrors", order_id
+        )
+
+    return f"repriced to {new_price}"
 
 
 def _replace(adapter, order: Order, new_price: Decimal) -> None:
