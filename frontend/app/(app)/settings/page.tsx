@@ -170,7 +170,9 @@ export default function SettingsPage() {
   // a running total). Enforced in the copy engine: an option entry whose
   // contract value exceeds this is skipped.
   const [maxContractInput, setMaxContractInput] = useState("");
+  const [maxOrderInput, setMaxOrderInput] = useState("");
   const [maxContractBusy, setMaxContractBusy] = useState(false);
+  const [maxOrderBusy, setMaxOrderBusy] = useState(false);
   // Max-account-pct-per-day is enforced server-side by pnl_poller.
   // `equity` comes in on every pnl.tick event so the panel can render
   // the dynamic dollar threshold (equity × pct/100). Null until the
@@ -263,6 +265,7 @@ export default function SettingsPage() {
         // whichever column is set (dollar wins, else percent, else "%").
         syncLimitInputs(s);
         setMaxContractInput(s.max_per_contract ?? "");
+        setMaxOrderInput(s.max_per_order ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setPosTpInput(s.position_tp_pct ?? "");
         setPosSlInput(s.position_sl_pct ?? "");
@@ -416,6 +419,7 @@ export default function SettingsPage() {
         daily_loss_limit_pct: e.daily_loss_limit_pct ?? null,
         daily_profit_limit_pct: e.daily_profit_limit_pct ?? null,
         max_per_contract: e.max_per_contract ?? null,
+        max_per_order: e.max_per_order ?? null,
         max_account_pct_per_day: e.max_account_pct_per_day ?? null,
         max_account_usd_per_day: e.max_account_usd_per_day ?? null,
         auto_liquidation_limit: e.auto_liquidation_limit ?? null,
@@ -595,6 +599,25 @@ export default function SettingsPage() {
       setProfitBusy(false);
     }
   }
+  async function saveMaxOrder() {
+    if (blockZeroLimit(maxOrderInput, "Max per order")) return;
+    setMaxOrderBusy(true);
+    try {
+      const trimmed = maxOrderInput.trim();
+      const body = { max_per_order: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/max-per-order", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setMaxOrderInput(s.max_per_order ?? "");
+      notify.success(s.max_per_order ? `Max per order set to $${s.max_per_order}` : "Max per order cleared");
+    } catch (e) {
+      notify.fromError(e, "Could not update max per order");
+    } finally {
+      setMaxOrderBusy(false);
+    }
+  }
+
   async function saveMaxContract() {
     if (blockZeroLimit(maxContractInput, "Max per contract")) return;
     setMaxContractBusy(true);
@@ -1339,6 +1362,28 @@ export default function SettingsPage() {
                 busy={maxContractBusy}
                 onSave={saveMaxContract}
                 current={sub.max_per_contract}
+                hasLimit={false}
+                thresholdUsdDisplay="—"
+                headroomDisplay="—"
+              />
+
+              {/* Below max per contract, and deliberately separate: that one
+                  asks what a CONTRACT costs, this what the ORDER costs. A
+                  cheap contract scaled up by the multiplier passes the first
+                  and can still fail this one. */}
+              <LimitRow
+                accent="#3b82f6"
+                icon={<IconLayers />}
+                title="Max per order"
+                subtitle={"Skips copying an entry when the whole order's value (quantity × price, × 100 for options) is above this amount. Applies to stocks as well as options — closing trades always go through."}
+                todayLabel="—"
+                todayValue="—"
+                inputPrefix="USD"
+                input={maxOrderInput}
+                onInput={setMaxOrderInput}
+                busy={maxOrderBusy}
+                onSave={saveMaxOrder}
+                current={sub.max_per_order}
                 hasLimit={false}
                 thresholdUsdDisplay="—"
                 headroomDisplay="—"

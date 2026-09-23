@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
@@ -207,6 +207,38 @@ class _PendingMirror:
     # still in the name, so their accumulation window is not over and the
     # subscriber's working entry on this contract must be left alone.
     trader_partial_close: bool = False
+
+
+def mirror_order_value(
+    unit_price: "Decimal | None", quantity: "Decimal | int | None", is_option: bool,
+) -> "Decimal | None":
+    """What this mirror costs, or None when it cannot be priced.
+
+    None matters: an unpriced mirror must not be treated as a $0 one, or the
+    ceiling would pass everything it cannot see rather than nothing.
+    """
+    if unit_price is None or quantity is None:
+        return None
+    qty = Decimal(str(quantity))
+    if qty <= 0:
+        return None
+    # One definition of "what an order costs", shared with the Discord ceiling.
+    # Two copies of a risk formula drift.
+    from app.services.discord_execution import order_value  # noqa: PLC0415
+
+    return order_value(qty, Decimal(str(unit_price)), is_option)
+
+
+def exceeds_order_cap(total: "Decimal | None", cap: "Decimal | None") -> bool:
+    """Whether a mirror worth ``total`` is above the subscriber's ceiling.
+
+    Strictly greater, so a mirror landing exactly ON the ceiling still copies.
+    No cap, or nothing to compare, means no refusal — the gate only ever skips
+    a trade it can show is over the line.
+    """
+    if cap is None or total is None:
+        return False
+    return total > Decimal(str(cap))
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -2397,19 +2429,32 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # authoritatively fetch every relevant cap once here and the gate reads this
     # map instead of the cached subscriber. One cheap indexed local query, only
     # for options.
+    #
+    # max_per_order is fetched in the SAME query and for stocks too: unlike the
+    # per-contract cap it has meaning on a stock mirror, because an order's
+    # value is an order's value.
     _fresh_caps: dict[uuid.UUID, Decimal] = {}
-    if trader_order.instrument_type == InstrumentType.OPTION:
-        _cap_ids = [s.user_id for s in (*subs, *paused_close_subs)]
-        if _cap_ids:
-            for _uid, _cap in db.execute(
-                select(
-                    SubscriberSettings.user_id, SubscriberSettings.max_per_contract,
-                ).where(
-                    SubscriberSettings.user_id.in_(_cap_ids),
+    _fresh_order_caps: dict[uuid.UUID, Decimal] = {}
+    _cap_ids = [s.user_id for s in (*subs, *paused_close_subs)]
+    if _cap_ids:
+        _is_option_order = trader_order.instrument_type == InstrumentType.OPTION
+        for _uid, _cap, _ocap in db.execute(
+            select(
+                SubscriberSettings.user_id,
+                SubscriberSettings.max_per_contract,
+                SubscriberSettings.max_per_order,
+            ).where(
+                SubscriberSettings.user_id.in_(_cap_ids),
+                or_(
                     SubscriberSettings.max_per_contract.isnot(None),
-                )
-            ).all():
+                    SubscriberSettings.max_per_order.isnot(None),
+                ),
+            )
+        ).all():
+            if _cap is not None and _is_option_order:
                 _fresh_caps[_uid] = _cap
+            if _ocap is not None:
+                _fresh_order_caps[_uid] = _ocap
 
     # Price the max-per-contract gate evaluates against. Prefer the trader's own
     # premium; for a MARKET option fanned out BEFORE its fill commits that isn't
@@ -2418,7 +2463,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # live option quote. Computed ONCE here (the contract's premium is the same
     # for every subscriber), and only when some subscriber actually has a cap.
     _gate_px: "Decimal | None" = trader_order.filled_avg_price or trader_order.limit_price
-    if _gate_px is None and _fresh_caps:
+    if _gate_px is None and (_fresh_caps or _fresh_order_caps):
         _gate_px = _live_option_premium(db, trader, trader_order)
 
     for sub in [*subs, *paused_close_subs]:
@@ -2715,6 +2760,43 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                         broker_account_id=acct.id,
                         order_id=None,
                         status="skipped_max_per_contract",
+                    ))
+                    continue
+
+            # ── Max per-ORDER value gate (opens only, stocks included) ───────
+            # Skip an OPENING mirror whose WHOLE value is above the subscriber's
+            # max_per_order. Distinct from the per-contract gate above and
+            # checked in its own right: that one asks what a contract costs,
+            # this one what the order costs, and a mirror can pass either and
+            # fail the other — a cheap contract scaled up by the multiplier is
+            # exactly the case a per-contract cap cannot see.
+            #
+            # Sized off `scaled`, the quantity actually being mirrored, so the
+            # multiplier counts toward it. A CLOSE always passes: they must be
+            # able to exit whatever it is now worth.
+            _mpo = _fresh_order_caps.get(sub.user_id)
+            if not is_closing_effective:
+                _total = mirror_order_value(
+                    _gate_px, scaled,
+                    trader_order.instrument_type == InstrumentType.OPTION,
+                )
+                if exceeds_order_cap(_total, _mpo):
+                    audit.record(
+                        db, actor_user_id=sub.user_id,
+                        action="copy.skipped_max_per_order",
+                        entity_type="order", entity_id=trader_order.id,
+                        metadata={
+                            "symbol": trade_symbol,
+                            "order_value": str(_total),
+                            "quantity": str(scaled),
+                            "max_per_order": str(_mpo),
+                        },
+                    )
+                    results.append(FanoutResult(
+                        subscriber_user_id=sub.user_id,
+                        broker_account_id=acct.id,
+                        order_id=None,
+                        status="skipped_max_per_order",
                     ))
                     continue
 

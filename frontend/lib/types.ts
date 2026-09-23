@@ -293,10 +293,15 @@ export interface SubscriberSettings {
   /** Subscriber's symbol allowlist — when non-empty, only trader trades
    *  on these symbols ARE mirrored. Empty = no filter (mirror all). */
   symbol_inclusion_list: string[];
-  /** UI-only ceiling on per-contract dollar size. Persisted but NOT
-   *  enforced server-side — the panel surfaces it for the user's own
-   *  risk-tracking. */
+  /** Ceiling on a single OPTION contract's value (premium x 100). ENFORCED in
+   *  the copy engine: an opening option mirror above it is skipped. (This was
+   *  once UI-only and the comment here said so long after it stopped being
+   *  true.) */
   max_per_contract: string | null;
+  /** Ceiling on a whole mirrored order (quantity x price, x100 for options).
+   *  Enforced in the copy engine, and unlike max_per_contract it applies to
+   *  stock mirrors too. Independent of it. */
+  max_per_order: string | null;
   /** Percent of today's beginning-day account balance (0–100). When
    *  today's filled trade NOTIONAL (USD) crosses
    *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */

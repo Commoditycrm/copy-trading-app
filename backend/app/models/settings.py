@@ -257,11 +257,21 @@ class SubscriberSettings(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True,
     )
 
-    # UI-only ceiling on per-contract dollar size — surfaced in the Settings
-    # panel for the user to track their own risk, NOT enforced server-side.
-    # We persist it so the value survives refresh and round-trips through
-    # PATCH/GET like the other limits.
+    # Ceiling on what ONE CONTRACT may cost (premium x 100). ENFORCED in
+    # copy_engine.fanout_async: an OPTION open above it is skipped rather than
+    # resized. (This was UI-only once and the comment here said so long after it
+    # stopped being true.)
     max_per_contract: Mapped[Decimal | None] = mapped_column(
+        Numeric(20, 2), nullable=True,
+    )
+
+    # Ceiling on what the WHOLE mirror may cost (quantity x price, x100 for
+    # options), where max_per_contract caps one contract. Independent: a cheap
+    # contract can still be a large order once the multiplier has scaled it, so
+    # ten contracts at $50 passes a $500 per-contract cap and is a $500 order.
+    # Also enforced in fanout_async, and unlike max_per_contract it applies to
+    # STOCK mirrors too — an order's value is an order's value. NULL = no cap.
+    max_per_order: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )
 
