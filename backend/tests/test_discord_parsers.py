@@ -707,3 +707,52 @@ def test_prose_is_not_traded_even_on_a_percent_channel():
 def test_scissors_still_work_on_a_percent_channel():
     sig = _p("✂️ $SPY 760c +58%", percent_exit=True).signal
     assert sig.action.value == "SELL" and sig.symbol == "SPY"
+
+
+# ── "light" / "not heavy": the author asking for a smaller entry ─────────────
+
+def _buy(body):
+    r = parse_message(text(body))
+    assert r.status is ParseStatus.PARSED, (body, r.reason)
+    return r.signals[0]
+
+
+def test_light_flags_a_buy_for_half_size():
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15 light").half_size is True
+
+
+def test_not_heavy_flags_a_buy_for_half_size():
+    assert _buy("not heavy — BUY AAPL 250C 09/18 @ 2.15").half_size is True
+
+
+def test_a_hyphenated_not_heavy_still_counts():
+    """People type it both ways."""
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15 (not-heavy)").half_size is True
+
+
+def test_an_ordinary_buy_is_not_flagged():
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15").half_size is False
+
+
+def test_lighten_does_not_flag_a_buy():
+    """"Lighten up" is the OPPOSITE instruction — trim a position. A substring
+    match on "light" would read it as "open a smaller position"."""
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15, will lighten later").half_size is False
+
+
+def test_light_inside_another_word_does_not_flag():
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15 delightful setup").half_size is False
+
+
+def test_the_flag_is_carried_into_the_signal_dict():
+    """discord_execution reads the dict, not the dataclass."""
+    assert _buy("BUY AAPL 250C 09/18 @ 2.15 light").as_dict()["half_size"] is True
+
+
+def test_a_sell_is_not_flagged():
+    """An exit sizes from the position held, never from the alert — and here
+    "light" most likely means lightening up, which is a trim, not a half-size
+    entry. Halving an exit would strand part of a position."""
+    r = parse_message(text("SELL AAPL 250C 09/18 @ 3.00 going light"))
+    assert r.status is ParseStatus.PARSED
+    assert r.signals[0].half_size is False

@@ -21,6 +21,7 @@ SAYS — validation, risk checks and execution are separate stages, deliberately
 from __future__ import annotations
 
 import logging
+import re
 
 from .alert_card import AlertCardParser
 from .compact_alert import CompactAlertParser
@@ -38,6 +39,19 @@ from .base import (
 from .generic_text import GenericTextParser
 
 log = logging.getLogger(__name__)
+
+# An author marking an entry as a smaller one. Matched on the whole message
+# rather than inside a parser: it is the author's turn of phrase, not a property
+# of any channel's format, so every parser's output gets the same treatment.
+#
+# Word-bounded on purpose. A bare "light" must not fire on "lighten", which is
+# the opposite instruction (trim a position), nor on "delight" or "flashlight".
+# "not heavy" tolerates a hyphen or extra spaces because people type both.
+_HALF_SIZE_RE = re.compile(r"\bnot[\s-]+heavy\b|\blight\b", re.IGNORECASE)
+
+
+def _is_half_size(text: str) -> bool:
+    return bool(_HALF_SIZE_RE.search(text or ""))
 
 # Most specific first.
 PARSERS: list[Parser] = [
@@ -87,11 +101,26 @@ def parse_message(message: ParsedMessage, *, parser_key: str | None = None) -> P
             if first_ignored is None and result.reason:
                 first_ignored = result
             continue
+        _mark_half_size(message, result)
         return result
 
     if first_ignored is not None:
         return first_ignored
     return ParseResult.ignored("not a trade alert")
+
+
+def _mark_half_size(message: ParsedMessage, result: ParseResult) -> None:
+    """Flag BUY signals the author called "light" or "not heavy".
+
+    Entries only. On a SELL the same words mean something different — "lighten
+    up" is an instruction to trim — and an exit is sized from the position held,
+    never from the alert, so halving one would strand part of a position.
+    """
+    if not _is_half_size(message.text):
+        return
+    for signal in result.signals or []:
+        if signal.action is SignalAction.BUY:
+            signal.half_size = True
 
 
 __all__ = [
