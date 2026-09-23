@@ -191,12 +191,20 @@ def _reconcile_once() -> None:
     now = time.monotonic()
     acct_ids: list[uuid.UUID] = []
     for acct_id, newest in candidates:
-        if now < _next_due_at.get(acct_id, 0.0):
+        hot = _is_hot(newest, window_s)
+        due = _next_due_at.get(acct_id, 0.0)
+        # A freshly-hot account must not wait out a timer set during an idle poll.
+        # Without this, a mirror placed 1s after an idle poll inherits that poll's
+        # 30s next-due and its fill isn't seen for up to idle_s — the 14-49s lag
+        # observed on prod. Bring the next poll forward so a just-placed mirror is
+        # caught on the next fast tick. No extra calls: a hot account was due for a
+        # fast poll anyway.
+        if hot and due > now + fast_s:
+            due = now
+        if now < due:
             continue
         acct_ids.append(acct_id)
-        _next_due_at[acct_id] = now + (
-            fast_s if _is_hot(newest, window_s) else idle_s
-        )
+        _next_due_at[acct_id] = now + (fast_s if hot else idle_s)
     # Drop accounts that no longer have working orders so the map can't grow.
     live = {a for a, _ in candidates}
     for gone in [a for a in _next_due_at if a not in live]:
