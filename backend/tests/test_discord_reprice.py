@@ -300,3 +300,61 @@ def test_the_two_reprice_ceilings_are_independent(wired):
     st = wired(order, _Settings(cap="1000", order_cap="400"))
     assert "cancelled" in rp.reprice_one(order.id)
     assert st["adapter"].replaced == []
+
+
+# ── the mirrors have to follow the new price ─────────────────────────────────
+
+@pytest.fixture
+def propagated(monkeypatch):
+    """Record every call to the mirror propagation."""
+    calls: list = []
+    import app.services.copy_engine as ce
+    monkeypatch.setattr(ce, "propagate_modify_to_mirrors", lambda oid: calls.append(oid))
+    return calls
+
+
+def test_a_successful_reprice_carries_the_new_price_to_the_mirrors(wired, propagated):
+    """Nothing else does this. The listeners propagate a trader's modify when
+    they SEE one on the broker feed, but this replacement is placed by us and
+    carries an app-originated marker so the listener deliberately ignores it.
+    Without the explicit call the trader chased the price while every
+    subscriber sat at the original limit."""
+    order = _Order(limit="2.00")
+    st = wired(order, _Settings())
+    out = rp.reprice_one(order.id)
+
+    assert "repriced" in out
+    assert propagated == [order.id]
+
+
+def test_a_failed_reprice_does_not_touch_the_mirrors(wired, propagated):
+    """The trader's own order never moved, so a mirror that followed would be
+    chasing a price that exists nowhere."""
+    order = _Order(limit="2.00")
+    wired(order, _Settings(), adapter=_Adapter(raises=True))
+    assert rp.reprice_one(order.id) == "reprice failed"
+    assert propagated == []
+
+
+def test_a_ceiling_cancel_does_not_propagate(wired, propagated):
+    """That path CANCELS rather than reprices — there is no new price."""
+    order = _Order(limit="2.00")
+    wired(order, _Settings(cap="100"))
+    assert "cancelled" in rp.reprice_one(order.id)
+    assert propagated == []
+
+
+def test_a_propagation_failure_does_not_fail_the_reprice(wired, monkeypatch):
+    """The trader's order is already moved by the time this runs. Reporting a
+    failure would make the next tick think the retry never happened."""
+    import app.services.copy_engine as ce
+
+    def _boom(oid):
+        raise RuntimeError("subscriber broker unreachable")
+
+    monkeypatch.setattr(ce, "propagate_modify_to_mirrors", _boom)
+    order = _Order(limit="2.00")
+    st = wired(order, _Settings())
+
+    assert "repriced" in rp.reprice_one(order.id)
+    assert st["adapter"].replaced == [Decimal("2.20")]
