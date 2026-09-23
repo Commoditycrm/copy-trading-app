@@ -35,8 +35,11 @@ class SubscriberSettingsOut(BaseModel):
     daily_loss_limit_pct: Decimal | None = None
     daily_profit_limit_pct: Decimal | None = None
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
-    # UI-only — persisted but never enforced server-side.
+    # Enforced in copy_engine.fanout_async: an opening OPTION mirror whose
+    # single contract costs more than this is skipped.
     max_per_contract: Decimal | None = None
+    # Enforced the same way, on the mirror's TOTAL value, and on stocks too.
+    max_per_order: Decimal | None = None
     # Per-position TP/SL percentages applied to every open position.
     # pnl_poller closes the offending position at market when the
     # unrealized P&L breaches the configured threshold. Independent of
@@ -151,6 +154,14 @@ class MaxPerContractIn(BaseModel):
     ceiling"."""
 
     max_per_contract: Decimal | None = Field(default=None, gt=0)
+
+
+class MaxPerOrderIn(BaseModel):
+    """Dollar ceiling on a whole mirrored order. Pass null to disable.
+    amount > 0 — a $0 ceiling would skip every copy rather than meaning "no
+    ceiling", exactly as for MaxPerContractIn."""
+
+    max_per_order: Decimal | None = Field(default=None, gt=0)
 
 
 class MaxAccountPctIn(BaseModel):
