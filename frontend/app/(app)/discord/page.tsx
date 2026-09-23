@@ -52,6 +52,10 @@ type DiscordSettings = {
   max_per_order: string | null;
   trail_percent: string;
   trim_profit_gate_pct: string;
+  trim2_profit_gate_pct: string;
+  trim2_stop_pct: string;
+  trim3_profit_gate_pct: string;
+  trim3_stop_pct: string;
   trim_stop_pct: string;
   trim_price_threshold: string;
   trim_trail_amount: string;
@@ -123,12 +127,66 @@ type LadderField = {
   suffix?: string;
 };
 
-const LADDER_FIELDS: LadderField[] = [
-  { key: "trim_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
-  { key: "trim_stop_pct", label: "1st stop below entry", suffix: "%", step: "5" },
-  { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
-  { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
+type LadderGroup = { title: string; hint?: string; fields: LadderField[] };
+
+// One group per rung, because each rung's gate and stop are set independently —
+// changing the 1st trim leaves the 2nd and 3rd exactly where they were. Laying
+// them out as one flat list of six made it read like six knobs on one thing.
+//
+// 0 is a meaningful value in both columns: a gate of 0 means no minimum profit,
+// and a stop 0% below entry is break-even.
+const LADDER_GROUPS: LadderGroup[] = [
+  {
+    title: "1st trim",
+    fields: [
+      { key: "trim_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
+      { key: "trim_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
+    ],
+  },
+  {
+    title: "2nd trim",
+    fields: [
+      { key: "trim2_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
+      { key: "trim2_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
+    ],
+  },
+  {
+    title: "3rd trim",
+    hint: "exits the rest",
+    fields: [
+      { key: "trim3_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
+      { key: "trim3_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
+    ],
+  },
+  {
+    title: "Trailing exit",
+    hint: "2nd and 3rd trims",
+    fields: [
+      { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
+      { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
+    ],
+  },
 ];
+
+// Flat view of the same fields, for the dirty check and for building state.
+const LADDER_FIELDS: LadderField[] = LADDER_GROUPS.flatMap((g) => g.fields);
+
+const LADDER_DEFAULTS: Record<string, string> = {
+  trim_profit_gate_pct: "20", trim_stop_pct: "25",
+  trim2_profit_gate_pct: "0", trim2_stop_pct: "0",
+  trim3_profit_gate_pct: "0", trim3_stop_pct: "0",
+  trim_price_threshold: "0.90", trim_trail_amount: "0.25",
+};
+
+/** Ladder values from a settings response, falling back to the defaults. */
+function ladderFrom(s: Partial<DiscordSettings>): Record<string, string> {
+  return Object.fromEntries(
+    LADDER_FIELDS.map((f) => [
+      f.key,
+      (s as Record<string, string | undefined>)[f.key] ?? LADDER_DEFAULTS[f.key],
+    ]),
+  );
+}
 
 export default function DiscordPage() {
   const router = useRouter();
@@ -160,10 +218,7 @@ export default function DiscordPage() {
   // lets Save disable itself when nothing has changed.
   const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
   const [savedMaxPerOrder, setSavedMaxPerOrder] = useState("");
-  const [ladder, setLadder] = useState<Record<string, string>>({
-    trim_profit_gate_pct: "20", trim_stop_pct: "25",
-    trim_price_threshold: "0.90", trim_trail_amount: "0.25",
-  });
+  const [ladder, setLadder] = useState<Record<string, string>>(LADDER_DEFAULTS);
   const [savedLadder, setSavedLadder] = useState<Record<string, string>>(ladder);
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   const [pair, setPair] = useState<Pairing | null>(null);
@@ -189,12 +244,7 @@ export default function DiscordPage() {
       setSavedMaxPerContract(settings.max_per_contract ?? "");
       setMaxPerOrder(settings.max_per_order ?? "");
       setSavedMaxPerOrder(settings.max_per_order ?? "");
-      const nextLadder = {
-        trim_profit_gate_pct: settings.trim_profit_gate_pct ?? "20",
-        trim_stop_pct: settings.trim_stop_pct ?? "25",
-        trim_price_threshold: settings.trim_price_threshold ?? "0.90",
-        trim_trail_amount: settings.trim_trail_amount ?? "0.25",
-      };
+      const nextLadder = ladderFrom(settings);
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
       setSavedMaxPerContract(settings.max_per_contract ?? "");
@@ -328,12 +378,7 @@ export default function DiscordPage() {
       setSavedMaxPerContract(r.max_per_contract ?? "");
       setMaxPerOrder(r.max_per_order ?? "");
       setSavedMaxPerOrder(r.max_per_order ?? "");
-      const nextLadder = {
-        trim_profit_gate_pct: r.trim_profit_gate_pct ?? "20",
-        trim_stop_pct: r.trim_stop_pct ?? "25",
-        trim_price_threshold: r.trim_price_threshold ?? "0.90",
-        trim_trail_amount: r.trim_trail_amount ?? "0.25",
-      };
+      const nextLadder = ladderFrom(r);
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
       notify.success("Saved");
@@ -1213,9 +1258,24 @@ export default function DiscordPage() {
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 mt-2">
-                    {LADDER_FIELDS.map((f) => (
-                      <div key={f.key}>
+                  {LADDER_GROUPS.map((group) => (
+                    <div key={group.title} className="mt-3">
+                      <div className="flex items-baseline gap-2">
+                        <span
+                          className="text-[10px] font-medium uppercase tracking-wide"
+                          style={{ color: "var(--text-2)" }}
+                        >
+                          {group.title}
+                        </span>
+                        {group.hint && (
+                          <span className="text-[10px]" style={{ color: "var(--muted)" }}>
+                            {group.hint}
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 mt-1.5">
+                        {group.fields.map((f) => (
+                          <div key={f.key}>
                         <label
                           className="block text-[10px] mb-1"
                           style={{ color: "var(--muted)" }}
@@ -1262,11 +1322,13 @@ export default function DiscordPage() {
                             </span>
                           )}
                         </div>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                  ))}
 
-                  <div className="flex items-center gap-2 mt-2">
+                  <div className="flex items-center gap-2 mt-3">
                     <button
                       type="button"
                       disabled={modeBusy || !ladderDirty}

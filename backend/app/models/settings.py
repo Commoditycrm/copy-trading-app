@@ -125,20 +125,45 @@ class TraderSettings(Base, TimestampMixin):
     # ORIGINAL entry price, never the live mark, so the ladder doesn't drift as
     # the price moves:
     #
-    #   1st alert — only if up by discord_trim_profit_gate_pct; sell half, then
-    #               protect the rest with a stop discord_trim_stop_pct below entry
-    #   2nd alert — sell half of what's left; the remainder's stop moves to
-    #               break-even (entry)
+    #   1st alert — sell half, then protect the rest with a stop below entry
+    #   2nd alert — sell half of what's left, and move that stop
     #   3rd alert — exit everything left
+    #
+    # Each rung has its OWN minimum profit and its OWN stop distance, set
+    # independently: changing the 1st cannot move the 2nd or 3rd. A rung only
+    # sells once the position is up by its gate, but it sets its stop either
+    # way — the gate decides whether to SELL, not whether to protect.
+    #
+    # A gate of 0 means NO minimum rather than "break-even or better", which is
+    # what lets the defaults reproduce the ladder's original behaviour exactly:
+    # the 1st trim gated at 20% with a stop 25% below entry, the 2nd and 3rd
+    # ungated with the remainder held at break-even (a stop 0% below entry IS
+    # break-even). Reading 0 as a threshold would refuse exactly the exits a
+    # losing position most needs.
     #
     # On the 2nd and 3rd alerts the quantity being sold leaves via a trailing
     # stop when entry was above discord_trim_price_threshold — a cheap contract
     # isn't worth trailing, it's worth being out of.
+    #
+    # The unsuffixed pair is the FIRST trim; they predate the other two and are
+    # left unrenamed so existing traders keep the values they already set.
     discord_trim_profit_gate_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("20"), server_default="20", nullable=False,
     )
     discord_trim_stop_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("25"), server_default="25", nullable=False,
+    )
+    discord_trim2_profit_gate_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
+    )
+    discord_trim2_stop_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
+    )
+    discord_trim3_profit_gate_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
+    )
+    discord_trim3_stop_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
     )
     # Entry price above which an exit trails instead of going to market.
     discord_trim_price_threshold: Mapped[Decimal] = mapped_column(

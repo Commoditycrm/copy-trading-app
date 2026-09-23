@@ -646,6 +646,10 @@ def get_discord_settings(
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim2_profit_gate_pct=_plain(_setting(ts, "discord_trim2_profit_gate_pct", "0")),
+        trim2_stop_pct=_plain(_setting(ts, "discord_trim2_stop_pct", "0")),
+        trim3_profit_gate_pct=_plain(_setting(ts, "discord_trim3_profit_gate_pct", "0")),
+        trim3_stop_pct=_plain(_setting(ts, "discord_trim3_stop_pct", "0")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
         reprice_after_seconds=(
@@ -713,12 +717,22 @@ def update_discord_settings(
         ts.discord_trail_percent = trail
     # Ladder thresholds. Each is a positive number; the two percentages are
     # additionally capped at 100, where they stop meaning anything.
-    for field, column, cap in (
-        ("trim_profit_gate_pct", "discord_trim_profit_gate_pct", Decimal(100)),
-        ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100)),
-        ("trim_price_threshold", "discord_trim_price_threshold", None),
-        ("trim_trail_amount", "discord_trim_trail_amount", None),
-        ("reprice_pct", "discord_reprice_pct", Decimal(100)),
+    # The ladder percentages accept 0, the other thresholds do not: a gate of 0
+    # means "no minimum profit" and a stop of 0 means break-even, both of which
+    # a trader can legitimately want. A price threshold or trail of 0, by
+    # contrast, is not a setting — it is an empty field.
+    _ZERO_OK = Decimal(0)
+    _POSITIVE = None
+    for field, column, cap, floor in (
+        ("trim_profit_gate_pct", "discord_trim_profit_gate_pct", Decimal(100), _ZERO_OK),
+        ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim2_profit_gate_pct", "discord_trim2_profit_gate_pct", Decimal(100), _ZERO_OK),
+        ("trim2_stop_pct", "discord_trim2_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim3_profit_gate_pct", "discord_trim3_profit_gate_pct", Decimal(100), _ZERO_OK),
+        ("trim3_stop_pct", "discord_trim3_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim_price_threshold", "discord_trim_price_threshold", None, _POSITIVE),
+        ("trim_trail_amount", "discord_trim_trail_amount", None, _POSITIVE),
+        ("reprice_pct", "discord_reprice_pct", Decimal(100), _POSITIVE),
     ):
         raw = getattr(payload, field, None)
         if raw is None:
@@ -727,10 +741,12 @@ def update_discord_settings(
             value = Decimal(str(raw).strip())
         except (InvalidOperation, ValueError, AttributeError):
             raise HTTPException(400, f"invalid_{field}")
-        if value <= 0 or (cap is not None and value > cap):
+        too_small = value < floor if floor is not None else value <= 0
+        if too_small or (cap is not None and value > cap):
             raise HTTPException(
                 400,
-                f"{field} must be greater than 0"
+                f"{field} must be "
+                + ("0 or more" if floor is not None else "greater than 0")
                 + (f" and no more than {cap}" if cap is not None else ""),
             )
         setattr(ts, column, value)
@@ -754,6 +770,10 @@ def update_discord_settings(
         trail_percent=_plain(ts.discord_trail_percent) or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
         trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim2_profit_gate_pct=_plain(_setting(ts, "discord_trim2_profit_gate_pct", "0")),
+        trim2_stop_pct=_plain(_setting(ts, "discord_trim2_stop_pct", "0")),
+        trim3_profit_gate_pct=_plain(_setting(ts, "discord_trim3_profit_gate_pct", "0")),
+        trim3_stop_pct=_plain(_setting(ts, "discord_trim3_stop_pct", "0")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
         reprice_after_seconds=(
@@ -1093,8 +1113,18 @@ def _execute_signal(
             log.exception("discord: stale-entry cancel failed for %s", p.symbol)
 
         cfg = guards.TrimConfig(
-            profit_gate_pct=_setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
-            stop_pct=_setting(ts_for_sizing, "discord_trim_stop_pct", "25"),
+            trim1=guards.RungConfig(
+                _setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
+                _setting(ts_for_sizing, "discord_trim_stop_pct", "25"),
+            ),
+            trim2=guards.RungConfig(
+                _setting(ts_for_sizing, "discord_trim2_profit_gate_pct", "0"),
+                _setting(ts_for_sizing, "discord_trim2_stop_pct", "0"),
+            ),
+            trim3=guards.RungConfig(
+                _setting(ts_for_sizing, "discord_trim3_profit_gate_pct", "0"),
+                _setting(ts_for_sizing, "discord_trim3_stop_pct", "0"),
+            ),
             price_threshold=_setting(ts_for_sizing, "discord_trim_price_threshold", "0.90"),
             trail_amount=_setting(ts_for_sizing, "discord_trim_trail_amount", "0.25"),
         )
