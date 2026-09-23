@@ -37,6 +37,15 @@ class Config:
     flush_ms: int = 250
     # Ceiling on consecutive-failure backoff when a channel won't stay open.
     max_backoff_s: int = 300
+    # How many channels may be ATTACHING at once. Every watcher renders a full
+    # Discord client to attach, which is the one genuinely CPU-heavy thing this
+    # service does; once attached it is an idle DOM observer. Watchers are
+    # started from a single reconcile sweep, so without this they all attach in
+    # the same instant — on prod three channels started at the same millisecond,
+    # pinned the CPU limit, and each blew the 45s channel-load timeout, which
+    # dropped them into a reconnect loop that burned still more CPU. Attaching
+    # one at a time costs a few seconds of startup and removes the spike.
+    connect_concurrency: int = 1
     headless: bool = True
     # Print each ingested message (author, text, embed title/description/fields)
     # to the log instead of just per-batch counts. On by default because the
