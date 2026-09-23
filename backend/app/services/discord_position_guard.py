@@ -50,14 +50,41 @@ NONE = "none"               # nothing is being sold on this rung
 OPEN = "open"               # a buy
 
 
+@dataclass(frozen=True)
+class RungConfig:
+    """One rung's two knobs, set independently of the other rungs.
+
+    ``profit_gate_pct`` is the minimum gain over ENTRY before this trim sells
+    anything; 0 means it always sells. ``stop_pct`` is how far below entry the
+    stop goes on whatever is still held afterwards; 0 means break-even.
+    """
+
+    profit_gate_pct: Decimal = Decimal("0")
+    stop_pct: Decimal = Decimal("0")
+
+
 @dataclass
 class TrimConfig:
-    """The trader's ladder settings, resolved by the caller."""
+    """The trader's ladder settings, resolved by the caller.
 
-    profit_gate_pct: Decimal = Decimal("20")    # 1st trim only runs above this
-    stop_pct: Decimal = Decimal("25")           # 1st trim's stop, below entry
+    Each rung carries its OWN gate and stop, so changing the 1st trim cannot
+    move the 2nd or 3rd. The defaults are the behaviour the ladder had before
+    they were configurable: the 1st trim gated at +20% with a stop 25% below
+    entry, and the 2nd and 3rd ungated with the remainder held at break-even
+    (a stop 0% below entry IS break-even, which is why 0 is the default rather
+    than a special case).
+    """
+
+    trim1: RungConfig = RungConfig(Decimal("20"), Decimal("25"))
+    trim2: RungConfig = RungConfig(Decimal("0"), Decimal("0"))
+    trim3: RungConfig = RungConfig(Decimal("0"), Decimal("0"))
     price_threshold: Decimal = Decimal("0.90")  # above this, exits trail
     trail_amount: Decimal = Decimal("0.25")     # dollar give-back that triggers
+
+    def rung(self, n: int) -> RungConfig:
+        """This rung's settings. Rungs past the third reuse the third's — the
+        ladder has three steps and anything beyond is a repeat of the last."""
+        return {1: self.trim1, 2: self.trim2}.get(n, self.trim3)
 
 
 @dataclass
@@ -106,58 +133,74 @@ def plan_exit(
         return TrimPlan(rung=rung, guard=guard, retire=True,
                         note="nothing held")
 
-    # ── rung 3 and beyond: everything goes ──────────────────────────────────
-    if rung >= 3:
-        style, amount = _exit_style(entry, cfg)
-        return TrimPlan(
-            rung=rung, guard=guard, sell_qty=held, exit_style=style,
-            trail_amount=amount, retire=(style == MARKET),
-            note=f"final exit of {held}",
-        )
+    rung_cfg = cfg.rung(rung)
 
-    # ── rung 1: gated on profit, and only ever sells at market ──────────────
-    # The gate is inclusive — "market >= 1.2 x fill" trims AT the threshold,
-    # not only past it.
-    if rung == 1:
-        if entry is None or entry <= 0 or mark is None or mark <= 0:
+    gain_pct = None
+    if entry is not None and entry > 0 and mark is not None and mark > 0:
+        gain_pct = (mark - entry) / entry * Decimal(100)
+
+    # This rung's stop, on whatever is still held after it. 0% below entry IS
+    # break-even, which is what the 2nd trim has always done — so break-even
+    # needs no special case.
+    stop = (
+        entry * (Decimal(1) - rung_cfg.stop_pct / Decimal(100))
+        if entry is not None and entry > 0 else None
+    )
+
+    # A gate of 0 means NO minimum, not "must be at break-even or better".
+    # That distinction is the difference between reproducing the old ladder and
+    # quietly changing it: the 2nd and 3rd trims never had a gate, so an
+    # UNDERWATER position still sold. Reading 0 as a threshold would make
+    # `gain_pct < 0` refuse exactly the exits a losing position most needs. A
+    # trader who wants "only in profit" sets a small positive number.
+    gate = rung_cfg.profit_gate_pct or Decimal(0)
+    if gate > 0:
+        if gain_pct is None:
+            # Only a GATED rung has to measure profit. An ungated one sells
+            # whether or not a live mark happens to be available, which is how
+            # rungs 2 and 3 behaved before they were configurable.
             return TrimPlan(
                 rung=rung, guard=guard,
                 note="no entry price or live mark — cannot measure profit",
             )
-        gain_pct = (mark - entry) / entry * Decimal(100)
-        stop = entry * (Decimal(1) - cfg.stop_pct / Decimal(100))
-        if gain_pct < cfg.profit_gate_pct:
+        # The gate is inclusive — "up 20%" trims AT a 20% gate, not past it.
+        if gain_pct < gate:
             # The gate decides whether to SELL, not whether to protect. The
             # position is open either way, so it gets its stop either way —
-            # otherwise an alert that arrives early leaves the trader holding
-            # an unprotected position until the next one happens to come.
+            # otherwise an alert that arrives early leaves the trader holding an
+            # unprotected position until the next one happens to come.
             return TrimPlan(
                 rung=rung, guard=guard,
                 new_stop_price=_armable_stop(stop, mark),
-                note=(f"up {gain_pct.quantize(Decimal('0.01'))}%, "
-                      f"under the {cfg.profit_gate_pct}% gate — nothing sold, "
-                      f"stop set at {stop.quantize(Decimal('0.0001'))}"),
+                note=(f"trim {rung}: up {gain_pct.quantize(Decimal('0.01'))}%, "
+                      f"under the {gate}% gate — nothing sold"
+                      + (f", stop set at {stop.quantize(Decimal('0.0001'))}"
+                         if stop is not None else "")),
             )
-        sell = _half(held)
-        return TrimPlan(
-            rung=rung, guard=guard, sell_qty=sell, exit_style=MARKET,
-            new_stop_price=(None if sell >= held else _armable_stop(stop, mark)),
-            retire=(sell >= held),
-            note=(f"up {gain_pct.quantize(Decimal('0.01'))}% — sold {sell} of {held}"
-                  + ("" if sell >= held else f", stop {stop.quantize(Decimal('0.0001'))}")),
-        )
 
-    # ── rung 2: half of what's left, remainder held at break-even ───────────
-    sell = _half(held)
-    style, amount = _exit_style(entry, cfg)
+    # How much leaves: half on the first two rungs, everything on the third.
+    final = rung >= 3
+    sell = held if final else _half(held)
+
+    # The 1st trim always goes to market. Later rungs ride an expensive contract
+    # out on a trailing give-back instead — a cheap one isn't worth trailing.
+    style, amount = _exit_style(entry, cfg) if rung >= 2 else (MARKET, None)
+
+    takes_everything = sell >= held
+    gain_note = (
+        f"up {gain_pct.quantize(Decimal('0.01'))}% — " if gain_pct is not None else ""
+    )
+    stop_note = (
+        "" if takes_everything or stop is None
+        else f", stop {stop.quantize(Decimal('0.0001'))}"
+    )
     return TrimPlan(
         rung=rung, guard=guard, sell_qty=sell, exit_style=style,
         trail_amount=amount,
-        # Break-even on whatever is still held — but only if the position is
-        # actually above it. Nothing left to protect if this rung takes it all.
-        new_stop_price=(None if sell >= held else _armable_stop(entry, mark)),
-        retire=(sell >= held and style == MARKET),
-        note=f"sold {sell} of {held}, stop to break-even",
+        # Nothing left to protect if this rung takes the whole position.
+        new_stop_price=(None if takes_everything else _armable_stop(stop, mark)),
+        retire=(takes_everything and style == MARKET),
+        note=f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}",
     )
 
 
@@ -431,7 +474,7 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 
 
 __all__ = [
-    "MARKET", "NONE", "OPEN", "TRAIL", "TrimConfig", "TrimPlan",
+    "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
     "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price",
 ]
