@@ -675,6 +675,15 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                 # session, so a stop that fires pre- or post-market would fail
                 # exactly when it matters. Price a marketable limit through the
                 # bid instead — it fills like a market order and is accepted.
+                # Imported here, like every other market_hours use in this
+                # module. It was referenced as a bare global and never imported,
+                # so this line raised NameError on EVERY close -- which meant no
+                # Discord position was ever closed by the poller: not a stop-out,
+                # not a trailing exit, and not the fallback that exits when the
+                # broker refuses to hold a stop. The failure was invisible
+                # because the sweep catches and logs it per account.
+                from app.services import market_hours  # noqa: PLC0415
+
                 order_type, limit_price = OrderType.MARKET, None
                 if is_option and not market_hours.in_regular_session():
                     bid = _bid_for(adapter, pos)
@@ -707,6 +716,16 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                     # A close, so the order is marked is_closing and the option
                     # SELL goes out as SELL_TO_CLOSE.
                     resolve_wash_trade=True,
+                    # A protective exit must never be mistaken for a double-POST.
+                    # It is shape-identical to the trim that usually precedes it
+                    # by a second or two -- same symbol, side, MARKET, same 1
+                    # contract -- so the 3s duplicate window swallowed it and
+                    # returned the TRIM's order instead, placing nothing. The
+                    # ladder then retired the guard believing it had closed,
+                    # leaving the position open and no longer tracked. Live:
+                    # trim 00:33:49, stop refused 00:33:51, close suppressed
+                    # 00:33:52.
+                    skip_dedup=True,
                 )
 
             # Keep a REAL stop order resting at the broker for each protected

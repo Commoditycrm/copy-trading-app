@@ -815,6 +815,7 @@ def _place_trader_order(
     skip_fanout: bool = False,
     resolve_wash_trade: bool = False,
     partial_close: bool = False,
+    skip_dedup: bool = False,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -912,7 +913,7 @@ def _place_trader_order(
     from datetime import timedelta  # noqa: PLC0415
     DEDUP_WINDOW = timedelta(seconds=3)
     cutoff = trader_submitted_at - DEDUP_WINDOW
-    existing = db.execute(
+    existing = None if skip_dedup else db.execute(
         select(Order).where(
             Order.user_id == trader.id,
             Order.broker_account_id == acct.id,
@@ -932,6 +933,9 @@ def _place_trader_order(
         ).order_by(Order.created_at.desc()).limit(1)
     ).scalar_one_or_none()
     if existing is not None:
+        # NOTE: this returns the EXISTING order and places nothing. A caller
+        # that cannot tolerate being silently skipped must pass skip_dedup —
+        # see the protective close in services/pnl_poller.
         import logging  # noqa: PLC0415
         logging.getLogger(__name__).warning(
             "trades: duplicate suppressed for user=%s symbol=%s side=%s qty=%s "
