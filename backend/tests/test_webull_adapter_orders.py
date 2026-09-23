@@ -923,3 +923,56 @@ def test_a_rejected_replace_is_not_reported_as_success(monkeypatch):
         pass
     else:
         raise AssertionError("a rejected replace was reported as success")
+
+
+# ── Webull's own vocabulary, not ours ────────────────────────────────────────
+
+# Every value Webull documents for the field, from
+# developer.webull.com/apis/docs/reference/common-order-place/
+_WEBULL_INSTRUMENT_TYPES = {"EQUITY", "OPTION", "FUTURES", "CRYPTO", "EVENT"}
+
+
+def test_a_stock_order_says_EQUITY_not_STOCK():
+    """STOCK is OUR enum's name for it. Webull refuses it outright:
+
+        HTTP 417 INVALID_PARAMETER "Instrument type invalid."
+
+    Options were never affected because their leg already says OPTION — which
+    is why every Discord option order worked on Webull while no stock order
+    ever placed, including a close from the positions table.
+    """
+    a = _adapter()
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="NIO", side=OrderSide.SELL,
+        order_type=OrderType.LIMIT, quantity=Decimal(1), limit_price=Decimal("3.69"),
+    )
+    assert a._build_stock_order(req, "c1")["instrument_type"] == "EQUITY"
+
+
+def test_every_instrument_type_we_send_is_one_webull_accepts():
+    """The round trip that would have caught this: a value we SEND has to be a
+    value they LIST."""
+    a = _adapter()
+    stock = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="NIO", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal(1), limit_price=Decimal("3.69"),
+    )
+    opt = BrokerOrderRequest(
+        instrument_type=InstrumentType.OPTION, symbol="NIO", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal(1), limit_price=Decimal("0.25"),
+        option_expiry=date(2026, 9, 25), option_strike=Decimal("3.5"),
+        option_right=OptionRight.CALL,
+    )
+    sent = {a._build_stock_order(stock, "c1")["instrument_type"]}
+    sent |= {leg["instrument_type"] for leg in a._build_option_order(opt, "c2")["legs"]}
+    assert sent <= _WEBULL_INSTRUMENT_TYPES, sent - _WEBULL_INSTRUMENT_TYPES
+
+
+def test_the_market_is_one_webull_accepts():
+    """Documented as [US] — the only value the field takes."""
+    a = _adapter()
+    req = BrokerOrderRequest(
+        instrument_type=InstrumentType.STOCK, symbol="NIO", side=OrderSide.BUY,
+        order_type=OrderType.LIMIT, quantity=Decimal(1), limit_price=Decimal("3.69"),
+    )
+    assert a._build_stock_order(req, "c1")["market"] == "US"
