@@ -21,6 +21,7 @@ from app.schemas.settings import (
     MaxAccountPctIn,
     MaxAccountUsdIn,
     MaxPerContractIn,
+    MaxPerOrderIn,
     PositionSlPctIn,
     PositionTpPctIn,
     RetryIntervalIn,
@@ -86,6 +87,7 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         symbol_exclusion_list=list(s.symbol_exclusion_list or []),
         symbol_inclusion_list=list(s.symbol_inclusion_list or []),
         max_per_contract=s.max_per_contract,
+        max_per_order=s.max_per_order,
         max_account_pct_per_day=s.max_account_pct_per_day,
         max_account_usd_per_day=s.max_account_usd_per_day,
         auto_liquidation_limit=s.auto_liquidation_limit,
@@ -138,6 +140,7 @@ def reset_subscriber_settings(
     s.daily_profit_limit_pct = None
     s.auto_liquidation_limit = None
     s.max_per_contract = None
+    s.max_per_order = None
     s.max_account_pct_per_day = None
     s.max_account_usd_per_day = None
     s.position_tp_pct = None
@@ -304,6 +307,45 @@ def set_daily_profit_limit_pct(
     )
     db.commit()
     db.refresh(s)
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/max-per-order", response_model=SubscriberSettingsOut)
+def set_max_per_order(
+    payload: MaxPerOrderIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Dollar ceiling on a whole mirrored order. Enforced in the copy engine:
+    an opening mirror whose total value (quantity x price, x100 for options)
+    exceeds this is skipped rather than resized. Independent of
+    max_per_contract — a cheap contract can still be a large order once the
+    multiplier has scaled it. Applies to stock mirrors as well. Closing trades
+    always go through."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.max_per_order
+    s.max_per_order = payload.max_per_order
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.max_per_order_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.max_per_order) if payload.max_per_order is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    # Bust the fanout cache so the copy engine picks up the new ceiling on the
+    # very next trade instead of after the cache TTL.
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
     return _to_out(db, s)
