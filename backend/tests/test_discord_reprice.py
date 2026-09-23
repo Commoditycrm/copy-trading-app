@@ -19,10 +19,13 @@ from app.models.order import InstrumentType, OrderStatus, OrderType
 
 
 class _Settings:
-    def __init__(self, pct="10", cap=None, after=30):
+    def __init__(self, pct="10", cap=None, after=30, order_cap=None):
         self.discord_reprice_pct = Decimal(pct)
         self.discord_reprice_after_seconds = after
         self.discord_max_per_contract = Decimal(str(cap)) if cap is not None else None
+        self.discord_max_per_order = (
+            Decimal(str(order_cap)) if order_cap is not None else None
+        )
 
 
 class _Order:
@@ -262,3 +265,38 @@ def test_the_replacement_is_marked_app_originated_before_the_call(wired, monkeyp
     marked_id, replaces_so_far = marked[0]
     assert replaces_so_far == 0          # marked BEFORE the broker call
     assert str(marked_id) == st["adapter"].reqs[0].client_order_id
+
+
+# ── the retry must not spend past the ORDER ceiling either ───────────────────
+
+def test_a_retry_that_breaches_the_order_ceiling_cancels(wired):
+    """The reprice raises the price, which lifts what ONE contract costs and
+    what the WHOLE order costs together. Checking only the per-contract cap
+    would let a large order slip past max_per_order on the retry after being
+    refused on the way in — the mechanism meant to get the trader IN quietly
+    overriding what they said they would put in."""
+    order = _Order(limit="2.00")          # qty 2 → 2.20 x 100 x 2 = $440 after +10%
+    st = wired(order, _Settings(order_cap="400"))
+    out = rp.reprice_one(order.id)
+
+    assert "cancelled" in out
+    assert st["adapter"].cancelled == ["brk-1"]
+    assert st["adapter"].replaced == []
+
+
+def test_a_retry_inside_the_order_ceiling_goes_through(wired):
+    order = _Order(limit="2.00")
+    st = wired(order, _Settings(order_cap="500"))
+    out = rp.reprice_one(order.id)
+
+    assert "repriced" in out
+    assert st["adapter"].replaced == [Decimal("2.20")]
+
+
+def test_the_two_reprice_ceilings_are_independent(wired):
+    """A contract well inside the per-contract cap can still make an order that
+    is over the order cap."""
+    order = _Order(limit="2.00")
+    st = wired(order, _Settings(cap="1000", order_cap="400"))
+    assert "cancelled" in rp.reprice_one(order.id)
+    assert st["adapter"].replaced == []

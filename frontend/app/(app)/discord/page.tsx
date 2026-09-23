@@ -49,6 +49,7 @@ type DiscordSettings = {
   live_trading: boolean;
   quantity_multiplier: number;
   max_per_contract: string | null;
+  max_per_order: string | null;
   trail_percent: string;
   trim_profit_gate_pct: string;
   trim_stop_pct: string;
@@ -154,9 +155,11 @@ export default function DiscordPage() {
   const [liveTrading, setLiveTrading] = useState(false);
   const [qtyMultiplier, setQtyMultiplier] = useState(1);
   const [maxPerContract, setMaxPerContract] = useState("");
+  const [maxPerOrder, setMaxPerOrder] = useState("");
   // What the server currently holds, as distinct from what's in the box —
   // lets Save disable itself when nothing has changed.
   const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
+  const [savedMaxPerOrder, setSavedMaxPerOrder] = useState("");
   const [ladder, setLadder] = useState<Record<string, string>>({
     trim_profit_gate_pct: "20", trim_stop_pct: "25",
     trim_price_threshold: "0.90", trim_trail_amount: "0.25",
@@ -184,6 +187,8 @@ export default function DiscordPage() {
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
+      setMaxPerOrder(settings.max_per_order ?? "");
+      setSavedMaxPerOrder(settings.max_per_order ?? "");
       const nextLadder = {
         trim_profit_gate_pct: settings.trim_profit_gate_pct ?? "20",
         trim_stop_pct: settings.trim_stop_pct ?? "25",
@@ -193,6 +198,7 @@ export default function DiscordPage() {
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
       setSavedMaxPerContract(settings.max_per_contract ?? "");
+      setSavedMaxPerOrder(settings.max_per_order ?? "");
     } catch (e) {
       notify.fromError(e, "Failed to load Discord channels");
     }
@@ -320,6 +326,8 @@ export default function DiscordPage() {
       setQtyMultiplier(r.quantity_multiplier || 1);
       setMaxPerContract(r.max_per_contract ?? "");
       setSavedMaxPerContract(r.max_per_contract ?? "");
+      setMaxPerOrder(r.max_per_order ?? "");
+      setSavedMaxPerOrder(r.max_per_order ?? "");
       const nextLadder = {
         trim_profit_gate_pct: r.trim_profit_gate_pct ?? "20",
         trim_stop_pct: r.trim_stop_pct ?? "25",
@@ -1135,6 +1143,58 @@ export default function DiscordPage() {
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
                     Skips an entry when one contract&apos;s value (premium × 100) is above this.
                     Options only — closes always go through.
+                  </p>
+                </div>
+
+                {/* Max per order — the whole order's value, not one contract's.
+                    Kept as a separate limit rather than folded into the one
+                    above: they answer different questions, and an alert can
+                    pass either and fail the other. */}
+                <div
+                  className="rounded-xl px-4 py-3 flex-1"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                      Max per order
+                    </label>
+                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
+                      {savedMaxPerOrder ? `$${savedMaxPerOrder}` : "No limit"}
+                    </span>
+                  </div>
+                  <div className="flex gap-2 mt-2">
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
+                            style={{ color: "var(--muted)" }}>$</span>
+                      <input
+                        type="number"
+                        min="1"
+                        step="100"
+                        placeholder="No limit"
+                        value={maxPerOrder}
+                        disabled={modeBusy}
+                        onChange={(e) => setMaxPerOrder(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveSizing({ max_per_order: maxPerOrder });
+                        }}
+                        className="w-full rounded-lg border pl-7 pr-3 py-1.5 text-sm bg-transparent focus-ring"
+                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                      />
+                    </div>
+                    {/* Explicit save, same as the limit above: typing a number
+                        shouldn't commit a risk limit when focus moves. */}
+                    <button
+                      type="button"
+                      disabled={modeBusy || maxPerOrder === savedMaxPerOrder}
+                      onClick={() => saveSizing({ max_per_order: maxPerOrder })}
+                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                    >
+                      {modeBusy ? <Spinner /> : "Save"}
+                    </button>
+                  </div>
+                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                    Skips an entry when the whole order&apos;s value (quantity × price,
+                    × 100 for options) is above this. Closes always go through.
                   </p>
                 </div>
 

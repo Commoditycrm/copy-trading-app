@@ -87,17 +87,35 @@ def _due_order_ids() -> list[uuid.UUID]:
         )
 
 
-def _breaches_ceiling(price: Decimal, ts: TraderSettings, is_option: bool) -> bool:
-    """Whether a single contract at ``price`` costs more than the trader allows.
+def _breaches_ceiling(
+    price: Decimal, ts: TraderSettings, is_option: bool,
+    quantity: Decimal | None = None,
+) -> bool:
+    """Whether repricing to ``price`` would break either dollar ceiling.
 
-    Mirrors the entry-side check exactly: the test is on ONE contract's value
-    (premium x 100 for an option), not the order's total.
+    Mirrors the entry-side checks exactly, and for the same reason: a retry that
+    quietly spends past a limit the trader set would be the mechanism meant to
+    get them IN overriding the rule about what they are willing to put in.
+
+    Both are tested because the reprice raises the price, and that moves BOTH
+    numbers — a +10% bump lifts what one contract costs and what the whole order
+    costs together. Checking only the per-contract ceiling would let a large
+    order slip past max_per_order on the retry after being refused on the way
+    in. They remain independent: either alone is enough to refuse.
     """
-    cap = getattr(ts, "discord_max_per_contract", None)
-    if cap is None:
-        return False
     per_contract = price * Decimal(100) if is_option else price
-    return per_contract > Decimal(str(cap))
+
+    cap = getattr(ts, "discord_max_per_contract", None)
+    if cap is not None and per_contract > Decimal(str(cap)):
+        return True
+
+    order_cap = getattr(ts, "discord_max_per_order", None)
+    if order_cap is not None and quantity is not None and quantity > 0:
+        total = per_contract * Decimal(str(quantity))
+        if total > Decimal(str(order_cap)):
+            return True
+
+    return False
 
 
 def reprice_one(order_id: uuid.UUID) -> str:
@@ -154,7 +172,9 @@ def reprice_one(order_id: uuid.UUID) -> str:
         adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
 
         is_option = order.instrument_type == InstrumentType.OPTION
-        if ts is not None and _breaches_ceiling(new_price, ts, is_option):
+        if ts is not None and _breaches_ceiling(
+            new_price, ts, is_option, order.quantity
+        ):
             # Getting filled must not cost more than the trader said a contract
             # is worth. Cancel rather than quietly spend past the ceiling.
             try:
@@ -166,7 +186,7 @@ def reprice_one(order_id: uuid.UUID) -> str:
             order.status = OrderStatus.CANCELED
             db.commit()
             log.info(
-                "discord reprice: %s would breach max-per-contract at %s — cancelled",
+                "discord reprice: %s would breach a dollar ceiling at %s — cancelled",
                 order.symbol, new_price,
             )
             return "cancelled (ceiling)"
