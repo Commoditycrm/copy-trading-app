@@ -511,6 +511,74 @@ def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) ->
     return qty
 
 
+def cancel_unfilled_entries(db: Session, user: User, payload) -> list[uuid.UUID]:
+    """Cancel this contract's still-working, unfilled Discord ENTRY orders.
+
+    An exit alert means the alert cycle has moved on to getting OUT. An entry
+    that never filled — even after the +10% retry — is now a bid for a position
+    the trader is already exiting, and leaving it resting means it can still
+    fill later into a trade nobody wants: bought at the top of a move whose exit
+    signal has already been given, with no rung of the ladder left to protect it.
+
+    Only UNFILLED entries. A partially filled one is a real position and belongs
+    to the trim ladder, not here.
+
+    In practice this only ever fires on the FIRST exit alert for a contract: it
+    cancels what it finds, so by the second there is nothing left to cancel.
+
+    Returns the ids cancelled, so the caller can cascade to subscriber mirrors —
+    they are resting on the same stale bid.
+    """
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+    from sqlalchemy import select  # noqa: PLC0415
+
+    working = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED)
+    entries = list(db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.parent_order_id.is_(None),          # the trader's own, not a mirror
+            Order.symbol == payload.symbol.upper(),
+            Order.instrument_type == payload.instrument_type,
+            Order.option_expiry.is_not_distinct_from(payload.option_expiry),
+            Order.option_strike.is_not_distinct_from(payload.option_strike),
+            Order.option_right.is_not_distinct_from(payload.option_right),
+            Order.side == OrderSide.BUY,
+            Order.is_closing.is_(False),
+            Order.status.in_(working),
+        )
+    ).scalars())
+
+    cancelled: list[uuid.UUID] = []
+    for entry in entries:
+        if (entry.filled_quantity or Decimal(0)) > 0:
+            continue                                   # a real position now
+        if entry.broker_order_id:
+            acct = db.get(BrokerAccount, entry.broker_account_id)
+            if acct is not None:
+                try:
+                    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+                    adapter.cancel_order(entry.broker_order_id)
+                except Exception:  # noqa: BLE001
+                    # Already gone at the broker is the usual reason, and it
+                    # means what we wanted. Anything else is still better
+                    # recorded as cancelled than left looking live to us.
+                    log.warning(
+                        "discord: could not cancel stale entry %s at the broker",
+                        entry.id, exc_info=True,
+                    )
+        entry.status = OrderStatus.CANCELED
+        entry.closed_at = datetime.now(timezone.utc)
+        cancelled.append(entry.id)
+        log.info(
+            "discord: cancelled unfilled entry %s for %s — an exit alert arrived",
+            entry.id, entry.symbol,
+        )
+    if cancelled:
+        db.commit()
+    return cancelled
+
+
 def order_value(qty: Decimal, limit_price: Decimal, is_option: bool) -> Decimal:
     """What this order costs: quantity x price, x100 for an option contract."""
     value = qty * limit_price
