@@ -235,6 +235,15 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             log.exception("failed to start pnl_poller")
 
+        # Centralized live market-data stream (one Alpaca SIP WebSocket → Redis,
+        # read by all users/brokers). No-op unless the keys are set and
+        # ALPACA_MARKET_STREAM_ENABLED is on; the supervisor re-checks each pass.
+        try:
+            from app.services import market_data_stream
+            market_data_stream.start_market_data_stream()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start market_data_stream")
+
         # Daily realized-P&L snapshot sweep (broker-direct values the Calendar
         # reads). Started INDEPENDENTLY here — it also runs at the tail of
         # start_all_listeners(), but that path is skipped whenever a broker
@@ -378,6 +387,11 @@ def create_app() -> FastAPI:
             await webull_subscriber_reconciler.stop_webull_subscriber_reconciler()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop webull subscriber reconciler cleanly")
+        try:
+            from app.services import market_data_stream
+            await market_data_stream.stop_market_data_stream()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop market_data_stream cleanly")
         try:
             await close_async_redis()
         except Exception:  # noqa: BLE001
