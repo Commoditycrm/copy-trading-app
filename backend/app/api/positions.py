@@ -171,7 +171,15 @@ def list_positions(
             ))
             continue
     # After every account's positions are in, so one query covers them all.
-    _attach_position_channels(db, user.id, out)
+    #
+    # Isolated: this is a display column, and this endpoint is how a trader
+    # CLOSES a position. The unreachable-account handling above exists so one
+    # bad broker cannot blank the list; an exception here would undo that for a
+    # different reason. Positions still render, just without the channel.
+    try:
+        _attach_position_channels(db, user.id, out)
+    except Exception:  # noqa: BLE001
+        log.warning("positions: could not attach discord channels", exc_info=True)
     if detail:
         return PositionsPayload(positions=out, unreachable=unreachable)
     return out
