@@ -25,7 +25,7 @@ reads every line and returns all of them.
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 from ._util import parse_expiry, to_decimal
@@ -67,7 +67,7 @@ _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -87,7 +87,7 @@ _ENTRY_RE = re.compile(
 # tried first, so the two cannot disagree about a line.
 _ENTRY_EXP_FIRST_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+"
+    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -99,7 +99,7 @@ _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -179,7 +179,7 @@ _ADD_RE = re.compile(
     rf"^\s*(?:ADD|ADDING)\s+"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
-    rf"\s*(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"\s*(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -516,16 +516,38 @@ def _right(raw: str) -> OptionType:
     return OptionType.CALL if raw.upper().startswith("C") else OptionType.PUT
 
 
+def _next_trading_day(day: date) -> date:
+    """The next day the market is open — what "1DTE" names.
+
+    Weekends only: a Friday 1DTE is Monday, not Saturday. Market HOLIDAYS are
+    not known here, and deliberately so — this module reads text and owns no
+    calendar. A 1DTE posted the day before a holiday therefore resolves to a
+    closed day, and execution refuses it by name: _check_contract_exists asks
+    the broker whether that contract exists and reports that it does not,
+    rather than silently trading a nearby expiry the alert never asked for.
+    """
+    nxt = day + timedelta(days=1)
+    while nxt.weekday() >= 5:      # 5 = Saturday, 6 = Sunday
+        nxt += timedelta(days=1)
+    return nxt
+
+
 def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool = False):
     """Returns ``(expiry, unspecified, error)``."""
     # "ODTE" with the letter O is a common mistype of "0DTE" and means the same
     # thing. Reading it as an unknown expiry rejects an otherwise valid alert.
+    #
+    # Both are resolved against the MESSAGE's own timestamp, not today, so
+    # re-reading an old alert doesn't move its expiry.
     if raw and raw.upper() in ("0DTE", "ODTE"):
-        # Expires the day it was posted. Resolved against the message's own
-        # timestamp, not today, so re-reading an old alert doesn't move it.
         if message.posted_at is None:
             return None, False, "0DTE alert has no timestamp to resolve the expiry against"
         return message.posted_at.date(), False, None
+
+    if raw and raw.upper() == "1DTE":
+        if message.posted_at is None:
+            return None, False, "1DTE alert has no timestamp to resolve the expiry against"
+        return _next_trading_day(message.posted_at.date()), False, None
 
     if not raw:
         if allow_missing:
