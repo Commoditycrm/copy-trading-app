@@ -9,13 +9,18 @@ The new columns default to 0, which reproduces the old behaviour exactly: a
 gate of 0 is no minimum, and a stop 0% below entry is break-even.
 
 Revision ID: a8d4f16b92c7
-Revises: f3b7d21a6c94
+Revises: c5e9a73d41b8
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "a8d4f16b92c7"
-down_revision = "f3b7d21a6c94"
+# Chained AFTER subscriber max_per_order rather than beside it. Both were
+# written against f3b7d21a6c94 on separate branches, which left two alembic
+# heads once they met — and "alembic upgrade head" refuses to run at all
+# with more than one. c5e9a73d41b8 is already the head on this PR's base
+# branch, so this one goes on top of it and the chain stays linear.
+down_revision = "c5e9a73d41b8"
 branch_labels = None
 depends_on = None
 
