@@ -511,7 +511,14 @@ def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) ->
     return qty
 
 
-def cancel_unfilled_entries(db: Session, user: User, payload) -> list[uuid.UUID]:
+def cancel_unfilled_entries(
+    db: Session, user: User, *,
+    symbol: str,
+    instrument_type: "InstrumentType | None" = None,
+    strike: "Decimal | None" = None,
+    right: "OptionRight | None" = None,
+    expiry: "date | None" = None,
+) -> list[uuid.UUID]:
     """Cancel this contract's still-working, unfilled Discord ENTRY orders.
 
     An exit alert means the alert cycle has moved on to getting OUT. An entry
@@ -519,6 +526,13 @@ def cancel_unfilled_entries(db: Session, user: User, payload) -> list[uuid.UUID]
     the trader is already exiting, and leaving it resting means it can still
     fill later into a trade nobody wants: bought at the top of a move whose exit
     signal has already been given, with no rung of the ladder left to protect it.
+
+    Matched on what the ALERT ACTUALLY STATES, not on a fully resolved contract.
+    That distinction is the whole point: an exit alert routinely names no expiry
+    ("$NVDA 225c +25%") and is normally resolved from the open position — but
+    when the entry never filled there IS no position, so resolution fails and a
+    contract-complete match would never find the very order this exists to
+    cancel. Every field left None widens the match rather than requiring NULL.
 
     Only UNFILLED entries. A partially filled one is a real position and belongs
     to the trim ladder, not here.
@@ -533,21 +547,27 @@ def cancel_unfilled_entries(db: Session, user: User, payload) -> list[uuid.UUID]
     from app.models.order import Order, OrderStatus  # noqa: PLC0415
     from sqlalchemy import select  # noqa: PLC0415
 
+    if not symbol:
+        return []
     working = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED)
-    entries = list(db.execute(
-        select(Order).where(
-            Order.user_id == user.id,
-            Order.parent_order_id.is_(None),          # the trader's own, not a mirror
-            Order.symbol == payload.symbol.upper(),
-            Order.instrument_type == payload.instrument_type,
-            Order.option_expiry.is_not_distinct_from(payload.option_expiry),
-            Order.option_strike.is_not_distinct_from(payload.option_strike),
-            Order.option_right.is_not_distinct_from(payload.option_right),
-            Order.side == OrderSide.BUY,
-            Order.is_closing.is_(False),
-            Order.status.in_(working),
-        )
-    ).scalars())
+    where = [
+        Order.user_id == user.id,
+        Order.parent_order_id.is_(None),          # the trader's own, not a mirror
+        Order.symbol == symbol.upper(),
+        Order.side == OrderSide.BUY,
+        Order.is_closing.is_(False),
+        Order.status.in_(working),
+    ]
+    # Narrow by each field the alert named, and only those.
+    if instrument_type is not None:
+        where.append(Order.instrument_type == instrument_type)
+    if strike is not None:
+        where.append(Order.option_strike == strike)
+    if right is not None:
+        where.append(Order.option_right == right)
+    if expiry is not None:
+        where.append(Order.option_expiry == expiry)
+    entries = list(db.execute(select(Order).where(*where)).scalars())
 
     cancelled: list[uuid.UUID] = []
     for entry in entries:
@@ -577,6 +597,40 @@ def cancel_unfilled_entries(db: Session, user: User, payload) -> list[uuid.UUID]
     if cancelled:
         db.commit()
     return cancelled
+
+
+def cancel_stale_entries_for_signal(db: Session, user: User, signal: dict) -> list[uuid.UUID]:
+    """Cancel the unfilled entries an exit alert supersedes, from the RAW signal.
+
+    Called BEFORE :func:`resolve`, and that order is the whole fix. An exit
+    alert usually names only part of the contract ("$NVDA 225c +25%") and
+    resolve() fills the rest in from the open position — so when the entry never
+    filled, resolve() refuses ("you hold no matching position") and anything
+    downstream of it never runs. Cancelling from a resolved payload therefore
+    could not fire in the one case it exists for: the entry is still resting
+    precisely BECAUSE there is no position yet.
+
+    Matching only on the fields the alert states can cancel more than one
+    resting entry when several expiries of the same strike are open at once.
+    That is the right trade: these channels work one contract at a time, and a
+    stale bid left live is the worse outcome.
+
+    No-ops on anything that isn't a SELL. Never a close of a close.
+    """
+    if (signal.get("action") or "").upper() != "SELL":
+        return []
+    symbol = (signal.get("symbol") or "").upper()
+    if not symbol:
+        return []
+    is_option = (signal.get("asset_type") or "OPTION").upper() == "OPTION"
+    return cancel_unfilled_entries(
+        db, user,
+        symbol=symbol,
+        instrument_type=InstrumentType.OPTION if is_option else InstrumentType.STOCK,
+        strike=_dec(signal.get("strike")) if is_option else None,
+        right=_right(signal.get("option_type")) if is_option else None,
+        expiry=_date(signal.get("expiration")) if is_option else None,
+    )
 
 
 def order_value(qty: Decimal, limit_price: Decimal, is_option: bool) -> Decimal:
@@ -704,5 +758,6 @@ def already_executed(msg: DiscordMessage) -> bool:
 
 __all__ = [
     "ExecutionRefused", "Resolved", "already_executed",
+    "cancel_stale_entries_for_signal", "cancel_unfilled_entries",
     "mark_executed", "mark_failed", "resolve",
 ]
