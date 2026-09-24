@@ -73,6 +73,27 @@ _ENTRY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# SPY 09/23 772P @.83   —   the EXPIRY BEFORE the strike.
+#
+# A second house style, not a variation of the one above: JPM's channel writes
+# the date where _ENTRY_RE expects the strike, so that pattern simply does not
+# match and a real buy alert was read as ordinary chatter.
+#
+# Kept as its own pattern rather than floating the expiry inside _ENTRY_RE, so
+# each pattern pins it to one position and stays readable. What keeps chatter
+# out is unchanged and still lives in _is_entry: an entry needs a price or an
+# expiry, and a trailing signed percentage makes it a P&L update. The expiry is
+# required here only because it is what identifies this ordering — _ENTRY_RE is
+# tried first, so the two cannot disagree about a line.
+_ENTRY_EXP_FIRST_RE = re.compile(
+    rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
+    rf"(?P<exp>[0O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+"
+    rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
+    rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
+    rf"(?P<trailing>[\s,;].*)?$",
+    re.IGNORECASE,
+)
+
 # ✂️ $SPY 769c +361%   (price optional, percent optional)
 _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
@@ -185,6 +206,10 @@ class CompactAlertParser(Parser):
             or (_ADD_RE.match(ln) and _is_add(_ADD_RE.match(ln)))
             or (_has_marker(ln) and _EXIT_RE.match(ln))
             or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln)))
+            or (
+                _ENTRY_EXP_FIRST_RE.match(ln)
+                and _is_entry(_ENTRY_EXP_FIRST_RE.match(ln))
+            )
             for ln in self._lines(message)
         )
 
@@ -231,7 +256,7 @@ class CompactAlertParser(Parser):
                 sig, err = self._close_arrow(m)
                 (signals.append(sig) if sig else errors.append(err))
                 continue
-            m = _ENTRY_RE.match(line)
+            m = _ENTRY_RE.match(line) or _ENTRY_EXP_FIRST_RE.match(line)
             if m and _is_entry(m):
                 sig, err = self._entry(m, message)
                 (signals.append(sig) if sig else errors.append(err))
