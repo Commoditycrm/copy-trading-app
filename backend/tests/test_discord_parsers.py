@@ -756,3 +756,52 @@ def test_a_sell_is_not_flagged():
     r = parse_message(text("SELL AAPL 250C 09/18 @ 3.00 going light"))
     assert r.status is ParseStatus.PARSED
     assert r.signals[0].half_size is False
+
+
+# ── expiry BEFORE the strike (JPM's house style) ─────────────────────────────
+
+def test_an_alert_with_the_expiry_before_the_strike_parses():
+    """SPY 09/23 772P @.83 — the date sits where _ENTRY_RE expects the strike,
+    so that pattern never matched and a real buy alert was read as chatter."""
+    s = parse_message(text("SPY 09/23 772P @.83")).signal
+    assert s.symbol == "SPY"
+    assert s.strike == Decimal("772")
+    assert s.option_type.value == "PUT"
+    assert s.expiration == date(2026, 9, 23)
+    assert s.limit_price == Decimal("0.83")
+
+
+def test_it_reads_the_same_from_an_embed():
+    """The channel posts it as an embed titled "Open", which is where the whole
+    alert actually lives."""
+    r = parse_message(card("Open", "SPY 09/23 772P @.83"))
+    assert r.status is ParseStatus.PARSED
+    assert r.signals[0].strike == Decimal("772")
+
+
+@pytest.mark.parametrize("body", [
+    "$SPY 09/23 772P @.83",       # $ on the ticker
+    "SPY 0DTE 772P @.83",         # 0DTE in the expiry slot
+    "AAPL 09/25 250 CALL @1.20",  # spelled-out right
+])
+def test_the_ordering_works_with_the_usual_variations(body):
+    assert parse_message(text(body)).status is ParseStatus.PARSED
+
+
+def test_the_original_ordering_still_parses():
+    """The two patterns coexist — a date cannot be read as a strike and a
+    strike cannot be read as a date, so no line matches both."""
+    s = parse_message(text("SPY 772P 09/23 @.83")).signal
+    assert s.strike == Decimal("772") and s.expiration == date(2026, 9, 23)
+
+
+@pytest.mark.parametrize("body", [
+    "SPY 09/23 772P +41%",        # a running P&L update, not an entry
+    "SPY 09/23 up 30% nice",
+    "see you 09/23",
+    "target 09/23 772",
+])
+def test_it_does_not_turn_chatter_into_an_order(body):
+    """The extra ordering must not widen what counts as a trade — a trailing
+    signed percentage is a P&L update and a date in prose is just a date."""
+    assert parse_message(text(body)).status is not ParseStatus.PARSED
