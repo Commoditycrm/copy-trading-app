@@ -87,3 +87,18 @@ def test_an_empty_page_does_not_query_at_all():
     db = _DB([])
     _attach_discord_channel(db, [])
     assert db.queries == 0
+
+
+# ── a display column must not be able to break the table ────────────────────
+
+class _BrokenDB:
+    def execute(self, stmt):
+        raise RuntimeError("database hiccup")
+
+
+def test_a_query_failure_leaves_the_column_blank_not_the_table_broken():
+    """The order history is how a trader sees and cancels working orders. A
+    decorative column failing must not take that down."""
+    o = _order()
+    _attach_discord_channel(_BrokenDB(), [o])     # must not raise
+    assert o.discord_channel is None

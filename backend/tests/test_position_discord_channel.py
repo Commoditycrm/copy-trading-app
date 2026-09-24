@@ -113,3 +113,27 @@ def test_no_positions_does_not_query():
     db = _DB([])
     _attach_position_channels(db, USER, [])
     assert db.queries == 0
+
+
+def test_a_query_failure_does_not_break_the_positions_endpoint():
+    """This endpoint is how a trader CLOSES a position. The unreachable-account
+    handling exists so one bad broker cannot blank the list; a display column
+    must not undo that for a different reason."""
+    import app.api.positions as mod
+
+    class _Broken:
+        def execute(self, stmt):
+            raise RuntimeError("database hiccup")
+
+    import inspect
+    import re
+
+    src = inspect.getsource(mod.list_positions)
+    # The CALL has to be inside a try. Checking merely that the function
+    # contains "except Exception" proves nothing — it already has several, for
+    # the unreachable-broker handling.
+    guarded = re.search(
+        r"try:\s*\n\s*_attach_position_channels\([^\n]*\)\s*\n\s*except Exception",
+        src,
+    )
+    assert guarded, "the channel attach must not be able to 500 the positions endpoint"

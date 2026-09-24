@@ -135,6 +135,10 @@ def _attach_reentry_flag(db: Session, user: User, orders: list[Order]) -> None:
 def _attach_discord_channel(db: Session, orders: list[Order]) -> None:
     """Set the transient .discord_channel on orders a Discord alert placed.
 
+    Never raises: this is a display column and the order history is how a
+    trader sees and cancels their working orders. A failure here leaves the
+    column blank rather than taking the table down.
+
     ONE query for the whole page, keyed by order id — a per-row lookup would be
     an N+1 across a table that routinely shows hundreds of rows.
 
@@ -154,6 +158,19 @@ def _attach_discord_channel(db: Session, orders: list[Order]) -> None:
     by_id = {o.id: o for o in orders}
     for o in orders:
         o.discord_channel = None
+    try:
+        _fill_channels(db, by_id)
+    except Exception:  # noqa: BLE001
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).warning(
+            "trades: could not attach discord channels", exc_info=True
+        )
+
+
+def _fill_channels(db: Session, by_id: dict) -> None:
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+
     rows = db.execute(
         select(DiscordMessage.order_id, DiscordAlertSource.label,
                DiscordAlertSource.channel_name)
