@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     # real-time (requires a paid Alpaca market-data subscription, e.g. Algo
     # Trader Plus). Set ALPACA_DATA_FEED=sip where subscribed.
     alpaca_data_feed: str = "iex"
+    # Centralized market-data stream: one Alpaca SIP WebSocket (a dedicated PAID
+    # account's keys — NEVER a subscriber's) streams live prices into Redis, read
+    # by ALL users/brokers. Worker-only, gated OFF by default. Set the keys +
+    # ALPACA_MARKET_STREAM_ENABLED=true once verified on QA. See
+    # services/market_data_stream.py.
+    alpaca_data_api_key: str = ""
+    alpaca_data_api_secret: str = ""
+    alpaca_market_stream_enabled: bool = False
     # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
     broker_concurrency_alpaca: int = 200
     # SnapTrade throttles order placement HARD (esp. multi-leg/option
