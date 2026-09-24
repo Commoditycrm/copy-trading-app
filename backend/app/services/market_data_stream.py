@@ -1,0 +1,259 @@
+"""Centralized live market-data stream (phase 1).
+
+One Alpaca SIP WebSocket — authenticated with a dedicated PAID account's keys,
+NEVER a subscriber's — streams live stock quotes into Redis. Every user, on every
+broker, then reads the SAME price from the cache (``get_live_price``) instead of
+each broker polling its own quote endpoint. This is the ingest + central-store
+half; rewiring the price readers to ``get_live_price`` is phase 2.
+
+Why it scales: the feed carries the UNION of symbols anyone holds/trades (deduped,
+~dozens), so the cost is O(unique symbols) — flat whether there are 100 or 10,000
+subscribers — versus today's O(subscribers × symbols) per-broker polling that
+blows SnapTrade's shared 250/min quota at ~100 subs.
+
+Worker-only. Gated behind ``settings.alpaca_market_stream_enabled`` (default OFF)
+plus non-empty keys, so it is inert until explicitly enabled after QA.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from sqlalchemy import select
+
+from app.database import SessionLocal
+from app.models.order import InstrumentType, Order, OrderStatus
+
+log = logging.getLogger(__name__)
+
+# Redis key per symbol; short TTL so a symbol we stop streaming goes stale on its
+# own rather than serving a frozen price forever.
+_PRICE_KEY = "mdprice:{}"
+_PRICE_TTL_S = 300
+# A cached price older than this is treated as stale (get_live_price returns None,
+# so the caller falls back to its existing REST path). Streams tick continuously
+# for liquid names; a gap this long means the feed or the symbol went quiet.
+_MAX_AGE_S = 15.0
+# How often the supervisor re-computes the held/traded symbol set.
+_REFRESH_S = 60.0
+
+_WORKING = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+_task: "asyncio.Task | None" = None
+_stream: Any = None            # the live StockDataStream (for stop on restart)
+_stream_task: "asyncio.Task | None" = None
+_current_symbols: frozenset[str] = frozenset()
+# Bumped on every (re)start so a late callback from an old stream is ignored.
+_generation = 0
+
+
+def _enabled() -> bool:
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    return bool(
+        s.alpaca_market_stream_enabled
+        and s.alpaca_data_api_key
+        and s.alpaca_data_api_secret
+    )
+
+
+# ── central store: Redis price cache ────────────────────────────────────────
+def _set_price(symbol: str, price: Decimal) -> None:
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    try:
+        payload = json.dumps({"p": str(price), "t": int(time.time() * 1000)})
+        get_sync_redis().set(_PRICE_KEY.format(symbol.upper()), payload, ex=_PRICE_TTL_S)
+    except Exception:  # noqa: BLE001
+        pass  # best-effort cache; never let a Redis blip kill the stream
+
+
+def get_live_price(symbol: str, max_age_s: float = _MAX_AGE_S) -> Decimal | None:
+    """The centralized live price for ``symbol`` (stocks), or None if we have no
+    fresh cached quote — in which case the caller uses its existing REST path.
+    Read by any user, any broker; safe to call from sync or async code."""
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    try:
+        raw = get_sync_redis().get(_PRICE_KEY.format(symbol.upper()))
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        age = time.time() - (float(obj["t"]) / 1000.0)
+        if age > max_age_s:
+            return None
+        return Decimal(str(obj["p"]))
+    except (InvalidOperation, ValueError, KeyError, TypeError, Exception):  # noqa: BLE001
+        return None
+
+
+# ── symbol set: everything anyone holds or is working ───────────────────────
+def _compute_symbols() -> set[str]:
+    """Union of STOCK symbols with a live net position (any user) or a working
+    order — the only symbols the stream subscribes to. Defensive so a bad query
+    never crashes the supervisor (it just keeps the previous set)."""
+    from sqlalchemy import case, func  # noqa: PLC0415
+    from app.models.order import OrderSide  # noqa: PLC0415
+
+    syms: set[str] = set()
+    with SessionLocal() as db:
+        # Held: net filled qty per (user, symbol) != 0 → still holding it.
+        net = func.sum(
+            case((Order.side == OrderSide.BUY, Order.filled_quantity),
+                 else_=-Order.filled_quantity)
+        )
+        held_rows = db.execute(
+            select(Order.symbol)
+            .where(
+                Order.instrument_type == InstrumentType.STOCK,
+                Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+            )
+            .group_by(Order.user_id, Order.symbol)
+            .having(net != 0)
+        ).scalars().all()
+        # About-to-hold: any working stock order.
+        working_rows = db.execute(
+            select(Order.symbol)
+            .where(
+                Order.instrument_type == InstrumentType.STOCK,
+                Order.status.in_(_WORKING),
+            )
+            .distinct()
+        ).scalars().all()
+    for sym in list(held_rows) + list(working_rows):
+        if sym:
+            syms.add(sym.upper())
+    return syms
+
+
+# ── the stream ──────────────────────────────────────────────────────────────
+def _quote_mid(q: Any) -> Decimal | None:
+    bid = getattr(q, "bid_price", None)
+    ask = getattr(q, "ask_price", None)
+    try:
+        if bid and ask and bid > 0 and ask > 0:
+            return (Decimal(str(bid)) + Decimal(str(ask))) / Decimal(2)
+        if ask and ask > 0:
+            return Decimal(str(ask))
+        if bid and bid > 0:
+            return Decimal(str(bid))
+    except (InvalidOperation, ValueError):
+        return None
+    return None
+
+
+async def _run_stream(symbols: frozenset[str], generation: int) -> None:
+    """Build + run the Alpaca StockDataStream for ``symbols`` (blocking run in a
+    thread, like the Webull gRPC listener). Writes each quote's mid to Redis."""
+    global _stream
+    from alpaca.data.enums import DataFeed  # noqa: PLC0415
+    from alpaca.data.live import StockDataStream  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    feed = DataFeed.SIP if s.alpaca_data_feed.lower() == "sip" else DataFeed.IEX
+    client = StockDataStream(
+        s.alpaca_data_api_key, s.alpaca_data_api_secret, feed=feed,
+    )
+    _stream = client
+
+    async def _on_quote(q: Any) -> None:
+        if generation != _generation:
+            return  # a newer stream superseded us
+        sym = getattr(q, "symbol", None)
+        if not sym:
+            return
+        px = _quote_mid(q)
+        if px is not None:
+            _set_price(sym, px)
+
+    client.subscribe_quotes(_on_quote, *symbols)
+    log.info("market_data_stream: subscribing to %d symbols (feed=%s)", len(symbols), feed)
+    # run() blocks until the socket closes (or client.stop() is called on restart).
+    await asyncio.to_thread(client.run)
+
+
+def _stop_stream() -> None:
+    global _stream
+    c = _stream
+    _stream = None
+    if c is not None:
+        try:
+            c.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _supervise() -> None:
+    """Recompute the symbol set every _REFRESH_S; (re)start the stream when it
+    changes. Restart-on-change avoids cross-thread subscribe/unsubscribe races —
+    holdings change rarely enough that an occasional reconnect is cheap."""
+    global _stream_task, _current_symbols, _generation
+    while True:
+        try:
+            if _enabled():
+                symbols = frozenset(await asyncio.to_thread(_compute_symbols))
+                need_restart = (
+                    symbols != _current_symbols
+                    or _stream_task is None
+                    or _stream_task.done()
+                )
+                if symbols and need_restart:
+                    _stop_stream()
+                    if _stream_task is not None and not _stream_task.done():
+                        _stream_task.cancel()
+                    _generation += 1
+                    _current_symbols = symbols
+                    loop = asyncio.get_running_loop()
+                    _stream_task = loop.create_task(_run_stream(symbols, _generation))
+                elif not symbols:
+                    _stop_stream()
+                    _current_symbols = frozenset()
+            else:
+                _stop_stream()
+                _current_symbols = frozenset()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("market_data_stream supervisor pass failed")
+        await asyncio.sleep(_REFRESH_S)
+
+
+def start_market_data_stream() -> None:
+    """Spawn the supervisor. Idempotent, worker-only. Safe to call
+    unconditionally — it re-checks the flag+keys each pass and runs nothing while
+    disabled."""
+    global _task
+    if _task is not None and not _task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.warning("market_data_stream: no running loop; not starting")
+        return
+    _task = loop.create_task(_supervise())
+    log.info("market_data_stream: supervisor started (enabled=%s)", _enabled())
+
+
+async def stop_market_data_stream() -> None:
+    global _task, _stream_task
+    _stop_stream()
+    for t in (_stream_task, _task):
+        if t is not None and not t.done():
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+    _task = None
+    _stream_task = None
+
+
+__all__ = ["start_market_data_stream", "stop_market_data_stream", "get_live_price"]
