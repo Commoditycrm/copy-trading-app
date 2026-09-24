@@ -805,3 +805,57 @@ def test_it_does_not_turn_chatter_into_an_order(body):
     """The extra ordering must not widen what counts as a trade — a trailing
     signed percentage is a P&L update and a date in prose is just a date."""
     assert parse_message(text(body)).status is not ParseStatus.PARSED
+
+
+# ── 1DTE: the next trading day ───────────────────────────────────────────────
+
+def _at(y, m, d):
+    return datetime(y, m, d, 14, 30, tzinfo=timezone.utc)
+
+
+def test_1dte_resolves_to_the_next_day():
+    """AAPL 337.5C 1DTE @2.19 — the whole alert was ignored because the expiry
+    token only accepted 0DTE, so no pattern claimed the line."""
+    s = parse_message(text("AAPL 337.5C 1DTE @2.19", posted_at=_at(2026, 9, 24))).signal
+    assert s.symbol == "AAPL"
+    assert s.strike == Decimal("337.5")
+    assert s.option_type.value == "CALL"
+    assert s.expiration == date(2026, 9, 25)
+    assert s.limit_price == Decimal("2.19")
+
+
+def test_a_friday_1dte_is_monday_not_saturday():
+    """Nothing expires on a Saturday — "next trading day" is the point of it."""
+    s = parse_message(text("AAPL 337.5C 1DTE @2.19", posted_at=_at(2026, 9, 25))).signal
+    assert s.expiration == date(2026, 9, 28)      # Friday -> Monday
+
+
+def test_a_weekend_alert_still_lands_on_monday():
+    s = parse_message(text("AAPL 337.5C 1DTE @2.19", posted_at=_at(2026, 9, 26))).signal
+    assert s.expiration == date(2026, 9, 28)      # Saturday -> Monday
+
+
+def test_a_trailing_mention_does_not_break_it():
+    """The alert arrives with the author tagged on the end."""
+    s = parse_message(text("AAPL 337.5C 1DTE @2.19 @Mark", posted_at=_at(2026, 9, 24))).signal
+    assert s.expiration == date(2026, 9, 25)
+    assert s.limit_price == Decimal("2.19")       # @Mark is not read as a price
+
+
+def test_0dte_is_unchanged():
+    """Resolved against the MESSAGE's timestamp, so re-reading an old alert
+    does not move its expiry."""
+    s = parse_message(text("AAPL 337.5C 0DTE @2.19", posted_at=_at(2026, 9, 24))).signal
+    assert s.expiration == date(2026, 9, 24)
+
+
+def test_the_expiry_first_ordering_takes_1dte_too():
+    s = parse_message(text("AAPL 1DTE 337.5C @2.19", posted_at=_at(2026, 9, 24))).signal
+    assert s.expiration == date(2026, 9, 25)
+
+
+@pytest.mark.parametrize("body", ["AAPL 337.5C 2DTE @2.19", "AAPL 337.5C 5DTE @2.19"])
+def test_other_dte_counts_are_not_guessed(body):
+    """Only 0DTE and 1DTE are used by these channels. Anything else is left
+    unparsed rather than resolved to a date the alert never named."""
+    assert parse_message(text(body, posted_at=_at(2026, 9, 24))).status is not ParseStatus.PARSED
