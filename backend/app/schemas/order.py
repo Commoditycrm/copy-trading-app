@@ -149,6 +149,12 @@ class OrderOut(BaseModel):
     # True when this order was placed by a Sell-All Re-Enter (from a snapshot).
     # Transient flag attached by trades.py; not a DB column.
     is_reentry: bool = False
+    # Which Discord channel's alert produced this order, for the history table.
+    # None for everything else — trade panel, copy mirrors, broker-app imports —
+    # which is most orders. Not a column on Order: the link is
+    # orders <- discord_messages.order_id -> source, and it is attached per
+    # request by _attach_discord_channel.
+    discord_channel: str | None = None
     fills: list[FillOut] = []
 
     model_config = {"from_attributes": True}

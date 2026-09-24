@@ -26,6 +26,10 @@ class PositionOut(BaseModel):
     option_expiry: date | None
     option_strike: Decimal | None
     option_right: OptionRight | None
+    # Which Discord channel's alert OPENED this position, matched by contract
+    # against the most recent Discord entry. None for positions opened any
+    # other way — trade panel, copy mirror, or bought in the broker's own app.
+    discord_channel: str | None = None
 
 
 class UnreachableAccount(BaseModel):
