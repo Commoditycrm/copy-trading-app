@@ -1046,6 +1046,32 @@ def _execute_signal(
     )
 
     signal = msg.parsed_signal or {}
+
+    # An entry that never filled — even after the +10% retry — is a bid for a
+    # position the trader is already exiting. Left resting it can still fill
+    # later, buying into a move whose exit signal has been given, with no rung
+    # of the ladder left to protect it. Cancel it, and cascade to subscribers'
+    # mirrors, which are resting on the same stale bid.
+    #
+    # BEFORE resolve(), not after: an exit alert usually names only part of the
+    # contract and resolve() completes it from the open position, so with an
+    # unfilled entry there IS no position, resolve() refuses, and anything after
+    # it never runs. That is exactly the case this exists for.
+    #
+    # Only ever fires on the FIRST exit alert for the contract: it cancels what
+    # it finds, so by the second there is nothing left.
+    try:
+        for _oid in discord_execution.cancel_stale_entries_for_signal(db, user, signal):
+            from app.api.trades import _run_cancel_fanout_in_background  # noqa: PLC0415
+            if background is not None:
+                background.add_task(_run_cancel_fanout_in_background, _oid)
+            else:
+                _run_cancel_fanout_in_background(_oid)
+    except Exception:  # noqa: BLE001
+        # Never let this stop the exit itself — getting OUT is the point of the
+        # alert, and a stray resting entry is the lesser problem.
+        log.exception("discord: stale-entry cancel failed for alert %s", msg.id)
+
     try:
         resolved = discord_execution.resolve(db, user, signal, sizing)
     except discord_execution.ExecutionRefused as exc:
@@ -1068,30 +1094,6 @@ def _execute_signal(
     is_trim = False
     trim_guard = None
     if resolved.is_closing:
-        # An entry that never filled — even after the +10% retry — is a bid for
-        # a position the trader is already exiting. Left resting it can still
-        # fill later, buying into a move whose exit signal has been given, with
-        # no rung of the ladder left to protect it. Cancel it before the rung
-        # runs, and cascade to the subscribers' mirrors, which are resting on
-        # the same stale bid.
-        #
-        # Only ever fires on the FIRST exit alert for the contract: it cancels
-        # what it finds, so by the second there is nothing left.
-        try:
-            stale = discord_execution.cancel_unfilled_entries(db, user, p)
-            for _oid in stale:
-                from app.api.trades import (  # noqa: PLC0415
-                    _run_cancel_fanout_in_background,
-                )
-                if background is not None:
-                    background.add_task(_run_cancel_fanout_in_background, _oid)
-                else:
-                    _run_cancel_fanout_in_background(_oid)
-        except Exception:  # noqa: BLE001
-            # Never let this stop the exit itself — getting OUT is the point of
-            # the alert, and a stray resting entry is the lesser problem.
-            log.exception("discord: stale-entry cancel failed for %s", p.symbol)
-
         cfg = guards.TrimConfig(
             profit_gate_pct=_setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
             stop_pct=_setting(ts_for_sizing, "discord_trim_stop_pct", "25"),
