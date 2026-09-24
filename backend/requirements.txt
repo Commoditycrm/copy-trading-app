@@ -23,6 +23,13 @@ redis==5.2.0
 # in memory, so a 50k-row export doesn't balloon the worker.
 openpyxl==3.1.5
 alpaca-py==0.33.0
+# Pin websockets: alpaca-py 0.33.0's DATA stream (alpaca.data.live) passes
+# extra_headers to websockets.connect(), which websockets removed in v14 — with
+# an unpinned websockets pip grabs 17.x and the market-data stream can't open the
+# socket ("create_connection() got an unexpected keyword argument 'extra_headers'").
+# 12.x still supports it. The alpaca TRADING stream is unaffected (different code
+# path); uvicorn[standard] works fine on 12.x too.
+websockets==12.0
 # REMOVED 2026-05-31 (security + architecture): webull==0.6.1 — unofficial
 # reverse-engineered SDK, root cause of the May 2026 prod supply-chain
 # compromise (outbound port-scan / Kinsing signature). The package executed
