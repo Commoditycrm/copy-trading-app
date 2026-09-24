@@ -200,10 +200,28 @@ def test_payload_shape_separates_empty_from_unreachable():
 
 # ── the default response shape must not change ──────────────────────────────
 class _StubDB:
-    def __init__(self, accts): self._accts = accts
-    def execute(self, *_a, **_k): return self
-    def scalars(self): return self
-    def all(self): return self._accts
+    """Answers the broker-account lookup and nothing else.
+
+    The endpoint runs more than one query, and they are distinguishable by
+    shape: the account lookup goes through .scalars().all(), while row queries
+    (e.g. the Discord-channel attach) call .all() directly. Returning accounts
+    for BOTH made an unrelated query receive _StubAcct objects and fail to
+    unpack — a stub artefact, not a defect in the code under test."""
+
+    def __init__(self, accts):
+        self._accts = accts
+        self._scalared = False
+
+    def execute(self, *_a, **_k):
+        self._scalared = False
+        return self
+
+    def scalars(self):
+        self._scalared = True
+        return self
+
+    def all(self):
+        return self._accts if self._scalared else []
 
 
 class _StubAcct:

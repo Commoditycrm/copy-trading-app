@@ -175,6 +175,10 @@ export interface Order {
   realized_pnl?: string | null;
   /** True when this order was placed by a Sell-All Re-Enter (from a snapshot). */
   is_reentry?: boolean;
+  /** Discord channel whose alert placed this order. Null for everything
+   *  else — trade panel, copy mirrors, broker-app imports — which is
+   *  most orders. Attached per request, not a column on the order. */
+  discord_channel?: string | null;
   fills: Fill[];
 }
 
@@ -206,6 +210,10 @@ export interface Position {
   instrument_type: InstrumentType;
   quantity: string;                  // signed: positive = long, negative = short
   avg_entry_price: string | null;
+  /** Discord channel whose alert OPENED this position, matched by
+   *  contract against the most recent Discord entry. Null for positions
+   *  opened any other way. */
+  discord_channel?: string | null;
   current_price: string | null;
   market_value: string | null;
   unrealized_pnl: string | null;

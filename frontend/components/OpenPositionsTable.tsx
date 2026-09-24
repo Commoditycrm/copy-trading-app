@@ -4,7 +4,7 @@ import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef,
 import { motion } from "framer-motion";
 import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api } from "@/lib/api";
-import { getSnapshot, setSnapshot } from "@/lib/swrCache";
+import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -12,7 +12,7 @@ import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { BrokerAccount, Order, Position, PositionsPayload, UnreachableAccount } from "@/lib/types";
+import type { BrokerAccount, Order, Position, PositionsPayload, UnreachableAccount, User } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -109,6 +109,27 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
   function OpenPositionsTable({ className, fillHeight }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
     // return nav, then refresh() below revalidates. Cleared on logout.
+    // The Channel column is only meaningful to a trader who has Discord — for
+    // everyone else every row reads "—", a column of nothing. Both pages that
+    // host this table already load the user into the shared snapshot, so this
+    // is normally free; the fetch is only for a cold start (a hard refresh
+    // straight onto the trade panel).
+    const [showChannel, setShowChannel] = useState<boolean>(
+      () => !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_enabled,
+    );
+    useEffect(() => {
+      if (getSnapshot<User>(USER_SNAPSHOT_KEY)) return;
+      let cancelled = false;
+      api<User>("/api/auth/me")
+        .then((u) => {
+          if (cancelled) return;
+          setSnapshot(USER_SNAPSHOT_KEY, u);
+          setShowChannel(!!u.discord_enabled);
+        })
+        .catch(() => {});   // the table still works without it; the column hides
+      return () => { cancelled = true; };
+    }, []);
+
     const [positions, setPositions] = useState<Position[]>(() => getSnapshot<PosSnap>(POS_KEY)?.positions ?? []);
     const [orders, setOrders] = useState<Order[]>(() => getSnapshot<PosSnap>(POS_KEY)?.orders ?? []);
     // Today's realized P&L (market tz), fetched alongside positions for the
@@ -441,7 +462,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       );
     };
 
-    const COLSPAN = 21;  // +Reference (PDC) +P&L %
+    // Must equal the number of <Th> cells — and the number of <td> in a data
+    // row — because it sizes BOTH the loading skeleton and the empty-state
+    // row. It had drifted to 21 against 18 real columns, so the skeleton
+    // rendered three phantom cells wider than the header. Channel is
+    // conditional, so this is too.
+    const COLSPAN = showChannel ? 19 : 18;
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -529,6 +555,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
+                  {showChannel && <Th label="Channel" title="Discord channel whose alert opened this position" />}
                   <Th label="Symbol" sortKey="symbol" />
                   <Th label="Qty" sortKey="quantity" />
                   <Th label="Side" />
@@ -590,6 +617,19 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   return (
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
+                        {/* Only a Discord alert has a channel. A position
+                            opened from the trade panel, as a copy mirror, or in
+                            the broker's own app shows a dash — an empty cell
+                            would read as still loading. */}
+                        {showChannel && (
+                          <td
+                            className="px-5 py-3.5 whitespace-nowrap"
+                            style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
+                            title={p.discord_channel ?? undefined}
+                          >
+                            {p.discord_channel || "—"}
+                          </td>
+                        )}
                         <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                           {/* gap-1.5 = 6px between glyph and symbol. */}
                           <span className="inline-flex items-center gap-1.5">

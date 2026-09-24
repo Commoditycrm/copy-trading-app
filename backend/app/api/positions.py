@@ -170,6 +170,8 @@ def list_positions(
                 detail=_unreachable_detail(exc),
             ))
             continue
+    # After every account's positions are in, so one query covers them all.
+    _attach_position_channels(db, user.id, out)
     if detail:
         return PositionsPayload(positions=out, unreachable=unreachable)
     return out
@@ -435,6 +437,71 @@ _REENTRY_WORKING = {
     OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED, OrderStatus.RETRY_PENDING,
 }
+
+
+def _attach_position_channels(db: Session, user_id, positions: list) -> None:
+    """Set .discord_channel on positions a Discord alert opened.
+
+    A position is the broker's, not ours, so there is no order id on it — the
+    link has to be made by CONTRACT. For each held contract we take the most
+    recent Discord ENTRY, and its channel.
+
+    ONE query, narrowed to the symbols actually held, so a trader with a long
+    Discord history does not pay for all of it on every positions refresh —
+    this endpoint is called up to four times per order event.
+
+    "Most recent" matters: re-entering the same contract from a different
+    channel should show the channel that opened the position you are holding
+    NOW, not the first one that ever traded it.
+    """
+    if not positions:
+        return
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderSide, OrderStatus  # noqa: PLC0415
+    from sqlalchemy import func  # noqa: PLC0415
+
+    for p in positions:
+        p.discord_channel = None
+    symbols = {(p.symbol or "").upper() for p in positions if p.symbol}
+    if not symbols:
+        return
+
+    rows = db.execute(
+        select(
+            Order.symbol, Order.instrument_type, Order.option_expiry,
+            Order.option_strike, Order.option_right,
+            DiscordAlertSource.label, DiscordAlertSource.channel_name,
+        )
+        .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id,
+              isouter=True)
+        .where(
+            Order.user_id == user_id,
+            Order.symbol.in_(symbols),
+            Order.side == OrderSide.BUY,
+            Order.is_closing.is_(False),
+            Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+        )
+        # Newest first, so the first row seen per contract is the one that wins.
+        .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
+    ).all()
+
+    by_contract: dict = {}
+    for sym, itype, expiry, strike, right, label, channel_name in rows:
+        key = ((sym or "").upper(), itype, expiry, strike, right)
+        if key in by_contract:
+            continue                      # an older entry for the same contract
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name:
+            by_contract[key] = name
+
+    for p in positions:
+        key = (
+            (p.symbol or "").upper(), p.instrument_type,
+            p.option_expiry, p.option_strike, p.option_right,
+        )
+        p.discord_channel = by_contract.get(key)
 
 
 def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None, str | None]":

@@ -687,7 +687,15 @@ export default function TradesPage() {
     );
   };
 
-  const COLSPAN = 16;
+  // The Channel column is only meaningful to a trader who has Discord — for
+  // everyone else every row reads "—", which is a column of nothing. Same
+  // gate as the Discord tab above.
+  const showChannel = !!user?.discord_enabled;
+
+  // Must match the number of <Th> cells below — it sizes the loading skeleton
+  // and the empty-state row, both of which misalign if a column is added or
+  // removed without updating it. Channel is conditional, so this is too.
+  const COLSPAN = showChannel ? 17 : 16;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -889,6 +897,7 @@ export default function TradesPage() {
           <table className={`min-w-full text-sm ${!isLoading && gridRows.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
+                {showChannel && <Th label="Channel" />}
                 <Th label="Symbol" sortKey="symbol" />
                 <Th label="Qty" sortKey="quantity" />
                 <Th label="Side" />
@@ -981,6 +990,10 @@ export default function TradesPage() {
                   const dash = <span style={{ color: "var(--faint)" }}>—</span>;
                   return (
                     <tr key={f.key} style={{ background: "var(--panel-2)" }}>
+                      {/* A fill inherits its order's channel; repeating it on
+                          every sub-row would be noise. Empty, not missing — the
+                          cell has to exist or every later column shears left. */}
+                      {showChannel && <td className="px-5 py-2.5" />}
                       <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>
                         <span className="inline-flex items-center gap-1.5 pl-4">
                           <span style={{ color: "var(--faint)" }}>↳</span>
@@ -1023,32 +1036,20 @@ export default function TradesPage() {
                         background: flashId === o.id ? "var(--good-soft)" : undefined,
                       }}
                     >
+                      {/* Only a Discord alert has a channel. Everything else —
+                          trade panel, copy mirrors, broker-app imports — shows a
+                          dash rather than an empty cell, so "no channel" reads
+                          as an answer and not as a loading state. */}
+                      {showChannel && (
+                        <td
+                          className="px-5 py-3.5 whitespace-nowrap"
+                          style={{ color: o.discord_channel ? "var(--text)" : "var(--muted)" }}
+                          title={o.discord_channel ?? undefined}
+                        >
+                          {o.discord_channel || "—"}
+                        </td>
+                      )}
                       <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>
-                        {/* Which channel an alert came from, under the symbol
-                            rather than in its own column — it applies only to
-                            Discord rows, and a dedicated column would sit empty
-                            for every real order. */}
-                        {tab === "discord" && (() => {
-                          const sig = signalById.get(o.id);
-                          if (!sig) return null;
-                          // The name the trader gave this source when adding it,
-                          // not Discord's channel name — it's what they'll
-                          // recognise, and it stays stable if the channel is
-                          // renamed or the source is repointed elsewhere.
-                          return (
-                            <div
-                              className="text-[11px] font-normal mb-0.5 truncate"
-                              style={{ color: "var(--muted)", maxWidth: 200 }}
-                              title={
-                                sig.channel_name
-                                  ? `${sig.source_label} · #${sig.channel_name}`
-                                  : sig.source_label
-                              }
-                            >
-                              {sig.source_label}
-                            </div>
-                          );
-                        })()}
                         {/* gap-1.5 = 6px between glyph and symbol. */}
                         <span className="inline-flex items-center gap-1.5">
                           <PositionIcon kind={orderKind(o)} />
