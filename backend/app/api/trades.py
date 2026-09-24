@@ -132,6 +132,41 @@ def _attach_reentry_flag(db: Session, user: User, orders: list[Order]) -> None:
         o.is_reentry = str(o.id) in reentry_ids
 
 
+def _attach_discord_channel(db: Session, orders: list[Order]) -> None:
+    """Set the transient .discord_channel on orders a Discord alert placed.
+
+    ONE query for the whole page, keyed by order id — a per-row lookup would be
+    an N+1 across a table that routinely shows hundreds of rows.
+
+    Prefers the trader's own label for the source over Discord's raw channel
+    name, because that is what the Discord tab shows them and what they named
+    it. Both can be null on a source captured before either was known, in which
+    case the order reads as non-Discord rather than as an empty name.
+
+    Left as None for everything else — trade panel, copy mirrors, broker-app
+    imports — which is most orders.
+    """
+    if not orders:
+        return
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+
+    by_id = {o.id: o for o in orders}
+    for o in orders:
+        o.discord_channel = None
+    rows = db.execute(
+        select(DiscordMessage.order_id, DiscordAlertSource.label,
+               DiscordAlertSource.channel_name)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id,
+              isouter=True)
+        .where(DiscordMessage.order_id.in_(list(by_id)))
+    ).all()
+    for order_id, label, channel_name in rows:
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name and order_id in by_id:
+            by_id[order_id].discord_channel = name
+
+
 @router.get("/trades", response_model=list[OrderOut])
 def list_trades(
     db: Session = Depends(get_db),
@@ -160,6 +195,7 @@ def list_trades(
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
     _attach_reentry_flag(db, user, orders)
+    _attach_discord_channel(db, orders)
     return orders
 
 
@@ -229,6 +265,7 @@ def list_trades_page(
     )
     _attach_realized_pnl(db, user, rows)
     _attach_reentry_flag(db, user, rows)
+    _attach_discord_channel(db, rows)
     return Page(items=rows, total=total, limit=limit, offset=offset)
 
 
@@ -531,6 +568,9 @@ def get_trade(
     ).scalar_one_or_none()
     if not order or order.user_id != user.id:
         raise HTTPException(404, "not_found")
+    # Same shape as the list endpoints, so a row opened on its own shows the
+    # channel too rather than silently losing it.
+    _attach_discord_channel(db, [order])
     return order
 
 
