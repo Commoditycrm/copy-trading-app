@@ -450,6 +450,43 @@ async def _reconnect_watchdog(
                 return
 
 
+async def _reconnect_watchdog(
+    stream: Any,
+    trader_user_id: uuid.UUID,
+    stop: asyncio.Event,
+) -> None:
+    """Break out of alpaca-py's internal reconnect storm. Its ``_run_forever``
+    retries every 10ms with no backoff, so a persistent rejection (e.g. Alpaca
+    HTTP 429 on the connection) hammers ~100x/sec and never returns control to
+    ``_run_listener`` (whose own loop DOES back off). If the socket stays down
+    (``_running`` False) for a sustained window, we ask the stream to stop —
+    ``_run_forever`` then returns and the outer loop reconnects on its backoff.
+    Uses ``stop_ws()`` (a coroutine), not ``stop()``, which would deadlock: the
+    stream shares this event loop, and ``stop()`` blocks on ``.result()``."""
+    stuck = 0
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=2.0)
+            return  # clean connection torn down elsewhere
+        except asyncio.TimeoutError:
+            pass
+        if getattr(stream, "_running", False):
+            stuck = 0
+        else:
+            stuck += 1
+            if stuck >= 4:  # ~8s unable to establish → almost certainly 429
+                log.warning(
+                    "listener[%s] websocket stuck reconnecting (likely 429) — "
+                    "stopping it so the outer loop backs off instead of hammering",
+                    trader_user_id,
+                )
+                try:
+                    await stream.stop_ws()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+
 async def _listener_heartbeat(
     trader_user_id: uuid.UUID,
     stop: asyncio.Event,
