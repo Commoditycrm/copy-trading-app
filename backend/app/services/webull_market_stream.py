@@ -30,11 +30,26 @@ from app.services.market_data_stream import _compute_symbols, _set_price
 log = logging.getLogger(__name__)
 
 _REFRESH_S = 60.0
+# On repeated connect failures (e.g. bad/entitlement-less keys) back off the
+# retry cadence instead of hammering + spamming logs; reset on a good connect.
+_BACKOFF_MAX = 300.0
 _task: "asyncio.Task | None" = None
 _client: Any = None
 _current_symbols: frozenset[str] = frozenset()
 _generation = 0
+_fail_streak = 0
 _logged_sample = False  # one-time raw-message dump to learn the payload shape
+
+
+def _is_connected() -> bool:
+    """True when the MQTT client exists and its socket is live. The SDK creates
+    the client with reconnect_on_failure=False, so a dropped connection stays
+    dead until the supervisor restarts it — this is how we detect that."""
+    c = _client
+    try:
+        return bool(c is not None and c.is_connected())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _enabled() -> bool:
@@ -96,9 +111,11 @@ def _on_quotes_message(*args: Any) -> None:
         log.exception("webull_market_stream: message handler failed")
 
 
-def _run_stream(symbols: frozenset[str], generation: int) -> None:
+def _run_stream(symbols: frozenset[str], generation: int) -> bool:
     """Build the DataStreamingClient, subscribe to ``symbols`` (US stocks) and
-    start the MQTT loop. Non-blocking (paho loop runs on its own thread)."""
+    start the MQTT loop (non-blocking — paho runs on its own thread). Waits
+    briefly and returns whether the socket actually came up, so the supervisor
+    can back off on a persistent failure (bad/entitlement-less keys)."""
     global _client
     from webull.data.common.category import Category  # noqa: PLC0415
     from webull.data.data_streaming_client import DataStreamingClient  # noqa: PLC0415
@@ -135,6 +152,11 @@ def _run_stream(symbols: frozenset[str], generation: int) -> None:
     _client = client
     client.connect_and_loop_start()
     log.info("webull_market_stream: connecting (%d symbols)", len(symbols))
+    # Give the async connect a moment, then report liveness. On bad creds the SDK
+    # raises 401 on its loop thread and never connects, so is_connected() stays
+    # False and the supervisor backs off.
+    time.sleep(5)
+    return _is_connected()
 
 
 def _stop_stream() -> None:
@@ -149,27 +171,49 @@ def _stop_stream() -> None:
 
 
 async def _supervise() -> None:
-    global _current_symbols, _generation
+    global _current_symbols, _generation, _fail_streak
     while True:
+        interval = _REFRESH_S
         try:
             if _enabled():
                 symbols = frozenset(await asyncio.to_thread(_compute_symbols))
-                if symbols and (symbols != _current_symbols or _client is None):
+                # Restart when: symbols changed, no client, OR the client died
+                # (the liveness check — the SDK won't auto-reconnect on its own).
+                need_restart = bool(symbols) and (
+                    symbols != _current_symbols or _client is None or not _is_connected()
+                )
+                if need_restart:
                     _stop_stream()
                     _generation += 1
                     _current_symbols = symbols
-                    await asyncio.to_thread(_run_stream, symbols, _generation)
+                    ok = await asyncio.to_thread(_run_stream, symbols, _generation)
+                    if ok:
+                        _fail_streak = 0
+                    else:
+                        _fail_streak += 1
+                        interval = min(_BACKOFF_MAX, _REFRESH_S * (2 ** min(_fail_streak, 3)))
+                        # Log once per streak start and occasionally after, not every tick.
+                        if _fail_streak == 1 or _fail_streak % 5 == 0:
+                            log.warning(
+                                "webull_market_stream: not connected (attempt %d) — "
+                                "check creds/entitlement; backing off to %.0fs",
+                                _fail_streak, interval,
+                            )
                 elif not symbols:
                     _stop_stream()
                     _current_symbols = frozenset()
+                    _fail_streak = 0
+                else:
+                    _fail_streak = 0  # healthy and unchanged
             else:
                 _stop_stream()
                 _current_symbols = frozenset()
+                _fail_streak = 0
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("webull_market_stream supervisor pass failed")
-        await asyncio.sleep(_REFRESH_S)
+        await asyncio.sleep(interval)
 
 
 def start_webull_market_stream() -> None:

@@ -30,6 +30,42 @@ from app.models.order import InstrumentType, Order, OrderStatus
 
 log = logging.getLogger(__name__)
 
+
+class _ThrottleLogFilter(logging.Filter):
+    """Collapse identical repeated log lines to at most one per interval. The
+    alpaca-py data websocket retries internally at full speed, so a bad/
+    unentitled key spams 'auth failed' every second — this quiets it to once a
+    minute without hiding a genuine new error."""
+
+    def __init__(self, min_interval_s: float = 60.0) -> None:
+        super().__init__()
+        self._iv = min_interval_s
+        self._last: dict[str, float] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            key = record.getMessage()[:80]
+        except Exception:  # noqa: BLE001
+            return True
+        now = time.monotonic()
+        if now - self._last.get(key, 0.0) < self._iv:
+            return False
+        self._last[key] = now
+        return True
+
+
+_throttle_installed = False
+
+
+def _install_log_throttle() -> None:
+    """Attach the throttle to the noisy alpaca data-websocket logger, once."""
+    global _throttle_installed
+    if _throttle_installed:
+        return
+    logging.getLogger("alpaca.data.live.websocket").addFilter(_ThrottleLogFilter(60.0))
+    _throttle_installed = True
+
+
 # Redis key per symbol; short TTL so a symbol we stop streaming goes stale on its
 # own rather than serving a frozen price forever.
 _PRICE_KEY = "mdprice:{}"
@@ -238,6 +274,7 @@ def start_market_data_stream() -> None:
     except RuntimeError:
         log.warning("market_data_stream: no running loop; not starting")
         return
+    _install_log_throttle()
     _task = loop.create_task(_supervise())
     log.info("market_data_stream: supervisor started (enabled=%s)", _enabled())
 
