@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -142,6 +143,23 @@ _opt_stream_task: "asyncio.Task | None" = None
 _opt_current_symbols: frozenset[str] = frozenset()
 _opt_generation = 0
 
+# On-demand watch (trade panel): symbols a user is actively viewing get streamed
+# even if nobody holds them, via a short-TTL Redis key subscribed INCREMENTALLY
+# on the running stream (no restart → the held/working feed never flaps). The
+# current quote handlers are stashed here so the supervisor can add/drop watched
+# symbols on the live client; the subscribed watch sets track what we've added.
+_WATCH_KEY = "mdwatch:{}"
+_WATCH_TTL_S = 120
+_stock_handler: Any = None
+_opt_handler: Any = None
+_watch_stock_subscribed: set[str] = set()
+_watch_opt_subscribed: set[str] = set()
+# OCC = root(1-6) + YYMMDD + C/P + strike(8). Anything else is treated as a stock.
+_OCC_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,5}\d{6}[CP]\d{8}$")
+# Base (held/working) sets are recomputed off the DB at most this often; watches
+# reconcile every supervisor pass so a typed symbol streams within a pass.
+_WATCH_PASS_S = 5.0
+
 
 def _enabled() -> bool:
     from app.config import get_settings  # noqa: PLC0415
@@ -199,6 +217,67 @@ def get_live_price(symbol: str, max_age_s: float = _MAX_AGE_S) -> Decimal | None
             return None
         return Decimal(str(obj["p"]))
     except (InvalidOperation, ValueError, KeyError, TypeError, Exception):  # noqa: BLE001
+        return None
+
+
+# ── on-demand watch (trade panel) ───────────────────────────────────────────
+def add_watch(symbols: list[str]) -> None:
+    """Mark symbols (tickers or OCC) as actively watched so the stream picks them
+    up on demand. Idempotent; refreshes the TTL. Called by the watch endpoint on
+    a heartbeat while a trade-panel symbol is selected."""
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    try:
+        r = get_sync_redis()
+        for s in symbols:
+            sym = (s or "").upper().strip()
+            if sym:
+                r.set(_WATCH_KEY.format(sym), "1", ex=_WATCH_TTL_S)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_watch() -> set[str]:
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    out: set[str] = set()
+    try:
+        for k in get_sync_redis().scan_iter(_WATCH_KEY.format("*")):
+            ks = k if isinstance(k, str) else k.decode()
+            out.add(ks.split(":", 1)[1].upper())
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def fetch_rest_quote(symbol: str) -> Decimal | None:
+    """One-shot REST quote for the instant trade-panel seed — so a price shows the
+    moment a symbol is typed, before the stream warms up. Uses the DEDICATED data
+    key (never a subscriber's broker) and writes the result into the cache, so
+    the very first paint is a real price and useLivePrice has it immediately."""
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    if not (s.alpaca_data_api_key and s.alpaca_data_api_secret):
+        return None
+    sym = symbol.upper().strip()
+    try:
+        if _OCC_RE.match(sym):
+            from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+            from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: PLC0415
+            c = OptionHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+            q = c.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=sym))
+        else:
+            from alpaca.data.enums import DataFeed  # noqa: PLC0415
+            from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
+            from alpaca.data.requests import StockLatestQuoteRequest  # noqa: PLC0415
+            feed = DataFeed.SIP if s.alpaca_data_feed.lower() == "sip" else DataFeed.IEX
+            c = StockHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+            q = c.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=sym, feed=feed))
+        v = q.get(sym) if isinstance(q, dict) else q
+        px = _quote_mid(v) if v is not None else None
+        if px is not None:
+            _set_price(sym, px)
+        return px
+    except Exception:  # noqa: BLE001
+        log.warning("market_data_stream: fetch_rest_quote(%s) failed", sym)
         return None
 
 
@@ -344,6 +423,8 @@ async def _run_stream(symbols: frozenset[str], generation: int) -> None:
         if px is not None:
             _set_price(sym, px)
 
+    global _stock_handler
+    _stock_handler = _on_quote          # for incremental watch subscribes
     client.subscribe_quotes(_on_quote, *symbols)
     log.info("market_data_stream: subscribing to %d symbols (feed=%s)", len(symbols), feed)
     # run() blocks until the socket closes (or client.stop() is called on restart).
@@ -387,6 +468,8 @@ async def _run_option_stream(symbols: frozenset[str], generation: int) -> None:
         if px is not None:
             _set_price(sym, px)
 
+    global _opt_handler
+    _opt_handler = _on_quote            # for incremental watch subscribes
     client.subscribe_quotes(_on_quote, *symbols)
     log.info("market_data_stream: subscribing to %d OPTION symbols (OPRA)", len(symbols))
     await asyncio.to_thread(client.run)
@@ -403,70 +486,130 @@ def _stop_option_stream() -> None:
             pass
 
 
+async def _reconcile_watches() -> None:
+    """Incrementally add/drop trade-panel watched symbols on the RUNNING streams
+    (no restart). Watched symbols already in the base held/working set are skipped
+    — they stream anyway. Runs every supervisor pass so a typed symbol streams
+    within seconds."""
+    global _watch_stock_subscribed, _watch_opt_subscribed
+    watch = await asyncio.to_thread(_read_watch)
+    want_stock = {s for s in watch if not _OCC_RE.match(s)} - _current_symbols
+    want_opt = {s for s in watch if _OCC_RE.match(s)} - _opt_current_symbols
+
+    if _stream is not None and _stock_handler is not None:
+        add = want_stock - _watch_stock_subscribed
+        rem = _watch_stock_subscribed - want_stock
+        if add:
+            try:
+                await asyncio.to_thread(_stream.subscribe_quotes, _stock_handler, *add)
+                _watch_stock_subscribed |= add
+                log.info("market_data_stream: watch +%d stock(s): %s", len(add), sorted(add))
+            except Exception:  # noqa: BLE001
+                log.exception("market_data_stream: watch stock subscribe failed")
+        if rem:
+            try:
+                await asyncio.to_thread(_stream.unsubscribe_quotes, *rem)
+            except Exception:  # noqa: BLE001
+                pass
+            _watch_stock_subscribed -= rem
+
+    if _opt_stream is not None and _opt_handler is not None:
+        add = want_opt - _watch_opt_subscribed
+        rem = _watch_opt_subscribed - want_opt
+        if add:
+            try:
+                await asyncio.to_thread(_opt_stream.subscribe_quotes, _opt_handler, *add)
+                _watch_opt_subscribed |= add
+                log.info("market_data_stream: watch +%d option(s): %s", len(add), sorted(add))
+            except Exception:  # noqa: BLE001
+                log.exception("market_data_stream: watch option subscribe failed")
+        if rem:
+            try:
+                await asyncio.to_thread(_opt_stream.unsubscribe_quotes, *rem)
+            except Exception:  # noqa: BLE001
+                pass
+            _watch_opt_subscribed -= rem
+
+
 async def _supervise() -> None:
-    """Recompute the symbol set every _REFRESH_S; (re)start the stream when it
-    changes. Restart-on-change avoids cross-thread subscribe/unsubscribe races —
-    holdings change rarely enough that an occasional reconnect is cheap."""
+    """Recompute the base held/working set every _REFRESH_S and (re)start the
+    streams on change or death; reconcile trade-panel watches every pass so a
+    typed symbol streams within seconds without restarting the base feed."""
     global _stream_task, _current_symbols, _generation
     global _opt_stream_task, _opt_current_symbols, _opt_generation
+    global _watch_stock_subscribed, _watch_opt_subscribed
+    last_base = 0.0
     while True:
         try:
             if _enabled():
                 if time.monotonic() < _auth_backoff_until:
                     # Auth is failing (bad/unentitled key). Hold both sockets down
                     # so alpaca-py's internal retry can't hammer → no 429 storm.
-                    # Keep the symbol sets so they restart on recovery.
                     _stop_stream()
                     _stop_option_stream()
+                    _watch_stock_subscribed = set()
+                    _watch_opt_subscribed = set()
                 else:
-                    # ── stock stream ──
-                    symbols = frozenset(await asyncio.to_thread(_compute_symbols))
-                    need_restart = (
-                        symbols != _current_symbols
-                        or _stream_task is None
-                        or _stream_task.done()
+                    now = time.monotonic()
+                    due = now - last_base >= _REFRESH_S
+                    if due:
+                        last_base = now
+                    loop = asyncio.get_running_loop()
+                    # ── stock base: recompute on the slow cadence; restart on
+                    #    change OR death (checked every pass via the cached set) ──
+                    stock_syms = (
+                        frozenset(await asyncio.to_thread(_compute_symbols)) if due
+                        else _current_symbols
                     )
-                    if symbols and need_restart:
+                    if stock_syms and (
+                        stock_syms != _current_symbols
+                        or _stream_task is None or _stream_task.done()
+                    ):
                         _stop_stream()
                         if _stream_task is not None and not _stream_task.done():
                             _stream_task.cancel()
                         _generation += 1
-                        _current_symbols = symbols
-                        loop = asyncio.get_running_loop()
-                        _stream_task = loop.create_task(_run_stream(symbols, _generation))
-                    elif not symbols:
+                        _current_symbols = stock_syms
+                        _watch_stock_subscribed = set()   # new client → re-add watches
+                        _stream_task = loop.create_task(_run_stream(stock_syms, _generation))
+                    elif due and not stock_syms:
                         _stop_stream()
                         _current_symbols = frozenset()
-                    # ── option stream (OPRA) ──
-                    opt_symbols = frozenset(await asyncio.to_thread(_compute_option_symbols))
-                    opt_need_restart = (
-                        opt_symbols != _opt_current_symbols
-                        or _opt_stream_task is None
-                        or _opt_stream_task.done()
+                        _watch_stock_subscribed = set()
+                    # ── option base (OPRA) ──
+                    opt_syms = (
+                        frozenset(await asyncio.to_thread(_compute_option_symbols)) if due
+                        else _opt_current_symbols
                     )
-                    if opt_symbols and opt_need_restart:
+                    if opt_syms and (
+                        opt_syms != _opt_current_symbols
+                        or _opt_stream_task is None or _opt_stream_task.done()
+                    ):
                         _stop_option_stream()
                         if _opt_stream_task is not None and not _opt_stream_task.done():
                             _opt_stream_task.cancel()
                         _opt_generation += 1
-                        _opt_current_symbols = opt_symbols
-                        loop = asyncio.get_running_loop()
-                        _opt_stream_task = loop.create_task(_run_option_stream(opt_symbols, _opt_generation))
-                    elif not opt_symbols:
+                        _opt_current_symbols = opt_syms
+                        _watch_opt_subscribed = set()
+                        _opt_stream_task = loop.create_task(_run_option_stream(opt_syms, _opt_generation))
+                    elif due and not opt_syms:
                         _stop_option_stream()
                         _opt_current_symbols = frozenset()
+                        _watch_opt_subscribed = set()
+                    # ── trade-panel watches (every pass, incremental) ──
+                    await _reconcile_watches()
             else:
                 _stop_stream()
                 _stop_option_stream()
                 _current_symbols = frozenset()
                 _opt_current_symbols = frozenset()
+                _watch_stock_subscribed = set()
+                _watch_opt_subscribed = set()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             log.exception("market_data_stream supervisor pass failed")
-        # Wake sooner while backing off so the stream resumes promptly once the
-        # window clears; otherwise the normal 60s symbol-recompute cadence.
-        await asyncio.sleep(5.0 if time.monotonic() < _auth_backoff_until else _REFRESH_S)
+        await asyncio.sleep(_WATCH_PASS_S)
 
 
 def start_market_data_stream() -> None:
@@ -502,4 +645,7 @@ async def stop_market_data_stream() -> None:
     _opt_stream_task = None
 
 
-__all__ = ["start_market_data_stream", "stop_market_data_stream", "get_live_price"]
+__all__ = [
+    "start_market_data_stream", "stop_market_data_stream",
+    "get_live_price", "add_watch",
+]
