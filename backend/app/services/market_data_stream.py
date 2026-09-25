@@ -260,8 +260,15 @@ def _compute_option_symbols() -> set[str]:
     """OCC symbols for options anyone holds (net != 0) or is working — the option
     stream's subscription set. Same held/working logic as _compute_symbols, keyed
     on the full contract (symbol+expiry+strike+right)."""
+    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+
     from sqlalchemy import case, func  # noqa: PLC0415
     from app.models.order import OrderSide  # noqa: PLC0415
+
+    # Never stream expired contracts — they can't quote and just waste OPRA
+    # subscription slots. One-day margin so a same-day expiry (still tradeable
+    # through its ET close) is never dropped by a UTC-date comparison.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).date()
 
     occs: set[str] = set()
     cols = (Order.symbol, Order.option_expiry, Order.option_strike, Order.option_right)
@@ -275,6 +282,7 @@ def _compute_option_symbols() -> set[str]:
             .where(
                 Order.instrument_type == InstrumentType.OPTION,
                 Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+                Order.option_expiry >= cutoff,
             )
             .group_by(Order.user_id, *cols)
             .having(net != 0)
@@ -284,6 +292,7 @@ def _compute_option_symbols() -> set[str]:
             .where(
                 Order.instrument_type == InstrumentType.OPTION,
                 Order.status.in_(_WORKING),
+                Order.option_expiry >= cutoff,
             )
             .distinct()
         ).all()
