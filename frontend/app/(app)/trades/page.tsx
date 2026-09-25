@@ -1,11 +1,12 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, Check, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { useLivePrice } from "@/lib/livePrices";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
 import { PositionIcon, orderKind } from "@/components/PositionIcon";
@@ -195,6 +196,37 @@ function orderSymbolLabel(o: Order): string {
     ? `$${Number(o.option_strike)}` : "";
   const exp = o.option_expiry ? optionExpiryShort(o.option_expiry) : "";
   return [o.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
+}
+
+/** Live-cache key for an order's symbol — the ticker for stocks, the OCC for
+ *  options (matching the stream/backend format). Null when we can't build one. */
+function orderLiveKey(o: Order): string | null {
+  const sym = (o.symbol || "").toUpperCase();
+  if (!sym || sym === "—") return null;
+  if (o.instrument_type !== "option") return sym;
+  if (!o.option_expiry || o.option_strike == null || o.option_strike === "" || !o.option_right) return null;
+  const iso = o.option_expiry;
+  const d = new Date(iso.length === 10 ? iso + "T00:00:00Z" : iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const cp = o.option_right === "call" ? "C" : "P";
+  const strikeInt = Math.round(Number(o.option_strike) * 1000);
+  if (!Number.isFinite(strikeInt)) return null;
+  return `${sym}${yy}${mm}${dd}${cp}${String(strikeInt).padStart(8, "0")}`;
+}
+
+/** Live current-price cell for an order row. Ticks off the central stream (via
+ *  the on-demand watch registered for the visible rows). Own component so the
+ *  hook stays out of the row .map(). */
+function LiveOrderPriceCell({ liveKey }: { liveKey: string | null }) {
+  const px = useLivePrice(liveKey, null);
+  return (
+    <td className="px-5 py-3.5 num" style={{ color: px == null ? "var(--faint)" : "var(--text-2)" }}>
+      {px == null ? "—" : px.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+    </td>
+  );
 }
 
 /** "Expected" price the user asked for: the limit (or stop) price they set,
@@ -639,6 +671,24 @@ export default function TradesPage() {
   // One grid for every tab. The Discord tab swaps the data source, not the
   // table — same columns, same row renderer, same sorting.
   const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
+
+  // Live "Current price" column: register an on-demand watch for the symbols on
+  // screen so the central stream subscribes to them, then each row ticks via
+  // useLivePrice. Capped + heartbeated (the watch TTL lapses when we stop).
+  const watchKeys = useMemo(
+    () => Array.from(new Set(gridRows.map(orderLiveKey).filter(Boolean) as string[])).slice(0, 40).sort().join(","),
+    [gridRows],
+  );
+  useEffect(() => {
+    if (!watchKeys) return;
+    const syms = watchKeys.split(",");
+    const ping = () => {
+      api("/api/market-data/watch", { method: "POST", body: JSON.stringify({ symbols: syms }) }).catch(() => {});
+    };
+    ping();
+    const t = setInterval(ping, 30_000);
+    return () => clearInterval(t);
+  }, [watchKeys]);
   const isLoading = tab === "discord" ? signalsLoading : loading;
   // Row id -> the alert behind it, so the Actions cell can reach the decision
   // state that the Order shape has no field for.
@@ -695,7 +745,7 @@ export default function TradesPage() {
   // Must match the number of <Th> cells below — it sizes the loading skeleton
   // and the empty-state row, both of which misalign if a column is added or
   // removed without updating it. Channel is conditional, so this is too.
-  const COLSPAN = showChannel ? 17 : 16;
+  const COLSPAN = showChannel ? 18 : 17;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -906,6 +956,7 @@ export default function TradesPage() {
                 <Th label="Order Type" />
                 <Th label="Expected price" />
                 <Th label="Filled price" />
+                <Th label="Current price" />
                 <Th label="TP" />
                 <Th label="SL" />
                 <Th label="Notional" sortKey="notional" />
@@ -1015,6 +1066,7 @@ export default function TradesPage() {
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.price, 2)}</td>
+                      <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5">{dash}</td>
                       <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fillNotional ? fmt(String(fillNotional)) : dash}</td>
@@ -1236,6 +1288,7 @@ export default function TradesPage() {
                       </td>
                       <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>
                       <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>
+                      <LiveOrderPriceCell liveKey={orderLiveKey(o)} />
                       {/* TP / SL — shown as a percent of the entry-side price.
                           Editable only on entry rows that are still open
                           (pre-fill); filled orders that survive here belong to
