@@ -40,6 +40,49 @@ _current_symbols: frozenset[str] = frozenset()
 _generation = 0
 _fail_streak = 0
 _logged_sample = False  # one-time raw-message dump to learn the payload shape
+# Whether Webull accepted our subscribe on the live connection. Stays False when
+# the socket is up but the account lacks the US_STOCK data entitlement (403), so
+# the supervisor keeps re-attempting — it starts flowing the moment the
+# entitlement is added, with no worker restart.
+_subscribed = False
+
+
+def _sub_types() -> list[str]:
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    return [t.strip() for t in (s.webull_data_sub_types or "QUOTE").split(",") if t.strip()]
+
+
+def _subscribe(client: Any, symbols: list[str], sub_types: list[str]) -> bool:
+    """Subscribe to ``symbols`` under US_STOCK, dropping any tickers Webull
+    rejects (417 INVALID_SYMBOL — preferreds like PNFP.PRB, or ETFs which live
+    under another category) and retrying so one bad symbol can't blank the feed.
+    Category is the STRING name, not the Category enum, which the SDK can't
+    serialize — matches brokers/webull.py's working get_snapshot("US_STOCK", …).
+    Returns True iff Webull accepted the subscription. Idempotent, so it's safe
+    to call again later (e.g. once a missing entitlement is granted)."""
+    syms = list(symbols)
+    for _attempt in range(6):
+        try:
+            client.subscribe(syms, "US_STOCK", sub_types)
+            log.info("webull_market_stream: subscribed %d US stocks (sub_types=%s)",
+                     len(syms), sub_types)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            bad = _parse_invalid_symbols(str(exc))
+            drop = [s for s in syms if s in bad]
+            if not drop:
+                # Non-symbol failure (e.g. 403 not-entitled). One line, no
+                # traceback — the supervisor will retry on its cadence.
+                log.warning("webull_market_stream: subscribe rejected: %s", str(exc)[:180])
+                return False
+            syms = [s for s in syms if s not in bad]
+            log.warning("webull_market_stream: Webull rejected %s; retrying with %d symbols",
+                        drop, len(syms))
+            if not syms:
+                log.warning("webull_market_stream: no US_STOCK symbols left to subscribe")
+                return False
+    return False
 
 
 def _is_connected() -> bool:
@@ -133,8 +176,10 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
     from webull.data.data_streaming_client import DataStreamingClient  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
 
+    global _subscribed
+    _subscribed = False  # fresh connection — nothing subscribed yet
     s = get_settings()
-    sub_types = [t.strip() for t in (s.webull_data_sub_types or "QUOTE").split(",") if t.strip()]
+    sub_types = _sub_types()
     client = DataStreamingClient(
         s.webull_data_app_key, s.webull_data_app_secret,
         s.webull_data_region_id, uuid.uuid4().hex,
@@ -151,34 +196,10 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
     client.on_quotes_message = _on_quotes_message
 
     def _on_connected(*_a: Any) -> None:
+        global _subscribed
         if generation != _generation:
             return
-        # Webull rejects the WHOLE batch if any symbol isn't in the US_STOCK
-        # universe (417 INVALID_SYMBOL names the offenders, e.g. preferreds like
-        # PNFP.PRB, or ETFs which live under a different category). Drop exactly
-        # the ones it names and retry, so one bad ticker can't blank the feed.
-        # Category is the STRING name, not the Category enum — the SDK drops it
-        # straight into the JSON body and can't serialize the enum. Matches
-        # brokers/webull.py's working get_snapshot("US_STOCK", ...) REST call.
-        syms = list(symbols)
-        for _attempt in range(6):
-            try:
-                client.subscribe(syms, "US_STOCK", sub_types)
-                log.info("webull_market_stream: subscribed %d US stocks (sub_types=%s)",
-                         len(syms), sub_types)
-                return
-            except Exception as exc:  # noqa: BLE001
-                bad = _parse_invalid_symbols(str(exc))
-                drop = [s for s in syms if s in bad]
-                if not drop:
-                    log.exception("webull_market_stream: subscribe failed")
-                    return
-                syms = [s for s in syms if s not in bad]
-                log.warning("webull_market_stream: Webull rejected %s; retrying with %d symbols",
-                            drop, len(syms))
-                if not syms:
-                    log.warning("webull_market_stream: no US_STOCK symbols left to subscribe")
-                    return
+        _subscribed = _subscribe(client, list(symbols), sub_types)
 
     client.on_connect_success = _on_connected
     _client = client
@@ -192,9 +213,10 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
 
 
 def _stop_stream() -> None:
-    global _client
+    global _client, _subscribed
     c = _client
     _client = None
+    _subscribed = False
     if c is not None:
         try:
             c.disconnect()
@@ -203,7 +225,7 @@ def _stop_stream() -> None:
 
 
 async def _supervise() -> None:
-    global _current_symbols, _generation, _fail_streak
+    global _current_symbols, _generation, _fail_streak, _subscribed
     while True:
         interval = _REFRESH_S
         try:
@@ -237,6 +259,15 @@ async def _supervise() -> None:
                     _fail_streak = 0
                 else:
                     _fail_streak = 0  # healthy and unchanged
+                    # Connected but never accepted a subscription (e.g. the
+                    # US_STOCK data entitlement was missing). Re-attempt on each
+                    # pass so it lights up the moment the entitlement is granted,
+                    # without a reconnect or worker restart.
+                    if not _subscribed and _client is not None:
+                        ok = await asyncio.to_thread(
+                            _subscribe, _client, list(symbols), _sub_types()
+                        )
+                        _subscribed = ok
             else:
                 _stop_stream()
                 _current_symbols = frozenset()
