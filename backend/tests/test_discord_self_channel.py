@@ -132,3 +132,24 @@ def test_order_history_shows_it_as_self():
     src = inspect.getsource(_fill_channels)
     assert "(label or \"\").strip() or (channel_name or \"\").strip()" in src
     assert ds._self_source(_DB(), _user()).label == "Self"
+
+
+# ── it must not appear as a channel the trader manages ──────────────────────
+
+def test_the_self_source_is_hidden_from_the_channel_list():
+    """It is plumbing, not a channel anyone connected. Listing it would offer
+    Change channel / Disconnect / a watch schedule for something with no
+    Discord behind it — and disconnecting it would break the composer with no
+    way to get it back."""
+    src = inspect.getsource(ds.list_sources)
+    assert "DiscordAlertSource.channel_id != _SELF_CHANNEL_ID" in src
+
+
+def test_hiding_it_does_not_hide_its_orders():
+    """The Channel column resolves the name by joining messages to sources
+    directly, so an order placed through Self still reads "Self" in Order
+    History even though the channel list never mentions it."""
+    from app.api.trades import _fill_channels
+
+    src = inspect.getsource(_fill_channels)
+    assert "_SELF" not in src and "self" not in src.replace("isouter", "")

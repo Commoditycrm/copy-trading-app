@@ -232,7 +232,7 @@ class CompactAlertParser(Parser):
         # traded rather than letting them fall through as generic chatter.
         return any(
             _UPDATE_RE.match(ln)
-            or (message.percent_means_exit and _PCT_BARE_RE.match(ln))
+            or _PCT_BARE_RE.match(ln)
             or _CLOSE_ARROW_RE.match(ln)
             or (_ADD_RE.match(ln) and _is_add(_ADD_RE.match(ln)))
             or (_has_marker(ln) and _EXIT_RE.match(ln))
@@ -269,14 +269,31 @@ class CompactAlertParser(Parser):
                 else:
                     saw_update = True
                 continue
-            # "AMD 27%" — no contract at all. Same convention, looser shape, so
-            # the contract has to come from what the account actually holds.
-            if message.percent_means_exit:
-                m = _PCT_BARE_RE.match(line)
-                if m:
-                    sig, err = self._pct_exit(m, message, with_contract=False)
-                    (signals.append(sig) if sig else errors.append(err))
-                    continue
+            # "TSLA 60%" / "AMD 27%" — a ticker and a percentage, no contract.
+            #
+            # ALWAYS a trim. This used to be gated on the source's
+            # percent_means_exit, because the same text is running P&L on some
+            # channels ("up 60%") and an instruction on others ("sell 60% of
+            # it"), and nothing in the line itself tells them apart. The gate
+            # had no UI, so in practice it was never on and this shape was
+            # silently dropped — live, Mark's "TSLA 60% @Mark" and
+            # "TSLA 70% @Mark" trims placed nothing at all.
+            #
+            # The cost of the choice, stated plainly: on a channel that posts a
+            # bare percentage as P&L while still holding, each post now reads as
+            # a rung of the trim ladder. The contract is still resolved from the
+            # position actually held, and the ladder still decides the size, so
+            # this cannot sell something that is not there — but it will work
+            # down a position the author never asked to reduce.
+            #
+            # The pattern stays strict on purpose: the line must be ONLY the
+            # ticker and the percentage, so prose like "AMD 27% of the float is
+            # short" is still not an order.
+            m = _PCT_BARE_RE.match(line)
+            if m:
+                sig, err = self._pct_exit(m, message, with_contract=False)
+                (signals.append(sig) if sig else errors.append(err))
+                continue
             m = _ADD_RE.match(line)
             if m and _is_add(m):
                 sig, err = self._add(m, message)
