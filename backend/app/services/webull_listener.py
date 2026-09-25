@@ -509,6 +509,25 @@ def _persist_and_fanout(
     broker_order_id = str(payload.get("order_id") or "").strip()
     if not broker_order_id:
         return
+    # The handle every LATER operation needs, which is not the id this feed
+    # keys on. Every Webull order endpoint takes the CLIENT order id:
+    #
+    #   cancel_order(account_id, client_order_id)
+    #   cancel_option(account_id, client_order_id)
+    #   get_order_detail(account_id, client_order_id)
+    #   replace_order(account_id, modify_orders, client_combo_order_id)
+    #
+    # and WebullAdapter is built on that -- place_order returns our
+    # client_order_id AS the broker_order_id precisely so cancel/replace/read
+    # keep working. Storing Webull's own order_id here broke that contract for
+    # every order placed in the Webull app: confirmed live 2026-09-25 against
+    # order EKIOD4IHFID9CRICBH2K5J5NBA, where
+    #   get_order_detail(account, order_id)        -> 417 "Order not present"
+    #   get_order_detail(account, client_order_id) -> 200
+    # so Cancel from the order history failed with "not found / not
+    # cancellable" and the order could not be touched from Kopyya at all.
+    client_oid = str(payload.get("client_order_id") or "").strip()
+    cancel_handle = client_oid or broker_order_id
     status_enum = _map_status(payload.get("order_status"))
     is_option = _is_option_payload(payload)
 
@@ -536,6 +555,17 @@ def _persist_and_fanout(
         )
 
         if existing is not None:
+            # Rows written before the id fix hold Webull's order_id, which no
+            # Webull endpoint accepts — so Cancel on them fails forever. This
+            # feed carries both ids, so correct it the next time we see the
+            # order rather than leaving it permanently uncancellable.
+            if client_oid and existing.broker_order_id != client_oid:
+                log.info(
+                    "webull-listener[%s] repointing order %s from %s to the "
+                    "client id %s (the handle Webull's endpoints accept)",
+                    trader_user_id, existing.id, existing.broker_order_id, client_oid,
+                )
+                existing.broker_order_id = client_oid
             was_working = existing.status in _WORKING
             # Did THIS event flip the order to FILLED? Used to fire the Discord
             # alert exactly once on the fill transition (not on later quiescent
@@ -716,7 +746,7 @@ def _persist_and_fanout(
             status=status_enum,
             filled_quantity=_dec(payload.get("filled_qty")) or Decimal(0),
             filled_avg_price=_dec(payload.get("filled_price")),
-            broker_order_id=broker_order_id,
+            broker_order_id=cancel_handle,
             submitted_at=placed_at or now,
             trader_submitted_at=placed_at,
             closed_at=closed_at,
@@ -727,7 +757,8 @@ def _persist_and_fanout(
         audit.record(
             db, actor_user_id=trader_user_id, action="listener.order_observed",
             entity_type="order", entity_id=order.id,
-            metadata={"broker": "webull", "broker_order_id": broker_order_id,
+            metadata={"broker": "webull", "broker_order_id": cancel_handle,
+                      "webull_order_id": broker_order_id,
                       "status": str(payload.get("order_status")), "symbol": symbol,
                       "side": order.side.value, "qty": str(order.quantity),
                       # The raw type field. Diagnosing the NIO misclassification
