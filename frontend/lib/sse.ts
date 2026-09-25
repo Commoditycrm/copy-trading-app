@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getAccessToken } from "@/lib/api";
+import { applyPriceTick } from "@/lib/livePrices";
 
 export type AppEvent =
   | { type: "order.placed"; order: OrderEventPayload }
@@ -198,7 +199,13 @@ export function useEventStream(
         setState("connected");
         try {
           const evt = JSON.parse(msg.data) as AppEvent;
-          handlerRef.current(evt);
+          // Live price ticks feed the shared price store for the whole app;
+          // they're not page events, so handle them here and don't forward.
+          if ((evt as { type?: string }).type === "price.tick") {
+            applyPriceTick(evt as { symbol?: string; price?: string | number });
+          } else {
+            handlerRef.current(evt);
+          }
         } catch {
           /* ignore malformed events */
         }
