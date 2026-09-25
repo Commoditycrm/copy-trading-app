@@ -40,20 +40,23 @@ function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fal
  *  than re-deriving sign/multiplier conventions in the UI. Returns 0 until a
  *  tick arrives, or for options (symbol null) — so the row shows exactly the
  *  backend values until the price actually moves. */
-function useLivePriceDelta(symbol: string | null, snapshotPrice: string | null, quantity: string | null): number {
+function useLivePriceDelta(
+  symbol: string | null, snapshotPrice: string | null, quantity: string | null, multiplier = 1,
+): number {
   const live = useLivePrice(symbol, null);
   if (live == null) return 0;
   const snap = Number(snapshotPrice);
   const qty = Number(quantity);
   if (!Number.isFinite(snap) || !Number.isFinite(qty)) return 0;
-  return (live - snap) * qty;
+  // Options move $100 of value per $1 of quote (contract multiplier); stocks 1.
+  return (live - snap) * qty * multiplier;
 }
 
 /** Unrealized P&L cell, moved live off the price delta. */
-function LivePnlCell({ symbol, snapshotPrice, quantity, baseline }: {
-  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null;
+function LivePnlCell({ symbol, snapshotPrice, quantity, baseline, multiplier = 1 }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null; multiplier?: number;
 }) {
-  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity, multiplier);
   const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
   const pnl = fmtSignedMoney(val == null ? null : String(val));
   return (
@@ -68,11 +71,11 @@ function LivePnlCell({ symbol, snapshotPrice, quantity, baseline }: {
 }
 
 /** P&L % = live unrealized P&L / cost basis. Mirrors the static formula. */
-function LivePnlPctCell({ symbol, snapshotPrice, quantity, unrealizedBaseline, costBasis }: {
+function LivePnlPctCell({ symbol, snapshotPrice, quantity, unrealizedBaseline, costBasis, multiplier = 1 }: {
   symbol: string | null; snapshotPrice: string | null; quantity: string | null;
-  unrealizedBaseline: string | null; costBasis: string | null;
+  unrealizedBaseline: string | null; costBasis: string | null; multiplier?: number;
 }) {
-  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity, multiplier);
   const cb = Number(costBasis);
   const upnl = Number(unrealizedBaseline) + delta;
   const pct = Number.isFinite(cb) && cb !== 0 && Number.isFinite(upnl) ? (upnl / Math.abs(cb)) * 100 : null;
@@ -84,10 +87,10 @@ function LivePnlPctCell({ symbol, snapshotPrice, quantity, unrealizedBaseline, c
 }
 
 /** Market-value cell, moved live off the price delta. */
-function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline }: {
-  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null;
+function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline, multiplier = 1 }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null; multiplier?: number;
 }) {
-  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity, multiplier);
   const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
   return <td className="px-5 py-3.5 num">{fmtNum(val == null ? baseline : String(val), 2)}</td>;
 }
@@ -99,26 +102,30 @@ function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline }: {
 function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
   positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string;
 }) {
-  const symbols = useMemo(
-    () => positions.filter((p) => p.instrument_type === "stock").map((p) => p.symbol.toUpperCase()),
+  // Each streamable row → its cache key (ticker or OCC), contract multiplier,
+  // snapshot price and signed qty. Stocks and options both stream now.
+  const rows = useMemo(
+    () => positions.map((p) => ({
+      sym: p.instrument_type === "stock" ? p.symbol.toUpperCase() : positionOcc(p),
+      mult: p.instrument_type === "option" ? 100 : 1,
+      snap: Number(p.current_price),
+      qty: Number(p.quantity),
+    })).filter((r): r is { sym: string; mult: number; snap: number; qty: number } => !!r.sym),
     [positions],
   );
+  const symbols = useMemo(() => rows.map((r) => r.sym), [rows]);
   const version = useLivePrices(symbols);
   const { pnl, mv } = useMemo(() => {
     let d = 0;
-    for (const p of positions) {
-      if (p.instrument_type !== "stock") continue;
-      const live = peekLivePrice(p.symbol);
-      if (live == null) continue;
-      const snap = Number(p.current_price);
-      const qty = Number(p.quantity);
-      if (!Number.isFinite(snap) || !Number.isFinite(qty)) continue;
-      d += (live - snap) * qty;
+    for (const r of rows) {
+      const live = peekLivePrice(r.sym);
+      if (live == null || !Number.isFinite(r.snap) || !Number.isFinite(r.qty)) continue;
+      d += (live - r.snap) * r.qty * r.mult;
     }
     return { pnl: baselinePnl + d, mv: baselineMv + d };
     // version drives the recompute when a subscribed symbol ticks.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [positions, baselinePnl, baselineMv, version]);
+  }, [rows, baselinePnl, baselineMv, version]);
   return (
     <>
       <SummaryTile label="Unrealized P&L" tone={pnl > 0 ? "good" : pnl < 0 ? "bad" : "neutral"}
@@ -162,6 +169,24 @@ function positionSymbolLabel(p: Position): string {
     ? `$${Number(p.option_strike)}` : "";
   const exp = p.option_expiry ? optionExpiryShort(p.option_expiry) : "";
   return [p.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
+}
+
+/** OCC symbol for an option position — must match the backend's _build_occ
+ *  (ROOT + YYMMDD + C/P + strike*1000, 8 digits, root not padded) so it looks up
+ *  the same cache key the option stream writes. Null for stocks / incomplete. */
+function positionOcc(p: Position): string | null {
+  if (p.instrument_type !== "option") return null;
+  if (!p.option_expiry || p.option_strike == null || p.option_strike === "" || !p.option_right) return null;
+  const iso = p.option_expiry;
+  const d = new Date(iso.length === 10 ? iso + "T00:00:00Z" : iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const cp = p.option_right === "call" ? "C" : "P";
+  const strikeInt = Math.round(Number(p.option_strike) * 1000);
+  if (!Number.isFinite(strikeInt)) return null;
+  return `${p.symbol.toUpperCase()}${yy}${mm}${dd}${cp}${String(strikeInt).padStart(8, "0")}`;
 }
 
 /** Days from today (UTC midnight) until an ISO date. Negative if past. */
@@ -715,9 +740,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   const key = posKey(p);
                   const qtyNum = Number(p.quantity);
                   const isLong = qtyNum > 0;
-                  // Live price only for stocks — options aren't in the stock
-                  // cache and an option row's p.symbol is the underlying.
-                  const liveSym = p.instrument_type === "stock" ? p.symbol : null;
+                  // Live-price key: the ticker for stocks, the OCC for options
+                  // (both streamed into the same cache). Options carry the x100
+                  // contract multiplier for the value/P&L deltas.
+                  const liveSym = p.instrument_type === "stock" ? p.symbol : positionOcc(p);
+                  const liveMult = p.instrument_type === "option" ? 100 : 1;
                   const inFlight = closing?.key === key;
                   return (
                     <Fragment key={key}>
@@ -825,9 +852,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </div>
                           </div>
                         </td>
-                        <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} />
+                        <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />
                         {/* P&L % = live unrealized P&L / cost basis. */}
-                        <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} />
+                        <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
                         <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />
                         {/* Reference = previous session's market close price. */}
@@ -867,7 +894,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               <td className="px-5 py-3.5 num">
                                 {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
-                              <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} />
+                              <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />
                               <td className="px-5 py-3.5 num">
                                 <InlineBracketCell
                                   orderId={orderId}
