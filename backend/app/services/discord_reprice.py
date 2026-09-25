@@ -212,6 +212,16 @@ def reprice_one(order_id: uuid.UUID) -> str:
             "discord reprice: %s unfilled at %s — retrying at %s (+%s%%)",
             order.symbol, original, new_price, pct,
         )
+        # Push it to any open UI. The +10% retry has the same problem the edit
+        # path had: the order moves at the broker and the Order History keeps
+        # showing the original limit until someone reloads.
+        try:
+            from app.services import events  # noqa: PLC0415
+            from app.services.copy_engine import _order_event  # noqa: PLC0415
+
+            events.publish(order.user_id, _order_event("order.updated", order))
+        except Exception:  # noqa: BLE001
+            log.exception("discord reprice: could not announce %s to the UI", order_id)
 
     # Carry the new price to the subscribers' mirrors, OUTSIDE the session above
     # so the trader's own row is committed first — the propagation opens its own.

@@ -10,6 +10,12 @@ export type AppEvent =
   | { type: "order.copy_failed"; order: OrderEventPayload }
   | { type: "order.copy_retry_scheduled"; order: OrderEventPayload }
   | { type: "order.cancelled"; order: OrderEventPayload }
+  /** An EXISTING order's terms changed — the Discord +10% retry, or an
+   *  alert the author edited in place ("@0.20" becomes "@0.15"). Not a new
+   *  order: the same row moves. Without this the table kept showing the old
+   *  limit until a reload, so a moved order and an edit that never applied
+   *  looked identical. The payload carries the new terms. */
+  | { type: "order.updated"; order: OrderEventPayload }
   | { type: "listener.state_changed"; trader_id: string; status: ListenerStatus }
   | { type: "notification.created"; notification: NotificationEventPayload }
   /** Fired by pnl_poller when the per-position TP/SL enforcer closes
