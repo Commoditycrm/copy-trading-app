@@ -1264,7 +1264,7 @@ def _execute_signal(
             if existing is not None:
                 guards.retire(db, existing, "closed by exit alert")
     else:
-        guards.on_buy(
+        opened = guards.on_buy(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
             # Provisional: the limit we bid is the only reference that exists at
             # placement. The real fill replaces it via sync_entry_price once the
@@ -1273,6 +1273,19 @@ def _execute_signal(
             entry_price=p.limit_price,
             entry_order_id=order.id,
         )
+        # An AVERAGING-DOWN add deliberately lowers the cost basis, so the
+        # ladder has to follow it. on_buy holds the reference fixed for ordinary
+        # adds on purpose (averaging UP must not raise its own stop); this is
+        # the opposite case and it is stated explicitly rather than inferred.
+        #
+        # The order was sized FROM the position, so the quantity we just placed
+        # is also the quantity that was held.
+        if signal.get("double_up"):
+            guards.average_in(
+                db, opened,
+                held_qty=p.quantity, added_qty=p.quantity,
+                added_price=p.limit_price,
+            )
 
     discord_execution.mark_executed(msg, order.id)
     log.info("discord: alert %s placed as order %s%s", msg.id, order.id,
