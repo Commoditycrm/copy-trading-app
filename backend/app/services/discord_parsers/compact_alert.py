@@ -166,29 +166,6 @@ def _strip_mentions(line: str) -> str:
     return _MENTION_RE.sub(" ", line)
 
 
-# "$SPY 768 PUT averaging down @0.48" — buy as much again as is already held.
-#
-# The phrase sits in the MIDDLE of an otherwise ordinary entry line, between the
-# contract and the price, which is why it is removed before the shape patterns
-# run rather than being written into each of them. Left in place it does real
-# damage: "$SPY 768 PUT 0DTE averaging down @0.48" still matched _ENTRY_RE, but
-# the words fell in the price's position, so the 0.48 was swallowed as trailing
-# text and the order would have been priced off the live quote instead.
-#
-# "down" is required. "Averaging" alone is ambiguous — averaging UP is a
-# different instruction and this must not quietly treat it as the same one.
-_AVERAGE_DOWN_RE = re.compile(
-    r"\b(?:aver(?:age|aging)|avg(?:ing)?)[\s-]+down\b",
-    re.IGNORECASE,
-)
-
-
-def _strip_average_down(line: str) -> tuple[str, bool]:
-    """Remove the phrase and report whether it was there."""
-    cleaned, n = _AVERAGE_DOWN_RE.subn(" ", line)
-    return (cleaned, True) if n else (line, False)
-
-
 # "Adding $MSFT 100c @1.90"  /  "Add $TSLA 375c"  /  "Adding $SPY"
 #
 # An instruction to increase a position the trader ALREADY holds. That's what
@@ -212,20 +189,12 @@ _ADD_RE = re.compile(
 class CompactAlertParser(Parser):
     name = "compact_alert"
 
-    def _scan(self, message: ParsedMessage) -> list[tuple[str, bool]]:
-        """Each non-empty line, cleaned, paired with "this line said averaging
-        down". Per line rather than per message: a block that mixes a fresh
-        entry with an average-down must not double BOTH positions."""
-        out: list[tuple[str, bool]] = []
-        for raw in message.text.splitlines():
-            if not raw.strip():
-                continue
-            cleaned, avg = _strip_average_down(_strip_mentions(raw))
-            out.append((cleaned.strip(), avg))
-        return out
-
     def _lines(self, message: ParsedMessage) -> list[str]:
-        return [line for line, _ in self._scan(message)]
+        return [
+            _strip_mentions(ln).strip()
+            for ln in message.text.splitlines()
+            if ln.strip()
+        ]
 
     def matches(self, message: ParsedMessage) -> bool:
         # Update lines are claimed too, so parse() can report WHY they aren't
@@ -236,12 +205,12 @@ class CompactAlertParser(Parser):
             or _CLOSE_ARROW_RE.match(ln)
             or (_ADD_RE.match(ln) and _is_add(_ADD_RE.match(ln)))
             or (_has_marker(ln) and _EXIT_RE.match(ln))
-            or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln), avg_down))
+            or (_ENTRY_RE.match(ln) and _is_entry(_ENTRY_RE.match(ln)))
             or (
                 _ENTRY_EXP_FIRST_RE.match(ln)
-                and _is_entry(_ENTRY_EXP_FIRST_RE.match(ln), avg_down)
+                and _is_entry(_ENTRY_EXP_FIRST_RE.match(ln))
             )
-            for ln, avg_down in self._scan(message)
+            for ln in self._lines(message)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -249,7 +218,7 @@ class CompactAlertParser(Parser):
         errors: list[str] = []
         saw_update = False
 
-        for line, avg_down in self._scan(message):
+        for line in self._lines(message):
             if _has_marker(line):
                 m = _EXIT_RE.match(line)
                 if m:
@@ -288,8 +257,8 @@ class CompactAlertParser(Parser):
                 (signals.append(sig) if sig else errors.append(err))
                 continue
             m = _ENTRY_RE.match(line) or _ENTRY_EXP_FIRST_RE.match(line)
-            if m and _is_entry(m, avg_down):
-                sig, err = self._entry(m, message, average_down=avg_down)
+            if m and _is_entry(m):
+                sig, err = self._entry(m, message)
                 (signals.append(sig) if sig else errors.append(err))
 
         if signals:
@@ -308,23 +277,12 @@ class CompactAlertParser(Parser):
 
     # ── line readers ────────────────────────────────────────────────────────
 
-    def _entry(self, m: re.Match, message: ParsedMessage, *, average_down: bool = False):
-        """One contract line as a BUY.
-
-        ``average_down`` marks the line as adding to a position already held.
-        That changes two things. The expiry becomes optional, for the same
-        reason it is on an "Adding" line — the contract is the one already open,
-        so a missing expiry is resolved from the position rather than guessed.
-        And the size stops coming from the alert: execution sizes it from the
-        position so the holding doubles.
-        """
+    def _entry(self, m: re.Match, message: ParsedMessage):
         strike = to_decimal(m.group("strike"))
         if strike is None or strike <= 0:
             return None, f"couldn't read the strike in {m.group(0).strip()!r}"
 
-        expiry, unspecified, err = _read_expiry(
-            m.group("exp"), message, allow_missing=average_down
-        )
+        expiry, unspecified, err = _read_expiry(m.group("exp"), message)
         if err:
             return None, err
 
@@ -338,14 +296,12 @@ class CompactAlertParser(Parser):
                 strike=strike,
                 expiration=expiry,
                 expiry_unspecified=unspecified,
-                # The format never states size; one lot is the convention —
-                # except on an average-down, where the position decides.
+                # The format never states size; one lot is the convention.
                 quantity=DEFAULT_QUANTITY,
-                double_up=average_down,
                 order_type=OrderKind.LIMIT,
                 limit_price_unspecified=price is None,
                 limit_price=price,
-                source_action="AVERAGE_DOWN" if average_down else "ENTRY",
+                source_action="ENTRY",
                 parser=self.name,
             ),
             None,
@@ -533,18 +489,14 @@ class CompactAlertParser(Parser):
         )
 
 
-def _is_entry(m: re.Match, average_down: bool = False) -> bool:
+def _is_entry(m: re.Match) -> bool:
     """Is this contract line actually an instruction to open a position?
 
     A price makes it unambiguous. Without one, an EXPIRY is what separates a
     real entry ("AAPL $350 CALL 09/02") from a bare mention of a contract — and
     a trailing signed percentage means it's a P&L update, never an entry.
-
-    "Averaging down" carries that weight by itself. It is an explicit
-    instruction, not a way anyone mentions a contract in passing, so a line
-    stating it needs neither a price nor an expiry to be read as a trade.
     """
-    if not (m.group("price") or m.group("exp") or average_down):
+    if not (m.group("price") or m.group("exp")):
         return False
     trailing = (m.group("trailing") or "").strip()
     return not re.match(rf"^[+\-−]\s*(?:{_NUM})\s*%", trailing)
