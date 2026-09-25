@@ -34,6 +34,64 @@ function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fal
   return <td className="px-5 py-3.5 num">{fmtNum(live == null ? fallback : String(live), 2)}</td>;
 }
 
+/** Change in a stock row's market value and unrealized P&L implied by the live
+ *  price: signed_qty × (livePrice − snapshotPrice). Both move by the same
+ *  amount, so we layer this on the backend's already-correct baseline rather
+ *  than re-deriving sign/multiplier conventions in the UI. Returns 0 until a
+ *  tick arrives, or for options (symbol null) — so the row shows exactly the
+ *  backend values until the price actually moves. */
+function useLivePriceDelta(symbol: string | null, snapshotPrice: string | null, quantity: string | null): number {
+  const live = useLivePrice(symbol, null);
+  if (live == null) return 0;
+  const snap = Number(snapshotPrice);
+  const qty = Number(quantity);
+  if (!Number.isFinite(snap) || !Number.isFinite(qty)) return 0;
+  return (live - snap) * qty;
+}
+
+/** Unrealized P&L cell, moved live off the price delta. */
+function LivePnlCell({ symbol, snapshotPrice, quantity, baseline }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null;
+}) {
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
+  const pnl = fmtSignedMoney(val == null ? null : String(val));
+  return (
+    <td className="px-5 py-3.5 num font-medium">
+      <span className="inline-flex items-center gap-1" style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}>
+        {pnl.sign === 1 && <TrendingUp size={13} />}
+        {pnl.sign === -1 && <TrendingDown size={13} />}
+        {pnl.text}
+      </span>
+    </td>
+  );
+}
+
+/** P&L % = live unrealized P&L / cost basis. Mirrors the static formula. */
+function LivePnlPctCell({ symbol, snapshotPrice, quantity, unrealizedBaseline, costBasis }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null;
+  unrealizedBaseline: string | null; costBasis: string | null;
+}) {
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const cb = Number(costBasis);
+  const upnl = Number(unrealizedBaseline) + delta;
+  const pct = Number.isFinite(cb) && cb !== 0 && Number.isFinite(upnl) ? (upnl / Math.abs(cb)) * 100 : null;
+  return (
+    <td className="px-5 py-3.5 num" style={{ color: pct == null ? "var(--muted)" : pct > 0 ? "var(--good)" : pct < 0 ? "var(--bad)" : "var(--text-2)" }}>
+      {pct == null ? "—" : `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`}
+    </td>
+  );
+}
+
+/** Market-value cell, moved live off the price delta. */
+function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; baseline: string | null;
+}) {
+  const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
+  const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
+  return <td className="px-5 py-3.5 num">{fmtNum(val == null ? baseline : String(val), 2)}</td>;
+}
+
 function fmtSignedMoney(n: string | null | undefined): { text: string; sign: 1 | -1 | 0 | null } {
   if (n === null || n === undefined || n === "") return { text: "—", sign: null };
   const v = Number(n);
@@ -622,7 +680,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   const key = posKey(p);
                   const qtyNum = Number(p.quantity);
                   const isLong = qtyNum > 0;
-                  const pnl = fmtSignedMoney(p.unrealized_pnl);
+                  // Live price only for stocks — options aren't in the stock
+                  // cache and an option row's p.symbol is the underlying.
+                  const liveSym = p.instrument_type === "stock" ? p.symbol : null;
                   const inFlight = closing?.key === key;
                   return (
                     <Fragment key={key}>
@@ -730,26 +790,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </div>
                           </div>
                         </td>
-                        <td className="px-5 py-3.5 num font-medium">
-                          <span className="inline-flex items-center gap-1" style={{ color: pnl.sign === 1 ? "var(--good)" : pnl.sign === -1 ? "var(--bad)" : "var(--muted)" }}>
-                            {pnl.sign === 1 && <TrendingUp size={13} />}
-                            {pnl.sign === -1 && <TrendingDown size={13} />}
-                            {pnl.text}
-                          </span>
-                        </td>
-                        {/* P&L % = unrealized P&L / cost basis. */}
-                        {(() => {
-                          const cb = Number(p.cost_basis);
-                          const upnl = Number(p.unrealized_pnl);
-                          const pct = Number.isFinite(cb) && cb !== 0 && Number.isFinite(upnl) ? (upnl / Math.abs(cb)) * 100 : null;
-                          return (
-                            <td className="px-5 py-3.5 num" style={{ color: pct == null ? "var(--muted)" : pct > 0 ? "var(--good)" : pct < 0 ? "var(--bad)" : "var(--text-2)" }}>
-                              {pct == null ? "—" : `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`}
-                            </td>
-                          );
-                        })()}
+                        <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} />
+                        {/* P&L % = live unrealized P&L / cost basis. */}
+                        <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} />
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                        <LiveCurrentPriceCell symbol={p.instrument_type === "stock" ? p.symbol : null} fallback={p.current_price} />
+                        <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />
                         {/* Reference = previous session's market close price. */}
                         <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
                         {(() => {
@@ -787,7 +832,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               <td className="px-5 py-3.5 num">
                                 {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
-                              <td className="px-5 py-3.5 num">{fmtNum(p.market_value, 2)}</td>
+                              <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} />
                               <td className="px-5 py-3.5 num">
                                 <InlineBracketCell
                                   orderId={orderId}
