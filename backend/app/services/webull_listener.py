@@ -48,6 +48,7 @@ from app.models.order import (
 )
 from app.models.user import User, UserRole
 from app.services import listener_state, order_intent
+from app.brokers.webull import _first, _looks_like_occ  # noqa: PLC2701
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -457,6 +458,32 @@ def _resolve_option_contract(
     return None
 
 
+def _is_option_payload(payload: dict) -> bool:
+    """Option or stock, read the way the adapter and get_positions read it.
+
+    Webull spells this DIFFERENTLY per endpoint and more than one spelling is
+    live: the docs say ``US_OPTION``, real rows also carry a bare ``OPTION``,
+    and some put the type on ``instrument_type`` / ``combo_ticker_type``
+    instead of ``category``. An exact ``== "US_OPTION"`` on the one key
+    therefore read a real NIO option as a STOCK (live 2026-09-25, Webull order
+    VIG6FSBI6BA0FC...). Two things went wrong, and the second is the serious
+    one:
+
+      * the row lost its strike / right / expiry, so the order history could
+        only show "NIO"; and
+      * the contract-resolution refusal below is keyed off this flag, so
+        instead of being held back it went to fanout as a $0.20 NIO STOCK buy.
+
+    An OCC-shaped symbol is the fallback for a payload that omits the type
+    altogether — the same fallback get_positions already uses.
+    """
+    cat = str(
+        _first(payload, "category", "combo_ticker_type", "instrument_type", "asset_type")
+        or ""
+    ).upper()
+    return "OPTION" in cat or _looks_like_occ(str(payload.get("symbol") or ""))
+
+
 def _persist_and_fanout(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID,
     creds: dict[str, Any], payload: dict,
@@ -470,7 +497,7 @@ def _persist_and_fanout(
     if not broker_order_id:
         return
     status_enum = _map_status(payload.get("order_status"))
-    is_option = str(payload.get("category") or "").upper() == "US_OPTION"
+    is_option = _is_option_payload(payload)
 
     with SessionLocal() as db:
         # Serialize concurrent handling of the SAME broker order so the
@@ -689,7 +716,11 @@ def _persist_and_fanout(
             entity_type="order", entity_id=order.id,
             metadata={"broker": "webull", "broker_order_id": broker_order_id,
                       "status": str(payload.get("order_status")), "symbol": symbol,
-                      "side": order.side.value, "qty": str(order.quantity)},
+                      "side": order.side.value, "qty": str(order.quantity),
+                      # The raw type field. Diagnosing the NIO misclassification
+                      # needed this and only the container log had it.
+                      "category": str(payload.get("category") or ""),
+                      "instrument_type": order.instrument_type.value},
         )
         db.commit()
         db.refresh(order)
@@ -784,7 +815,10 @@ def _rest_order_to_payload(o: dict) -> dict | None:
         "client_order_id": o.get("client_order_id"),
         "account_id": o.get("account_id") or leg.get("account_id"),
         "order_status": leg.get("order_status") or o.get("order_status"),
-        "category": leg.get("category") or o.get("combo_ticker_type"),
+        # Same key set as _is_option_payload: the type is not always on
+        # "category", and defaulting an option to STOCK is what this fixes.
+        "category": _first(leg, "category", "instrument_type", "asset_type")
+        or _first(o, "combo_ticker_type", "category", "instrument_type"),
         "symbol": leg.get("symbol"),
         "side": leg.get("side"),
         "order_type": leg.get("order_type") or o.get("order_type"),
