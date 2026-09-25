@@ -110,6 +110,15 @@ def _run_stream(symbols: frozenset[str], generation: int) -> None:
         s.webull_data_app_key, s.webull_data_app_secret,
         s.webull_data_region_id, uuid.uuid4().hex,
     )
+    # The SDK's connect flow writes a log file to cwd (/app), which is a READ-ONLY
+    # filesystem under our container hardening — that OSError crashes the MQTT
+    # loop thread (the connect itself succeeds). No-op its file logger; we have
+    # our own logging via _on_quotes_message. (The gRPC listener sidesteps the
+    # same issue by pre-marking logger flags.)
+    try:
+        client.set_file_logger = lambda *a, **k: None  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001
+        pass
     client.on_quotes_message = _on_quotes_message
 
     def _on_connected(*_a: Any) -> None:
