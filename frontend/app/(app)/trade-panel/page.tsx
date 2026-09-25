@@ -11,6 +11,7 @@ import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/
 import { BulkExitBar } from "@/components/BulkExitBar";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { PercentInput } from "@/components/PercentInput";
+import { useLivePrice } from "@/lib/livePrices";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 /** Build OCC option symbol — ROOT + YYMMDD + C/P + strike*1000 (8 digits). */
@@ -398,6 +399,32 @@ export default function TradePanelPage() {
     [isOption, symbol, expiry, strike, right]
   );
 
+  // Live price for the symbol/contract in focus. We tell the backend to "watch"
+  // it (so the central stream subscribes on demand) and seed an instant REST
+  // quote; from then on useLivePrice ticks it live over SSE — same feed the
+  // positions table uses. For options the live value is the quote mid.
+  const watchSym = isOption ? occ : (symbol.trim().toUpperCase() || null);
+  const [seedPx, setSeedPx] = useState<number | null>(null);
+  useEffect(() => {
+    if (!watchSym) { setSeedPx(null); return; }
+    let alive = true;
+    const ping = async () => {
+      try {
+        const res = await api<{ prices: Record<string, string | null> }>(
+          "/api/market-data/watch",
+          { method: "POST", body: JSON.stringify({ symbols: [watchSym] }) },
+        );
+        if (!alive) return;
+        const p = res.prices?.[watchSym];
+        if (p != null && Number.isFinite(Number(p))) setSeedPx(Number(p));
+      } catch { /* non-fatal — the live tick still arrives once streamed */ }
+    };
+    ping();
+    const t = setInterval(ping, 30_000);   // heartbeat keeps the watch alive
+    return () => { alive = false; clearInterval(t); };
+  }, [watchSym]);
+  const livePx = useLivePrice(watchSym, seedPx);
+
   // Reference price for converting TP/SL percentages → absolute prices.
   // We use the order's limit price as the implicit reference. Market
   // orders have no upfront price → an inline hint asks the trader to
@@ -615,6 +642,20 @@ export default function TradePanelPage() {
                 onChange={e => setSymbol(e.target.value)}
                 required
               />
+              {watchSym && livePx != null && (
+                <div className="flex items-center gap-2 mt-1.5 text-[13px]" aria-live="polite">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60" style={{ background: "var(--good)" }} />
+                      <span className="relative inline-flex rounded-full h-1.5 w-1.5" style={{ background: "var(--good)" }} />
+                    </span>
+                    <span style={{ color: "var(--muted)" }}>{isOption ? "Live mid" : "Live"}</span>
+                  </span>
+                  <span className="num font-semibold tabular-nums" style={{ color: "var(--text)" }}>
+                    {livePx.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </span>
+                </div>
+              )}
               <div className="flex flex-wrap gap-1.5 mt-2">
                 {POPULAR_SYMBOLS.map(tk => {
                   const selected = symbol.trim().toUpperCase() === tk;

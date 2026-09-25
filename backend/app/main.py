@@ -15,6 +15,7 @@ from app.api import (
     events,
     follow_requests,
     listener as listener_api,
+    market_data as market_data_api,
     notifications as notifications_api,
     options,
     performance,
@@ -140,6 +141,7 @@ def create_app() -> FastAPI:
     app.include_router(positions.router)
     app.include_router(performance.router)
     app.include_router(listener_api.router)
+    app.include_router(market_data_api.router)
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
 
