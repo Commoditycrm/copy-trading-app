@@ -243,6 +243,13 @@ def create_app() -> FastAPI:
             market_data_stream.start_market_data_stream()
         except Exception:  # noqa: BLE001
             log.exception("failed to start market_data_stream")
+        # Second source for the same price cache: Webull MQTT (fallback for the
+        # Alpaca stream). No-op unless its keys + flag are set.
+        try:
+            from app.services import webull_market_stream
+            webull_market_stream.start_webull_market_stream()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start webull_market_stream")
 
         # Daily realized-P&L snapshot sweep (broker-direct values the Calendar
         # reads). Started INDEPENDENTLY here — it also runs at the tail of
@@ -392,6 +399,11 @@ def create_app() -> FastAPI:
             await market_data_stream.stop_market_data_stream()
         except Exception:  # noqa: BLE001
             log.exception("failed to stop market_data_stream cleanly")
+        try:
+            from app.services import webull_market_stream
+            await webull_market_stream.stop_webull_market_stream()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to stop webull_market_stream cleanly")
         try:
             await close_async_redis()
         except Exception:  # noqa: BLE001
