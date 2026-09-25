@@ -462,3 +462,36 @@ class DiscordSettingsIn(BaseModel):
     trim_trail_amount: str | None = None
     reprice_after_seconds: int | None = Field(default=None, ge=5, le=600)
     reprice_pct: str | None = None
+
+
+# ── the "Self" channel: manually replaying an alert the system missed ────────
+
+class DiscordSelfAlertIn(BaseModel):
+    """One alert the trader is submitting by hand.
+
+    Deliberately carries ONLY the text. Everything else a Discord message would
+    have — author, timestamps, ids — is synthesised, because the point is that
+    this goes through the SAME parser and the same execution path as a real
+    alert. Letting the caller supply a parsed signal would be a second, untested
+    way into the order pipeline.
+    """
+
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class DiscordSelfAlertOut(BaseModel):
+    """What happened to it — the stored message's own verdict.
+
+    Returned rather than a bare 204 so the modal can say "placed", "rejected —
+    the alert names no symbol", or "awaiting your approval" instead of leaving
+    the trader to go hunting in another tab.
+    """
+
+    id: uuid.UUID
+    content: str
+    # received | ignored | parsed | invalid | order_created | order_failed
+    status: str
+    status_reason: str | None
+    decision: str | None
+    order_id: uuid.UUID | None
+    parsed_signal: dict[str, Any] | None
