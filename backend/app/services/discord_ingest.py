@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -80,6 +81,11 @@ class IngestReport:
     stored: list[Any] = field(default_factory=list)
     # Already on record — the normal outcome of a reconnect or backlog replay.
     duplicates: list[str] = field(default_factory=list)
+    # Rows whose CONTENT changed because the author edited the message in place.
+    # Kept apart from `stored`: an edit must never be executed as a fresh alert
+    # — that would place a second order for one trade. The caller repoints the
+    # order the message already placed instead.
+    edited: list[Any] = field(default_factory=list)
     # NOT taken: nothing was stored and the message is gone unless re-observed.
     rejected: list[dict[str, str]] = field(default_factory=list)
     # Stored, but couldn't be pushed onto the pipeline queue. Deliberately NOT
@@ -104,6 +110,7 @@ class IngestReport:
         return {
             "accepted": len(self.accepted),
             "duplicates": len(self.duplicates),
+            "edited": len(self.edited),
             "rejected": self.rejected,
             "queue_failed": len(self.queue_failed),
         }
@@ -141,8 +148,22 @@ def _json(payload: dict[str, Any]) -> str:
 
 def _persist(
     db: Session, source: DiscordAlertSource, raw: dict[str, Any], *, auto_approve: bool
-) -> DiscordMessage | None:
-    """Insert the raw message. Returns None if it's already on record.
+) -> tuple[DiscordMessage | None, bool]:
+    """Insert the raw message. Returns ``(row, was_edit)``.
+
+    ``(None, False)`` means it is already on record, unchanged — the normal
+    outcome of a reconnect or backlog replay.
+
+    ``(row, True)`` means the author EDITED the message in place: same snowflake,
+    different text. Alert channels correct a price seconds after posting
+    ("$SPY 770 CALL 0DTE @0.20" becomes "@0.15"), and until now the edit hit the
+    uniqueness constraint and was counted as a duplicate — so the corrected
+    price was never acted on and the order stayed resting at the price the
+    author had already withdrawn.
+
+    The row is re-parsed against the new text, so the caller sees the CURRENT
+    reading. It is deliberately NOT returned in ``stored``: re-running it
+    through execution would place a second order for one trade.
 
     The uniqueness decision is made by the DATABASE, not by a prior SELECT: a
     check-then-insert would still race two concurrent batches carrying the same
@@ -174,8 +195,68 @@ def _persist(
             db.add(row)
             db.flush()
     except IntegrityError:
-        return None
-    return row
+        # The savepoint rollback usually detaches `row` already; expunge is the
+        # belt-and-braces case. Without it still being out of the session, the
+        # SELECT below autoflushes and re-attempts the INSERT that just failed.
+        try:
+            db.expunge(row)
+        except Exception:  # noqa: BLE001
+            pass
+        return _apply_edit(db, source, raw, auto_approve=auto_approve)
+    return row, False
+
+
+def _apply_edit(
+    db: Session, source: DiscordAlertSource, raw: dict[str, Any], *, auto_approve: bool
+) -> tuple[DiscordMessage | None, bool]:
+    """The insert was rejected as a duplicate — decide whether it is an EDIT.
+
+    Only text that actually CHANGED counts. The observer re-emits a message on
+    any DOM mutation it cannot attribute, and a reconnect replays the whole
+    rendered backlog, so "we have seen this snowflake before" is far commoner
+    than a real edit; treating those as edits would re-parse and repoint live
+    orders off messages nobody touched.
+    """
+    with db.no_autoflush:
+        existing = db.execute(
+            select(DiscordMessage).where(
+                DiscordMessage.source_id == source.id,
+                DiscordMessage.discord_message_id == str(raw["message_id"]).strip(),
+            )
+        ).scalars().first()
+    if existing is None:
+        return None, False
+
+    new_content = raw.get("content") or ""
+    if (existing.content or "") == new_content:
+        return None, False        # same text — an ordinary duplicate
+
+    log.info(
+        "discord_ingest: message %s was edited — %r -> %r",
+        existing.discord_message_id, (existing.content or "")[:80], new_content[:80],
+    )
+    existing.content = new_content
+    existing.attachments = list(raw.get("attachments") or [])
+    existing.embeds = list(raw.get("embeds") or [])
+    # Re-read the NEW text. _apply_parse overwrites parsed_signal/status, so the
+    # caller compares against the order that was actually placed, not against
+    # the stale reading.
+    #
+    # The STATUS is restored afterwards: this alert already ran, and re-parsing
+    # would walk it back to PARSED as though it never had. That reads as an
+    # alert still awaiting execution — in the order history the row looked
+    # half-executed, carrying an order_id under a status that says no order was
+    # placed. The reading changes; what happened to it did not.
+    was = existing.status
+    had_order = existing.order_id is not None
+    _apply_parse(
+        existing,
+        auto_approve=auto_approve,
+        percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
+    )
+    if had_order:
+        existing.status = was
+    return existing, True
 
 
 def _apply_parse(
@@ -271,9 +352,14 @@ def ingest_batch(
             report.rejected.append({"message_id": "", "reason": "missing_message_id"})
             continue
 
-        row = _persist(db, source, raw, auto_approve=auto_approve)
+        row, was_edit = _persist(db, source, raw, auto_approve=auto_approve)
         if row is None:
             report.duplicates.append(message_id)
+            continue
+        if was_edit:
+            # NOT accepted: an edit is a correction to a trade already placed,
+            # never a new one. The caller repoints the existing order.
+            report.edited.append(row)
             continue
 
         # Best-effort. The durable record already exists, so a queue failure
