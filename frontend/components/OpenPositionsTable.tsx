@@ -8,7 +8,7 @@ import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
-import { useLivePrice } from "@/lib/livePrices";
+import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -90,6 +90,45 @@ function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline }: {
   const delta = useLivePriceDelta(symbol, snapshotPrice, quantity);
   const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
   return <td className="px-5 py-3.5 num">{fmtNum(val == null ? baseline : String(val), 2)}</td>;
+}
+
+/** The two summary tiles that move with price — Unrealized P&L and Market value.
+ *  Own component so a tick only re-renders these tiles, not the whole table.
+ *  Sums each visible stock row's live delta (same signed_qty × Δprice as the
+ *  per-row cells) on top of the backend baseline; 0 until ticks arrive. */
+function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
+  positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string;
+}) {
+  const symbols = useMemo(
+    () => positions.filter((p) => p.instrument_type === "stock").map((p) => p.symbol.toUpperCase()),
+    [positions],
+  );
+  const version = useLivePrices(symbols);
+  const { pnl, mv } = useMemo(() => {
+    let d = 0;
+    for (const p of positions) {
+      if (p.instrument_type !== "stock") continue;
+      const live = peekLivePrice(p.symbol);
+      if (live == null) continue;
+      const snap = Number(p.current_price);
+      const qty = Number(p.quantity);
+      if (!Number.isFinite(snap) || !Number.isFinite(qty)) continue;
+      d += (live - snap) * qty;
+    }
+    return { pnl: baselinePnl + d, mv: baselineMv + d };
+    // version drives the recompute when a subscribed symbol ticks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [positions, baselinePnl, baselineMv, version]);
+  return (
+    <>
+      <SummaryTile label="Unrealized P&L" tone={pnl > 0 ? "good" : pnl < 0 ? "bad" : "neutral"}
+        node={<AnimatedNumber value={pnl} format={fmtSignedUsd} className="num" />}
+        sub="On open positions" />
+      <SummaryTile label="Market value" tone="neutral"
+        node={<AnimatedNumber value={mv} format={fmtUsd} className="num" />}
+        sub={mvSub} />
+    </>
+  );
 }
 
 function fmtSignedMoney(n: string | null | undefined): { text: string; sign: 1 | -1 | 0 | null } {
@@ -576,12 +615,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
               : <AnimatedNumber value={todayRealized} format={fmtSignedUsd} className="num" />}
             sub="Matches Calendar" />
-          <SummaryTile label="Unrealized P&L" tone={summary.pnl > 0 ? "good" : summary.pnl < 0 ? "bad" : "neutral"}
-            node={<AnimatedNumber value={summary.pnl} format={fmtSignedUsd} className="num" />}
-            sub="On open positions" />
-          <SummaryTile label="Market value" tone="neutral"
-            node={<AnimatedNumber value={summary.mv} format={fmtUsd} className="num" />}
-            sub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
+          <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv}
+            mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
           <SummaryTile label="Account value" tone="neutral"
             node={totalEquity == null
               ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
