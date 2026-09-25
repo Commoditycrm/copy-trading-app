@@ -111,6 +111,12 @@ class TradeSignal:
     # Acted on in discord_execution._resolve_quantity: the entry is taken at
     # HALF the size it otherwise would be.
     half_size: bool = False
+    # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
+    # held, so the position doubles. Distinct from half_size, which scales the
+    # alert's own size; this one IGNORES it and sizes purely from the position,
+    # because "double up" is a statement about what you hold, not about the
+    # author's conviction. Acted on in discord_execution._resolve_quantity.
+    double_up: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -154,6 +160,7 @@ class TradeSignal:
             ),
             "position_closed": self.position_closed,
             "half_size": self.half_size,
+            "double_up": self.double_up,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,

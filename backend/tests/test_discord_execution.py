@@ -803,3 +803,92 @@ def test_a_close_is_never_halved(monkeypatch):
         ex.Sizing(),
     )
     assert r.is_closing and r.payload.quantity == Decimal("4")
+
+
+# ── "averaging down": double the position already held ───────────────────────
+
+def test_an_average_down_doubles_what_is_held(monkeypatch):
+    """"$SPY 768 PUT averaging down @0.48" — you hold 5, so 5 more go on and
+    the position becomes 10."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="5")]))
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    assert r.is_closing is False
+    assert r.payload.side.value == "buy"
+    assert r.payload.quantity == Decimal("5")
+
+
+def test_the_same_alert_without_the_flag_uses_the_alert_size(monkeypatch):
+    """Pins that doubling is what changed, not the position lookup."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="5")]))
+    r = ex.resolve(None, _User(), _signal(quantity="1"), ex.Sizing())
+    assert r.payload.quantity == Decimal("1")
+
+
+def test_an_average_down_ignores_the_multiplier(monkeypatch):
+    """The held 5 was ALREADY shaped by the multiplier when it was opened.
+    Scaling it again would quadruple a 2x account instead of doubling it."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="5")]))
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=4))
+    assert r.payload.quantity == Decimal("5")
+
+
+def test_an_average_down_ignores_the_alerts_own_quantity(monkeypatch):
+    """Sized from the POSITION, not the alert — "double up" is a statement
+    about what you hold."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="3")]))
+    r = ex.resolve(None, _User(), _signal(double_up=True, quantity="9"), ex.Sizing())
+    assert r.payload.quantity == Decimal("3")
+
+
+def test_an_average_down_is_not_also_halved(monkeypatch):
+    """"light" scales the author's size into yours. This one already sized
+    itself from your position, so halving it would UNDO half the holding."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="4")]))
+    r = ex.resolve(
+        None, _User(), _signal(double_up=True, half_size=True), ex.Sizing(multiplier=4),
+    )
+    assert r.payload.quantity == Decimal("4")
+
+
+def test_an_average_down_with_nothing_held_is_refused(monkeypatch):
+    """Nothing to average INTO. Taking the default size here would open a
+    fresh position at a price the channel is calling a loss."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
+    with pytest.raises(ex.ExecutionRefused, match="no position in that contract"):
+        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+
+
+def test_an_average_down_matches_the_contract_not_just_the_symbol(monkeypatch):
+    """A different strike on the same ticker is a different position. Sizing
+    off it would double something the alert never named."""
+    _wire(monkeypatch, _ChainAdapter(
+        contracts=[_Contract(100)],
+        positions=[_Pos(strike="105", qty="8")],      # MSFT 105C, not 100C
+    ))
+    with pytest.raises(ex.ExecutionRefused, match="no position in that contract"):
+        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+
+
+def test_the_doubling_is_recorded_for_the_audit_trail(monkeypatch):
+    """An order at a size the alert never stated must be explainable later."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="5")]))
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    assert "doubling" in r.resolutions["quantity"]
+
+
+def test_an_average_down_still_obeys_the_order_ceiling(monkeypatch):
+    """Doubling is a sizing rule, not a licence to exceed the trader's own
+    risk caps — the cap is the last word on every entry."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)],
+                                     positions=[_Pos(qty="5")]))
+    with pytest.raises(ex.ExecutionRefused, match="max per order"):
+        ex.resolve(
+            None, _User(), _signal(double_up=True),
+            ex.Sizing(max_per_order=Decimal("100")),   # 5 x 1.90 x 100 = $950
+        )
