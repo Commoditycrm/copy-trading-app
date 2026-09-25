@@ -147,6 +147,16 @@ function signalToOrder(sig: DiscordSignal): Order {
         ? "Rejected by you"
         : null,
     created_at: sig.created_at,
+    // The Channel column is shared with Order History, which gets this from the
+    // backend (trades._fill_channels). Nothing fills it in here, so every row on
+    // the Discord tab showed a dash — on the one tab where EVERY row has a
+    // channel by definition.
+    //
+    // Same preference as the backend: the trader's own label for the source
+    // first, Discord's raw channel name second. Both can be blank on a source
+    // captured before either was known, which then reads as a dash.
+    discord_channel:
+      (sig.source_label || "").trim() || (sig.channel_name || "").trim() || null,
     // Left null on purpose: the alert's P&L belongs to whoever posted it, not
     // to this trader. Showing it under "Realized P&L" would claim otherwise.
     realized_pnl: null,
