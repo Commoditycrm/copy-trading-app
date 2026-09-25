@@ -11,7 +11,12 @@ from app.models.user import User, UserRole
 _oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 
-def client_ip(request: Request) -> str | None:
+def client_ip(request: Request | None) -> str | None:
+    # None when the caller is a background worker rather than a request — an
+    # auto-trim, a poller-driven close. There is no client, and an audit row
+    # saying so is better than one the worker cannot write at all.
+    if request is None:
+        return None
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()

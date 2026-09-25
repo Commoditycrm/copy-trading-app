@@ -656,6 +656,7 @@ def get_discord_settings(
     return DiscordSettingsOut(
         execution_mode="auto" if _auto_approve(db, user.id) else "manual",
         live_trading=bool(ts and ts.discord_live_trading),
+        auto_trim=bool(ts and getattr(ts, "discord_auto_trim", False)),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
@@ -770,6 +771,13 @@ def update_discord_settings(
     if payload.reprice_after_seconds is not None:
         ts.discord_reprice_after_seconds = payload.reprice_after_seconds
 
+    if payload.auto_trim is not None:
+        ts.discord_auto_trim = payload.auto_trim
+        log.info(
+            "discord: auto-trim %s for user %s",
+            "ENABLED" if payload.auto_trim else "disabled", user.id,
+        )
+
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
         log.warning(
@@ -780,6 +788,7 @@ def update_discord_settings(
     return DiscordSettingsOut(
         execution_mode=ts.discord_execution_mode,
         live_trading=bool(ts.discord_live_trading),
+        auto_trim=bool(getattr(ts, "discord_auto_trim", False)),
         quantity_multiplier=ts.discord_quantity_multiplier or 1,
         max_per_contract=_plain(ts.discord_max_per_contract),
         max_per_order=_plain(ts.discord_max_per_order),
@@ -1111,6 +1120,68 @@ def _self_message_id() -> str:
     return str(int(time.time() * 1_000_000))
 
 
+class _InlineTasks(BackgroundTasks):
+    """Run "background" work inline.
+
+    _place_trader_order hands the subscriber fanout to BackgroundTasks, which a
+    REQUEST drains after responding. A worker thread has nothing to drain it, so
+    passing a plain BackgroundTasks would silently DROP the fanout — the trader
+    would be trimmed and every subscriber left holding. Running it inline is
+    correct here: we are already off the request path, so there is nothing to
+    return to early.
+    """
+
+    def add_task(self, func, *args, **kwargs) -> None:  # noqa: ANN001, ANN003
+        func(*args, **kwargs)
+
+
+def submit_self_alert_text(
+    db: Session,
+    user: User,
+    content: str,
+    *,
+    background: BackgroundTasks | None = None,
+    request: Request | None = None,
+    approve: bool = False,
+) -> DiscordMessage | None:
+    """Put ``content`` through the Discord pipeline as a Self-channel alert.
+
+    The one place an alert can be injected without Discord — used by the
+    composer in Order History and by auto-trim. Returns the stored message so
+    the caller can report its verdict, or None if it could not be stored.
+
+    ``approve`` forces execution past the trader's manual/auto gate. Auto-trim
+    sets it: the trader turned auto-trim ON, which IS the approval, and an
+    automatic trim that sat waiting for a second approval would miss the move
+    it was watching for. The composer leaves it False, so a pasted alert behaves
+    exactly as if Discord had delivered it.
+    """
+    src = _self_source(db, user)
+    raw = {
+        "message_id": _self_message_id(),
+        "channel_id": src.channel_id,
+        "server_id": None,
+        "author": user.email,
+        "author_id": str(user.id),
+        "content": (content or "").strip(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "attachments": [],
+        "embeds": [],
+    }
+
+    auto = approve or _auto_approve(db, user.id)
+    report = discord_ingest.ingest_batch(db, src, [raw], auto_approve=auto)
+    if not report.stored:
+        return None
+
+    msg = report.stored[0]
+    if auto and msg.decision is SignalDecision.APPROVED:
+        _execute_signal(db, user, msg, background or _InlineTasks(), request)
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
 @router.post("/self/alert", response_model=DiscordSelfAlertOut)
 def submit_self_alert(
     payload: DiscordSelfAlertIn,
@@ -1130,32 +1201,14 @@ def submit_self_alert(
     delivered it" means. In auto it places; in manual it lands awaiting approval
     in the Discord tab, exactly where a real alert would have.
     """
-    src = _self_source(db, user)
-    raw = {
-        "message_id": _self_message_id(),
-        "channel_id": src.channel_id,
-        "server_id": None,
-        "author": user.email,
-        "author_id": str(user.id),
-        "content": payload.content.strip(),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "attachments": [],
-        "embeds": [],
-    }
-
-    auto = _auto_approve(db, user.id)
-    report = discord_ingest.ingest_batch(db, src, [raw], auto_approve=auto)
-    if not report.stored:
+    msg = submit_self_alert_text(
+        db, user, payload.content, background=background, request=request,
+    )
+    if msg is None:
         # ingest_batch only rejects a message with no id, which cannot happen
         # here — but returning a 500 on an impossible branch is worse than
         # saying plainly that nothing was stored.
         raise HTTPException(500, "could not store the alert")
-
-    msg = report.stored[0]
-    if auto and msg.decision is SignalDecision.APPROVED:
-        _execute_signal(db, user, msg, background, request)
-    db.commit()
-    db.refresh(msg)
     return DiscordSelfAlertOut(
         id=msg.id,
         content=msg.content or "",

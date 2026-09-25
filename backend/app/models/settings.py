@@ -165,6 +165,24 @@ class TraderSettings(Base, TimestampMixin):
     discord_trim3_stop_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
     )
+    # Run the ladder off the PRICE instead of waiting for an alert.
+    #
+    # Off, a rung fires when its Discord alert arrives and the profit gate is
+    # the condition it has to satisfy. On, there is no alert to wait for: the
+    # poller watches the position and fires the rung the moment its gate is
+    # reached, through exactly the same execution path.
+    #
+    # A rung whose gate is 0 is NEVER auto-fired. Zero means "no minimum" — it
+    # is the right default for an alert-driven rung (sell whenever the author
+    # says to) and meaningless without one, because "reached 0% profit" is true
+    # the instant a position is up a cent. Auto-firing those would walk rungs
+    # 2 and 3 immediately after rung 1 and flatten the position. So auto-trim
+    # needs a positive threshold per rung, which is also the only way a trader
+    # can say WHERE they want each automatic trim to happen.
+    discord_auto_trim: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # Entry price above which an exit trails instead of going to market.
     discord_trim_price_threshold: Mapped[Decimal] = mapped_column(
         Numeric(18, 4), default=Decimal("0.90"), server_default="0.90", nullable=False,
