@@ -435,6 +435,64 @@ def on_buy(
     return guard
 
 
+def average_in(
+    db: Session, guard: DiscordPositionGuard, *,
+    held_qty: Decimal, added_qty: Decimal, added_price: Decimal | None,
+) -> Decimal | None:
+    """Re-weight ``entry_price`` after AVERAGING DOWN. Returns the new average.
+
+    Normally an add must NOT move the reference — see on_buy. A position that
+    kept averaging UP would otherwise quietly raise its own stop-loss under a
+    trader who never asked for that, so the ladder holds the first fill fixed.
+
+    Averaging down is the case where holding it fixed is the error, and by a
+    wide margin. Doubling 4 @ 0.68 into 8 @ 0.40 makes the real cost 0.54, and
+    doubling again at 0.23 makes it 0.385 — while the guard still reads 0.68.
+    Every level then means something the trader never chose:
+
+        stop (-25%)        0.5100   vs   0.2888 off the real average
+        trim gate (+20%)   0.8160   vs   0.4620
+
+    A stop at 0.51 sits ABOVE the true cost of 0.385, so it exits a position
+    that is actually in profit; and a gate at 0.816 needs +112% over real cost,
+    so no trim ever fires. Both are worse than the risk on_buy is guarding
+    against, which is why this is a separate, explicit call rather than a
+    loosening of on_buy.
+
+    Weighted by quantity, so it stays right if an add is ever sized differently
+    from the position:
+
+        (held x entry + added x price) / (held + added)
+
+    ``added_price`` is the LIMIT we bid, not the fill — the fill is not known at
+    placement. A limit buy fills at or better than its limit, so the true
+    average can only be LOWER than this, which errs toward a stop that exits
+    early rather than one that sits under the real cost.
+    """
+    if added_price is None or added_price <= 0:
+        return guard.entry_price
+    if guard.entry_price is None:
+        # Nothing to weight against — the add IS the only price we know.
+        guard.entry_price = added_price
+        return guard.entry_price
+    held_qty = Decimal(str(held_qty or 0))
+    added_qty = Decimal(str(added_qty or 0))
+    total = held_qty + added_qty
+    if total <= 0 or added_qty <= 0:
+        return guard.entry_price
+
+    previous = Decimal(str(guard.entry_price))
+    new_avg = (
+        (held_qty * previous + added_qty * Decimal(str(added_price))) / total
+    ).quantize(Decimal("0.0001"))
+    log.info(
+        "discord guard: %s averaged down — entry %s -> %s (%s held @ %s + %s @ %s)",
+        guard.symbol, previous, new_avg, held_qty, previous, added_qty, added_price,
+    )
+    guard.entry_price = new_avg
+    return new_avg
+
+
 def rollback_exit(guard: DiscordPositionGuard) -> None:
     """Undo the rung bump from an exit whose order never made it.
 
