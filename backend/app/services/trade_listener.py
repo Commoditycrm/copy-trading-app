@@ -255,6 +255,7 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
     handler_calls = 0
     while True:
         connect_attempts += 1
+        connected_ok = {"v": False}  # flipped by the watchdog on a real socket
         try:
             # Re-read creds + broker on every connect attempt — they may have
             # been rotated or the account marked disconnected since last try.
@@ -326,7 +327,12 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             # so it can run in parallel with the WebSocket consumer.
             listener_state.clear_disconnect_debounce(trader_user_id)
             _set_state(trader_user_id, "connected")
-            backoff = _BACKOFF_INITIAL
+            # NOTE: backoff is NOT reset here. This "connected" is optimistic —
+            # set before the socket actually establishes. Resetting backoff here
+            # meant a listener that could never truly connect (e.g. an account
+            # perpetually 429'd) reset to 1s every cycle and hammered forever.
+            # The watchdog confirms a real socket and flips connected["v"], and
+            # the backoff tail below resets only then; otherwise it grows to 60s.
             log.info(
                 "listener[%s] connected; handler_calls so far: %d",
                 trader_user_id, handler_calls,
@@ -353,7 +359,7 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             # Watchdog that converts alpaca-py's 10ms internal 429 storm into the
             # outer loop's real backoff. Shares hb_stop's lifecycle.
             wd_task = asyncio.create_task(
-                _reconnect_watchdog(stream, trader_user_id, hb_stop)
+                _reconnect_watchdog(stream, trader_user_id, hb_stop, connected_ok)
             )
 
             # Blocks until disconnected / cancelled. THIS IS THE LINE
@@ -388,19 +394,26 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             log.exception("listener[%s] error: %s", trader_user_id, exc)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 
-        # Reconnect with exponential backoff capped at 60s.
+        # Reconnect with exponential backoff capped at 60s. Reset only when the
+        # socket genuinely came up this cycle; otherwise grow — so an account
+        # that can never connect (e.g. perpetually 429'd) backs off to 60s
+        # instead of retrying every ~1s and hammering Alpaca.
+        if connected_ok["v"]:
+            backoff = _BACKOFF_INITIAL
         log.info(
-            "listener[%s] sleeping %.1fs before reconnect attempt #%d",
-            trader_user_id, backoff, connect_attempts + 1,
+            "listener[%s] sleeping %.1fs before reconnect attempt #%d (connected=%s)",
+            trader_user_id, backoff, connect_attempts + 1, connected_ok["v"],
         )
         await asyncio.sleep(backoff)
-        backoff = min(_BACKOFF_MAX, backoff * 2)
+        if not connected_ok["v"]:
+            backoff = min(_BACKOFF_MAX, backoff * 2)
 
 
 async def _reconnect_watchdog(
     stream: Any,
     trader_user_id: uuid.UUID,
     stop: asyncio.Event,
+    connected: "dict[str, bool] | None" = None,
 ) -> None:
     """Break out of alpaca-py's internal reconnect storm. Its ``_run_forever``
     retries every 10ms with no backoff, so a persistent rejection (e.g. Alpaca
@@ -418,6 +431,9 @@ async def _reconnect_watchdog(
         except asyncio.TimeoutError:
             pass
         if getattr(stream, "_running", False):
+            if connected is not None:
+                connected["v"] = True  # a genuine live socket — lets the outer
+                                       # loop reset backoff (vs a stuck 429 flap)
             stuck = 0
         else:
             stuck += 1
