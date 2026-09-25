@@ -225,10 +225,17 @@ def get_live_price(symbol: str, max_age_s: float = _MAX_AGE_S) -> Decimal | None
 
 
 # ── on-demand watch (trade panel) ───────────────────────────────────────────
-def add_watch(symbols: list[str]) -> None:
+# Per-user watch keys drive per-client SSE filtering: an SSE connection only
+# forwards price ticks for symbols in THAT user's interest set (held ∪ watched),
+# instead of the global firehose. Keyed per user + symbol with the same TTL.
+_USER_WATCH_KEY = "mduserwatch:{}:{}"
+
+
+def add_watch(symbols: list[str], user_id: Any = None) -> None:
     """Mark symbols (tickers or OCC) as actively watched so the stream picks them
-    up on demand. Idempotent; refreshes the TTL. Called by the watch endpoint on
-    a heartbeat while a trade-panel symbol is selected."""
+    up on demand (global key), and — when a user is given — record them under
+    that user so their SSE connection forwards those ticks. Idempotent; refreshes
+    the TTL. Called by the watch endpoint on a heartbeat."""
     from app.services.redis_client import get_sync_redis  # noqa: PLC0415
     try:
         r = get_sync_redis()
@@ -236,8 +243,81 @@ def add_watch(symbols: list[str]) -> None:
             sym = (s or "").upper().strip()
             if sym:
                 r.set(_WATCH_KEY.format(sym), "1", ex=_WATCH_TTL_S)
+                if user_id is not None:
+                    r.set(_USER_WATCH_KEY.format(user_id, sym), "1", ex=_WATCH_TTL_S)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _user_watched(user_id: Any) -> set[str]:
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    out: set[str] = set()
+    prefix = f"mduserwatch:{user_id}:"
+    try:
+        for k in get_sync_redis().scan_iter(prefix + "*"):
+            ks = k if isinstance(k, str) else k.decode()
+            out.add(ks[len(prefix):].upper())
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _user_held(user_id: Any) -> set[str]:
+    """Stock tickers + option OCCs this user holds (net != 0) or is working — so
+    their positions/snapshot rows keep ticking without an explicit watch."""
+    from sqlalchemy import case, func  # noqa: PLC0415
+    from app.models.order import OrderSide  # noqa: PLC0415
+
+    syms: set[str] = set()
+    net = func.sum(
+        case((Order.side == OrderSide.BUY, Order.filled_quantity),
+             else_=-Order.filled_quantity)
+    )
+    held_status = (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+    with SessionLocal() as db:
+        for sym in db.execute(
+            select(Order.symbol).where(
+                Order.user_id == user_id,
+                Order.instrument_type == InstrumentType.STOCK,
+                Order.status.in_(held_status),
+            ).group_by(Order.symbol).having(net != 0)
+        ).scalars().all():
+            if sym:
+                syms.add(sym.upper())
+        for sym in db.execute(
+            select(Order.symbol).where(
+                Order.user_id == user_id,
+                Order.instrument_type == InstrumentType.STOCK,
+                Order.status.in_(_WORKING),
+            ).distinct()
+        ).scalars().all():
+            if sym:
+                syms.add(sym.upper())
+        cols = (Order.symbol, Order.option_expiry, Order.option_strike, Order.option_right)
+        opt_rows = db.execute(
+            select(*cols).where(
+                Order.user_id == user_id,
+                Order.instrument_type == InstrumentType.OPTION,
+                Order.status.in_(held_status),
+            ).group_by(*cols).having(net != 0)
+        ).all() + db.execute(
+            select(*cols).where(
+                Order.user_id == user_id,
+                Order.instrument_type == InstrumentType.OPTION,
+                Order.status.in_(_WORKING),
+            ).distinct()
+        ).all()
+    for sym, exp, strike, right in opt_rows:
+        occ = _build_occ(sym, exp, strike, right)
+        if occ:
+            syms.add(occ)
+    return syms
+
+
+def user_interest(user_id: Any) -> set[str]:
+    """Symbols an SSE connection for ``user_id`` should receive live ticks for:
+    everything they hold/work plus everything they're actively watching."""
+    return _user_held(user_id) | _user_watched(user_id)
 
 
 def _read_watch() -> set[str]:
@@ -651,5 +731,5 @@ async def stop_market_data_stream() -> None:
 
 __all__ = [
     "start_market_data_stream", "stop_market_data_stream",
-    "get_live_price", "add_watch",
+    "get_live_price", "add_watch", "user_interest",
 ]

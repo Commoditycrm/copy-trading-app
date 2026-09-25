@@ -75,20 +75,49 @@ async def subscribe(
         log.exception("redis pubsub subscribe failed for user=%s", user_id)
         return
 
+    # Per-client price filtering: the prices channel is global, but this
+    # connection should only forward ticks for symbols THIS user is actually
+    # showing (held ∪ watched) — not the whole platform's firehose. Recomputed
+    # periodically; a lookup failure leaves it None → fail open (forward all).
+    import time as _time  # noqa: PLC0415
+
+    async def _load_interest() -> "set[str] | None":
+        try:
+            from app.services import market_data_stream as _mds  # noqa: PLC0415
+            return await asyncio.to_thread(_mds.user_interest, user_id)
+        except Exception:  # noqa: BLE001
+            return None
+
+    interest: "set[str] | None" = await _load_interest() if include_prices else None
+    interest_at = _time.monotonic()
+
     try:
         while True:
             # get_message returns None on timeout — we use that to let the
             # caller poll request.is_disconnected() between events.
             msg = await pubsub.get_message(timeout=1.0)
+            if include_prices and _time.monotonic() - interest_at >= 10.0:
+                interest = await _load_interest()
+                interest_at = _time.monotonic()
             if msg is None:
                 continue
             data = msg.get("data")
             if data is None:
                 continue
             try:
-                yield json.loads(data) if isinstance(data, (str, bytes)) else data
+                payload = json.loads(data) if isinstance(data, (str, bytes)) else data
             except json.JSONDecodeError:
                 log.warning("dropping malformed event on channel %s", _channel(user_id))
+                continue
+            # Drop price ticks for symbols this client isn't showing.
+            if (
+                interest is not None
+                and isinstance(payload, dict)
+                and payload.get("type") == "price.tick"
+                and str(payload.get("symbol", "")).upper() not in interest
+            ):
+                continue
+            yield payload
     finally:
         try:
             await pubsub.unsubscribe(*channels)

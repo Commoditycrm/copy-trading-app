@@ -24,13 +24,14 @@ class WatchBody(BaseModel):
 
 
 @router.post("/watch")
-def watch(body: WatchBody, _user: User = Depends(current_user)) -> dict:
+def watch(body: WatchBody, user: User = Depends(current_user)) -> dict:
     """Register symbols as watched (heartbeat) and return a current price for
     each — cache first, one-shot REST otherwise — so the trade panel paints a
-    price instantly and then ticks live off the stream."""
+    price instantly and then ticks live off the stream. Scoped to the caller so
+    their SSE connection forwards exactly these symbols."""
     syms = [s.upper().strip() for s in body.symbols if s and s.strip()][:25]
     if syms:
-        mds.add_watch(syms)
+        mds.add_watch(syms, user_id=user.id)
     prices: dict[str, str | None] = {}
     for sym in syms:
         px = mds.get_live_price(sym, max_age_s=30.0)
