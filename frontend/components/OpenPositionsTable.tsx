@@ -365,6 +365,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     useEventStream((evt) => {
       if (
         evt.type !== "order.placed" &&
+        evt.type !== "order.updated" &&
         evt.type !== "order.copy_submitted" &&
         evt.type !== "order.copy_failed" &&
         evt.type !== "order.cancelled" &&

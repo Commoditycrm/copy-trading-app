@@ -540,6 +540,7 @@ export default function TradesPage() {
     }
     if (
       evt.type !== "order.placed" &&
+      evt.type !== "order.updated" &&
       evt.type !== "order.copy_submitted" &&
       evt.type !== "order.copy_failed" &&
       evt.type !== "order.copy_retry_scheduled" &&
