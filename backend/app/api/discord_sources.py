@@ -86,6 +86,7 @@ from app.services import (
     discord_execution,
     discord_position_guard as guards,
     price_override,
+    discord_edit,
     discord_ingest,
     discord_login,
     discord_pairing,
@@ -1538,6 +1539,23 @@ def listener_messages(
             for msg in report.stored:
                 if msg.decision is SignalDecision.APPROVED:
                     _execute_signal(db, owner, msg, background, request)
+
+    # An EDITED alert is a correction to the trade it already placed, never a
+    # new one — so it deliberately bypasses _execute_signal above and repoints
+    # the resting order instead. Handled per message: one failure must not stop
+    # the rest of the batch, and a bad edit must never fail the listener's POST.
+    for msg in report.edited:
+        try:
+            outcome = discord_edit.apply_price_edit(db, msg)
+            # Recorded on the row, not just logged. "The edit did nothing" and
+            # "the edit was never seen" look identical in an order history and
+            # mean completely different things — and the log is the one place
+            # nobody has when they ask why the price did not move.
+            msg.status_reason = f"Edited alert: {outcome}"[:480]
+            log.info("discord: edited alert %s — %s", msg.discord_message_id, outcome)
+        except Exception as exc:  # noqa: BLE001
+            msg.status_reason = f"Edited alert: handling failed — {exc}"[:480]
+            log.exception("discord: edit handling failed for %s", msg.discord_message_id)
 
     for mid in wrong:
         report.rejected.append({"message_id": mid, "reason": "channel_mismatch"})
