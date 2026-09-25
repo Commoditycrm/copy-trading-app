@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -60,6 +61,18 @@ def _enabled() -> bool:
         and s.webull_data_app_key
         and s.webull_data_app_secret
     )
+
+
+def _parse_invalid_symbols(err_msg: str) -> set[str]:
+    """Pull the symbols Webull flags in a 417 INVALID_SYMBOL error so we can drop
+    exactly those and retry. The message lists them in brackets, e.g.
+    '...does not exist in the category. [PNFP.PRB].' → {'PNFP.PRB'}."""
+    out: set[str] = set()
+    for grp in re.findall(r"\[([^\]]+)\]", err_msg or ""):
+        for tok in re.split(r"[,\s]+", grp.strip()):
+            if tok:
+                out.add(tok.upper())
+    return out
 
 
 def _extract(msg: Any) -> tuple[str | None, Decimal | None]:
@@ -140,16 +153,32 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
     def _on_connected(*_a: Any) -> None:
         if generation != _generation:
             return
-        try:
-            # Category is the STRING name, not the Category enum — the SDK drops
-            # it straight into the JSON body (SubscribeRequest.add_body_params)
-            # and can't serialize the enum. Matches brokers/webull.py's working
-            # get_snapshot("US_STOCK", ...) REST call.
-            client.subscribe(list(symbols), "US_STOCK", sub_types)
-            log.info("webull_market_stream: subscribed %d US stocks (sub_types=%s)",
-                     len(symbols), sub_types)
-        except Exception:  # noqa: BLE001
-            log.exception("webull_market_stream: subscribe failed")
+        # Webull rejects the WHOLE batch if any symbol isn't in the US_STOCK
+        # universe (417 INVALID_SYMBOL names the offenders, e.g. preferreds like
+        # PNFP.PRB, or ETFs which live under a different category). Drop exactly
+        # the ones it names and retry, so one bad ticker can't blank the feed.
+        # Category is the STRING name, not the Category enum — the SDK drops it
+        # straight into the JSON body and can't serialize the enum. Matches
+        # brokers/webull.py's working get_snapshot("US_STOCK", ...) REST call.
+        syms = list(symbols)
+        for _attempt in range(6):
+            try:
+                client.subscribe(syms, "US_STOCK", sub_types)
+                log.info("webull_market_stream: subscribed %d US stocks (sub_types=%s)",
+                         len(syms), sub_types)
+                return
+            except Exception as exc:  # noqa: BLE001
+                bad = _parse_invalid_symbols(str(exc))
+                drop = [s for s in syms if s in bad]
+                if not drop:
+                    log.exception("webull_market_stream: subscribe failed")
+                    return
+                syms = [s for s in syms if s not in bad]
+                log.warning("webull_market_stream: Webull rejected %s; retrying with %d symbols",
+                            drop, len(syms))
+                if not syms:
+                    log.warning("webull_market_stream: no US_STOCK symbols left to subscribe")
+                    return
 
     client.on_connect_success = _on_connected
     _client = client
