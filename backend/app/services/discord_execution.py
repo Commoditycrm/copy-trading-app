@@ -454,34 +454,6 @@ def _resolve_quantity(
         resolutions["quantity"] = f"{qty} (your full position)"
         return qty
 
-    # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
-    # held, so the position doubles.
-    #
-    # Sized from the POSITION, not the alert, and deliberately outside the
-    # multiplier and the "light" halving below. Those scale the author's size
-    # into yours; this one is a statement about your own holding, which the
-    # multiplier already shaped when it was opened. Running it through again
-    # would quadruple a 2x account instead of doubling it.
-    if signal.get("double_up"):
-        held = next(
-            (p for p in positions
-             if p.option_strike == strike and p.option_right == right
-             and p.option_expiry == expiry),
-            None,
-        )
-        qty = abs(Decimal(str(held.quantity))) if held is not None else Decimal(0)
-        if qty <= 0:
-            # Nothing to average down INTO. Taking the default size here would
-            # open a fresh position at a price the channel is calling a loss —
-            # a trade nobody asked for, off an alert that assumed you were
-            # already in. Refuse by name instead.
-            raise ExecutionRefused(
-                "This is an averaging-down alert, but you hold no position in "
-                "that contract to average into."
-            )
-        resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
-        return qty
-
     qty = _dec(signal.get("quantity"))
     if qty is None or qty <= 0:
         raise ExecutionRefused("The alert states no quantity.")
