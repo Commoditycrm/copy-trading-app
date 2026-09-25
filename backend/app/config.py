@@ -28,6 +28,17 @@ class Settings(BaseSettings):
     alpaca_data_api_key: str = ""
     alpaca_data_api_secret: str = ""
     alpaca_market_stream_enabled: bool = False
+    # Webull as a SECOND market-data source (fallback for the Alpaca stream): a
+    # quote-entitled Webull OpenAPI app_key streams live quotes over MQTT into the
+    # SAME Redis price cache read by get_live_price. Worker-only, gated OFF. See
+    # services/webull_market_stream.py.
+    webull_data_app_key: str = ""
+    webull_data_app_secret: str = ""
+    webull_data_region_id: str = "us"
+    # MQTT quote sub-type(s) to subscribe (SDK-specific; finalized against live
+    # keys). Comma-separated, configurable so it can be tuned without a redeploy.
+    webull_data_sub_types: str = "QUOTE"
+    webull_market_stream_enabled: bool = False
     # Per-broker concurrent-request cap during fanout. Tune down if you hit 429s.
     broker_concurrency_alpaca: int = 200
     # SnapTrade throttles order placement HARD (esp. multi-leg/option
