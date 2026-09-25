@@ -9,10 +9,11 @@
  * Each snapshot renders as a self-contained <SnapshotBlock/> that owns its own
  * re-entry state and Re-Enter/delete calls (targeted by snapshot id + row index).
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
+import { useLivePrice } from "@/lib/livePrices";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { PercentInput } from "@/components/PercentInput";
@@ -57,6 +58,32 @@ function fmtMoney(v: string | null): string {
   if (v === null || v === undefined) return "—";
   const n = Number(v);
   return Number.isFinite(n) ? `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : String(v);
+}
+
+/** Live-cache key for a snapshot row — ticker for stocks, OCC for options
+ *  (matching the backend/stream format). Null when it can't be built. */
+function snapLiveKey(p: SnapPos): string | null {
+  const sym = (p.symbol || "").toUpperCase();
+  if (!sym) return null;
+  if (p.instrument_type !== "option") return sym;
+  if (!p.option_expiry || p.option_strike == null || p.option_strike === "" || !p.option_right) return null;
+  const d = new Date(p.option_expiry.length === 10 ? p.option_expiry + "T00:00:00Z" : p.option_expiry);
+  if (Number.isNaN(d.getTime())) return null;
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const cp = p.option_right === "call" ? "C" : "P";
+  const strikeInt = Math.round(Number(p.option_strike) * 1000);
+  if (!Number.isFinite(strikeInt)) return null;
+  return `${sym}${yy}${mm}${dd}${cp}${String(strikeInt).padStart(8, "0")}`;
+}
+
+/** Snapshot current-price cell, ticking live off the stream. Falls back to the
+ *  snapshot's captured price until a tick arrives. Own component so the hook
+ *  stays out of the row .map(). */
+function LiveSnapPrice({ liveKey, fallback }: { liveKey: string | null; fallback: string | null }) {
+  const px = useLivePrice(liveKey, fallback);
+  return <>{px == null ? fmtMoney(fallback) : fmtMoney(String(px))}</>;
 }
 
 /** ISO timestamp → ET "7:18 PM" (market time, like Order History); "—" absent. */
@@ -154,6 +181,23 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
   const [rowChoice, setRowChoice] = useState<Record<string, ReChoice>>({});
   const [rowVal, setRowVal] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a row index
+
+  // Register the snapshot's symbols as watched so the central stream feeds their
+  // live prices to this client (LiveSnapPrice ticks off them). Heartbeated.
+  const watchKeys = useMemo(() => {
+    const keys = (snap?.positions ?? []).map(snapLiveKey).filter(Boolean) as string[];
+    return Array.from(new Set(keys)).slice(0, 30).sort().join(",");
+  }, [snap]);
+  useEffect(() => {
+    if (!watchKeys) return;
+    const syms = watchKeys.split(",");
+    const ping = () => {
+      api("/api/market-data/watch", { method: "POST", body: JSON.stringify({ symbols: syms }) }).catch(() => {});
+    };
+    ping();
+    const t = setInterval(ping, 30_000);
+    return () => clearInterval(t);
+  }, [watchKeys]);
 
   // Pre-fill each row's re-entry control from the default chosen at exit time,
   // without overwriting anything already edited. Keyed by array index (the same
@@ -403,7 +447,7 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
                       {fmtExpiry(p.option_expiry)}
                     </td>
                     <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
-                    <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>{fmtMoney(p.current_price)}</td>
+                    <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}><LiveSnapPrice liveKey={snapLiveKey(p)} fallback={p.current_price} /></td>
                     <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }} title="Previous day's market close price">{fmtMoney(p.pdc)}</td>
                     <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
                       {p.reentry_status === "filled"

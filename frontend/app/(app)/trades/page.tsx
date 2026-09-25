@@ -675,10 +675,15 @@ export default function TradesPage() {
   // Live "Current price" column: register an on-demand watch for the symbols on
   // screen so the central stream subscribes to them, then each row ticks via
   // useLivePrice. Capped + heartbeated (the watch TTL lapses when we stop).
-  const watchKeys = useMemo(
-    () => Array.from(new Set(gridRows.map(orderLiveKey).filter(Boolean) as string[])).slice(0, 40).sort().join(","),
-    [gridRows],
-  );
+  const watchKeys = useMemo(() => {
+    // Only the rows on screen need live push, and open orders matter most —
+    // prioritize them, then fill from the rest, capped so a big history load
+    // doesn't subscribe the stream to hundreds of stale symbols.
+    const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
+    const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
+    const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
+    return Array.from(new Set(keys)).slice(0, 25).sort().join(",");
+  }, [gridRows]);
   useEffect(() => {
     if (!watchKeys) return;
     const syms = watchKeys.split(",");
