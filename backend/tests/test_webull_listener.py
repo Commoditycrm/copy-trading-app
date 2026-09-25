@@ -301,3 +301,44 @@ def test_the_detector_does_not_stop_at_the_first_key():
     import inspect
     src = inspect.getsource(wl._is_option_payload)
     assert "_first(" not in src
+
+
+# ── the id a later cancel needs ──────────────────────────────────────────────
+#
+# Every Webull order endpoint takes the CLIENT order id — cancel_order,
+# cancel_option, get_order_detail, replace_order — and WebullAdapter is built
+# on that: place_order returns our client_order_id AS broker_order_id so
+# cancel/replace/read keep working. The listener stored Webull's own order_id
+# instead, so an order placed in the Webull app could never be cancelled from
+# Kopyya. Confirmed live 2026-09-25 on order EKIOD4IHFID9CRICBH2K5J5NBA:
+#   get_order_detail(account, order_id)        -> 417 "Order not present"
+#   get_order_detail(account, client_order_id) -> 200
+
+def test_the_stored_handle_is_the_client_order_id():
+    """Pins the mechanism at the source: the INSERT must use the client id."""
+    import inspect
+    src = inspect.getsource(wl._persist_and_fanout)
+    assert "broker_order_id=cancel_handle," in src
+    assert "broker_order_id=broker_order_id," not in src
+    # And the handle must prefer the client id, falling back only when absent.
+    assert "cancel_handle = client_oid or broker_order_id" in src
+
+
+def test_a_row_stored_under_the_wrong_id_is_repointed():
+    """Rows written before the fix hold an id no Webull endpoint accepts, so
+    Cancel on them fails forever. The feed carries both ids — correct it."""
+    import inspect
+    src = inspect.getsource(wl._persist_and_fanout)
+    heal = src[src.index("if existing is not None:"):][:900]
+    assert "existing.broker_order_id != client_oid" in heal
+    assert "existing.broker_order_id = client_oid" in heal
+
+
+def test_either_id_still_finds_the_row():
+    """The heal and the dedup both depend on this: an event carrying Webull's
+    order_id must still match a row now stored under the client id, or the
+    listener would insert a duplicate instead of updating."""
+    import inspect
+    src = inspect.getsource(wl.find_placed_order)
+    assert "or_(" in src                      # matched on EITHER id
+    assert 'i.replace("-", "")' in src        # and both dash spellings
