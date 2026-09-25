@@ -117,7 +117,6 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
     briefly and returns whether the socket actually came up, so the supervisor
     can back off on a persistent failure (bad/entitlement-less keys)."""
     global _client
-    from webull.data.common.category import Category  # noqa: PLC0415
     from webull.data.data_streaming_client import DataStreamingClient  # noqa: PLC0415
     from app.config import get_settings  # noqa: PLC0415
 
@@ -142,7 +141,11 @@ def _run_stream(symbols: frozenset[str], generation: int) -> bool:
         if generation != _generation:
             return
         try:
-            client.subscribe(list(symbols), Category.US_STOCK, sub_types)
+            # Category is the STRING name, not the Category enum — the SDK drops
+            # it straight into the JSON body (SubscribeRequest.add_body_params)
+            # and can't serialize the enum. Matches brokers/webull.py's working
+            # get_snapshot("US_STOCK", ...) REST call.
+            client.subscribe(list(symbols), "US_STOCK", sub_types)
             log.info("webull_market_stream: subscribed %d US stocks (sub_types=%s)",
                      len(symbols), sub_types)
         except Exception:  # noqa: BLE001
