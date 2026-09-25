@@ -178,7 +178,7 @@ _TICK_MIN_INTERVAL_S = 1.0
 _last_tick_at: dict[str, float] = {}
 
 
-def _set_price(symbol: str, price: Decimal) -> None:
+def _set_price(symbol: str, price: Decimal, bid: Any = None, ask: Any = None) -> None:
     from app.services.redis_client import get_sync_redis  # noqa: PLC0415
     # A real quote means auth succeeded — clear any auth-failure backoff.
     global _auth_fail_count, _auth_backoff_until
@@ -191,13 +191,17 @@ def _set_price(symbol: str, price: Decimal) -> None:
         get_sync_redis().set(_PRICE_KEY.format(sym), payload, ex=_PRICE_TTL_S)
     except Exception:  # noqa: BLE001
         pass  # best-effort cache; never let a Redis blip kill the stream
-    # Phase 4: push the tick to open screens over SSE, throttled per symbol.
+    # Phase 4: push the tick to open screens over SSE, throttled per symbol. The
+    # tick carries bid/ask too so the trade panel's quote panel ticks live (the
+    # cache above stays mid-only — get_live_price wants one number).
     now = time.monotonic()
     if now - _last_tick_at.get(sym, 0.0) >= _TICK_MIN_INTERVAL_S:
         _last_tick_at[sym] = now
         try:
             from app.services import events  # noqa: PLC0415
-            events.publish_price(sym, str(price))
+            b = str(bid) if bid not in (None, "") and float(bid) > 0 else None
+            a = str(ask) if ask not in (None, "") and float(ask) > 0 else None
+            events.publish_price(sym, str(price), b, a)
         except Exception:  # noqa: BLE001
             pass
 
@@ -421,7 +425,7 @@ async def _run_stream(symbols: frozenset[str], generation: int) -> None:
             return
         px = _quote_mid(q)
         if px is not None:
-            _set_price(sym, px)
+            _set_price(sym, px, getattr(q, "bid_price", None), getattr(q, "ask_price", None))
 
     global _stock_handler
     _stock_handler = _on_quote          # for incremental watch subscribes
@@ -466,7 +470,7 @@ async def _run_option_stream(symbols: frozenset[str], generation: int) -> None:
             return
         px = _quote_mid(q)
         if px is not None:
-            _set_price(sym, px)
+            _set_price(sym, px, getattr(q, "bid_price", None), getattr(q, "ask_price", None))
 
     global _opt_handler
     _opt_handler = _on_quote            # for incremental watch subscribes

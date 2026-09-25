@@ -11,7 +11,7 @@ import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/
 import { BulkExitBar } from "@/components/BulkExitBar";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { PercentInput } from "@/components/PercentInput";
-import { useLivePrice } from "@/lib/livePrices";
+import { useLivePrice, useLiveQuote } from "@/lib/livePrices";
 import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
 
 /** Build OCC option symbol — ROOT + YYMMDD + C/P + strike*1000 (8 digits). */
@@ -424,6 +424,8 @@ export default function TradePanelPage() {
     return () => { alive = false; clearInterval(t); };
   }, [watchSym]);
   const livePx = useLivePrice(watchSym, seedPx);
+  // Live bid/mid/ask for the option quote panel — ticks the REST-seeded quote.
+  const liveQuote = useLiveQuote(watchSym);
 
   // Reference price for converting TP/SL percentages → absolute prices.
   // We use the order's limit price as the implicit reference. Market
@@ -846,10 +848,17 @@ export default function TradePanelPage() {
                           click seeds the limit with that price. */}
                       <div className="flex gap-1.5" style={{ height: 34 }}>
                         {(["bid", "mid", "ask"] as const).map(side => {
-                          const val =
+                          // Prefer the live streamed value; fall back to the
+                          // REST-seeded quote until the first tick lands.
+                          const liveVal =
+                            side === "bid" ? liveQuote?.bid :
+                            side === "mid" ? liveQuote?.mid :
+                            liveQuote?.ask;
+                          const restVal =
                             side === "bid" ? optionQuote!.bid :
                             side === "mid" ? optionQuote!.mid :
                             optionQuote!.ask;
+                          const val = liveVal ?? restVal;
                           const color =
                             side === "bid" ? "var(--bad)" :
                             side === "mid" ? "var(--text)" :
