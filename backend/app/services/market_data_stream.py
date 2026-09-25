@@ -135,6 +135,13 @@ _current_symbols: frozenset[str] = frozenset()
 # Bumped on every (re)start so a late callback from an old stream is ignored.
 _generation = 0
 
+# Parallel OPTION stream (Alpaca OPRA). Same cache + _set_price, keyed by the OCC
+# symbol; separate connection/lifecycle because options use their own websocket.
+_opt_stream: Any = None
+_opt_stream_task: "asyncio.Task | None" = None
+_opt_current_symbols: frozenset[str] = frozenset()
+_opt_generation = 0
+
 
 def _enabled() -> bool:
     from app.config import get_settings  # noqa: PLC0415
@@ -234,6 +241,59 @@ def _compute_symbols() -> set[str]:
     return syms
 
 
+def _build_occ(symbol: str | None, expiry: Any, strike: Any, right: Any) -> str | None:
+    """OCC symbol Alpaca's OPRA feed uses: ROOT + YYMMDD + C/P + strike*1000 (8
+    digits), root NOT zero-padded — e.g. INQQ261016C00013000. Must match the OCC
+    the frontend builds so cache writes and reads line up."""
+    try:
+        if not symbol or expiry is None or strike is None or not right:
+            return None
+        yymmdd = expiry.strftime("%y%m%d")
+        cp = "C" if "call" in str(right).lower() else "P"
+        strike_int = int(round(float(strike) * 1000))
+        return f"{symbol.upper()}{yymmdd}{cp}{strike_int:08d}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _compute_option_symbols() -> set[str]:
+    """OCC symbols for options anyone holds (net != 0) or is working — the option
+    stream's subscription set. Same held/working logic as _compute_symbols, keyed
+    on the full contract (symbol+expiry+strike+right)."""
+    from sqlalchemy import case, func  # noqa: PLC0415
+    from app.models.order import OrderSide  # noqa: PLC0415
+
+    occs: set[str] = set()
+    cols = (Order.symbol, Order.option_expiry, Order.option_strike, Order.option_right)
+    with SessionLocal() as db:
+        net = func.sum(
+            case((Order.side == OrderSide.BUY, Order.filled_quantity),
+                 else_=-Order.filled_quantity)
+        )
+        held_rows = db.execute(
+            select(*cols)
+            .where(
+                Order.instrument_type == InstrumentType.OPTION,
+                Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+            )
+            .group_by(Order.user_id, *cols)
+            .having(net != 0)
+        ).all()
+        working_rows = db.execute(
+            select(*cols)
+            .where(
+                Order.instrument_type == InstrumentType.OPTION,
+                Order.status.in_(_WORKING),
+            )
+            .distinct()
+        ).all()
+    for sym, exp, strike, right in list(held_rows) + list(working_rows):
+        occ = _build_occ(sym, exp, strike, right)
+        if occ:
+            occs.add(occ)
+    return occs
+
+
 # ── the stream ──────────────────────────────────────────────────────────────
 def _quote_mid(q: Any) -> Decimal | None:
     bid = getattr(q, "bid_price", None)
@@ -292,20 +352,65 @@ def _stop_stream() -> None:
             pass
 
 
+async def _run_option_stream(symbols: frozenset[str], generation: int) -> None:
+    """Build + run the Alpaca OptionDataStream (OPRA) for ``symbols`` (OCC), same
+    shape as the stock stream. Writes each contract's quote mid to the shared
+    cache under its OCC key, so a position row / trade ticket keyed on that OCC
+    ticks live."""
+    global _opt_stream
+    from alpaca.data.enums import OptionsFeed  # noqa: PLC0415
+    from alpaca.data.live.option import OptionDataStream  # noqa: PLC0415
+    from app.config import get_settings  # noqa: PLC0415
+
+    s = get_settings()
+    client = OptionDataStream(
+        s.alpaca_data_api_key, s.alpaca_data_api_secret, feed=OptionsFeed.OPRA,
+    )
+    _opt_stream = client
+
+    async def _on_quote(q: Any) -> None:
+        if generation != _opt_generation:
+            return
+        sym = getattr(q, "symbol", None)
+        if not sym:
+            return
+        px = _quote_mid(q)
+        if px is not None:
+            _set_price(sym, px)
+
+    client.subscribe_quotes(_on_quote, *symbols)
+    log.info("market_data_stream: subscribing to %d OPTION symbols (OPRA)", len(symbols))
+    await asyncio.to_thread(client.run)
+
+
+def _stop_option_stream() -> None:
+    global _opt_stream
+    c = _opt_stream
+    _opt_stream = None
+    if c is not None:
+        try:
+            c.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _supervise() -> None:
     """Recompute the symbol set every _REFRESH_S; (re)start the stream when it
     changes. Restart-on-change avoids cross-thread subscribe/unsubscribe races —
     holdings change rarely enough that an occasional reconnect is cheap."""
     global _stream_task, _current_symbols, _generation
+    global _opt_stream_task, _opt_current_symbols, _opt_generation
     while True:
         try:
             if _enabled():
                 if time.monotonic() < _auth_backoff_until:
-                    # Auth is failing (bad/unentitled key). Hold the socket down
+                    # Auth is failing (bad/unentitled key). Hold both sockets down
                     # so alpaca-py's internal retry can't hammer → no 429 storm.
-                    # Keep _current_symbols so the same set restarts on recovery.
+                    # Keep the symbol sets so they restart on recovery.
                     _stop_stream()
+                    _stop_option_stream()
                 else:
+                    # ── stock stream ──
                     symbols = frozenset(await asyncio.to_thread(_compute_symbols))
                     need_restart = (
                         symbols != _current_symbols
@@ -323,9 +428,29 @@ async def _supervise() -> None:
                     elif not symbols:
                         _stop_stream()
                         _current_symbols = frozenset()
+                    # ── option stream (OPRA) ──
+                    opt_symbols = frozenset(await asyncio.to_thread(_compute_option_symbols))
+                    opt_need_restart = (
+                        opt_symbols != _opt_current_symbols
+                        or _opt_stream_task is None
+                        or _opt_stream_task.done()
+                    )
+                    if opt_symbols and opt_need_restart:
+                        _stop_option_stream()
+                        if _opt_stream_task is not None and not _opt_stream_task.done():
+                            _opt_stream_task.cancel()
+                        _opt_generation += 1
+                        _opt_current_symbols = opt_symbols
+                        loop = asyncio.get_running_loop()
+                        _opt_stream_task = loop.create_task(_run_option_stream(opt_symbols, _opt_generation))
+                    elif not opt_symbols:
+                        _stop_option_stream()
+                        _opt_current_symbols = frozenset()
             else:
                 _stop_stream()
+                _stop_option_stream()
                 _current_symbols = frozenset()
+                _opt_current_symbols = frozenset()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -353,9 +478,10 @@ def start_market_data_stream() -> None:
 
 
 async def stop_market_data_stream() -> None:
-    global _task, _stream_task
+    global _task, _stream_task, _opt_stream_task
     _stop_stream()
-    for t in (_stream_task, _task):
+    _stop_option_stream()
+    for t in (_stream_task, _opt_stream_task, _task):
         if t is not None and not t.done():
             t.cancel()
             try:
@@ -364,6 +490,7 @@ async def stop_market_data_stream() -> None:
                 pass
     _task = None
     _stream_task = None
+    _opt_stream_task = None
 
 
 __all__ = ["start_market_data_stream", "stop_market_data_stream", "get_live_price"]
