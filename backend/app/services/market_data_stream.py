@@ -54,15 +54,59 @@ class _ThrottleLogFilter(logging.Filter):
         return True
 
 
+# Auth-failure backoff. alpaca-py's data websocket retries internally at full
+# speed on a bad/unentitled key, which trips Alpaca's 429 connection-rate limit.
+# We watch the stream logger for auth/429 markers and, after a few, stop the
+# socket and refuse to restart for a growing interval — so an invalid key can't
+# hammer the endpoint. Cleared the moment a real quote arrives (_set_price).
+_AUTH_FAIL_MARKERS = ("auth failed", "forbidden", "not authorized", "unauthorized", "http 429", "connection limit")
+_AUTH_FAIL_THRESHOLD = 3
+_AUTH_BACKOFF_BASE_S = 60.0
+_AUTH_BACKOFF_MAX_S = 600.0
+_auth_fail_count = 0
+_auth_backoff_until = 0.0  # monotonic; don't (re)start the stream before this
+
+
+class _AuthFailWatcher(logging.Filter):
+    """Filter (never suppresses) that counts auth/429 failures on the alpaca data
+    websocket and arms a backoff once they cross a threshold, stopping the socket
+    so alpaca-py's internal retry loop can't keep hammering. Added BEFORE the
+    throttle filter so it sees every record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        global _auth_fail_count, _auth_backoff_until
+        try:
+            msg = record.getMessage().lower()
+        except Exception:  # noqa: BLE001
+            return True
+        if any(m in msg for m in _AUTH_FAIL_MARKERS):
+            _auth_fail_count += 1
+            if _auth_fail_count >= _AUTH_FAIL_THRESHOLD and _auth_backoff_until <= time.monotonic():
+                backoff = min(_AUTH_BACKOFF_MAX_S,
+                              _AUTH_BACKOFF_BASE_S * (2 ** min(_auth_fail_count - _AUTH_FAIL_THRESHOLD, 4)))
+                _auth_backoff_until = time.monotonic() + backoff
+                try:
+                    _stop_stream()
+                except Exception:  # noqa: BLE001
+                    pass
+                log.warning("market_data_stream: auth failing (%d) — pausing the stream %.0fs "
+                            "to avoid a 429 storm; check the data key/entitlement",
+                            _auth_fail_count, backoff)
+        return True
+
+
 _throttle_installed = False
 
 
 def _install_log_throttle() -> None:
-    """Attach the throttle to the noisy alpaca data-websocket logger, once."""
+    """Attach the auth watcher + throttle to the noisy alpaca data-websocket
+    logger, once. Watcher first so it sees records the throttle would drop."""
     global _throttle_installed
     if _throttle_installed:
         return
-    logging.getLogger("alpaca.data.live.websocket").addFilter(_ThrottleLogFilter(60.0))
+    lg = logging.getLogger("alpaca.data.live.websocket")
+    lg.addFilter(_AuthFailWatcher())
+    lg.addFilter(_ThrottleLogFilter(60.0))
     _throttle_installed = True
 
 
@@ -111,6 +155,11 @@ _last_tick_at: dict[str, float] = {}
 
 def _set_price(symbol: str, price: Decimal) -> None:
     from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    # A real quote means auth succeeded — clear any auth-failure backoff.
+    global _auth_fail_count, _auth_backoff_until
+    if _auth_fail_count or _auth_backoff_until:
+        _auth_fail_count = 0
+        _auth_backoff_until = 0.0
     sym = symbol.upper()
     try:
         payload = json.dumps({"p": str(price), "t": int(time.time() * 1000)})
@@ -251,23 +300,29 @@ async def _supervise() -> None:
     while True:
         try:
             if _enabled():
-                symbols = frozenset(await asyncio.to_thread(_compute_symbols))
-                need_restart = (
-                    symbols != _current_symbols
-                    or _stream_task is None
-                    or _stream_task.done()
-                )
-                if symbols and need_restart:
+                if time.monotonic() < _auth_backoff_until:
+                    # Auth is failing (bad/unentitled key). Hold the socket down
+                    # so alpaca-py's internal retry can't hammer → no 429 storm.
+                    # Keep _current_symbols so the same set restarts on recovery.
                     _stop_stream()
-                    if _stream_task is not None and not _stream_task.done():
-                        _stream_task.cancel()
-                    _generation += 1
-                    _current_symbols = symbols
-                    loop = asyncio.get_running_loop()
-                    _stream_task = loop.create_task(_run_stream(symbols, _generation))
-                elif not symbols:
-                    _stop_stream()
-                    _current_symbols = frozenset()
+                else:
+                    symbols = frozenset(await asyncio.to_thread(_compute_symbols))
+                    need_restart = (
+                        symbols != _current_symbols
+                        or _stream_task is None
+                        or _stream_task.done()
+                    )
+                    if symbols and need_restart:
+                        _stop_stream()
+                        if _stream_task is not None and not _stream_task.done():
+                            _stream_task.cancel()
+                        _generation += 1
+                        _current_symbols = symbols
+                        loop = asyncio.get_running_loop()
+                        _stream_task = loop.create_task(_run_stream(symbols, _generation))
+                    elif not symbols:
+                        _stop_stream()
+                        _current_symbols = frozenset()
             else:
                 _stop_stream()
                 _current_symbols = frozenset()
@@ -275,7 +330,9 @@ async def _supervise() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("market_data_stream supervisor pass failed")
-        await asyncio.sleep(_REFRESH_S)
+        # Wake sooner while backing off so the stream resumes promptly once the
+        # window clears; otherwise the normal 60s symbol-recompute cadence.
+        await asyncio.sleep(5.0 if time.monotonic() < _auth_backoff_until else _REFRESH_S)
 
 
 def start_market_data_stream() -> None:
