@@ -409,6 +409,7 @@ class DiscordSettingsOut(BaseModel):
     # False — paper: validate and record, never send to the broker
     # True  — live: approved alerts place real orders
     live_trading: bool = False
+    auto_trim: bool = False
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
@@ -445,6 +446,10 @@ class DiscordSettingsOut(BaseModel):
 class DiscordSettingsIn(BaseModel):
     execution_mode: str | None = Field(default=None, pattern=r"^(auto|manual)$")
     live_trading: bool | None = None
+    # Fire each ladder rung when its profit gate is reached, instead of
+    # waiting for that rung's Discord alert. A rung whose gate is 0 is
+    # never auto-fired -- see TraderSettings.discord_auto_trim.
+    auto_trim: bool | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.

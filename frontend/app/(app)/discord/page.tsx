@@ -47,6 +47,9 @@ const CONNECTOR_MAC = `${CONNECTOR_RELEASES}/Kopyya-Connector-macOS.zip`;
 type DiscordSettings = {
   execution_mode: string;
   live_trading: boolean;
+  /** Fire each ladder rung when its Min profit is reached, instead of
+   *  waiting for that rung's Discord alert. */
+  auto_trim: boolean;
   quantity_multiplier: number;
   max_per_contract: string | null;
   max_per_order: string | null;
@@ -211,6 +214,8 @@ export default function DiscordPage() {
   const [modeBusy, setModeBusy] = useState(false);
   // Paper until the server says otherwise — never show "live" optimistically.
   const [liveTrading, setLiveTrading] = useState(false);
+  const [autoTrim, setAutoTrim] = useState(false);
+  const [autoTrimBusy, setAutoTrimBusy] = useState(false);
   const [qtyMultiplier, setQtyMultiplier] = useState(1);
   const [maxPerContract, setMaxPerContract] = useState("");
   const [maxPerOrder, setMaxPerOrder] = useState("");
@@ -239,6 +244,7 @@ export default function DiscordPage() {
       setSources(list);
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
+      setAutoTrim(!!settings.auto_trim);
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
@@ -408,6 +414,29 @@ export default function DiscordPage() {
       notify.fromError(e, "Could not change that");
     } finally {
       setModeBusy(false);
+    }
+  }
+
+  async function toggleAutoTrim(next: boolean) {
+    setAutoTrimBusy(true);
+    const prev = autoTrim;
+    setAutoTrim(next);
+    try {
+      const r = await api<{ auto_trim: boolean }>(
+        "/api/discord-sources/settings",
+        { method: "PATCH", body: JSON.stringify({ auto_trim: next }) }
+      );
+      setAutoTrim(!!r.auto_trim);
+      notify.success(
+        next
+          ? "Auto trim on — rungs fire at their own Min profit"
+          : "Auto trim off — rungs wait for their Discord alert"
+      );
+    } catch (e) {
+      setAutoTrim(prev);
+      notify.fromError(e, "Could not change that");
+    } finally {
+      setAutoTrimBusy(false);
     }
   }
 
@@ -1257,6 +1286,32 @@ export default function DiscordPage() {
                       measured from entry price
                     </span>
                   </div>
+
+                  {/* Auto trim. Off, a rung waits for its Discord alert and the
+                      Min profit below is the condition that alert has to meet.
+                      On, there is no alert to wait for — the rung fires the
+                      moment its Min profit is reached. */}
+                  <label
+                    className="mt-2 flex items-start gap-2 text-[11px] cursor-pointer select-none"
+                    title="Fire each rung at its Min profit instead of waiting for an alert"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 cursor-pointer mt-[1px]"
+                      style={{ accentColor: "var(--accent)" }}
+                      checked={autoTrim}
+                      disabled={autoTrimBusy}
+                      onChange={(e) => toggleAutoTrim(e.target.checked)}
+                    />
+                    <span style={{ color: "var(--text-2)" }}>
+                      Auto trim
+                      <span style={{ color: "var(--muted)" }}>
+                        {" — "}fire each rung at its Min profit, without waiting for an
+                        alert. A rung left at 0% keeps waiting: 0 means &ldquo;no
+                        minimum&rdquo;, which is a threshold nothing can reach.
+                      </span>
+                    </span>
+                  </label>
 
                   {LADDER_GROUPS.map((group) => (
                     <div key={group.title} className="mt-3">
