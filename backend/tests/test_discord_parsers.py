@@ -842,6 +842,22 @@ def test_a_trailing_mention_does_not_break_it():
     assert s.limit_price == Decimal("2.19")       # @Mark is not read as a price
 
 
+def test_the_dte_repeated_in_a_trailing_note_does_not_break_it():
+    """The exact live form: "AAPL 337.5C 1DTE @2.19 @Mark (1DTE )", with the
+    expiry echoed in a parenthesised note at the end — including the stray
+    space before the bracket. The second 1DTE must not be read as a second
+    contract, nor stop the line being claimed at all."""
+    r = parse_message(text("AAPL 337.5C 1DTE @2.19 @Mark (1DTE )",
+                           posted_at=_at(2026, 9, 24)))
+    assert len(r.signals) == 1
+    s = r.signals[0]
+    assert s.symbol == "AAPL"
+    assert s.strike == Decimal("337.5")
+    assert s.option_type.value == "CALL"
+    assert s.expiration == date(2026, 9, 25)
+    assert s.limit_price == Decimal("2.19")
+
+
 def test_0dte_is_unchanged():
     """Resolved against the MESSAGE's timestamp, so re-reading an old alert
     does not move its expiry."""
