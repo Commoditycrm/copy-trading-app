@@ -25,15 +25,6 @@ function fmtNum(n: string | null | undefined, dp = 2): string {
   return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
-/** Current-price cell that ticks live off the central price stream. `symbol` is
- *  null for options (the stock cache doesn't carry them, and an option row's
- *  p.symbol is the UNDERLYING), so those fall straight through to the fallback.
- *  Its own component so the hook stays out of the row's .map(). */
-function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fallback: string | null }) {
-  const live = useLivePrice(symbol, fallback);
-  return <td className="px-5 py-3.5 num">{fmtNum(live == null ? fallback : String(live), 2)}</td>;
-}
-
 /** Change in a stock row's market value and unrealized P&L implied by the live
  *  price: signed_qty × (livePrice − snapshotPrice). Both move by the same
  *  amount, so we layer this on the backend's already-correct baseline rather
@@ -692,7 +683,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
                   <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />
                   <Th label="Avg entry" sortKey="avg_entry_price" />
-                  <Th label="Current price" sortKey="current_price" />
                   <Th label="PDC" title="Previous day's market close price" />
                   <Th label="Filled price" />
                   <Th label="Market value" sortKey="market_value" />
@@ -856,7 +846,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                         {/* P&L % = live unrealized P&L / cost basis. */}
                         <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                        <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />
                         {/* Reference = previous session's market close price. */}
                         <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
                         {(() => {

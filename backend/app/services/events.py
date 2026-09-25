@@ -114,12 +114,18 @@ def publish(user_id: uuid.UUID, event: dict[str, Any]) -> None:
         log.warning("event publish dropped for user=%s", user_id)
 
 
-def publish_price(symbol: str, price: str) -> None:
+def publish_price(symbol: str, price: str, bid: str | None = None, ask: str | None = None) -> None:
     """Broadcast one live price tick to the global prices channel (all SSE
     connections). Sync, fire-and-forget. Callers throttle upstream, so this just
-    ships it. The frontend applies it to any on-screen row for ``symbol``."""
+    ships it. ``price`` is the mid; ``bid``/``ask`` ride along (when present) so
+    the trade panel's quote panel ticks live. The frontend applies it to any
+    on-screen row/ticket for ``symbol``."""
     try:
-        payload = json.dumps({"type": "price.tick", "symbol": symbol.upper(), "price": price})
-        get_sync_redis().publish(_PRICES_CHANNEL, payload)
+        evt: dict[str, Any] = {"type": "price.tick", "symbol": symbol.upper(), "price": price}
+        if bid is not None:
+            evt["bid"] = bid
+        if ask is not None:
+            evt["ask"] = ask
+        get_sync_redis().publish(_PRICES_CHANNEL, json.dumps(evt))
     except Exception:  # noqa: BLE001
         pass
