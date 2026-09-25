@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 import uuid
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
@@ -81,6 +82,8 @@ from app.schemas.discord import (
     DiscordSourceIn,
     DiscordSourceOut,
     DiscordSourceUpdateIn,
+    DiscordSelfAlertIn,
+    DiscordSelfAlertOut,
 )
 from app.services import (
     discord_execution,
@@ -1034,6 +1037,124 @@ def clear_session(
     db.commit()
     db.refresh(src)
     return _to_out(src)
+
+
+# ── the "Self" channel ──────────────────────────────────────────────────────
+#
+# A virtual source for alerts the trader submits by hand, when one was missed —
+# the listener was down, the message scrolled past, the channel dropped. It is a
+# real DiscordAlertSource row so that EVERYTHING downstream treats it like any
+# other channel: the parser, the trim ladder, the sizing caps, the guards, the
+# Channel column in Order History.
+#
+# What makes it virtual is the absence of an account. listener_assignments joins
+# sources to DiscordAccount, so a source with account_id NULL is never handed to
+# a watcher — there is no browser, no session, no channel to read. Nothing had
+# to be excluded by name.
+_SELF_CHANNEL_ID = "self"
+_SELF_LABEL = "Self"
+
+
+def _self_source(db: Session, user: User) -> DiscordAlertSource:
+    """This trader's Self channel, created on demand.
+
+    Keyed on the reserved channel_id, which the (user_id, channel_id) unique
+    constraint then makes one-per-trader for free. A real Discord channel id is
+    a numeric snowflake, so "self" cannot collide with one.
+    """
+    src = db.execute(
+        select(DiscordAlertSource).where(
+            DiscordAlertSource.user_id == user.id,
+            DiscordAlertSource.channel_id == _SELF_CHANNEL_ID,
+        )
+    ).scalars().first()
+    if src is not None:
+        return src
+    src = DiscordAlertSource(
+        user_id=user.id,
+        label=_SELF_LABEL,
+        channel_id=_SELF_CHANNEL_ID,
+        channel_name=_SELF_LABEL,
+        # No account: this is what keeps the listener from ever trying to open
+        # a watcher for it.
+        account_id=None,
+        is_enabled=True,
+        # Always available. A schedule would mean "the trader may not replay a
+        # missed alert right now", which is the opposite of the point.
+        schedule_mode="always",
+        status="connected",
+    )
+    db.add(src)
+    db.flush()
+    log.info("discord: opened the Self channel for user %s", user.id)
+    return src
+
+
+def _self_message_id() -> str:
+    """A synthetic snowflake for a hand-submitted alert.
+
+    Microseconds since the epoch. It has to be numeric and increasing because
+    ingest orders sources by it (``_is_newer`` compares as int), and unique per
+    source because that is the idempotency key. Two manual pastes cannot land in
+    the same microsecond.
+    """
+    return str(int(time.time() * 1_000_000))
+
+
+@router.post("/self/alert", response_model=DiscordSelfAlertOut)
+def submit_self_alert(
+    payload: DiscordSelfAlertIn,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> DiscordSelfAlertOut:
+    """Replay an alert the system missed, through the normal Discord pipeline.
+
+    Reuses ``ingest_batch`` and ``_execute_signal`` verbatim — the same parse,
+    the same auto/manual gate, the same sizing, caps, guards and fanout. There
+    is deliberately no separate path: a second way into the order pipeline would
+    be a second thing to keep correct, and it would be the one nobody tests.
+
+    Honours the trader's execution mode, because that is what "as if Discord had
+    delivered it" means. In auto it places; in manual it lands awaiting approval
+    in the Discord tab, exactly where a real alert would have.
+    """
+    src = _self_source(db, user)
+    raw = {
+        "message_id": _self_message_id(),
+        "channel_id": src.channel_id,
+        "server_id": None,
+        "author": user.email,
+        "author_id": str(user.id),
+        "content": payload.content.strip(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "attachments": [],
+        "embeds": [],
+    }
+
+    auto = _auto_approve(db, user.id)
+    report = discord_ingest.ingest_batch(db, src, [raw], auto_approve=auto)
+    if not report.stored:
+        # ingest_batch only rejects a message with no id, which cannot happen
+        # here — but returning a 500 on an impossible branch is worse than
+        # saying plainly that nothing was stored.
+        raise HTTPException(500, "could not store the alert")
+
+    msg = report.stored[0]
+    if auto and msg.decision is SignalDecision.APPROVED:
+        _execute_signal(db, user, msg, background, request)
+    db.commit()
+    db.refresh(msg)
+    return DiscordSelfAlertOut(
+        id=msg.id,
+        content=msg.content or "",
+        status=msg.status.value if hasattr(msg.status, "value") else str(msg.status),
+        status_reason=msg.status_reason,
+        decision=(msg.decision.value if msg.decision else None),
+        order_id=msg.order_id,
+        parsed_signal=msg.parsed_signal,
+    )
 
 
 def _execute_signal(
