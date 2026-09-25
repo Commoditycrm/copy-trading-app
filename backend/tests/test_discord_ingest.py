@@ -637,3 +637,100 @@ def test_the_mode_that_applied_is_recorded_on_the_alert(db, redis):
 
     src.execution_mode = "manual"      # changed afterwards
     assert row.decision_mode == "auto"  # unchanged
+
+
+# ── an edited alert is a correction, not a new trade ─────────────────────────
+#
+# Alert channels post a price then fix it seconds later:
+#
+#     $SPY 770 CALL 0DTE @0.20      -> placed, resting unfilled
+#     $SPY 770 CALL 0DTE @0.15      -> the SAME order must move to 0.15
+#
+# The edit arrives with the SAME snowflake, so it hit the uniqueness constraint
+# and was counted as a duplicate — the corrected price was never acted on and
+# our order sat at a price the author had already withdrawn.
+
+_ENTRY = "$SPY 770 CALL 0DTE @0.20"
+_EDITED = "$SPY 770 CALL 0DTE @0.15"
+
+
+def _edit(message_id, content):
+    m = _msg(message_id, content=content)
+    m["is_edit"] = True
+    return m
+
+
+@pytest.fixture
+def source():
+    return _FakeSource()
+
+
+def test_an_edit_is_not_counted_as_a_duplicate(db, redis, source):
+    r = ingest.ingest_batch(db, source, [_msg("900", content=_ENTRY)])
+    assert len(r.accepted) == 1
+
+    r2 = ingest.ingest_batch(db, source, [_edit("900", _EDITED)])
+    assert r2.duplicates == []
+    assert len(r2.edited) == 1
+
+
+def test_the_edit_never_becomes_a_second_alert(db, redis, source):
+    """The whole safety property. An edit routed through execution would place
+    a SECOND order for one trade."""
+    ingest.ingest_batch(db, source, [_msg("901", content=_ENTRY)])
+    r = ingest.ingest_batch(db, source, [_edit("901", _EDITED)])
+    assert r.accepted == []          # execution runs off `accepted`
+    assert r.stored == []
+    # And exactly one row exists for that snowflake.
+    rows = db.execute(
+        select(DiscordMessage).where(DiscordMessage.discord_message_id == "901")
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+def test_the_stored_row_is_updated_and_re_read(db, redis, source):
+    """The caller compares the NEW reading against the order that was placed,
+    so a stale parsed_signal would reprice to the old price."""
+    ingest.ingest_batch(db, source, [_msg("902", content=_ENTRY)])
+    r = ingest.ingest_batch(db, source, [_edit("902", _EDITED)])
+    row = r.edited[0]
+    assert row.content == _EDITED
+    assert row.parsed_signal["limit_price"] == "0.15"
+
+
+def test_a_replay_with_identical_text_is_still_a_duplicate(db, redis, source):
+    """A reconnect replays the whole rendered backlog and the observer re-emits
+    on DOM mutations it cannot attribute. Treating those as edits would
+    re-parse and repoint live orders off messages nobody touched."""
+    ingest.ingest_batch(db, source, [_msg("903", content=_ENTRY)])
+    r = ingest.ingest_batch(db, source, [_edit("903", _ENTRY)])   # flag set, text same
+    assert r.edited == []
+    assert r.duplicates == ["903"]
+
+
+def test_the_rest_of_the_batch_survives_an_edit(db, redis, source):
+    """One edit in a batch must not swallow the new alerts beside it."""
+    ingest.ingest_batch(db, source, [_msg("904", content=_ENTRY)])
+    r = ingest.ingest_batch(db, source, [
+        _edit("904", _EDITED),
+        _msg("905", content="$QQQ 500 CALL 0DTE @1.10"),
+    ])
+    assert len(r.edited) == 1
+    assert r.accepted == ["905"]
+
+
+def test_an_edit_does_not_walk_an_executed_alert_back_to_parsed(db, redis, source):
+    """The row carries an order_id; resetting its status to PARSED reads as an
+    alert still awaiting execution, so the order history showed a row that was
+    half-executed. The READING changes on an edit; what happened to it does not."""
+    ingest.ingest_batch(db, source, [_msg("906", content=_ENTRY)])
+    row = db.execute(
+        select(DiscordMessage).where(DiscordMessage.discord_message_id == "906")
+    ).scalars().one()
+    row.status = DiscordMessageStatus.ORDER_CREATED
+    row.order_id = uuid.uuid4()
+    db.flush()
+
+    r = ingest.ingest_batch(db, source, [_edit("906", _EDITED)])
+    assert r.edited[0].status is DiscordMessageStatus.ORDER_CREATED
+    assert r.edited[0].parsed_signal["limit_price"] == "0.15"   # still re-read

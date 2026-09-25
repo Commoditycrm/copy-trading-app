@@ -246,6 +246,26 @@ class Order(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False
     )
 
+    # The price an EDITED Discord alert asked this resting entry to move to,
+    # while it has not been applied yet.
+    #
+    # It needs somewhere durable to live because the broker often cannot replace
+    # the order at the moment the edit arrives: pre-market an Alpaca option sits
+    # in `accepted` (received, not yet routed) and will not take a PATCH until
+    # options start routing at 09:30. The edit is the author's current
+    # instruction, so it is held and retried rather than dropped.
+    #
+    # Distinct from discord_repriced_at, which records our OWN +10% retry. That
+    # deliberately moves the price AWAY from the alert's, so the two must never
+    # be inferred from each other — "the order's limit differs from the alert's"
+    # is true in both cases and means opposite things.
+    #
+    # Cleared the moment it is applied, or when the order stops being a working
+    # unfilled entry.
+    discord_edit_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 4), nullable=True
+    )
+
     # When a Discord entry was repriced after failing to fill. Set once and only
     # once — it is what keeps the retry to a single attempt rather than a chase,
     # since the scanner only considers rows where this is NULL.

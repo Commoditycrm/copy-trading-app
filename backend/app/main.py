@@ -369,6 +369,20 @@ def create_app() -> FastAPI:
                 daemon=True,
             ).start()
 
+            # Edited alerts: the author corrects a price seconds after posting,
+            # and the broker often cannot apply it yet — pre-market an Alpaca
+            # option rests in `accepted` and will not take a PATCH until options
+            # route at 09:30. The wanted price is held on the order and retried
+            # here until it lands or the entry stops being a working unfilled
+            # one. Nothing is cancelled while it waits.
+            from app.services import discord_edit
+            threading.Thread(
+                target=discord_edit.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="discord-edit-retry",
+                daemon=True,
+            ).start()
+
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
         # Signal the retry scheduler to exit at its next poll tick. We
