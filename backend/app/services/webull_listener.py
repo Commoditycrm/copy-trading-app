@@ -477,11 +477,24 @@ def _is_option_payload(payload: dict) -> bool:
     An OCC-shaped symbol is the fallback for a payload that omits the type
     altogether — the same fallback get_positions already uses.
     """
-    cat = str(
-        _first(payload, "category", "combo_ticker_type", "instrument_type", "asset_type")
-        or ""
-    ).upper()
-    return "OPTION" in cat or _looks_like_occ(str(payload.get("symbol") or ""))
+    # EVERY key, not the first non-empty one. Webull contradicts itself within
+    # a single order row and the WRONG field comes first:
+    #
+    #   items[0].category   = "US_STOCK"     <- plainly wrong
+    #   combo_ticker_type   = "PUT_OPTION"   <- the truth, one level up
+    #
+    # (live 2026-09-25, order RDGG4OSLPLGU..., a real NIO $4 PUT). A
+    # first-non-empty read stops at the leg's "US_STOCK" and never sees the
+    # wrapper, so ANY field naming an option has to win outright.
+    keys = ("category", "combo_ticker_type", "instrument_type", "asset_type",
+            "ticker_type", "sec_type")
+    if any("OPTION" in str(payload.get(k) or "").upper() for k in keys):
+        return True
+    # Contract terms are proof in themselves — an order carrying a strike and an
+    # expiry is an option whatever the type field claims.
+    if payload.get("strike_price") or payload.get("option_expire_date"):
+        return True
+    return _looks_like_occ(str(payload.get("symbol") or ""))
 
 
 def _persist_and_fanout(
@@ -720,6 +733,8 @@ def _persist_and_fanout(
                       # The raw type field. Diagnosing the NIO misclassification
                       # needed this and only the container log had it.
                       "category": str(payload.get("category") or ""),
+                      "combo_ticker_type": str(payload.get("combo_ticker_type") or ""),
+                      "payload_keys": sorted(payload.keys()),
                       "instrument_type": order.instrument_type.value},
         )
         db.commit()
@@ -815,10 +830,13 @@ def _rest_order_to_payload(o: dict) -> dict | None:
         "client_order_id": o.get("client_order_id"),
         "account_id": o.get("account_id") or leg.get("account_id"),
         "order_status": leg.get("order_status") or o.get("order_status"),
-        # Same key set as _is_option_payload: the type is not always on
-        # "category", and defaulting an option to STOCK is what this fixes.
-        "category": _first(leg, "category", "instrument_type", "asset_type")
-        or _first(o, "combo_ticker_type", "category", "instrument_type"),
+        # The leg's "category" is NOT authoritative: Webull sends US_STOCK
+        # there for an option whose combo_ticker_type says PUT_OPTION. Pass
+        # both through untouched and let _is_option_payload weigh them --
+        # collapsing them here is what hid the wrapper's verdict.
+        "category": leg.get("category") or o.get("category"),
+        "combo_ticker_type": o.get("combo_ticker_type") or leg.get("combo_ticker_type"),
+        "instrument_type": leg.get("instrument_type") or o.get("instrument_type"),
         "symbol": leg.get("symbol"),
         "side": leg.get("side"),
         "order_type": leg.get("order_type") or o.get("order_type"),

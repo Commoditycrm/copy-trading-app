@@ -247,3 +247,57 @@ def test_an_option_that_cannot_be_resolved_is_never_fanned_out_as_stock(monkeypa
     # a stock row and still fan it out.
     assert "if resolved is None:" in guard
     assert "return" in guard.split("if resolved is None:")[1][:400]
+
+
+def test_the_wrapper_beats_a_wrong_leg_category():
+    """The live failure, replayed from Webull's actual response. Webull
+    contradicts itself inside ONE order row and puts the wrong field first:
+
+        items[0].category = "US_STOCK"     <- plainly wrong
+        combo_ticker_type = "PUT_OPTION"   <- the truth
+
+    (order RDGG4OSLPLGU..., a real NIO $4 PUT). A first-non-empty read stops
+    at the leg and never sees the wrapper."""
+    row = {
+        "order_id": "RDGG4OSLPLGU42HGTKJ8DEOQBB",
+        "combo_ticker_type": "PUT_OPTION",
+        "items": [{"symbol": "NIO", "category": "US_STOCK", "side": "BUY",
+                   "order_status": "SUBMITTED", "qty": "1", "limit_price": "0.2"}],
+    }
+    p = wl._rest_order_to_payload(row)
+    assert p["category"] == "US_STOCK"          # passed through, not collapsed
+    assert p["combo_ticker_type"] == "PUT_OPTION"
+    assert wl._is_option_payload(p) is True
+
+
+@pytest.mark.parametrize("payload, why", [
+    ({"symbol": "NIO", "category": "US_STOCK", "combo_ticker_type": "PUT_OPTION"},
+     "wrapper says option, leg says stock"),
+    ({"symbol": "NIO", "category": "US_STOCK", "combo_ticker_type": "CALL_OPTION"},
+     "the call side of the same shape"),
+    ({"symbol": "NIO", "category": "US_STOCK", "instrument_type": "OPTION"},
+     "type on instrument_type while category lies"),
+    ({"symbol": "NIO", "category": "US_STOCK", "strike_price": "4.00"},
+     "a strike is proof regardless of the type field"),
+    ({"symbol": "NIO", "category": "US_STOCK", "option_expire_date": "2026-09-25"},
+     "so is an expiry"),
+])
+def test_any_field_naming_an_option_wins(payload, why):
+    """Not the first non-empty one — that is the whole defect."""
+    assert wl._is_option_payload(payload) is True, why
+
+
+def test_a_genuine_stock_is_still_a_stock():
+    """The widening must not swallow real stock orders: every field agrees,
+    and there are no contract terms."""
+    assert wl._is_option_payload(
+        {"symbol": "NIO", "category": "US_STOCK", "combo_ticker_type": "NORMAL"}
+    ) is False
+
+
+def test_the_detector_does_not_stop_at_the_first_key():
+    """Pins the mechanism. _first() short-circuits, which is exactly how the
+    wrapper's verdict got hidden behind the leg's wrong one."""
+    import inspect
+    src = inspect.getsource(wl._is_option_payload)
+    assert "_first(" not in src
