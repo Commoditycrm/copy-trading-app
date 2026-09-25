@@ -14,6 +14,8 @@ import os
 import sys
 import uuid
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.services.webull_listener as wl
@@ -177,3 +179,71 @@ def test_the_day_orders_page_covers_a_busy_session():
     assert default == wl._DAYORDERS_PAGE_SIZE, (
         "the poller must use the widened page, not its own literal"
     )
+
+
+# ── option-vs-stock detection: the NIO misclassification ─────────────────────
+#
+# Live 2026-09-25: a NIO option placed in the Webull app was persisted as
+# instrument_type=STOCK with no strike/right/expiry (order VIG6FSBI6BA0FC...).
+# Two consequences, and the second is the one that matters:
+#   * order history could only render "NIO"; and
+#   * _persist_and_fanout's "refuse to mirror an option whose contract we
+#     cannot resolve" guard is keyed off this flag, so instead of being held
+#     back the order went to fanout as a $0.20 NIO STOCK buy.
+
+
+@pytest.mark.parametrize("payload, why", [
+    ({"symbol": "NIO", "category": "US_OPTION"}, "the documented spelling"),
+    ({"symbol": "NIO", "category": "OPTION"}, "the bare spelling, also live"),
+    ({"symbol": "NIO", "category": "us_option"}, "lower case"),
+    ({"symbol": "NIO", "instrument_type": "US_OPTION"}, "type on instrument_type"),
+    ({"symbol": "NIO", "combo_ticker_type": "OPTION"}, "type on combo_ticker_type"),
+    ({"symbol": "NIO", "asset_type": "OPTION"}, "type on asset_type"),
+    ({"symbol": "NIO250925C00003500"}, "no type field at all — OCC symbol"),
+    ({"symbol": "NIO  250925C00003500"}, "OCC with Webull's padding"),
+])
+def test_every_spelling_of_option_is_recognised(payload, why):
+    assert wl._is_option_payload(payload) is True, why
+
+
+@pytest.mark.parametrize("payload", [
+    {"symbol": "NIO", "category": "US_STOCK"},
+    {"symbol": "AAPL", "category": "STOCK"},
+    {"symbol": "NIO"},                      # plain ticker, nothing to go on
+    {},
+])
+def test_a_stock_is_not_promoted_to_an_option(payload):
+    """The widening must not run the other way: calling a stock an option
+    would send it down the contract-resolution path and refuse to mirror it."""
+    assert wl._is_option_payload(payload) is False
+
+
+def test_the_exact_match_that_caused_it_is_gone():
+    """Pins the actual defect, not just the behaviour around it. The old line
+    was `== "US_OPTION"` on `category` alone."""
+    import inspect
+    src = inspect.getsource(wl._persist_and_fanout)
+    assert '== "US_OPTION"' not in src
+    assert "_is_option_payload(payload)" in src
+
+
+def test_the_rest_flattening_looks_at_the_same_keys():
+    """The poll path builds its own payload, so widening the detector alone
+    would leave the poll still blind to a type on instrument_type."""
+    p = wl._rest_order_to_payload(
+        {"order_id": "X", "items": [{"symbol": "NIO", "instrument_type": "OPTION"}]}
+    )
+    assert wl._is_option_payload(p) is True
+
+
+def test_an_option_that_cannot_be_resolved_is_never_fanned_out_as_stock(monkeypatch):
+    """The dangerous half. Misreading the type skipped this refusal entirely —
+    which is how a NIO OPTION reached fanout as a NIO STOCK buy at $0.20."""
+    import inspect
+    src = inspect.getsource(wl._persist_and_fanout)
+    resolve_at = src.index("_resolve_option_contract")
+    guard = src[resolve_at:resolve_at + 700]
+    # The refusal must RETURN — logging it and carrying on would still persist
+    # a stock row and still fan it out.
+    assert "if resolved is None:" in guard
+    assert "return" in guard.split("if resolved is None:")[1][:400]
