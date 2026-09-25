@@ -875,3 +875,93 @@ def test_other_dte_counts_are_not_guessed(body):
     """Only 0DTE and 1DTE are used by these channels. Anything else is left
     unparsed rather than resolved to a date the alert never named."""
     assert parse_message(text(body, posted_at=_at(2026, 9, 24))).status is not ParseStatus.PARSED
+
+
+# ── "averaging down": double the position already held ───────────────────────
+
+def test_averaging_down_is_read_as_a_buy_that_doubles():
+    """$SPY 768 PUT averaging down @0.48 — the live format. The phrase sits
+    BETWEEN the contract and the price, which is what broke it: the words fell
+    in the price's slot, so 0.48 was swallowed as trailing text."""
+    s = parse_message(text("$SPY 768 PUT averaging down @0.48")).signal
+    assert s.action.value == "BUY"
+    assert s.symbol == "SPY"
+    assert s.strike == Decimal("768")
+    assert s.option_type.value == "PUT"
+    assert s.limit_price == Decimal("0.48")     # NOT lost to the phrase
+    assert s.double_up is True
+
+
+def test_the_price_survives_when_an_expiry_is_stated_too():
+    """The variant that parsed before this change but silently dropped the
+    price — the worst outcome, since it would have been priced off the live
+    quote instead of the 0.48 the alert named."""
+    s = parse_message(text("$SPY 768 PUT 0DTE averaging down @0.48")).signal
+    assert s.limit_price == Decimal("0.48")
+    assert s.expiration == POSTED.date()        # 0DTE, from the post time
+    assert s.double_up is True
+
+
+def test_no_expiry_is_left_for_the_position_to_resolve():
+    """Averaging down is by definition into something already open, so the
+    contract is the one held — not a guess at today's expiry."""
+    s = parse_message(text("$SPY 768 PUT averaging down @0.48")).signal
+    assert s.expiration is None
+    assert s.expiry_unspecified is True
+
+
+def test_it_is_tradeable_without_a_price_or_an_expiry():
+    """The phrase is an explicit instruction, not a way anyone mentions a
+    contract in passing, so it carries the line on its own."""
+    s = parse_message(text("$SPY 768 PUT averaging down")).signal
+    assert s.double_up is True
+    assert s.limit_price_unspecified is True
+
+
+@pytest.mark.parametrize("body", [
+    "SPY 768P averaging down @0.48",        # compact right, no $
+    "$SPY 768 PUT avg down @0.48",          # abbreviated
+    "$SPY 768 PUT averaging-down @0.48",    # hyphenated
+    "$SPY 768 PUT Averaging Down @0.48",    # capitalised
+])
+def test_the_usual_phrasings_all_double(body):
+    s = parse_message(text(body)).signal
+    assert s.double_up is True
+    assert s.limit_price == Decimal("0.48")
+
+
+def test_averaging_UP_is_not_treated_as_the_same_instruction():
+    """A different trade. Reading it as "double up" would add to a WINNER at
+    the top of a move, off an alert that never asked for it."""
+    r = parse_message(text("$SPY 768 PUT averaging up @0.48"))
+    assert r.status is not ParseStatus.PARSED or r.signals[0].double_up is False
+
+
+def test_a_plain_entry_never_doubles():
+    """Pins that the phrase is what sets the flag."""
+    s = parse_message(text("$SPY 768 PUT 0DTE @0.48")).signal
+    assert s.double_up is False
+
+
+def test_the_phrase_alone_is_not_a_trade():
+    """No contract, so nothing to double. Prose must not become an order."""
+    assert parse_message(text("averaging down here")).status is not ParseStatus.PARSED
+
+
+def test_a_pnl_update_is_still_not_an_entry():
+    """The phrase widened what counts as a trade line; it must not have
+    widened it far enough to swallow a running P&L post."""
+    r = parse_message(text("$TSLA 375c +43%"))
+    assert r.status is not ParseStatus.PARSED
+
+
+def test_only_the_line_that_says_it_doubles():
+    """A block mixing a fresh entry with an average-down must not double both
+    — the flag is read per line, not per message."""
+    r = parse_message(text(
+        "$SPY 768 PUT averaging down @0.48\n$QQQ 500 CALL 0DTE @1.10"
+    ))
+    assert r.status is ParseStatus.PARSED
+    by_symbol = {s.symbol: s for s in r.signals}
+    assert by_symbol["SPY"].double_up is True
+    assert by_symbol["QQQ"].double_up is False
