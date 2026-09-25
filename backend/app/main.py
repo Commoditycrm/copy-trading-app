@@ -377,6 +377,18 @@ def create_app() -> FastAPI:
             # route at 09:30. The wanted price is held on the order and retried
             # here until it lands or the entry stops being a working unfilled
             # one. Nothing is cancelled while it waits.
+            # Auto Trim: fire each ladder rung the moment its profit gate is
+            # reached, instead of waiting for that rung's Discord alert. Inert
+            # unless the trader turns it on, and a rung with no threshold set
+            # is never fired automatically.
+            from app.services import discord_auto_trim
+            threading.Thread(
+                target=discord_auto_trim.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="discord-auto-trim",
+                daemon=True,
+            ).start()
+
             from app.services import discord_edit
             threading.Thread(
                 target=discord_edit.poll_loop,

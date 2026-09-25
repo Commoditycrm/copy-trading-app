@@ -18,7 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.api.discord_sources as ds
 
-_SRC = inspect.getsource(ds.submit_self_alert)
+# The endpoint is a thin wrapper now; the pipeline lives in the core that
+# both it and auto-trim call.
+_SRC = inspect.getsource(ds.submit_self_alert_text)
 
 
 # ── it reuses the real pipeline, it does not reimplement one ────────────────
@@ -30,7 +32,7 @@ def test_it_goes_through_the_normal_ingest():
 
 
 def test_it_executes_through_the_normal_path():
-    assert "_execute_signal(db, user, msg, background, request)" in _SRC
+    assert "_execute_signal(db, user, msg, background or _InlineTasks(), request)" in _SRC
 
 
 def test_it_never_accepts_a_pre_parsed_signal():
@@ -45,6 +47,10 @@ def test_it_honours_the_traders_execution_mode():
     manual it must land awaiting approval, not place."""
     assert "_auto_approve(db, user.id)" in _SRC
     assert "if auto and msg.decision is SignalDecision.APPROVED:" in _SRC
+    # The composer never forces approval — only auto-trim does, and only
+    # because turning auto-trim on IS the approval.
+    endpoint = inspect.getsource(ds.submit_self_alert)
+    assert "approve=True" not in endpoint
 
 
 # ── the source itself ───────────────────────────────────────────────────────
