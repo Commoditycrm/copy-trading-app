@@ -109,6 +109,11 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/discord-sources", tags=["discord-sources"])
 
+# The virtual "Self" channel — see submit_self_alert. Defined up here because
+# list_sources filters on it long before that endpoint appears.
+_SELF_CHANNEL_ID = "self"
+_SELF_LABEL = "Self"
+
 
 def _require_feature(user: User = Depends(require_trader)) -> None:
     """Gate every trader Discord route two ways:
@@ -294,7 +299,14 @@ def list_sources(
 ) -> list[DiscordSourceOut]:
     rows = db.execute(
         select(DiscordAlertSource)
-        .where(DiscordAlertSource.user_id == user.id)
+        .where(
+            DiscordAlertSource.user_id == user.id,
+            # The Self channel is a plumbing detail, not a channel the trader
+            # connected. Listing it would offer Change channel / Disconnect /
+            # a watch schedule for something with no Discord behind it — and
+            # disconnecting it would break the composer with no way back.
+            DiscordAlertSource.channel_id != _SELF_CHANNEL_ID,
+        )
         .order_by(DiscordAlertSource.created_at.desc())
     ).scalars()
     return [_to_out(r) for r in rows]
@@ -1051,8 +1063,6 @@ def clear_session(
 # sources to DiscordAccount, so a source with account_id NULL is never handed to
 # a watcher — there is no browser, no session, no channel to read. Nothing had
 # to be excluded by name.
-_SELF_CHANNEL_ID = "self"
-_SELF_LABEL = "Self"
 
 
 def _self_source(db: Session, user: User) -> DiscordAlertSource:
