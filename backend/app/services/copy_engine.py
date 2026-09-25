@@ -45,7 +45,7 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
-from app.services import audit, cache, events, snaptrade_nudge
+from app.services import audit, cache, events, order_intent, snaptrade_nudge
 from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
@@ -1294,6 +1294,23 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
                 )
                 continue
 
+            # The replacement needs its OWN client_order_id. Reusing str(child.id)
+            # — the id the mirror being replaced is still resting under — is
+            # answered by Alpaca with
+            #   {"code":40010001,"message":"client_order_id must be unique"}
+            # and since the cancel has already succeeded by then, the mirror is
+            # simply GONE: marked canceled with old_order_lost=true, while the
+            # trader's own order moved. That is what happened to the SPY 770C
+            # mirror on 2026-09-25, and it is the same defect discord_reprice
+            # fixed for the TRADER's order and never carried across to here.
+            #
+            # Marked app-originated BEFORE the call, as every other placement
+            # does: the broker echoes client_order_id back on its order stream,
+            # and without the marker the listener reads the replacement as an
+            # externally-placed trade and inserts a duplicate parent row.
+            new_coid = uuid.uuid4()
+            order_intent.mark_app_originated(new_coid)
+
             pending.append((child, adapter, BrokerOrderRequest(
                 instrument_type=child.instrument_type,
                 symbol=child.symbol,
@@ -1308,7 +1325,7 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
                 option_strike=child.option_strike,
                 option_right=child.option_right,
                 is_closing=child.is_closing,
-                client_order_id=str(child.id),
+                client_order_id=str(new_coid),
             )))
 
         if not pending:
@@ -1316,6 +1333,31 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
 
         def _replace(item: tuple[Order, Any, BrokerOrderRequest]):
             ch, ad, rq = item
+            # Prefer the broker's ATOMIC replace, for the same reason
+            # _modify_place_one does: it changes price/qty without releasing the
+            # position's share reservation, and on failure it leaves the original
+            # order working untouched. Cancel+place has neither property — the
+            # subscriber is orderless in the gap, and a failed place strands them.
+            if getattr(ad, "supports_replace", False):
+                # Alpaca models a modify as a replacement CHAIN, and a re-replace
+                # fired before the previous one settles fails TRANSIENTLY with
+                # 42210000 "order chain not fully replaced". It settles in ~1-2s.
+                last_exc: BaseException | None = None
+                for attempt in range(_MODIFY_PLACE_ATTEMPTS):
+                    try:
+                        return ch.id, ad.replace_order(ch.broker_order_id, rq), None
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        if (is_replace_chain_pending_error(exc)
+                                and attempt < _MODIFY_PLACE_ATTEMPTS - 1):
+                            time.sleep(_MODIFY_PLACE_BACKOFF_S)
+                            continue
+                        break
+                # The atomic contract holds: the original order is untouched, so
+                # the caller leaves the mirror resting at its old terms rather
+                # than marking it lost.
+                return ch.id, None, f"replace_chain_failed: {last_exc}"[:300]
+
             # Cancel the old resting order, THEN place the replacement. A cancel
             # failure almost always means the mirror just filled — abort the
             # replace so we never stack a duplicate order on top of a fill.

@@ -35,6 +35,10 @@ def _order(**kw):
         limit_price=Decimal("0.20"), status=OrderStatus.SUBMITTED,
         discord_edit_price=None,
         broker_order_id="brk-1",
+        # The rest of what _order_event() reads, so the UI push can
+        # serialise this row.
+        created_at=None, filled_avg_price=None, reject_reason=None,
+        stop_price=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -289,3 +293,39 @@ def test_the_mirrors_are_carried_along(monkeypatch, broker):
     o = _order()
     ed.apply_price_edit(_DB(o), _msg(o, _signal()))
     assert carried == [o.id]
+
+
+# ── the UI has to hear about it ──────────────────────────────────────────────
+
+def test_a_landed_edit_is_pushed_to_the_ui(monkeypatch, broker):
+    """Without this the row keeps showing the OLD limit until a reload — and a
+    stale row is indistinguishable from an edit that never applied."""
+    import app.services.events as events
+    sent = []
+    monkeypatch.setattr(events, "publish", lambda uid, payload: sent.append(payload))
+    o = _order()
+    ed.apply_price_edit(_DB(o), _msg(o, _signal()))
+    assert [p["type"] for p in sent] == ["order.updated"]
+    assert sent[0]["order"]["limit_price"] == "0.15"     # the NEW terms ride along
+
+
+def test_nothing_is_announced_when_the_price_did_not_move(monkeypatch, broker):
+    """An announcement for an order that did not change would flash a row and
+    trigger a refetch for nothing."""
+    import app.services.events as events
+    sent = []
+    monkeypatch.setattr(events, "publish", lambda uid, payload: sent.append(payload))
+    o = _order()
+    ed.apply_price_edit(_DB(o), _msg(o, _signal(limit_price="0.20")))   # same price
+    assert sent == []
+
+
+def test_a_failed_announcement_does_not_undo_the_reprice(monkeypatch, broker):
+    """The price is already changed at the broker. An SSE failure must not read
+    as a failed reprice."""
+    import app.services.events as events
+    monkeypatch.setattr(events, "publish", lambda *a: (_ for _ in ()).throw(RuntimeError("bus down")))
+    o = _order()
+    out = ed.apply_price_edit(_DB(o), _msg(o, _signal()))
+    assert out.startswith("repriced")
+    assert o.limit_price == Decimal("0.15")

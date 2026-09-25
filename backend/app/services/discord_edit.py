@@ -146,6 +146,24 @@ def apply_price_edit(db: Session, msg: DiscordMessage) -> str:
     return _attempt(db, order)
 
 
+def _announce(order: Order) -> None:
+    """Push the new price to the open UI.
+
+    Without this the row keeps showing the OLD limit until the user reloads —
+    the order moved at the broker and the screen quietly disagreed with it,
+    which is worse than not moving at all: you cannot tell a stale row from an
+    edit that never applied. Best-effort; the price is already changed and an
+    SSE failure must not read as a failed reprice.
+    """
+    from app.services import events  # noqa: PLC0415
+    from app.services.copy_engine import _order_event  # noqa: PLC0415
+
+    try:
+        events.publish(order.user_id, _order_event("order.updated", order))
+    except Exception:  # noqa: BLE001
+        log.exception("discord edit: could not announce %s to the UI", order.id)
+
+
 def _attempt(db: Session, order: Order) -> str:
     """Try to move ``order`` to its pending ``discord_edit_price``.
 
@@ -192,6 +210,7 @@ def _attempt(db: Session, order: Order) -> str:
         "discord edit: %s alert edited %s -> %s; the resting order was moved",
         order.symbol, original, new_price,
     )
+    _announce(order)
 
     # Carry it to the subscribers' mirrors. They are resting at the price the
     # author has withdrawn, and the replacement is app-originated so no listener
