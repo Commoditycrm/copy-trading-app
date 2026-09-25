@@ -36,6 +36,12 @@ def _channel(user_id: uuid.UUID) -> str:
 # only reach the order's OWNER, never an admin watching the whole platform.
 _ADMIN_CHANNEL = "events:admin"
 
+# Global channel carrying live market-data ticks (price.tick). EVERY SSE
+# connection subscribes to it so a held symbol's price updates on screen without
+# a refresh; the frontend ignores ticks for symbols it isn't showing. Fed by the
+# market-data streams (throttled, ~1 tick/sec/symbol), so it's low-volume.
+_PRICES_CHANNEL = "events:prices"
+
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     """No-op now — kept for backward compatibility with main.py's startup
@@ -46,17 +52,21 @@ def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 async def subscribe(
-    user_id: uuid.UUID, include_admin: bool = False
+    user_id: uuid.UUID, include_admin: bool = False, include_prices: bool = True
 ) -> AsyncIterator[dict[str, Any]]:
     """Subscribe to events for `user_id`. Yields decoded JSON payloads. If
     Redis is unreachable, the generator yields nothing and exits — the SSE
     endpoint's heartbeat keeps the connection alive.
 
     include_admin: also subscribe to the global admin channel (set for admins)
-    so the admin panel receives platform-wide order-lifecycle events."""
+    so the admin panel receives platform-wide order-lifecycle events.
+    include_prices: also subscribe to the global live-price channel so held
+    symbols tick on screen (default on)."""
     channels = [_channel(user_id)]
     if include_admin:
         channels.append(_ADMIN_CHANNEL)
+    if include_prices:
+        channels.append(_PRICES_CHANNEL)
     r = get_async_redis()
     try:
         pubsub = r.pubsub(ignore_subscribe_messages=True)
@@ -102,3 +112,14 @@ def publish(user_id: uuid.UUID, event: dict[str, Any]) -> None:
             r.publish(_ADMIN_CHANNEL, payload)
     except Exception:  # noqa: BLE001
         log.warning("event publish dropped for user=%s", user_id)
+
+
+def publish_price(symbol: str, price: str) -> None:
+    """Broadcast one live price tick to the global prices channel (all SSE
+    connections). Sync, fire-and-forget. Callers throttle upstream, so this just
+    ships it. The frontend applies it to any on-screen row for ``symbol``."""
+    try:
+        payload = json.dumps({"type": "price.tick", "symbol": symbol.upper(), "price": price})
+        get_sync_redis().publish(_PRICES_CHANNEL, payload)
+    except Exception:  # noqa: BLE001
+        pass

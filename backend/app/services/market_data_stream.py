@@ -103,13 +103,29 @@ def _enabled() -> bool:
 
 
 # ── central store: Redis price cache ────────────────────────────────────────
+# Per-symbol throttle for the SSE price-tick broadcast: quotes tick many times a
+# second (esp. options), but the screen only needs ~1 update/sec/symbol.
+_TICK_MIN_INTERVAL_S = 1.0
+_last_tick_at: dict[str, float] = {}
+
+
 def _set_price(symbol: str, price: Decimal) -> None:
     from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+    sym = symbol.upper()
     try:
         payload = json.dumps({"p": str(price), "t": int(time.time() * 1000)})
-        get_sync_redis().set(_PRICE_KEY.format(symbol.upper()), payload, ex=_PRICE_TTL_S)
+        get_sync_redis().set(_PRICE_KEY.format(sym), payload, ex=_PRICE_TTL_S)
     except Exception:  # noqa: BLE001
         pass  # best-effort cache; never let a Redis blip kill the stream
+    # Phase 4: push the tick to open screens over SSE, throttled per symbol.
+    now = time.monotonic()
+    if now - _last_tick_at.get(sym, 0.0) >= _TICK_MIN_INTERVAL_S:
+        _last_tick_at[sym] = now
+        try:
+            from app.services import events  # noqa: PLC0415
+            events.publish_price(sym, str(price))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def get_live_price(symbol: str, max_age_s: float = _MAX_AGE_S) -> Decimal | None:

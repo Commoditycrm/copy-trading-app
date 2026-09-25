@@ -8,6 +8,7 @@ import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import { useLivePrice } from "@/lib/livePrices";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -22,6 +23,15 @@ function fmtNum(n: string | null | undefined, dp = 2): string {
   const v = Number(n);
   if (!Number.isFinite(v)) return String(n);
   return v.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+/** Current-price cell that ticks live off the central price stream. `symbol` is
+ *  null for options (the stock cache doesn't carry them, and an option row's
+ *  p.symbol is the UNDERLYING), so those fall straight through to the fallback.
+ *  Its own component so the hook stays out of the row's .map(). */
+function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fallback: string | null }) {
+  const live = useLivePrice(symbol, fallback);
+  return <td className="px-5 py-3.5 num">{fmtNum(live == null ? fallback : String(live), 2)}</td>;
 }
 
 function fmtSignedMoney(n: string | null | undefined): { text: string; sign: 1 | -1 | 0 | null } {
@@ -739,7 +749,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           );
                         })()}
                         <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                        <td className="px-5 py-3.5 num">{fmtNum(p.current_price, 2)}</td>
+                        <LiveCurrentPriceCell symbol={p.instrument_type === "stock" ? p.symbol : null} fallback={p.current_price} />
                         {/* Reference = previous session's market close price. */}
                         <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
                         {(() => {
