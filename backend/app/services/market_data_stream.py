@@ -365,6 +365,48 @@ def fetch_rest_quote(symbol: str) -> Decimal | None:
         return None
 
 
+def fetch_rest_quotes(symbols: list[str]) -> dict[str, Decimal]:
+    """Batched instant-seed: one multi-symbol REST call for all stocks and one
+    for all options, instead of a call per symbol. Order History can seed 25
+    symbols in 2 requests rather than 25 — well under the data account's rate
+    limit. Writes each into the cache and returns {SYMBOL: mid}."""
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    out: dict[str, Decimal] = {}
+    if not (s.alpaca_data_api_key and s.alpaca_data_api_secret):
+        return out
+    syms = [x.upper().strip() for x in symbols if x and x.strip()]
+    stocks = [x for x in syms if not _OCC_RE.match(x)]
+    opts = [x for x in syms if _OCC_RE.match(x)]
+
+    def _absorb(resp: Any) -> None:
+        for sym, v in (resp or {}).items():
+            px = _quote_mid(v)
+            if px is not None:
+                _set_price(sym, px)
+                out[str(sym).upper()] = px
+
+    try:
+        if stocks:
+            from alpaca.data.enums import DataFeed  # noqa: PLC0415
+            from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: PLC0415
+            from alpaca.data.requests import StockLatestQuoteRequest  # noqa: PLC0415
+            feed = DataFeed.SIP if s.alpaca_data_feed.lower() == "sip" else DataFeed.IEX
+            c = StockHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+            _absorb(c.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=stocks, feed=feed)))
+    except Exception:  # noqa: BLE001
+        log.warning("market_data_stream: fetch_rest_quotes stock batch failed")
+    try:
+        if opts:
+            from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+            from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: PLC0415
+            c = OptionHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+            _absorb(c.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=opts)))
+    except Exception:  # noqa: BLE001
+        log.warning("market_data_stream: fetch_rest_quotes option batch failed")
+    return out
+
+
 # ── symbol set: everything anyone holds or is working ───────────────────────
 def _compute_symbols() -> set[str]:
     """Union of STOCK symbols with a live net position (any user) or a working

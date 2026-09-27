@@ -409,6 +409,9 @@ export default function TradePanelPage() {
     if (!watchSym) { setSeedPx(null); return; }
     let alive = true;
     const ping = async () => {
+      // Skip while the tab is hidden — let the watch TTL lapse so the stream
+      // isn't kept spending on a symbol nobody's looking at.
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const res = await api<{ prices: Record<string, string | null> }>(
           "/api/market-data/watch",
@@ -421,7 +424,9 @@ export default function TradePanelPage() {
     };
     ping();
     const t = setInterval(ping, 30_000);   // heartbeat keeps the watch alive
-    return () => { alive = false; clearInterval(t); };
+    const onVis = () => { if (!document.hidden) ping(); };  // resume immediately
+    document.addEventListener("visibilitychange", onVis);
+    return () => { alive = false; clearInterval(t); document.removeEventListener("visibilitychange", onVis); };
   }, [watchSym]);
   const livePx = useLivePrice(watchSym, seedPx);
   // Live bid/mid/ask for the option quote panel — ticks the REST-seeded quote.

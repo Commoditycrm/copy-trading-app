@@ -7,6 +7,7 @@ import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, Check, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLivePrice } from "@/lib/livePrices";
+import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
 import { PositionIcon, orderKind } from "@/components/PositionIcon";
@@ -706,28 +707,19 @@ export default function TradesPage() {
   // table — same columns, same row renderer, same sorting.
   const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
 
-  // Live "Current price" column: register an on-demand watch for the symbols on
-  // screen so the central stream subscribes to them, then each row ticks via
-  // useLivePrice. Capped + heartbeated (the watch TTL lapses when we stop).
+  // Live "Current price" column: watch the symbols on screen so the central
+  // stream subscribes to them, then each row ticks via useLivePrice. Only the
+  // rows on screen need live push, and open orders matter most — prioritize
+  // them, then fill from the rest, capped so a big history load doesn't
+  // subscribe the stream to hundreds of stale symbols. The shared hook
+  // heartbeats it and pauses while the tab is hidden.
   const watchKeys = useMemo(() => {
-    // Only the rows on screen need live push, and open orders matter most —
-    // prioritize them, then fill from the rest, capped so a big history load
-    // doesn't subscribe the stream to hundreds of stale symbols.
     const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
     const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
     const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
-    return Array.from(new Set(keys)).slice(0, 25).sort().join(",");
+    return Array.from(new Set(keys)).slice(0, 25);
   }, [gridRows]);
-  useEffect(() => {
-    if (!watchKeys) return;
-    const syms = watchKeys.split(",");
-    const ping = () => {
-      api("/api/market-data/watch", { method: "POST", body: JSON.stringify({ symbols: syms }) }).catch(() => {});
-    };
-    ping();
-    const t = setInterval(ping, 30_000);
-    return () => clearInterval(t);
-  }, [watchKeys]);
+  useMarketDataWatch(watchKeys);
   const isLoading = tab === "discord" ? signalsLoading : loading;
   // Row id -> the alert behind it, so the Actions cell can reach the decision
   // state that the Order shape has no field for.
