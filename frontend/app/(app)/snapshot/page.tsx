@@ -14,6 +14,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { useLivePrice } from "@/lib/livePrices";
+import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { PercentInput } from "@/components/PercentInput";
@@ -183,21 +184,13 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
   const [busy, setBusy] = useState<string | null>(null); // "all" or a row index
 
   // Register the snapshot's symbols as watched so the central stream feeds their
-  // live prices to this client (LiveSnapPrice ticks off them). Heartbeated.
+  // live prices to this client (LiveSnapPrice ticks off them). The shared hook
+  // heartbeats and pauses while the tab is hidden.
   const watchKeys = useMemo(() => {
     const keys = (snap?.positions ?? []).map(snapLiveKey).filter(Boolean) as string[];
-    return Array.from(new Set(keys)).slice(0, 30).sort().join(",");
+    return Array.from(new Set(keys)).slice(0, 30);
   }, [snap]);
-  useEffect(() => {
-    if (!watchKeys) return;
-    const syms = watchKeys.split(",");
-    const ping = () => {
-      api("/api/market-data/watch", { method: "POST", body: JSON.stringify({ symbols: syms }) }).catch(() => {});
-    };
-    ping();
-    const t = setInterval(ping, 30_000);
-    return () => clearInterval(t);
-  }, [watchKeys]);
+  useMarketDataWatch(watchKeys);
 
   // Pre-fill each row's re-entry control from the default chosen at exit time,
   // without overwriting anything already edited. Keyed by array index (the same
