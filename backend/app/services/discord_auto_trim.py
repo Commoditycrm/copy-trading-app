@@ -124,19 +124,15 @@ def _live_guards(db):
     ).scalars())
 
 
-def _mark_for(adapter, guard) -> Decimal | None:
+def _mark_for(positions, guard) -> Decimal | None:
     """The broker's own mark for this contract, from the position it holds.
 
-    Read from the POSITION rather than a quote endpoint because Alpaca exposes
-    no option quote, and because a mark with no position behind it would fire a
-    trim on something already gone.
+    Takes the account's ALREADY-FETCHED positions (fetched once per account per
+    sweep by the caller) — reading them per-guard blew Webull's 10-req/30s limit
+    (429 storm). Read from the POSITION rather than a quote endpoint because
+    Alpaca exposes no option quote, and because a mark with no position behind it
+    would fire a trim on something already gone.
     """
-    try:
-        positions = adapter.get_positions()
-    except Exception:  # noqa: BLE001
-        # A broker hiccup must not fire or skip a rung on bad data.
-        log.warning("auto-trim: could not read positions for %s", guard.symbol, exc_info=True)
-        return None
     for p in positions:
         if (p.symbol or "").upper() != guard.symbol:
             continue
@@ -201,9 +197,18 @@ def tick() -> None:
                 log.warning("auto-trim: no adapter for user %s", user_id, exc_info=True)
                 continue
 
+            # Fetch the account's positions ONCE per sweep and match every guard
+            # against that list. Reading them per-guard made N broker calls per
+            # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
+            try:
+                positions = adapter.get_positions()
+            except Exception:  # noqa: BLE001
+                log.warning("auto-trim: could not read positions for user %s", user_id, exc_info=True)
+                continue
+
             for guard in rows:
                 try:
-                    mark = _mark_for(adapter, guard)
+                    mark = _mark_for(positions, guard)
                     rung = due_rung(ts, guard, mark)
                     if rung is None:
                         continue
