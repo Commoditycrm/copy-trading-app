@@ -79,13 +79,16 @@ export function ColumnsMenu({ cols, label = "Columns", reorderable = true }: { c
 /** Drag handle placed at a header cell's right edge to resize that column.
  *  Calls onResize(px) live while dragging. */
 export function ResizeHandle({
-  startWidth, minWidth = 60, onResize,
-}: { startWidth: number; minWidth?: number; onResize: (width: number) => void }) {
+  minWidth = 60, onResize,
+}: { minWidth?: number; onResize: (width: number) => void }) {
   const down = (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
     const x0 = e.clientX;
-    const w0 = startWidth;
+    // Measure the header cell's actual current width so resizing works even for
+    // columns that have no explicit width yet (auto-sized).
+    const th = (e.currentTarget as HTMLElement).closest("th");
+    const w0 = th ? th.getBoundingClientRect().width : 120;
     const move = (ev: PointerEvent) => onResize(Math.max(minWidth, w0 + (ev.clientX - x0)));
     const up = () => {
       window.removeEventListener("pointermove", move);

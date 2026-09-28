@@ -9,8 +9,8 @@ import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
-import { useTableColumns, type ColumnDef } from "@/lib/useTableColumns";
-import { ColumnsMenu } from "@/components/ColumnsMenu";
+import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
+import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -277,7 +277,6 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       { id: "expires", header: "Expires in Days" },
     ], [showChannel]);
     const cols = useTableColumns("positions", columnDefs);
-    const showCol = (id: string) => !cols.isHidden(id);
     useEffect(() => {
       if (getSnapshot<User>(USER_SNAPSHOT_KEY)) return;
       let cancelled = false;
@@ -610,18 +609,48 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
     };
 
-    const Th = ({ label, sortKey, className: thc = "", title }: { label: string; sortKey?: SortKey; className?: string; title?: string }) => {
+    const Th = ({ label, sortKey, className: thc = "", title, col }: { label: string; sortKey?: SortKey; className?: string; title?: string; col?: ResolvedColumn }) => {
       const active = sortKey && sort?.key === sortKey;
+      const w = col?.width;
       return (
-        <th title={title} className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
+        <th
+          title={title}
+          className={`relative text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`}
+          style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+        >
           {sortKey ? (
             <button type="button" onClick={() => toggleSort(sortKey)} className="inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors uppercase tracking-[0.06em] text-[11px]" style={{ color: "inherit" }}>
               {label}
               <SortIcon k={sortKey} />
             </button>
           ) : label}
+          {col && <ResizeHandle minWidth={col.minWidth ?? 60} onResize={(px) => cols.setWidth(col.id, px)} />}
         </th>
       );
+    };
+
+    // Header metadata by column id — label + optional sort key/title. Drives the
+    // ordered header render below.
+    const HEADER_META: Record<string, { label: string; sortKey?: SortKey; title?: string }> = {
+      channel: { label: "Channel", title: "Discord channel whose alert opened this position" },
+      symbol: { label: "Symbol", sortKey: "symbol" },
+      qty: { label: "Qty", sortKey: "quantity" },
+      side: { label: "Side" },
+      close_pct: { label: "Close %" },
+      actions: { label: "Actions" },
+      unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
+      pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
+      avg_entry: { label: "Avg entry", sortKey: "avg_entry_price" },
+      current_price: { label: "Current price", sortKey: "current_price" },
+      pdc: { label: "PDC", title: "Previous day's market close price" },
+      filled_price: { label: "Filled price" },
+      market_value: { label: "Market value", sortKey: "market_value" },
+      tp: { label: "TP" },
+      sl: { label: "SL" },
+      submitted_at: { label: "Submitted at" },
+      filled_at: { label: "Filled at" },
+      time_taken: { label: "Time Taken to Filled" },
+      expires: { label: "Expires in Days", sortKey: "expires" },
     };
 
     // Must equal the number of <Th> cells — and the number of <td> in a data
@@ -706,8 +735,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                 </button>
               )}
             </div>
-            {/* Show/hide columns (reorder + resize land next). */}
-            <ColumnsMenu cols={cols} reorderable={false} />
+            {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
+            <ColumnsMenu cols={cols} />
           </div>
         </div>
 
@@ -717,25 +746,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
-                  {showChannel && showCol("channel") && <Th label="Channel" title="Discord channel whose alert opened this position" />}
-                  {showCol("symbol") && <Th label="Symbol" sortKey="symbol" />}
-                  {showCol("qty") && <Th label="Qty" sortKey="quantity" />}
-                  {showCol("side") && <Th label="Side" />}
-                  {showCol("close_pct") && <Th label="Close %" />}
-                  {showCol("actions") && <Th label="Actions" />}
-                  {showCol("unrealized_pnl") && <Th label="Unrealized P&L" sortKey="unrealized_pnl" />}
-                  {showCol("pnl_pct") && <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />}
-                  {showCol("avg_entry") && <Th label="Avg entry" sortKey="avg_entry_price" />}
-                  {showCol("current_price") && <Th label="Current price" sortKey="current_price" />}
-                  {showCol("pdc") && <Th label="PDC" title="Previous day's market close price" />}
-                  {showCol("filled_price") && <Th label="Filled price" />}
-                  {showCol("market_value") && <Th label="Market value" sortKey="market_value" />}
-                  {showCol("tp") && <Th label="TP" />}
-                  {showCol("sl") && <Th label="SL" />}
-                  {showCol("submitted_at") && <Th label="Submitted at" />}
-                  {showCol("filled_at") && <Th label="Filled at" />}
-                  {showCol("time_taken") && <Th label="Time Taken to Filled" />}
-                  {showCol("expires") && <Th label="Expires in Days" sortKey="expires" />}
+                  {cols.columns.map((c) => {
+                    const m = HEADER_META[c.id] ?? { label: c.header };
+                    return <Th key={c.id} col={c} label={m.label} sortKey={m.sortKey} title={m.title} />;
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -780,223 +794,179 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   const liveSym = p.instrument_type === "stock" ? p.symbol : positionOcc(p);
                   const liveMult = p.instrument_type === "option" ? 100 : 1;
                   const inFlight = closing?.key === key;
+                  // Entry-order match for this position — drives Filled price,
+                  // the bracket cells and the timestamps. Bracket modify is
+                  // allowed while the position is alive (i.e. this row exists);
+                  // without a match (broker connected after the trade) the
+                  // bracket cells render read-only. The % anchor mirrors Order
+                  // History: a copied mirror reverses off filled_avg_price, the
+                  // trader's own entry off limit_price.
+                  const t = orderTimestamps.byKey.get(orderTimestamps.key(
+                    p.broker_account_id, p.instrument_type, p.symbol,
+                    p.option_expiry, p.option_strike, p.option_right,
+                  ));
+                  const orderId = t?.order_id ?? null;
+                  const entryPrice = t?.parent_order_id
+                    ? (t?.filled_avg_price ?? t?.limit_price ?? null)
+                    : (t?.limit_price ?? t?.filled_avg_price ?? null);
+                  const isMirror = !!t?.parent_order_id;
+                  const tpPct = isMirror && t?.take_profit_pct != null ? Number(t.take_profit_pct) : null;
+                  const slPct = isMirror && t?.stop_loss_pct != null ? Number(t.stop_loss_pct) : null;
+                  const side = t?.side ?? (isLong ? "buy" : "sell");
+                  const onUpdated = (updated: Order) => {
+                    setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
+                  };
+                  const sub = t?.submitted_at ?? null;
+                  const fill = t?.filled_at ?? null;
+                  const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
+
+                  // Each column's cell keyed by id; rendered below in the user's
+                  // configured order (reorderable) and visibility (show/hide).
+                  const cell: Record<string, React.ReactNode> = {
+                    channel: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }} title={p.discord_channel ?? undefined}>
+                        {p.discord_channel || "—"}
+                      </td>
+                    ),
+                    symbol: (
+                      <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PositionIcon kind={positionKind(p)} />
+                          {positionSymbolLabel(p)}
+                        </span>
+                      </td>
+                    ),
+                    qty: <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>,
+                    side: (
+                      <td className="px-5 py-3.5">
+                        <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
+                          {isLong ? "Long" : "Short"}
+                        </span>
+                      </td>
+                    ),
+                    close_pct: (
+                      <td className="px-5 py-3.5">
+                        <div className="flex gap-1">
+                          {[25, 50, 75, 100].map(pct => {
+                            const computedQty = quantityForPercent(p, pct);
+                            const disabled = computedQty == null;
+                            const selected = (closePercents[key] ?? 100) === pct;
+                            return (
+                              <button
+                                key={pct}
+                                type="button"
+                                disabled={disabled}
+                                onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
+                                title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
+                                className="px-2 py-0.5 text-[10px] rounded transition-colors"
+                                style={{
+                                  border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                                  background: selected ? "var(--nav-active-bg)" : "transparent",
+                                  color: disabled ? "var(--faint)" : selected ? "var(--accent)" : "var(--text-2)",
+                                  cursor: disabled ? "not-allowed" : "pointer",
+                                  opacity: disabled ? 0.5 : 1,
+                                }}
+                              >
+                                {pct}%
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    ),
+                    actions: (
+                      <td className="px-5 py-3.5">
+                        <div className="flex gap-2 items-center whitespace-nowrap">
+                          <button
+                            disabled={inFlight}
+                            onClick={() => closePosition(p, "market")}
+                            className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                          >
+                            <span>Close at Market</span>
+                            {inFlight && closing.kind === "market" && <Spinner />}
+                          </button>
+                          <div className="flex items-stretch">
+                            <input
+                              type="number" step="0.01" min="0.01"
+                              placeholder="Limit"
+                              aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
+                              value={closeLimitPrices[key] ?? ""}
+                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
+                              className="w-20 px-2 py-1 text-xs border"
+                              style={{
+                                borderColor: "var(--border)",
+                                background: "var(--bg)",
+                                borderTopLeftRadius: "var(--r-sm)",
+                                borderBottomLeftRadius: "var(--r-sm)",
+                                borderTopRightRadius: 0,
+                                borderBottomRightRadius: 0,
+                                borderRight: "none",
+                              }}
+                            />
+                            <button
+                              disabled={inFlight || !closeLimitPrices[key]}
+                              onClick={() => closePosition(p, "limit")}
+                              className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
+                              style={{
+                                borderTopLeftRadius: 0,
+                                borderBottomLeftRadius: 0,
+                                borderTopRightRadius: "var(--r-sm)",
+                                borderBottomRightRadius: "var(--r-sm)",
+                              }}
+                            >
+                              <span>Close</span>
+                              {inFlight && closing.kind === "limit" && <Spinner />}
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    ),
+                    unrealized_pnl: <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />,
+                    pnl_pct: <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />,
+                    avg_entry: <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>,
+                    current_price: <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />,
+                    pdc: <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>,
+                    filled_price: (
+                      <td className="px-5 py-3.5 num">
+                        {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    market_value: <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />,
+                    tp: (
+                      <td className="px-5 py-3.5 num">
+                        <InlineBracketCell orderId={orderId} leg="tp" value={t?.take_profit_price ?? null} entryPrice={entryPrice} side={side} canEdit={!!orderId} pctOverride={tpPct} onUpdated={onUpdated} />
+                      </td>
+                    ),
+                    sl: (
+                      <td className="px-5 py-3.5 num">
+                        <InlineBracketCell orderId={orderId} leg="sl" value={t?.stop_loss_price ?? null} entryPrice={entryPrice} side={side} canEdit={!!orderId} pctOverride={slPct} onUpdated={onUpdated} />
+                      </td>
+                    ),
+                    submitted_at: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                        {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    filled_at: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                        {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    time_taken: (
+                      <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
+                        {sub && fill ? fmtDuration(sub, fill) : "—"}
+                      </td>
+                    ),
+                    expires: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
+                        {exp ? exp.text : "—"}
+                      </td>
+                    ),
+                  };
                   return (
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                        {/* Only a Discord alert has a channel. A position
-                            opened from the trade panel, as a copy mirror, or in
-                            the broker's own app shows a dash — an empty cell
-                            would read as still loading. */}
-                        {showChannel && showCol("channel") && (
-                          <td
-                            className="px-5 py-3.5 whitespace-nowrap"
-                            style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
-                            title={p.discord_channel ?? undefined}
-                          >
-                            {p.discord_channel || "—"}
-                          </td>
-                        )}
-                        {showCol("symbol") && (
-                        <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
-                          {/* gap-1.5 = 6px between glyph and symbol. */}
-                          <span className="inline-flex items-center gap-1.5">
-                            <PositionIcon kind={positionKind(p)} />
-                            {positionSymbolLabel(p)}
-                          </span>
-                        </td>
-                        )}
-                        {showCol("qty") && <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>}
-                        {/* Side — Long / Short. */}
-                        {showCol("side") && (
-                        <td className="px-5 py-3.5">
-                          <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
-                            {isLong ? "Long" : "Short"}
-                          </span>
-                        </td>
-                        )}
-                        {/* Close % — pick a fraction of the position to close.
-                            Pills that would round to zero (e.g. 25% of one
-                            contract) are disabled. */}
-                        <td className="px-5 py-3.5">
-                          <div className="flex gap-1">
-                            {[25, 50, 75, 100].map(pct => {
-                              const computedQty = quantityForPercent(p, pct);
-                              const disabled = computedQty == null;
-                              const selected = (closePercents[key] ?? 100) === pct;
-                              return (
-                                <button
-                                  key={pct}
-                                  type="button"
-                                  disabled={disabled}
-                                  onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
-                                  title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
-                                  className="px-2 py-0.5 text-[10px] rounded transition-colors"
-                                  style={{
-                                    border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
-                                    background: selected ? "var(--nav-active-bg)" : "transparent",
-                                    color: disabled ? "var(--faint)" : selected ? "var(--accent)" : "var(--text-2)",
-                                    cursor: disabled ? "not-allowed" : "pointer",
-                                    opacity: disabled ? 0.5 : 1,
-                                  }}
-                                >
-                                  {pct}%
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <div className="flex gap-2 items-center whitespace-nowrap">
-                            <button
-                              disabled={inFlight}
-                              onClick={() => closePosition(p, "market")}
-                              className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
-                            >
-                              <span>Close at Market</span>
-                              {inFlight && closing.kind === "market" && <Spinner />}
-                            </button>
-                            <div className="flex items-stretch">
-                              <input
-                                type="number" step="0.01" min="0.01"
-                                placeholder="Limit"
-                                aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
-                                value={closeLimitPrices[key] ?? ""}
-                                onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
-                                className="w-20 px-2 py-1 text-xs border"
-                                style={{
-                                  borderColor: "var(--border)",
-                                  background: "var(--bg)",
-                                  borderTopLeftRadius: "var(--r-sm)",
-                                  borderBottomLeftRadius: "var(--r-sm)",
-                                  borderTopRightRadius: 0,
-                                  borderBottomRightRadius: 0,
-                                  borderRight: "none",
-                                }}
-                              />
-                              <button
-                                disabled={inFlight || !closeLimitPrices[key]}
-                                onClick={() => closePosition(p, "limit")}
-                                className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
-                                style={{
-                                  borderTopLeftRadius: 0,
-                                  borderBottomLeftRadius: 0,
-                                  borderTopRightRadius: "var(--r-sm)",
-                                  borderBottomRightRadius: "var(--r-sm)",
-                                }}
-                              >
-                                <span>Close</span>
-                                {inFlight && closing.kind === "limit" && <Spinner />}
-                              </button>
-                            </div>
-                          </div>
-                        </td>
-                        {showCol("unrealized_pnl") && <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />}
-                        {/* P&L % = live unrealized P&L / cost basis. */}
-                        {showCol("pnl_pct") && <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />}
-                        {showCol("avg_entry") && <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>}
-                        {showCol("current_price") && <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />}
-                        {/* Reference = previous session's market close price. */}
-                        {showCol("pdc") && <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>}
-                        {(() => {
-                          const t = orderTimestamps.byKey.get(orderTimestamps.key(
-                            p.broker_account_id, p.instrument_type, p.symbol,
-                            p.option_expiry, p.option_strike, p.option_right,
-                          ));
-                          // Bracket modify is allowed while the underlying
-                          // position is still alive — exactly when this row
-                          // exists. Without an entry-order match (e.g. broker
-                          // connected after the trade) we can't target a
-                          // parent → render the cells read-only.
-                          const orderId = t?.order_id ?? null;
-                          // % anchor — must match the Order History logic so the
-                          // two views agree. A copied mirror (parent_order_id set)
-                          // re-anchors its exits on the subscriber's actual fill,
-                          // so reverse the % off filled_avg_price; the trader's own
-                          // entry reverses off limit_price (what the Trade Panel
-                          // used to set the bracket).
-                          const entryPrice = t?.parent_order_id
-                            ? (t?.filled_avg_price ?? t?.limit_price ?? null)
-                            : (t?.limit_price ?? t?.filled_avg_price ?? null);
-                          // Copied mirror → show the trader's intended percent
-                          // verbatim, not the percent re-derived from the
-                          // tick-rounded exit price.
-                          const isMirror = !!t?.parent_order_id;
-                          const tpPct = isMirror && t?.take_profit_pct != null ? Number(t.take_profit_pct) : null;
-                          const slPct = isMirror && t?.stop_loss_pct != null ? Number(t.stop_loss_pct) : null;
-                          const side = t?.side ?? (isLong ? "buy" : "sell");
-                          const onUpdated = (updated: Order) => {
-                            setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
-                          };
-                          return (
-                            <>
-                              {showCol("filled_price") && (
-                              <td className="px-5 py-3.5 num">
-                                {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              )}
-                              {showCol("market_value") && <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />}
-                              <td className="px-5 py-3.5 num">
-                                <InlineBracketCell
-                                  orderId={orderId}
-                                  leg="tp"
-                                  value={t?.take_profit_price ?? null}
-                                  entryPrice={entryPrice}
-                                  side={side}
-                                  canEdit={!!orderId}
-                                  pctOverride={tpPct}
-                                  onUpdated={onUpdated}
-                                />
-                              </td>
-                              <td className="px-5 py-3.5 num">
-                                <InlineBracketCell
-                                  orderId={orderId}
-                                  leg="sl"
-                                  value={t?.stop_loss_price ?? null}
-                                  entryPrice={entryPrice}
-                                  side={side}
-                                  canEdit={!!orderId}
-                                  pctOverride={slPct}
-                                  onUpdated={onUpdated}
-                                />
-                              </td>
-                            </>
-                          );
-                        })()}
-                        {(() => {
-                          const t = orderTimestamps.byKey.get(orderTimestamps.key(
-                            p.broker_account_id, p.instrument_type, p.symbol,
-                            p.option_expiry, p.option_strike, p.option_right,
-                          ));
-                          const sub = t?.submitted_at ?? null;
-                          const fill = t?.filled_at ?? null;
-                          return (
-                            <>
-                              {showCol("submitted_at") && (
-                              <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                                {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              )}
-                              {showCol("filled_at") && (
-                              <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                                {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              )}
-                              {showCol("time_taken") && (
-                              <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
-                                {sub && fill ? fmtDuration(sub, fill) : "—"}
-                              </td>
-                              )}
-                            </>
-                          );
-                        })()}
-                        {(() => {
-                          const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
-                          return showCol("expires") ? (
-                            <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
-                              {exp ? exp.text : "—"}
-                            </td>
-                          ) : null;
-                        })()}
+                        {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                       </tr>
                     </Fragment>
                   );
