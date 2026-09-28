@@ -6,7 +6,7 @@ import type { TableColumns } from "@/lib/useTableColumns";
 
 /** "Columns" button + popover: toggle visibility, drag to reorder, reset. Driven
  *  entirely by a useTableColumns() instance so it works for any table. */
-export function ColumnsMenu({ cols, label = "Columns" }: { cols: TableColumns; label?: string }) {
+export function ColumnsMenu({ cols, label = "Columns", reorderable = true }: { cols: TableColumns; label?: string; reorderable?: boolean }) {
   const [open, setOpen] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -48,15 +48,15 @@ export function ColumnsMenu({ cols, label = "Columns" }: { cols: TableColumns; l
             {cols.allInOrder.map((c, idx) => (
               <div
                 key={c.id}
-                draggable={!c.locked}
-                onDragStart={() => setDragId(c.id)}
-                onDragOver={(e) => { e.preventDefault(); }}
-                onDrop={(e) => { e.preventDefault(); if (dragId && dragId !== c.id) cols.move(dragId, idx); setDragId(null); }}
+                draggable={reorderable && !c.locked}
+                onDragStart={() => reorderable && setDragId(c.id)}
+                onDragOver={(e) => { if (reorderable) e.preventDefault(); }}
+                onDrop={(e) => { if (!reorderable) return; e.preventDefault(); if (dragId && dragId !== c.id) cols.move(dragId, idx); setDragId(null); }}
                 onDragEnd={() => setDragId(null)}
                 className="flex items-center gap-2 px-2.5 py-1.5 mx-1 rounded transition-colors hover:bg-[var(--panel-2)]"
-                style={{ opacity: dragId === c.id ? 0.4 : 1, cursor: c.locked ? "default" : "grab" }}
+                style={{ opacity: dragId === c.id ? 0.4 : 1, cursor: reorderable && !c.locked ? "grab" : "default" }}
               >
-                <GripVertical size={13} style={{ color: c.locked ? "var(--faint)" : "var(--muted)" }} />
+                {reorderable && <GripVertical size={13} style={{ color: c.locked ? "var(--faint)" : "var(--muted)" }} />}
                 <label className="flex items-center gap-2 flex-1 text-xs cursor-pointer" style={{ color: "var(--text)" }}>
                   <input
                     type="checkbox"

@@ -9,6 +9,8 @@ import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
+import { useTableColumns, type ColumnDef } from "@/lib/useTableColumns";
+import { ColumnsMenu } from "@/components/ColumnsMenu";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -249,6 +251,33 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [showChannel, setShowChannel] = useState<boolean>(
       () => !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_enabled,
     );
+
+    // Configurable columns (per-user, synced). The functional columns —
+    // Symbol, Close %, Actions, TP, SL — are locked (can't be hidden) so their
+    // per-row controls always render; every data column can be toggled off.
+    const columnDefs = useMemo<ColumnDef[]>(() => [
+      ...(showChannel ? [{ id: "channel", header: "Channel" }] : []),
+      { id: "symbol", header: "Symbol", locked: true },
+      { id: "qty", header: "Qty" },
+      { id: "side", header: "Side" },
+      { id: "close_pct", header: "Close %", locked: true },
+      { id: "actions", header: "Actions", locked: true },
+      { id: "unrealized_pnl", header: "Unrealized P&L" },
+      { id: "pnl_pct", header: "P&L %" },
+      { id: "avg_entry", header: "Avg entry" },
+      { id: "current_price", header: "Current price" },
+      { id: "pdc", header: "PDC" },
+      { id: "filled_price", header: "Filled price" },
+      { id: "market_value", header: "Market value" },
+      { id: "tp", header: "TP", locked: true },
+      { id: "sl", header: "SL", locked: true },
+      { id: "submitted_at", header: "Submitted at" },
+      { id: "filled_at", header: "Filled at" },
+      { id: "time_taken", header: "Time Taken to Filled" },
+      { id: "expires", header: "Expires in Days" },
+    ], [showChannel]);
+    const cols = useTableColumns("positions", columnDefs);
+    const showCol = (id: string) => !cols.isHidden(id);
     useEffect(() => {
       if (getSnapshot<User>(USER_SNAPSHOT_KEY)) return;
       let cancelled = false;
@@ -600,7 +629,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // row. It had drifted to 21 against 18 real columns, so the skeleton
     // rendered three phantom cells wider than the header. Channel is
     // conditional, so this is too.
-    const COLSPAN = showChannel ? 19 : 18;
+    const COLSPAN = cols.columns.length;
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -660,21 +689,25 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             {tabBtn("option", "Options")}
             {tabBtn("stock", "Stocks")}
           </div>
-          <div className="relative">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search symbol…"
-              className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
-              aria-label="Search positions by symbol"
-            />
-            {search && (
-              <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
-                className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
-                <X size={14} />
-              </button>
-            )}
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search symbol…"
+                className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
+                aria-label="Search positions by symbol"
+              />
+              {search && (
+                <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            {/* Show/hide columns (reorder + resize land next). */}
+            <ColumnsMenu cols={cols} reorderable={false} />
           </div>
         </div>
 
@@ -684,25 +717,25 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
-                  {showChannel && <Th label="Channel" title="Discord channel whose alert opened this position" />}
-                  <Th label="Symbol" sortKey="symbol" />
-                  <Th label="Qty" sortKey="quantity" />
-                  <Th label="Side" />
-                  <Th label="Close %" />
-                  <Th label="Actions" />
-                  <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
-                  <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />
-                  <Th label="Avg entry" sortKey="avg_entry_price" />
-                  <Th label="Current price" sortKey="current_price" />
-                  <Th label="PDC" title="Previous day's market close price" />
-                  <Th label="Filled price" />
-                  <Th label="Market value" sortKey="market_value" />
-                  <Th label="TP" />
-                  <Th label="SL" />
-                  <Th label="Submitted at" />
-                  <Th label="Filled at" />
-                  <Th label="Time Taken to Filled" />
-                  <Th label="Expires in Days" sortKey="expires" />
+                  {showChannel && showCol("channel") && <Th label="Channel" title="Discord channel whose alert opened this position" />}
+                  {showCol("symbol") && <Th label="Symbol" sortKey="symbol" />}
+                  {showCol("qty") && <Th label="Qty" sortKey="quantity" />}
+                  {showCol("side") && <Th label="Side" />}
+                  {showCol("close_pct") && <Th label="Close %" />}
+                  {showCol("actions") && <Th label="Actions" />}
+                  {showCol("unrealized_pnl") && <Th label="Unrealized P&L" sortKey="unrealized_pnl" />}
+                  {showCol("pnl_pct") && <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />}
+                  {showCol("avg_entry") && <Th label="Avg entry" sortKey="avg_entry_price" />}
+                  {showCol("current_price") && <Th label="Current price" sortKey="current_price" />}
+                  {showCol("pdc") && <Th label="PDC" title="Previous day's market close price" />}
+                  {showCol("filled_price") && <Th label="Filled price" />}
+                  {showCol("market_value") && <Th label="Market value" sortKey="market_value" />}
+                  {showCol("tp") && <Th label="TP" />}
+                  {showCol("sl") && <Th label="SL" />}
+                  {showCol("submitted_at") && <Th label="Submitted at" />}
+                  {showCol("filled_at") && <Th label="Filled at" />}
+                  {showCol("time_taken") && <Th label="Time Taken to Filled" />}
+                  {showCol("expires") && <Th label="Expires in Days" sortKey="expires" />}
                 </tr>
               </thead>
               <tbody>
@@ -754,7 +787,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             opened from the trade panel, as a copy mirror, or in
                             the broker's own app shows a dash — an empty cell
                             would read as still loading. */}
-                        {showChannel && (
+                        {showChannel && showCol("channel") && (
                           <td
                             className="px-5 py-3.5 whitespace-nowrap"
                             style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
@@ -763,6 +796,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             {p.discord_channel || "—"}
                           </td>
                         )}
+                        {showCol("symbol") && (
                         <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                           {/* gap-1.5 = 6px between glyph and symbol. */}
                           <span className="inline-flex items-center gap-1.5">
@@ -770,13 +804,16 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             {positionSymbolLabel(p)}
                           </span>
                         </td>
-                        <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
+                        )}
+                        {showCol("qty") && <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>}
                         {/* Side — Long / Short. */}
+                        {showCol("side") && (
                         <td className="px-5 py-3.5">
                           <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
                             {isLong ? "Long" : "Short"}
                           </span>
                         </td>
+                        )}
                         {/* Close % — pick a fraction of the position to close.
                             Pills that would round to zero (e.g. 25% of one
                             contract) are disabled. */}
@@ -853,13 +890,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </div>
                           </div>
                         </td>
-                        <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />
+                        {showCol("unrealized_pnl") && <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />}
                         {/* P&L % = live unrealized P&L / cost basis. */}
-                        <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />
-                        <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                        <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />
+                        {showCol("pnl_pct") && <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />}
+                        {showCol("avg_entry") && <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>}
+                        {showCol("current_price") && <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />}
                         {/* Reference = previous session's market close price. */}
-                        <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
+                        {showCol("pdc") && <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>}
                         {(() => {
                           const t = orderTimestamps.byKey.get(orderTimestamps.key(
                             p.broker_account_id, p.instrument_type, p.symbol,
@@ -892,10 +929,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           };
                           return (
                             <>
+                              {showCol("filled_price") && (
                               <td className="px-5 py-3.5 num">
                                 {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
-                              <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />
+                              )}
+                              {showCol("market_value") && <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />}
                               <td className="px-5 py-3.5 num">
                                 <InlineBracketCell
                                   orderId={orderId}
@@ -932,25 +971,31 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                           const fill = t?.filled_at ?? null;
                           return (
                             <>
+                              {showCol("submitted_at") && (
                               <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                                 {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
+                              )}
+                              {showCol("filled_at") && (
                               <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                                 {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
                               </td>
+                              )}
+                              {showCol("time_taken") && (
                               <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
                                 {sub && fill ? fmtDuration(sub, fill) : "—"}
                               </td>
+                              )}
                             </>
                           );
                         })()}
                         {(() => {
                           const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
-                          return (
+                          return showCol("expires") ? (
                             <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
                               {exp ? exp.text : "—"}
                             </td>
-                          );
+                          ) : null;
                         })()}
                       </tr>
                     </Fragment>
