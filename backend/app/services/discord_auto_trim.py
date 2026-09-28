@@ -40,6 +40,15 @@ from app.models.order import OptionRight
 
 log = logging.getLogger(__name__)
 
+# One sweep every 15s, the same for every broker.
+#
+# Each sweep costs one get_positions per account, and that budget is shared:
+# Webull allows 10 requests per 30 SECONDS across the pnl poller, the order
+# listener and this, which is how the 429 storm happened that the
+# once-per-account position fetch was written to fix. Alpaca is far roomier
+# (200/min), but a single cadence is worth more than the few seconds a
+# broker-aware one would save — the detection lag is bounded by this, while the
+# stop now goes on within ~1s of the fill regardless (see pnl_poller.poll_now).
 POLL_INTERVAL_S = 15
 
 
@@ -96,6 +105,23 @@ def due_rung(ts, guard: DiscordPositionGuard, mark: Decimal | None) -> int | Non
     return rung if gain >= gate else None
 
 
+def _strike_text(v) -> str:
+    """The strike, written the way a human writes it.
+
+    Decimal.normalize() renders a round number in SCIENTIFIC notation —
+    Decimal("230").normalize() is 2.3E+2 — so the alert came out as
+    "✂️ $NVDA 2.3E+2C 09/28", which no parser recognises. Live 2026-09-28 that
+    silently disabled auto-trim for every strike ending in a zero: the message
+    was stored as "not a trade alert" and the rung never fired. NVDA only
+    looked healthy because real Discord alerts were driving it.
+
+    format(..., "f") never uses an exponent; the trailing-zero strip keeps
+    342.50 reading as 342.5.
+    """
+    s = format(Decimal(str(v or 0)), "f")
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
 def _exit_alert_text(guard: DiscordPositionGuard) -> str:
     """The synthetic alert that fires this rung.
 
@@ -106,8 +132,8 @@ def _exit_alert_text(guard: DiscordPositionGuard) -> str:
     """
     right = guard.option_right
     cp = "C" if (right == OptionRight.CALL or right == "call") else "P"
-    strike = Decimal(str(guard.option_strike or 0)).normalize()
-    return f"✂️ ${guard.symbol} {strike}{cp} {guard.option_expiry:%m/%d}"
+    return (f"✂️ ${guard.symbol} {_strike_text(guard.option_strike)}{cp} "
+            f"{guard.option_expiry:%m/%d}")
 
 
 def _live_guards(db):
@@ -162,6 +188,8 @@ def tick() -> None:
     """One sweep. Never raises: a bad guard must not stop the others."""
     from app.api.discord_sources import submit_self_alert_text  # noqa: PLC0415
     from app.brokers import adapter_for  # noqa: PLC0415
+    # `guards` is a local in this function, so the module is aliased.
+    from app.services import discord_position_guard as pg  # noqa: PLC0415
     from app.models.broker_account import BrokerAccount  # noqa: PLC0415
     from app.models.settings import TraderSettings  # noqa: PLC0415
     from app.models.user import User  # noqa: PLC0415
@@ -208,16 +236,67 @@ def tick() -> None:
 
             for guard in rows:
                 try:
+                    # Measure against the ACTUAL fill, not the limit we bid.
+                    #
+                    # A guard is seeded at placement with the limit, and only
+                    # the EXIT path used to replace it with the fill — so
+                    # auto-trim measured a price nobody paid. Live 2026-09-28:
+                    # QQQ was bid 0.65, repriced to 0.72, filled at 0.6875;
+                    # auto-trim read +7.7% off 0.65 and fired, the ladder
+                    # re-synced and answered "up 1.82%, under the 5% gate". The
+                    # rung was spent for nothing and the next sweep walked the
+                    # ladder down a position that never reached a target. SPY
+                    # went the same way and ended flat on a break-even stop that
+                    # only moved because of this.
+                    #
+                    # Idempotent (returns False when unchanged) and the exit
+                    # path still syncs too, so nothing else changes behaviour —
+                    # the reference is simply correct sooner.
+                    if pg.sync_entry_price(db, guard):
+                        db.commit()
+
                     mark = _mark_for(positions, guard)
                     rung = due_rung(ts, guard, mark)
                     if rung is None:
                         continue
+
+                    before_rung = guard.sell_count or 0
+                    before_trail = guard.trail_qty
+
                     text = _exit_alert_text(guard)
                     log.info(
                         "auto-trim: %s reached %.2f%% — firing trim %s via %r",
                         guard.symbol, gain_pct(guard.entry_price, mark), rung, text,
                     )
-                    submit_self_alert_text(db, user, text, approve=True)
+                    msg = submit_self_alert_text(db, user, text, approve=True)
+
+                    # If the rung sold nothing and armed nothing, give it back.
+                    #
+                    # plan_exit advances the rung unconditionally, and for a
+                    # HUMAN alert that is right: the trader's Nth alert is their
+                    # Nth trim whatever it managed to do. Auto-trim has no alert
+                    # — nobody asked for anything — so a rung that turns out not
+                    # to be due must not be spent, or the next sweep measures
+                    # the rung after it and the ladder walks itself out of a
+                    # position on a price wobble between check and execution.
+                    #
+                    # Judged on what actually happened rather than on the note:
+                    # an order id means it sold, a changed trail_qty means this
+                    # rung armed one. Any stop the rung set is deliberately
+                    # KEPT — the gate decides whether to sell, never whether to
+                    # protect.
+                    db.refresh(guard)
+                    did_something = (
+                        (msg is not None and msg.order_id is not None)
+                        or guard.trail_qty != before_trail
+                    )
+                    if not did_something and (guard.sell_count or 0) > before_rung:
+                        log.info(
+                            "auto-trim: %s trim %s sold nothing — returning the rung",
+                            guard.symbol, rung,
+                        )
+                        pg.rollback_exit(guard)
+                        db.commit()
                 except Exception:  # noqa: BLE001
                     log.exception("auto-trim: failed on %s", guard.symbol)
 
