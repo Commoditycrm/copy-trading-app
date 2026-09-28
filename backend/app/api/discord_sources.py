@@ -662,11 +662,14 @@ def get_discord_settings(
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
-        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "-25")),
         trim2_profit_gate_pct=_plain(_setting(ts, "discord_trim2_profit_gate_pct", "0")),
         trim2_stop_pct=_plain(_setting(ts, "discord_trim2_stop_pct", "0")),
         trim3_profit_gate_pct=_plain(_setting(ts, "discord_trim3_profit_gate_pct", "0")),
         trim3_stop_pct=_plain(_setting(ts, "discord_trim3_stop_pct", "0")),
+        trim_qty_pct=_plain(_setting(ts, "discord_trim_qty_pct", "50")),
+        trim2_qty_pct=_plain(_setting(ts, "discord_trim2_qty_pct", "50")),
+        trim3_qty_pct=_plain(_setting(ts, "discord_trim3_qty_pct", "100")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
         reprice_after_seconds=(
@@ -740,13 +743,24 @@ def update_discord_settings(
     # contrast, is not a setting — it is an empty field.
     _ZERO_OK = Decimal(0)
     _POSITIVE = None
+    # A stop may be typed the way a trader says it out loud — "-25%", meaning
+    # 25% below entry. The sign is how people WRITE a drawdown; the ladder
+    # reads the distance, so -25 and 25 set the same level. Floored at -100
+    # rather than 0 purely so the spelling is accepted.
+    _SIGNED = Decimal(-100)
     for field, column, cap, floor in (
         ("trim_profit_gate_pct", "discord_trim_profit_gate_pct", Decimal(100), _ZERO_OK),
-        ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim_stop_pct", "discord_trim_stop_pct", Decimal(100), _SIGNED),
         ("trim2_profit_gate_pct", "discord_trim2_profit_gate_pct", Decimal(100), _ZERO_OK),
-        ("trim2_stop_pct", "discord_trim2_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim2_stop_pct", "discord_trim2_stop_pct", Decimal(100), _SIGNED),
         ("trim3_profit_gate_pct", "discord_trim3_profit_gate_pct", Decimal(100), _ZERO_OK),
-        ("trim3_stop_pct", "discord_trim3_stop_pct", Decimal(100), _ZERO_OK),
+        ("trim3_stop_pct", "discord_trim3_stop_pct", Decimal(100), _SIGNED),
+        # A rung's share of what is still held. Capped at 100 (a rung cannot
+        # sell more than the position) and floored at 0, where 0 means the rung
+        # sells nothing — which is a legitimate way to switch a rung off.
+        ("trim_qty_pct", "discord_trim_qty_pct", Decimal(100), _ZERO_OK),
+        ("trim2_qty_pct", "discord_trim2_qty_pct", Decimal(100), _ZERO_OK),
+        ("trim3_qty_pct", "discord_trim3_qty_pct", Decimal(100), _ZERO_OK),
         ("trim_price_threshold", "discord_trim_price_threshold", None, _POSITIVE),
         ("trim_trail_amount", "discord_trim_trail_amount", None, _POSITIVE),
         ("reprice_pct", "discord_reprice_pct", Decimal(100), _POSITIVE),
@@ -794,11 +808,14 @@ def update_discord_settings(
         max_per_order=_plain(ts.discord_max_per_order),
         trail_percent=_plain(ts.discord_trail_percent) or "20",
         trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
-        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "25")),
+        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "-25")),
         trim2_profit_gate_pct=_plain(_setting(ts, "discord_trim2_profit_gate_pct", "0")),
         trim2_stop_pct=_plain(_setting(ts, "discord_trim2_stop_pct", "0")),
         trim3_profit_gate_pct=_plain(_setting(ts, "discord_trim3_profit_gate_pct", "0")),
         trim3_stop_pct=_plain(_setting(ts, "discord_trim3_stop_pct", "0")),
+        trim_qty_pct=_plain(_setting(ts, "discord_trim_qty_pct", "50")),
+        trim2_qty_pct=_plain(_setting(ts, "discord_trim2_qty_pct", "50")),
+        trim3_qty_pct=_plain(_setting(ts, "discord_trim3_qty_pct", "100")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
         reprice_after_seconds=(
@@ -1302,15 +1319,18 @@ def _execute_signal(
         cfg = guards.TrimConfig(
             trim1=guards.RungConfig(
                 _setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
-                _setting(ts_for_sizing, "discord_trim_stop_pct", "25"),
+                _setting(ts_for_sizing, "discord_trim_stop_pct", "-25"),
+                _setting(ts_for_sizing, "discord_trim_qty_pct", "50"),
             ),
             trim2=guards.RungConfig(
                 _setting(ts_for_sizing, "discord_trim2_profit_gate_pct", "0"),
                 _setting(ts_for_sizing, "discord_trim2_stop_pct", "0"),
+                _setting(ts_for_sizing, "discord_trim2_qty_pct", "50"),
             ),
             trim3=guards.RungConfig(
                 _setting(ts_for_sizing, "discord_trim3_profit_gate_pct", "0"),
                 _setting(ts_for_sizing, "discord_trim3_stop_pct", "0"),
+                _setting(ts_for_sizing, "discord_trim3_qty_pct", "100"),
             ),
             price_threshold=_setting(ts_for_sizing, "discord_trim_price_threshold", "0.90"),
             trail_amount=_setting(ts_for_sizing, "discord_trim_trail_amount", "0.25"),
@@ -1470,6 +1490,29 @@ def _execute_signal(
                 held_qty=p.quantity, added_qty=p.quantity,
                 added_price=p.limit_price,
             )
+
+    # A trim leaves a REMAINDER, and that remainder is unprotected until the
+    # stop reconciler next runs — up to the account's whole poll interval (10s
+    # on Alpaca; 4-13s measured live). The interval exists to ration position
+    # reads, not to delay a known event, and a filled trim is a known event.
+    #
+    # Only once the sell is actually FILLED. Reconcile sizes the stop from the
+    # quantity the BROKER reports, so poking it while the sell is still
+    # settling would size the stop to the whole position and block that very
+    # sell — the reservation problem the release-then-replace order exists for.
+    # Unfilled simply falls through to the normal tick, exactly as today.
+    from app.models.order import OrderStatus  # noqa: PLC0415 — local elsewhere too
+
+    if is_trim and order.status is OrderStatus.FILLED:
+        try:
+            from app.services.pnl_poller import poll_now  # noqa: PLC0415
+
+            poll_now(resolved.broker_account_id)
+        except Exception:  # noqa: BLE001
+            # The stop still gets placed on the next tick; this only ever
+            # makes it sooner, so a failure here must not fail the trim.
+            log.warning("discord: could not expedite the stop for %s", p.symbol,
+                        exc_info=True)
 
     discord_execution.mark_executed(msg, order.id)
     log.info("discord: alert %s placed as order %s%s", msg.id, order.id,

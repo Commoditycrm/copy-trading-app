@@ -21,7 +21,7 @@ import app.services.discord_execution as ex
 import app.services.discord_position_guard as guards
 from app.models.discord_message import DiscordMessageStatus
 from app.models.discord_position_guard import DiscordPositionGuard
-from app.models.order import InstrumentType, OptionRight, OrderSide, OrderType
+from app.models.order import OrderStatus, InstrumentType, OptionRight, OrderSide, OrderType
 from app.schemas.order import PlaceOrderIn
 
 FUTURE = datetime.now(timezone.utc).date() + timedelta(days=7)
@@ -44,7 +44,8 @@ class _Settings:
         self.discord_live_trading = live
         self.discord_trail_percent = Decimal("20")
         self.discord_trim_profit_gate_pct = Decimal("20")
-        self.discord_trim_stop_pct = Decimal("25")
+        # SIGNED now: -25 is 25% BELOW entry, exactly where it always sat.
+        self.discord_trim_stop_pct = Decimal("-25")
         self.discord_trim_price_threshold = Decimal("0.90")
         self.discord_trim_trail_amount = Decimal("0.25")
 
@@ -61,7 +62,13 @@ class _User:
 
 
 class _Order:
-    def __init__(self): self.id = uuid.uuid4()
+    def __init__(self, status=None):
+        self.id = uuid.uuid4()
+        # A real Order always carries one, and the trim path now reads it to
+        # decide whether the remainder can be stopped straight away. SUBMITTED
+        # keeps these tests on the path they were written for — the expedite is
+        # covered in test_discord_auto_trim.
+        self.status = status or OrderStatus.SUBMITTED
 
 
 @pytest.fixture

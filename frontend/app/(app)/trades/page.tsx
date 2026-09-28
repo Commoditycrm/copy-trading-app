@@ -7,6 +7,9 @@ import { useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, Check, ChevronsUpDown, Download, Inbox, Search, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLivePrice } from "@/lib/livePrices";
+import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
+import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
+import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { ExportButton } from "@/components/ExportButton";
 import { PositionIcon, orderKind } from "@/components/PositionIcon";
@@ -706,28 +709,19 @@ export default function TradesPage() {
   // table — same columns, same row renderer, same sorting.
   const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
 
-  // Live "Current price" column: register an on-demand watch for the symbols on
-  // screen so the central stream subscribes to them, then each row ticks via
-  // useLivePrice. Capped + heartbeated (the watch TTL lapses when we stop).
+  // Live "Current price" column: watch the symbols on screen so the central
+  // stream subscribes to them, then each row ticks via useLivePrice. Only the
+  // rows on screen need live push, and open orders matter most — prioritize
+  // them, then fill from the rest, capped so a big history load doesn't
+  // subscribe the stream to hundreds of stale symbols. The shared hook
+  // heartbeats it and pauses while the tab is hidden.
   const watchKeys = useMemo(() => {
-    // Only the rows on screen need live push, and open orders matter most —
-    // prioritize them, then fill from the rest, capped so a big history load
-    // doesn't subscribe the stream to hundreds of stale symbols.
     const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
     const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
     const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
-    return Array.from(new Set(keys)).slice(0, 25).sort().join(",");
+    return Array.from(new Set(keys)).slice(0, 25);
   }, [gridRows]);
-  useEffect(() => {
-    if (!watchKeys) return;
-    const syms = watchKeys.split(",");
-    const ping = () => {
-      api("/api/market-data/watch", { method: "POST", body: JSON.stringify({ symbols: syms }) }).catch(() => {});
-    };
-    ping();
-    const t = setInterval(ping, 30_000);
-    return () => clearInterval(t);
-  }, [watchKeys]);
+  useMarketDataWatch(watchKeys);
   const isLoading = tab === "discord" ? signalsLoading : loading;
   // Row id -> the alert behind it, so the Actions cell can reach the decision
   // state that the Order shape has no field for.
@@ -763,15 +757,20 @@ export default function TradesPage() {
     return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
   };
 
-  const Th = ({ label, sortKey, className: thc = "" }: { label: string; sortKey?: SortKey; className?: string }) => {
+  const Th = ({ label, sortKey, className: thc = "", col }: { label: string; sortKey?: SortKey; className?: string; col?: ResolvedColumn }) => {
     const active = sortKey && sort?.key === sortKey;
+    const w = col?.width;
     return (
-      <th className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
+      <th
+        className={`relative text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`}
+        style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+      >
         {sortKey ? (
           <button type="button" onClick={() => toggleSort(sortKey)} className="inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors uppercase tracking-[0.06em] text-[11px]">
             {label}<SortIcon k={sortKey} />
           </button>
         ) : label}
+        {col && <ResizeHandle minWidth={col.minWidth ?? 60} onResize={(px) => cols.setWidth(col.id, px)} />}
       </th>
     );
   };
@@ -780,6 +779,51 @@ export default function TradesPage() {
   // everyone else every row reads "—", which is a column of nothing. Same
   // gate as the Discord tab above.
   const showChannel = !!user?.discord_enabled;
+
+  // Configurable columns (per-user, synced). Functional columns — Symbol,
+  // Actions, TP, SL — are locked so their per-row controls always render.
+  const columnDefs = useMemo<ColumnDef[]>(() => [
+    ...(showChannel ? [{ id: "channel", header: "Channel" }] : []),
+    { id: "symbol", header: "Symbol", locked: true },
+    { id: "qty", header: "Qty" },
+    { id: "side", header: "Side" },
+    { id: "actions", header: "Actions", locked: true },
+    { id: "status", header: "Status" },
+    { id: "order_type", header: "Order Type" },
+    { id: "expected_price", header: "Expected price" },
+    { id: "filled_price", header: "Filled price" },
+    { id: "current_price", header: "Current price" },
+    { id: "tp", header: "TP", locked: true },
+    { id: "sl", header: "SL", locked: true },
+    { id: "notional", header: "Notional" },
+    { id: "realized_pnl", header: "Realized P&L" },
+    { id: "submitted_at", header: "Submitted at" },
+    { id: "filled_at", header: "Filled at" },
+    { id: "time_taken", header: "Time Taken to Filled" },
+    { id: "expires", header: "Expires in Days" },
+  ], [showChannel]);
+  const cols = useTableColumns("order_history", columnDefs);
+
+  const HEADER_META: Record<string, { label: string; sortKey?: SortKey }> = {
+    channel: { label: "Channel" },
+    symbol: { label: "Symbol", sortKey: "symbol" },
+    qty: { label: "Qty", sortKey: "quantity" },
+    side: { label: "Side" },
+    actions: { label: "Actions" },
+    status: { label: "Status", sortKey: "status" },
+    order_type: { label: "Order Type" },
+    expected_price: { label: "Expected price" },
+    filled_price: { label: "Filled price" },
+    current_price: { label: "Current price" },
+    tp: { label: "TP" },
+    sl: { label: "SL" },
+    notional: { label: "Notional", sortKey: "notional" },
+    realized_pnl: { label: "Realized P&L" },
+    submitted_at: { label: "Submitted at", sortKey: "submitted" },
+    filled_at: { label: "Filled at", sortKey: "filled" },
+    time_taken: { label: "Time Taken to Filled" },
+    expires: { label: "Expires in Days", sortKey: "expires" },
+  };
 
   // "Self" channel: paste an alert the system missed and replay it through the
   // normal Discord pipeline. Same parser, same rules, same execution — the
@@ -828,7 +872,7 @@ export default function TradesPage() {
   // Must match the number of <Th> cells below — it sizes the loading skeleton
   // and the empty-state row, both of which misalign if a column is added or
   // removed without updating it. Channel is conditional, so this is too.
-  const COLSPAN = showChannel ? 18 : 17;
+  const COLSPAN = cols.columns.length;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -926,6 +970,8 @@ export default function TradesPage() {
               </button>
             )}
           </div>
+          {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
+          <ColumnsMenu cols={cols} />
           {/* Export is collapsed behind one button; clicking it reveals the
               date range + row-count options and the actual download action.
               The date range (ET) is independent of the on-screen table. */}
@@ -1054,24 +1100,10 @@ export default function TradesPage() {
           <table className={`min-w-full text-sm ${!isLoading && gridRows.length === 0 ? "h-full" : ""}`}>
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
               <tr>
-                {showChannel && <Th label="Channel" />}
-                <Th label="Symbol" sortKey="symbol" />
-                <Th label="Qty" sortKey="quantity" />
-                <Th label="Side" />
-                <Th label="Actions" />
-                <Th label="Status" sortKey="status" />
-                <Th label="Order Type" />
-                <Th label="Expected price" />
-                <Th label="Filled price" />
-                <Th label="Current price" />
-                <Th label="TP" />
-                <Th label="SL" />
-                <Th label="Notional" sortKey="notional" />
-                <Th label="Realized P&L" />
-                <Th label="Submitted at" sortKey="submitted" />
-                <Th label="Filled at" sortKey="filled" />
-                <Th label="Time Taken to Filled" />
-                <Th label="Expires in Days" sortKey="expires" />
+                {cols.columns.map((c) => {
+                  const m = HEADER_META[c.id] ?? { label: c.header };
+                  return <Th key={c.id} col={c} label={m.label} sortKey={m.sortKey} />;
+                })}
               </tr>
             </thead>
             <tbody>
@@ -1146,60 +1178,64 @@ export default function TradesPage() {
                 ).map(f => {
                   const fillNotional = Number(f.quantity) * Number(f.price);
                   const dash = <span style={{ color: "var(--faint)" }}>—</span>;
-                  return (
-                    <tr key={f.key} style={{ background: "var(--panel-2)" }}>
-                      {/* A fill inherits its order's channel; repeating it on
-                          every sub-row would be noise. Empty, not missing — the
-                          cell has to exist or every later column shears left. */}
-                      {showChannel && <td className="px-5 py-2.5" />}
+                  const fillCell: Record<string, React.ReactNode> = {
+                    channel: <td className="px-5 py-2.5" />,
+                    symbol: (
                       <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>
                         <span className="inline-flex items-center gap-1.5 pl-4">
                           <span style={{ color: "var(--faint)" }}>↳</span>
                           {orderSymbolLabel(o)}
                         </span>
                       </td>
-                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmtQty(f.quantity)}</td>
+                    ),
+                    qty: <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmtQty(f.quantity)}</td>,
+                    side: (
                       <td className="px-5 py-2.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent", opacity: 0.75 }}>
                           {o.side}
                         </span>
                       </td>
-                      <td className="px-5 py-2.5">{dash}</td>
+                    ),
+                    actions: <td className="px-5 py-2.5">{dash}</td>,
+                    status: (
                       <td className="px-5 py-2.5">
                         <span className="chip uppercase tracking-wider font-medium whitespace-nowrap" style={{ background: "var(--good-soft)", color: "var(--good)", borderColor: "transparent" }}>
                           fill
                         </span>
                       </td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.price, 2)}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fillNotional ? fmt(String(fillNotional)) : dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{f.at ? fmtDateTimeMs(f.at, "America/New_York") : dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
-                      <td className="px-5 py-2.5">{dash}</td>
+                    ),
+                    order_type: <td className="px-5 py-2.5">{dash}</td>,
+                    expected_price: <td className="px-5 py-2.5">{dash}</td>,
+                    filled_price: <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fmt(f.price, 2)}</td>,
+                    current_price: <td className="px-5 py-2.5">{dash}</td>,
+                    tp: <td className="px-5 py-2.5">{dash}</td>,
+                    sl: <td className="px-5 py-2.5">{dash}</td>,
+                    notional: <td className="px-5 py-2.5 num text-xs" style={{ color: "var(--text-2)" }}>{fillNotional ? fmt(String(fillNotional)) : dash}</td>,
+                    realized_pnl: <td className="px-5 py-2.5">{dash}</td>,
+                    submitted_at: <td className="px-5 py-2.5">{dash}</td>,
+                    filled_at: <td className="px-5 py-2.5 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{f.at ? fmtDateTimeMs(f.at, "America/New_York") : dash}</td>,
+                    time_taken: <td className="px-5 py-2.5">{dash}</td>,
+                    expires: <td className="px-5 py-2.5">{dash}</td>,
+                  };
+                  return (
+                    <tr key={f.key} style={{ background: "var(--panel-2)" }}>
+                      {cols.columns.map((c) => <Fragment key={c.id}>{fillCell[c.id] ?? <td className="px-5 py-2.5" />}</Fragment>)}
                     </tr>
                   );
                 });
-                return (
-                  <Fragment key={o.id}>
-                    {fillEntries}
-                    <tr
-                      className="border-t transition-colors hover:bg-[var(--panel-2)]"
-                      style={{
-                        borderColor: "var(--border)",
-                        background: flashId === o.id ? "var(--good-soft)" : undefined,
-                      }}
-                    >
-                      {/* Only a Discord alert has a channel. Everything else —
-                          trade panel, copy mirrors, broker-app imports — shows a
-                          dash rather than an empty cell, so "no channel" reads
-                          as an answer and not as a loading state. */}
-                      {showChannel && (
+                const isEntry = !o.bracket_parent_id;
+                const editable = isEntry && isOpen;
+                const bracketEntry = o.parent_order_id
+                  ? (o.filled_avg_price ?? o.limit_price)
+                  : (o.limit_price ?? o.filled_avg_price);
+                const isMirror = !!o.parent_order_id;
+                const tpPct = isMirror && o.take_profit_pct != null ? Number(o.take_profit_pct) : null;
+                const slPct = isMirror && o.stop_loss_pct != null ? Number(o.stop_loss_pct) : null;
+                const onBracketUpdated = (updated: Order) =>
+                  setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
+                const emDash = <span style={{ color: "var(--faint)" }}>—</span>;
+                const mainCell: Record<string, React.ReactNode> = {
+                      channel: (
                         <td
                           className="px-5 py-3.5 whitespace-nowrap"
                           style={{ color: o.discord_channel ? "var(--text)" : "var(--muted)" }}
@@ -1207,7 +1243,8 @@ export default function TradesPage() {
                         >
                           {o.discord_channel || "—"}
                         </td>
-                      )}
+                      ),
+                      symbol: (
                       <td className="px-5 py-3.5 font-medium whitespace-nowrap" style={{ color: "var(--text)" }}>
                         {/* gap-1.5 = 6px between glyph and symbol. */}
                         <span className="inline-flex items-center gap-1.5">
@@ -1240,6 +1277,8 @@ export default function TradesPage() {
                           )}
                         </span>
                       </td>
+                      ),
+                      qty: (
                       <td className="px-5 py-3.5 num">
                         {/* A close alert that names no contract also names no
                             size — it means "close what you hold". Rendering 0
@@ -1267,11 +1306,15 @@ export default function TradesPage() {
                           );
                         })()}
                       </td>
+                      ),
+                      side: (
                       <td className="px-5 py-3.5">
                         <span className="chip uppercase font-semibold" style={{ background: o.side === "buy" ? "var(--good-soft)" : "var(--bad-soft)", color: o.side === "buy" ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
                           {o.side}
                         </span>
                       </td>
+                      ),
+                      actions: (
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
                           {/* Manual-mode Discord alerts are decided here. Only
@@ -1382,6 +1425,8 @@ export default function TradesPage() {
                           )}
                         </div>
                       </td>
+                      ),
+                      status: (
                       <td className="px-5 py-3.5">
                         <span
                           className="chip uppercase tracking-wider font-medium whitespace-nowrap"
@@ -1390,73 +1435,35 @@ export default function TradesPage() {
                           {statusLabel}{o.parent_order_id ? " · copy" : ""}
                         </span>
                       </td>
+                      ),
+                      order_type: (
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--text)" }}>
                         {orderTypeLabel(o.order_type)}
                       </td>
-                      <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>
-                      <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>
-                      <LiveOrderPriceCell liveKey={orderLiveKey(o)} />
-                      {/* TP / SL — shown as a percent of the entry-side price.
-                          Editable only on entry rows that are still open
-                          (pre-fill); filled orders that survive here belong to
-                          positions that already closed, so brackets are
-                          immutable. Bracket-exit legs (TP/SL closes) never
-                          expose an editor. Anchor the % off limit_price (the
-                          exact number the Trade Panel used to set the bracket),
-                          falling back to filled_avg_price for market entries.
-                          For a COPIED mirror (parent_order_id set) the exits are
-                          re-anchored on the subscriber's actual fill, so display
-                          the % off filled_avg_price to match what fires. */}
-                      {(() => {
-                        const isEntry = !o.bracket_parent_id;
-                        const editable = isEntry && isOpen;
-                        const entryPrice = o.parent_order_id
-                          ? (o.filled_avg_price ?? o.limit_price)
-                          : (o.limit_price ?? o.filled_avg_price);
-                        // A copied mirror shows the trader's INTENDED percent
-                        // verbatim, not the percent re-derived from its
-                        // tick-rounded exit price.
-                        const isMirror = !!o.parent_order_id;
-                        const tpPct = isMirror && o.take_profit_pct != null ? Number(o.take_profit_pct) : null;
-                        const slPct = isMirror && o.stop_loss_pct != null ? Number(o.stop_loss_pct) : null;
-                        const onUpdated = (updated: Order) =>
-                          setOrders(cur => cur.map(x => x.id === updated.id ? updated : x));
-                        return (
-                          <>
-                            <td className="px-5 py-3.5 num">
-                              {isEntry ? (
-                                <InlineBracketCell
-                                  orderId={o.id}
-                                  leg="tp"
-                                  value={o.take_profit_price}
-                                  entryPrice={entryPrice}
-                                  side={o.side}
-                                  canEdit={editable}
-                                  pctOverride={tpPct}
-                                  onUpdated={onUpdated}
-                                />
-                              ) : <span style={{ color: "var(--faint)" }}>—</span>}
-                            </td>
-                            <td className="px-5 py-3.5 num">
-                              {isEntry ? (
-                                <InlineBracketCell
-                                  orderId={o.id}
-                                  leg="sl"
-                                  value={o.stop_loss_price}
-                                  entryPrice={entryPrice}
-                                  side={o.side}
-                                  canEdit={editable}
-                                  pctOverride={slPct}
-                                  onUpdated={onUpdated}
-                                />
-                              ) : <span style={{ color: "var(--faint)" }}>—</span>}
-                            </td>
-                          </>
-                        );
-                      })()}
+                      ),
+                      expected_price: <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>,
+                      filled_price: <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>,
+                      current_price: <LiveOrderPriceCell liveKey={orderLiveKey(o)} />,
+                      tp: (
+                        <td className="px-5 py-3.5 num">
+                          {isEntry ? (
+                            <InlineBracketCell orderId={o.id} leg="tp" value={o.take_profit_price} entryPrice={bracketEntry} side={o.side} canEdit={editable} pctOverride={tpPct} onUpdated={onBracketUpdated} />
+                          ) : emDash}
+                        </td>
+                      ),
+                      sl: (
+                        <td className="px-5 py-3.5 num">
+                          {isEntry ? (
+                            <InlineBracketCell orderId={o.id} leg="sl" value={o.stop_loss_price} entryPrice={bracketEntry} side={o.side} canEdit={editable} pctOverride={slPct} onUpdated={onBracketUpdated} />
+                          ) : emDash}
+                        </td>
+                      ),
+                      notional: (
                       <td className="px-5 py-3.5 num">
                         {notionalFor(o) ? fmt(String(notionalFor(o))) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
+                      ),
+                      realized_pnl: (
                       <td className="px-5 py-3.5 num">
                         {o.realized_pnl != null && Number(o.realized_pnl) !== 0 ? (
                           <span style={{ color: Number(o.realized_pnl) >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
@@ -1464,9 +1471,13 @@ export default function TradesPage() {
                           </span>
                         ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
+                      ),
+                      submitted_at: (
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
                         {fmtDateTimeMs(submittedTs, "America/New_York")}
                       </td>
+                      ),
+                      filled_at: (
                       <td
                         className="px-5 py-3.5 whitespace-nowrap"
                         style={{ color: "var(--muted)" }}
@@ -1479,12 +1490,8 @@ export default function TradesPage() {
                           </>
                         ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
-                      {/* Fill latency. When the broker gave us its own execution
-                          time we show the REAL fill duration on top and our
-                          detection lag underneath — the two used to be summed
-                          into one number, which made a slow broker and a slow
-                          poller indistinguishable. Without a broker timestamp
-                          the single number IS the detection time, marked '~'. */}
+                      ),
+                      time_taken: (
                       <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fillTs ? "var(--text-2)" : "var(--faint)" }}>
                         {!fillTs ? "—" : timing.exact ? (
                           <>
@@ -1509,9 +1516,24 @@ export default function TradesPage() {
                           </span>
                         )}
                       </td>
+                      ),
+                      expires: (
                       <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
                         {exp ? exp.text : "—"}
                       </td>
+                      ),
+                };
+                return (
+                  <Fragment key={o.id}>
+                    {fillEntries}
+                    <tr
+                      className="border-t transition-colors hover:bg-[var(--panel-2)]"
+                      style={{
+                        borderColor: "var(--border)",
+                        background: flashId === o.id ? "var(--good-soft)" : undefined,
+                      }}
+                    >
+                      {cols.columns.map((c) => <Fragment key={c.id}>{mainCell[c.id] ?? <td className="px-5 py-3.5" />}</Fragment>)}
                     </tr>
                   </Fragment>
                 );

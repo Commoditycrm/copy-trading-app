@@ -2,13 +2,15 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, MoreVertical, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
+import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
+import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -93,6 +95,93 @@ function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline, multip
   const delta = useLivePriceDelta(symbol, snapshotPrice, quantity, multiplier);
   const val = baseline == null || baseline === "" ? null : Number(baseline) + delta;
   return <td className="px-5 py-3.5 num">{fmtNum(val == null ? baseline : String(val), 2)}</td>;
+}
+
+/** Net liquidity cell — the position's live liquidation value, computed directly
+ *  as price × signed_qty × multiplier rather than off the backend market_value.
+ *  That keeps it correctly signed (short = negative) no matter how each broker
+ *  reports market_value (some send it unsigned). Falls back to the snapshot
+ *  price until a tick arrives. */
+function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; multiplier?: number;
+}) {
+  const live = useLivePrice(symbol, null);
+  const price = live != null ? live : Number(snapshotPrice);
+  const qty = Number(quantity);
+  const val = Number.isFinite(price) && Number.isFinite(qty) ? price * qty * multiplier : null;
+  return <td className="px-5 py-3.5 num">{val == null ? "—" : fmtNum(String(val), 2)}</td>;
+}
+
+/** Overflow menu on a position row — extra, destructive actions kept out of the
+ *  main Close buttons: cancel this position's working stop, and cancel every
+ *  open order the user owns. Both confirm first. onDone refreshes the table. */
+function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
+  orderId: string | null; hasStop: boolean; label: string; onDone: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<null | "stop" | "all">(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  async function cancelStop() {
+    if (!orderId) return;
+    if (!confirm(`Cancel the stop-loss on ${label}? The position stays open — only the stop order is removed.`)) return;
+    setBusy("stop");
+    try {
+      // Clearing the SL leg cancels the live stop order (same path as emptying
+      // the inline SL field). Key presence flags sl_present on the backend.
+      await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: null }) });
+      notify.success("Stop cancelled");
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel stop"); }
+    finally { setBusy(null); }
+  }
+
+  async function cancelAllOpen() {
+    if (!confirm("Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.")) return;
+    setBusy("all");
+    try {
+      const res = await api<{ cancelled?: unknown[] }>(
+        `/api/trades/cancel-all-open?include_subscribers=true`, { method: "POST" },
+      );
+      const n = Array.isArray(res.cancelled) ? res.cancelled.length : 0;
+      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel open orders"); }
+    finally { setBusy(null); }
+  }
+
+  const item = "w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors";
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" onClick={() => setOpen(o => !o)} aria-label="More actions" title="More actions"
+              className="btn-ghost px-1.5 py-1 inline-flex items-center" disabled={busy !== null}>
+        <MoreVertical size={14} />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
+             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 190 }}>
+          <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
+                  className={item} style={{ color: "var(--text-2)" }}
+                  title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
+            {busy === "stop" ? "Cancelling stop…" : "Cancel stop"}
+          </button>
+          <button type="button" disabled={busy !== null} onClick={cancelAllOpen}
+                  className={item} style={{ color: "var(--bad)" }}>
+            {busy === "all" ? "Cancelling…" : "Cancel all open orders"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** The two summary tiles that move with price — Unrealized P&L and Market value.
@@ -214,7 +303,7 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
   | "symbol" | "quantity" | "avg_entry_price" | "current_price"
-  | "market_value" | "unrealized_pnl" | "expires";
+  | "market_value" | "net_liq" | "unrealized_pnl" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
@@ -223,6 +312,7 @@ function sortValue(p: Position, key: SortKey): number | string {
     case "avg_entry_price": return Number(p.avg_entry_price) || 0;
     case "current_price": return Number(p.current_price) || 0;
     case "market_value": return Number(p.market_value) || 0;
+    case "net_liq": return (Number(p.current_price) || 0) * (Number(p.quantity) || 0) * (p.instrument_type === "option" ? 100 : 1);
     case "unrealized_pnl": return Number(p.unrealized_pnl) || 0;
     case "expires": return p.option_expiry ? daysUntil(p.option_expiry) : Number.POSITIVE_INFINITY;
   }
@@ -249,6 +339,33 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [showChannel, setShowChannel] = useState<boolean>(
       () => !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_enabled,
     );
+
+    // Configurable columns (per-user, synced). The functional columns —
+    // Symbol, Close %, Actions, TP, SL — are locked (can't be hidden) so their
+    // per-row controls always render; every data column can be toggled off.
+    const columnDefs = useMemo<ColumnDef[]>(() => [
+      ...(showChannel ? [{ id: "channel", header: "Channel" }] : []),
+      { id: "symbol", header: "Symbol", locked: true },
+      { id: "qty", header: "Qty" },
+      { id: "side", header: "Side" },
+      { id: "close_pct", header: "Close %", locked: true },
+      { id: "actions", header: "Actions", locked: true },
+      { id: "unrealized_pnl", header: "Unrealized P&L" },
+      { id: "pnl_pct", header: "P&L %" },
+      { id: "avg_entry", header: "Avg entry" },
+      { id: "current_price", header: "Current price" },
+      { id: "pdc", header: "PDC" },
+      { id: "filled_price", header: "Filled price" },
+      { id: "market_value", header: "Market value" },
+      { id: "net_liq", header: "Net Liq" },
+      { id: "tp", header: "TP", locked: true },
+      { id: "sl", header: "SL", locked: true },
+      { id: "submitted_at", header: "Submitted at" },
+      { id: "filled_at", header: "Filled at" },
+      { id: "time_taken", header: "Time Taken to Filled" },
+      { id: "expires", header: "Expires in Days" },
+    ], [showChannel]);
+    const cols = useTableColumns("positions", columnDefs);
     useEffect(() => {
       if (getSnapshot<User>(USER_SNAPSHOT_KEY)) return;
       let cancelled = false;
@@ -581,18 +698,49 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
     };
 
-    const Th = ({ label, sortKey, className: thc = "", title }: { label: string; sortKey?: SortKey; className?: string; title?: string }) => {
+    const Th = ({ label, sortKey, className: thc = "", title, col }: { label: string; sortKey?: SortKey; className?: string; title?: string; col?: ResolvedColumn }) => {
       const active = sortKey && sort?.key === sortKey;
+      const w = col?.width;
       return (
-        <th title={title} className={`text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`} style={{ color: active ? "var(--text-2)" : "var(--muted)" }}>
+        <th
+          title={title}
+          className={`relative text-left px-5 py-3 font-medium whitespace-nowrap select-none ${thc}`}
+          style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+        >
           {sortKey ? (
             <button type="button" onClick={() => toggleSort(sortKey)} className="inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors uppercase tracking-[0.06em] text-[11px]" style={{ color: "inherit" }}>
               {label}
               <SortIcon k={sortKey} />
             </button>
           ) : label}
+          {col && <ResizeHandle minWidth={col.minWidth ?? 60} onResize={(px) => cols.setWidth(col.id, px)} />}
         </th>
       );
+    };
+
+    // Header metadata by column id — label + optional sort key/title. Drives the
+    // ordered header render below.
+    const HEADER_META: Record<string, { label: string; sortKey?: SortKey; title?: string }> = {
+      channel: { label: "Channel", title: "Discord channel whose alert opened this position" },
+      symbol: { label: "Symbol", sortKey: "symbol" },
+      qty: { label: "Qty", sortKey: "quantity" },
+      side: { label: "Side" },
+      close_pct: { label: "Close %" },
+      actions: { label: "Actions" },
+      unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
+      pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
+      avg_entry: { label: "Avg entry", sortKey: "avg_entry_price" },
+      current_price: { label: "Current price", sortKey: "current_price" },
+      pdc: { label: "PDC", title: "Previous day's market close price" },
+      filled_price: { label: "Filled price" },
+      market_value: { label: "Market value", sortKey: "market_value" },
+      net_liq: { label: "Net Liq", sortKey: "net_liq", title: "Live liquidation value = price × quantity × contract multiplier (signed; short = negative)" },
+      tp: { label: "TP" },
+      sl: { label: "SL" },
+      submitted_at: { label: "Submitted at" },
+      filled_at: { label: "Filled at" },
+      time_taken: { label: "Time Taken to Filled" },
+      expires: { label: "Expires in Days", sortKey: "expires" },
     };
 
     // Must equal the number of <Th> cells — and the number of <td> in a data
@@ -600,7 +748,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // row. It had drifted to 21 against 18 real columns, so the skeleton
     // rendered three phantom cells wider than the header. Channel is
     // conditional, so this is too.
-    const COLSPAN = showChannel ? 19 : 18;
+    const COLSPAN = cols.columns.length;
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -660,21 +808,25 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             {tabBtn("option", "Options")}
             {tabBtn("stock", "Stocks")}
           </div>
-          <div className="relative">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search symbol…"
-              className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
-              aria-label="Search positions by symbol"
-            />
-            {search && (
-              <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
-                className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
-                <X size={14} />
-              </button>
-            )}
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search symbol…"
+                className="pl-8 pr-8 py-1.5 text-sm w-44 sm:w-56"
+                aria-label="Search positions by symbol"
+              />
+              {search && (
+                <button type="button" onClick={() => setSearch("")} aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 focus-ring rounded" style={{ color: "var(--muted)" }}>
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
+            <ColumnsMenu cols={cols} />
           </div>
         </div>
 
@@ -684,25 +836,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <table className={`min-w-full text-sm ${!loading && visible.length === 0 ? "h-full" : ""}`}>
               <thead className="sticky top-0 z-10" style={{ background: "var(--panel)", boxShadow: "0 1px 0 var(--border)" }}>
                 <tr>
-                  {showChannel && <Th label="Channel" title="Discord channel whose alert opened this position" />}
-                  <Th label="Symbol" sortKey="symbol" />
-                  <Th label="Qty" sortKey="quantity" />
-                  <Th label="Side" />
-                  <Th label="Close %" />
-                  <Th label="Actions" />
-                  <Th label="Unrealized P&L" sortKey="unrealized_pnl" />
-                  <Th label="P&L %" title="Unrealized P&L as a % of cost basis" />
-                  <Th label="Avg entry" sortKey="avg_entry_price" />
-                  <Th label="Current price" sortKey="current_price" />
-                  <Th label="PDC" title="Previous day's market close price" />
-                  <Th label="Filled price" />
-                  <Th label="Market value" sortKey="market_value" />
-                  <Th label="TP" />
-                  <Th label="SL" />
-                  <Th label="Submitted at" />
-                  <Th label="Filled at" />
-                  <Th label="Time Taken to Filled" />
-                  <Th label="Expires in Days" sortKey="expires" />
+                  {cols.columns.map((c) => {
+                    const m = HEADER_META[c.id] ?? { label: c.header };
+                    return <Th key={c.id} col={c} label={m.label} sortKey={m.sortKey} title={m.title} />;
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -747,211 +884,186 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   const liveSym = p.instrument_type === "stock" ? p.symbol : positionOcc(p);
                   const liveMult = p.instrument_type === "option" ? 100 : 1;
                   const inFlight = closing?.key === key;
+                  // Entry-order match for this position — drives Filled price,
+                  // the bracket cells and the timestamps. Bracket modify is
+                  // allowed while the position is alive (i.e. this row exists);
+                  // without a match (broker connected after the trade) the
+                  // bracket cells render read-only. The % anchor mirrors Order
+                  // History: a copied mirror reverses off filled_avg_price, the
+                  // trader's own entry off limit_price.
+                  const t = orderTimestamps.byKey.get(orderTimestamps.key(
+                    p.broker_account_id, p.instrument_type, p.symbol,
+                    p.option_expiry, p.option_strike, p.option_right,
+                  ));
+                  const orderId = t?.order_id ?? null;
+                  const entryPrice = t?.parent_order_id
+                    ? (t?.filled_avg_price ?? t?.limit_price ?? null)
+                    : (t?.limit_price ?? t?.filled_avg_price ?? null);
+                  const isMirror = !!t?.parent_order_id;
+                  const tpPct = isMirror && t?.take_profit_pct != null ? Number(t.take_profit_pct) : null;
+                  const slPct = isMirror && t?.stop_loss_pct != null ? Number(t.stop_loss_pct) : null;
+                  const side = t?.side ?? (isLong ? "buy" : "sell");
+                  const onUpdated = (updated: Order) => {
+                    setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
+                  };
+                  const sub = t?.submitted_at ?? null;
+                  const fill = t?.filled_at ?? null;
+                  const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
+
+                  // Each column's cell keyed by id; rendered below in the user's
+                  // configured order (reorderable) and visibility (show/hide).
+                  const cell: Record<string, React.ReactNode> = {
+                    channel: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }} title={p.discord_channel ?? undefined}>
+                        {p.discord_channel || "—"}
+                      </td>
+                    ),
+                    symbol: (
+                      <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PositionIcon kind={positionKind(p)} />
+                          {positionSymbolLabel(p)}
+                        </span>
+                      </td>
+                    ),
+                    qty: <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>,
+                    side: (
+                      <td className="px-5 py-3.5">
+                        <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
+                          {isLong ? "Long" : "Short"}
+                        </span>
+                      </td>
+                    ),
+                    close_pct: (
+                      <td className="px-5 py-3.5">
+                        <div className="flex gap-1">
+                          {[25, 50, 75, 100].map(pct => {
+                            const computedQty = quantityForPercent(p, pct);
+                            const disabled = computedQty == null;
+                            const selected = (closePercents[key] ?? 100) === pct;
+                            return (
+                              <button
+                                key={pct}
+                                type="button"
+                                disabled={disabled}
+                                onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
+                                title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
+                                className="px-2 py-0.5 text-[10px] rounded transition-colors"
+                                style={{
+                                  border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                                  background: selected ? "var(--nav-active-bg)" : "transparent",
+                                  color: disabled ? "var(--faint)" : selected ? "var(--accent)" : "var(--text-2)",
+                                  cursor: disabled ? "not-allowed" : "pointer",
+                                  opacity: disabled ? 0.5 : 1,
+                                }}
+                              >
+                                {pct}%
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    ),
+                    actions: (
+                      <td className="px-5 py-3.5">
+                        <div className="flex gap-2 items-center whitespace-nowrap">
+                          <button
+                            disabled={inFlight}
+                            onClick={() => closePosition(p, "market")}
+                            className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                          >
+                            <span>Close at Market</span>
+                            {inFlight && closing.kind === "market" && <Spinner />}
+                          </button>
+                          <div className="flex items-stretch">
+                            <input
+                              type="number" step="0.01" min="0.01"
+                              placeholder="Limit"
+                              aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
+                              value={closeLimitPrices[key] ?? ""}
+                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
+                              className="w-20 px-2 py-1 text-xs border"
+                              style={{
+                                borderColor: "var(--border)",
+                                background: "var(--bg)",
+                                borderTopLeftRadius: "var(--r-sm)",
+                                borderBottomLeftRadius: "var(--r-sm)",
+                                borderTopRightRadius: 0,
+                                borderBottomRightRadius: 0,
+                                borderRight: "none",
+                              }}
+                            />
+                            <button
+                              disabled={inFlight || !closeLimitPrices[key]}
+                              onClick={() => closePosition(p, "limit")}
+                              className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
+                              style={{
+                                borderTopLeftRadius: 0,
+                                borderBottomLeftRadius: 0,
+                                borderTopRightRadius: "var(--r-sm)",
+                                borderBottomRightRadius: "var(--r-sm)",
+                              }}
+                            >
+                              <span>Close</span>
+                              {inFlight && closing.kind === "limit" && <Spinner />}
+                            </button>
+                          </div>
+                          <PositionActionsMenu
+                            orderId={orderId}
+                            hasStop={t?.stop_loss_price != null}
+                            label={p.symbol.toUpperCase()}
+                            onDone={refresh}
+                          />
+                        </div>
+                      </td>
+                    ),
+                    unrealized_pnl: <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />,
+                    pnl_pct: <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />,
+                    avg_entry: <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>,
+                    current_price: <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />,
+                    pdc: <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>,
+                    filled_price: (
+                      <td className="px-5 py-3.5 num">
+                        {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    market_value: <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />,
+                    net_liq: <LiveNetLiqCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} multiplier={liveMult} />,
+                    tp: (
+                      <td className="px-5 py-3.5 num">
+                        <InlineBracketCell orderId={orderId} leg="tp" value={t?.take_profit_price ?? null} entryPrice={entryPrice} side={side} canEdit={!!orderId} pctOverride={tpPct} onUpdated={onUpdated} />
+                      </td>
+                    ),
+                    sl: (
+                      <td className="px-5 py-3.5 num">
+                        <InlineBracketCell orderId={orderId} leg="sl" value={t?.stop_loss_price ?? null} entryPrice={entryPrice} side={side} canEdit={!!orderId} pctOverride={slPct} onUpdated={onUpdated} />
+                      </td>
+                    ),
+                    submitted_at: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                        {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    filled_at: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
+                        {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    time_taken: (
+                      <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
+                        {sub && fill ? fmtDuration(sub, fill) : "—"}
+                      </td>
+                    ),
+                    expires: (
+                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
+                        {exp ? exp.text : "—"}
+                      </td>
+                    ),
+                  };
                   return (
                     <Fragment key={key}>
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
-                        {/* Only a Discord alert has a channel. A position
-                            opened from the trade panel, as a copy mirror, or in
-                            the broker's own app shows a dash — an empty cell
-                            would read as still loading. */}
-                        {showChannel && (
-                          <td
-                            className="px-5 py-3.5 whitespace-nowrap"
-                            style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
-                            title={p.discord_channel ?? undefined}
-                          >
-                            {p.discord_channel || "—"}
-                          </td>
-                        )}
-                        <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
-                          {/* gap-1.5 = 6px between glyph and symbol. */}
-                          <span className="inline-flex items-center gap-1.5">
-                            <PositionIcon kind={positionKind(p)} />
-                            {positionSymbolLabel(p)}
-                          </span>
-                        </td>
-                        <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>
-                        {/* Side — Long / Short. */}
-                        <td className="px-5 py-3.5">
-                          <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
-                            {isLong ? "Long" : "Short"}
-                          </span>
-                        </td>
-                        {/* Close % — pick a fraction of the position to close.
-                            Pills that would round to zero (e.g. 25% of one
-                            contract) are disabled. */}
-                        <td className="px-5 py-3.5">
-                          <div className="flex gap-1">
-                            {[25, 50, 75, 100].map(pct => {
-                              const computedQty = quantityForPercent(p, pct);
-                              const disabled = computedQty == null;
-                              const selected = (closePercents[key] ?? 100) === pct;
-                              return (
-                                <button
-                                  key={pct}
-                                  type="button"
-                                  disabled={disabled}
-                                  onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
-                                  title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
-                                  className="px-2 py-0.5 text-[10px] rounded transition-colors"
-                                  style={{
-                                    border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
-                                    background: selected ? "var(--nav-active-bg)" : "transparent",
-                                    color: disabled ? "var(--faint)" : selected ? "var(--accent)" : "var(--text-2)",
-                                    cursor: disabled ? "not-allowed" : "pointer",
-                                    opacity: disabled ? 0.5 : 1,
-                                  }}
-                                >
-                                  {pct}%
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <div className="flex gap-2 items-center whitespace-nowrap">
-                            <button
-                              disabled={inFlight}
-                              onClick={() => closePosition(p, "market")}
-                              className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
-                            >
-                              <span>Close at Market</span>
-                              {inFlight && closing.kind === "market" && <Spinner />}
-                            </button>
-                            <div className="flex items-stretch">
-                              <input
-                                type="number" step="0.01" min="0.01"
-                                placeholder="Limit"
-                                aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
-                                value={closeLimitPrices[key] ?? ""}
-                                onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
-                                className="w-20 px-2 py-1 text-xs border"
-                                style={{
-                                  borderColor: "var(--border)",
-                                  background: "var(--bg)",
-                                  borderTopLeftRadius: "var(--r-sm)",
-                                  borderBottomLeftRadius: "var(--r-sm)",
-                                  borderTopRightRadius: 0,
-                                  borderBottomRightRadius: 0,
-                                  borderRight: "none",
-                                }}
-                              />
-                              <button
-                                disabled={inFlight || !closeLimitPrices[key]}
-                                onClick={() => closePosition(p, "limit")}
-                                className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
-                                style={{
-                                  borderTopLeftRadius: 0,
-                                  borderBottomLeftRadius: 0,
-                                  borderTopRightRadius: "var(--r-sm)",
-                                  borderBottomRightRadius: "var(--r-sm)",
-                                }}
-                              >
-                                <span>Close</span>
-                                {inFlight && closing.kind === "limit" && <Spinner />}
-                              </button>
-                            </div>
-                          </div>
-                        </td>
-                        <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />
-                        {/* P&L % = live unrealized P&L / cost basis. */}
-                        <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />
-                        <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>
-                        <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />
-                        {/* Reference = previous session's market close price. */}
-                        <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>
-                        {(() => {
-                          const t = orderTimestamps.byKey.get(orderTimestamps.key(
-                            p.broker_account_id, p.instrument_type, p.symbol,
-                            p.option_expiry, p.option_strike, p.option_right,
-                          ));
-                          // Bracket modify is allowed while the underlying
-                          // position is still alive — exactly when this row
-                          // exists. Without an entry-order match (e.g. broker
-                          // connected after the trade) we can't target a
-                          // parent → render the cells read-only.
-                          const orderId = t?.order_id ?? null;
-                          // % anchor — must match the Order History logic so the
-                          // two views agree. A copied mirror (parent_order_id set)
-                          // re-anchors its exits on the subscriber's actual fill,
-                          // so reverse the % off filled_avg_price; the trader's own
-                          // entry reverses off limit_price (what the Trade Panel
-                          // used to set the bracket).
-                          const entryPrice = t?.parent_order_id
-                            ? (t?.filled_avg_price ?? t?.limit_price ?? null)
-                            : (t?.limit_price ?? t?.filled_avg_price ?? null);
-                          // Copied mirror → show the trader's intended percent
-                          // verbatim, not the percent re-derived from the
-                          // tick-rounded exit price.
-                          const isMirror = !!t?.parent_order_id;
-                          const tpPct = isMirror && t?.take_profit_pct != null ? Number(t.take_profit_pct) : null;
-                          const slPct = isMirror && t?.stop_loss_pct != null ? Number(t.stop_loss_pct) : null;
-                          const side = t?.side ?? (isLong ? "buy" : "sell");
-                          const onUpdated = (updated: Order) => {
-                            setOrders(cur => cur.map(o => o.id === updated.id ? updated : o));
-                          };
-                          return (
-                            <>
-                              <td className="px-5 py-3.5 num">
-                                {t?.filled_avg_price ? fmtNum(t.filled_avg_price, 2) : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />
-                              <td className="px-5 py-3.5 num">
-                                <InlineBracketCell
-                                  orderId={orderId}
-                                  leg="tp"
-                                  value={t?.take_profit_price ?? null}
-                                  entryPrice={entryPrice}
-                                  side={side}
-                                  canEdit={!!orderId}
-                                  pctOverride={tpPct}
-                                  onUpdated={onUpdated}
-                                />
-                              </td>
-                              <td className="px-5 py-3.5 num">
-                                <InlineBracketCell
-                                  orderId={orderId}
-                                  leg="sl"
-                                  value={t?.stop_loss_price ?? null}
-                                  entryPrice={entryPrice}
-                                  side={side}
-                                  canEdit={!!orderId}
-                                  pctOverride={slPct}
-                                  onUpdated={onUpdated}
-                                />
-                              </td>
-                            </>
-                          );
-                        })()}
-                        {(() => {
-                          const t = orderTimestamps.byKey.get(orderTimestamps.key(
-                            p.broker_account_id, p.instrument_type, p.symbol,
-                            p.option_expiry, p.option_strike, p.option_right,
-                          ));
-                          const sub = t?.submitted_at ?? null;
-                          const fill = t?.filled_at ?? null;
-                          return (
-                            <>
-                              <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                                {sub ? fmtDateTimeMs(sub, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: "var(--muted)" }}>
-                                {fill ? fmtDateTimeMs(fill, "America/New_York") : <span style={{ color: "var(--faint)" }}>—</span>}
-                              </td>
-                              <td className="px-5 py-3.5 whitespace-nowrap num" style={{ color: fill && sub ? "var(--text-2)" : "var(--faint)" }}>
-                                {sub && fill ? fmtDuration(sub, fill) : "—"}
-                              </td>
-                            </>
-                          );
-                        })()}
-                        {(() => {
-                          const exp = p.instrument_type === "option" ? fmtExpiresIn(p.option_expiry) : null;
-                          return (
-                            <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: exp ? exp.color : "var(--faint)" }}>
-                              {exp ? exp.text : "—"}
-                            </td>
-                          );
-                        })()}
+                        {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                       </tr>
                     </Fragment>
                   );

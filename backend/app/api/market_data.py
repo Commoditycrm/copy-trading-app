@@ -33,9 +33,17 @@ def watch(body: WatchBody, user: User = Depends(current_user)) -> dict:
     if syms:
         mds.add_watch(syms, user_id=user.id)
     prices: dict[str, str | None] = {}
+    misses: list[str] = []
     for sym in syms:
         px = mds.get_live_price(sym, max_age_s=30.0)
-        if px is None:
-            px = mds.fetch_rest_quote(sym)
-        prices[sym] = str(px) if px is not None else None
+        if px is not None:
+            prices[sym] = str(px)
+        else:
+            misses.append(sym)
+    # Seed the cache-misses in ONE batched call (stocks + options), not per-symbol.
+    if misses:
+        seeded = mds.fetch_rest_quotes(misses)
+        for sym in misses:
+            px = seeded.get(sym)
+            prices[sym] = str(px) if px is not None else None
     return {"prices": prices}

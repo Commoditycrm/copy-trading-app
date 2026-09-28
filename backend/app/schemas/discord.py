@@ -428,6 +428,9 @@ class DiscordSettingsOut(BaseModel):
     trim2_stop_pct: str = "0"
     trim3_profit_gate_pct: str = "0"
     trim3_stop_pct: str = "0"
+    trim_qty_pct: str
+    trim2_qty_pct: str
+    trim3_qty_pct: str
     trim_profit_gate_pct: str = "20"
     # How far below entry the first trim's stop sits.
     trim_stop_pct: str = "25"
@@ -462,6 +465,9 @@ class DiscordSettingsIn(BaseModel):
     trim2_stop_pct: str | None = None
     trim3_profit_gate_pct: str | None = None
     trim3_stop_pct: str | None = None
+    trim_qty_pct: str | None = None
+    trim2_qty_pct: str | None = None
+    trim3_qty_pct: str | None = None
     trim_stop_pct: str | None = None
     trim_price_threshold: str | None = None
     trim_trail_amount: str | None = None

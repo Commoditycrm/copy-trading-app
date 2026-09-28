@@ -11,6 +11,7 @@ covered by the ladder's own tests, which is the point of not duplicating it.
 import inspect
 import os
 import sys
+import uuid
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
@@ -169,3 +170,159 @@ def test_an_auto_trim_does_not_wait_for_a_second_approval():
     queue would miss the move it was watching for."""
     src = inspect.getsource(at.tick)
     assert "approve=True" in src
+
+
+# ── the strike must survive the round trip ──────────────────────────────────
+#
+# Live 2026-09-28: Decimal("230").normalize() renders as 2.3E+2, so auto-trim
+# wrote "✂️ $NVDA 2.3E+2C 09/28" and the message was stored as "not a trade
+# alert". Every strike ending in a zero was silently un-trimmable; NVDA only
+# looked healthy because real Discord alerts were driving it.
+
+@pytest.mark.parametrize("strike", ["230", "741", "342.5", "769", "3.5",
+                                    "6000", "342.50", "20", "0.5"])
+def test_every_strike_parses_back_to_itself(strike):
+    from datetime import datetime, timezone
+
+    from app.services.discord_parsers import parse_message
+    from app.services.discord_parsers.base import ParsedMessage, ParseStatus
+
+    guard = _guard()
+    guard.option_strike = Decimal(strike)
+    guard.option_expiry = EXP
+    text = at._exit_alert_text(guard)
+    assert "E+" not in text and "e+" not in text, text
+
+    r = parse_message(ParsedMessage(content=text, posted_at=datetime.now(timezone.utc)))
+    assert r.status is ParseStatus.PARSED, text
+    assert r.signals[0].strike == Decimal(strike), text
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("230", "230"), ("342.50", "342.5"), ("3.5", "3.5"), ("6000", "6000"),
+])
+def test_the_strike_is_written_the_way_a_human_writes_it(raw, want):
+    assert at._strike_text(Decimal(raw)) == want
+
+
+# ── it must measure against the FILL, not the limit we bid ──────────────────
+
+def test_the_entry_is_synced_before_the_gate_is_measured():
+    """QQQ was bid 0.65, repriced to 0.72 and filled at 0.6875. Measuring off
+    0.65 read +7.7% and fired; the ladder then re-synced to 0.6875 and answered
+    "up 1.82%, under the 5% gate" — a rung spent on a price nobody paid."""
+    import inspect
+
+    src = inspect.getsource(at.tick)
+    sync_at = src.index("pg.sync_entry_price(db, guard)")
+    measure_at = src.index("rung = due_rung(ts, guard, mark)")
+    assert sync_at < measure_at, "the entry must be synced BEFORE the gate is read"
+
+
+def test_the_two_gate_checks_agree_on_the_same_entry():
+    """due_rung and plan_exit must read the same reference, or auto-trim fires
+    rungs the ladder then refuses."""
+    entry, mark = Decimal("0.6875"), Decimal("0.70")
+    ts = _ts(g1="5")
+    guard = _guard(entry=str(entry))
+    assert at.due_rung(ts, guard, mark) is None            # 1.82% < 5%
+    # ...and off the stale limit it would wrongly have fired:
+    assert at.due_rung(ts, _guard(entry="0.65"), mark) == 1
+
+
+# ── a rung that did nothing is not spent ────────────────────────────────────
+
+def test_an_unspent_rung_is_returned():
+    """plan_exit advances the rung unconditionally, which is right for a HUMAN
+    alert — the trader's Nth alert is their Nth trim. Auto-trim has no alert,
+    so a rung that turns out not to be due must not be spent, or the next sweep
+    measures the rung after it and the ladder walks itself out."""
+    import inspect
+
+    src = inspect.getsource(at.tick)
+    assert "pg.rollback_exit(guard)" in src
+    # Judged on what HAPPENED, not on the note text.
+    assert "msg.order_id is not None" in src
+    assert "guard.trail_qty != before_trail" in src
+
+
+def test_a_rung_that_armed_a_trail_is_kept():
+    """An expensive contract leaves on a trailing give-back, so the rung places
+    no order — rolling that back would arm the same trail every sweep."""
+    import inspect
+
+    src = inspect.getsource(at.tick)
+    at_check = src.index("did_something = (")
+    assert "guard.trail_qty != before_trail" in src[at_check:at_check + 260]
+
+
+def test_the_alert_path_still_spends_its_rung():
+    """The one thing this fix must NOT change. plan_exit advances the rung for
+    every caller; only auto-trim hands it back."""
+    import inspect
+
+    import app.services.discord_position_guard as g
+
+    src = inspect.getsource(g.plan_exit)
+    assert "guard.sell_count = rung" in src
+    assert "rollback" not in src.lower()
+
+
+# ── cadence ─────────────────────────────────────────────────────────────────
+
+def test_the_sweep_is_one_cadence_for_every_broker():
+    """Each sweep costs one get_positions per account, and the budget is
+    shared: Webull allows 10 per 30 SECONDS across the pnl poller, the order
+    listener and this. A broker-aware cadence was tried and dropped — the few
+    seconds it saved on Alpaca were not worth two code paths, because the
+    detection lag is all this bounds. The stop now goes on within ~1s of the
+    fill regardless (pnl_poller.poll_now)."""
+    assert at.POLL_INTERVAL_S == 15
+
+
+def test_positions_are_read_once_per_account_not_per_guard():
+    """Reading them per-guard is what blew Webull's limit."""
+    import inspect
+
+    src = inspect.getsource(at.tick)
+    assert src.count("adapter.get_positions()") == 1
+    # ...and the per-guard loop takes the already-fetched list.
+    assert "_mark_for(positions, guard)" in src
+
+
+# ── the stop is placed as soon as the trim fills ────────────────────────────
+
+def test_a_filled_trim_makes_the_account_due_now():
+    """The remainder is unprotected until the stop reconciler runs — up to the
+    account's whole poll interval (4-13s measured live on Alpaca)."""
+    import inspect
+
+    from app.api.discord_sources import _execute_signal
+
+    src = inspect.getsource(_execute_signal)
+    assert "poll_now(resolved.broker_account_id)" in src
+    # ONLY once filled: reconcile sizes the stop from what the BROKER reports,
+    # so poking it mid-settlement would size the stop to the whole position and
+    # block the very sell that just went out.
+    assert "if is_trim and order.status is OrderStatus.FILLED:" in src
+
+
+def test_poll_now_only_clears_that_account():
+    """It must not reset anyone else's timer — that would multiply position
+    reads across every account on the box."""
+    import uuid as _u
+
+    from app.services import pnl_poller
+
+    a, b = _u.uuid4(), _u.uuid4()
+    pnl_poller._next_due_at[a] = 1e9
+    pnl_poller._next_due_at[b] = 1e9
+    pnl_poller.poll_now(a)
+    assert a not in pnl_poller._next_due_at
+    assert pnl_poller._next_due_at[b] == 1e9
+
+
+def test_poll_now_is_safe_for_an_unknown_account():
+    from app.services import pnl_poller
+
+    pnl_poller.poll_now(uuid.uuid4())          # must not raise

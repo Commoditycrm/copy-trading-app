@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { Fragment, FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Hash, Radio, ScanLine, Receipt, ShieldCheck, Clock, Eye, PlugZap, Check, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -130,7 +130,6 @@ type LadderField = {
   suffix?: string;
 };
 
-type LadderGroup = { title: string; hint?: string; fields: LadderField[] };
 
 // One group per rung, because each rung's gate and stop are set independently —
 // changing the 1st trim leaves the 2nd and 3rd exactly where they were. Laying
@@ -138,46 +137,78 @@ type LadderGroup = { title: string; hint?: string; fields: LadderField[] };
 //
 // 0 is a meaningful value in both columns: a gate of 0 means no minimum profit,
 // and a stop 0% below entry is break-even.
-const LADDER_GROUPS: LadderGroup[] = [
+/** The ladder as a matrix — one ROW per setting, one COLUMN per trim.
+ *
+ *  Laid out this way because that is how the ladder is actually reasoned
+ *  about: "what does each trim take?" is one question across three rungs, and
+ *  the old per-trim grouping made you read three separate blocks to answer it.
+ *  Reading down a column gives one rung; reading across a row compares the
+ *  same setting at every rung.
+ */
+type LadderRow = {
+  label: string;
+  hint?: string;
+  /** Column order: 1st, 2nd, 3rd trim. */
+  keys: [string, string, string];
+  suffix?: string;
+  prefix?: string;
+  step: string;
+  /** Lowest value the field accepts. Defaults to 0; the Stop row allows a
+   *  negative so a drawdown can be written the way it is spoken. */
+  min?: string;
+};
+
+const LADDER_ROWS: LadderRow[] = [
   {
-    title: "1st trim",
-    fields: [
-      { key: "trim_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
-      { key: "trim_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
-    ],
+    label: "Profit target",
+    hint: "minimum gain over entry before this trim sells",
+    keys: ["trim_profit_gate_pct", "trim2_profit_gate_pct", "trim3_profit_gate_pct"],
+    suffix: "%",
+    step: "5",
   },
   {
-    title: "2nd trim",
-    fields: [
-      { key: "trim2_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
-      { key: "trim2_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
-    ],
+    label: "Qty",
+    hint: "share of what is still held, not of the original position",
+    keys: ["trim_qty_pct", "trim2_qty_pct", "trim3_qty_pct"],
+    suffix: "%",
+    step: "5",
   },
   {
-    title: "3rd trim",
-    hint: "exits the rest",
-    fields: [
-      { key: "trim3_profit_gate_pct", label: "Min profit to trim", suffix: "%", step: "5" },
-      { key: "trim3_stop_pct", label: "Stop below entry", suffix: "%", step: "5" },
-    ],
-  },
-  {
-    title: "Trailing exit",
-    hint: "2nd and 3rd trims",
-    fields: [
-      { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
-      { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
-    ],
+    label: "Stop",
+    hint: "where the stop sits, as a return from entry: -25% is 25% below, "
+      + "0% is break-even, +10% locks in profit",
+    keys: ["trim_stop_pct", "trim2_stop_pct", "trim3_stop_pct"],
+    suffix: "%",
+    step: "5",
+    // A drawdown is usually said with a minus sign, so let it be typed that
+    // way. The ladder reads the distance, not the sign.
+    min: "-100",
   },
 ];
 
+/** Not part of the per-trim matrix: these two describe the trailing exit that
+ *  the 2nd and 3rd trims use on an expensive contract, so they keep their own
+ *  row rather than pretending to belong to one rung. */
+const TRAIL_FIELDS: LadderField[] = [
+  { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
+  { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
+];
+
+const TRIM_COLUMNS = ["1st trim", "2nd trim", "3rd trim"];
+
 // Flat view of the same fields, for the dirty check and for building state.
-const LADDER_FIELDS: LadderField[] = LADDER_GROUPS.flatMap((g) => g.fields);
+const LADDER_FIELDS: LadderField[] = [
+  ...LADDER_ROWS.flatMap((r) =>
+    r.keys.map((key) => ({ key, label: r.label, suffix: r.suffix, step: r.step })),
+  ),
+  ...TRAIL_FIELDS,
+];
 
 const LADDER_DEFAULTS: Record<string, string> = {
-  trim_profit_gate_pct: "20", trim_stop_pct: "25",
+  trim_profit_gate_pct: "20", trim_stop_pct: "-25",
   trim2_profit_gate_pct: "0", trim2_stop_pct: "0",
   trim3_profit_gate_pct: "0", trim3_stop_pct: "0",
+  trim_qty_pct: "50", trim2_qty_pct: "50", trim3_qty_pct: "100",
   trim_price_threshold: "0.90", trim_trail_amount: "0.25",
 };
 
@@ -1271,13 +1302,17 @@ export default function DiscordPage() {
                     × 100 for options) is above this. Closes always go through.
                   </p>
                 </div>
+              </div>
 
-                {/* The exit ladder. Every level is measured from the position's
-                    ENTRY price, so these are fixed the moment it opens. */}
-                <div
-                  className="rounded-xl px-4 py-3 flex-1"
-                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
-                >
+              {/* The exit ladder, below the sizing cards and full width: the
+                  grid is three columns of inputs, and squeezed into a flex row
+                  beside them it was the one card that always wrapped.
+                  Every level is measured from the position's ENTRY price, so
+                  they are fixed the moment it opens. */}
+              <div
+                className="rounded-xl px-4 py-3 w-full mt-4"
+                style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+              >
                   <div className="flex items-baseline justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
                       Exit ladder
@@ -1313,75 +1348,144 @@ export default function DiscordPage() {
                     </span>
                   </label>
 
-                  {LADDER_GROUPS.map((group) => (
-                    <div key={group.title} className="mt-3">
-                      <div className="flex items-baseline gap-2">
+                  {/* One ROW per setting, one COLUMN per trim — read down a
+                      column for a single rung, across a row to compare the same
+                      setting at every rung.
+
+                      No overflow wrapper: "overflow-x-auto" makes an element a
+                      scroll container in BOTH axes, and .focus-ring draws its
+                      outline 2px OUTSIDE the input, so the ring was clipped on
+                      every cell. The columns are minmax(0,1fr) and shrink on
+                      their own, so nothing needed to scroll. */}
+                  <div className="mt-3 grid gap-x-2 gap-y-2"
+                       style={{ gridTemplateColumns: "78px repeat(3, minmax(0, 1fr))" }}>
+                    {/* Header: the trim names. */}
+                    <span />
+                      {TRIM_COLUMNS.map((c) => (
                         <span
-                          className="text-[10px] font-medium uppercase tracking-wide"
+                          key={c}
+                          className="text-[10px] font-medium uppercase tracking-wide text-center"
                           style={{ color: "var(--text-2)" }}
                         >
-                          {group.title}
+                          {c}
                         </span>
-                        {group.hint && (
-                          <span className="text-[10px]" style={{ color: "var(--muted)" }}>
-                            {group.hint}
-                          </span>
-                        )}
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 mt-1.5">
-                        {group.fields.map((f) => (
-                          <div key={f.key}>
-                        <label
-                          className="block text-[10px] mb-1"
-                          style={{ color: "var(--muted)" }}
-                          htmlFor={`ladder-${f.key}`}
-                        >
-                          {f.label}
-                        </label>
-                        <div className="relative">
-                          {f.prefix && (
+                      ))}
+
+                      {LADDER_ROWS.map((row) => (
+                        <Fragment key={row.label}>
+                          <label
+                            className="text-[11px] self-center"
+                            style={{ color: "var(--muted)" }}
+                            title={row.hint}
+                          >
+                            {row.label}
+                          </label>
+                          {row.keys.map((key) => (
+                            <div key={key} className="relative">
+                              {row.prefix && (
+                                <span
+                                  className="absolute left-2 top-1/2 -translate-y-1/2 text-[13px]"
+                                  style={{ color: "var(--muted)" }}
+                                >
+                                  {row.prefix}
+                                </span>
+                              )}
+                              <input
+                                id={`ladder-${key}`}
+                                aria-label={`${row.label}, ${TRIM_COLUMNS[row.keys.indexOf(key)]}`}
+                                type="number"
+                                min={row.min ?? "0"}
+                                step={row.step}
+                                value={ladder[key]}
+                                disabled={modeBusy}
+                                onChange={(e) =>
+                                  setLadder((l) => ({ ...l, [key]: e.target.value }))
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") saveSizing({ [key]: ladder[key] });
+                                }}
+                                className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
+                                style={{
+                                  // --border is 6% white in dark, which on a
+                                  // panel reads as no edge at all. An input
+                                  // people are meant to type into needs the
+                                  // stronger token.
+                                  borderColor: "var(--border-strong)",
+                                  color: "var(--text)",
+                                  paddingLeft: row.prefix ? 18 : 8,
+                                  paddingRight: row.suffix ? 20 : 8,
+                                }}
+                              />
+                              {row.suffix && (
+                                <span
+                                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]"
+                                  style={{ color: "var(--muted)" }}
+                                >
+                                  {row.suffix}
+                                </span>
+                              )}
+                            </div>
+                          ))}
+                      </Fragment>
+                    ))}
+                  </div>
+
+                  {/* The trailing exit is not per-rung: it is the style the 2nd
+                      and 3rd trims use when the contract is expensive enough to
+                      be worth riding. */}
+                  <div className="mt-3">
+                    <span
+                      className="text-[10px] font-medium uppercase tracking-wide"
+                      style={{ color: "var(--text-2)" }}
+                    >
+                      Trailing exit
+                    </span>
+                    <span className="text-[10px] ml-2" style={{ color: "var(--muted)" }}>
+                      2nd and 3rd trims
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 mt-1.5">
+                      {TRAIL_FIELDS.map((f) => (
+                        <div key={f.key}>
+                          <label
+                            className="block text-[10px] mb-1"
+                            style={{ color: "var(--muted)" }}
+                            htmlFor={`ladder-${f.key}`}
+                          >
+                            {f.label}
+                          </label>
+                          <div className="relative">
                             <span
                               className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
                               style={{ color: "var(--muted)" }}
                             >
                               {f.prefix}
                             </span>
-                          )}
-                          <input
-                            id={`ladder-${f.key}`}
-                            type="number"
-                            min="0"
-                            step={f.step}
-                            value={ladder[f.key]}
-                            disabled={modeBusy}
-                            onChange={(e) =>
-                              setLadder((l) => ({ ...l, [f.key]: e.target.value }))
-                            }
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") saveSizing({ [f.key]: ladder[f.key] });
-                            }}
-                            className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
-                            style={{
-                              borderColor: "var(--border)",
-                              color: "var(--text)",
-                              paddingLeft: f.prefix ? 22 : 12,
-                              paddingRight: f.suffix ? 22 : 12,
-                            }}
-                          />
-                          {f.suffix && (
-                            <span
-                              className="absolute right-3 top-1/2 -translate-y-1/2 text-sm"
-                              style={{ color: "var(--muted)" }}
-                            >
-                              {f.suffix}
-                            </span>
-                          )}
-                        </div>
+                            <input
+                              id={`ladder-${f.key}`}
+                              type="number"
+                              min="0"
+                              step={f.step}
+                              value={ladder[f.key]}
+                              disabled={modeBusy}
+                              onChange={(e) =>
+                                setLadder((l) => ({ ...l, [f.key]: e.target.value }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") saveSizing({ [f.key]: ladder[f.key] });
+                              }}
+                              className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
+                              style={{
+                                borderColor: "var(--border)",
+                                color: "var(--text)",
+                                paddingLeft: 22,
+                                paddingRight: 12,
+                              }}
+                            />
                           </div>
-                        ))}
-                      </div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </div>
 
                   <div className="flex items-center gap-2 mt-3">
                     <button
@@ -1393,11 +1497,11 @@ export default function DiscordPage() {
                       {modeBusy ? <Spinner /> : "Save"}
                     </button>
                     <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                      1st exit alert sells half, but only above the gate. 2nd sells half of
-                      what&rsquo;s left and moves the stop to break-even. 3rd exits the rest.
+                      Qty is a share of what is STILL held, so 50 / 50 / 100 works a
+                      position of 4 down as 2, then 1, then 1. A trim only fires above
+                      its profit target; the stop applies to whatever is left after it.
                     </p>
                   </div>
-                </div>
               </div>
             </div>
             </div>
@@ -1476,10 +1580,10 @@ export default function DiscordPage() {
               <li>
                 Open the <strong>Kopyya Connector</strong> app on your computer.
                 <div className="mt-2 flex flex-wrap gap-2">
-                  <a href={CONNECTOR_WINDOWS} className="btn-primary px-3 py-1.5 text-xs">
+                  <a href={CONNECTOR_WINDOWS} target="_blank" rel="noopener noreferrer" className="btn-primary px-3 py-1.5 text-xs">
                     Download for Windows
                   </a>
-                  <a href={CONNECTOR_MAC} className="btn-ghost px-3 py-1.5 text-xs">
+                  <a href={CONNECTOR_MAC} target="_blank" rel="noopener noreferrer" className="btn-ghost px-3 py-1.5 text-xs">
                     Download for Mac
                   </a>
                 </div>
