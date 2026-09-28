@@ -521,10 +521,10 @@ def admin_user_pnl_calendar(
     return [
         DailyPnL(
             day=c.day,
-            realized_pnl=c.marked_pnl,   # the SHOWN number (marked), same as the calendar wire format
+            realized_pnl=c.realized_pnl,   # realized-only, same basis as the trader's own Calendar
             trade_count=c.trade_count,
             pct=None,
-            unrealized_pnl=c.unrealized_pnl,
+            unrealized_pnl=None,
             live=c.live,
         )
         for c in sorted(series.values(), key=lambda c: c.day)

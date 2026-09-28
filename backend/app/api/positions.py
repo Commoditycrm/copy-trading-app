@@ -208,29 +208,24 @@ def today_realized(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict[str, float]:
-    """Today's P&L for the positions-page summary strip — the SAME MARKED value
-    the Calendar shows for today (realized + today's live unrealized swing), so
-    the two never disagree.
+    """Today's P&L for the positions-page summary strip — the SAME realized value
+    the Calendar shows for today (closed trades, FIFO), so the two never disagree.
+    Matches the broker's daily P&L; the open-position unrealized swing is
+    deliberately excluded (see calendar_pnl).
 
-    Single source of truth: ``calendar_series`` with the live open-position
-    unrealized, exactly like the Calendar endpoint (``_live_unrealized_today`` +
-    ``calendar_series(..., live_today_unrealized=...)``). Subscribers keep mirror
-    de-duplication via ``mirrors_only``. The response key stays ``realized_pnl``
-    for the frontend, but the number is now the marked day P&L.
+    Subscribers keep mirror de-duplication via ``mirrors_only``. The response key
+    stays ``realized_pnl`` for the frontend.
     """
-    from app.api.trades import _live_unrealized_today
     from app.services import market_hours
     from app.services.pnl import calendar_series
 
     today = market_hours.now_et().date()
     mirrors = user.role == UserRole.SUBSCRIBER
-    live = _live_unrealized_today(db, user.id)
     series = calendar_series(
-        db, user.id, today, today, tz_name=None,
-        mirrors_only=mirrors, live_today_unrealized=live,
+        db, user.id, today, today, tz_name=None, mirrors_only=mirrors,
     )
     day = series.get(today)
-    return {"realized_pnl": float(day.marked_pnl) if day else 0.0}
+    return {"realized_pnl": float(day.realized_pnl) if day else 0.0}
 
 
 @router.post("/close-all")

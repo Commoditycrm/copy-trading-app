@@ -9,7 +9,7 @@ import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { BrokerAccount, DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
+import type { DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -45,9 +45,6 @@ export default function CalendarPage() {
   const [firstLoadDone, setFirstLoadDone] = useState(_calSnap !== undefined);
   const [user, setUser] = useState<User | null>(() => getSnapshot<User>(USER_SNAPSHOT_KEY) ?? null);
   const [subs, setSubs] = useState<SubscriberSummary[]>(() => getSnapshot<SubscriberSummary[]>(CAL_SUBS_KEY) ?? []);
-  // Broker drives the P&L tooltip: Alpaca calendars are MARKED (match the app),
-  // Webull/SnapTrade are REALIZED-only (differ from the app by unrealized).
-  const [brokers, setBrokers] = useState<BrokerAccount[]>([]);
   // The "viewing" user — defaults to self. Trader can pick a subscriber.
   const [viewingUserId, setViewingUserId] = useState<string | null>(null);
   // Sync status — auto-sync fills on mount.
@@ -87,8 +84,6 @@ export default function CalendarPage() {
         if (cancelled) return;
         setUser(u);
         setSnapshot(USER_SNAPSHOT_KEY, u);
-        // Broker(s) for the P&L-source tooltip — best-effort, non-blocking.
-        api<BrokerAccount[]>("/api/brokers").then((b) => { if (!cancelled) setBrokers(b); }).catch(() => {});
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
           api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => {
@@ -146,19 +141,16 @@ export default function CalendarPage() {
   const maxAbs = Math.max(...data.map(d => Math.abs(Number(d.realized_pnl))), 1);
   const todayKey = iso(new Date());
 
-  // P&L source depends on the broker. Alpaca exposes a marked portfolio-history
-  // series (matches the app); SnapTrade/Webull only exposes realized trades, so
-  // our number omits the unrealized P&L the Webull app folds in.
-  const pnlTooltip = useMemo(() => {
-    const kinds = new Set(brokers.map((b) => b.broker));
-    if (kinds.has("snaptrade") || kinds.has("webull")) {
-      return "Daily P&L including unrealized (open-position) gain/loss, so it tracks your broker app. Webull/SnapTrade exposes no marked history, so we rebuild it from our own end-of-day snapshots — meaning it works GOING FORWARD: recent days show realized + unrealized, while days from before this feature show realized (closed-trade) profit only. Today updates through the session as your open positions move.";
-    }
-    if (kinds.has("alpaca")) {
-      return "Daily P&L that matches your Alpaca app: each day is realized (closed-trade) profit PLUS the unrealized mark-to-market on positions still open at that day's close. Past days are LOCKED and never change. TODAY is LIVE — it moves with the market as your open positions do, then locks at the close; the next day shows only its own change.";
-    }
-    return "Realized P&L — profit/loss from trades you've CLOSED (bought and sold), net of fees. On days you hold positions overnight it can differ from your broker app, which also marks open positions to market.";
-  }, [brokers]);
+  // Realized-only across every broker: the day's number is profit/loss from
+  // trades CLOSED that day (FIFO, net of fees), matching the broker's daily
+  // realized figure. Open-position unrealized mark-to-market is deliberately
+  // excluded so a green realized day can't flip red just because a position
+  // held overnight is currently underwater.
+  const pnlTooltip = useMemo(
+    () =>
+      "Daily REALIZED P&L — profit/loss from trades you CLOSED that day (net of fees), matching your broker's daily realized number. It does NOT include unrealized gain/loss on positions still open, so holding a losing position overnight won't turn a profitable trading day negative. Today updates through the session as trades close, then locks.",
+    [],
+  );
 
   // What we display in the heading — "Your P&L" or "<sub> · P&L"
   const viewingLabel = useMemo(() => {
@@ -243,7 +235,7 @@ export default function CalendarPage() {
               title={
                 has
                   ? day.live
-                    ? `Live · ${fmtSignedUsd(pnl)} total (includes ${fmtSignedUsd(Number(day.unrealized_pnl ?? 0))} unrealized on open positions). Click to view today's trades.`
+                    ? `Live · ${fmtSignedUsd(pnl)} realized so far today (closed trades). Click to view today's trades.`
                     : `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
                   : undefined
               }
@@ -272,8 +264,8 @@ export default function CalendarPage() {
                 <div className="text-xs font-medium" style={{ color: has ? "var(--text)" : isToday ? "var(--accent)" : "var(--muted)" }}>
                   {d.getDate()}
                 </div>
-                {/* Today's number includes live unrealized on open positions —
-                    flag it so the moving figure reads as live, not settled. */}
+                {/* Today's realized figure is still moving as trades close —
+                    flag it so it reads as live, not settled. */}
                 {day?.live && (
                   <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide" style={{ color: "var(--text)" }}>
                     <span className="animate-pulse" style={{ width: 6, height: 6, borderRadius: 9999, background: "var(--accent)", display: "inline-block" }} aria-hidden />
