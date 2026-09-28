@@ -252,6 +252,7 @@ export default function SimulationPage() {
   const [importMsg, setImportMsg] = useState<string | null>(null);
   const [livePos, setLivePos] = useState<{ label: string; ticker: string; entry: number; qty: number }[]>([]);
   const [posMsg, setPosMsg] = useState<string | null>(null);
+  const [mounted, setMounted] = useState<boolean>(false);
   const [, setFrame] = useState<number>(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -386,9 +387,14 @@ export default function SimulationPage() {
   }, [rules, pos, threshold, scenarioKey, draw]);
 
   useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mounted) return;
     reset();
     return stopTimer;
-  }, [reset]);
+  }, [reset, mounted]);
 
   const loop = useCallback(() => {
     const s = engRef.current;
@@ -538,6 +544,17 @@ export default function SimulationPage() {
       <button className="btn tiny" onClick={() => addRuleStage(r.id)}>+ stage</button>
     </div>
   );
+
+  // Render the interactive UI client-only. The server/first-paint markup is just
+  // the dark shell, so nothing (incl. form-filler browser extensions that inject
+  // attributes like fdprocessedid) can cause a hydration mismatch.
+  if (!mounted) {
+    return (
+      <div className="simx" style={{ minHeight: "100vh" }}>
+        <style dangerouslySetInnerHTML={{ __html: CSS }} />
+      </div>
+    );
+  }
 
   return (
     <div className="simx">
