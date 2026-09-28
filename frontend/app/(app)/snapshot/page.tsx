@@ -9,12 +9,14 @@
  * Each snapshot renders as a self-contained <SnapshotBlock/> that owns its own
  * re-entry state and Re-Enter/delete calls (targeted by snapshot id + row index).
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { useLivePrice } from "@/lib/livePrices";
 import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
+import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
+import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { PercentInput } from "@/components/PercentInput";
@@ -191,6 +193,35 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
     return Array.from(new Set(keys)).slice(0, 30);
   }, [snap]);
   useMarketDataWatch(watchKeys);
+
+  // Configurable columns (per-user, synced). Re-Enter is locked (its controls
+  // must always render).
+  const columnDefs = useMemo<ColumnDef[]>(() => [
+    { id: "symbol", header: "Symbol", locked: true },
+    { id: "side", header: "Side" },
+    { id: "qty", header: "Qty" },
+    { id: "expiry", header: "Expiry" },
+    { id: "exit_price", header: "Exit Price" },
+    { id: "current_price", header: "Current Price" },
+    { id: "pdc", header: "PDC" },
+    { id: "reentry_price", header: "Re-Entry Price" },
+    { id: "fill_time", header: "Fill Time (ET)" },
+    { id: "change_sh", header: "Change / sh" },
+    { id: "pct", header: "%" },
+    { id: "status", header: "Status" },
+    { id: "reenter", header: "Re-Enter", locked: true },
+  ], []);
+  const cols = useTableColumns("snapshot", columnDefs);
+  const COL_META: Record<string, { align: "left" | "right"; title?: string }> = {
+    symbol: { align: "left" }, side: { align: "left" }, qty: { align: "right" },
+    expiry: { align: "left", title: "Option expiry date (— for stocks)" },
+    exit_price: { align: "right" }, current_price: { align: "right" },
+    pdc: { align: "right", title: "Previous day's market close price" },
+    reentry_price: { align: "right" },
+    fill_time: { align: "right", title: "When the re-entry filled (US Eastern / market time)" },
+    change_sh: { align: "right" }, pct: { align: "right", title: "Current price vs exit price, as a %" },
+    status: { align: "left" }, reenter: { align: "right" },
+  };
 
   // Pre-fill each row's re-entry control from the default chosen at exit time,
   // without overwriting anything already edited. Keyed by array index (the same
@@ -385,25 +416,31 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
         </div>
       </div>
 
+      {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
+      <div className="flex justify-end mb-2">
+        <ColumnsMenu cols={cols} />
+      </div>
       {/* Per-order table */}
       <div className="rounded-xl overflow-hidden" style={{ border: "1px solid var(--border)" }}>
         <div className="overflow-auto" style={{ maxHeight: "62vh" }}>
           <table className="w-full">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ borderBottom: "1px solid var(--border)" }}>
-                <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Symbol</th>
-                <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Side</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Qty</th>
-                <th className={`${th} text-left`} style={{ color: "var(--muted)" }} title="Option expiry date (— for stocks)">Expiry</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Exit Price</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Current Price</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Previous day's market close price">PDC</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Entry Price</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="When the re-entry filled (US Eastern / market time)">Fill Time (ET)</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Change / sh</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }} title="Current price vs exit price, as a %">%</th>
-                <th className={`${th} text-left`} style={{ color: "var(--muted)" }}>Status</th>
-                <th className={`${th} text-right`} style={{ color: "var(--muted)" }}>Re-Enter</th>
+                {cols.columns.map((c) => {
+                  const m = COL_META[c.id] ?? { align: "left" as const };
+                  const w = c.width;
+                  return (
+                    <th
+                      key={c.id}
+                      className={`relative ${th} ${m.align === "right" ? "text-right" : "text-left"}`}
+                      title={m.title}
+                      style={{ color: "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+                    >
+                      {c.header}
+                      {!c.locked && <ResizeHandle minWidth={c.minWidth ?? 60} onResize={(px) => cols.setWidth(c.id, px)} />}
+                    </th>
+                  );
+                })}
               </tr>
             </thead>
             <tbody>
@@ -430,18 +467,20 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
                     : ((isPct || choice === "trail_down") && rvValid && basisPx != null ? basisPx * (1 - rv / 100) : null);
                 const pctVsExit =
                   exitP != null && exitP !== 0 && curP != null ? ((curP - exitP) / exitP) * 100 : null;
-                return (
-                  <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)", opacity: p.reentry_status === "expired" ? 0.55 : 1 }}>
-                    <td className={`${td} font-medium`}>{positionLabel(p)}</td>
-                    <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>
-                    <td className={`${td} text-right num`}>{Math.abs(qty)}</td>
+                const cell: Record<string, ReactNode> = {
+                    symbol: <td className={`${td} font-medium`}>{positionLabel(p)}</td>,
+                    side: <td className={td} style={{ color: qty >= 0 ? "var(--good)" : "var(--bad)" }}>{side}</td>,
+                    qty: <td className={`${td} text-right num`}>{Math.abs(qty)}</td>,
+                    expiry: (
                     <td className={`${td} text-left num`}
                         style={{ color: p.reentry_status === "expired" ? "var(--bad)" : "var(--text-2)" }}>
                       {fmtExpiry(p.option_expiry)}
                     </td>
-                    <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>
-                    <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}><LiveSnapPrice liveKey={snapLiveKey(p)} fallback={p.current_price} /></td>
-                    <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }} title="Previous day's market close price">{fmtMoney(p.pdc)}</td>
+                    ),
+                    exit_price: <td className={`${td} text-right num`}>{fmtMoney(p.price)}</td>,
+                    current_price: <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}><LiveSnapPrice liveKey={snapLiveKey(p)} fallback={p.current_price} /></td>,
+                    pdc: <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }} title="Previous day's market close price">{fmtMoney(p.pdc)}</td>,
+                    reentry_price: (
                     <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
                       {p.reentry_status === "filled"
                         ? fmtMoney(p.reentry_price)
@@ -449,25 +488,34 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
                           ? (p.reentry_price ? `resting @ ${fmtMoney(p.reentry_price)}` : "resting")
                           : "—"}
                     </td>
-                    {/* When the re-entry filled (Back in only). */}
+                    ),
+                    fill_time: (
                     <td className={`${td} text-right num`} style={{ color: "var(--text-2)" }}>
                       {p.reentry_status === "filled" ? fmtTime(p.reentry_filled_at) : "—"}
                     </td>
+                    ),
+                    change_sh: (
                     <td className={`${td} text-right num`} style={{
                       color: changePerSh == null ? "var(--muted)" : changePerSh > 0 ? "var(--good)" : changePerSh < 0 ? "var(--bad)" : "var(--text-2)",
                     }}>
                       {changePerSh == null ? "—" : `${changePerSh > 0 ? "+" : ""}${changePerSh.toFixed(2)}`}
                     </td>
+                    ),
+                    pct: (
                     <td className={`${td} text-right num`} style={{
                       color: pctVsExit == null ? "var(--muted)" : pctVsExit > 0 ? "var(--good)" : pctVsExit < 0 ? "var(--bad)" : "var(--text-2)",
                     }} title="Current price vs exit price">
                       {pctVsExit == null ? "—" : `${pctVsExit > 0 ? "+" : ""}${pctVsExit.toFixed(2)}%`}
                     </td>
+                    ),
+                    status: (
                     <td className={td}>
                       <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: st.bg, color: st.color }}>
                         {st.label}
                       </span>
                     </td>
+                    ),
+                    reenter: (
                     <td className={`${td} text-right`}>
                       <div className="inline-flex items-center gap-2 justify-end whitespace-nowrap">
                         <div className="inline-flex items-stretch rounded-md overflow-hidden"
@@ -524,6 +572,11 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
                         </button>
                       </div>
                     </td>
+                    ),
+                };
+                return (
+                  <tr key={rowKey} style={{ borderBottom: "1px solid var(--border)", opacity: p.reentry_status === "expired" ? 0.55 : 1 }}>
+                    {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                   </tr>
                 );
               })}
