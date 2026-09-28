@@ -241,6 +241,14 @@ def running_trader_ids() -> set[uuid.UUID]:
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
+# After this many consecutive cycles that never established a real socket, treat
+# the account as persistently unavailable — its broker stream is almost always
+# held by another client (same account connected elsewhere) or perpetually 429'd.
+# Retrying every 60s forever just hammers the broker (each attempt triggers
+# alpaca-py's internal reconnect storm), so widen the cap to back off far harder.
+# Recovery still happens within one _BACKOFF_STUCK_MAX window once the slot frees.
+_STUCK_AFTER = 5
+_BACKOFF_STUCK_MAX = 300.0  # 5 min — vs 60s for a normally-flapping connection
 
 
 async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
@@ -253,6 +261,7 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
     # all logs. Survives any number of inner-loop iterations.
     connect_attempts = 0
     handler_calls = 0
+    stuck_cycles = 0  # consecutive cycles that never established a real socket
     while True:
         connect_attempts += 1
         connected_ok = {"v": False}  # flipped by the watchdog on a real socket
@@ -394,19 +403,32 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             log.exception("listener[%s] error: %s", trader_user_id, exc)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 
-        # Reconnect with exponential backoff capped at 60s. Reset only when the
-        # socket genuinely came up this cycle; otherwise grow — so an account
-        # that can never connect (e.g. perpetually 429'd) backs off to 60s
-        # instead of retrying every ~1s and hammering Alpaca.
+        # Reconnect with exponential backoff. Reset only when the socket
+        # genuinely came up this cycle; otherwise grow — so an account that can
+        # never connect (e.g. perpetually 429'd) backs off instead of retrying
+        # every ~1s and hammering Alpaca. Once it's been stuck for _STUCK_AFTER
+        # straight cycles the cap widens from 60s to _BACKOFF_STUCK_MAX, cutting
+        # the retry (and 429) rate ~5x for a stream that's held elsewhere.
         if connected_ok["v"]:
             backoff = _BACKOFF_INITIAL
+            stuck_cycles = 0
+        else:
+            stuck_cycles += 1
+            if stuck_cycles == _STUCK_AFTER:
+                log.warning(
+                    "listener[%s] persistently unavailable after %d cycles — widening "
+                    "backoff cap to %.0fs. The account's broker stream is likely held by "
+                    "another client (same account connected elsewhere) or perpetually 429'd.",
+                    trader_user_id, _STUCK_AFTER, _BACKOFF_STUCK_MAX,
+                )
+        cap = _BACKOFF_MAX if stuck_cycles < _STUCK_AFTER else _BACKOFF_STUCK_MAX
         log.info(
-            "listener[%s] sleeping %.1fs before reconnect attempt #%d (connected=%s)",
-            trader_user_id, backoff, connect_attempts + 1, connected_ok["v"],
+            "listener[%s] sleeping %.1fs before reconnect attempt #%d (connected=%s, stuck_cycles=%d)",
+            trader_user_id, backoff, connect_attempts + 1, connected_ok["v"], stuck_cycles,
         )
         await asyncio.sleep(backoff)
         if not connected_ok["v"]:
-            backoff = min(_BACKOFF_MAX, backoff * 2)
+            backoff = min(cap, backoff * 2)
 
 
 async def _reconnect_watchdog(
