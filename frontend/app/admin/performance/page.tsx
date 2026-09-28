@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useTableColumns, type ColumnDef, type ResolvedColumn, type TableColumns } from "@/lib/useTableColumns";
+import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -134,42 +136,6 @@ function successRatio(f: Fanout): number {
   return f.subscribers.total > 0 ? f.subscribers.submitted / f.subscribers.total : -1;
 }
 
-// Clickable header cell for the fanout table.
-function PerfTh({
-  label, colKey, sortKey, sortDir, onSort,
-}: {
-  label: string;
-  colKey: PerfSortKey;
-  sortKey: PerfSortKey;
-  sortDir: "asc" | "desc";
-  onSort: (k: PerfSortKey) => void;
-}) {
-  const active = sortKey === colKey;
-  return (
-    <th
-      onClick={() => onSort(colKey)}
-      className="px-3 py-3 text-left text-xs font-semibold cursor-pointer select-none whitespace-nowrap"
-      style={{ color: active ? "var(--text-2)" : "var(--muted)" }}
-      title={`Sort by ${label}`}
-    >
-      {label}
-      <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.4 }}>
-        {active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}
-      </span>
-    </th>
-  );
-}
-
-// Non-sortable header cell — for the timestamp/lag columns mirrored from the
-// trader Performance table (sorting them by wall-clock adds little value).
-function PlainTh({ label }: { label: string }) {
-  return (
-    <th className="px-3 py-3 text-left text-xs font-semibold whitespace-nowrap" style={{ color: "var(--muted)" }}>
-      {label}
-    </th>
-  );
-}
-
 // Broker-lag min/avg/max across a fanout's subscriber children, with which
 // broker hit the min/max. Mirrors the trader Performance table. avgBroker is
 // only labelled when every contributing child shares one broker.
@@ -201,13 +167,94 @@ function brokerLagStats(children: ChildOrder[]): {
 }
 
 // ── Expandable fanout row ──────────────────────────────────────────────────────
-function FanoutRow({ fanout }: { fanout: Fanout }) {
+function FanoutRow({ fanout, cols }: { fanout: Fanout; cols: TableColumns }) {
   const [open, setOpen] = useState(false);
   const successRate = fanout.subscribers.total > 0
     ? Math.round((fanout.subscribers.submitted / fanout.subscribers.total) * 100)
     : 0;
   const blStats = brokerLagStats(fanout.children);
 
+  const cell: Record<string, ReactNode> = {
+        symbol: (
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          <span style={{ marginRight: 6, color: "var(--muted)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <span className="font-semibold">{fanoutSymbolLabel(fanout)}</span>
+        </td>
+        ),
+        qty: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--text-2)" }}>{Number(fanout.quantity)}</td>,
+        side: (
+        <td className="px-3 py-2.5">
+          <span className="text-xs font-semibold uppercase" style={{ color: fanout.side === "buy" ? "#22c55e" : "#ef4444" }}>
+            {fanout.side}
+          </span>
+        </td>
+        ),
+        order_type: (
+        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)" }}>
+          {orderTypeLabel(fanout.order_type)}
+        </td>
+        ),
+        status: (
+        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)", textTransform: "capitalize" }}>
+          {(fanout.status || "").replace(/_/g, " ") || "—"}
+        </td>
+        ),
+        expected_price: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>,
+        filled_price: <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>,
+        filled_at: <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtClock(fanout.filled_at)}</td>,
+        trader: (
+        <td className="px-3 py-2.5 text-xs" style={{ color: "var(--text-2)" }}>
+          {fanout.trader_display_name ?? fanout.trader_email ?? "—"}
+          {fanout.trader_email && (
+            <div className="text-xs" style={{ color: "var(--muted)" }}>{fanout.trader_email}</div>
+          )}
+        </td>
+        ),
+        date: <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtDate(fanout.broker_accepted_at ?? fanout.detected_at)}</td>,
+        trader_submitted: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.trader_submitted_at)}</td>,
+        broker_accepted: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.broker_accepted_at)}</td>,
+        trader_listened: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.socket_received_at)}</td>,
+        db_saved: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.detected_at)}</td>,
+        published: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.redis_published_at)}</td>,
+        all_subs: <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.fanout_completed_at)}</td>,
+        api_to_broker: <td className="px-3 py-2.5">{ms(fanout.api_to_broker_lag_ms)}</td>,
+        ui_lag: <td className="px-3 py-2.5">{ms(fanout.publish_lag_ms)}</td>,
+        detection: <td className="px-3 py-2.5">{ms(fanout.detection_lag_ms)}</td>,
+        fanout_dur: <td className="px-3 py-2.5">{ms(fanout.fanout_duration_ms)}</td>,
+        total: <td className="px-3 py-2.5">{ms(fanout.total_ms)}</td>,
+        lowest_bl: (
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.min)}
+          {blStats.minBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.minBroker})</span>}
+        </td>
+        ),
+        avg_bl: (
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.avg)}
+          {blStats.avgBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.avgBroker})</span>}
+        </td>
+        ),
+        highest_bl: (
+        <td className="px-3 py-2.5 whitespace-nowrap">
+          {ms(blStats.max)}
+          {blStats.maxBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.maxBroker})</span>}
+        </td>
+        ),
+        subscribers: (
+        <td className="px-3 py-2.5">
+          <SubscriberPill counts={fanout.subscribers} />
+        </td>
+        ),
+        success: (
+        <td className="px-3 py-2.5 text-xs font-medium" style={{
+          color: fanout.subscribers.total === 0 ? "var(--muted)"
+               : successRate === 100 ? "var(--good)"
+               : successRate >= 50 ? "#facc15" : "var(--bad)",
+        }}>
+          {fanout.subscribers.total === 0 ? "—" : `${successRate}%`}
+        </td>
+        ),
+  };
   return (
     <>
       {/* Parent row */}
@@ -217,97 +264,13 @@ function FanoutRow({ fanout }: { fanout: Fanout }) {
         style={{ borderBottom: "1px solid var(--border)" }}
         title="Click to see per-subscriber breakdown"
       >
-        <td className="px-3 py-2.5 whitespace-nowrap">
-          <span style={{ marginRight: 6, color: "var(--muted)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
-          <span className="font-semibold">{fanoutSymbolLabel(fanout)}</span>
-        </td>
-
-        {/* Qty — Number() strips the trailing zeros from the Numeric(18,6)
-            string ("3.000000" → "3"), while keeping real fractions ("2.5"). */}
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--text-2)" }}>{Number(fanout.quantity)}</td>
-
-        {/* Side — buy (green) / sell (red) */}
-        <td className="px-3 py-2.5">
-          <span className="text-xs font-semibold uppercase" style={{ color: fanout.side === "buy" ? "#22c55e" : "#ef4444" }}>
-            {fanout.side}
-          </span>
-        </td>
-
-        {/* Order type — Market / Limit / Stop */}
-        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-          {orderTypeLabel(fanout.order_type)}
-        </td>
-
-        {/* Trader's order status */}
-        <td className="px-3 py-2.5 text-xs whitespace-nowrap" style={{ color: "var(--text-2)", textTransform: "capitalize" }}>
-          {(fanout.status || "").replace(/_/g, " ") || "—"}
-        </td>
-
-        {/* Expected (limit) vs filled price */}
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtPrice(fanout.expected_price)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums">{fmtPrice(fanout.filled_avg_price)}</td>
-        {/* Filled At — when the trader's order actually filled */}
-        <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtClock(fanout.filled_at)}</td>
-
-        {/* Trader */}
-        <td className="px-3 py-2.5 text-xs" style={{ color: "var(--text-2)" }}>
-          {fanout.trader_display_name ?? fanout.trader_email ?? "—"}
-          {fanout.trader_email && (
-            <div className="text-xs" style={{ color: "var(--muted)" }}>{fanout.trader_email}</div>
-          )}
-        </td>
-
-        {/* Trade date (ET) — the timestamp columns show time-of-day only. */}
-        <td className="px-3 py-2.5 text-xs tabular-nums whitespace-nowrap" style={{ color: "var(--muted)" }}>{fmtDate(fanout.broker_accepted_at ?? fanout.detected_at)}</td>
-
-        {/* Timeline timestamps (HH:MM:SS.mmm ET) — mirrors the trader table. */}
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.trader_submitted_at)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.broker_accepted_at)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.socket_received_at)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.detected_at)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.redis_published_at)}</td>
-        <td className="px-3 py-2.5 text-xs tabular-nums" style={{ color: "var(--muted)" }}>{fmtClock(fanout.fanout_completed_at)}</td>
-
-        {/* Lags */}
-        <td className="px-3 py-2.5">{ms(fanout.api_to_broker_lag_ms)}</td>
-        <td className="px-3 py-2.5">{ms(fanout.publish_lag_ms)}</td>
-        <td className="px-3 py-2.5">{ms(fanout.detection_lag_ms)}</td>
-        <td className="px-3 py-2.5">{ms(fanout.fanout_duration_ms)}</td>
-        <td className="px-3 py-2.5">{ms(fanout.total_ms)}</td>
-
-        {/* Broker lag min / avg / max across subscriber children */}
-        <td className="px-3 py-2.5 whitespace-nowrap">
-          {ms(blStats.min)}
-          {blStats.minBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.minBroker})</span>}
-        </td>
-        <td className="px-3 py-2.5 whitespace-nowrap">
-          {ms(blStats.avg)}
-          {blStats.avgBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.avgBroker})</span>}
-        </td>
-        <td className="px-3 py-2.5 whitespace-nowrap">
-          {ms(blStats.max)}
-          {blStats.maxBroker && <span className="ml-1.5 text-[10px]" style={{ color: "var(--muted)" }}>({blStats.maxBroker})</span>}
-        </td>
-
-        {/* Subscribers — same pill as the trader Performance table */}
-        <td className="px-3 py-2.5">
-          <SubscriberPill counts={fanout.subscribers} />
-        </td>
-
-        {/* Success rate */}
-        <td className="px-3 py-2.5 text-xs font-medium" style={{
-          color: fanout.subscribers.total === 0 ? "var(--muted)"
-               : successRate === 100 ? "var(--good)"
-               : successRate >= 50 ? "#facc15" : "var(--bad)",
-        }}>
-          {fanout.subscribers.total === 0 ? "—" : `${successRate}%`}
-        </td>
+        {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? <td className="px-3 py-2.5" />}</Fragment>)}
       </tr>
 
       {/* Expanded: full-width per-subscriber drawer (trader-table pattern). */}
       {open && (
         <tr style={{ background: "var(--panel-2)" }}>
-          <td colSpan={26} className="px-4 py-2.5">
+          <td colSpan={cols.columns.length} className="px-4 py-2.5">
             {/* Shared with the trader Performance view so admins see the exact
                 same per-subscriber columns — no second copy to keep in sync. */}
             <SubscriberBreakdown mirrors={fanout.children} />
@@ -327,6 +290,44 @@ export default function AdminPerformancePage() {
   const [side, setSide]       = useState<"all" | "buy" | "sell">("all");
   const [sortKey, setSortKey] = useState<PerfSortKey>("time");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  // Configurable columns (per-user, synced). Trade (symbol) is locked — it holds
+  // the expand caret. This table is 26 columns wide, so show/hide is the point.
+  const columnDefs = useMemo<ColumnDef[]>(() => [
+    { id: "symbol", header: "Trade", locked: true },
+    { id: "qty", header: "Qty" },
+    { id: "side", header: "Side" },
+    { id: "order_type", header: "Order Type" },
+    { id: "status", header: "Status" },
+    { id: "expected_price", header: "Expected Price" },
+    { id: "filled_price", header: "Filled Price" },
+    { id: "filled_at", header: "Filled At" },
+    { id: "trader", header: "Trader" },
+    { id: "date", header: "Date" },
+    { id: "trader_submitted", header: "Trader Submitted At" },
+    { id: "broker_accepted", header: "Broker Accepted At" },
+    { id: "trader_listened", header: "Trader Listened At" },
+    { id: "db_saved", header: "DB Saved At" },
+    { id: "published", header: "Published For Subs At" },
+    { id: "all_subs", header: "All Subs Completed At" },
+    { id: "api_to_broker", header: "API→Broker" },
+    { id: "ui_lag", header: "UI Notification Lag" },
+    { id: "detection", header: "Detection Lag" },
+    { id: "fanout_dur", header: "Fanout Duration" },
+    { id: "total", header: "Total Time" },
+    { id: "lowest_bl", header: "Lowest Broker Lag" },
+    { id: "avg_bl", header: "Average Broker Lag" },
+    { id: "highest_bl", header: "Highest Broker Lag" },
+    { id: "subscribers", header: "Subscribers" },
+    { id: "success", header: "Success" },
+  ], []);
+  const cols = useTableColumns("admin_performance", columnDefs);
+  // Which columns are sortable, and their sort key.
+  const SORT_KEY: Record<string, PerfSortKey> = {
+    symbol: "symbol", trader: "trader", broker_accepted: "time",
+    detection: "detection", fanout_dur: "fanout", total: "total",
+    subscribers: "subscribers", success: "success",
+  };
 
   // The table filters q/side in the browser; the export is built server-side,
   // so pass them along or the file won't match what's on screen.
@@ -478,6 +479,8 @@ export default function AdminPerformancePage() {
           {/* One row per subscriber mirror. Ignores the "Last N" selector on
               purpose — that bounds the on-screen table, not the export. */}
           <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-fanouts.xlsx" />
+          {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
+          <ColumnsMenu cols={cols} />
         </div>
       </div>
 
@@ -519,36 +522,28 @@ export default function AdminPerformancePage() {
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
-                <PerfTh label="Trade"            colKey="symbol"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PlainTh label="Qty" />
-                <PlainTh label="Side" />
-                <PlainTh label="Order Type" />
-                <PlainTh label="Status" />
-                <PlainTh label="Expected Price" />
-                <PlainTh label="Filled Price" />
-                <PlainTh label="Filled At" />
-                <PerfTh label="Trader"           colKey="trader"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PlainTh label="Date" />
-                <PlainTh label="Trader Submitted At" />
-                <PerfTh label="Broker Accepted At" colKey="time"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PlainTh label="Trader Listened At" />
-                <PlainTh label="DB Saved At" />
-                <PlainTh label="Published For Subs At" />
-                <PlainTh label="All Subs Completed At" />
-                <PlainTh label="API→Broker" />
-                <PlainTh label="UI Notification Lag" />
-                <PerfTh label="Detection Lag"    colKey="detection"   sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PerfTh label="Fanout Duration"  colKey="fanout"      sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PerfTh label="Total Time"       colKey="total"       sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PlainTh label="Lowest Broker Lag" />
-                <PlainTh label="Average Broker Lag" />
-                <PlainTh label="Highest Broker Lag" />
-                <PerfTh label="Subscribers"      colKey="subscribers" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <PerfTh label="Success"          colKey="success"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                {cols.columns.map((c) => {
+                  const sk = SORT_KEY[c.id];
+                  const active = sk && sortKey === sk;
+                  const w = c.width;
+                  return (
+                    <th
+                      key={c.id}
+                      onClick={sk ? () => toggleSort(sk) : undefined}
+                      className={`relative px-3 py-3 text-left text-xs font-semibold whitespace-nowrap ${sk ? "cursor-pointer select-none" : ""}`}
+                      style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+                      title={sk ? `Sort by ${c.header}` : undefined}
+                    >
+                      {c.header}
+                      {sk && <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.4 }}>{active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}</span>}
+                      {!c.locked && <ResizeHandle minWidth={c.minWidth ?? 60} onResize={(px) => cols.setWidth(c.id, px)} />}
+                    </th>
+                  );
+                })}
               </tr>
             </thead>
             <tbody>
-              {visibleFanouts.map(f => <FanoutRow key={f.parent_order_id} fanout={f} />)}
+              {visibleFanouts.map(f => <FanoutRow key={f.parent_order_id} fanout={f} cols={cols} />)}
             </tbody>
           </table>
           </div>
