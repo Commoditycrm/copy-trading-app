@@ -250,6 +250,8 @@ export default function SimulationPage() {
   const [speed, setSpeed] = useState<number>(4);
   const [running, setRunning] = useState<boolean>(false);
   const [importMsg, setImportMsg] = useState<string | null>(null);
+  const [livePos, setLivePos] = useState<{ label: string; ticker: string; entry: number; qty: number }[]>([]);
+  const [posMsg, setPosMsg] = useState<string | null>(null);
   const [, setFrame] = useState<number>(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -462,6 +464,46 @@ export default function SimulationPage() {
     }
   };
 
+  const loadPositions = async () => {
+    setPosMsg("Loading your open positions…");
+    try {
+      const token = typeof window !== "undefined" ? window.localStorage.getItem(TOKEN_KEY) : null;
+      const res = await fetch("/api/positions", { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      if (!res.ok) {
+        setPosMsg(res.status === 401 || res.status === 403 ? "Log in as the trader first — live positions need authentication." : `Couldn't load positions (HTTP ${res.status}).`);
+        return;
+      }
+      const data = await res.json();
+      const arr: unknown[] = Array.isArray(data) ? data : (data?.positions ?? []);
+      const num = (v: unknown, d: number) => {
+        const n = parseFloat(String(v));
+        return isFinite(n) ? n : d;
+      };
+      const mapped = arr
+        .map((raw) => {
+          const p = raw as Record<string, unknown>;
+          const qty = Math.max(1, Math.round(Math.abs(num(p.quantity, 0))));
+          const entry = num(p.avg_entry_price ?? p.current_price, 0);
+          const isOpt = p.option_strike != null || String(p.instrument_type).toLowerCase() === "option";
+          const rightCh = p.option_right ? String(p.option_right).charAt(0).toUpperCase() : "";
+          const label = isOpt
+            ? `${p.symbol} ${p.option_strike ?? ""}${rightCh} ${p.option_expiry ?? ""} · ${qty} @ ${entry}`
+            : `${p.symbol} · ${qty} @ ${entry}`;
+          return { label, ticker: String(p.symbol ?? p.broker_symbol ?? "?"), entry: entry > 0 ? entry : 0.01, qty };
+        })
+        .filter((x) => x.entry > 0 && x.qty > 0);
+      if (!mapped.length) {
+        setLivePos([]);
+        setPosMsg("No open positions found on your account.");
+        return;
+      }
+      setLivePos(mapped);
+      setPosMsg(`Loaded ${mapped.length} open position${mapped.length > 1 ? "s" : ""} — pick one below to simulate.`);
+    } catch {
+      setPosMsg("Load failed — are you logged in on this domain?");
+    }
+  };
+
   // ── readouts ──
   const s = engRef.current;
   const gain = s ? ((s.price - s.entry) / s.entry) * 100 : 0;
@@ -533,6 +575,14 @@ export default function SimulationPage() {
               </div>
               <button className="btn primary block" onClick={importSettings}>⭳ Import live settings → this rule</button>
               {importMsg && <div className="importmsg">{importMsg}</div>}
+              <button className="btn block" onClick={loadPositions}>⭳ Load a live position</button>
+              {livePos.length > 0 && (
+                <select className="poslist" defaultValue="-1" onChange={(e) => { const i = parseInt(e.target.value); if (i >= 0) { const p = livePos[i]; setPos({ ticker: p.ticker, entry: p.entry, qty: p.qty }); } }}>
+                  <option value="-1" disabled>Choose a position…</option>
+                  {livePos.map((p, i) => (<option key={i} value={i}>{p.label}</option>))}
+                </select>
+              )}
+              {posMsg && <div className="importmsg">{posMsg}</div>}
             </div>
           </div>
 
@@ -663,6 +713,7 @@ const CSS = `
 .simx .rbadge.bad{background:#2a1413;color:#f87171}
 .simx .rbadge .via{color:#657481;font-size:11px}
 .simx .importmsg{font-size:11.5px;color:#38bdf8;background:#0f151a;border:1px solid #222c34;border-radius:7px;padding:7px 9px;line-height:1.5}
+.simx select.poslist{width:100%;font-size:12px;padding:6px 8px}
 .simx .rules{display:flex;flex-direction:column;gap:8px}
 .simx .rule{border:1px solid #222c34;border-radius:10px;background:#0f151a;padding:9px 10px}
 .simx .rule.active{border-color:#2dd4bf;box-shadow:0 0 0 1px #2dd4bf inset}
