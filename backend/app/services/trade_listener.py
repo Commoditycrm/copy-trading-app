@@ -423,10 +423,14 @@ async def _reconnect_watchdog(
     ``_run_forever`` then returns and the outer loop reconnects on its backoff.
     Uses ``stop_ws()`` (a coroutine), not ``stop()``, which would deadlock: the
     stream shares this event loop, and ``stop()`` blocks on ``.result()``."""
+    # Poll at 1.5s and act after 2 misses (~3s) — a healthy socket flips
+    # _running within the first check, so one grace check avoids false-stopping
+    # a slow connect while cutting the 429 hammer window (was ~8s) in more than
+    # half for an account that's genuinely stuck.
     stuck = 0
     while not stop.is_set():
         try:
-            await asyncio.wait_for(stop.wait(), timeout=2.0)
+            await asyncio.wait_for(stop.wait(), timeout=1.5)
             return  # clean connection torn down elsewhere
         except asyncio.TimeoutError:
             pass
@@ -437,7 +441,7 @@ async def _reconnect_watchdog(
             stuck = 0
         else:
             stuck += 1
-            if stuck >= 4:  # ~8s unable to establish → almost certainly 429
+            if stuck >= 2:  # ~3s unable to establish → almost certainly 429
                 log.warning(
                     "listener[%s] websocket stuck reconnecting (likely 429) — "
                     "stopping it so the outer loop backs off instead of hammering",
