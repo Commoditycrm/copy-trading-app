@@ -161,6 +161,24 @@ def _interval_for_broker(broker: BrokerName) -> float:
 # deleted accounts hang around but are harmless — just stale keys.
 _next_due_at: dict[uuid.UUID, float] = {}
 
+
+def poll_now(broker_account_id: uuid.UUID) -> None:
+    """Make this account due on the loop's next 1s wake.
+
+    The loop already runs every second and only does real work for accounts
+    whose per-broker interval has elapsed — 10s for Alpaca. That interval is
+    there to ration position reads, not to delay a KNOWN event, and after a
+    trim fills there is one: the remainder is unprotected until the stop
+    reconciler next runs, which measured 4-13s live.
+
+    Clearing the timer costs one extra sweep of one account, and only when a
+    trim actually filled. It cannot run the stop EARLY, which is the thing that
+    would matter: reconcile sizes the stop from the quantity the broker
+    actually reports, so a sell still settling simply leaves the stop for the
+    next pass, exactly as today.
+    """
+    _next_due_at.pop(broker_account_id, None)
+
 # Last-known-good P&L snapshot per broker account. When a live
 # ``_fetch_pnl_snapshot`` call fails (SnapTrade 429/404/timeout, a broker
 # hiccup — see the prod report of a daily limit that never tripped because
