@@ -24,6 +24,7 @@ from app.api import (
     subscribers,
     system as system_api,
     trades,
+    ui_prefs,
 )
 from app.config import get_settings
 from app.services import events as events_bus
@@ -144,6 +145,7 @@ def create_app() -> FastAPI:
     app.include_router(market_data_api.router)
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
+    app.include_router(ui_prefs.router)
 
     # Shared across the startup/shutdown hooks so the retry scheduler
     # thread can be signalled to exit cleanly when uvicorn shuts down.
