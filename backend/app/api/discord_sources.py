@@ -1491,6 +1491,29 @@ def _execute_signal(
                 added_price=p.limit_price,
             )
 
+    # A trim leaves a REMAINDER, and that remainder is unprotected until the
+    # stop reconciler next runs — up to the account's whole poll interval (10s
+    # on Alpaca; 4-13s measured live). The interval exists to ration position
+    # reads, not to delay a known event, and a filled trim is a known event.
+    #
+    # Only once the sell is actually FILLED. Reconcile sizes the stop from the
+    # quantity the BROKER reports, so poking it while the sell is still
+    # settling would size the stop to the whole position and block that very
+    # sell — the reservation problem the release-then-replace order exists for.
+    # Unfilled simply falls through to the normal tick, exactly as today.
+    from app.models.order import OrderStatus  # noqa: PLC0415 — local elsewhere too
+
+    if is_trim and order.status is OrderStatus.FILLED:
+        try:
+            from app.services.pnl_poller import poll_now  # noqa: PLC0415
+
+            poll_now(resolved.broker_account_id)
+        except Exception:  # noqa: BLE001
+            # The stop still gets placed on the next tick; this only ever
+            # makes it sooner, so a failure here must not fail the trim.
+            log.warning("discord: could not expedite the stop for %s", p.symbol,
+                        exc_info=True)
+
     discord_execution.mark_executed(msg, order.id)
     log.info("discord: alert %s placed as order %s%s", msg.id, order.id,
              f" ({detail})" if detail else "")
