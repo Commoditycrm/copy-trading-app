@@ -128,7 +128,50 @@ function fmtPrice(p: string | null) {
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-type PerfSortKey = "symbol" | "instrument" | "trader" | "time" | "subscribers" | "success" | "detection" | "fanout" | "total";
+// Every column is sortable — the key IS the column id.
+type PerfSortKey =
+  | "symbol" | "qty" | "side" | "order_type" | "status"
+  | "expected_price" | "filled_price" | "filled_at"
+  | "trader" | "date" | "trader_submitted" | "broker_accepted"
+  | "trader_listened" | "db_saved" | "published" | "all_subs"
+  | "api_to_broker" | "ui_lag" | "detection" | "fanout_dur" | "total"
+  | "lowest_bl" | "avg_bl" | "highest_bl" | "subscribers" | "success";
+
+// Sort value for a fanout row by column. Strings compare case-insensitively;
+// numbers/timestamps use -1 for missing so blanks sink on a descending sort.
+function perfSortValue(f: Fanout, key: PerfSortKey): number | string {
+  const t = (iso: string | null) => (iso ? new Date(iso).getTime() : -1);
+  const n = (v: number | null) => (v ?? -1);
+  const price = (v: string | null) => { const x = Number(v); return v != null && Number.isFinite(x) ? x : -1; };
+  switch (key) {
+    case "symbol":           return fanoutSymbolLabel(f).toUpperCase();
+    case "qty":              return Number(f.quantity) || 0;
+    case "side":             return f.side;
+    case "order_type":       return f.order_type;
+    case "status":           return f.status;
+    case "expected_price":   return price(f.expected_price);
+    case "filled_price":     return price(f.filled_avg_price);
+    case "filled_at":        return t(f.filled_at);
+    case "trader":           return (f.trader_display_name ?? f.trader_email ?? "").toUpperCase();
+    case "date":             return t(f.broker_accepted_at ?? f.detected_at);
+    case "trader_submitted": return t(f.trader_submitted_at);
+    case "broker_accepted":  return t(f.broker_accepted_at);
+    case "trader_listened":  return t(f.socket_received_at);
+    case "db_saved":         return t(f.detected_at);
+    case "published":        return t(f.redis_published_at);
+    case "all_subs":         return t(f.fanout_completed_at);
+    case "api_to_broker":    return n(f.api_to_broker_lag_ms);
+    case "ui_lag":           return n(f.publish_lag_ms);
+    case "detection":        return n(f.detection_lag_ms);
+    case "fanout_dur":       return n(f.fanout_duration_ms);
+    case "total":            return n(f.total_ms);
+    case "lowest_bl":        return n(brokerLagStats(f.children).min);
+    case "avg_bl":           return n(brokerLagStats(f.children).avg);
+    case "highest_bl":       return n(brokerLagStats(f.children).max);
+    case "subscribers":      return f.subscribers.total;
+    case "success":          return successRatio(f);
+  }
+}
 
 // Per-fanout mirror success ratio (submitted / total). -1 when no subscribers,
 // so those sort to the bottom on a descending sort.
@@ -288,7 +331,7 @@ export default function AdminPerformancePage() {
   const [limit, setLimit]     = useState(50);
   const [q, setQ]             = useState("");                              // search: symbol / trader
   const [side, setSide]       = useState<"all" | "buy" | "sell">("all");
-  const [sortKey, setSortKey] = useState<PerfSortKey>("time");
+  const [sortKey, setSortKey] = useState<PerfSortKey>("broker_accepted");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
   // Configurable columns (per-user, synced). Trade (symbol) is locked — it holds
@@ -322,13 +365,6 @@ export default function AdminPerformancePage() {
     { id: "success", header: "Success" },
   ], []);
   const cols = useTableColumns("admin_performance", columnDefs);
-  // Which columns are sortable, and their sort key.
-  const SORT_KEY: Record<string, PerfSortKey> = {
-    symbol: "symbol", trader: "trader", broker_accepted: "time",
-    detection: "detection", fanout_dur: "fanout", total: "total",
-    subscribers: "subscribers", success: "success",
-  };
-
   // The table filters q/side in the browser; the export is built server-side,
   // so pass them along or the file won't match what's on screen.
   function exportEndpoint() {
@@ -379,11 +415,6 @@ export default function AdminPerformancePage() {
   });
   useEffect(() => () => { if (reloadTimer.current) clearTimeout(reloadTimer.current); }, []);
 
-  // Null lags/times sort as -1 so missing values sink to the bottom on
-  // a descending sort (where the interesting rows are).
-  const num = (v: number | null) => (v ?? -1);
-  const time = (iso: string | null) => (iso ? new Date(iso).getTime() : -1);
-
   const visibleFanouts = (data?.fanouts ?? [])
     .filter(f => {
       const needle = q.trim().toLowerCase();
@@ -396,19 +427,10 @@ export default function AdminPerformancePage() {
     })
     .sort((a, b) => {
       const dir = sortDir === "asc" ? 1 : -1;
-      switch (sortKey) {
-        case "symbol":      return a.symbol.localeCompare(b.symbol) * dir;
-        case "instrument":  return a.instrument_type.localeCompare(b.instrument_type) * dir;
-        case "success":     return (successRatio(a) - successRatio(b)) * dir;
-        case "trader":      return (a.trader_display_name ?? a.trader_email ?? "")
-                                     .localeCompare(b.trader_display_name ?? b.trader_email ?? "") * dir;
-        case "time":        return (time(a.broker_accepted_at) - time(b.broker_accepted_at)) * dir;
-        case "subscribers": return (a.subscribers.total - b.subscribers.total) * dir;
-        case "detection":   return (num(a.detection_lag_ms) - num(b.detection_lag_ms)) * dir;
-        case "fanout":      return (num(a.fanout_duration_ms) - num(b.fanout_duration_ms)) * dir;
-        case "total":       return (num(a.total_ms) - num(b.total_ms)) * dir;
-        default:            return 0;
-      }
+      const va = perfSortValue(a, sortKey);
+      const vb = perfSortValue(b, sortKey);
+      const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+      return cmp * dir;
     });
 
   const filtersActive = q.trim() !== "" || side !== "all";
@@ -523,19 +545,19 @@ export default function AdminPerformancePage() {
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr style={{ background: "rgba(255,255,255,0.03)", borderBottom: "1px solid var(--border)" }}>
                 {cols.columns.map((c) => {
-                  const sk = SORT_KEY[c.id];
-                  const active = sk && sortKey === sk;
+                  const sk = c.id as PerfSortKey;   // every column is sortable
+                  const active = sortKey === sk;
                   const w = c.width;
                   return (
                     <th
                       key={c.id}
-                      onClick={sk ? () => toggleSort(sk) : undefined}
-                      className={`relative px-3 py-3 text-left text-xs font-semibold whitespace-nowrap ${sk ? "cursor-pointer select-none" : ""}`}
+                      onClick={() => toggleSort(sk)}
+                      className="relative px-3 py-3 text-left text-xs font-semibold whitespace-nowrap cursor-pointer select-none"
                       style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
-                      title={sk ? `Sort by ${c.header}` : undefined}
+                      title={`Sort by ${c.header}`}
                     >
                       {c.header}
-                      {sk && <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.4 }}>{active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}</span>}
+                      <span style={{ marginLeft: 5, fontSize: 10, opacity: active ? 1 : 0.4 }}>{active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}</span>
                       {!c.locked && <ResizeHandle minWidth={c.minWidth ?? 60} onResize={(px) => cols.setWidth(c.id, px)} />}
                     </th>
                   );
