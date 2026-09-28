@@ -1,17 +1,20 @@
 "use client";
 
 /**
- * Configurable trim-ladder SIMULATION — a self-contained, isolated tool page.
+ * Configurable trim-ladder SIMULATION — self-contained, isolated tool page.
  *
- * It does NOT touch any production logic, schema, or component. It mirrors the
- * Discord exit-ladder behaviour in the browser so a tester can configure any
- * number of stages (target %, sell % of remaining, optional fixed stop, optional
- * trailing stop) and watch how a synthetic price path drives the trims and stops.
+ * Changes nothing in production. It mirrors the Discord exit-ladder behaviour
+ * in the browser so a tester can define ladders PER TICKER and PER TRANSACTION
+ * SIZE (e.g. AAPL vs everything else, split at a $ threshold), set a position's
+ * ticker/entry/qty, and watch the resolved ladder trim the position in portions
+ * while fixed/trailing stops manage the remainder.
  *
- * Public route (outside the (app) auth group). The one network call is the
- * read-only "Import my live settings" button → GET /api/discord-sources/settings,
- * which only works when a trader is logged in on this domain (uses the stored
- * bearer token). Nothing here writes to the server.
+ * NOTE: the live backend currently uses ONE GLOBAL ladder per trader — per-ticker
+ * / per-size ladders are modelled here for design only. The read-only "Import my
+ * live settings" button pulls that single global ladder into the selected rule.
+ *
+ * Public route (outside the (app) auth group). The only network call is the
+ * read-only GET /api/discord-sources/settings. Nothing here writes to the server.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -25,17 +28,16 @@ type Stage = {
   trailOn: boolean;
   trailPct: number; // trailing stop, % below the highest price since it armed
 };
-type Ladder = {
-  entry: number;
-  qty: number;
-  initOn: boolean; // initial stop at entry — OFF by default
-  initPct: number; // signed % vs entry
-  stages: Stage[];
-};
+type Ladder = { initOn: boolean; initPct: number; stages: Stage[] };
+type Bucket = "under" | "over";
+type Rule = { id: string; ticker: string; bucket: Bucket; ladder: Ladder };
+type Position = { ticker: string; entry: number; qty: number };
+
 type TrimRow = { i: number; target: number; sold: number; px: number; left: number; stop: number | null; trail: number | null };
 type LogRow = { t: number; cls: string; m: string };
 type Eng = {
   L: Ladder;
+  ticker: string;
   dur: number;
   t: number;
   series: number[];
@@ -58,22 +60,26 @@ type Eng = {
   trims: TrimRow[];
 };
 
-// ─────────────────────────── config ───────────────────────────
-const EXAMPLE: Ladder = {
-  entry: 4.2,
-  qty: 100,
-  initOn: false,
-  initPct: -10,
-  stages: [
-    { target: 20, sell: 50, stopOn: true, stopPct: 0, trailOn: true, trailPct: 5 },
-    { target: 40, sell: 50, stopOn: true, stopPct: 10, trailOn: true, trailPct: 5 },
-    { target: 60, sell: 100, stopOn: false, stopPct: 0, trailOn: false, trailPct: 5 },
-  ],
-};
+// ─────────────────────────── example config (editable, per screenshot) ─────────
+const uid = () => Math.random().toString(36).slice(2, 9);
+const mkStage = (target: number, sell: number, stopOn: boolean, stopPct: number): Stage => ({
+  target,
+  sell,
+  stopOn,
+  stopPct,
+  trailOn: false,
+  trailPct: 5,
+});
+const EXAMPLE_RULES = (): Rule[] => [
+  { id: uid(), ticker: "AAPL", bucket: "under", ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 50, true, 0), mkStage(40, 50, true, 10), mkStage(60, 100, false, 0)] } },
+  { id: uid(), ticker: "AAPL", bucket: "over", ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 30, true, 0), mkStage(50, 50, true, 20), mkStage(80, 100, false, 0)] } },
+  { id: uid(), ticker: "ALL", bucket: "under", ladder: { initOn: false, initPct: -10, stages: [mkStage(15, 50, true, 0), mkStage(30, 50, true, 10), mkStage(50, 100, false, 0)] } },
+  { id: uid(), ticker: "ALL", bucket: "over", ladder: { initOn: true, initPct: -15, stages: [mkStage(25, 20, true, 0), mkStage(50, 50, true, 15), mkStage(75, 100, false, 0)] } },
+];
 
 type Scenario = { label: string; dur: number; path: [number, number][] };
 const SCENARIOS: Record<string, Scenario> = {
-  climb_hold: { label: "Climb to +70%, hold", dur: 200, path: [[0, 0], [150, 70], [200, 66]] },
+  climb_hold: { label: "Climb to +90%, hold", dur: 200, path: [[0, 0], [150, 90], [200, 86]] },
   climb_reverse: { label: "Climb +55%, reverse to +5%", dur: 200, path: [[0, 0], [95, 58], [135, 42], [200, 5]] },
   climb_crash: { label: "Climb +38% then crash to −18%", dur: 200, path: [[0, 0], [70, 40], [110, 26], [150, -15], [200, -18]] },
   drop: { label: "Straight drop −22% (initial-stop test)", dur: 140, path: [[0, 0], [100, -22], [140, -24]] },
@@ -83,6 +89,17 @@ const SCENARIOS: Record<string, Scenario> = {
 const TOKEN_KEY = "trading-app:access";
 const f2 = (n: number) => n.toFixed(2);
 const f0 = (n: number) => Math.round(n);
+
+// ─────────────────────────── rule resolution ───────────────────────────
+function resolveRule(rules: Rule[], ticker: string, size: number, threshold: number): { rule: Rule | null; via: "exact" | "all" | null; bucket: Bucket } {
+  const bucket: Bucket = size < threshold ? "under" : "over";
+  const tk = ticker.trim().toUpperCase();
+  const exact = rules.find((r) => r.ticker.trim().toUpperCase() === tk && r.bucket === bucket);
+  if (exact) return { rule: exact, via: "exact", bucket };
+  const all = rules.find((r) => r.ticker.trim().toUpperCase() === "ALL" && r.bucket === bucket);
+  if (all) return { rule: all, via: "all", bucket };
+  return { rule: null, via: null, bucket };
+}
 
 // ─────────────────────────── engine ───────────────────────────
 function makeSeries(path: [number, number][], dur: number, entry: number): number[] {
@@ -109,39 +126,36 @@ function makeSeries(path: [number, number][], dur: number, entry: number): numbe
   return out;
 }
 
-function initEngine(L: Ladder, sc: Scenario): Eng {
+function initEngine(ladder: Ladder, ticker: string, entry: number, qty: number, sc: Scenario): Eng {
   const eng: Eng = {
-    L: JSON.parse(JSON.stringify(L)),
+    L: JSON.parse(JSON.stringify(ladder)),
+    ticker,
     dur: sc.dur,
     t: 0,
-    series: makeSeries(sc.path, sc.dur, L.entry),
-    entry: L.entry,
-    qty: L.qty,
-    remaining: L.qty,
-    high: L.entry,
+    series: makeSeries(sc.path, sc.dur, entry),
+    entry,
+    qty,
+    remaining: qty,
+    high: entry,
     cur: 0,
     realized: 0,
     closed: false,
     fixed: { on: false, price: null },
     trail: { on: false, pct: 0 },
     lastTrailLog: 0,
-    price: L.entry,
-    priceHist: [L.entry],
-    highHist: [L.entry],
+    price: entry,
+    priceHist: [entry],
+    highHist: [entry],
     fixedHist: [null],
     trailHist: [null],
     logs: [],
     trims: [],
   };
-  if (L.initOn) {
-    eng.fixed = { on: true, price: +(L.entry * (1 + L.initPct / 100)).toFixed(4) };
-  }
+  if (ladder.initOn) eng.fixed = { on: true, price: +(entry * (1 + ladder.initPct / 100)).toFixed(4) };
   eng.logs.push({
     t: 0,
     cls: "buy",
-    m: `ENTRY — <b>${L.qty}</b> @ ${f2(L.entry)} — ${
-      L.initOn ? `STOP ${f2(eng.fixed.price as number)} (${L.initPct >= 0 ? "+" : ""}${L.initPct}%)` : "NO STOP"
-    }`,
+    m: `ENTRY — <b>${ticker || "?"}</b> — ${qty} @ ${f2(entry)} — ${ladder.initOn ? `STOP ${f2(eng.fixed.price as number)} (${ladder.initPct >= 0 ? "+" : ""}${ladder.initPct}%)` : "NO STOP"}`,
   });
   return eng;
 }
@@ -187,7 +201,7 @@ function fireStage(s: Eng, stg: Stage, idx: number, px: number) {
   if (s.remaining <= 0) s.closed = true;
 }
 
-function stepEngine(s: Eng) {
+function stepEngine(s: Eng): boolean {
   const px = s.series[s.t];
   s.price = px;
   if (px > s.high) s.high = px;
@@ -222,14 +236,16 @@ function stepEngine(s: Eng) {
   s.t++;
   if (s.t > s.dur) {
     s.logs.push({ t: s.t - 1, cls: "", m: s.remaining <= 0 ? "— position flat —" : `— ${s.remaining} still held at end —` });
-    return true; // done
+    return true;
   }
   return false;
 }
 
 // ─────────────────────────── component ───────────────────────────
 export default function SimulationPage() {
-  const [ladder, setLadder] = useState<Ladder>(() => JSON.parse(JSON.stringify(EXAMPLE)));
+  const [rules, setRules] = useState<Rule[]>(EXAMPLE_RULES);
+  const [threshold, setThreshold] = useState<number>(500);
+  const [pos, setPos] = useState<Position>({ ticker: "AAPL", entry: 4.2, qty: 100 });
   const [scenarioKey, setScenarioKey] = useState<string>("climb_reverse");
   const [speed, setSpeed] = useState<number>(4);
   const [running, setRunning] = useState<boolean>(false);
@@ -244,10 +260,13 @@ export default function SimulationPage() {
 
   const bump = () => setFrame((f) => f + 1);
 
+  const size = pos.entry * pos.qty;
+  const resolved = resolveRule(rules, pos.ticker, size, threshold);
+
   const draw = useCallback(() => {
     const s = engRef.current;
     const cv = canvasRef.current;
-    if (!s || !cv) return;
+    if (!cv) return;
     const ctx = cv.getContext("2d");
     if (!ctx) return;
     const dpr = window.devicePixelRatio || 1;
@@ -257,6 +276,7 @@ export default function SimulationPage() {
     cv.height = H * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
+    if (!s) return;
     const padL = 48, padR = 10, padT = 12, padB = 20, iw = W - padL - padR, ih = H - padT - padB;
     let lo = Infinity, hi = -Infinity;
     const push = (v: number | null) => {
@@ -347,7 +367,7 @@ export default function SimulationPage() {
     ctx.fill();
   }, []);
 
-  const stop = () => {
+  const stopTimer = () => {
     if (timerRef.current != null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -355,16 +375,17 @@ export default function SimulationPage() {
   };
 
   const reset = useCallback(() => {
-    stop();
+    stopTimer();
     setRunning(false);
-    engRef.current = initEngine(ladder, SCENARIOS[scenarioKey]);
+    const r = resolveRule(rules, pos.ticker, pos.entry * pos.qty, threshold);
+    engRef.current = r.rule ? initEngine(r.rule.ladder, pos.ticker, pos.entry, pos.qty, SCENARIOS[scenarioKey]) : null;
     draw();
     bump();
-  }, [ladder, scenarioKey, draw]);
+  }, [rules, pos, threshold, scenarioKey, draw]);
 
   useEffect(() => {
     reset();
-    return stop;
+    return stopTimer;
   }, [reset]);
 
   const loop = useCallback(() => {
@@ -375,7 +396,7 @@ export default function SimulationPage() {
     bump();
     if (done) {
       setRunning(false);
-      stop();
+      stopTimer();
       return;
     }
     timerRef.current = window.setTimeout(loop, 1000 / speedRef.current);
@@ -389,34 +410,39 @@ export default function SimulationPage() {
     timerRef.current = window.setTimeout(loop, 1000 / speedRef.current);
   };
 
-  // ── ladder editing helpers ──
-  const setPos = (patch: Partial<Ladder>) => setLadder((l) => ({ ...l, ...patch }));
-  const setStage = (i: number, patch: Partial<Stage>) =>
-    setLadder((l) => ({ ...l, stages: l.stages.map((s, j) => (j === i ? { ...s, ...patch } : s)) }));
-  const addStage = () =>
-    setLadder((l) => {
-      const last = l.stages[l.stages.length - 1];
-      return {
-        ...l,
-        stages: [...l.stages, { target: last ? last.target + 20 : 20, sell: 50, stopOn: false, stopPct: 0, trailOn: false, trailPct: 5 }],
-      };
-    });
-  const removeStage = (i: number) => setLadder((l) => ({ ...l, stages: l.stages.filter((_, j) => j !== i) }));
-  const resetExample = () => setLadder(JSON.parse(JSON.stringify(EXAMPLE)));
+  // ── editing helpers ──
+  const setRuleMeta = (id: string, patch: Partial<Pick<Rule, "ticker" | "bucket">>) =>
+    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const setRuleLadder = (id: string, patch: Partial<Ladder>) =>
+    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, ...patch } } : r)));
+  const setRuleStage = (id: string, i: number, patch: Partial<Stage>) =>
+    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, stages: r.ladder.stages.map((s, j) => (j === i ? { ...s, ...patch } : s)) } } : r)));
+  const addRuleStage = (id: string) =>
+    setRules((rs) =>
+      rs.map((r) => {
+        if (r.id !== id) return r;
+        const last = r.ladder.stages[r.ladder.stages.length - 1];
+        return { ...r, ladder: { ...r.ladder, stages: [...r.ladder.stages, mkStage(last ? last.target + 20 : 20, 50, false, 0)] } };
+      }),
+    );
+  const removeRuleStage = (id: string, i: number) =>
+    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, stages: r.ladder.stages.filter((_, j) => j !== i) } } : r)));
+  const addRule = () => setRules((rs) => [...rs, { id: uid(), ticker: "ALL", bucket: "under", ladder: { initOn: false, initPct: -10, stages: [mkStage(20, 50, true, 0)] } }]);
+  const removeRule = (id: string) => setRules((rs) => rs.filter((r) => r.id !== id));
+  const resetExample = () => setRules(EXAMPLE_RULES());
 
   const importSettings = async () => {
+    if (!resolved.rule) {
+      setImportMsg("No rule resolves for this ticker/size — add one first.");
+      return;
+    }
+    const targetId = resolved.rule.id;
     setImportMsg("Loading your live settings…");
     try {
       const token = typeof window !== "undefined" ? window.localStorage.getItem(TOKEN_KEY) : null;
-      const res = await fetch("/api/discord-sources/settings", {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
+      const res = await fetch("/api/discord-sources/settings", { headers: token ? { Authorization: `Bearer ${token}` } : {} });
       if (!res.ok) {
-        setImportMsg(
-          res.status === 401 || res.status === 403
-            ? "Log in as the trader first — live settings need authentication."
-            : `Couldn't load settings (HTTP ${res.status}).`,
-        );
+        setImportMsg(res.status === 401 || res.status === 403 ? "Log in as the trader first — live settings need authentication." : `Couldn't load settings (HTTP ${res.status}).`);
         return;
       }
       const s = await res.json();
@@ -425,27 +451,23 @@ export default function SimulationPage() {
         return isFinite(n) ? n : d;
       };
       const stages: Stage[] = [
-        { target: num(s.trim_profit_gate_pct, 20), sell: 50, stopOn: true, stopPct: num(s.trim_stop_pct, 25), trailOn: false, trailPct: 5 },
-        { target: num(s.trim2_profit_gate_pct, 0), sell: 50, stopOn: true, stopPct: num(s.trim2_stop_pct, 0), trailOn: false, trailPct: 5 },
-        { target: num(s.trim3_profit_gate_pct, 0), sell: 100, stopOn: false, stopPct: num(s.trim3_stop_pct, 0), trailOn: false, trailPct: 5 },
+        mkStage(num(s.trim_profit_gate_pct, 20), 50, true, num(s.trim_stop_pct, 25)),
+        mkStage(num(s.trim2_profit_gate_pct, 0), 50, true, num(s.trim2_stop_pct, 0)),
+        mkStage(num(s.trim3_profit_gate_pct, 0), 100, false, num(s.trim3_stop_pct, 0)),
       ];
-      setLadder((l) => ({ ...l, initOn: false, stages }));
-      setImportMsg(
-        `Imported live ladder (3 rungs). Sell % set to 50 / 50 / 100 (live sells half, half, all). ` +
-          `Live trailing was a $${s.trim_trail_amount ?? "?"} give-back above $${s.trim_price_threshold ?? "?"} — ` +
-          `re-enable trailing here as a % if you want to model it.`,
-      );
+      setRules((rs) => rs.map((r) => (r.id === targetId ? { ...r, ladder: { initOn: false, initPct: -10, stages } } : r)));
+      setImportMsg(`Imported the live global ladder into rule ${resolved.rule.ticker}/${resolved.bucket === "under" ? "<" : "≥"}$${threshold}. Sell % set 50/50/100; live trailing was a $${s.trim_trail_amount ?? "?"} give-back — set % here to model it.`);
     } catch {
       setImportMsg("Import failed — are you logged in on this domain?");
     }
   };
 
-  // ── derived readouts ──
+  // ── readouts ──
   const s = engRef.current;
   const gain = s ? ((s.price - s.entry) / s.entry) * 100 : 0;
   const stats: [string, string, string][] = s
     ? [
-        ["Entry", f2(s.entry), ""],
+        ["Ticker", s.ticker || "?", "sm"],
         ["Price", f2(s.price), s.price >= s.entry ? "pos" : "neg"],
         ["Profit", (gain >= 0 ? "+" : "") + gain.toFixed(1) + "%", gain >= 0 ? "pos" : "neg"],
         ["Remaining", `${s.remaining} / ${s.qty}`, ""],
@@ -457,150 +479,105 @@ export default function SimulationPage() {
       ]
     : [];
 
+  const stageEditor = (r: Rule) => (
+    <div className="stages">
+      {r.ladder.stages.map((st, i) => (
+        <div className="stagerow" key={i}>
+          <span className="sidx">S{i + 1}</span>
+          <label>target +%<input type="number" step="1" value={st.target} onChange={(e) => setRuleStage(r.id, i, { target: parseFloat(e.target.value) || 0 })} /></label>
+          <label>sell %<input type="number" step="5" min="0" max="100" value={st.sell} onChange={(e) => setRuleStage(r.id, i, { sell: parseFloat(e.target.value) || 0 })} /></label>
+          <label className="chk"><input type="checkbox" checked={st.stopOn} onChange={(e) => setRuleStage(r.id, i, { stopOn: e.target.checked })} />stop</label>
+          <label>@%<input type="number" step="5" value={st.stopPct} disabled={!st.stopOn} onChange={(e) => setRuleStage(r.id, i, { stopPct: parseFloat(e.target.value) || 0 })} /></label>
+          <label className="chk"><input type="checkbox" checked={st.trailOn} onChange={(e) => setRuleStage(r.id, i, { trailOn: e.target.checked })} />trail</label>
+          <label>%<input type="number" step="1" min="0" value={st.trailPct} disabled={!st.trailOn} onChange={(e) => setRuleStage(r.id, i, { trailPct: parseFloat(e.target.value) || 0 })} /></label>
+          <button className="rm" title="remove stage" onClick={() => removeRuleStage(r.id, i)}>✕</button>
+        </div>
+      ))}
+      <button className="btn tiny" onClick={() => addRuleStage(r.id)}>+ stage</button>
+    </div>
+  );
+
   return (
     <div className="simx">
       <style dangerouslySetInnerHTML={{ __html: CSS }} />
       <div className="wrap">
         <header>
           <div className="eyebrow">Kopyya · Internal Tool</div>
-          <h1>
-            Trim-Ladder Simulation <span className="tag-demo">SIMULATION</span>
-          </h1>
+          <h1>Trim-Ladder Simulation <span className="tag-demo">SIMULATION</span></h1>
           <p>
-            A self-contained testing tool — it changes nothing in the live system. Configure any number of stages (target %, sell % of
-            remaining, optional fixed stop, optional trailing stop), then run a synthetic price path and watch the position trim in
-            portions while the stops manage the remainder. Use <b>Import my live settings</b> to pull your real Discord ladder in.
+            Define ladders <b>per ticker</b> and <b>per transaction size</b>, set a position, and watch the resolved ladder trim it in
+            portions while fixed/trailing stops manage the remainder. It changes nothing in the live system.{" "}
+            <b>Note:</b> the live backend uses one global ladder today — per-ticker/size ladders are modelled here for design.
           </p>
         </header>
 
         <div className="cfgwrap">
           <div className="panel">
-            <h3>Position &amp; entry <span className="tag">no stop unless set</span></h3>
+            <h3>Position <span className="tag">what to simulate</span></h3>
             <div className="posrow">
-              <div className="f">
-                <label>Entry price</label>
-                <input type="number" step="0.1" min="0.01" value={ladder.entry} onChange={(e) => setPos({ entry: parseFloat(e.target.value) || 0.01 })} />
-              </div>
-              <div className="f">
-                <label>Quantity</label>
-                <input type="number" step="1" min="1" value={ladder.qty} onChange={(e) => setPos({ qty: Math.max(1, parseInt(e.target.value) || 1) })} />
-              </div>
+              <div className="f"><label>Ticker</label><input className="txt" type="text" value={pos.ticker} onChange={(e) => setPos({ ...pos, ticker: e.target.value })} /></div>
+              <div className="f"><label>Entry price</label><input type="number" step="0.1" min="0.01" value={pos.entry} onChange={(e) => setPos({ ...pos, entry: parseFloat(e.target.value) || 0.01 })} /></div>
+              <div className="f"><label>Quantity</label><input type="number" step="1" min="1" value={pos.qty} onChange={(e) => setPos({ ...pos, qty: Math.max(1, parseInt(e.target.value) || 1) })} /></div>
+              <div className="f"><label>Size threshold $</label><input type="number" step="50" min="0" value={threshold} onChange={(e) => setThreshold(parseFloat(e.target.value) || 0)} /></div>
               <div className="divider" />
-              <div className="initstop">
-                <span className="l">
-                  <input id="initOn" type="checkbox" checked={ladder.initOn} onChange={(e) => setPos({ initOn: e.target.checked })} />
-                  <label htmlFor="initOn">Initial stop</label>
-                </span>
-                <span>
-                  <input type="number" step="1" value={ladder.initPct} disabled={!ladder.initOn} onChange={(e) => setPos({ initPct: parseFloat(e.target.value) || 0 })} />{" "}
-                  <span className="unit">% vs entry</span>
-                </span>
+              <div className="resolved">
+                <div className="rsize">size = entry × qty = <b>${f0(size)}</b> → {resolved.bucket === "under" ? `< $${threshold}` : `≥ $${threshold}`}</div>
+                {resolved.rule ? (
+                  <div className="rbadge ok">
+                    ▶ ladder: <b>{resolved.rule.ticker}</b> / {resolved.bucket === "under" ? `<$${threshold}` : `≥$${threshold}`}
+                    {resolved.via === "all" && <span className="via"> (via ALL — no {pos.ticker.toUpperCase()} rule)</span>}
+                  </div>
+                ) : (
+                  <div className="rbadge bad">✗ no rule matches {pos.ticker.toUpperCase()} / {resolved.bucket} — add one</div>
+                )}
               </div>
-              <div className="note">
-                Default is <b>OFF</b> — a buy places no stop-loss unless you enable one. Negative % = below entry.
-              </div>
-              <div className="divider" />
-              <button className="btn primary block" onClick={importSettings}>
-                ⭳ Import my live settings
-              </button>
+              <button className="btn primary block" onClick={importSettings}>⭳ Import live settings → this rule</button>
               {importMsg && <div className="importmsg">{importMsg}</div>}
             </div>
           </div>
 
           <div className="panel">
-            <h3>Trim stages <span className="tag">add / remove — any number</span></h3>
-            <div className="stages">
-              {ladder.stages.map((st, i) => (
-                <div className="stagerow" key={i}>
-                  <span className="sidx">S{i + 1}</span>
-                  <label>
-                    target +%
-                    <input type="number" step="1" value={st.target} onChange={(e) => setStage(i, { target: parseFloat(e.target.value) || 0 })} />
-                  </label>
-                  <label>
-                    sell %
-                    <input type="number" step="5" min="0" max="100" value={st.sell} onChange={(e) => setStage(i, { sell: parseFloat(e.target.value) || 0 })} />
-                  </label>
-                  <label className="chk">
-                    <input type="checkbox" checked={st.stopOn} onChange={(e) => setStage(i, { stopOn: e.target.checked })} />
-                    stop
-                  </label>
-                  <label>
-                    @%
-                    <input type="number" step="5" value={st.stopPct} disabled={!st.stopOn} onChange={(e) => setStage(i, { stopPct: parseFloat(e.target.value) || 0 })} />
-                  </label>
-                  <label className="chk">
-                    <input type="checkbox" checked={st.trailOn} onChange={(e) => setStage(i, { trailOn: e.target.checked })} />
-                    trail
-                  </label>
-                  <label>
-                    %
-                    <input type="number" step="1" min="0" value={st.trailPct} disabled={!st.trailOn} onChange={(e) => setStage(i, { trailPct: parseFloat(e.target.value) || 0 })} />
-                  </label>
-                  <button className="rm" title="remove" onClick={() => removeStage(i)}>
-                    ✕
-                  </button>
-                </div>
-              ))}
+            <h3>Ladder rules <span className="tag">per ticker · per size — add / remove</span></h3>
+            <div className="rules">
+              {rules.map((r) => {
+                const active = resolved.rule?.id === r.id;
+                return (
+                  <div className={"rule" + (active ? " active" : "")} key={r.id}>
+                    <div className="rulehead">
+                      {active && <span className="live">● active</span>}
+                      <label className="rl">ticker<input className="txt sm" type="text" value={r.ticker} onChange={(e) => setRuleMeta(r.id, { ticker: e.target.value })} /></label>
+                      <label className="rl">size<select value={r.bucket} onChange={(e) => setRuleMeta(r.id, { bucket: e.target.value as Bucket })}><option value="under">&lt; threshold</option><option value="over">≥ threshold</option></select></label>
+                      <label className="rl chk2"><input type="checkbox" checked={r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initOn: e.target.checked })} />init stop</label>
+                      <label className="rl">@%<input type="number" step="1" value={r.ladder.initPct} disabled={!r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initPct: parseFloat(e.target.value) || 0 })} /></label>
+                      <button className="rm big" title="remove rule" onClick={() => removeRule(r.id)}>✕</button>
+                    </div>
+                    {stageEditor(r)}
+                  </div>
+                );
+              })}
             </div>
-            <button className="btn tiny" onClick={addStage}>
-              + Add stage
-            </button>
-            <button className="btn tiny" style={{ marginLeft: 6 }} onClick={resetExample}>
-              ↺ example
-            </button>
-            <div className="note">
-              Each stage fires when profit reaches its <b>target %</b>, sells that <b>% of the remaining</b> position, then sets an optional
-              fixed <b>stop</b> (% vs entry; +ve locks profit, 0 = break-even) and/or a <b>trailing</b> stop. A stage selling 100% exits fully.
-            </div>
+            <button className="btn tiny" onClick={addRule}>+ Add rule</button>
+            <button className="btn tiny" style={{ marginLeft: 6 }} onClick={resetExample}>↺ example (from the table)</button>
+            <div className="note">A position resolves to the rule matching its <b>ticker</b> + <b>size bucket</b>; if no exact ticker rule exists it falls back to <b>ALL</b>. Each stage fires at its <b>target %</b>, sells that <b>% of remaining</b>, then sets an optional fixed <b>stop</b> and/or <b>trailing</b> stop. 100% sell exits fully.</div>
           </div>
         </div>
 
         <div className="controls">
-          <div>
-            <label className="cl">Price path</label>
-            <select value={scenarioKey} onChange={(e) => setScenarioKey(e.target.value)}>
-              {Object.entries(SCENARIOS).map(([k, v]) => (
-                <option key={k} value={k}>
-                  {v.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="cl">Speed</label>
-            <div className="seg">
-              {[1, 4, 20].map((sp) => (
-                <button key={sp} className={speed === sp ? "on" : ""} onClick={() => setSpeed(sp)}>
-                  {sp}×
-                </button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label className="cl">&nbsp;</label>
-            <button className="btn primary" onClick={run} disabled={running}>
-              {running ? "● Running…" : "▶ Run"}
-            </button>
-          </div>
-          <div>
-            <label className="cl">&nbsp;</label>
-            <button className="btn" onClick={reset}>
-              ↺ Reset
-            </button>
-          </div>
-          <div className="clock">
-            t = <b>{s ? s.t : 0}s</b>/{s ? s.dur : 0}s
-          </div>
+          <div><label className="cl">Price path</label><select value={scenarioKey} onChange={(e) => setScenarioKey(e.target.value)}>{Object.entries(SCENARIOS).map(([k, v]) => (<option key={k} value={k}>{v.label}</option>))}</select></div>
+          <div><label className="cl">Speed</label><div className="seg">{[1, 4, 20].map((sp) => (<button key={sp} className={speed === sp ? "on" : ""} onClick={() => setSpeed(sp)}>{sp}×</button>))}</div></div>
+          <div><label className="cl">&nbsp;</label><button className="btn primary" onClick={run} disabled={running || !resolved.rule}>{running ? "● Running…" : "▶ Run"}</button></div>
+          <div><label className="cl">&nbsp;</label><button className="btn" onClick={reset}>↺ Reset</button></div>
+          <div className="clock">t = <b>{s ? s.t : 0}s</b>/{s ? s.dur : 0}s</div>
         </div>
 
         <div className="stats">
-          {stats.map((c, i) => (
-            <div className="stat" key={i}>
-              <div className="k">{c[0]}</div>
-              <div className={"v " + (c[2] === "pos" || c[2] === "neg" ? c[2] : "") + (c[2] === "sm" ? " sm" : "")}>{c[1]}</div>
-            </div>
-          ))}
+          {stats.length ? (
+            stats.map((c, i) => (
+              <div className="stat" key={i}><div className="k">{c[0]}</div><div className={"v " + (c[2] === "pos" || c[2] === "neg" ? c[2] : "") + (c[2] === "sm" ? " sm" : "")}>{c[1]}</div></div>
+            ))
+          ) : (
+            <div className="stat" style={{ gridColumn: "1 / -1", color: COLORS.down }}><div className="k">No ladder</div><div className="v sm">Add a rule that matches the position, then Run.</div></div>
+          )}
         </div>
 
         <div className="grid">
@@ -619,51 +596,26 @@ export default function SimulationPage() {
             <h3>Trim history <span className="tag">what sold, when</span></h3>
             <div className="tblwrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>Stage</th><th>Target</th><th>Sold</th><th>@</th><th>Left</th><th>Stop</th><th>Trail</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Stage</th><th>Target</th><th>Sold</th><th>@</th><th>Left</th><th>Stop</th><th>Trail</th></tr></thead>
                 <tbody>
                   {s && s.trims.length ? (
                     s.trims.map((r, i) => (
-                      <tr key={i}>
-                        <td>T{r.i}</td>
-                        <td className="m">+{r.target}%</td>
-                        <td className="m">{r.sold}</td>
-                        <td className="m">{f2(r.px)}</td>
-                        <td className="m">{r.left}</td>
-                        <td className="m" style={{ color: COLORS.stop }}>{r.stop != null ? f2(r.stop) : "—"}</td>
-                        <td className="m" style={{ color: COLORS.trail }}>{r.trail != null ? r.trail + "%" : "—"}</td>
-                      </tr>
+                      <tr key={i}><td>T{r.i}</td><td className="m">+{r.target}%</td><td className="m">{r.sold}</td><td className="m">{f2(r.px)}</td><td className="m">{r.left}</td><td className="m" style={{ color: COLORS.stop }}>{r.stop != null ? f2(r.stop) : "—"}</td><td className="m" style={{ color: COLORS.trail }}>{r.trail != null ? r.trail + "%" : "—"}</td></tr>
                     ))
                   ) : (
-                    <tr>
-                      <td colSpan={7} className="empty">no trims yet</td>
-                    </tr>
+                    <tr><td colSpan={7} className="empty">no trims yet</td></tr>
                   )}
                 </tbody>
               </table>
             </div>
             <h3 style={{ marginTop: 14 }}>Event log</h3>
             <div className="log">
-              {s
-                ? s.logs.slice(-100).map((e, i) => (
-                    <div className="row" key={i}>
-                      <span className="lt">{String(e.t).padStart(3, "0")}s</span>
-                      <span className={"lm " + (e.cls || "")} dangerouslySetInnerHTML={{ __html: e.m }} />
-                    </div>
-                  ))
-                : null}
+              {s ? s.logs.slice(-100).map((e, i) => (<div className="row" key={i}><span className="lt">{String(e.t).padStart(3, "0")}s</span><span className={"lm " + (e.cls || "")} dangerouslySetInnerHTML={{ __html: e.m }} /></div>)) : null}
             </div>
           </div>
         </div>
 
-        <p className="foot">
-          <b>Simulation only.</b> This page mirrors the exit-ladder logic in the browser to test configurations — it does not read or write
-          any live position and does not affect production behaviour. The only server call is the read-only <b>Import my live settings</b>
-          button. Trailing never moves down; a stop closes only the remaining quantity, never what was already trimmed.
-        </p>
+        <p className="foot"><b>Simulation only.</b> Mirrors the exit-ladder logic in the browser to test per-ticker / per-size configurations — it reads and writes no live position and changes no production behaviour. The only server call is the read-only <b>Import live settings</b> button (the live backend has one global ladder). Trailing never moves down; a stop closes only the remaining quantity, never what was already trimmed.</p>
       </div>
     </div>
   );
@@ -671,36 +623,31 @@ export default function SimulationPage() {
 
 // ─────────────────────────── palette + styles (self-contained, dark) ───────────────────────────
 const COLORS: Record<string, string> = {
-  accent: "#2dd4bf",
-  up: "#34d399",
-  down: "#f87171",
-  stop: "#fbbf24",
-  trail: "#a78bfa",
-  high: "#38bdf8",
-  neutral: "#7c8b98",
-  line: "#222c34",
-  faint: "#657481",
+  accent: "#2dd4bf", up: "#34d399", down: "#f87171", stop: "#fbbf24", trail: "#a78bfa",
+  high: "#38bdf8", neutral: "#7c8b98", line: "#222c34", faint: "#657481",
 };
 
 const CSS = `
 .simx{min-height:100vh;background:#0c1014;color:#e8edf1;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5}
 .simx *{box-sizing:border-box}
-.simx .wrap{max-width:1140px;margin:0 auto;padding:26px 18px 70px}
+.simx .wrap{max-width:1160px;margin:0 auto;padding:26px 18px 70px}
 .simx h1,.simx h3{margin:0;font-weight:800;letter-spacing:-.01em}
 .simx .eyebrow{font-family:ui-monospace,monospace;font-size:11.5px;letter-spacing:.18em;text-transform:uppercase;color:#2dd4bf;font-weight:600}
 .simx h1{font-size:clamp(23px,3.6vw,31px);margin:6px 0 6px}
-.simx header p{color:#9aa7b2;font-size:14px;margin:0;max-width:88ch}
+.simx header p{color:#9aa7b2;font-size:14px;margin:0;max-width:92ch}
 .simx b{color:#e8edf1}
 .simx .tag-demo{font-family:ui-monospace,monospace;font-size:10.5px;color:#fbbf24;border:1px solid #fbbf24;border-radius:5px;padding:1px 6px;margin-left:6px;vertical-align:middle}
 .simx .panel{background:#141a20;border:1px solid #222c34;border-radius:12px;padding:14px 15px}
 .simx .panel h3{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:11px}
 .simx .panel h3 .tag{font-family:ui-monospace,monospace;font-size:10px;color:#657481;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
-.simx .cfgwrap{display:grid;grid-template-columns:290px 1fr;gap:14px;margin:16px 0}
-@media(max-width:820px){.simx .cfgwrap{grid-template-columns:1fr}}
+.simx .cfgwrap{display:grid;grid-template-columns:310px 1fr;gap:14px;margin:16px 0}
+@media(max-width:860px){.simx .cfgwrap{grid-template-columns:1fr}}
 .simx label{font-size:12px;color:#9aa7b2}
-.simx input[type=number]{font-family:ui-monospace,monospace;font-size:12px;padding:4px 6px;border-radius:6px;border:1px solid #31404a;background:#0c1014;color:#e8edf1;text-align:right;width:84px}
-.simx input[type=number]:disabled{opacity:.4}
+.simx input[type=number],.simx input.txt{font-family:ui-monospace,monospace;font-size:12px;padding:4px 6px;border-radius:6px;border:1px solid #31404a;background:#0c1014;color:#e8edf1;text-align:right;width:96px}
+.simx input.txt{text-align:left}.simx input.txt.sm{width:74px}
+.simx input:disabled{opacity:.4}
 .simx input[type=checkbox]{accent-color:#2dd4bf;vertical-align:-1px}
+.simx select{font-family:inherit;font-size:12px;border-radius:6px;border:1px solid #31404a;background:#0c1014;color:#e8edf1;padding:4px 6px}
 .simx .btn{font-family:inherit;font-size:13px;border-radius:8px;border:1px solid #31404a;background:#0f151a;color:#e8edf1;padding:7px 12px;cursor:pointer}
 .simx .btn.primary{background:#2dd4bf;color:#04211d;border-color:transparent;font-weight:700}
 .simx .btn.tiny{font-size:11px;padding:4px 9px}
@@ -709,22 +656,32 @@ const CSS = `
 .simx .posrow{display:flex;flex-direction:column;gap:9px}
 .simx .posrow .f{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .simx .divider{height:1px;background:#222c34;margin:2px 0}
-.simx .initstop{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.simx .initstop .l{display:flex;align-items:center;gap:6px}
-.simx .initstop input[type=number]{width:66px}
-.simx .unit{font-family:ui-monospace,monospace;font-size:11px;color:#657481}
-.simx .note{font-size:11.5px;color:#657481;line-height:1.5}
+.simx .resolved{font-size:12px;display:flex;flex-direction:column;gap:6px}
+.simx .rsize{color:#9aa7b2;font-family:ui-monospace,monospace;font-size:11.5px}
+.simx .rbadge{font-family:ui-monospace,monospace;font-size:12px;padding:6px 9px;border-radius:7px}
+.simx .rbadge.ok{background:#0f2e2b;color:#2dd4bf}
+.simx .rbadge.bad{background:#2a1413;color:#f87171}
+.simx .rbadge .via{color:#657481;font-size:11px}
 .simx .importmsg{font-size:11.5px;color:#38bdf8;background:#0f151a;border:1px solid #222c34;border-radius:7px;padding:7px 9px;line-height:1.5}
-.simx .stagerow{display:grid;grid-template-columns:26px 1fr 1fr auto auto auto auto 22px;gap:6px;align-items:center;padding:7px;border:1px solid #222c34;border-radius:9px;background:#0f151a;margin-bottom:6px}
+.simx .rules{display:flex;flex-direction:column;gap:8px}
+.simx .rule{border:1px solid #222c34;border-radius:10px;background:#0f151a;padding:9px 10px}
+.simx .rule.active{border-color:#2dd4bf;box-shadow:0 0 0 1px #2dd4bf inset}
+.simx .rulehead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.simx .rulehead .live{font-family:ui-monospace,monospace;font-size:10px;color:#2dd4bf;font-weight:700}
+.simx .rl{display:flex;align-items:center;gap:5px;font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.03em;text-transform:uppercase;color:#657481}
+.simx .rl.chk2{text-transform:none;font-size:11px;color:#9aa7b2}
+.simx .rl input[type=number]{width:56px}
+.simx .rm{border:none;background:none;color:#657481;font-size:13px;cursor:pointer;padding:2px}
+.simx .rm:hover{color:#f87171}.simx .rm.big{margin-left:auto;font-size:15px}
+.simx .stages{display:flex;flex-direction:column;gap:6px}
+.simx .stagerow{display:grid;grid-template-columns:26px 1fr 1fr auto auto auto auto 22px;gap:6px;align-items:center;padding:6px;border:1px solid #222c34;border-radius:8px;background:#141a20}
 .simx .stagerow .sidx{font-family:ui-monospace,monospace;font-size:11px;font-weight:700;color:#2dd4bf}
 .simx .stagerow label{display:flex;flex-direction:column;gap:2px;font-size:9px;font-family:ui-monospace,monospace;letter-spacing:.03em;text-transform:uppercase;color:#657481}
 .simx .stagerow label.chk{flex-direction:row;align-items:center;gap:4px;text-transform:none;font-size:11px;color:#9aa7b2}
 .simx .stagerow input[type=number]{width:100%}
-.simx .stagerow .rm{border:none;background:none;color:#657481;font-size:13px;cursor:pointer;padding:2px}
-.simx .stagerow .rm:hover{color:#f87171}
 .simx .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:2px 0 14px}
 .simx .controls .cl{font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#657481;display:block;margin-bottom:4px}
-.simx select{font-family:inherit;font-size:13.5px;border-radius:8px;border:1px solid #31404a;background:#0f151a;color:#e8edf1;padding:8px 12px;min-width:230px}
+.simx .controls select{font-size:13.5px;padding:8px 12px;min-width:230px}
 .simx .seg{display:inline-flex;border:1px solid #31404a;border-radius:8px;overflow:hidden}
 .simx .seg button{border:none;border-left:1px solid #31404a;padding:8px 11px;background:#0f151a;color:#e8edf1;cursor:pointer;font-family:inherit;font-size:13px}
 .simx .seg button:first-child{border-left:none}
@@ -736,7 +693,7 @@ const CSS = `
 .simx .stat{background:#141a20;padding:10px 12px}
 .simx .stat .k{font-family:ui-monospace,monospace;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#657481}
 .simx .stat .v{font-family:ui-monospace,monospace;font-size:17px;font-weight:600;margin-top:3px}
-.simx .stat .v.sm{font-size:14px}
+.simx .stat .v.sm{font-size:13px}
 .simx .pos{color:#34d399}.simx .neg{color:#f87171}
 .simx .grid{display:grid;grid-template-columns:1.5fr 1fr;gap:14px}
 @media(max-width:860px){.simx .grid{grid-template-columns:1fr}}
@@ -757,5 +714,5 @@ const CSS = `
 .simx .log .lt{color:#657481;flex:none}
 .simx .log .lm{color:#9aa7b2}
 .simx .log .lm.buy{color:#38bdf8}.simx .log .lm.tgt{color:#2dd4bf}.simx .log .lm.trim{color:#34d399}.simx .log .lm.st{color:#fbbf24}.simx .log .lm.tr{color:#a78bfa}.simx .log .lm.brk{color:#f87171}
-.simx .foot{margin-top:22px;font-size:12px;color:#657481;border-top:1px solid #222c34;padding-top:14px;max-width:88ch}
+.simx .foot{margin-top:22px;font-size:12px;color:#657481;border-top:1px solid #222c34;padding-top:14px;max-width:92ch}
 `;
