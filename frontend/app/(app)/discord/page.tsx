@@ -1476,10 +1476,10 @@ export default function DiscordPage() {
               <li>
                 Open the <strong>Kopyya Connector</strong> app on your computer.
                 <div className="mt-2 flex flex-wrap gap-2">
-                  <a href={CONNECTOR_WINDOWS} className="btn-primary px-3 py-1.5 text-xs">
+                  <a href={CONNECTOR_WINDOWS} target="_blank" rel="noopener noreferrer" className="btn-primary px-3 py-1.5 text-xs">
                     Download for Windows
                   </a>
-                  <a href={CONNECTOR_MAC} className="btn-ghost px-3 py-1.5 text-xs">
+                  <a href={CONNECTOR_MAC} target="_blank" rel="noopener noreferrer" className="btn-ghost px-3 py-1.5 text-xs">
                     Download for Mac
                   </a>
                 </div>
