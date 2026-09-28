@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, MoreVertical, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
@@ -110,6 +110,78 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
   const qty = Number(quantity);
   const val = Number.isFinite(price) && Number.isFinite(qty) ? price * qty * multiplier : null;
   return <td className="px-5 py-3.5 num">{val == null ? "—" : fmtNum(String(val), 2)}</td>;
+}
+
+/** Overflow menu on a position row — extra, destructive actions kept out of the
+ *  main Close buttons: cancel this position's working stop, and cancel every
+ *  open order the user owns. Both confirm first. onDone refreshes the table. */
+function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
+  orderId: string | null; hasStop: boolean; label: string; onDone: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState<null | "stop" | "all">(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  async function cancelStop() {
+    if (!orderId) return;
+    if (!confirm(`Cancel the stop-loss on ${label}? The position stays open — only the stop order is removed.`)) return;
+    setBusy("stop");
+    try {
+      // Clearing the SL leg cancels the live stop order (same path as emptying
+      // the inline SL field). Key presence flags sl_present on the backend.
+      await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: null }) });
+      notify.success("Stop cancelled");
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel stop"); }
+    finally { setBusy(null); }
+  }
+
+  async function cancelAllOpen() {
+    if (!confirm("Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.")) return;
+    setBusy("all");
+    try {
+      const res = await api<{ cancelled?: unknown[] }>(
+        `/api/trades/cancel-all-open?include_subscribers=true`, { method: "POST" },
+      );
+      const n = Array.isArray(res.cancelled) ? res.cancelled.length : 0;
+      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel open orders"); }
+    finally { setBusy(null); }
+  }
+
+  const item = "w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors";
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" onClick={() => setOpen(o => !o)} aria-label="More actions" title="More actions"
+              className="btn-ghost px-1.5 py-1 inline-flex items-center" disabled={busy !== null}>
+        <MoreVertical size={14} />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
+             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 190 }}>
+          <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
+                  className={item} style={{ color: "var(--text-2)" }}
+                  title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
+            {busy === "stop" ? "Cancelling stop…" : "Cancel stop"}
+          </button>
+          <button type="button" disabled={busy !== null} onClick={cancelAllOpen}
+                  className={item} style={{ color: "var(--bad)" }}>
+            {busy === "all" ? "Cancelling…" : "Cancel all open orders"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** The two summary tiles that move with price — Unrealized P&L and Market value.
@@ -936,6 +1008,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               {inFlight && closing.kind === "limit" && <Spinner />}
                             </button>
                           </div>
+                          <PositionActionsMenu
+                            orderId={orderId}
+                            hasStop={t?.stop_loss_price != null}
+                            label={p.symbol.toUpperCase()}
+                            onDone={refresh}
+                          />
                         </div>
                       </td>
                     ),
