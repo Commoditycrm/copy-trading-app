@@ -55,12 +55,23 @@ class RungConfig:
     """One rung's two knobs, set independently of the other rungs.
 
     ``profit_gate_pct`` is the minimum gain over ENTRY before this trim sells
-    anything; 0 means it always sells. ``stop_pct`` is how far below entry the
-    stop goes on whatever is still held afterwards; 0 means break-even.
+    anything; 0 means it always sells.
+
+    ``stop_pct`` is SIGNED — the return the stop sits at, relative to entry.
+    -25 is 25% below entry, 0 is break-even, +10 is 10% ABOVE entry and locks
+    in profit. It reads as a return so that a stop and a profit target are
+    written the same way; the unsigned version could never express a stop above
+    break-even at all.
+
+    ``qty_pct`` is how much of what is STILL HELD this rung sells. Of the
+    remainder, not of the original position — that is what makes the rungs
+    compose: 50 / 50 / 100 works down a position of 4 as 2, then 1, then 1,
+    and it is the behaviour the ladder had before these were configurable.
     """
 
     profit_gate_pct: Decimal = Decimal("0")
     stop_pct: Decimal = Decimal("0")
+    qty_pct: Decimal = Decimal("50")
 
 
 @dataclass
@@ -69,15 +80,15 @@ class TrimConfig:
 
     Each rung carries its OWN gate and stop, so changing the 1st trim cannot
     move the 2nd or 3rd. The defaults are the behaviour the ladder had before
-    they were configurable: the 1st trim gated at +20% with a stop 25% below
-    entry, and the 2nd and 3rd ungated with the remainder held at break-even
-    (a stop 0% below entry IS break-even, which is why 0 is the default rather
+    they were configurable: the 1st trim gated at +20% with a stop at -25%
+    (25% below entry), and the 2nd and 3rd ungated with the remainder held at
+    break-even (a stop of 0 IS break-even, which is why 0 is the default rather
     than a special case).
     """
 
-    trim1: RungConfig = RungConfig(Decimal("20"), Decimal("25"))
-    trim2: RungConfig = RungConfig(Decimal("0"), Decimal("0"))
-    trim3: RungConfig = RungConfig(Decimal("0"), Decimal("0"))
+    trim1: RungConfig = RungConfig(Decimal("20"), Decimal("-25"), Decimal("50"))
+    trim2: RungConfig = RungConfig(Decimal("0"), Decimal("0"), Decimal("50"))
+    trim3: RungConfig = RungConfig(Decimal("0"), Decimal("0"), Decimal("100"))
     price_threshold: Decimal = Decimal("0.90")  # above this, exits trail
     trail_amount: Decimal = Decimal("0.25")     # dollar give-back that triggers
 
@@ -112,6 +123,24 @@ def _half(held: Decimal) -> Decimal:
     return (held / Decimal(2)).to_integral_value(rounding=ROUND_CEILING)
 
 
+def _slice(held: Decimal, pct: Decimal | None) -> Decimal:
+    """``pct`` percent of what is still held, rounded UP to a whole contract.
+
+    Rounding up rather than down keeps a trim from being a no-op: 30% of one
+    contract rounds to zero, and an alert that sells nothing while still
+    consuming a rung would walk the trader down the ladder without ever
+    reducing the position. Capped at the holding, so 100% (or anything above
+    it) is a full exit rather than an oversell the broker would reject.
+    """
+    if held <= 0:
+        return Decimal(0)
+    pct = Decimal(str(pct if pct is not None else 50))
+    if pct <= 0:
+        return Decimal(0)
+    want = (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_CEILING)
+    return want if want < held else held
+
+
 def plan_exit(
     guard: DiscordPositionGuard,
     held: Decimal,
@@ -142,8 +171,18 @@ def plan_exit(
     # This rung's stop, on whatever is still held after it. 0% below entry IS
     # break-even, which is what the 2nd trim has always done — so break-even
     # needs no special case.
+    # A SIGNED offset from entry, read as the return the stop sits at:
+    #
+    #   -25  ->  entry x 0.75   25% below entry, the usual protective stop
+    #     0  ->  entry          break-even
+    #   +10  ->  entry x 1.10   10% ABOVE entry, locking in profit
+    #
+    # The sign is the whole point: without it the highest a stop could go was
+    # break-even, so there was no way to say "the 2nd trim moves the stop to
+    # +10%". Existing values were negated by migration e4c9d2a6b183, so a
+    # ladder that read 25 (25% below) now reads -25 and sits where it always did.
     stop = (
-        entry * (Decimal(1) - rung_cfg.stop_pct / Decimal(100))
+        entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100))
         if entry is not None and entry > 0 else None
     )
 
@@ -178,9 +217,10 @@ def plan_exit(
                          if stop is not None else "")),
             )
 
-    # How much leaves: half on the first two rungs, everything on the third.
-    final = rung >= 3
-    sell = held if final else _half(held)
+    # How much leaves: this rung's configured share of what is still held.
+    # The defaults (50 / 50 / 100) reproduce the ladder exactly as it behaved
+    # before the size was configurable.
+    sell = _slice(held, rung_cfg.qty_pct)
 
     # The 1st trim always goes to market. Later rungs ride an expensive contract
     # out on a trailing give-back instead — a cheap one isn't worth trailing.

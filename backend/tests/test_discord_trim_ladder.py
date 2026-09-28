@@ -23,7 +23,7 @@ from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.order import OptionRight
 
 EXP = date(2026, 10, 16)
-CFG = guards.TrimConfig()          # gate 20%, stop 25%, threshold 0.90, trail 0.25
+CFG = guards.TrimConfig()          # gate 20%, stop -25%, threshold 0.90, trail 0.25
 
 
 def _guard(entry="2.00", rung=0):
@@ -135,7 +135,7 @@ def test_the_threshold_is_strict():
 
 def test_the_thresholds_are_configurable():
     cfg = guards.TrimConfig(
-        trim1=guards.RungConfig(Decimal("5"), Decimal("10")),
+        trim1=guards.RungConfig(Decimal("5"), Decimal("-10")),
         price_threshold=Decimal("5.00"), trail_amount=Decimal("1.00"),
     )
     g = _guard(entry="2.00")
@@ -288,11 +288,15 @@ def test_a_stop_exactly_at_the_mark_is_not_armed():
 
 # ── each rung is configured independently ────────────────────────────────────
 
-def _cfg(t1=("20", "25"), t2=("0", "0"), t3=("0", "0")):
+def _cfg(t1=("20", "-25"), t2=("0", "0"), t3=("0", "0"),
+         q1="50", q2="50", q3="100"):
+    """Stops are SIGNED: -25 is 25% below entry. The sizes default to the
+    shipped 50 / 50 / 100, so a test that only cares about gates and stops
+    still describes a real ladder."""
     return guards.TrimConfig(
-        trim1=guards.RungConfig(Decimal(t1[0]), Decimal(t1[1])),
-        trim2=guards.RungConfig(Decimal(t2[0]), Decimal(t2[1])),
-        trim3=guards.RungConfig(Decimal(t3[0]), Decimal(t3[1])),
+        trim1=guards.RungConfig(Decimal(t1[0]), Decimal(t1[1]), Decimal(q1)),
+        trim2=guards.RungConfig(Decimal(t2[0]), Decimal(t2[1]), Decimal(q2)),
+        trim3=guards.RungConfig(Decimal(t3[0]), Decimal(t3[1]), Decimal(q3)),
         # Cheap contract, so every rung goes to market and the stop is the only
         # thing under test.
         price_threshold=Decimal("100"),
@@ -302,7 +306,7 @@ def _cfg(t1=("20", "25"), t2=("0", "0"), t3=("0", "0")):
 def test_each_trim_uses_its_own_gate():
     """Up 12%: over the 2nd trim's 10% gate, under the 1st trim's 20% one. The
     same position and the same price, two different answers."""
-    cfg = _cfg(t1=("20", "25"), t2=("10", "0"))
+    cfg = _cfg(t1=("20", "-25"), t2=("10", "0"))
 
     first = guards.plan_exit(_guard(entry="2.00", rung=0), Decimal(4), Decimal("2.24"), cfg)
     assert first.sell_qty == Decimal(0)         # gated
@@ -313,7 +317,7 @@ def test_each_trim_uses_its_own_gate():
 
 def test_each_trim_uses_its_own_stop():
     """Three rungs, three stop distances off the same $2.00 entry."""
-    cfg = _cfg(t1=("0", "25"), t2=("0", "10"), t3=("0", "50"))
+    cfg = _cfg(t1=("0", "-25"), t2=("0", "-10"), t3=("0", "-50"))
 
     r1 = guards.plan_exit(_guard(entry="2.00", rung=0), Decimal(8), Decimal("3.00"), cfg)
     assert r1.new_stop_price == Decimal("1.50")     # 25% below
@@ -325,7 +329,7 @@ def test_each_trim_uses_its_own_stop():
 def test_the_third_trims_gate_can_hold_the_position():
     """Gated, so nothing sells — and the position keeps its stop, at the THIRD
     trim's distance."""
-    cfg = _cfg(t3=("50", "10"))
+    cfg = _cfg(t3=("50", "-10"))
     plan = guards.plan_exit(_guard(entry="2.00", rung=2), Decimal(4), Decimal("2.20"), cfg)
 
     assert plan.rung == 3
@@ -335,7 +339,7 @@ def test_the_third_trims_gate_can_hold_the_position():
 
 
 def test_the_third_trim_exits_everything_once_its_gate_opens():
-    cfg = _cfg(t3=("50", "10"))
+    cfg = _cfg(t3=("50", "-10"))
     plan = guards.plan_exit(_guard(entry="2.00", rung=2), Decimal(4), Decimal("3.20"), cfg)
 
     assert plan.sell_qty == Decimal(4)
@@ -386,7 +390,7 @@ def test_a_gated_rung_without_a_mark_sells_nothing():
 
 def test_rungs_past_the_third_reuse_the_thirds_settings():
     """The ladder has three steps; a fourth alert is a repeat of the last."""
-    cfg = _cfg(t3=("50", "10"))
+    cfg = _cfg(t3=("50", "-10"))
     plan = guards.plan_exit(_guard(entry="2.00", rung=3), Decimal(4), Decimal("2.20"), cfg)
     assert plan.rung == 4
     assert plan.sell_qty == Decimal(0)               # the 3rd trim's gate held
