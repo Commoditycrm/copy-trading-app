@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -394,9 +394,27 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
                 closed_at=trade_at,
                 broker_filled_at=trade_at,
             )
-            db.add(order)
-            db.flush()
-            orders_added += 1
+            # Insert inside a savepoint: if a concurrent sync/listener already
+            # recorded this exact FILLED order (unique index on
+            # user_id+broker_order_id WHERE status=FILLED), adopt the winner's
+            # row instead of duplicating. The fill below dedups on broker_fill_id.
+            try:
+                with db.begin_nested():
+                    db.add(order)
+                    db.flush()
+                orders_added += 1
+            except IntegrityError:
+                db.expunge(order)
+                order = db.execute(
+                    select(Order).where(
+                        Order.user_id == acct.user_id,
+                        Order.broker_order_id == (broker_oid or activity_id),
+                        Order.status == OrderStatus.FILLED,
+                    ).order_by(Order.created_at.asc()).limit(1)
+                ).scalar_one_or_none()
+                if order is None:
+                    skipped += 1
+                    continue
         else:
             # Recompute filled qty + volume-weighted avg from the AUTHORITATIVE
             # Fill rows (deduped by broker_fill_id), rather than ACCUMULATING
@@ -487,6 +505,16 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
 
 def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
     """Sync every connected broker for one app user."""
+    # Serialize concurrent fills-sync for the SAME user. Every calendar and
+    # positions load triggers this, so two requests can run it at once and race
+    # the check-then-insert in sync_account_fills, each synthesizing the same
+    # external order — the root cause of duplicate FILLED rows that double-count
+    # realized P&L. This transaction-scoped advisory lock makes the second wait;
+    # under READ COMMITTED its later SELECT then sees the first's committed row
+    # and updates it instead of inserting. Auto-released at transaction end.
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+               {"k": f"fills_sync:{user_id}"})
+
     accts = list(db.execute(
         select(BrokerAccount).where(BrokerAccount.user_id == user_id)
     ).scalars())
