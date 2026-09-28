@@ -20,6 +20,7 @@ import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { PercentInput } from "@/components/PercentInput";
+import { ChevronsUpDown, ArrowUp, ArrowDown } from "lucide-react";
 import type { User } from "@/lib/types";
 
 type Status = "filled" | "working" | "pending" | "expired";
@@ -170,6 +171,32 @@ function mergeToday(snaps: Snapshot[]): Snapshot {
   };
 }
 
+type SnapSortKey =
+  | "symbol" | "side" | "qty" | "expiry" | "exit_price" | "current_price"
+  | "pdc" | "reentry_price" | "fill_time" | "change_sh" | "pct" | "status";
+
+// Sort value for a row. Computed columns (change/sh, %) mirror the same math the
+// cells render. Missing numbers fall back to 0 to stay in step with the other
+// tables; timestamps/expiry with no value sink out of the way.
+function snapSortValue(p: SnapPos, key: SnapSortKey): number | string {
+  const num = (v: string | null) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
+  const exitP = num(p.price), curP = num(p.current_price), reP = num(p.reentry_price);
+  switch (key) {
+    case "symbol": return positionLabel(p).toUpperCase();
+    case "side": return Number(p.quantity) >= 0 ? 0 : 1;
+    case "qty": return Math.abs(Number(p.quantity)) || 0;
+    case "expiry": return p.option_expiry ? new Date(p.option_expiry).getTime() : Number.POSITIVE_INFINITY;
+    case "exit_price": return exitP ?? 0;
+    case "current_price": return curP ?? 0;
+    case "pdc": return num(p.pdc) ?? 0;
+    case "reentry_price": return reP ?? 0;
+    case "fill_time": return p.reentry_filled_at ? new Date(p.reentry_filled_at).getTime() : 0;
+    case "change_sh": return (p.reentry_status === "filled" && exitP != null && reP != null) ? exitP - reP : 0;
+    case "pct": return (exitP != null && exitP !== 0 && curP != null) ? ((curP - exitP) / exitP) * 100 : 0;
+    case "status": return p.reentry_status;
+  }
+}
+
 /**
  * One snapshot, fully self-contained: its own table, Re-Enter All bar, per-row
  * Re-Enter / delete, and re-entry state. `initial` seeds it (from the today
@@ -184,6 +211,7 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
   const [rowChoice, setRowChoice] = useState<Record<string, ReChoice>>({});
   const [rowVal, setRowVal] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null); // "all" or a row index
+  const [sort, setSort] = useState<{ key: SnapSortKey; dir: "asc" | "desc" } | null>(null);
 
   // Register the snapshot's symbols as watched so the central stream feeds their
   // live prices to this client (LiveSnapPrice ticks off them). The shared hook
@@ -212,15 +240,15 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
     { id: "reenter", header: "Re-Enter", locked: true },
   ], []);
   const cols = useTableColumns("snapshot", columnDefs);
-  const COL_META: Record<string, { align: "left" | "right"; title?: string }> = {
-    symbol: { align: "left" }, side: { align: "left" }, qty: { align: "right" },
-    expiry: { align: "left", title: "Option expiry date (— for stocks)" },
-    exit_price: { align: "right" }, current_price: { align: "right" },
-    pdc: { align: "right", title: "Previous day's market close price" },
-    reentry_price: { align: "right" },
-    fill_time: { align: "right", title: "When the re-entry filled (US Eastern / market time)" },
-    change_sh: { align: "right" }, pct: { align: "right", title: "Current price vs exit price, as a %" },
-    status: { align: "left" }, reenter: { align: "right" },
+  const COL_META: Record<string, { align: "left" | "right"; title?: string; sortKey?: SnapSortKey }> = {
+    symbol: { align: "left", sortKey: "symbol" }, side: { align: "left", sortKey: "side" }, qty: { align: "right", sortKey: "qty" },
+    expiry: { align: "left", title: "Option expiry date (— for stocks)", sortKey: "expiry" },
+    exit_price: { align: "right", sortKey: "exit_price" }, current_price: { align: "right", sortKey: "current_price" },
+    pdc: { align: "right", title: "Previous day's market close price", sortKey: "pdc" },
+    reentry_price: { align: "right", sortKey: "reentry_price" },
+    fill_time: { align: "right", title: "When the re-entry filled (US Eastern / market time)", sortKey: "fill_time" },
+    change_sh: { align: "right", sortKey: "change_sh" }, pct: { align: "right", title: "Current price vs exit price, as a %", sortKey: "pct" },
+    status: { align: "left", sortKey: "status" }, reenter: { align: "right" },
   };
 
   // Pre-fill each row's re-entry control from the default chosen at exit time,
@@ -353,8 +381,32 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
   const th = "px-4 py-3 text-xs font-semibold whitespace-nowrap";
   const td = "px-4 py-3 text-sm whitespace-nowrap";
 
+  function toggleSort(key: SnapSortKey) {
+    setSort(prev => {
+      if (!prev || prev.key !== key) return { key, dir: "asc" };
+      if (prev.dir === "asc") return { key, dir: "desc" };
+      return null;
+    });
+  }
+  const SortIcon = ({ k }: { k: SnapSortKey }) => {
+    if (!sort || sort.key !== k) return <ChevronsUpDown size={12} style={{ opacity: 0.4 }} />;
+    return sort.dir === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
+  };
+
   if (loading) return <div style={{ color: "var(--muted)" }}>Loading…</div>;
   if (!snap || snap.positions.length === 0) return null; // caller shows the empty state
+
+  // Render rows in sorted order but keep each row's ORIGINAL array index — the
+  // re-entry controls and Re-Enter/delete key off snap.positions[index].
+  const rowOrder = snap.positions.map((_, i) => i);
+  if (sort) {
+    rowOrder.sort((ia, ib) => {
+      const va = snapSortValue(snap.positions[ia], sort.key);
+      const vb = snapSortValue(snap.positions[ib], sort.key);
+      const cmp = typeof va === "string" ? va.localeCompare(vb as string) : (va as number) - (vb as number);
+      return sort.dir === "asc" ? cmp : -cmp;
+    });
+  }
 
   return (
     <div className="space-y-3">
@@ -429,14 +481,23 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
                 {cols.columns.map((c) => {
                   const m = COL_META[c.id] ?? { align: "left" as const };
                   const w = c.width;
+                  const sk = m.sortKey;
+                  const active = sk && sort?.key === sk;
                   return (
                     <th
                       key={c.id}
                       className={`relative ${th} ${m.align === "right" ? "text-right" : "text-left"}`}
                       title={m.title}
-                      style={{ color: "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
+                      style={{ color: active ? "var(--text-2)" : "var(--muted)", ...(w ? { width: w, minWidth: w, maxWidth: w } : {}) }}
                     >
-                      {c.header}
+                      {sk ? (
+                        <button type="button" onClick={() => toggleSort(sk)}
+                                className={`inline-flex items-center gap-1 focus-ring rounded hover:text-[var(--text)] transition-colors ${m.align === "right" ? "flex-row-reverse" : ""}`}
+                                style={{ color: "inherit" }}>
+                          {c.header}
+                          <SortIcon k={sk} />
+                        </button>
+                      ) : c.header}
                       {!c.locked && <ResizeHandle minWidth={c.minWidth ?? 60} onResize={(px) => cols.setWidth(c.id, px)} />}
                     </th>
                   );
@@ -444,7 +505,8 @@ function SnapshotBlock({ snapshotId, initial, merged }: { snapshotId: string; in
               </tr>
             </thead>
             <tbody>
-              {snap.positions.map((p, i) => {
+              {rowOrder.map((i) => {
+                const p = snap.positions[i];
                 const rowKey = String(i);
                 const qty = Number(p.quantity);
                 const side = qty >= 0 ? "Long" : "Short";
