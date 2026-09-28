@@ -97,6 +97,21 @@ function LiveMarketValueCell({ symbol, snapshotPrice, quantity, baseline, multip
   return <td className="px-5 py-3.5 num">{fmtNum(val == null ? baseline : String(val), 2)}</td>;
 }
 
+/** Net liquidity cell — the position's live liquidation value, computed directly
+ *  as price × signed_qty × multiplier rather than off the backend market_value.
+ *  That keeps it correctly signed (short = negative) no matter how each broker
+ *  reports market_value (some send it unsigned). Falls back to the snapshot
+ *  price until a tick arrives. */
+function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
+  symbol: string | null; snapshotPrice: string | null; quantity: string | null; multiplier?: number;
+}) {
+  const live = useLivePrice(symbol, null);
+  const price = live != null ? live : Number(snapshotPrice);
+  const qty = Number(quantity);
+  const val = Number.isFinite(price) && Number.isFinite(qty) ? price * qty * multiplier : null;
+  return <td className="px-5 py-3.5 num">{val == null ? "—" : fmtNum(String(val), 2)}</td>;
+}
+
 /** The two summary tiles that move with price — Unrealized P&L and Market value.
  *  Own component so a tick only re-renders these tiles, not the whole table.
  *  Sums each visible stock row's live delta (same signed_qty × Δprice as the
@@ -216,7 +231,7 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
   | "symbol" | "quantity" | "avg_entry_price" | "current_price"
-  | "market_value" | "unrealized_pnl" | "expires";
+  | "market_value" | "net_liq" | "unrealized_pnl" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
@@ -225,6 +240,7 @@ function sortValue(p: Position, key: SortKey): number | string {
     case "avg_entry_price": return Number(p.avg_entry_price) || 0;
     case "current_price": return Number(p.current_price) || 0;
     case "market_value": return Number(p.market_value) || 0;
+    case "net_liq": return (Number(p.current_price) || 0) * (Number(p.quantity) || 0) * (p.instrument_type === "option" ? 100 : 1);
     case "unrealized_pnl": return Number(p.unrealized_pnl) || 0;
     case "expires": return p.option_expiry ? daysUntil(p.option_expiry) : Number.POSITIVE_INFINITY;
   }
@@ -269,6 +285,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       { id: "pdc", header: "PDC" },
       { id: "filled_price", header: "Filled price" },
       { id: "market_value", header: "Market value" },
+      { id: "net_liq", header: "Net Liq" },
       { id: "tp", header: "TP", locked: true },
       { id: "sl", header: "SL", locked: true },
       { id: "submitted_at", header: "Submitted at" },
@@ -645,6 +662,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       pdc: { label: "PDC", title: "Previous day's market close price" },
       filled_price: { label: "Filled price" },
       market_value: { label: "Market value", sortKey: "market_value" },
+      net_liq: { label: "Net Liq", sortKey: "net_liq", title: "Live liquidation value = price × quantity × contract multiplier (signed; short = negative)" },
       tp: { label: "TP" },
       sl: { label: "SL" },
       submitted_at: { label: "Submitted at" },
@@ -932,6 +950,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       </td>
                     ),
                     market_value: <LiveMarketValueCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.market_value} multiplier={liveMult} />,
+                    net_liq: <LiveNetLiqCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} multiplier={liveMult} />,
                     tp: (
                       <td className="px-5 py-3.5 num">
                         <InlineBracketCell orderId={orderId} leg="tp" value={t?.take_profit_price ?? null} entryPrice={entryPrice} side={side} canEdit={!!orderId} pctOverride={tpPct} onUpdated={onUpdated} />
