@@ -8,13 +8,16 @@ Measured against what is STILL HELD, not the original position, which is what
 makes the rungs compose.
 
 Revision ID: d5b62e91af07
-Revises: c3a81f5e27d4
+Revises: e2c7a04b19f5
 """
 import sqlalchemy as sa
 from alembic import op
 
 revision = "d5b62e91af07"
-down_revision = "c3a81f5e27d4"
+# Chained AFTER qa-branch's e2c7a04b19f5, not beside it: both were written
+# against c3a81f5e27d4 and alembic then had TWO heads, which is the exact
+# failure that broke CI on PR #309.
+down_revision = "e2c7a04b19f5"
 branch_labels = None
 depends_on = None
 
