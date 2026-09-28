@@ -150,8 +150,12 @@ class TraderSettings(Base, TimestampMixin):
     discord_trim_profit_gate_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("20"), server_default="20", nullable=False,
     )
+    # SIGNED: the return the stop sits at, relative to entry. -25 is 25% below
+    # entry (the usual protective stop), 0 is break-even, +10 is 10% ABOVE
+    # entry — a stop that locks in profit, which the old unsigned field could
+    # not express at all.
     discord_trim_stop_pct: Mapped[Decimal] = mapped_column(
-        Numeric(9, 4), default=Decimal("25"), server_default="25", nullable=False,
+        Numeric(9, 4), default=Decimal("-25"), server_default="-25", nullable=False,
     )
     discord_trim2_profit_gate_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("0"), server_default="0", nullable=False,
@@ -181,6 +185,21 @@ class TraderSettings(Base, TimestampMixin):
     # can say WHERE they want each automatic trim to happen.
     discord_auto_trim: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False,
+    )
+
+    # How much of what is STILL HELD each rung sells. Of the remainder, not of
+    # the original position — that is what makes the rungs compose: 50/50/100
+    # works a position of 4 down as 2, then 1, then 1, which is what the ladder
+    # did before the size was configurable. The defaults are exactly that, so
+    # nobody's live ladder changes shape by upgrading.
+    discord_trim_qty_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("50"), server_default="50", nullable=False,
+    )
+    discord_trim2_qty_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("50"), server_default="50", nullable=False,
+    )
+    discord_trim3_qty_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("100"), server_default="100", nullable=False,
     )
 
     # Entry price above which an exit trails instead of going to market.

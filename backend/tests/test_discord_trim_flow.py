@@ -44,7 +44,8 @@ class _Settings:
         self.discord_live_trading = live
         self.discord_trail_percent = Decimal("20")
         self.discord_trim_profit_gate_pct = Decimal("20")
-        self.discord_trim_stop_pct = Decimal("25")
+        # SIGNED now: -25 is 25% BELOW entry, exactly where it always sat.
+        self.discord_trim_stop_pct = Decimal("-25")
         self.discord_trim_price_threshold = Decimal("0.90")
         self.discord_trim_trail_amount = Decimal("0.25")
 
