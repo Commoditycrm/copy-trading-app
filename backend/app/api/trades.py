@@ -1369,6 +1369,131 @@ def cancel_trade(
     return order
 
 
+def _cancel_orders_batch(
+    db: Session,
+    request: Request,
+    background: BackgroundTasks,
+    user: User,
+    orders: list[Order],
+    include_subscribers: bool,
+    via: str,
+) -> dict:
+    """Cancel a set of already-selected open orders at the broker, mark them
+    CANCELED, publish SSE, and (trader + include_subscribers) cascade to mirrors.
+    Shared by cancel-all-open and the channel-scoped cancel so both behave
+    identically; only the order SELECTION differs upstream."""
+    cancelled_ids: list[uuid.UUID] = []
+    failed: list[dict] = []
+
+    # Cancel sequentially — N is bounded (a trader rarely has >50 open orders);
+    # parallelism adds per-broker concurrency/lock complexity for no real win.
+    for order in orders:
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+        try:
+            if acct is not None and order.broker_order_id:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter_for(acct, creds).cancel_order(order.broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            # Broker rejected the cancel (often "already filled" / "no such
+            # order" — both fine; the listener reflects status next tick).
+            audit.record(
+                db, actor_user_id=user.id, action="order.cancel_failed",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(exc)[:480], "via": via},
+                ip_address=client_ip(request),
+            )
+            failed.append({
+                "order_id": str(order.id),
+                "symbol":   order.symbol,
+                "error":    str(exc)[:300],
+            })
+            continue
+
+        order.status = OrderStatus.CANCELED
+        order.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db, actor_user_id=user.id, action="order.cancelled",
+            entity_type="order", entity_id=order.id,
+            metadata={"via": via, "broker_order_id": order.broker_order_id},
+            ip_address=client_ip(request),
+        )
+        cancelled_ids.append(order.id)
+
+    db.commit()
+
+    # SSE *after* commit so subscribers reading the DB on event-receipt see the
+    # cancelled state.
+    for oid in cancelled_ids:
+        cancelled = db.get(Order, oid)
+        if cancelled is None:
+            continue
+        events.publish(user.id, copy_engine._order_event("order.cancelled", cancelled))
+
+    # Trader-only: cascade to mirror orders for each root order we cancelled.
+    if user.role == UserRole.TRADER and include_subscribers:
+        for oid in cancelled_ids:
+            cancelled = db.get(Order, oid)
+            if cancelled is not None and cancelled.parent_order_id is None:
+                background.add_task(_run_cancel_fanout_in_background, oid)
+    elif user.role == UserRole.TRADER and not include_subscribers:
+        # "Just my orders" — mark each root so the listener skips ITS cascade.
+        from app.services.cancel_intent import mark_no_cascade  # noqa: PLC0415
+        for oid in cancelled_ids:
+            cancelled = db.get(Order, oid)
+            if cancelled is not None and cancelled.parent_order_id is None:
+                mark_no_cascade(oid)
+
+    return {
+        "cancelled_count": len(cancelled_ids),
+        "failed_count":    len(failed),
+        "failed":          failed,
+    }
+
+
+@router.post("/trades/cancel-open-by-channel")
+def cancel_open_orders_by_channel(
+    request: Request,
+    background: BackgroundTasks,
+    channel: str = Query(..., description="Discord channel display name (label or channel_name) whose open orders to cancel."),
+    include_subscribers: bool = Query(
+        default=True,
+        description="Trader-only: also cancel subscribers' mirrors of the cancelled root orders. Ignored for subscribers.",
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel every OPEN order that came from one Discord channel, across all
+    instruments. The channel link is Order → DiscordMessage → DiscordAlertSource;
+    the display name matches either the source label or its channel_name. Same
+    cancel/cascade behaviour as cancel-all-open, just scoped to the channel."""
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+
+    needle = (channel or "").strip()
+    if not needle:
+        raise HTTPException(422, "channel required")
+
+    order_ids = db.execute(
+        select(Order.id)
+        .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id)
+        .where(
+            Order.user_id == user.id,
+            Order.status.in_(_CANCELLABLE_STATUSES),
+            or_(DiscordAlertSource.label == needle,
+                DiscordAlertSource.channel_name == needle),
+        )
+    ).scalars().unique().all()
+
+    orders = list(db.execute(
+        select(Order).options(selectinload(Order.fills)).where(Order.id.in_(order_ids))
+    ).scalars()) if order_ids else []
+
+    return _cancel_orders_batch(
+        db, request, background, user, orders, include_subscribers, via="cancel-by-channel",
+    )
+
+
 @router.post("/trades/cancel-all-open")
 def cancel_all_open_orders(
     request: Request,
@@ -1404,84 +1529,9 @@ def cancel_all_open_orders(
         .where(Order.user_id == user.id, Order.status.in_(_CANCELLABLE_STATUSES))
     ).scalars())
 
-    cancelled_ids: list[uuid.UUID] = []
-    failed: list[dict] = []
-
-    # We cancel sequentially. The N here is bounded (a trader rarely has
-    # >50 open orders); parallel cancel adds complexity (per-broker
-    # concurrency limits, lock contention on adapter sessions) without
-    # meaningful win for the typical case. If volume grows we can revisit
-    # using the same ThreadPoolExecutor pattern as _run_cancel_fanout.
-    for order in orders:
-        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
-        try:
-            if acct is not None and order.broker_order_id:
-                creds = decrypt_json(acct.encrypted_credentials)
-                adapter_for(acct, creds).cancel_order(order.broker_order_id)
-        except Exception as exc:  # noqa: BLE001
-            # Broker rejected the cancel (often "order already filled" or
-            # "no such order" — both fine; DB will reflect status on next
-            # listener update). Record + skip rather than mutate state.
-            audit.record(
-                db, actor_user_id=user.id, action="order.cancel_failed",
-                entity_type="order", entity_id=order.id,
-                metadata={"error": str(exc)[:480], "via": "cancel-all-open"},
-                ip_address=client_ip(request),
-            )
-            failed.append({
-                "order_id": str(order.id),
-                "symbol":   order.symbol,
-                "error":    str(exc)[:300],
-            })
-            continue
-
-        order.status = OrderStatus.CANCELED
-        order.closed_at = datetime.now(timezone.utc)
-        audit.record(
-            db, actor_user_id=user.id, action="order.cancelled",
-            entity_type="order", entity_id=order.id,
-            metadata={"via": "cancel-all-open",
-                      "broker_order_id": order.broker_order_id},
-            ip_address=client_ip(request),
-        )
-        cancelled_ids.append(order.id)
-
-    db.commit()
-
-    # Publish SSE *after* commit so subscribers reading from the DB on
-    # event-receipt see the cancelled state.
-    for oid in cancelled_ids:
-        cancelled = db.get(Order, oid)
-        if cancelled is None:
-            continue
-        events.publish(user.id, copy_engine._order_event("order.cancelled", cancelled))
-
-    # Trader-only: cascade cancel to mirror orders for every root order
-    # we just cancelled. Skip the cascade if caller asked for "just me"
-    # OR is a subscriber (subscribers have no downstream).
-    if user.role == UserRole.TRADER and include_subscribers:
-        for oid in cancelled_ids:
-            cancelled = db.get(Order, oid)
-            if cancelled is not None and cancelled.parent_order_id is None:
-                background.add_task(_run_cancel_fanout_in_background, oid)
-    elif user.role == UserRole.TRADER and not include_subscribers:
-        # The trader explicitly said "just my orders". Drop a Redis marker
-        # for each cancelled root order so the broker listener — which
-        # receives the canceled WebSocket/poll event AFTER our cancel —
-        # knows to skip ITS cascade too. Without this, the listener sees
-        # `fanned_out_to_subscribers=True` and runs the same mirror-cancel
-        # cascade we just deliberately avoided, defeating the toggle.
-        from app.services.cancel_intent import mark_no_cascade  # noqa: PLC0415
-        for oid in cancelled_ids:
-            cancelled = db.get(Order, oid)
-            if cancelled is not None and cancelled.parent_order_id is None:
-                mark_no_cascade(oid)
-
-    return {
-        "cancelled_count": len(cancelled_ids),
-        "failed_count":    len(failed),
-        "failed":          failed,
-    }
+    return _cancel_orders_batch(
+        db, request, background, user, orders, include_subscribers, via="cancel-all-open",
+    )
 
 
 @router.post("/trades/cancel-all-subscribers-open")
@@ -1877,20 +1927,36 @@ def update_bracket(
     new_tp = payload.take_profit_price if payload.tp_present else entry.take_profit_price
     new_sl = payload.stop_loss_price if payload.sl_present else entry.stop_loss_price
 
-    # Directional geometry: buy → sl < ref < tp; sell → tp < ref < sl.
-    # Only enforced when ref_price is known AND both legs are set (one-leg
-    # brackets have no directional constraint to check beyond ref-side).
-    if ref_price is not None:
-        if new_tp is not None:
-            if entry.side == OrderSide.BUY and new_tp <= ref_price:
-                raise HTTPException(422, "buy_tp_must_be_above_entry")
-            if entry.side == OrderSide.SELL and new_tp >= ref_price:
-                raise HTTPException(422, "sell_tp_must_be_below_entry")
-        if new_sl is not None:
-            if entry.side == OrderSide.BUY and new_sl >= ref_price:
-                raise HTTPException(422, "buy_sl_must_be_below_entry")
-            if entry.side == OrderSide.SELL and new_sl <= ref_price:
-                raise HTTPException(422, "sell_sl_must_be_above_entry")
+    # TP geometry (anchored on entry): buy → tp > entry; sell → tp < entry.
+    if ref_price is not None and new_tp is not None:
+        if entry.side == OrderSide.BUY and new_tp <= ref_price:
+            raise HTTPException(422, "buy_tp_must_be_above_entry")
+        if entry.side == OrderSide.SELL and new_tp >= ref_price:
+            raise HTTPException(422, "sell_tp_must_be_below_entry")
+
+    # SL geometry. On a FILLED (live) position a stop only has to sit on the
+    # correct side of the CURRENT market price — not entry — so breakeven and
+    # lock-in-profit stops are allowed (a "Stop %" P&L level of 0 or +N). An
+    # underwater breakeven is still rejected because it would trigger instantly.
+    # Anchor on the fresh cached price when we have one; otherwise fall back to
+    # the entry anchor, preserving the pre-existing pre-fill behaviour.
+    sl_anchor = ref_price
+    used_live = False
+    if is_filled and new_sl is not None:
+        from app.services.market_data_stream import _build_occ, get_live_price  # noqa: PLC0415
+        key = (
+            _build_occ(entry.symbol, entry.option_expiry, entry.option_strike, entry.option_right)
+            if entry.instrument_type == InstrumentType.OPTION
+            else (entry.symbol or "").upper()
+        )
+        live = get_live_price(key) if key else None
+        if live is not None:
+            sl_anchor, used_live = live, True
+    if sl_anchor is not None and new_sl is not None:
+        if entry.side == OrderSide.BUY and new_sl >= sl_anchor:
+            raise HTTPException(422, "buy_sl_must_be_below_current" if used_live else "buy_sl_must_be_below_entry")
+        if entry.side == OrderSide.SELL and new_sl <= sl_anchor:
+            raise HTTPException(422, "sell_sl_must_be_above_current" if used_live else "sell_sl_must_be_above_entry")
 
     old_tp = entry.take_profit_price
     old_sl = entry.stop_loss_price

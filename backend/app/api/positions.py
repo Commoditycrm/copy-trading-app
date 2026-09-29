@@ -1523,3 +1523,81 @@ def close_position(
     _capture_exit_snapshot(db, user.id, [closed_item], new_event=False)
     db.commit()
     return order
+
+
+@router.post("/{broker_symbol}/trailing-stop")
+def arm_trailing_stop(
+    broker_symbol: str,
+    request: Request,
+    background: BackgroundTasks,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    trail_percent: Decimal = Query(..., gt=0, le=100, description="Trailing give-back % off the current market price."),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Arm a trailing stop on one position, measured off the CURRENT market price.
+
+    Stocks on trailing-capable brokers get a NATIVE trailing-stop order. Options
+    (which brokers reject for trailing stops) get an EMULATED trail — a guard the
+    P&L poller advances against the live mark and MARKET-closes when the price
+    retraces ``trail_percent`` % from its peak (same engine as Discord trims)."""
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    if acct.connection_status != "connected":
+        raise HTTPException(409, "broker_not_connected")
+
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    positions = adapter.get_positions()
+    target = broker_symbol.upper()
+    pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+
+    raw_price = pos.current_price
+    if raw_price is None or Decimal(str(raw_price)) <= 0:
+        raise HTTPException(422, "no_live_price_to_anchor_trail")
+    price = Decimal(str(raw_price))
+    held = abs(Decimal(str(pos.quantity)))
+    reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+
+    # Native trailing stop where the broker holds it (stocks on Alpaca). Trader-
+    # only (skip_fanout) — arming a protective stop isn't a copy signal.
+    if trailing_stop_close.trailing_stop_supported(adapter, pos):
+        payload = PlaceOrderIn(
+            instrument_type=pos.instrument_type,
+            symbol=pos.symbol,
+            side=reverse_side,
+            order_type=OrderType.TRAILING_STOP,
+            quantity=held,
+            trail_percent=trail_percent,
+        )
+        order = _place_trader_order(
+            db, user, payload, acct.id, background, request,
+            skip_fanout=True, resolve_wash_trade=True,
+        )
+        db.commit()
+        return {"mode": "native", "order_id": str(order.id), "trail_percent": str(trail_percent)}
+
+    # Emulated trail (options): arm/refresh a guard the P&L poller enforces. The
+    # dollar give-back is trail_percent % of the current mark; the peak seeds at
+    # the current price and ratchets up from there.
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    if guard is None:
+        guard = DiscordPositionGuard(
+            user_id=user.id,
+            symbol=pos.symbol.upper(),
+            option_strike=pos.option_strike,
+            option_right=(pos.option_right.value if pos.option_right else None),
+            option_expiry=pos.option_expiry,
+            entry_price=getattr(pos, "avg_entry_price", None),
+        )
+        db.add(guard)
+    guard.trail_percent = trail_percent
+    guards.arm_trail(guard, held, (price * trail_percent / Decimal(100)), price)
+    db.commit()
+    return {"mode": "emulated", "trail_percent": str(trail_percent), "peak": str(price)}

@@ -113,13 +113,16 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
 }
 
 /** Overflow menu on a position row — extra, destructive actions kept out of the
- *  main Close buttons: cancel this position's working stop, and cancel every
- *  open order the user owns. Both confirm first. onDone refreshes the table. */
-function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
-  orderId: string | null; hasStop: boolean; label: string; onDone: () => void;
+ *  main Close buttons: cancel this position's working stop, cancel every open
+ *  order from this row's Discord channel, and cancel every open order the user
+ *  owns. All confirm first. onDone refreshes the table. */
+function PositionActionsMenu({ orderId, hasStop, label, channel, brokerSymbol, brokerAccountId, onDone }: {
+  orderId: string | null; hasStop: boolean; label: string; channel: string | null;
+  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<null | "stop" | "all">(null);
+  const [busy, setBusy] = useState<null | "stop" | "all" | "channel" | "trail">(null);
+  const [trailPct, setTrailPct] = useState("");
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -144,14 +147,48 @@ function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
     finally { setBusy(null); }
   }
 
+  async function armTrail() {
+    const pct = parseFloat(trailPct);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) { notify.warn("Enter a trail % between 0 and 100"); return; }
+    setBusy("trail");
+    try {
+      const res = await api<{ mode?: string }>(
+        `/api/positions/${encodeURIComponent(brokerSymbol)}/trailing-stop?broker_account_id=${brokerAccountId}&trail_percent=${pct}`,
+        { method: "POST" },
+      );
+      notify.success(`Trailing stop armed at ${pct}% off the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
+      setTrailPct("");
+      setOpen(false);
+      onDone();
+    } catch (err) { notify.fromError(err, "Could not arm trailing stop"); }
+    finally { setBusy(null); }
+  }
+
+  async function cancelChannel() {
+    if (!channel) return;
+    if (!confirm(`Cancel all open orders from the ${channel} channel (every instrument)? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.`)) return;
+    setBusy("channel");
+    try {
+      const res = await api<{ cancelled_count?: number }>(
+        `/api/trades/cancel-open-by-channel?channel=${encodeURIComponent(channel)}&include_subscribers=true`,
+        { method: "POST" },
+      );
+      const n = res.cancelled_count ?? 0;
+      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"} from ${channel}`);
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel channel orders"); }
+    finally { setBusy(null); }
+  }
+
   async function cancelAllOpen() {
     if (!confirm("Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.")) return;
     setBusy("all");
     try {
-      const res = await api<{ cancelled?: unknown[] }>(
+      const res = await api<{ cancelled_count?: number }>(
         `/api/trades/cancel-all-open?include_subscribers=true`, { method: "POST" },
       );
-      const n = Array.isArray(res.cancelled) ? res.cancelled.length : 0;
+      const n = res.cancelled_count ?? 0;
       notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
       setOpen(false);
       onDone();
@@ -168,11 +205,35 @@ function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
       </button>
       {open && (
         <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
-             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 190 }}>
+             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 210 }}>
+          {/* Trailing stop — trails the market by this % from the peak. Native on
+              stocks; emulated (app-monitored market close) on options. */}
+          <div className="px-3 py-1.5">
+            <div className="mb-1" style={{ color: "var(--muted)" }}>Trailing Stop</div>
+            <div className="flex gap-1 items-center">
+              <input type="number" step="0.1" min="0.1" max="100" placeholder="%"
+                     value={trailPct} onChange={e => setTrailPct(e.target.value)}
+                     onKeyDown={e => { if (e.key === "Enter") armTrail(); }}
+                     aria-label={`Trailing stop percent for ${label}`}
+                     className="w-16 px-2 py-1 rounded text-xs"
+                     style={{ border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)" }} />
+              <button type="button" disabled={busy !== null || !trailPct} onClick={armTrail}
+                      className="btn-accent-solid px-2.5 py-1 rounded text-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                {busy === "trail" ? "…" : "Set"}
+              </button>
+            </div>
+            <div className="text-[10px] mt-0.5" style={{ color: "var(--muted)" }}>% off current market price</div>
+          </div>
+          <div style={{ borderTop: "1px solid var(--border)", margin: "2px 0" }} />
           <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
                   className={item} style={{ color: "var(--text-2)" }}
                   title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
             {busy === "stop" ? "Cancelling stop…" : "Cancel stop"}
+          </button>
+          <button type="button" disabled={!channel || busy !== null} onClick={cancelChannel}
+                  className={item} style={{ color: "var(--text-2)" }}
+                  title={channel ? `Cancel open orders from ${channel}` : "No Discord channel on this position"}>
+            {busy === "channel" ? "Cancelling…" : channel ? `Cancel open orders from ${channel}` : "Cancel open orders (this channel)"}
           </button>
           <button type="button" disabled={busy !== null} onClick={cancelAllOpen}
                   className={item} style={{ color: "var(--bad)" }}>
@@ -1012,6 +1073,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             orderId={orderId}
                             hasStop={t?.stop_loss_price != null}
                             label={p.symbol.toUpperCase()}
+                            channel={p.discord_channel ?? null}
+                            brokerSymbol={p.broker_symbol}
+                            brokerAccountId={p.broker_account_id}
                             onDone={refresh}
                           />
                         </div>
