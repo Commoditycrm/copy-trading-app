@@ -1428,9 +1428,24 @@ export default function TradesPage() {
                       ),
                       status: (
                       <td className="px-5 py-3.5">
+                        {/* Why an order did not go through is the first thing
+                            anyone wants when they see "rejected", and the
+                            reason is already on the row — the notification is
+                            the only other place it appears, and that scrolls
+                            away. Surface it on hover. Shown whenever a reason
+                            exists, not only for REJECTED: a cancelled mirror
+                            carries one too (e.g. "Trader closed before your
+                            entry filled"), and that is worth reading as well. */}
                         <span
                           className="chip uppercase tracking-wider font-medium whitespace-nowrap"
-                          style={{ background: st.bg, color: st.color, borderColor: "transparent" }}
+                          style={{
+                            background: st.bg, color: st.color, borderColor: "transparent",
+                            // Only hint at a tooltip when there is one to show.
+                            ...(o.reject_reason
+                              ? { cursor: "help", textDecoration: "underline dotted", textUnderlineOffset: 3 }
+                              : null),
+                          }}
+                          title={o.reject_reason || undefined}
                         >
                           {statusLabel}{o.parent_order_id ? " · copy" : ""}
                         </span>
