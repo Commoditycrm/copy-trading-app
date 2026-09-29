@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
@@ -29,7 +31,7 @@ from app.brokers import adapter_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
-from datetime import date
+from datetime import date, datetime, timezone
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
@@ -41,7 +43,7 @@ from app.schemas.position import (
     UnreachableAccount,
 )
 from app.models.sell_all_snapshot import SellAllSnapshot
-from app.services import trailing_stop_close
+from app.services import copy_engine, events, trailing_stop_close
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -1421,6 +1423,109 @@ def _close_account_positions_sync(
     return {"closed": closed, "failed": failed}
 
 
+
+# Statuses whose UNFILLED remainder still RESERVES the position at the broker.
+# A resting order on a contract holds the shares/contracts behind it, so a close
+# placed on top is refused — Webull:
+#   OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION "This order cannot be entered
+#   because it will reverse an existing position. You may need to close an open
+#   position, or cancel an open order, before you can submit this order."
+# Alpaca does the same thing with 40310000 (held_for_orders).
+_RESERVING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+# A cancel's 200 means the request was ACCEPTED, not that the broker has already
+# released the reservation. Placing the close in the same breath can still hit
+# the rejection we just cleared. One short pause is enough in practice and costs
+# no extra API calls — deliberately not a poll, because Webull's trade endpoints
+# share a ~10 req/30s budget per app_key and a verify loop would spend it at the
+# exact moment the close needs it.
+_CANCEL_SETTLE_S = 0.6
+
+
+def _cancel_working_orders_for_position(
+    db: Session, user: User, acct: BrokerAccount, adapter: Any, pos: BrokerPosition,
+) -> list[uuid.UUID]:
+    """Cancel every still-working order on the SAME contract before closing it.
+
+    Closing from the positions table used to fail outright whenever anything was
+    already resting on that contract — a protective stop, a take-profit, a
+    partially-filled limit. The broker refuses the close because the resting
+    order still reserves the position, and the user is left reading a raw
+    OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION with a working stop they did not
+    know was in the way.
+
+    So clear the contract first. BOTH sides go: a resting SELL blocks the close
+    directly, and a resting BUY would re-open the position moments after we
+    flatten it.
+
+    This is the trader-side twin of ``copy_engine._cancel_subscriber_conflicts``,
+    which already does the same thing for mirrors — the subscriber path was
+    handled and the trader's own account was not. Kept separate rather than
+    shared because that one runs in a worker thread on its own session and
+    excludes the mirror it is about to place.
+
+    Best-effort per order: a cancel that fails is logged and the rest continue,
+    because a stale id (already filled/cancelled at the broker) must not block a
+    close the user asked for. Returns the ids actually cancelled.
+    """
+    rows = db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.broker_account_id == acct.id,
+            Order.instrument_type == pos.instrument_type,
+            Order.symbol == pos.symbol,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            Order.status.in_(_RESERVING_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars().all()
+    if not rows:
+        return []
+
+    now = datetime.now(timezone.utc)
+    cancelled: list[uuid.UUID] = []
+    touched: list[Order] = []
+    for o in rows:
+        try:
+            adapter.cancel_order(o.broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "close: could not cancel %s order %s (broker_order=%s) blocking the "
+                "close of %s — continuing: %s",
+                o.order_type.value, o.id, o.broker_order_id, pos.broker_symbol,
+                str(exc)[:200],
+            )
+            continue
+        o.status = OrderStatus.CANCELED
+        o.closed_at = now
+        o.reject_reason = (
+            "Cancelled automatically to free the position for a close you placed "
+            "from the positions table."
+        )[:480]
+        cancelled.append(o.id)
+        touched.append(o)
+
+    if cancelled:
+        db.commit()
+        for o in touched:
+            db.refresh(o)
+            events.publish(user.id, copy_engine._order_event("order.cancelled", o))  # noqa: SLF001
+        log.info(
+            "close: cancelled %d working order(s) on %s before closing",
+            len(cancelled), pos.broker_symbol,
+        )
+        # Give the broker a moment to release the reservation (see above).
+        time.sleep(_CANCEL_SETTLE_S)
+    return cancelled
+
+
 @router.post("/{broker_symbol}/close", response_model=OrderOut)
 def close_position(
     broker_symbol: str,
@@ -1457,6 +1562,30 @@ def close_position(
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
 
+    if payload.quantity is not None and payload.quantity <= 0:
+        raise HTTPException(422, "quantity_must_be_positive")
+
+    # Anything still resting on this contract reserves the position at the
+    # broker, so the close would be refused. Clear it first — see the helper.
+    cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+
+    # RE-READ after cancelling. An order we just cancelled may have FILLED in
+    # the moments before the cancel reached the broker — a resting stop is
+    # exactly the kind that does. Sizing the close from the snapshot taken
+    # BEFORE the cancel then sells a holding that is already gone, and a close
+    # becomes a SHORT. Only pay for the extra read when we actually cancelled
+    # something; the common case (nothing resting) is unchanged.
+    if cancelled:
+        positions = adapter.get_positions()
+        pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
+        if pos is None or pos.quantity == 0:
+            # The resting order closed it for us. Nothing left to sell, and
+            # selling anyway is precisely how the short happened.
+            raise HTTPException(
+                409,
+                "position_already_closed_by_a_resting_order",
+            )
+
     # Reverse the side based on the current holding (long → sell, short → buy).
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
     full_qty = abs(pos.quantity)
@@ -1464,7 +1593,16 @@ def close_position(
     if close_qty <= 0:
         raise HTTPException(422, "quantity_must_be_positive")
     if close_qty > full_qty:
-        raise HTTPException(422, "quantity_exceeds_position")
+        # CLAMP, never reject. The size can legitimately shrink between the
+        # client's view and now (a partial fill on the stop we just cancelled,
+        # a trim elsewhere), and the user asked to get OUT — closing what is
+        # actually there is the right answer. Erroring would leave them holding
+        # it; over-selling would open a short.
+        log.info(
+            "close: clamping %s from %s to the %s actually held on %s",
+            broker_symbol, close_qty, full_qty, acct.id,
+        )
+        close_qty = full_qty
 
     # Options can't be closed with a market order — Alpaca rejects them always,
     # Webull rejects them on limited-liquidity contracts ("does not support

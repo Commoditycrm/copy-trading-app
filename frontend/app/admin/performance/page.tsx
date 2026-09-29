@@ -6,7 +6,7 @@ import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
-import { ExportButton } from "@/components/ExportButton";
+import { ExportDialog } from "./ExportDialog";
 import { SubscriberPill, SubscriberBreakdown, type FanoutChild } from "@/components/performance/PerformanceView";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -365,16 +365,6 @@ export default function AdminPerformancePage() {
     { id: "success", header: "Success" },
   ], []);
   const cols = useTableColumns("admin_performance", columnDefs);
-  // The table filters q/side in the browser; the export is built server-side,
-  // so pass them along or the file won't match what's on screen.
-  function exportEndpoint() {
-    const p = new URLSearchParams();
-    if (q.trim()) p.set("search", q.trim());
-    if (side !== "all") p.set("side", side);
-    const qs = p.toString();
-    return `/api/admin/performance/export${qs ? `?${qs}` : ""}`;
-  }
-
   function toggleSort(k: PerfSortKey) {
     if (sortKey === k) setSortDir(d => (d === "asc" ? "desc" : "asc"));
     else { setSortKey(k); setSortDir("asc"); }
@@ -500,7 +490,7 @@ export default function AdminPerformancePage() {
           </button>
           {/* One row per subscriber mirror. Ignores the "Last N" selector on
               purpose — that bounds the on-screen table, not the export. */}
-          <ExportButton path={exportEndpoint()} label="Export" fallbackName="kopyya-fanouts.xlsx" />
+          <ExportDialog search={q} side={side} />
           {/* Show/hide + drag-reorder columns; drag a header edge to resize. */}
           <ColumnsMenu cols={cols} />
         </div>
