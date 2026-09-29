@@ -248,6 +248,54 @@ def test_quantity_is_clamped_to_what_is_actually_held():
     assert src.index("if cancelled:") < src.index("close_qty = full_qty")
 
 
+# ── 7. stocks, where every option field is NULL on both sides ──────────────
+def _stock_pos(symbol="NIO"):
+    return BrokerPosition(
+        broker_symbol=symbol, symbol=symbol, instrument_type=InstrumentType.STOCK,
+        quantity=Decimal("10"), avg_entry_price=Decimal("3.40"),
+        current_price=Decimal("3.49"), market_value=None, unrealized_pnl=None,
+        option_expiry=None, option_strike=None, option_right=None,
+    )
+
+
+def _stock_order(db, acct, *, boid="S1", symbol="NIO", status=OrderStatus.SUBMITTED):
+    o = Order(id=uuid.uuid4(), user_id=_USER, broker_account_id=acct.id,
+              instrument_type=InstrumentType.STOCK, symbol=symbol,
+              option_expiry=None, option_strike=None, option_right=None,
+              side=OrderSide.SELL, order_type=OrderType.STOP,
+              quantity=Decimal("10"), status=status, broker_order_id=boid)
+    db.add(o); db.commit()
+    return o
+
+
+def test_matches_stock_orders_where_option_fields_are_null():
+    """is_not_distinct_from(None) has to behave as IS NULL, or a stock close
+    would silently cancel nothing and hit the same broker rejection."""
+    db = _db(); acct = _acct(db)
+    stop = _stock_order(db, acct, boid="STOCK-STOP")
+    user = db.get(User, _USER)
+    ad = _Adapter()
+    got = mod._cancel_working_orders_for_position(db, user, acct, ad, _stock_pos())
+    assert got == [stop.id] and ad.cancelled == ["STOCK-STOP"]
+
+
+def test_a_stock_close_never_cancels_an_option_on_the_same_ticker():
+    """NIO stock and NIO 3.5C are different positions. Closing the stock must
+    not cancel the option's protective stop."""
+    db = _db(); acct = _acct(db)
+    opt = _order(db, acct, boid="NIO-OPT")           # NIO 3.5 call
+    stk = _stock_order(db, acct, boid="NIO-STOCK")
+    user = db.get(User, _USER)
+
+    ad = _Adapter()
+    assert mod._cancel_working_orders_for_position(db, user, acct, ad, _stock_pos()) == [stk.id]
+    assert ad.cancelled == ["NIO-STOCK"]
+
+    ad2 = _Adapter()
+    assert mod._cancel_working_orders_for_position(db, user, acct, ad2, _pos()) == [opt.id]
+    assert ad2.cancelled == ["NIO-OPT"]
+
+
 def test_close_places_the_order_after_cancelling():
     """Wiring check: close_position clears the contract BEFORE it builds the
     close, so the broker sees a free position."""
