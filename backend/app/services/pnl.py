@@ -480,6 +480,33 @@ def realized_pnl_by_day(
             else:
                 open_lots[key].append(_Lot(qty=-qty, price=price))
 
+    # ── Book expired LONG options as worthless ──────────────────────────────
+    # A LONG option still open past its expiry was let-expire — which almost
+    # always means it finished out-of-the-money and expired WORTHLESS (an ITM
+    # long gets sold or exercised, not left to lapse). The broker books the full
+    # premium loss on the expiry day, but a fill-based FIFO never sees a closing
+    # sell — so without this the loss is silently dropped and realized P&L reads
+    # too high (the Webull "+$1,339 vs +$475" gap). Only LONG lots: short and
+    # ITM/cash-settled expiries need the broker's settlement value (follow-up).
+    today = datetime.now(bucket_tz).date()
+    for key, lots in open_lots.items():
+        if not lots or key[0] != "OPT":
+            continue
+        exp = key[2]                        # option_expiry date from _instrument_key
+        if exp is None or exp >= today:
+            continue                        # not expired yet (or expires today — not settled)
+        if (start and exp < start) or (end and exp > end):
+            continue                        # expiry outside the queried window
+        loss = Decimal(0)
+        for lot in lots:
+            if lot.qty > 0:                 # LONG only
+                loss += (Decimal(0) - lot.price) * lot.qty * Decimal(100)
+        if loss != 0:
+            daily_pnl[exp] += loss
+            # One synthetic "trade" for the contract's expiry, deterministic so
+            # re-runs don't inflate the count.
+            closing_orders[exp].add(uuid.uuid5(uuid.NAMESPACE_OID, f"exp:{key}"))
+
     return {
         d: (daily_pnl.get(d, Decimal(0)), len(closing_orders[d]))
         for d in closing_orders
