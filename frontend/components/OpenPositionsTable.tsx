@@ -116,16 +116,14 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
  *  main Close buttons: cancel this position's working stop, cancel every open
  *  order from this row's Discord channel, and cancel every open order the user
  *  owns. All confirm first. onDone refreshes the table. */
-function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, side, onDone }: {
+function PositionActionsMenu({ orderId, hasStop, label, channel, brokerSymbol, brokerAccountId, onDone }: {
   orderId: string | null; hasStop: boolean; label: string; channel: string | null;
-  entryPrice: string | null; side: string; onDone: () => void;
+  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<null | "stop" | "all" | "channel" | "stoppct">(null);
+  const [busy, setBusy] = useState<null | "stop" | "all" | "channel" | "trail">(null);
+  const [trailPct, setTrailPct] = useState("");
   const ref = useRef<HTMLDivElement>(null);
-  // A stop-loss sits BELOW entry for a long (buy) and ABOVE for a short (sell) —
-  // same convention as the inline SL cell (pctToPrice/legDirection).
-  const canSetStop = !!orderId && !!entryPrice && Number(entryPrice) > 0;
 
   useEffect(() => {
     if (!open) return;
@@ -149,20 +147,20 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, sid
     finally { setBusy(null); }
   }
 
-  async function setStopPct(pct: number) {
-    if (!canSetStop || !orderId || !entryPrice) return;
-    const e = Number(entryPrice);
-    // pct is a signed P&L LEVEL: place the stop at the price where the position's
-    // P&L equals pct%. Long profits as price rises, short as it falls.
-    const sign = side === "buy" ? 1 : -1;
-    const price = (e * (1 + (sign * pct) / 100)).toFixed(4);
-    setBusy("stoppct");
+  async function armTrail() {
+    const pct = parseFloat(trailPct);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) { notify.warn("Enter a trail % between 0 and 100"); return; }
+    setBusy("trail");
     try {
-      await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: price }) });
-      notify.success(`Stop set at ${pct > 0 ? "+" : ""}${pct}% P&L (${fmtNum(price, 2)})`);
+      const res = await api<{ mode?: string }>(
+        `/api/positions/${encodeURIComponent(brokerSymbol)}/trailing-stop?broker_account_id=${brokerAccountId}&trail_percent=${pct}`,
+        { method: "POST" },
+      );
+      notify.success(`Trailing stop armed at ${pct}% off the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
+      setTrailPct("");
       setOpen(false);
       onDone();
-    } catch (err) { notify.fromError(err, "Could not set stop"); }
+    } catch (err) { notify.fromError(err, "Could not arm trailing stop"); }
     finally { setBusy(null); }
   }
 
@@ -208,21 +206,23 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, sid
       {open && (
         <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
              style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 210 }}>
-          {/* Quick stop-loss setter — same %s as Close %, but sets the SL at that
-              distance from entry via the bracket. */}
+          {/* Trailing stop — trails the market by this % from the peak. Native on
+              stocks; emulated (app-monitored market close) on options. */}
           <div className="px-3 py-1.5">
-            <div className="mb-1" style={{ color: "var(--muted)" }}>Stop % (P&L)</div>
-            <div className="flex gap-1">
-              {[-25, -10, 0, 20].map(pct => (
-                <button key={pct} type="button" disabled={!canSetStop || busy !== null}
-                        onClick={() => setStopPct(pct)}
-                        title={canSetStop ? `Set stop at ${pct > 0 ? "+" : ""}${pct}% P&L` : "No entry price to anchor the stop"}
-                        className="px-2 py-0.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        style={{ border: "1px solid var(--border)", color: "var(--text-2)", background: "transparent" }}>
-                  {busy === "stoppct" ? "…" : `${pct}%`}
-                </button>
-              ))}
+            <div className="mb-1" style={{ color: "var(--muted)" }}>Trailing Stop</div>
+            <div className="flex gap-1 items-center">
+              <input type="number" step="0.1" min="0.1" max="100" placeholder="%"
+                     value={trailPct} onChange={e => setTrailPct(e.target.value)}
+                     onKeyDown={e => { if (e.key === "Enter") armTrail(); }}
+                     aria-label={`Trailing stop percent for ${label}`}
+                     className="w-16 px-2 py-1 rounded text-xs"
+                     style={{ border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)" }} />
+              <button type="button" disabled={busy !== null || !trailPct} onClick={armTrail}
+                      className="btn-accent-solid px-2.5 py-1 rounded text-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                {busy === "trail" ? "…" : "Set"}
+              </button>
             </div>
+            <div className="text-[10px] mt-0.5" style={{ color: "var(--muted)" }}>% off current market price</div>
           </div>
           <div style={{ borderTop: "1px solid var(--border)", margin: "2px 0" }} />
           <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
@@ -1074,8 +1074,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             hasStop={t?.stop_loss_price != null}
                             label={p.symbol.toUpperCase()}
                             channel={p.discord_channel ?? null}
-                            entryPrice={entryPrice}
-                            side={side}
+                            brokerSymbol={p.broker_symbol}
+                            brokerAccountId={p.broker_account_id}
                             onDone={refresh}
                           />
                         </div>
