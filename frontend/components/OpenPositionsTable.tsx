@@ -116,12 +116,16 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
  *  main Close buttons: cancel this position's working stop, cancel every open
  *  order from this row's Discord channel, and cancel every open order the user
  *  owns. All confirm first. onDone refreshes the table. */
-function PositionActionsMenu({ orderId, hasStop, label, channel, onDone }: {
-  orderId: string | null; hasStop: boolean; label: string; channel: string | null; onDone: () => void;
+function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, side, onDone }: {
+  orderId: string | null; hasStop: boolean; label: string; channel: string | null;
+  entryPrice: string | null; side: string; onDone: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<null | "stop" | "all" | "channel">(null);
+  const [busy, setBusy] = useState<null | "stop" | "all" | "channel" | "stoppct">(null);
   const ref = useRef<HTMLDivElement>(null);
+  // A stop-loss sits BELOW entry for a long (buy) and ABOVE for a short (sell) —
+  // same convention as the inline SL cell (pctToPrice/legDirection).
+  const canSetStop = !!orderId && !!entryPrice && Number(entryPrice) > 0;
 
   useEffect(() => {
     if (!open) return;
@@ -142,6 +146,21 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, onDone }: {
       setOpen(false);
       onDone();
     } catch (e) { notify.fromError(e, "Could not cancel stop"); }
+    finally { setBusy(null); }
+  }
+
+  async function setStopPct(pct: number) {
+    if (!canSetStop || !orderId || !entryPrice) return;
+    const e = Number(entryPrice);
+    const sign = side === "buy" ? -1 : 1;              // SL below entry (long) / above (short)
+    const price = (e * (1 + (sign * pct) / 100)).toFixed(4);
+    setBusy("stoppct");
+    try {
+      await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: price }) });
+      notify.success(`Stop set ${pct}% from entry (${fmtNum(price, 2)})`);
+      setOpen(false);
+      onDone();
+    } catch (err) { notify.fromError(err, "Could not set stop"); }
     finally { setBusy(null); }
   }
 
@@ -186,7 +205,24 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, onDone }: {
       </button>
       {open && (
         <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
-             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 190 }}>
+             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 210 }}>
+          {/* Quick stop-loss setter — same %s as Close %, but sets the SL at that
+              distance from entry via the bracket. */}
+          <div className="px-3 py-1.5">
+            <div className="mb-1" style={{ color: "var(--muted)" }}>Stop %</div>
+            <div className="flex gap-1">
+              {[25, 50, 75, 100].map(pct => (
+                <button key={pct} type="button" disabled={!canSetStop || busy !== null}
+                        onClick={() => setStopPct(pct)}
+                        title={canSetStop ? `Set stop ${pct}% from entry` : "No entry price to anchor the stop"}
+                        className="px-2 py-0.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        style={{ border: "1px solid var(--border)", color: "var(--text-2)", background: "transparent" }}>
+                  {busy === "stoppct" ? "…" : `${pct}%`}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{ borderTop: "1px solid var(--border)", margin: "2px 0" }} />
           <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
                   className={item} style={{ color: "var(--text-2)" }}
                   title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
@@ -1036,6 +1072,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             hasStop={t?.stop_loss_price != null}
                             label={p.symbol.toUpperCase()}
                             channel={p.discord_channel ?? null}
+                            entryPrice={entryPrice}
+                            side={side}
                             onDone={refresh}
                           />
                         </div>
