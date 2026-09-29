@@ -1927,20 +1927,36 @@ def update_bracket(
     new_tp = payload.take_profit_price if payload.tp_present else entry.take_profit_price
     new_sl = payload.stop_loss_price if payload.sl_present else entry.stop_loss_price
 
-    # Directional geometry: buy → sl < ref < tp; sell → tp < ref < sl.
-    # Only enforced when ref_price is known AND both legs are set (one-leg
-    # brackets have no directional constraint to check beyond ref-side).
-    if ref_price is not None:
-        if new_tp is not None:
-            if entry.side == OrderSide.BUY and new_tp <= ref_price:
-                raise HTTPException(422, "buy_tp_must_be_above_entry")
-            if entry.side == OrderSide.SELL and new_tp >= ref_price:
-                raise HTTPException(422, "sell_tp_must_be_below_entry")
-        if new_sl is not None:
-            if entry.side == OrderSide.BUY and new_sl >= ref_price:
-                raise HTTPException(422, "buy_sl_must_be_below_entry")
-            if entry.side == OrderSide.SELL and new_sl <= ref_price:
-                raise HTTPException(422, "sell_sl_must_be_above_entry")
+    # TP geometry (anchored on entry): buy → tp > entry; sell → tp < entry.
+    if ref_price is not None and new_tp is not None:
+        if entry.side == OrderSide.BUY and new_tp <= ref_price:
+            raise HTTPException(422, "buy_tp_must_be_above_entry")
+        if entry.side == OrderSide.SELL and new_tp >= ref_price:
+            raise HTTPException(422, "sell_tp_must_be_below_entry")
+
+    # SL geometry. On a FILLED (live) position a stop only has to sit on the
+    # correct side of the CURRENT market price — not entry — so breakeven and
+    # lock-in-profit stops are allowed (a "Stop %" P&L level of 0 or +N). An
+    # underwater breakeven is still rejected because it would trigger instantly.
+    # Anchor on the fresh cached price when we have one; otherwise fall back to
+    # the entry anchor, preserving the pre-existing pre-fill behaviour.
+    sl_anchor = ref_price
+    used_live = False
+    if is_filled and new_sl is not None:
+        from app.services.market_data_stream import _build_occ, get_live_price  # noqa: PLC0415
+        key = (
+            _build_occ(entry.symbol, entry.option_expiry, entry.option_strike, entry.option_right)
+            if entry.instrument_type == InstrumentType.OPTION
+            else (entry.symbol or "").upper()
+        )
+        live = get_live_price(key) if key else None
+        if live is not None:
+            sl_anchor, used_live = live, True
+    if sl_anchor is not None and new_sl is not None:
+        if entry.side == OrderSide.BUY and new_sl >= sl_anchor:
+            raise HTTPException(422, "buy_sl_must_be_below_current" if used_live else "buy_sl_must_be_below_entry")
+        if entry.side == OrderSide.SELL and new_sl <= sl_anchor:
+            raise HTTPException(422, "sell_sl_must_be_above_current" if used_live else "sell_sl_must_be_above_entry")
 
     old_tp = entry.take_profit_price
     old_sl = entry.stop_loss_price
