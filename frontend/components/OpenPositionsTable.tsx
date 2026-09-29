@@ -152,12 +152,14 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, sid
   async function setStopPct(pct: number) {
     if (!canSetStop || !orderId || !entryPrice) return;
     const e = Number(entryPrice);
-    const sign = side === "buy" ? -1 : 1;              // SL below entry (long) / above (short)
+    // pct is a signed P&L LEVEL: place the stop at the price where the position's
+    // P&L equals pct%. Long profits as price rises, short as it falls.
+    const sign = side === "buy" ? 1 : -1;
     const price = (e * (1 + (sign * pct) / 100)).toFixed(4);
     setBusy("stoppct");
     try {
       await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: price }) });
-      notify.success(`Stop set ${pct}% from entry (${fmtNum(price, 2)})`);
+      notify.success(`Stop set at ${pct > 0 ? "+" : ""}${pct}% P&L (${fmtNum(price, 2)})`);
       setOpen(false);
       onDone();
     } catch (err) { notify.fromError(err, "Could not set stop"); }
@@ -209,12 +211,12 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, entryPrice, sid
           {/* Quick stop-loss setter — same %s as Close %, but sets the SL at that
               distance from entry via the bracket. */}
           <div className="px-3 py-1.5">
-            <div className="mb-1" style={{ color: "var(--muted)" }}>Stop %</div>
+            <div className="mb-1" style={{ color: "var(--muted)" }}>Stop % (P&L)</div>
             <div className="flex gap-1">
-              {[25, 50, 75, 100].map(pct => (
+              {[-25, -10, 0, 20].map(pct => (
                 <button key={pct} type="button" disabled={!canSetStop || busy !== null}
                         onClick={() => setStopPct(pct)}
-                        title={canSetStop ? `Set stop ${pct}% from entry` : "No entry price to anchor the stop"}
+                        title={canSetStop ? `Set stop at ${pct > 0 ? "+" : ""}${pct}% P&L` : "No entry price to anchor the stop"}
                         className="px-2 py-0.5 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         style={{ border: "1px solid var(--border)", color: "var(--text-2)", background: "transparent" }}>
                   {busy === "stoppct" ? "…" : `${pct}%`}
