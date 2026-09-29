@@ -25,6 +25,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.brokers.ibkr import IBKRAdapter
 from app.database import SessionLocal
@@ -568,9 +569,23 @@ def _insert_order_from_ibkr(
         ),
         fanned_out_to_subscribers=False,
     )
-    db.add(order)
-    db.flush()
-    return order
+    # Insert inside a savepoint: if a concurrent listener/sync already recorded
+    # this exact FILLED order (unique index user_id+broker_order_id WHERE
+    # FILLED), adopt the winner's row instead of erroring the poll.
+    try:
+        with db.begin_nested():
+            db.add(order)
+            db.flush()
+        return order
+    except IntegrityError:
+        db.expunge(order)
+        adopted = db.execute(
+            select(Order)
+            .where(Order.user_id == trader_user_id,
+                   Order.broker_order_id == broker_order_id)
+            .order_by(Order.created_at.desc()).limit(1)
+        ).scalars().first()
+        return adopted if adopted is not None else order
 
 
 def _cascade_cancel_to_mirrors(parent_order_id: uuid.UUID) -> None:
