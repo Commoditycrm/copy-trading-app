@@ -1294,6 +1294,10 @@ def admin_export_fanouts(
     broker: str | None = None,
     search: str | None = Query(default=None, description="Symbol / trader, as the admin table's box"),
     side: str | None = Query(default=None, description="all | buy | sell"),
+    columns: str | None = Query(
+        default=None,
+        description="Comma-separated column HEADERS to include, in order. Omit for all.",
+    ),
 ) -> Response:
     """Fanout data as .xlsx, one row per subscriber mirror.
 
@@ -1346,9 +1350,19 @@ def admin_export_fanouts(
     # the ORM.
     db.commit()
 
+    # Column selection: keep only the requested headers, in the requested order.
+    # Unknown headers are ignored; an empty/garbage selection falls back to all
+    # so the export can never come back with zero columns.
+    export_cols = _fanout_export_columns()
+    if columns:
+        by_header = {col.header: col for col in export_cols}
+        wanted = [by_header[h.strip()] for h in columns.split(",") if h.strip() in by_header]
+        if wanted:
+            export_cols = wanted
+
     now = datetime.now(timezone.utc)
     data = excel_export.build_workbook(
-        columns=_fanout_export_columns(),
+        columns=export_cols,
         rows=rows,
         sheet_title="Fanouts",
         meta=(
