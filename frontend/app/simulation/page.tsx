@@ -4,17 +4,16 @@
  * Configurable trim-ladder SIMULATION — self-contained, isolated tool page.
  *
  * Changes nothing in production. It mirrors the Discord exit-ladder behaviour
- * in the browser so a tester can define ladders PER TICKER and PER TRANSACTION
- * SIZE (e.g. AAPL vs everything else, split at a $ threshold), set a position's
- * ticker/entry/qty, and watch the resolved ladder trim the position in portions
- * while fixed/trailing stops manage the remainder.
+ * in the browser so a tester can define ladders PER TICKER and PER COST BAND
+ * (any number of cost ranges, e.g. <200 / 200-500 / 500-750 / >=750), set a
+ * position's ticker/entry/qty, and watch the resolved ladder trim the position
+ * in portions while fixed/trailing stops manage the remainder.
  *
  * NOTE: the live backend currently uses ONE GLOBAL ladder per trader — per-ticker
- * / per-size ladders are modelled here for design only. The read-only "Import my
- * live settings" button pulls that single global ladder into the selected rule.
+ * / per-cost ladders are modelled here for design only. The read-only imports
+ * (settings + a live position) are GET-only; nothing here writes to the server.
  *
- * Public route (outside the (app) auth group). The only network call is the
- * read-only GET /api/discord-sources/settings. Nothing here writes to the server.
+ * Public route (outside the (app) auth group).
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -29,8 +28,8 @@ type Stage = {
   trailPct: number; // trailing stop, % below the highest price since it armed
 };
 type Ladder = { initOn: boolean; initPct: number; stages: Stage[] };
-type Bucket = "under" | "over";
-type Rule = { id: string; ticker: string; bucket: Bucket; ladder: Ladder };
+type BandRule = { id: string; band: number; ladder: Ladder };
+type TickerGroup = { id: string; ticker: string; rules: BandRule[] };
 type Position = { ticker: string; entry: number; qty: number };
 
 type TrimRow = { i: number; target: number; sold: number; px: number; left: number; stop: number | null; trail: number | null };
@@ -60,21 +59,44 @@ type Eng = {
   trims: TrimRow[];
 };
 
-// ─────────────────────────── example config (editable, per screenshot) ─────────
+// ─────────────────────────── cost bands ───────────────────────────
+// breakpoints [200,500,750] -> bands: <200 | 200-500 | 500-750 | >=750
+function bandCount(bp: number[]): number {
+  return bp.length + 1;
+}
+function bandOf(cost: number, bp: number[]): number {
+  for (let i = 0; i < bp.length; i++) if (cost < bp[i]) return i;
+  return bp.length;
+}
+function bandLabel(i: number, bp: number[]): string {
+  if (bp.length === 0) return "all costs";
+  if (i === 0) return `< $${bp[0]}`;
+  if (i >= bp.length) return `≥ $${bp[bp.length - 1]}`;
+  return `$${bp[i - 1]}–${bp[i]}`;
+}
+
+// ─────────────────────────── example config (editable) ───────────────────────────
 const uid = () => Math.random().toString(36).slice(2, 9);
-const mkStage = (target: number, sell: number, stopOn: boolean, stopPct: number): Stage => ({
-  target,
-  sell,
-  stopOn,
-  stopPct,
-  trailOn: false,
-  trailPct: 5,
-});
-const EXAMPLE_RULES = (): Rule[] => [
-  { id: uid(), ticker: "AAPL", bucket: "under", ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 50, true, 0), mkStage(40, 50, true, 10), mkStage(60, 100, false, 0)] } },
-  { id: uid(), ticker: "AAPL", bucket: "over", ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 30, true, 0), mkStage(50, 50, true, 20), mkStage(80, 100, false, 0)] } },
-  { id: uid(), ticker: "ALL", bucket: "under", ladder: { initOn: false, initPct: -10, stages: [mkStage(15, 50, true, 0), mkStage(30, 50, true, 10), mkStage(50, 100, false, 0)] } },
-  { id: uid(), ticker: "ALL", bucket: "over", ladder: { initOn: true, initPct: -15, stages: [mkStage(25, 20, true, 0), mkStage(50, 50, true, 15), mkStage(75, 100, false, 0)] } },
+const mkStage = (target: number, sell: number, stopOn: boolean, stopPct: number): Stage => ({ target, sell, stopOn, stopPct, trailOn: false, trailPct: 5 });
+const EX_BREAKS = [200, 500, 750];
+const EXAMPLE_TICKERS = (): TickerGroup[] => [
+  {
+    id: uid(),
+    ticker: "AAPL",
+    rules: [
+      { id: uid(), band: 1, ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 50, true, 0), mkStage(40, 50, true, 10), mkStage(60, 100, false, 0)] } },
+      { id: uid(), band: 2, ladder: { initOn: true, initPct: -10, stages: [mkStage(20, 30, true, 0), mkStage(50, 50, true, 20), mkStage(80, 100, false, 0)] } },
+    ],
+  },
+  {
+    id: uid(),
+    ticker: "ALL",
+    rules: [
+      { id: uid(), band: 0, ladder: { initOn: false, initPct: -10, stages: [mkStage(15, 50, true, 0), mkStage(30, 50, true, 10), mkStage(50, 100, false, 0)] } },
+      { id: uid(), band: 1, ladder: { initOn: false, initPct: -10, stages: [mkStage(15, 50, true, 0), mkStage(30, 50, true, 10), mkStage(50, 100, false, 0)] } },
+      { id: uid(), band: 3, ladder: { initOn: true, initPct: -15, stages: [mkStage(25, 20, true, 0), mkStage(50, 50, true, 15), mkStage(75, 100, false, 0)] } },
+    ],
+  },
 ];
 
 type Scenario = { label: string; dur: number; path: [number, number][] };
@@ -91,14 +113,15 @@ const f2 = (n: number) => n.toFixed(2);
 const f0 = (n: number) => Math.round(n);
 
 // ─────────────────────────── rule resolution ───────────────────────────
-function resolveRule(rules: Rule[], ticker: string, size: number, threshold: number): { rule: Rule | null; via: "exact" | "all" | null; bucket: Bucket } {
-  const bucket: Bucket = size < threshold ? "under" : "over";
+function resolveRule(tickers: TickerGroup[], ticker: string, band: number): { rule: BandRule | null; via: "exact" | "all" | null } {
   const tk = ticker.trim().toUpperCase();
-  const exact = rules.find((r) => r.ticker.trim().toUpperCase() === tk && r.bucket === bucket);
-  if (exact) return { rule: exact, via: "exact", bucket };
-  const all = rules.find((r) => r.ticker.trim().toUpperCase() === "ALL" && r.bucket === bucket);
-  if (all) return { rule: all, via: "all", bucket };
-  return { rule: null, via: null, bucket };
+  const g = tickers.find((x) => x.ticker.trim().toUpperCase() === tk);
+  const exact = g?.rules.find((r) => r.band === band);
+  if (exact) return { rule: exact, via: "exact" };
+  const all = tickers.find((x) => x.ticker.trim().toUpperCase() === "ALL");
+  const allr = all?.rules.find((r) => r.band === band);
+  if (allr) return { rule: allr, via: "all" };
+  return { rule: null, via: null };
 }
 
 // ─────────────────────────── engine ───────────────────────────
@@ -243,8 +266,8 @@ function stepEngine(s: Eng): boolean {
 
 // ─────────────────────────── component ───────────────────────────
 export default function SimulationPage() {
-  const [rules, setRules] = useState<Rule[]>(EXAMPLE_RULES);
-  const [threshold, setThreshold] = useState<number>(500);
+  const [breakpoints, setBreakpoints] = useState<number[]>([...EX_BREAKS]);
+  const [tickers, setTickers] = useState<TickerGroup[]>(EXAMPLE_TICKERS);
   const [pos, setPos] = useState<Position>({ ticker: "AAPL", entry: 4.2, qty: 100 });
   const [scenarioKey, setScenarioKey] = useState<string>("climb_reverse");
   const [speed, setSpeed] = useState<number>(4);
@@ -263,8 +286,9 @@ export default function SimulationPage() {
 
   const bump = () => setFrame((f) => f + 1);
 
-  const size = pos.entry * pos.qty;
-  const resolved = resolveRule(rules, pos.ticker, size, threshold);
+  const cost = pos.entry * pos.qty;
+  const band = bandOf(cost, breakpoints);
+  const resolved = resolveRule(tickers, pos.ticker, band);
 
   const draw = useCallback(() => {
     const s = engRef.current;
@@ -380,11 +404,12 @@ export default function SimulationPage() {
   const reset = useCallback(() => {
     stopTimer();
     setRunning(false);
-    const r = resolveRule(rules, pos.ticker, pos.entry * pos.qty, threshold);
+    const b = bandOf(pos.entry * pos.qty, breakpoints);
+    const r = resolveRule(tickers, pos.ticker, b);
     engRef.current = r.rule ? initEngine(r.rule.ladder, pos.ticker, pos.entry, pos.qty, SCENARIOS[scenarioKey]) : null;
     draw();
     bump();
-  }, [rules, pos, threshold, scenarioKey, draw]);
+  }, [tickers, pos, breakpoints, scenarioKey, draw]);
 
   useEffect(() => {
     setMounted(true);
@@ -418,30 +443,40 @@ export default function SimulationPage() {
     timerRef.current = window.setTimeout(loop, 1000 / speedRef.current);
   };
 
-  // ── editing helpers ──
-  const setRuleMeta = (id: string, patch: Partial<Pick<Rule, "ticker" | "bucket">>) =>
-    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
-  const setRuleLadder = (id: string, patch: Partial<Ladder>) =>
-    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, ...patch } } : r)));
-  const setRuleStage = (id: string, i: number, patch: Partial<Stage>) =>
-    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, stages: r.ladder.stages.map((s, j) => (j === i ? { ...s, ...patch } : s)) } } : r)));
-  const addRuleStage = (id: string) =>
-    setRules((rs) =>
-      rs.map((r) => {
-        if (r.id !== id) return r;
-        const last = r.ladder.stages[r.ladder.stages.length - 1];
-        return { ...r, ladder: { ...r.ladder, stages: [...r.ladder.stages, mkStage(last ? last.target + 20 : 20, 50, false, 0)] } };
+  // ── breakpoint editing ──
+  const sortUniq = (a: number[]) => Array.from(new Set(a.filter((n) => n > 0))).sort((x, y) => x - y);
+  const setBreak = (i: number, v: number) => setBreakpoints((bp) => bp.map((x, j) => (j === i ? v : x)));
+  const commitBreaks = () => setBreakpoints((bp) => sortUniq(bp));
+  const addBreak = () => setBreakpoints((bp) => sortUniq([...bp, (bp[bp.length - 1] || 0) + 250]));
+  const removeBreak = (i: number) => setBreakpoints((bp) => bp.filter((_, j) => j !== i));
+
+  // ── ticker / rule editing (keyed by unique rule id) ──
+  const updateRule = (ruleId: string, fn: (r: BandRule) => BandRule) =>
+    setTickers((ts) => ts.map((g) => ({ ...g, rules: g.rules.map((r) => (r.id === ruleId ? fn(r) : r)) })));
+  const setRuleBand = (ruleId: string, b: number) => updateRule(ruleId, (r) => ({ ...r, band: b }));
+  const setRuleLadder = (ruleId: string, patch: Partial<Ladder>) => updateRule(ruleId, (r) => ({ ...r, ladder: { ...r.ladder, ...patch } }));
+  const setRuleStage = (ruleId: string, i: number, patch: Partial<Stage>) => updateRule(ruleId, (r) => ({ ...r, ladder: { ...r.ladder, stages: r.ladder.stages.map((s, j) => (j === i ? { ...s, ...patch } : s)) } }));
+  const addRuleStage = (ruleId: string) => updateRule(ruleId, (r) => { const last = r.ladder.stages[r.ladder.stages.length - 1]; return { ...r, ladder: { ...r.ladder, stages: [...r.ladder.stages, mkStage(last ? last.target + 20 : 20, 50, false, 0)] } }; });
+  const removeRuleStage = (ruleId: string, i: number) => updateRule(ruleId, (r) => ({ ...r, ladder: { ...r.ladder, stages: r.ladder.stages.filter((_, j) => j !== i) } }));
+  const removeBandRule = (groupId: string, ruleId: string) => setTickers((ts) => ts.map((g) => (g.id === groupId ? { ...g, rules: g.rules.filter((r) => r.id !== ruleId) } : g)));
+  const addBandRule = (groupId: string) =>
+    setTickers((ts) =>
+      ts.map((g) => {
+        if (g.id !== groupId) return g;
+        const used = new Set(g.rules.map((r) => r.band));
+        let nb = 0;
+        for (let i = 0; i < bandCount(breakpoints); i++) if (!used.has(i)) { nb = i; break; }
+        return { ...g, rules: [...g.rules, { id: uid(), band: nb, ladder: { initOn: false, initPct: -10, stages: [mkStage(20, 50, true, 0)] } }] };
       }),
     );
-  const removeRuleStage = (id: string, i: number) =>
-    setRules((rs) => rs.map((r) => (r.id === id ? { ...r, ladder: { ...r.ladder, stages: r.ladder.stages.filter((_, j) => j !== i) } } : r)));
-  const addRule = () => setRules((rs) => [...rs, { id: uid(), ticker: "ALL", bucket: "under", ladder: { initOn: false, initPct: -10, stages: [mkStage(20, 50, true, 0)] } }]);
-  const removeRule = (id: string) => setRules((rs) => rs.filter((r) => r.id !== id));
-  const resetExample = () => setRules(EXAMPLE_RULES());
+  const setTickerName = (groupId: string, name: string) => setTickers((ts) => ts.map((g) => (g.id === groupId ? { ...g, ticker: name } : g)));
+  const addTicker = () => setTickers((ts) => [...ts, { id: uid(), ticker: "NEW", rules: [{ id: uid(), band: 0, ladder: { initOn: false, initPct: -10, stages: [mkStage(20, 50, true, 0)] } }] }]);
+  const removeTicker = (groupId: string) => setTickers((ts) => ts.filter((g) => g.id !== groupId));
+  const resetExample = () => { setBreakpoints([...EX_BREAKS]); setTickers(EXAMPLE_TICKERS()); };
 
   const importSettings = async () => {
     if (!resolved.rule) {
-      setImportMsg("No rule resolves for this ticker/size — add one first.");
+      setImportMsg("No rule resolves for this ticker/cost — add one first.");
       return;
     }
     const targetId = resolved.rule.id;
@@ -463,8 +498,8 @@ export default function SimulationPage() {
         mkStage(num(s.trim2_profit_gate_pct, 0), 50, true, num(s.trim2_stop_pct, 0)),
         mkStage(num(s.trim3_profit_gate_pct, 0), 100, false, num(s.trim3_stop_pct, 0)),
       ];
-      setRules((rs) => rs.map((r) => (r.id === targetId ? { ...r, ladder: { initOn: false, initPct: -10, stages } } : r)));
-      setImportMsg(`Imported the live global ladder into rule ${resolved.rule.ticker}/${resolved.bucket === "under" ? "<" : "≥"}$${threshold}. Sell % set 50/50/100; live trailing was a $${s.trim_trail_amount ?? "?"} give-back — set % here to model it.`);
+      setRuleLadder(targetId, { initOn: false, initPct: -10, stages });
+      setImportMsg(`Imported the live global ladder into the active rule. Sell % set 50/50/100; live trailing was a $${s.trim_trail_amount ?? "?"} give-back — set % here to model it.`);
     } catch {
       setImportMsg("Import failed — are you logged in on this domain?");
     }
@@ -492,9 +527,7 @@ export default function SimulationPage() {
           const entry = num(p.avg_entry_price ?? p.current_price, 0);
           const isOpt = p.option_strike != null || String(p.instrument_type).toLowerCase() === "option";
           const rightCh = p.option_right ? String(p.option_right).charAt(0).toUpperCase() : "";
-          const label = isOpt
-            ? `${p.symbol} ${p.option_strike ?? ""}${rightCh} ${p.option_expiry ?? ""} · ${qty} @ ${entry}`
-            : `${p.symbol} · ${qty} @ ${entry}`;
+          const label = isOpt ? `${p.symbol} ${p.option_strike ?? ""}${rightCh} ${p.option_expiry ?? ""} · ${qty} @ ${entry}` : `${p.symbol} · ${qty} @ ${entry}`;
           return { label, ticker: String(p.symbol ?? p.broker_symbol ?? "?"), entry: entry > 0 ? entry : 0.01, qty };
         })
         .filter((x) => x.entry > 0 && x.qty > 0);
@@ -527,7 +560,9 @@ export default function SimulationPage() {
       ]
     : [];
 
-  const stageEditor = (r: Rule) => (
+  const bandOptions = Array.from({ length: bandCount(breakpoints) }, (_, i) => i);
+
+  const stageEditor = (r: BandRule) => (
     <div className="stages">
       {r.ladder.stages.map((st, i) => (
         <div className="stagerow" key={i}>
@@ -545,9 +580,6 @@ export default function SimulationPage() {
     </div>
   );
 
-  // Render the interactive UI client-only. The server/first-paint markup is just
-  // the dark shell, so nothing (incl. form-filler browser extensions that inject
-  // attributes like fdprocessedid) can cause a hydration mismatch.
   if (!mounted) {
     return (
       <div className="simx" style={{ minHeight: "100vh" }}>
@@ -564,9 +596,9 @@ export default function SimulationPage() {
           <div className="eyebrow">Kopyya · Internal Tool</div>
           <h1>Trim-Ladder Simulation <span className="tag-demo">SIMULATION</span></h1>
           <p>
-            Define ladders <b>per ticker</b> and <b>per transaction size</b>, set a position, and watch the resolved ladder trim it in
-            portions while fixed/trailing stops manage the remainder. It changes nothing in the live system.{" "}
-            <b>Note:</b> the live backend uses one global ladder today — per-ticker/size ladders are modelled here for design.
+            Define ladders <b>per ticker</b> and <b>per cost band</b>, set a position, and watch the resolved ladder trim it in portions
+            while fixed/trailing stops manage the remainder. It changes nothing in the live system.{" "}
+            <b>Note:</b> the live backend uses one global ladder today — per-ticker/cost ladders are modelled here for design.
           </p>
         </header>
 
@@ -577,20 +609,30 @@ export default function SimulationPage() {
               <div className="f"><label>Ticker</label><input className="txt" type="text" value={pos.ticker} onChange={(e) => setPos({ ...pos, ticker: e.target.value })} /></div>
               <div className="f"><label>Entry price</label><input type="number" step="0.1" min="0.01" value={pos.entry} onChange={(e) => setPos({ ...pos, entry: parseFloat(e.target.value) || 0.01 })} /></div>
               <div className="f"><label>Quantity</label><input type="number" step="1" min="1" value={pos.qty} onChange={(e) => setPos({ ...pos, qty: Math.max(1, parseInt(e.target.value) || 1) })} /></div>
-              <div className="f"><label>Size threshold $</label><input type="number" step="50" min="0" value={threshold} onChange={(e) => setThreshold(parseFloat(e.target.value) || 0)} /></div>
+              <div className="divider" />
+              <div className="bandsedit">
+                <div className="blabel">Cost bands <span className="tag">breakpoints $</span></div>
+                <div className="bchips">
+                  {breakpoints.map((bp, i) => (
+                    <span className="bchip" key={i}>
+                      <input type="number" step="50" min="1" value={bp} onChange={(e) => setBreak(i, parseFloat(e.target.value) || 0)} onBlur={commitBreaks} />
+                      <button className="rm" title="remove breakpoint" onClick={() => removeBreak(i)}>✕</button>
+                    </span>
+                  ))}
+                  <button className="btn tiny" onClick={addBreak}>+ band</button>
+                </div>
+                <div className="bpreview">{bandOptions.map((i) => <span key={i} className={"btag" + (i === band ? " on" : "")}>{bandLabel(i, breakpoints)}</span>)}</div>
+              </div>
               <div className="divider" />
               <div className="resolved">
-                <div className="rsize">size = entry × qty = <b>${f0(size)}</b> → {resolved.bucket === "under" ? `< $${threshold}` : `≥ $${threshold}`}</div>
+                <div className="rsize">cost = entry × qty = <b>${f0(cost)}</b> → band <b>{bandLabel(band, breakpoints)}</b></div>
                 {resolved.rule ? (
-                  <div className="rbadge ok">
-                    ▶ ladder: <b>{resolved.rule.ticker}</b> / {resolved.bucket === "under" ? `<$${threshold}` : `≥$${threshold}`}
-                    {resolved.via === "all" && <span className="via"> (via ALL — no {pos.ticker.toUpperCase()} rule)</span>}
-                  </div>
+                  <div className="rbadge ok">▶ ladder: <b>{pos.ticker.toUpperCase()}</b> / {bandLabel(band, breakpoints)}{resolved.via === "all" && <span className="via"> (via ALL — no {pos.ticker.toUpperCase()} rule)</span>}</div>
                 ) : (
-                  <div className="rbadge bad">✗ no rule matches {pos.ticker.toUpperCase()} / {resolved.bucket} — add one</div>
+                  <div className="rbadge bad">✗ no rule for {pos.ticker.toUpperCase()} / {bandLabel(band, breakpoints)} — add one</div>
                 )}
               </div>
-              <button className="btn primary block" onClick={importSettings}>⭳ Import live settings → this rule</button>
+              <button className="btn primary block" onClick={importSettings}>⭳ Import live settings → active rule</button>
               {importMsg && <div className="importmsg">{importMsg}</div>}
               <button className="btn block" onClick={loadPositions}>⭳ Load a live position</button>
               {livePos.length > 0 && (
@@ -604,28 +646,38 @@ export default function SimulationPage() {
           </div>
 
           <div className="panel">
-            <h3>Ladder rules <span className="tag">per ticker · per size — add / remove</span></h3>
-            <div className="rules">
-              {rules.map((r) => {
-                const active = resolved.rule?.id === r.id;
-                return (
-                  <div className={"rule" + (active ? " active" : "")} key={r.id}>
-                    <div className="rulehead">
-                      {active && <span className="live">● active</span>}
-                      <label className="rl">ticker<input className="txt sm" type="text" value={r.ticker} onChange={(e) => setRuleMeta(r.id, { ticker: e.target.value })} /></label>
-                      <label className="rl">size<select value={r.bucket} onChange={(e) => setRuleMeta(r.id, { bucket: e.target.value as Bucket })}><option value="under">&lt; threshold</option><option value="over">≥ threshold</option></select></label>
-                      <label className="rl chk2"><input type="checkbox" checked={r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initOn: e.target.checked })} />init stop</label>
-                      <label className="rl">@%<input type="number" step="1" value={r.ladder.initPct} disabled={!r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initPct: parseFloat(e.target.value) || 0 })} /></label>
-                      <button className="rm big" title="remove rule" onClick={() => removeRule(r.id)}>✕</button>
-                    </div>
-                    {stageEditor(r)}
+            <h3>Ladder rules <span className="tag">per ticker · per cost band</span></h3>
+            <div className="tgroups">
+              {tickers.map((g) => (
+                <div className="tgroup" key={g.id}>
+                  <div className="thead">
+                    <span className="tlabel">ticker</span>
+                    <input className="txt" type="text" value={g.ticker} onChange={(e) => setTickerName(g.id, e.target.value)} />
+                    <span className="tcount">{g.rules.length} band{g.rules.length !== 1 ? "s" : ""}</span>
+                    <button className="rm big" title="remove ticker" onClick={() => removeTicker(g.id)}>✕</button>
                   </div>
-                );
-              })}
+                  {g.rules.map((r) => {
+                    const active = resolved.rule?.id === r.id;
+                    return (
+                      <div className={"brule" + (active ? " active" : "")} key={r.id}>
+                        <div className="bhead">
+                          {active && <span className="live">● active</span>}
+                          <label className="rl">band<select value={r.band} onChange={(e) => setRuleBand(r.id, parseInt(e.target.value))}>{bandOptions.map((i) => <option key={i} value={i}>{bandLabel(i, breakpoints)}</option>)}</select></label>
+                          <label className="rl chk2"><input type="checkbox" checked={r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initOn: e.target.checked })} />init stop</label>
+                          <label className="rl">@%<input type="number" step="1" value={r.ladder.initPct} disabled={!r.ladder.initOn} onChange={(e) => setRuleLadder(r.id, { initPct: parseFloat(e.target.value) || 0 })} /></label>
+                          <button className="rm" title="remove band rule" onClick={() => removeBandRule(g.id, r.id)}>✕</button>
+                        </div>
+                        {stageEditor(r)}
+                      </div>
+                    );
+                  })}
+                  <button className="btn tiny" onClick={() => addBandRule(g.id)}>+ Add band rule</button>
+                </div>
+              ))}
             </div>
-            <button className="btn tiny" onClick={addRule}>+ Add rule</button>
-            <button className="btn tiny" style={{ marginLeft: 6 }} onClick={resetExample}>↺ example (from the table)</button>
-            <div className="note">A position resolves to the rule matching its <b>ticker</b> + <b>size bucket</b>; if no exact ticker rule exists it falls back to <b>ALL</b>. Each stage fires at its <b>target %</b>, sells that <b>% of remaining</b>, then sets an optional fixed <b>stop</b> and/or <b>trailing</b> stop. 100% sell exits fully.</div>
+            <button className="btn tiny" onClick={addTicker}>+ Add ticker</button>
+            <button className="btn tiny" style={{ marginLeft: 6 }} onClick={resetExample}>↺ example</button>
+            <div className="note">A position resolves to <b>(ticker, cost band)</b>; if no exact ticker rule exists it falls back to <b>ALL</b>. Each stage fires at its <b>target %</b>, sells that <b>% of remaining</b>, then sets an optional fixed <b>stop</b> and/or <b>trailing</b> stop. 100% sell exits fully.</div>
           </div>
         </div>
 
@@ -643,7 +695,7 @@ export default function SimulationPage() {
               <div className="stat" key={i}><div className="k">{c[0]}</div><div className={"v " + (c[2] === "pos" || c[2] === "neg" ? c[2] : "") + (c[2] === "sm" ? " sm" : "")}>{c[1]}</div></div>
             ))
           ) : (
-            <div className="stat" style={{ gridColumn: "1 / -1", color: COLORS.down }}><div className="k">No ladder</div><div className="v sm">Add a rule that matches the position, then Run.</div></div>
+            <div className="stat" style={{ gridColumn: "1 / -1", color: COLORS.down }}><div className="k">No ladder</div><div className="v sm">Add a rule that matches the position's ticker + cost band, then Run.</div></div>
           )}
         </div>
 
@@ -682,7 +734,7 @@ export default function SimulationPage() {
           </div>
         </div>
 
-        <p className="foot"><b>Simulation only.</b> Mirrors the exit-ladder logic in the browser to test per-ticker / per-size configurations — it reads and writes no live position and changes no production behaviour. The only server call is the read-only <b>Import live settings</b> button (the live backend has one global ladder). Trailing never moves down; a stop closes only the remaining quantity, never what was already trimmed.</p>
+        <p className="foot"><b>Simulation only.</b> Mirrors the exit-ladder logic in the browser to test per-ticker / per-cost configurations — it reads and writes no live position and changes no production behaviour. The only server calls are the read-only imports. Trailing never moves down; a stop closes only the remaining quantity, never what was already trimmed.</p>
       </div>
     </div>
   );
@@ -707,11 +759,11 @@ const CSS = `
 .simx .panel{background:#141a20;border:1px solid #222c34;border-radius:12px;padding:14px 15px}
 .simx .panel h3{font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:11px}
 .simx .panel h3 .tag{font-family:ui-monospace,monospace;font-size:10px;color:#657481;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
-.simx .cfgwrap{display:grid;grid-template-columns:310px 1fr;gap:14px;margin:16px 0}
+.simx .cfgwrap{display:grid;grid-template-columns:320px 1fr;gap:14px;margin:16px 0}
 @media(max-width:860px){.simx .cfgwrap{grid-template-columns:1fr}}
 .simx label{font-size:12px;color:#9aa7b2}
 .simx input[type=number],.simx input.txt{font-family:ui-monospace,monospace;font-size:12px;padding:4px 6px;border-radius:6px;border:1px solid #31404a;background:#0c1014;color:#e8edf1;text-align:right;width:96px}
-.simx input.txt{text-align:left}.simx input.txt.sm{width:74px}
+.simx input.txt{text-align:left}
 .simx input:disabled{opacity:.4}
 .simx input[type=checkbox]{accent-color:#2dd4bf;vertical-align:-1px}
 .simx select{font-family:inherit;font-size:12px;border-radius:6px;border:1px solid #31404a;background:#0c1014;color:#e8edf1;padding:4px 6px}
@@ -723,6 +775,15 @@ const CSS = `
 .simx .posrow{display:flex;flex-direction:column;gap:9px}
 .simx .posrow .f{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .simx .divider{height:1px;background:#222c34;margin:2px 0}
+.simx .bandsedit{display:flex;flex-direction:column;gap:7px}
+.simx .blabel{font-size:12px;color:#e8edf1;font-weight:600;display:flex;gap:8px;align-items:center}
+.simx .blabel .tag{font-family:ui-monospace,monospace;font-size:9.5px;color:#657481;font-weight:500;letter-spacing:.05em;text-transform:uppercase}
+.simx .bchips{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.simx .bchip{display:inline-flex;align-items:center;gap:2px;background:#0f151a;border:1px solid #31404a;border-radius:7px;padding:2px 4px}
+.simx .bchip input[type=number]{width:56px;border:none;background:transparent;padding:2px 3px}
+.simx .bpreview{display:flex;flex-wrap:wrap;gap:5px}
+.simx .btag{font-family:ui-monospace,monospace;font-size:10px;color:#657481;border:1px solid #222c34;border-radius:5px;padding:2px 6px}
+.simx .btag.on{color:#2dd4bf;border-color:#2dd4bf;background:#0f2e2b}
 .simx .resolved{font-size:12px;display:flex;flex-direction:column;gap:6px}
 .simx .rsize{color:#9aa7b2;font-family:ui-monospace,monospace;font-size:11.5px}
 .simx .rbadge{font-family:ui-monospace,monospace;font-size:12px;padding:6px 9px;border-radius:7px}
@@ -731,11 +792,16 @@ const CSS = `
 .simx .rbadge .via{color:#657481;font-size:11px}
 .simx .importmsg{font-size:11.5px;color:#38bdf8;background:#0f151a;border:1px solid #222c34;border-radius:7px;padding:7px 9px;line-height:1.5}
 .simx select.poslist{width:100%;font-size:12px;padding:6px 8px}
-.simx .rules{display:flex;flex-direction:column;gap:8px}
-.simx .rule{border:1px solid #222c34;border-radius:10px;background:#0f151a;padding:9px 10px}
-.simx .rule.active{border-color:#2dd4bf;box-shadow:0 0 0 1px #2dd4bf inset}
-.simx .rulehead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
-.simx .rulehead .live{font-family:ui-monospace,monospace;font-size:10px;color:#2dd4bf;font-weight:700}
+.simx .tgroups{display:flex;flex-direction:column;gap:10px}
+.simx .tgroup{border:1px solid #2a3742;border-radius:11px;background:#11171d;padding:10px}
+.simx .thead{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.simx .thead .tlabel{font-family:ui-monospace,monospace;font-size:10px;text-transform:uppercase;color:#657481}
+.simx .thead .txt{width:100px;font-size:13px;font-weight:700}
+.simx .thead .tcount{font-family:ui-monospace,monospace;font-size:10px;color:#657481}
+.simx .brule{border:1px solid #222c34;border-radius:9px;background:#0f151a;padding:8px 9px;margin-bottom:6px}
+.simx .brule.active{border-color:#2dd4bf;box-shadow:0 0 0 1px #2dd4bf inset}
+.simx .bhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:7px}
+.simx .bhead .live{font-family:ui-monospace,monospace;font-size:10px;color:#2dd4bf;font-weight:700}
 .simx .rl{display:flex;align-items:center;gap:5px;font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.03em;text-transform:uppercase;color:#657481}
 .simx .rl.chk2{text-transform:none;font-size:11px;color:#9aa7b2}
 .simx .rl input[type=number]{width:56px}
