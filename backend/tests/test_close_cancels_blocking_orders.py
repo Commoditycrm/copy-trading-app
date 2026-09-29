@@ -212,6 +212,42 @@ def test_a_failing_cancel_does_not_stop_the_others():
     assert sorted(ad.cancelled) == ["GOOD", "STALE"], "both were attempted"
 
 
+# ── 6. the race that turned a close into a SHORT ────────────────────────────
+def test_position_is_re_read_after_cancelling():
+    """The reason a sell became a short.
+
+    A resting stop can FILL in the moments before our cancel reaches the
+    broker. Sizing the close from the snapshot taken BEFORE the cancel then
+    sells a holding that no longer exists, and the account goes short.
+
+    So close_position must re-read the position after cancelling, and it must
+    only pay for that extra broker call when something was actually cancelled.
+    """
+    import inspect
+    src = inspect.getsource(mod.close_position)
+    cancel_at = src.index("_cancel_working_orders_for_position(")
+    place_at = src.index("_place_trader_order(")
+    # A second get_positions, guarded by `if cancelled:`, between the two.
+    assert "if cancelled:" in src, "the re-read must be conditional on a cancel"
+    reread_at = src.index("if cancelled:")
+    assert cancel_at < reread_at < place_at, \
+        "re-read must sit between the cancel and the placement"
+    assert src.count("adapter.get_positions()") == 2, \
+        "one read up front, one after cancelling"
+
+
+def test_quantity_is_clamped_to_what_is_actually_held():
+    """Never sell more than the position. The size can legitimately shrink
+    between the client's view and now — a partial fill on the stop we just
+    cancelled — and over-selling is exactly what opens a short. Clamping also
+    beats erroring: the user asked to get OUT."""
+    import inspect
+    src = inspect.getsource(mod.close_position)
+    assert "close_qty = full_qty" in src, "must clamp down to the held size"
+    # And the clamp must come AFTER the re-read, or it clamps to a stale size.
+    assert src.index("if cancelled:") < src.index("close_qty = full_qty")
+
+
 def test_close_places_the_order_after_cancelling():
     """Wiring check: close_position clears the contract BEFORE it builds the
     close, so the broker sees a free position."""
