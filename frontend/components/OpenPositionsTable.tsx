@@ -113,13 +113,14 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
 }
 
 /** Overflow menu on a position row — extra, destructive actions kept out of the
- *  main Close buttons: cancel this position's working stop, and cancel every
- *  open order the user owns. Both confirm first. onDone refreshes the table. */
-function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
-  orderId: string | null; hasStop: boolean; label: string; onDone: () => void;
+ *  main Close buttons: cancel this position's working stop, cancel every open
+ *  order from this row's Discord channel, and cancel every open order the user
+ *  owns. All confirm first. onDone refreshes the table. */
+function PositionActionsMenu({ orderId, hasStop, label, channel, onDone }: {
+  orderId: string | null; hasStop: boolean; label: string; channel: string | null; onDone: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<null | "stop" | "all">(null);
+  const [busy, setBusy] = useState<null | "stop" | "all" | "channel">(null);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -144,14 +145,31 @@ function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
     finally { setBusy(null); }
   }
 
+  async function cancelChannel() {
+    if (!channel) return;
+    if (!confirm(`Cancel all open orders from the ${channel} channel (every instrument)? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.`)) return;
+    setBusy("channel");
+    try {
+      const res = await api<{ cancelled_count?: number }>(
+        `/api/trades/cancel-open-by-channel?channel=${encodeURIComponent(channel)}&include_subscribers=true`,
+        { method: "POST" },
+      );
+      const n = res.cancelled_count ?? 0;
+      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"} from ${channel}`);
+      setOpen(false);
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not cancel channel orders"); }
+    finally { setBusy(null); }
+  }
+
   async function cancelAllOpen() {
     if (!confirm("Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.")) return;
     setBusy("all");
     try {
-      const res = await api<{ cancelled?: unknown[] }>(
+      const res = await api<{ cancelled_count?: number }>(
         `/api/trades/cancel-all-open?include_subscribers=true`, { method: "POST" },
       );
-      const n = Array.isArray(res.cancelled) ? res.cancelled.length : 0;
+      const n = res.cancelled_count ?? 0;
       notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
       setOpen(false);
       onDone();
@@ -173,6 +191,11 @@ function PositionActionsMenu({ orderId, hasStop, label, onDone }: {
                   className={item} style={{ color: "var(--text-2)" }}
                   title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
             {busy === "stop" ? "Cancelling stop…" : "Cancel stop"}
+          </button>
+          <button type="button" disabled={!channel || busy !== null} onClick={cancelChannel}
+                  className={item} style={{ color: "var(--text-2)" }}
+                  title={channel ? `Cancel open orders from ${channel}` : "No Discord channel on this position"}>
+            {busy === "channel" ? "Cancelling…" : channel ? `Cancel open orders from ${channel}` : "Cancel open orders (this channel)"}
           </button>
           <button type="button" disabled={busy !== null} onClick={cancelAllOpen}
                   className={item} style={{ color: "var(--bad)" }}>
@@ -1012,6 +1035,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             orderId={orderId}
                             hasStop={t?.stop_loss_price != null}
                             label={p.symbol.toUpperCase()}
+                            channel={p.discord_channel ?? null}
                             onDone={refresh}
                           />
                         </div>
