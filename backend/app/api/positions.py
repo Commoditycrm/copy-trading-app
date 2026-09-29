@@ -1562,6 +1562,30 @@ def close_position(
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
 
+    if payload.quantity is not None and payload.quantity <= 0:
+        raise HTTPException(422, "quantity_must_be_positive")
+
+    # Anything still resting on this contract reserves the position at the
+    # broker, so the close would be refused. Clear it first — see the helper.
+    cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+
+    # RE-READ after cancelling. An order we just cancelled may have FILLED in
+    # the moments before the cancel reached the broker — a resting stop is
+    # exactly the kind that does. Sizing the close from the snapshot taken
+    # BEFORE the cancel then sells a holding that is already gone, and a close
+    # becomes a SHORT. Only pay for the extra read when we actually cancelled
+    # something; the common case (nothing resting) is unchanged.
+    if cancelled:
+        positions = adapter.get_positions()
+        pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
+        if pos is None or pos.quantity == 0:
+            # The resting order closed it for us. Nothing left to sell, and
+            # selling anyway is precisely how the short happened.
+            raise HTTPException(
+                409,
+                "position_already_closed_by_a_resting_order",
+            )
+
     # Reverse the side based on the current holding (long → sell, short → buy).
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
     full_qty = abs(pos.quantity)
@@ -1569,11 +1593,16 @@ def close_position(
     if close_qty <= 0:
         raise HTTPException(422, "quantity_must_be_positive")
     if close_qty > full_qty:
-        raise HTTPException(422, "quantity_exceeds_position")
-
-    # Anything still resting on this contract reserves the position at the
-    # broker, so the close would be refused. Clear it first — see the helper.
-    _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+        # CLAMP, never reject. The size can legitimately shrink between the
+        # client's view and now (a partial fill on the stop we just cancelled,
+        # a trim elsewhere), and the user asked to get OUT — closing what is
+        # actually there is the right answer. Erroring would leave them holding
+        # it; over-selling would open a short.
+        log.info(
+            "close: clamping %s from %s to the %s actually held on %s",
+            broker_symbol, close_qty, full_qty, acct.id,
+        )
+        close_qty = full_qty
 
     # Options can't be closed with a market order — Alpaca rejects them always,
     # Webull rejects them on limited-liquidity contracts ("does not support
