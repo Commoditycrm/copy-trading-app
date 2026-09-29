@@ -220,6 +220,9 @@ export default function CalendarPage() {
           const pnl = day ? Number(day.realized_pnl) : 0;
           const unreal = day ? Number(day.unrealized_pnl ?? 0) : 0;
           const marked = pnl + unreal;          // realized + unrealized = the day's marked total
+          // Today only: full current unrealized on all open positions (not the
+          // day's swing) — for the tooltip so "Unreal" can't be mistaken for it.
+          const openUnreal = day?.open_unrealized != null ? Number(day.open_unrealized) : null;
           const has = !!day;
           const isToday = key === todayKey;
           // Heatmap fill — green for gains / red for losses, opacity scaled to
@@ -237,7 +240,7 @@ export default function CalendarPage() {
               title={
                 has
                   ? day.live
-                    ? `Live · Realized ${fmtSignedUsd(pnl)} (closed) · Unrealized ${fmtSignedUsd(unreal)} (open) · Marked ${fmtSignedUsd(marked)} total. Click to view today's trades.`
+                    ? `Live · Realized ${fmtSignedUsd(pnl)} (closed) · Today's unrealized swing ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)}${openUnreal != null ? ` · Open positions right now: ${fmtSignedUsd(openUnreal)}` : ""}. Click to view today's trades.`
                     : `Realized ${fmtSignedUsd(pnl)} · Unrealized ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)} · ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
                   : undefined
               }

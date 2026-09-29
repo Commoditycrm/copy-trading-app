@@ -525,6 +525,7 @@ def admin_user_pnl_calendar(
             trade_count=c.trade_count,
             pct=None,
             unrealized_pnl=c.marked_pnl - c.realized_pnl,
+            open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
         )
         for c in sorted(series.values(), key=lambda c: c.day)

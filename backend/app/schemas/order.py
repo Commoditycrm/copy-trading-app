@@ -174,6 +174,11 @@ class DailyPnL(BaseModel):
     # `realized_pnl` for TODAY only; None on settled days. Surfaced so the UI
     # can show the realized/unrealized split. Direct-Alpaca for now.
     unrealized_pnl: Decimal | None = None
+    # TODAY only: the FULL current unrealized on all open positions (not the
+    # day's swing) — what the trader is actually down/up right now. Shown in the
+    # cell tooltip so the calendar's per-day swing can't be mistaken for total
+    # exposure. None on settled days.
+    open_unrealized: Decimal | None = None
     # True on the current day when `realized_pnl` includes live unrealized — the
     # figure moves with the market and is NOT a settled number.
     live: bool = False
