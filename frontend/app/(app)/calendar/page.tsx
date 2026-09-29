@@ -218,6 +218,7 @@ export default function CalendarPage() {
           const key = iso(d);
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
+          const unreal = day ? Number(day.unrealized_pnl ?? 0) : 0;
           const has = !!day;
           const isToday = key === todayKey;
           // Heatmap fill — green for gains / red for losses, opacity scaled to
@@ -235,8 +236,8 @@ export default function CalendarPage() {
               title={
                 has
                   ? day.live
-                    ? `Live · ${fmtSignedUsd(pnl)} realized so far today (closed trades). Click to view today's trades.`
-                    : `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
+                    ? `Live · Realized ${fmtSignedUsd(pnl)} (closed trades) · Unrealized ${fmtSignedUsd(unreal)} (open positions). Click to view today's trades.`
+                    : `Realized ${fmtSignedUsd(pnl)} · Unrealized ${fmtSignedUsd(unreal)} · ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
                   : undefined
               }
               whileHover={has ? { y: -2 } : undefined}
@@ -274,23 +275,25 @@ export default function CalendarPage() {
                 )}
               </div>
               {has && (
-                <>
-                  <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
-                    {fmtSignedUsd(pnl)}
+                <div className="mt-auto">
+                  {/* Two figures: realized (closed trades) + unrealized (open
+                      positions' mark-to-market swing that day). */}
+                  <div className="flex items-baseline justify-between gap-1 leading-tight">
+                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Real</span>
+                    <span className="num font-semibold text-[13px]" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
+                      {fmtSignedUsd(pnl)}
+                    </span>
                   </div>
-                  {/* Alpaca reports a daily return % (matches its app); show it
-                      in place of the trade count. Webull/SnapTrade has no % —
-                      fall back to the trade count there. */}
-                  {day.pct != null ? (
-                    <div className="text-[11px] num" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
-                      {Number(day.pct) >= 0 ? "+" : ""}{Number(day.pct).toFixed(2)}%
-                    </div>
-                  ) : (
-                    <div className="text-[11px]" style={{ color: "var(--text-2)" }}>
-                      {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
-                    </div>
-                  )}
-                </>
+                  <div className="flex items-baseline justify-between gap-1 leading-tight">
+                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Unreal</span>
+                    <span className="num text-[12px]" style={{ color: unreal > 0 ? "var(--pnl-pos)" : unreal < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                      {fmtSignedUsd(unreal)}
+                    </span>
+                  </div>
+                  <div className="text-[10px] mt-0.5" style={{ color: "var(--text-2)" }}>
+                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
+                  </div>
+                </div>
               )}
             </motion.button>
           );
