@@ -111,16 +111,30 @@ export default function CalendarPage() {
 
   useEffect(() => { loadPnL(); }, [loadPnL]);
 
-  // Today's cell is LIVE (realized + open-position unrealized). While the month
-  // in view contains today and the tab is visible, quietly re-fetch every 30s
-  // so the figure ticks with the market without flashing the loader.
+  // Today's cell is LIVE (the broker's own Day's P&L — Webull
+  // total_day_profit_loss — or realized + open-position unrealized). While the
+  // month in view contains today, quietly re-fetch every 30s (visible tabs
+  // only), and also on window focus / reconnect / becoming visible, so the
+  // figure stays current after the tab was backgrounded — without flashing the
+  // loader or reloading the page. Only today's month polls; historical-only
+  // months don't (nothing there moves).
   useEffect(() => {
     const today = iso(new Date());
     if (!(range.from <= today && today <= range.to)) return;
+    const refresh = () => loadPnL(true);
     const id = setInterval(() => {
-      if (document.visibilityState === "visible") loadPnL(true);
+      if (document.visibilityState === "visible") refresh();
     }, 30_000);
-    return () => clearInterval(id);
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    window.addEventListener("focus", refresh);
+    window.addEventListener("online", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("online", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [range.from, range.to, loadPnL]);
 
   const byDay = useMemo(() => {

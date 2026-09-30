@@ -82,6 +82,31 @@ def test_no_live_day_pnl_leaves_marked_none(monkeypatch):
     assert cell.source == "calculated"
 
 
+def test_historical_day_stays_finalized_during_live_refresh(monkeypatch):
+    """A past day with a finalized (eod) snapshot is NOT marked live and does NOT
+    pick up today's live value — the live path only touches today's cell."""
+    db, user = _setup(monkeypatch, Decimal("-150.72"))
+    past = date(2026, 9, 15)  # a past Monday, well before "today"
+    db.add(DailyRealizedPnlSnapshot(
+        id=uuid.uuid4(), user_id=user.id, day=past, realized_pnl=Decimal("42"),
+        trade_count=0, source="marked", snapshot_type="eod",
+        eod_unrealized=Decimal("-10"), hidden=False,
+    ))
+    db.flush()
+    today = market_hours.now_et().date()
+    rows = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
+                               tz="America/New_York", user_id=None)
+    todc = next(r for r in rows if r.day == today)
+    pastc = next(r for r in rows if r.day == past)
+    # Today: live broker value.
+    assert todc.live is True and todc.marked_pnl == Decimal("-150.72")
+    assert todc.source == "webull_live"
+    # Past: finalized, NOT live, and never tagged with the live number/source.
+    assert pastc.live is False
+    assert pastc.marked_pnl is None            # live value doesn't leak to history
+    assert pastc.source != "webull_live"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
