@@ -5,11 +5,13 @@ import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info } from "lucide-react";
 import { api } from "@/lib/api";
+import { fetchAllSubscribers } from "@/lib/subscribers";
+import { notify } from "@/lib/toast";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
+import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -86,9 +88,9 @@ export default function CalendarPage() {
         setSnapshot(USER_SNAPSHOT_KEY, u);
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
-          api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => {
-            if (!cancelled) { setSubs(p.items); setSnapshot(CAL_SUBS_KEY, p.items); }
-          });
+          fetchAllSubscribers().then((items) => {
+            if (!cancelled) { setSubs(items); setSnapshot(CAL_SUBS_KEY, items); }
+          }).catch((e) => notify.fromError(e, "Could not load subscribers"));
         }
         // Sync our own fills — refreshes the data the calendar reads from.
         setSyncing(true);
@@ -214,10 +216,15 @@ export default function CalendarPage() {
       </div>
       <div className="grid grid-cols-7 gap-1.5">
         {cells.map((d, i) => {
-          if (!d) return <div key={i} className="h-24" />;
+          if (!d) return <div key={i} className="h-28" />;
           const key = iso(d);
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
+          const unreal = day ? Number(day.unrealized_pnl ?? 0) : 0;
+          const marked = pnl + unreal;          // realized + unrealized = the day's marked total
+          // Today only: full current unrealized on all open positions (not the
+          // day's swing) — for the tooltip so "Unreal" can't be mistaken for it.
+          const openUnreal = day?.open_unrealized != null ? Number(day.open_unrealized) : null;
           const has = !!day;
           const isToday = key === todayKey;
           // Heatmap fill — green for gains / red for losses, opacity scaled to
@@ -235,13 +242,13 @@ export default function CalendarPage() {
               title={
                 has
                   ? day.live
-                    ? `Live · ${fmtSignedUsd(pnl)} realized so far today (closed trades). Click to view today's trades.`
-                    : `View ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
+                    ? `Live · Realized ${fmtSignedUsd(pnl)} (closed) · Today's unrealized swing ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)}${openUnreal != null ? ` · Open positions right now: ${fmtSignedUsd(openUnreal)}` : ""}. Click to view today's trades.`
+                    : `Realized ${fmtSignedUsd(pnl)} · Unrealized ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)} · ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
                   : undefined
               }
               whileHover={has ? { y: -2 } : undefined}
               transition={{ duration: 0.15 }}
-              className="h-24 p-2 border flex flex-col text-left"
+              className="h-28 p-2 border flex flex-col text-left"
               style={{
                 borderRadius: 10,
                 borderColor: isToday ? "var(--accent)" : "var(--border)",
@@ -274,23 +281,31 @@ export default function CalendarPage() {
                 )}
               </div>
               {has && (
-                <>
-                  <div className="mt-auto num font-semibold text-sm" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
-                    {fmtSignedUsd(pnl)}
+                <div className="mt-auto">
+                  {/* Three figures: realized (closed trades) + unrealized (open
+                      positions' mark-to-market swing) + marked (their total). */}
+                  <div className="flex items-baseline justify-between gap-1 leading-tight">
+                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Real</span>
+                    <span className="num text-[12px]" style={{ color: pnl > 0 ? "var(--pnl-pos)" : pnl < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                      {fmtSignedUsd(pnl)}
+                    </span>
                   </div>
-                  {/* Alpaca reports a daily return % (matches its app); show it
-                      in place of the trade count. Webull/SnapTrade has no % —
-                      fall back to the trade count there. */}
-                  {day.pct != null ? (
-                    <div className="text-[11px] num" style={{ color: pnl >= 0 ? "var(--pnl-pos)" : "var(--pnl-neg)" }}>
-                      {Number(day.pct) >= 0 ? "+" : ""}{Number(day.pct).toFixed(2)}%
-                    </div>
-                  ) : (
-                    <div className="text-[11px]" style={{ color: "var(--text-2)" }}>
-                      {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
-                    </div>
-                  )}
-                </>
+                  <div className="flex items-baseline justify-between gap-1 leading-tight">
+                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Unreal</span>
+                    <span className="num text-[12px]" style={{ color: unreal > 0 ? "var(--pnl-pos)" : unreal < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                      {fmtSignedUsd(unreal)}
+                    </span>
+                  </div>
+                  <div className="flex items-baseline justify-between gap-1 leading-tight mt-0.5 pt-0.5" style={{ borderTop: "1px solid var(--border)" }}>
+                    <span className="text-[9px] uppercase tracking-wide font-semibold" style={{ color: "var(--muted)" }}>Marked</span>
+                    <span className="num font-semibold text-[13px]" style={{ color: marked > 0 ? "var(--pnl-pos)" : marked < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                      {fmtSignedUsd(marked)}
+                    </span>
+                  </div>
+                  <div className="text-[10px] mt-0.5" style={{ color: "var(--text-2)" }}>
+                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
+                  </div>
+                </div>
               )}
             </motion.button>
           );

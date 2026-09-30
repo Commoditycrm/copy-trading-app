@@ -30,6 +30,10 @@ class PositionOut(BaseModel):
     # against the most recent Discord entry. None for positions opened any
     # other way — trade panel, copy mirror, or bought in the broker's own app.
     discord_channel: str | None = None
+    # The Discord exit ladder's stop level on this position, if it has one.
+    # That stop is its own order at the broker (not the entry's bracket SL), so
+    # the row needs to know about it to offer "Cancel stop" for it.
+    ladder_stop_price: Decimal | None = None
 
 
 class UnreachableAccount(BaseModel):
@@ -55,6 +59,22 @@ class PositionsPayload(BaseModel):
     only the UI that needs to SAY something about a failure opts in."""
     positions: list[PositionOut]
     unreachable: list[UnreachableAccount] = []
+
+
+class AveragePositionIn(BaseModel):
+    """Add to an open position (average it) at market or at a limit."""
+
+    order_type: OrderType = OrderType.MARKET
+    limit_price: Decimal | None = Field(default=None, gt=0)
+    quantity: Decimal = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "AveragePositionIn":
+        if self.order_type == OrderType.LIMIT and self.limit_price is None:
+            raise ValueError("limit_price required for a limit average")
+        if self.order_type not in (OrderType.MARKET, OrderType.LIMIT):
+            raise ValueError("order_type must be market or limit")
+        return self
 
 
 class ClosePositionIn(BaseModel):

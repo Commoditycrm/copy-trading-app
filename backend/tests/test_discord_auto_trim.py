@@ -142,8 +142,89 @@ def test_an_unusable_price_never_fires(entry, mark):
 def test_it_fires_through_the_normal_alert_pipeline():
     """A second trim path would be a second thing to keep correct, and it
     would be the one nobody tests."""
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     assert "submit_self_alert_text(db, user, text, approve=True)" in src
+
+
+def test_a_simulated_pin_is_the_auto_trim_mark(monkeypatch):
+    """BUY PATH pins must drive the same gain calculation as a live quote."""
+    from app.services import price_override
+
+    position = SimpleNamespace(
+        symbol="SPY", option_strike=Decimal("771"), option_right=OptionRight.CALL,
+        option_expiry=EXP, quantity=Decimal("1"), current_price=Decimal("1.01"),
+    )
+    monkeypatch.setattr(price_override, "apply_to", lambda user_id, pos: Decimal("1.20"))
+
+    assert at._mark_for([position], _guard(), uuid.uuid4()) == Decimal("1.20")
+
+
+# ── one sweeper per trader at a time ───────────────────────────────────────
+
+class _FakeLock:
+    def __init__(self, acquired):
+        self.acquired = acquired
+        self.released = False
+
+    def acquire(self):
+        return self.acquired
+
+    def release(self):
+        self.released = True
+
+
+def _sweep_with(monkeypatch, *, lock=None, redis_error=False, user_id=None):
+    """Run tick() over one guard with the sweep itself stubbed out."""
+    from app.services import redis_client
+
+    trader = uuid.uuid4()
+    guard = _guard()
+    guard.user_id = trader
+    swept = []
+
+    class _Db:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _redis():
+        if redis_error:
+            raise ConnectionError("redis down")
+        return SimpleNamespace(lock=lambda *a, **k: lock)
+
+    monkeypatch.setattr(at, "SessionLocal", _Db)
+    monkeypatch.setattr(at, "_live_guards", lambda db, uid=None: [guard])
+    monkeypatch.setattr(at, "_sweep_trader", lambda db, tid, rows: swept.append(tid))
+    monkeypatch.setattr(redis_client, "get_sync_redis", _redis)
+    at.tick(user_id)
+    return swept
+
+
+def test_a_trader_already_being_swept_is_skipped(monkeypatch):
+    """A pin-triggered sweep and the worker's sweep read the same sell_count;
+    without the lock both see the rung due and both sell it."""
+    lock = _FakeLock(acquired=False)
+    assert _sweep_with(monkeypatch, lock=lock) == []
+    assert lock.released is False
+
+
+def test_the_lock_is_released_after_a_sweep(monkeypatch):
+    lock = _FakeLock(acquired=True)
+    assert len(_sweep_with(monkeypatch, lock=lock)) == 1
+    assert lock.released is True
+
+
+def test_the_worker_still_sweeps_without_redis(monkeypatch):
+    """Redis down must not switch auto-trim off for everyone."""
+    assert len(_sweep_with(monkeypatch, redis_error=True)) == 1
+
+
+def test_a_pin_sweep_skips_without_redis(monkeypatch):
+    """The pin-triggered sweep is the second sweeper; unlocked, it could race
+    the worker, and the worker picks the move up on its next tick anyway."""
+    assert _sweep_with(monkeypatch, redis_error=True, user_id=uuid.uuid4()) == []
 
 
 def test_the_synthetic_alert_is_a_real_exit_the_parser_reads():
@@ -168,7 +249,7 @@ def test_the_synthetic_alert_is_a_real_exit_the_parser_reads():
 def test_an_auto_trim_does_not_wait_for_a_second_approval():
     """The trader turning Auto Trim on IS the approval. Sitting in the manual
     queue would miss the move it was watching for."""
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     assert "approve=True" in src
 
 
@@ -213,7 +294,7 @@ def test_the_entry_is_synced_before_the_gate_is_measured():
     "up 1.82%, under the 5% gate" — a rung spent on a price nobody paid."""
     import inspect
 
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     sync_at = src.index("pg.sync_entry_price(db, guard)")
     measure_at = src.index("rung = due_rung(ts, guard, mark)")
     assert sync_at < measure_at, "the entry must be synced BEFORE the gate is read"
@@ -239,7 +320,7 @@ def test_an_unspent_rung_is_returned():
     measures the rung after it and the ladder walks itself out."""
     import inspect
 
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     assert "pg.rollback_exit(guard)" in src
     # Judged on what HAPPENED, not on the note text.
     assert "msg.order_id is not None" in src
@@ -251,7 +332,7 @@ def test_a_rung_that_armed_a_trail_is_kept():
     no order — rolling that back would arm the same trail every sweep."""
     import inspect
 
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     at_check = src.index("did_something = (")
     assert "guard.trail_qty != before_trail" in src[at_check:at_check + 260]
 
@@ -284,10 +365,10 @@ def test_positions_are_read_once_per_account_not_per_guard():
     """Reading them per-guard is what blew Webull's limit."""
     import inspect
 
-    src = inspect.getsource(at.tick)
+    src = inspect.getsource(at._sweep_trader)
     assert src.count("adapter.get_positions()") == 1
     # ...and the per-guard loop takes the already-fetched list.
-    assert "_mark_for(positions, guard)" in src
+    assert "_mark_for(positions, guard, trader_id)" in src
 
 
 # ── the stop is placed as soon as the trim fills ────────────────────────────

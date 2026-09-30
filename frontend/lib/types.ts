@@ -214,6 +214,9 @@ export interface Position {
    *  contract against the most recent Discord entry. Null for positions
    *  opened any other way. */
   discord_channel?: string | null;
+  /** The Discord exit ladder's stop level on this position — its own order
+   *  at the broker, separate from the entry's bracket SL. Null when none. */
+  ladder_stop_price?: string | null;
   current_price: string | null;
   market_value: string | null;
   unrealized_pnl: string | null;
@@ -233,9 +236,11 @@ export interface DailyPnL {
   trade_count: number;
   /** Daily return %, broker-reported (Alpaca only). null when unavailable. */
   pct?: string | null;
-  /** Live unrealized (open-position) P&L folded into realized_pnl for TODAY
-   *  only; null on settled days. Direct-Alpaca. */
+  /** The day's unrealized swing (marked − realized). Shown as its own row. */
   unrealized_pnl?: string | null;
+  /** TODAY only: full current unrealized on all open positions (not the swing) —
+   *  what the trader is down/up right now. Shown in the cell tooltip. */
+  open_unrealized?: string | null;
   /** True on today's cell when realized_pnl includes live unrealized — the
    *  number ticks with the market and is not settled. */
   live?: boolean;

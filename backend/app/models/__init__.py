@@ -1,3 +1,4 @@
+from app.models.ai_trim_decision import AiTrimDecision
 from app.models.audit_log import AuditLog
 from app.models.base import Base
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -17,6 +18,7 @@ from app.models.ui_prefs import UserUiPrefs
 from app.models.user import User, UserRole
 
 __all__ = [
+    "AiTrimDecision",
     "AuditLog",
     "Base",
     "BrokerAccount",

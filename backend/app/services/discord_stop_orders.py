@@ -107,9 +107,31 @@ def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> s
             "the position would otherwise be left unprotected",
             guard.symbol, price, msg[:160], quantity,
         )
-        close_position(quantity)
-        guards.retire(db, guard, f"stop refused, position closed: {msg[:80]}")
+        _exit_instead(db, guard, quantity, close_position)
         return None
+
+
+def _exit_instead(db, guard, quantity, close_position) -> str:
+    """Sell what the refused stop was meant to protect — and nothing more.
+
+    The guard is NOT retired here. Retiring on submit is how a position ended up
+    held with nothing managing it: live 2026-09-29, six refused-stop exits were
+    sent after 16:00, expired unfilled, and their guards were already closed.
+    The guard now stays live until the position is actually flat
+    (``retire_if_flat``), so a failed exit is retried and a slice riding a
+    trailing exit keeps being watched.
+    """
+    if guard.option_strike is not None:
+        from app.services import market_hours  # noqa: PLC0415
+
+        # Options only trade in the regular session; an exit sent outside it
+        # expires, and sending one every tick all night is just noise.
+        if not market_hours.in_regular_session():
+            return "exit deferred to the regular session"
+    if working_exit(db, guard) is not None:
+        return "exit already working"
+    close_position(quantity)
+    return "exit sent"
 
 
 def reconcile(
@@ -129,12 +151,35 @@ def reconcile(
 
     want_qty = desired_quantity(held, guard)
     want_price = guard.stop_price
+    # A stop can't be $0 or less — a stop that rounded down to nothing is not a
+    # stop, and placing it fails validation, which would read as a refusal.
+    if want_price is not None and want_price <= 0:
+        want_price = None
 
     resting = db.get(Order, guard.stop_order_id) if guard.stop_order_id else None
     # A filled or cancelled order is not resting, whatever the guard remembers.
     if resting is not None and resting.status not in (
         OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
     ):
+        if resting.status == OrderStatus.CANCELED:
+            # Every cancel WE make (release before an exit, moving the level,
+            # pulling a stop with nothing to protect) clears stop_order_id
+            # first, so a stop the guard still points at that is now cancelled
+            # was cancelled by the trader — "Cancel all open orders", Order
+            # History, or the Alpaca dashboard. Honour it: forget the level, so
+            # neither this reconciler nor the emulated enforcer brings it back.
+            # Re-placing it was the old behaviour; live 2026-09-29 the trader
+            # removed a ladder stop and watched it come back every tick, even
+            # after turning Auto trim off. A later rung that sets a new level
+            # places a new stop — that is a new decision, not this one undone.
+            log.warning(
+                "discord stop: %s's stop @ %s was cancelled outside the ladder "
+                "— treating it as removed by the trader, not re-placing",
+                guard.symbol, guard.stop_price,
+            )
+            guard.stop_order_id = None
+            guard.stop_price = None
+            return "removed by the trader"
         guard.stop_order_id = None
         resting = None
 
@@ -146,6 +191,13 @@ def reconcile(
             guard.stop_order_id = None
             return "cancelled (nothing to protect)"
         return "idle"
+
+    # An exit is working for this contract (a trim, a manual close, a refused
+    # stop's exit). It has the contracts reserved, so a stop placed now would be
+    # refused for insufficient quantity — and a refusal triggers another exit.
+    # Wait for it to finish; the next tick sizes the stop to what is left.
+    if resting is None and working_exit(db, guard) is not None:
+        return "waiting (exit working)"
 
     if resting is None:
         # A REJECTED stop is not resting, so without this the reconciler would
@@ -170,9 +222,7 @@ def reconcile(
                     "the last one (%s) — closing %s rather than leaving it open",
                     guard.symbol, refusal[:160], want_qty,
                 )
-                close_position(want_qty)
-                guards.retire(db, guard, f"stop refused, position closed: {refusal[:80]}")
-                return "closed (stop refused)"
+                return _exit_instead(db, guard, want_qty, close_position)
             return "backing off (recent rejection)"
         oid = _place_or_close(
             db, guard, want_qty, want_price, place_stop, close_position
@@ -264,6 +314,62 @@ def _recent_rejection_reason(db: Session, guard) -> str | None:
     return row[0] or ""
 
 
+# How long a SELL may sit "working" before we stop trusting it. Order status is
+# updated by the trade listener; a row it never heard back about must not block
+# protection forever.
+_WORKING_EXIT_MAX_AGE_S = 30 * 60
+
+
+def working_exit(db: Session, guard):
+    """A non-stop SELL for this contract still working at the broker, or None.
+
+    Any exit counts — a ladder trim, a manual close, a refused stop's exit —
+    because each reserves the contracts it is selling.
+    """
+    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+
+    from app.models.order import Order, OrderSide, OrderStatus, OrderType  # noqa: PLC0415
+    from sqlalchemy import select  # noqa: PLC0415
+
+    since = datetime.now(timezone.utc) - timedelta(seconds=_WORKING_EXIT_MAX_AGE_S)
+    return db.execute(
+        select(Order).where(
+            Order.user_id == guard.user_id,
+            Order.parent_order_id.is_(None),
+            Order.symbol == guard.symbol,
+            Order.option_strike.is_not_distinct_from(guard.option_strike),
+            Order.option_expiry.is_not_distinct_from(guard.option_expiry),
+            Order.side == OrderSide.SELL,
+            Order.order_type != OrderType.STOP,
+            Order.status.in_([
+                OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
+                OrderStatus.PARTIALLY_FILLED, OrderStatus.RETRY_PENDING,
+            ]),
+            Order.created_at >= since,
+        ).order_by(Order.created_at.desc()).limit(1)
+    ).scalars().first()
+
+
+def release_for_position(db: Session, user, pos) -> bool:
+    """Free a ladder stop's contracts before a manual exit of ``pos``.
+
+    A resting SELL stop reserves what it covers, so a manual close of the same
+    contracts is read by Alpaca as OPENING a short and refused ("insufficient
+    options buying power for cash-secured put") — live 2026-09-29, twice. The
+    stop reconciler waits while that close works, then re-sizes the stop to
+    whatever is left.
+    """
+    guard = guards.find(
+        db, user.id, pos.symbol, pos.option_strike,
+        getattr(pos, "option_right", None), pos.option_expiry,
+    )
+    if guard is None or not guard.stop_order_id:
+        return False
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+
+    return release(db, guard, _cancel_stop_order(db, user))
+
+
 def release(db: Session, guard, cancel_stop) -> bool:
     """Cancel the resting stop so its contracts are free to be sold.
 
@@ -284,4 +390,4 @@ def release(db: Session, guard, cancel_stop) -> bool:
     return True
 
 
-__all__ = ["desired_quantity", "reconcile", "release"]
+__all__ = ["desired_quantity", "reconcile", "release", "release_for_position", "working_exit"]

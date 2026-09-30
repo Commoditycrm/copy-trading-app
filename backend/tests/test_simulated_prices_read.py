@@ -20,7 +20,8 @@ from app.brokers.webull import WebullAdapter
 
 
 def test_the_screen_takes_the_shared_cached_read():
-    src = inspect.getsource(discord_sources.list_simulated_prices)
+    # The list and the dry run both read positions through this one helper.
+    src = inspect.getsource(discord_sources._positions_for_screen)
     assert "get_positions(cached_ok=True)" in src, (
         "a display-only screen must share the cached positions read"
     )

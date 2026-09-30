@@ -203,14 +203,34 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         loop.call_soon_threadsafe(_schedule)
 
 
+def _request_stop(stream) -> None:
+    """Ask a TradingStream to close without blocking the loop it runs on.
+
+    ``TradingStream.stop()`` is ``run_coroutine_threadsafe(stop_ws(), loop)
+    .result()`` against the stream's own loop — and the listener runs the stream
+    on the MAIN loop (``await stream._run_forever()``). Called from that loop it
+    waits on itself forever: every shutdown with the worker on deadlocked there
+    (2026-09-29, found with the SIGUSR1 stack dump), and a runtime stop — a
+    broker disconnect, a listener restart — would freeze the whole app.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    try:
+        if running is not None and getattr(stream, "_loop", None) is running:
+            running.create_task(stream.stop_ws())
+        else:
+            stream.stop()
+    except Exception:  # noqa: BLE001
+        log.debug("listener: stream stop failed", exc_info=True)
+
+
 def stop_listener(trader_user_id: uuid.UUID) -> None:
     """Signal the listener to shut down and clean up state."""
     stream = _streams.pop(trader_user_id, None)
     if stream is not None:
-        try:
-            stream.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        _request_stop(stream)
     task = _tasks.pop(trader_user_id, None)
     if task and not task.done():
         task.cancel()

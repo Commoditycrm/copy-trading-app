@@ -17,6 +17,16 @@ import app.services.discord_stop_orders as so
 from app.models.order import OrderStatus
 
 
+@pytest.fixture(autouse=True)
+def _no_working_exit_and_market_open(monkeypatch):
+    """These tests are about the stop/trail rules, not the order book or the
+    clock: no exit is already working, and the regular session is open."""
+    from app.services import discord_stop_orders, market_hours
+
+    monkeypatch.setattr(discord_stop_orders, "working_exit", lambda db, guard: None)
+    monkeypatch.setattr(market_hours, "in_regular_session", lambda *a, **k: True)
+
+
 class _Guard:
     def __init__(self, stop=None, trail_qty=None, stop_order_id=None):
         self.user_id = uuid.uuid4()
@@ -142,13 +152,29 @@ def test_a_stop_that_already_filled_is_forgotten_not_reused(db, broker):
     assert broker["placed"] == [(Decimal(2), Decimal("1.50"))]
 
 
-def test_a_stop_cancelled_by_hand_at_the_broker_is_re_placed(db, broker):
-    """Reconciling rather than placing once is what makes this self-heal."""
+def test_a_stop_the_trader_cancelled_stays_cancelled(db, broker):
+    """The ladder clears stop_order_id before every cancel of its own, so a
+    cancelled stop it still points at was removed by the trader (Cancel all
+    open orders, Order History, the Alpaca dashboard). Re-placing it every tick
+    overrode the trader — live 2026-09-29, even with Auto trim off."""
     order = _Order(2, "1.50", status=OrderStatus.CANCELED); db.add(order)
     g = _Guard(stop="1.50", stop_order_id=order.id)
 
-    so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
-    assert broker["placed"] == [(Decimal(2), Decimal("1.50"))]
+    out = so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
+    assert out == "removed by the trader"
+    assert broker["placed"] == []
+    assert g.stop_price is None and g.stop_order_id is None
+
+    # ...and it stays gone on every later tick.
+    assert so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"]) == "idle"
+    assert broker["placed"] == []
+
+
+def test_a_filled_stop_is_just_forgotten(db, broker):
+    order = _Order(2, "1.50", status=OrderStatus.FILLED); db.add(order)
+    g = _Guard(stop="1.50", stop_order_id=order.id)
+    so.reconcile(db, g, Decimal(0), broker["place"], broker["cancel"])
+    assert g.stop_order_id is None
 
 
 # ── when there is nothing to protect ─────────────────────────────────────────
@@ -333,8 +359,10 @@ def test_a_refused_stop_closes_the_position(monkeypatch):
         close_position=closed.append,
     )
     assert closed == [Decimal(1)]
-    assert "closed" in out
-    assert g.closed_at is not None          # the ladder is done with it
+    assert "refused" in out
+    # Not retired on submit: live until retire_if_flat sees the position gone,
+    # so an exit that expires unfilled is sent again.
+    assert getattr(g, "closed_at", None) is None
 
 
 def test_a_rate_limit_does_not_liquidate(monkeypatch):
@@ -451,8 +479,8 @@ def test_a_position_left_unprotected_by_an_earlier_refusal_is_rescued(db, broker
     )
     assert closed == [Decimal(1)], out
     assert broker["placed"] == []          # no pointless re-place first
-    assert "closed" in out
-    assert g.closed_at is not None
+    assert out == "exit sent"
+    assert getattr(g, "closed_at", None) is None
 
 
 def test_a_transient_refusal_still_only_backs_off(db, broker):
