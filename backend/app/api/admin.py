@@ -43,7 +43,9 @@ from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.services import audit, excel_export, market_hours, visibility
-from app.services.pnl import alpaca_marked_by_day, calendar_series, realized_pnl_by_day
+from app.services.pnl import (
+    alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_day,
+)
 from app.schemas.order import DailyPnL
 from app.services.redis_client import get_sync_redis
 from app.services.broker_names import heal_snaptrade_brokerage_names
@@ -518,14 +520,15 @@ def admin_user_pnl_calendar(
         db, user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
         live_today_unrealized=live_unreal_today,
     )
-    # Same broker-direct match as the trader's own Calendar: Alpaca settled days
-    # show Alpaca's own marked P&L. Single source of truth, so admin never drifts.
-    alpaca_marked = alpaca_marked_by_day(db, user_id, from_, to, tz)
+    # Same broker-direct match as the trader's own Calendar: Alpaca/Webull days
+    # show the broker's own marked Day's P&L. Single source of truth, no drift.
+    marked_by_day = frozen_marked_by_day(db, user_id, from_, to)
+    marked_by_day.update(alpaca_marked_by_day(db, user_id, from_, to, tz))
     out: list[DailyPnL] = []
     for c in sorted(series.values(), key=lambda c: c.day):
         marked = c.marked_pnl
         pct = None
-        ov = alpaca_marked.get(c.day)
+        ov = marked_by_day.get(c.day)
         if ov is not None and not c.live:
             marked, pct = ov
         out.append(DailyPnL(

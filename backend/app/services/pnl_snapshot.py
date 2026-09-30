@@ -62,15 +62,16 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
       * SnapTrade exposes a complete trade-activity feed → REALIZED P&L, FIFO'd
         (``realized_by_day_from_broker``). SnapTrade does not expose marked
         equity, so realized is the best we can do there.
-      * Alpaca exposes a marked portfolio-history series, so we freeze MARKED
-        P&L (``marked_pnl_by_day`` — realized + unrealized), the exact per-day
-        figure Alpaca's own app shows — FORWARD-ONLY: only today's row is
+      * Alpaca AND Webull expose a live day-P&L snapshot (get_pnl_snapshot →
+        todays_pl, equity vs day-start) → we freeze MARKED P&L (the exact
+        "Day's P&L" their own app shows) — FORWARD-ONLY: only today's row is
         written, so settled past days are never rewritten and historical
         calendar values are preserved. Each day locks at its END-OF-DAY marked
         as it passes through "today", so an overnight position's gain lands on
         the day it accrued and the next day shows only its incremental change.
         The calendar shows the SAME metric live for today, so a settled day
-        doesn't jump when the snapshot lands.
+        doesn't jump when the snapshot lands. Webull exposes NO history, so a
+        Webull account only starts matching from the first sweep forward.
     Brokers with neither keep using the DB calc via the calendar fallback."""
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
     source_by_day: dict[date, str] = {}
@@ -79,25 +80,32 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         daily = realized_by_day_from_broker(adapter, start, end)
         source_by_day = {d: "broker_activities" for d in daily}
         _fill_lagging_gap_days(db, acct, end, daily, source_by_day)
-    elif hasattr(adapter, "marked_pnl_by_day"):
-        # Alpaca: freeze MARKED P&L (realized + unrealized), the exact figure
-        # Alpaca's own app shows — FORWARD-ONLY. We (re)write ONLY today's row;
-        # settled past days are never rewritten, so historical calendar values
-        # stay EXACTLY as they are (no backfill, no retroactive change). Each day
-        # locks at its end-of-day marked as it passes through "today" — the last
-        # post-close sweep captures the settled figure.
+    elif hasattr(adapter, "get_pnl_snapshot"):
+        # Alpaca / Webull: freeze MARKED P&L (the exact Day's P&L their app
+        # shows) — FORWARD-ONLY. We (re)write ONLY today's row; settled past days
+        # are never rewritten, so historical calendar values stay EXACTLY as they
+        # are (no backfill, no retroactive change). Each day locks at its
+        # end-of-day marked as it passes through "today" — the last post-close
+        # sweep captures the settled figure.
         #
-        # Source is get_pnl_snapshot()['todays_pl'] (equity vs day-start), NOT
-        # portfolio-history: Alpaca's portfolio-history (1D) does NOT include the
-        # CURRENT intraday day, so it can never provide today's marked. This is
-        # the SAME live source the calendar shows for today and the poller
-        # enforces daily limits on, so there's no after-hours jump.
+        # Source is get_pnl_snapshot()['todays_pl'] (equity vs day-start). For
+        # Alpaca this is preferred over its portfolio-history (1D), which omits
+        # the CURRENT intraday day; Webull has no history endpoint at all, so
+        # this live snapshot is the only source. It's the SAME live figure the
+        # calendar shows for today and the poller enforces daily limits on, so
+        # there's no after-hours jump.
         daily = {}
         try:
             _snap = adapter.get_pnl_snapshot()
             _tp = _snap.get("todays_pl") if _snap else None
             if _tp is not None:
-                daily = {end: (Decimal(str(_tp)), 0, None)}
+                # Daily return % = day P&L / day-start equity, the same figure
+                # the broker's calendar shows next to the dollar amount.
+                _base = _snap.get("beginning_day_balance") if _snap else None
+                _pct = None
+                if _base not in (None, 0):
+                    _pct = (Decimal(str(_tp)) / Decimal(str(_base))) * Decimal(100)
+                daily = {end: (Decimal(str(_tp)), 0, _pct)}
         except Exception:  # noqa: BLE001
             log.warning(
                 "pnl_snapshot: get_pnl_snapshot failed for acct %s", acct.id,
@@ -231,15 +239,17 @@ def _fill_lagging_gap_days(
 
 def run_snapshot_sweep(window_days: int = SNAPSHOT_WINDOW_DAYS) -> int:
     """One pass over every connected broker-direct account (SnapTrade → realized,
-    Alpaca → marked). Per-account session + commit so one bad account can't roll
-    back the rest. Returns rows written."""
+    Alpaca / Webull → marked Day's P&L). Per-account session + commit so one bad
+    account can't roll back the rest. Returns rows written."""
     end = market_hours.now_et().date()
     start = end - timedelta(days=window_days)
     with SessionLocal() as db:
         account_ids = [
             a.id for a in db.execute(
                 select(BrokerAccount).where(
-                    BrokerAccount.broker.in_((BrokerName.SNAPTRADE, BrokerName.ALPACA)),
+                    BrokerAccount.broker.in_(
+                        (BrokerName.SNAPTRADE, BrokerName.ALPACA, BrokerName.WEBULL)
+                    ),
                     BrokerAccount.connection_status == "connected",
                 )
             ).scalars()
