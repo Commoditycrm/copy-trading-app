@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -238,6 +238,35 @@ class TraderSettings(Base, TimestampMixin):
     discord_live_trading: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False,
     )
+
+    # ── Which engine manages exits ──────────────────────────────────────────
+    # "ladder" — the configured trim ladder (auto-trim, if on, fires its rungs).
+    # "ai"     — an OpenRouter model decides each exit; the ladder's automatic
+    #            sweep stands down so two engines never sell the same contracts.
+    # Either way a Discord author's own exit alert still runs as it always did.
+    discord_exit_engine: Mapped[str] = mapped_column(
+        String(10), default="ladder", server_default="ladder", nullable=False,
+    )
+    # "suggest" — every AI decision waits for the trader to approve it.
+    # "auto"    — decisions execute as they arrive (still paper unless
+    #             discord_live_trading is on).
+    discord_ai_mode: Mapped[str] = mapped_column(
+        String(10), default="suggest", server_default="suggest", nullable=False,
+    )
+    discord_ai_model: Mapped[str] = mapped_column(
+        String(120), default="anthropic/claude-sonnet-5.5",
+        server_default="anthropic/claude-sonnet-5.5", nullable=False,
+    )
+    # Ask again once the price has moved this far (%) since the last ask...
+    discord_ai_move_pct: Mapped[Decimal] = mapped_column(
+        Numeric(9, 4), default=Decimal("5"), server_default="5", nullable=False,
+    )
+    # ...but never more often than this, per position.
+    discord_ai_min_interval_s: Mapped[int] = mapped_column(
+        Integer, default=60, server_default="60", nullable=False,
+    )
+    # The trader's own guidance, appended to the model's instructions.
+    discord_ai_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     user = relationship("User", back_populates="trader_settings")
 

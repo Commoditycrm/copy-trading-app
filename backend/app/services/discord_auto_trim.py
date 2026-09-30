@@ -27,11 +27,18 @@ The guard's sell_count is the rung counter and plan_exit advances it, so a
 fired rung cannot fire again while the price stays above its gate. What stops a
 DOUBLE fire inside one tick is that this runs sequentially per guard and the
 count is committed before the next guard is considered.
+
+Across ticks it is a per-trader Redis lock. Two processes sweep: the worker's
+poll loop, and the web tier right after a Simulated Prices pin. Without the
+lock both read the same sell_count, both see the rung due, and both sell it.
+Each guard is refreshed once the lock is held, so the second sweep sees the
+count the first one committed.
 """
 from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from decimal import Decimal
 
 from app.database import SessionLocal
@@ -51,9 +58,20 @@ log = logging.getLogger(__name__)
 # stop now goes on within ~1s of the fill regardless (see pnl_poller.poll_now).
 POLL_INTERVAL_S = 15
 
+# A sweep for one trader can include several trims, each with its own fanout, so
+# the lock outlives a slow sweep; the TTL only matters if a process dies holding
+# it. A pin waits briefly for a worker sweep in progress rather than skipping.
+_LOCK_TTL_S = 120
+_LOCK_WAIT_S = 10
+
 
 def _enabled(ts) -> bool:
     return bool(ts is not None and getattr(ts, "discord_auto_trim", False))
+
+
+def _engine(ts) -> str:
+    """Which exit engine this trader runs: "ladder" (default) or "ai"."""
+    return "ai" if getattr(ts, "discord_exit_engine", None) == "ai" else "ladder"
 
 
 def _gate_for(ts, rung: int) -> Decimal:
@@ -136,21 +154,22 @@ def _exit_alert_text(guard: DiscordPositionGuard) -> str:
             f"{guard.option_expiry:%m/%d}")
 
 
-def _live_guards(db):
+def _live_guards(db, user_id=None):
     from sqlalchemy import select  # noqa: PLC0415
 
-    return list(db.execute(
-        select(DiscordPositionGuard).where(
-            DiscordPositionGuard.closed_at.is_(None),
-            DiscordPositionGuard.entry_price.is_not(None),
-            # Options only: the alert text this builds names a contract, and
-            # the ladder has never run on anything else.
-            DiscordPositionGuard.option_strike.is_not(None),
-        )
-    ).scalars())
+    statement = select(DiscordPositionGuard).where(
+        DiscordPositionGuard.closed_at.is_(None),
+        DiscordPositionGuard.entry_price.is_not(None),
+        # Options only: the alert text this builds names a contract, and
+        # the ladder has never run on anything else.
+        DiscordPositionGuard.option_strike.is_not(None),
+    )
+    if user_id is not None:
+        statement = statement.where(DiscordPositionGuard.user_id == user_id)
+    return list(db.execute(statement).scalars())
 
 
-def _mark_for(positions, guard) -> Decimal | None:
+def _mark_for(positions, guard, user_id=None) -> Decimal | None:
     """The broker's own mark for this contract, from the position it holds.
 
     Takes the account's ALREADY-FETCHED positions (fetched once per account per
@@ -170,6 +189,14 @@ def _mark_for(positions, guard) -> Decimal | None:
             continue
         if (p.quantity or 0) == 0:
             return None
+        # Test-only pins from Simulated Prices must exercise the automatic
+        # trim ladder too, not just stop/trailing enforcement. Pins are scoped
+        # by trader and contract and are disabled outside a test-enabled env.
+        if user_id is not None:
+            from app.services import price_override  # noqa: PLC0415
+            pinned = price_override.apply_to(user_id, p)
+            if pinned is not None:
+                return pinned
         return _dec(getattr(p, "current_price", None))
     return None
 
@@ -184,11 +211,68 @@ def _dec(v) -> Decimal | None:
     return d if d > 0 else None
 
 
-def tick() -> None:
-    """One sweep. Never raises: a bad guard must not stop the others."""
+@contextmanager
+def _trader_lock(trader_id, *, required: bool):
+    """Hold this trader's sweep lock; yields whether the sweep may proceed.
+
+    With Redis down, the worker (``required=False``) sweeps unlocked, as it did
+    before the lock existed, so auto-trim keeps working. A pin-triggered sweep
+    (``required=True``) skips instead: it is the second sweeper, and the worker
+    picks the move up on its next tick anyway.
+    """
+    lock = None
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+        lock = get_sync_redis().lock(
+            f"discord:autotrim:lock:{trader_id}",
+            timeout=_LOCK_TTL_S,
+            blocking_timeout=_LOCK_WAIT_S,
+        )
+        acquired = bool(lock.acquire())
+        if not acquired:
+            log.info("auto-trim: trader %s is already being swept — skipping", trader_id)
+    except Exception:  # noqa: BLE001
+        log.warning("auto-trim: sweep lock unavailable for %s", trader_id, exc_info=True)
+        lock = None
+        acquired = not required
+    try:
+        yield acquired
+    finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:  # noqa: BLE001
+                # Expired mid-sweep (TTL) — nothing left to release.
+                log.warning("auto-trim: sweep lock for %s expired before release", trader_id)
+
+
+def tick(user_id=None) -> None:
+    """One sweep, optionally scoped to one trader.
+
+    The normal worker leaves ``user_id`` empty. Simulated Prices supplies the
+    trader id immediately after changing a test price so each one-second path
+    step is evaluated then, rather than waiting for the worker's next sweep.
+    """
+    with SessionLocal() as db:
+        guards = _live_guards(db, user_id)
+        if not guards:
+            return
+        by_user: dict = {}
+        for g in guards:
+            by_user.setdefault(g.user_id, []).append(g)
+
+        for trader_id, rows in by_user.items():
+            # Only the pin-triggered sweep insists on the lock; see _trader_lock.
+            with _trader_lock(trader_id, required=user_id is not None) as ok:
+                if ok:
+                    _sweep_trader(db, trader_id, rows)
+
+
+def _sweep_trader(db, trader_id, rows) -> None:
+    """Fire whatever rungs are due for one trader. Caller holds the sweep lock."""
     from app.api.discord_sources import submit_self_alert_text  # noqa: PLC0415
     from app.brokers import adapter_for  # noqa: PLC0415
-    # `guards` is a local in this function, so the module is aliased.
+    # `guards` is a local in tick, so the module is aliased.
     from app.services import discord_position_guard as pg  # noqa: PLC0415
     from app.models.broker_account import BrokerAccount  # noqa: PLC0415
     from app.models.settings import TraderSettings  # noqa: PLC0415
@@ -196,109 +280,123 @@ def tick() -> None:
     from app.services.crypto import decrypt_json  # noqa: PLC0415
     from sqlalchemy import select  # noqa: PLC0415
 
-    with SessionLocal() as db:
-        guards = _live_guards(db)
-        if not guards:
-            return
-        by_user: dict = {}
-        for g in guards:
-            by_user.setdefault(g.user_id, []).append(g)
+    ts = db.get(TraderSettings, trader_id)
+    # The AI engine runs whether or not ladder auto-trim is on; with it selected
+    # the ladder's rungs are never auto-fired, so two engines can't both sell.
+    engine = _engine(ts)
+    if engine == "ladder" and not _enabled(ts):
+        return
+    user = db.get(User, trader_id)
+    if user is None:
+        return
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == trader_id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is None:
+        return
+    try:
+        adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    except Exception:  # noqa: BLE001
+        log.warning("auto-trim: no adapter for user %s", trader_id, exc_info=True)
+        return
 
-        for user_id, rows in by_user.items():
-            ts = db.get(TraderSettings, user_id)
-            if not _enabled(ts):
+    # Fetch the account's positions ONCE per sweep and match every guard
+    # against that list. Reading them per-guard made N broker calls per
+    # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
+    try:
+        positions = adapter.get_positions()
+    except Exception:  # noqa: BLE001
+        log.warning("auto-trim: could not read positions for user %s", trader_id, exc_info=True)
+        return
+
+    if engine == "ai":
+        from app.services import ai_trim  # noqa: PLC0415
+
+        live = []
+        for guard in rows:
+            db.refresh(guard)
+            if guard.closed_at is None:
+                live.append(guard)
+        ai_trim.sweep(
+            db, user, ts, acct, adapter, live, positions,
+            lambda ps, g: _mark_for(ps, g, trader_id),
+        )
+        return
+
+    for guard in rows:
+        try:
+            # Loaded before the lock was taken — another sweep may have fired a
+            # rung or closed the guard since. Judge the committed state.
+            db.refresh(guard)
+            if guard.closed_at is not None:
                 continue
-            user = db.get(User, user_id)
-            if user is None:
+
+            # Measure against the ACTUAL fill, not the limit we bid.
+            #
+            # A guard is seeded at placement with the limit, and only
+            # the EXIT path used to replace it with the fill — so
+            # auto-trim measured a price nobody paid. Live 2026-09-28:
+            # QQQ was bid 0.65, repriced to 0.72, filled at 0.6875;
+            # auto-trim read +7.7% off 0.65 and fired, the ladder
+            # re-synced and answered "up 1.82%, under the 5% gate". The
+            # rung was spent for nothing and the next sweep walked the
+            # ladder down a position that never reached a target. SPY
+            # went the same way and ended flat on a break-even stop that
+            # only moved because of this.
+            #
+            # Idempotent (returns False when unchanged) and the exit
+            # path still syncs too, so nothing else changes behaviour —
+            # the reference is simply correct sooner.
+            if pg.sync_entry_price(db, guard):
+                db.commit()
+
+            mark = _mark_for(positions, guard, trader_id)
+            rung = due_rung(ts, guard, mark)
+            if rung is None:
                 continue
-            acct = db.execute(
-                select(BrokerAccount).where(
-                    BrokerAccount.user_id == user_id,
-                    BrokerAccount.connection_status == "connected",
+
+            before_rung = guard.sell_count or 0
+            before_trail = guard.trail_qty
+
+            text = _exit_alert_text(guard)
+            log.info(
+                "auto-trim: %s reached %.2f%% — firing trim %s via %r",
+                guard.symbol, gain_pct(guard.entry_price, mark), rung, text,
+            )
+            msg = submit_self_alert_text(db, user, text, approve=True)
+
+            # If the rung sold nothing and armed nothing, give it back.
+            #
+            # plan_exit advances the rung unconditionally, and for a
+            # HUMAN alert that is right: the trader's Nth alert is their
+            # Nth trim whatever it managed to do. Auto-trim has no alert
+            # — nobody asked for anything — so a rung that turns out not
+            # to be due must not be spent, or the next sweep measures
+            # the rung after it and the ladder walks itself out of a
+            # position on a price wobble between check and execution.
+            #
+            # Judged on what actually happened rather than on the note:
+            # an order id means it sold, a changed trail_qty means this
+            # rung armed one. Any stop the rung set is deliberately
+            # KEPT — the gate decides whether to sell, never whether to
+            # protect.
+            db.refresh(guard)
+            did_something = (
+                (msg is not None and msg.order_id is not None)
+                or guard.trail_qty != before_trail
+            )
+            if not did_something and (guard.sell_count or 0) > before_rung:
+                log.info(
+                    "auto-trim: %s trim %s sold nothing — returning the rung",
+                    guard.symbol, rung,
                 )
-            ).scalars().first()
-            if acct is None:
-                continue
-            try:
-                adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-            except Exception:  # noqa: BLE001
-                log.warning("auto-trim: no adapter for user %s", user_id, exc_info=True)
-                continue
-
-            # Fetch the account's positions ONCE per sweep and match every guard
-            # against that list. Reading them per-guard made N broker calls per
-            # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
-            try:
-                positions = adapter.get_positions()
-            except Exception:  # noqa: BLE001
-                log.warning("auto-trim: could not read positions for user %s", user_id, exc_info=True)
-                continue
-
-            for guard in rows:
-                try:
-                    # Measure against the ACTUAL fill, not the limit we bid.
-                    #
-                    # A guard is seeded at placement with the limit, and only
-                    # the EXIT path used to replace it with the fill — so
-                    # auto-trim measured a price nobody paid. Live 2026-09-28:
-                    # QQQ was bid 0.65, repriced to 0.72, filled at 0.6875;
-                    # auto-trim read +7.7% off 0.65 and fired, the ladder
-                    # re-synced and answered "up 1.82%, under the 5% gate". The
-                    # rung was spent for nothing and the next sweep walked the
-                    # ladder down a position that never reached a target. SPY
-                    # went the same way and ended flat on a break-even stop that
-                    # only moved because of this.
-                    #
-                    # Idempotent (returns False when unchanged) and the exit
-                    # path still syncs too, so nothing else changes behaviour —
-                    # the reference is simply correct sooner.
-                    if pg.sync_entry_price(db, guard):
-                        db.commit()
-
-                    mark = _mark_for(positions, guard)
-                    rung = due_rung(ts, guard, mark)
-                    if rung is None:
-                        continue
-
-                    before_rung = guard.sell_count or 0
-                    before_trail = guard.trail_qty
-
-                    text = _exit_alert_text(guard)
-                    log.info(
-                        "auto-trim: %s reached %.2f%% — firing trim %s via %r",
-                        guard.symbol, gain_pct(guard.entry_price, mark), rung, text,
-                    )
-                    msg = submit_self_alert_text(db, user, text, approve=True)
-
-                    # If the rung sold nothing and armed nothing, give it back.
-                    #
-                    # plan_exit advances the rung unconditionally, and for a
-                    # HUMAN alert that is right: the trader's Nth alert is their
-                    # Nth trim whatever it managed to do. Auto-trim has no alert
-                    # — nobody asked for anything — so a rung that turns out not
-                    # to be due must not be spent, or the next sweep measures
-                    # the rung after it and the ladder walks itself out of a
-                    # position on a price wobble between check and execution.
-                    #
-                    # Judged on what actually happened rather than on the note:
-                    # an order id means it sold, a changed trail_qty means this
-                    # rung armed one. Any stop the rung set is deliberately
-                    # KEPT — the gate decides whether to sell, never whether to
-                    # protect.
-                    db.refresh(guard)
-                    did_something = (
-                        (msg is not None and msg.order_id is not None)
-                        or guard.trail_qty != before_trail
-                    )
-                    if not did_something and (guard.sell_count or 0) > before_rung:
-                        log.info(
-                            "auto-trim: %s trim %s sold nothing — returning the rung",
-                            guard.symbol, rung,
-                        )
-                        pg.rollback_exit(guard)
-                        db.commit()
-                except Exception:  # noqa: BLE001
-                    log.exception("auto-trim: failed on %s", guard.symbol)
+                pg.rollback_exit(guard)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("auto-trim: failed on %s", guard.symbol)
 
 
 def poll_loop(shutdown_check=None) -> None:

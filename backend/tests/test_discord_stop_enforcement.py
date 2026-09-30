@@ -21,6 +21,16 @@ import app.services.discord_trailing_stop as stops
 from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.order import InstrumentType, OptionRight
 
+
+@pytest.fixture(autouse=True)
+def _no_working_exit_and_market_open(monkeypatch):
+    """These tests are about the stop/trail rules, not the order book or the
+    clock: no exit is already working, and the regular session is open."""
+    from app.services import discord_stop_orders, market_hours
+
+    monkeypatch.setattr(discord_stop_orders, "working_exit", lambda db, guard: None)
+    monkeypatch.setattr(market_hours, "in_regular_session", lambda *a, **k: True)
+
 EXP = date(2026, 10, 16)
 
 
@@ -84,6 +94,10 @@ def test_a_break_below_the_stop_closes_everything(db, closer, sold):
 
     assert n == 1
     assert sold == [Decimal(4)]              # the whole position, not a slice
+    # Not retired on submit — an exit that expires must be retried. The next
+    # tick, with the position gone, retires it.
+    assert g.closed_at is None
+    stops.enforce(db, g.user_id, _Adapter([]), closer)
     assert g.closed_at is not None
 
 
@@ -130,6 +144,10 @@ def test_a_trailing_exit_taking_everything_retires(db, closer, sold):
     stops.enforce(db, g.user_id, _Adapter([_Pos("2.70", qty=4)]), closer)
 
     assert sold == [Decimal(4)]
+    # Not retired on submit — an exit that expires must be retried. The next
+    # tick, with the position gone, retires it.
+    assert g.closed_at is None
+    stops.enforce(db, g.user_id, _Adapter([]), closer)
     assert g.closed_at is not None
 
 
@@ -151,6 +169,10 @@ def test_the_stop_takes_priority_over_a_pending_trail(db, closer, sold):
     stops.enforce(db, g.user_id, _Adapter([_Pos("1.40", qty=4)]), closer)
 
     assert sold == [Decimal(4)]              # everything, not the 2-slice
+    # Not retired on submit — an exit that expires must be retried. The next
+    # tick, with the position gone, retires it.
+    assert g.closed_at is None
+    stops.enforce(db, g.user_id, _Adapter([]), closer)
     assert g.closed_at is not None
 
 

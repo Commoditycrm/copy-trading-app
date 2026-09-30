@@ -272,6 +272,11 @@ def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     protection but never trigger an exit by itself.
     """
     stop = _to_tick(stop)
+    # A deep stop on a cheap contract rounds down to $0.00 (entry 0.02 at -90%
+    # is 0.002). That is not a stop, and the broker refuses it — which the stop
+    # reconciler used to answer by selling the whole position. Live 2026-09-29.
+    if stop is not None and stop <= 0:
+        return None
     if stop is None or mark is None:
         return stop
     return stop if stop < mark else None

@@ -20,7 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, require_sell_all_access, require_trader
+from app.api.deps import client_ip, current_user, require_sell_all_access, require_trader
 from app.api.trades import _place_trader_order
 from collections.abc import Callable
 from decimal import Decimal
@@ -35,6 +35,7 @@ from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import (
+    AveragePositionIn,
     ClosePositionIn,
     PositionOut,
     PositionsPayload,
@@ -180,6 +181,10 @@ def list_positions(
         _attach_position_channels(db, user.id, out)
     except Exception:  # noqa: BLE001
         log.warning("positions: could not attach discord channels", exc_info=True)
+    try:
+        _attach_ladder_stops(db, user.id, out)
+    except Exception:  # noqa: BLE001
+        log.warning("positions: could not attach ladder stops", exc_info=True)
     if detail:
         return PositionsPayload(positions=out, unreachable=unreachable)
     return out
@@ -398,6 +403,11 @@ def close_all_positions(
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
             )
             try:
+                if reverse_side == OrderSide.SELL:
+                    # Free a resting Discord ladder stop first (see close_position).
+                    from app.services import discord_stop_orders  # noqa: PLC0415
+
+                    discord_stop_orders.release_for_position(db, user, pos)
                 order = _place_trader_order(
                     db, user, payload, acct.id, background, request,
                     skip_fanout=skip_fanout, resolve_wash_trade=True,
@@ -505,6 +515,38 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             p.option_expiry, p.option_strike, p.option_right,
         )
         p.discord_channel = by_contract.get(key)
+
+
+def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
+    """Set .ladder_stop_price from each held contract's live Discord guard.
+
+    One query over the live guards for the symbols held. A display column, so
+    the caller isolates failures the same way as the channel column.
+    """
+    for p in positions:
+        p.ladder_stop_price = None
+    symbols = {(p.symbol or "").upper() for p in positions if p.symbol}
+    if not symbols:
+        return
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    rows = db.execute(
+        select(DiscordPositionGuard).where(
+            DiscordPositionGuard.user_id == user_id,
+            DiscordPositionGuard.closed_at.is_(None),
+            DiscordPositionGuard.stop_price.is_not(None),
+            DiscordPositionGuard.symbol.in_(symbols),
+        )
+    ).scalars()
+    by_contract = {
+        (g.symbol, g.option_strike, (g.option_right or None), g.option_expiry): g.stop_price
+        for g in rows
+    }
+    for p in positions:
+        right = getattr(p.option_right, "value", p.option_right)
+        p.ladder_stop_price = by_contract.get(
+            ((p.symbol or "").upper(), p.option_strike, right or None, p.option_expiry)
+        )
 
 
 def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None, str | None]":
@@ -1493,6 +1535,13 @@ def close_position(
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
 
+    # A Discord ladder stop resting on this contract reserves it; without this
+    # the close is read as opening a short and refused.
+    if reverse_side == OrderSide.SELL:
+        from app.services import discord_stop_orders  # noqa: PLC0415
+
+        discord_stop_orders.release_for_position(db, user, pos)
+
     try:
         order = _place_trader_order(
             db, user, new_payload, acct.id, background, request, resolve_wash_trade=True,
@@ -1521,6 +1570,237 @@ def close_position(
     # Single close joins today's current snapshot (don't fragment into one
     # snapshot per order). Exit-All still starts its own.
     _capture_exit_snapshot(db, user.id, [closed_item], new_event=False)
+    db.commit()
+    return order
+
+
+@router.post("/{broker_symbol}/stop")
+def set_position_stop(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    pnl_pct: Decimal = Query(..., ge=-99, le=1000, description="P&L level for the stop: -25 is 25% below entry, 0 break-even, +25 locks in 25%."),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Put the position's stop at a P&L level measured from entry.
+
+    Sets the level on the position's ladder guard (creating one, as the
+    trailing-stop action does, if the position has none). The stop reconciler
+    then keeps a real STOP order resting at that level — one mechanism for
+    every stop on the row, so a ladder stop and a second bracket stop never end
+    up competing for the same contracts.
+    """
+    from decimal import ROUND_DOWN  # noqa: PLC0415
+
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.services import audit  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.quantity < 0:
+        # The stop reconciler places SELL stops; a short needs a BUY stop.
+        raise HTTPException(422, "Stops from this row are for long positions only.")
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    entry = (guard.entry_price if guard is not None and guard.entry_price else None) \
+        or getattr(pos, "avg_entry_price", None)
+    if entry is None or Decimal(str(entry)) <= 0:
+        raise HTTPException(422, "No entry price to measure the stop from.")
+    entry = Decimal(str(entry))
+
+    # Rounded DOWN to the cent: brokers refuse sub-cent option stops, and down
+    # never tightens a stop past the level asked for.
+    price = (entry * (Decimal(1) + pnl_pct / Decimal(100))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if price <= 0:
+        raise HTTPException(422, "That level rounds to a $0 stop.")
+    mark = getattr(pos, "current_price", None)
+    if mark is not None and Decimal(str(mark)) > 0 and price >= Decimal(str(mark)):
+        # A sell stop at or above the market fires at once; Alpaca refuses it.
+        raise HTTPException(
+            422, f"A stop at {price} is at or above the current price {mark} — it would sell immediately.",
+        )
+
+    if guard is None:
+        guard = DiscordPositionGuard(
+            user_id=user.id,
+            symbol=pos.symbol.upper(),
+            option_strike=pos.option_strike,
+            option_right=(pos.option_right.value if pos.option_right else None),
+            option_expiry=pos.option_expiry,
+            entry_price=entry,
+            sell_count=0,
+        )
+        db.add(guard)
+    previous = guard.stop_price
+    guard.stop_price = price
+    audit.record(
+        db, actor_user_id=user.id, action="positions.stop_set",
+        entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
+        metadata={"broker_symbol": pos.broker_symbol, "pnl_pct": str(pnl_pct),
+                  "stop_price": str(price), "previous": str(previous) if previous is not None else None},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    log.info("positions: stop on %s set to %s (%s%% P&L)", pos.broker_symbol, price, pnl_pct)
+    return {"stop_price": str(price), "entry_price": str(entry), "pnl_pct": str(pnl_pct)}
+
+
+def _resting_stop_orders(db: Session, user_id, pos) -> list:
+    """The trader's working STOP / TRAILING_STOP sells on this contract,
+    excluding bracket legs (the bracket endpoint owns those)."""
+    return list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.parent_order_id.is_(None),
+            Order.bracket_leg.is_(None),
+            Order.symbol == pos.symbol,
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.side == OrderSide.SELL,
+            Order.order_type.in_((OrderType.STOP, OrderType.TRAILING_STOP)),
+            Order.status.in_((OrderStatus.PENDING, OrderStatus.SUBMITTED,
+                              OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)),
+        )
+    ).scalars())
+
+
+@router.post("/{broker_symbol}/stops/cancel")
+def cancel_position_stops(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Remove every stop on one position, and keep them removed.
+
+    * the ladder's stop — the resting order AND its level. Cancelling only the
+      order left the level behind, and the stop reconciler put the order
+      straight back on its next tick, even with Auto trim off;
+    * a trailing exit — the app-monitored trail (options) is disarmed;
+    * any other resting STOP / TRAILING_STOP sell on the contract (a native
+      trailing stop on a stock).
+
+    A bracket's SL leg is not touched here: the row clears that through the
+    bracket endpoint, which keeps the entry's bracket state consistent.
+    """
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.services import audit, discord_stop_orders  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None:
+        raise HTTPException(404, "position_not_found")
+
+    cancel = _cancel_stop_order(db, user)
+    removed: list[str] = []
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        pos.option_right, pos.option_expiry)
+    if guard is not None:
+        if guard.stop_price is not None:
+            removed.append(f"stop @ {guard.stop_price}")
+            discord_stop_orders.release(db, guard, cancel)
+            guard.stop_price = None
+        if guard.trail_qty is not None:
+            removed.append(f"trailing exit on {guard.trail_qty}")
+            guards.clear_trail(guard)
+            guard.trail_percent = None
+
+    others = _resting_stop_orders(db, user.id, pos)
+    for order in others:
+        cancel(order.id)
+        removed.append(f"{order.order_type.value} order")
+
+    if not removed:
+        raise HTTPException(404, "no_stops")
+    audit.record(
+        db, actor_user_id=user.id, action="positions.stops_cancelled",
+        entity_type="position", entity_id=None,
+        metadata={"broker_symbol": pos.broker_symbol, "removed": removed},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    log.warning("positions: trader removed stops on %s: %s", pos.broker_symbol, ", ".join(removed))
+    return {"removed": removed}
+
+
+@router.post("/{broker_symbol}/average", response_model=OrderOut)
+def average_position(
+    broker_symbol: str,
+    payload: AveragePositionIn,
+    request: Request,
+    background: BackgroundTasks,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Order:
+    """Add ``quantity`` more of a held position — the mirror of close_position.
+
+    At market, an option goes out as a LIMIT through the ask (brokers refuse
+    option market orders — see _option_close_limit), exactly as a close is
+    priced through the bid. It is an ordinary buy on the trader's order path,
+    so subscribers copy it like any other entry.
+
+    A Discord ladder on the contract follows the new cost basis only when this
+    averages DOWN: guards.average_in, the same rule a Discord "double up" uses.
+    Averaging UP leaves the entry where it was, so an add can never raise the
+    ladder's own stop. The resting stop re-sizes to the new quantity on its own.
+    """
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    if acct.connection_status != "connected":
+        raise HTTPException(409, "broker_not_connected")
+
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    pos = next((p for p in adapter.get_positions()
+                if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.quantity < 0:
+        raise HTTPException(422, "Averaging is for long positions — adding to a short would sell to open.")
+
+    order_type, limit = payload.order_type, payload.limit_price
+    if pos.instrument_type == InstrumentType.OPTION and order_type == OrderType.MARKET:
+        order_type, limit = OrderType.LIMIT, _option_close_limit(adapter, pos, OrderSide.BUY)
+
+    held = abs(Decimal(str(pos.quantity)))
+    is_option = pos.instrument_type == InstrumentType.OPTION
+    order = _place_trader_order(
+        db, user,
+        PlaceOrderIn(
+            instrument_type=pos.instrument_type,
+            symbol=pos.symbol,
+            side=OrderSide.BUY,
+            order_type=order_type,
+            quantity=payload.quantity,
+            limit_price=limit,
+            option_expiry=pos.option_expiry if is_option else None,
+            option_strike=pos.option_strike if is_option else None,
+            option_right=pos.option_right if is_option else None,
+        ),
+        acct.id, background, request,
+    )
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    added_price = limit if limit is not None else getattr(pos, "current_price", None)
+    if (guard is not None and guard.entry_price is not None and added_price is not None
+            and Decimal(str(added_price)) < guard.entry_price):
+        guards.average_in(db, guard, held_qty=held, added_qty=payload.quantity,
+                          added_price=Decimal(str(added_price)))
     db.commit()
     return order
 

@@ -2,8 +2,8 @@
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronsUpDown, Layers, MoreVertical, Search, TrendingDown, TrendingUp, X } from "lucide-react";
-import { api } from "@/lib/api";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
@@ -112,38 +112,132 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
   return <td className="px-5 py-3.5 num">{val == null ? "—" : fmtNum(String(val), 2)}</td>;
 }
 
-/** Overflow menu on a position row — extra, destructive actions kept out of the
- *  main Close buttons: cancel this position's working stop, cancel every open
- *  order from this row's Discord channel, and cancel every open order the user
- *  owns. All confirm first. onDone refreshes the table. */
-function PositionActionsMenu({ orderId, hasStop, label, channel, brokerSymbol, brokerAccountId, onDone }: {
-  orderId: string | null; hasStop: boolean; label: string; channel: string | null;
-  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
+type ExitMode = "close" | "average";
+
+/** The ▾ half of a split button: switches what its button does for this row
+ *  between closing the position and averaging into it (buying more). */
+function ModeCaret({ mode, labels, onChange, disabled, variant }: {
+  mode: ExitMode; labels: Record<ExitMode, string>; onChange: (m: ExitMode) => void;
+  disabled?: boolean; variant: "ghost" | "solid";
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<null | "stop" | "all" | "channel" | "trail">(null);
-  const [trailPct, setTrailPct] = useState("");
   const ref = useRef<HTMLDivElement>(null);
-
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
+  return (
+    <div ref={ref} className="relative flex">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen(o => !o)}
+        aria-label="Choose close or average"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`${variant === "solid" ? "btn-accent-solid" : "btn-ghost"} px-0.5 py-1 text-xs inline-flex items-center`}
+        style={{
+          borderTopLeftRadius: 0, borderBottomLeftRadius: 0,
+          borderTopRightRadius: "var(--r-sm)", borderBottomRightRadius: "var(--r-sm)",
+          borderLeft: "1px solid rgba(255,255,255,0.15)",
+          background: mode === "average" ? "var(--good)" : undefined,
+          color: mode === "average" ? "#fff" : undefined,
+        }}
+      >
+        <ChevronDown size={12} />
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 top-full z-20 mt-1 flex flex-col rounded-lg py-1 text-xs shadow-lg"
+             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 150 }}>
+          {(["close", "average"] as const).map(m => (
+            <button
+              key={m}
+              type="button"
+              role="menuitemradio"
+              aria-checked={mode === m}
+              onClick={() => { onChange(m); setOpen(false); }}
+              className="block w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] whitespace-nowrap"
+              style={{ color: mode === m ? "var(--accent)" : "var(--text-2)" }}
+            >
+              {labels[m]}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
-  async function cancelStop() {
-    if (!orderId) return;
-    if (!confirm(`Cancel the stop-loss on ${label}? The position stays open — only the stop order is removed.`)) return;
-    setBusy("stop");
+/** Stop levels offered on the expanded row, as the position's P&L: -25 puts the
+ *  stop 25% below entry, 0 at break-even, +25 locks in a quarter. */
+const STOP_LEVELS = [-25, -10, 0, 25];
+
+/** Width of the first control in both action rows (Close at Market above,
+ *  Stop + X.Stops below), so the inputs after it line up in one column. */
+const ACTION_SLOT_W = 116;
+
+/** The row that opens under a position (down arrow in Actions): the same two
+ *  columns as the main row, repurposed for protection. Close % becomes the stop
+ *  level; Actions holds Stop (set it), X.Stops (cancel them), and the trailing % with
+ *  T.Stop. Every other column renders empty so the two cells sit exactly
+ *  under their counterparts in the user's own column order. */
+function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, label, brokerSymbol, brokerAccountId, onDone }: {
+  columnIds: string[]; orderId: string | null; hasStop: boolean; ladderStop: string | null;
+  entryPrice: number | null; label: string;
+  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
+}) {
+  // The entry's bracket SL is cleared through the bracket endpoint; everything
+  // else (ladder stop, trailing exit, resting stop orders) through stops/cancel.
+  const bracketStop = !!orderId && hasStop;
+  const [level, setLevel] = useState<number | null>(null);
+  const [busy, setBusy] = useState<null | "set" | "stop" | "trail">(null);
+  const [trailPct, setTrailPct] = useState("");
+  const account = `broker_account_id=${brokerAccountId}`;
+  const base = `/api/positions/${encodeURIComponent(brokerSymbol)}`;
+
+  const levelPrice = (pct: number) =>
+    entryPrice != null ? Math.floor(entryPrice * (1 + pct / 100) * 100) / 100 : null;
+
+  async function setStop() {
+    if (level == null) return;
+    setBusy("set");
     try {
-      // Clearing the SL leg cancels the live stop order (same path as emptying
-      // the inline SL field). Key presence flags sl_present on the backend.
-      await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: null }) });
-      notify.success("Stop cancelled");
-      setOpen(false);
+      const res = await api<{ stop_price: string }>(`${base}/stop?${account}&pnl_pct=${level}`, { method: "POST" });
+      notify.success(`Stop set at ${level > 0 ? "+" : ""}${level}% P&L (${res.stop_price}) — placed at the broker within a few seconds`);
+      setLevel(null);
       onDone();
-    } catch (e) { notify.fromError(e, "Could not cancel stop"); }
+    } catch (e) { notify.fromError(e, "Could not set the stop"); }
+    finally { setBusy(null); }
+  }
+
+  async function cancelStops() {
+    const which = ladderStop != null ? ` (stop @ ${ladderStop})` : "";
+    if (!confirm(`Cancel every stop on ${label}${which}, including a trailing stop? The position stays open, and the ladder won't put them back.`)) return;
+    setBusy("stop");
+    let removed = 0;
+    try {
+      try {
+        const res = await api<{ removed: string[] }>(`${base}/stops/cancel?${account}`, { method: "POST" });
+        removed += res.removed.length;
+      } catch (e) {
+        // 404 "no_stops" just means nothing of that kind was set.
+        if (!(e instanceof ApiError && e.status === 404)) throw e;
+      }
+      if (bracketStop) {
+        // Clearing the SL leg cancels the live stop order (same path as emptying
+        // the inline SL field). Key presence flags sl_present on the backend.
+        await api(`/api/trades/${orderId}/bracket`, { method: "PATCH", body: JSON.stringify({ stop_loss_price: null }) });
+        removed += 1;
+      }
+      if (removed) {
+        notify.success("Stops cancelled");
+        onDone();
+      } else {
+        notify.info("No stops on this position");
+      }
+    } catch (e) { notify.fromError(e, "Could not cancel stops"); }
     finally { setBusy(null); }
   }
 
@@ -152,96 +246,111 @@ function PositionActionsMenu({ orderId, hasStop, label, channel, brokerSymbol, b
     if (!Number.isFinite(pct) || pct <= 0 || pct > 100) { notify.warn("Enter a trail % between 0 and 100"); return; }
     setBusy("trail");
     try {
-      const res = await api<{ mode?: string }>(
-        `/api/positions/${encodeURIComponent(brokerSymbol)}/trailing-stop?broker_account_id=${brokerAccountId}&trail_percent=${pct}`,
-        { method: "POST" },
-      );
-      notify.success(`Trailing stop armed at ${pct}% off the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
+      const res = await api<{ mode?: string }>(`${base}/trailing-stop?${account}&trail_percent=${pct}`, { method: "POST" });
+      notify.success(`Trailing stop armed ${pct}% below the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
       setTrailPct("");
-      setOpen(false);
       onDone();
     } catch (err) { notify.fromError(err, "Could not arm trailing stop"); }
     finally { setBusy(null); }
   }
 
-  async function cancelChannel() {
-    if (!channel) return;
-    if (!confirm(`Cancel all open orders from the ${channel} channel (every instrument)? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.`)) return;
-    setBusy("channel");
-    try {
-      const res = await api<{ cancelled_count?: number }>(
-        `/api/trades/cancel-open-by-channel?channel=${encodeURIComponent(channel)}&include_subscribers=true`,
-        { method: "POST" },
-      );
-      const n = res.cancelled_count ?? 0;
-      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"} from ${channel}`);
-      setOpen(false);
-      onDone();
-    } catch (e) { notify.fromError(e, "Could not cancel channel orders"); }
-    finally { setBusy(null); }
-  }
-
-  async function cancelAllOpen() {
-    if (!confirm("Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. Filled positions are not affected.")) return;
-    setBusy("all");
-    try {
-      const res = await api<{ cancelled_count?: number }>(
-        `/api/trades/cancel-all-open?include_subscribers=true`, { method: "POST" },
-      );
-      const n = res.cancelled_count ?? 0;
-      notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
-      setOpen(false);
-      onDone();
-    } catch (e) { notify.fromError(e, "Could not cancel open orders"); }
-    finally { setBusy(null); }
-  }
-
-  const item = "w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors";
-  return (
-    <div ref={ref} className="relative">
-      <button type="button" onClick={() => setOpen(o => !o)} aria-label="More actions" title="More actions"
-              className="btn-ghost px-1.5 py-1 inline-flex items-center" disabled={busy !== null}>
-        <MoreVertical size={14} />
-      </button>
-      {open && (
-        <div className="absolute right-0 z-20 mt-1 rounded-lg py-1 text-xs shadow-lg"
-             style={{ background: "var(--panel)", border: "1px solid var(--border)", minWidth: 210 }}>
-          {/* Trailing stop — trails the market by this % from the peak. Native on
-              stocks; emulated (app-monitored market close) on options. */}
-          <div className="px-3 py-1.5">
-            <div className="mb-1" style={{ color: "var(--muted)" }}>Trailing Stop</div>
-            <div className="flex gap-1 items-center">
-              <input type="number" step="0.1" min="0.1" max="100" placeholder="%"
-                     value={trailPct} onChange={e => setTrailPct(e.target.value)}
-                     onKeyDown={e => { if (e.key === "Enter") armTrail(); }}
-                     aria-label={`Trailing stop percent for ${label}`}
-                     className="w-16 px-2 py-1 rounded text-xs"
-                     style={{ border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)" }} />
-              <button type="button" disabled={busy !== null || !trailPct} onClick={armTrail}
-                      className="btn-accent-solid px-2.5 py-1 rounded text-xs disabled:opacity-40 disabled:cursor-not-allowed">
-                {busy === "trail" ? "…" : "Set"}
+  const cells: Record<string, React.ReactNode> = {
+    close_pct: (
+      <td className="px-5 pb-3 pt-1">
+        <div className="flex gap-1">
+          {STOP_LEVELS.map(pct => {
+            const selected = level === pct;
+            const px = levelPrice(pct);
+            return (
+              <button
+                key={pct}
+                type="button"
+                onClick={() => setLevel(selected ? null : pct)}
+                title={px != null ? `Stop at ${px.toFixed(2)} (${pct > 0 ? "+" : ""}${pct}% P&L from entry)` : `${pct}% P&L from entry`}
+                className="px-2 py-0.5 text-[10px] rounded transition-colors"
+                style={{
+                  border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                  background: selected ? "var(--nav-active-bg)" : "transparent",
+                  color: selected ? "var(--accent)" : "var(--text-2)",
+                }}
+              >
+                {pct}%
               </button>
-            </div>
-            <div className="text-[10px] mt-0.5" style={{ color: "var(--muted)" }}>% off current market price</div>
-          </div>
-          <div style={{ borderTop: "1px solid var(--border)", margin: "2px 0" }} />
-          <button type="button" disabled={!orderId || !hasStop || busy !== null} onClick={cancelStop}
-                  className={item} style={{ color: "var(--text-2)" }}
-                  title={!orderId ? "No linked entry order" : !hasStop ? "No stop set on this position" : undefined}>
-            {busy === "stop" ? "Cancelling stop…" : "Cancel stop"}
-          </button>
-          <button type="button" disabled={!channel || busy !== null} onClick={cancelChannel}
-                  className={item} style={{ color: "var(--text-2)" }}
-                  title={channel ? `Cancel open orders from ${channel}` : "No Discord channel on this position"}>
-            {busy === "channel" ? "Cancelling…" : channel ? `Cancel open orders from ${channel}` : "Cancel open orders (this channel)"}
-          </button>
-          <button type="button" disabled={busy !== null} onClick={cancelAllOpen}
-                  className={item} style={{ color: "var(--bad)" }}>
-            {busy === "all" ? "Cancelling…" : "Cancel all open orders"}
-          </button>
+            );
+          })}
         </div>
-      )}
-    </div>
+      </td>
+    ),
+    actions: (
+      <td className="px-5 pb-3 pt-1">
+        <div className="flex gap-2 items-center whitespace-nowrap">
+          {/* Same width as the main row's Close at Market, so the input below
+              lines up under the Limit field. */}
+          <div className="flex gap-1 justify-between" style={{ width: ACTION_SLOT_W }}>
+            <button
+              type="button"
+              disabled={level == null || busy !== null}
+              onClick={setStop}
+              title={level == null ? "Pick a stop level first" : `Set the stop at ${level > 0 ? "+" : ""}${level}% P&L`}
+              className="btn-ghost px-2 py-1 text-xs inline-flex items-center justify-center gap-1 disabled:opacity-40"
+            >
+              <span>Stop</span>
+              {busy === "set" && <Spinner />}
+            </button>
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={cancelStops}
+              title="Cancel every stop on this position — the stop, a trailing stop, and a bracket stop-loss"
+              className="btn-ghost px-2 py-1 text-xs inline-flex items-center justify-center gap-1 disabled:opacity-40"
+            >
+              <span>X.Stops</span>
+              {busy === "stop" && <Spinner />}
+            </button>
+          </div>
+          <div className="flex items-stretch">
+            <input
+              type="number" step="0.1" min="0.1" max="100"
+              placeholder="-% mkt"
+              aria-label={`Trailing stop percent below market for ${label}`}
+              value={trailPct}
+              onChange={e => setTrailPct(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && trailPct) void armTrail(); }}
+              className="w-20 px-2 py-1 text-xs border"
+              style={{
+                borderColor: "var(--border)",
+                background: "var(--bg)",
+                borderTopLeftRadius: "var(--r-sm)",
+                borderBottomLeftRadius: "var(--r-sm)",
+                borderTopRightRadius: 0,
+                borderBottomRightRadius: 0,
+                borderRight: "none",
+              }}
+            />
+            <button
+              type="button"
+              disabled={busy !== null || !trailPct}
+              onClick={armTrail}
+              className="btn-danger px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+              style={{
+                borderTopLeftRadius: 0,
+                borderBottomLeftRadius: 0,
+                borderTopRightRadius: "var(--r-sm)",
+                borderBottomRightRadius: "var(--r-sm)",
+              }}
+            >
+              <span>T.Stop</span>
+              {busy === "trail" && <Spinner />}
+            </button>
+          </div>
+        </div>
+      </td>
+    ),
+  };
+  return (
+    <tr style={{ background: "var(--panel-2)" }}>
+      {columnIds.map(id => <Fragment key={id}>{cells[id] ?? <td />}</Fragment>)}
+    </tr>
   );
 }
 
@@ -456,6 +565,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+    // Positions whose stop row (down arrow in Actions) is open.
+    const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+    // Per row, what each split button does: close the position, or average
+    // into it (buy more). Chosen from the ▾ beside the button.
+    const [marketMode, setMarketMode] = useState<Record<string, ExitMode>>({});
+    const [limitMode, setLimitMode] = useState<Record<string, ExitMode>>({});
     // Per-row close size as a percentage of the held quantity. Defaults to 100%.
     const [closePercents, setClosePercents] = useState<Record<string, number>>({});
     // Filter: default to options since that's the most common workflow here.
@@ -607,6 +722,42 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         refresh();
       } catch (e) {
         notify.fromError(e, "close failed");
+      } finally {
+        setClosing(null);
+      }
+    }
+
+    async function averagePosition(p: Position, type: "market" | "limit") {
+      const key = posKey(p);
+      if (type === "limit") {
+        const price = closeLimitPrices[key];
+        if (!price || Number(price) <= 0) {
+          notify.warn("Enter a limit price");
+          return;
+        }
+      }
+      // Sized off what is held now, like a close: 50% of 10 adds 5.
+      const pct = closePercents[key] ?? 100;
+      const qty = quantityForPercent(p, pct);
+      if (qty == null) {
+        notify.warn(`Can't average ${pct}% of this position — would round to zero.`);
+        return;
+      }
+      const at = type === "limit" ? `at ${closeLimitPrices[key]}` : "at market";
+      if (!confirm(`Average into ${p.symbol.toUpperCase()}: BUY ${qty} more ${at} (${pct}% of what you hold)?`)) return;
+      setClosing({ key, kind: type });
+      try {
+        const body: Record<string, unknown> = { order_type: type, quantity: String(qty) };
+        if (type === "limit") body.limit_price = closeLimitPrices[key];
+        const order = await api<Order>(
+          `/api/positions/${encodeURIComponent(p.broker_symbol)}/average?broker_account_id=${p.broker_account_id}`,
+          { method: "POST", body: JSON.stringify(body) },
+        );
+        notify.success(`Average placed: BUY ${order.symbol} ×${qty} (${type})`);
+        if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "average failed");
       } finally {
         setClosing(null);
       }
@@ -945,6 +1096,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   const liveSym = p.instrument_type === "stock" ? p.symbol : positionOcc(p);
                   const liveMult = p.instrument_type === "option" ? 100 : 1;
                   const inFlight = closing?.key === key;
+                  const mMode: ExitMode = marketMode[key] ?? "close";
+                  const lMode: ExitMode = limitMode[key] ?? "close";
                   // Entry-order match for this position — drives Filled price,
                   // the bracket cells and the timestamps. Bracket modify is
                   // allowed while the position is alive (i.e. this row exists);
@@ -1008,7 +1161,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                                 type="button"
                                 disabled={disabled}
                                 onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
-                                title={disabled ? "Too small to close at this %" : `Close ${pct}% (×${computedQty})`}
+                                title={disabled ? "Too small at this %" : `${pct}% of the position (×${computedQty}) — sizes a close or an average`}
                                 className="px-2 py-0.5 text-[10px] rounded transition-colors"
                                 style={{
                                   border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
@@ -1028,14 +1181,27 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                     actions: (
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
-                          <button
-                            disabled={inFlight}
-                            onClick={() => closePosition(p, "market")}
-                            className="btn-ghost px-3 py-1 text-xs inline-flex items-center gap-1.5"
-                          >
-                            <span>Close at Market</span>
-                            {inFlight && closing.kind === "market" && <Spinner />}
-                          </button>
+                          <div className="flex items-stretch" style={{ width: ACTION_SLOT_W }}>
+                            <button
+                              disabled={inFlight}
+                              onClick={() => (mMode === "average" ? averagePosition(p, "market") : closePosition(p, "market"))}
+                              className="btn-ghost flex-1 min-w-0 px-1 py-1 text-xs inline-flex items-center justify-center gap-1"
+                              style={{
+                                borderTopRightRadius: 0, borderBottomRightRadius: 0,
+                                color: mMode === "average" ? "var(--good)" : undefined,
+                              }}
+                            >
+                              <span>{mMode === "average" ? "Avg. at Market" : "Close at Market"}</span>
+                              {inFlight && closing.kind === "market" && <Spinner />}
+                            </button>
+                            <ModeCaret
+                              variant="ghost"
+                              mode={mMode}
+                              labels={{ close: "Close at Market", average: "Avg. at Market" }}
+                              onChange={m => setMarketMode(s => ({ ...s, [key]: m }))}
+                              disabled={inFlight}
+                            />
+                          </div>
                           <div className="flex items-stretch">
                             <input
                               type="number" step="0.01" min="0.01"
@@ -1056,28 +1222,35 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             />
                             <button
                               disabled={inFlight || !closeLimitPrices[key]}
-                              onClick={() => closePosition(p, "limit")}
-                              className="btn-accent-solid px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5"
+                              onClick={() => (lMode === "average" ? averagePosition(p, "limit") : closePosition(p, "limit"))}
+                              className="btn-accent-solid px-2 py-1 text-xs font-medium inline-flex items-center justify-center gap-1"
                               style={{
-                                borderTopLeftRadius: 0,
-                                borderBottomLeftRadius: 0,
-                                borderTopRightRadius: "var(--r-sm)",
-                                borderBottomRightRadius: "var(--r-sm)",
+                                borderRadius: 0,
+                                minWidth: 40,
+                                background: lMode === "average" ? "var(--good)" : undefined,
                               }}
                             >
-                              <span>Close</span>
+                              <span>{lMode === "average" ? "Avg." : "Close"}</span>
                               {inFlight && closing.kind === "limit" && <Spinner />}
                             </button>
+                            <ModeCaret
+                              variant="solid"
+                              mode={lMode}
+                              labels={{ close: "Close", average: "Avg." }}
+                              onChange={m => setLimitMode(s => ({ ...s, [key]: m }))}
+                              disabled={inFlight}
+                            />
                           </div>
-                          <PositionActionsMenu
-                            orderId={orderId}
-                            hasStop={t?.stop_loss_price != null}
-                            label={p.symbol.toUpperCase()}
-                            channel={p.discord_channel ?? null}
-                            brokerSymbol={p.broker_symbol}
-                            brokerAccountId={p.broker_account_id}
-                            onDone={refresh}
-                          />
+                          <button
+                            type="button"
+                            onClick={() => setExpanded(s => ({ ...s, [key]: !s[key] }))}
+                            aria-expanded={!!expanded[key]}
+                            aria-label={expanded[key] ? "Hide stop options" : "Show stop options"}
+                            title={expanded[key] ? "Hide stop options" : "Stops and trailing stop"}
+                            className="btn-ghost px-1.5 py-1 inline-flex items-center"
+                          >
+                            {expanded[key] ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          </button>
                         </div>
                       </td>
                     ),
@@ -1129,6 +1302,19 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
                         {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                       </tr>
+                      {expanded[key] && (
+                        <PositionStopRow
+                          columnIds={cols.columns.map(c => c.id)}
+                          orderId={orderId}
+                          hasStop={t?.stop_loss_price != null}
+                          ladderStop={p.ladder_stop_price ?? null}
+                          entryPrice={p.avg_entry_price != null ? Number(p.avg_entry_price) : null}
+                          label={p.symbol.toUpperCase()}
+                          brokerSymbol={p.broker_symbol}
+                          brokerAccountId={p.broker_account_id}
+                          onDone={refresh}
+                        />
+                      )}
                     </Fragment>
                   );
                 })}

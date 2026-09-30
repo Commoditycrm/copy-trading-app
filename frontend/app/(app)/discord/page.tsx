@@ -7,6 +7,7 @@ import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { PageLoading } from "@/components/PageLoading";
+import { AiTrimPanel } from "@/components/discord/AiTrimPanel";
 import type { User } from "@/lib/types";
 
 /**
@@ -247,6 +248,9 @@ export default function DiscordPage() {
   const [liveTrading, setLiveTrading] = useState(false);
   const [autoTrim, setAutoTrim] = useState(false);
   const [autoTrimBusy, setAutoTrimBusy] = useState(false);
+  // Which tab of the exits card is open, and which engine actually runs.
+  const [exitTab, setExitTab] = useState<"ladder" | "ai">("ladder");
+  const [exitEngine, setExitEngine] = useState<"ladder" | "ai">("ladder");
   const [qtyMultiplier, setQtyMultiplier] = useState(1);
   const [maxPerContract, setMaxPerContract] = useState("");
   const [maxPerOrder, setMaxPerOrder] = useState("");
@@ -268,11 +272,14 @@ export default function DiscordPage() {
       // Channels and the account-wide alert-handling mode are fetched together:
       // the mode is part of the page's state, and loading it separately left the
       // card showing the default until something else happened to refresh it.
-      const [list, settings] = await Promise.all([
+      const [list, settings, ai] = await Promise.all([
         api<DiscordSource[]>("/api/discord-sources"),
         api<DiscordSettings>("/api/discord-sources/settings"),
+        // Only for which engine is active; the AI tab loads its own settings.
+        api<{ engine: "ladder" | "ai" }>("/api/discord-sources/ai-trim").catch(() => null),
       ]);
       setSources(list);
+      if (ai) setExitEngine(ai.engine);
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
       setAutoTrim(!!settings.auto_trim);
@@ -1313,14 +1320,49 @@ export default function DiscordPage() {
                 className="rounded-xl px-4 py-3 w-full mt-4"
                 style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
               >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
-                      Exit ladder
-                    </label>
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div role="tablist" aria-label="Exit engine" className="flex gap-1">
+                      {([
+                        ["ladder", "Exit ladder"],
+                        ["ai", "AI trimming"],
+                      ] as const).map(([value, label]) => (
+                        <button
+                          key={value}
+                          type="button"
+                          role="tab"
+                          aria-selected={exitTab === value}
+                          onClick={() => setExitTab(value)}
+                          className="text-[11px] font-medium px-2.5 py-1 rounded-md"
+                          style={{
+                            color: exitTab === value ? "var(--text)" : "var(--muted)",
+                            background: exitTab === value ? "var(--accent-glow)" : "transparent",
+                            border: `1px solid ${exitTab === value ? "rgba(44,147,197,0.5)" : "transparent"}`,
+                          }}
+                        >
+                          {label}
+                          {exitEngine === value && (
+                            <span className="ml-1.5 text-[9px] uppercase tracking-wide" style={{ color: "var(--good)" }}>
+                              active
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
                     <span className="text-[11px]" style={{ color: "var(--muted)" }}>
-                      measured from entry price
+                      {exitTab === "ladder" ? "measured from entry price" : "OpenRouter decides each exit"}
                     </span>
                   </div>
+
+                  {exitTab === "ai" ? (
+                    <AiTrimPanel onEngineChange={setExitEngine} />
+                  ) : (
+                  <>
+                  {exitEngine === "ai" && (
+                    <p className="mt-2 text-[11px] rounded-md px-2 py-1" style={{ color: "var(--warn)", border: "1px solid var(--warn)" }}>
+                      AI trimming is managing exits, so Auto trim is paused. These rungs still apply
+                      to exit alerts your Discord author posts.
+                    </p>
+                  )}
 
                   {/* Auto trim. Off, a rung waits for its Discord alert and the
                       Min profit below is the condition that alert has to meet.
@@ -1502,6 +1544,8 @@ export default function DiscordPage() {
                       its profit target; the stop applies to whatever is left after it.
                     </p>
                   </div>
+                  </>
+                  )}
               </div>
             </div>
             </div>

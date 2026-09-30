@@ -32,7 +32,7 @@ import secrets
 import time
 import uuid
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import (
     APIRouter,
@@ -44,8 +44,8 @@ from fastapi import (
     Request,
     status,
 )
-from pydantic import BaseModel
-from sqlalchemy import func, select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -54,7 +54,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
-from app.models.order import Order
+from app.models.order import Order, OrderSide, OrderStatus
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.models.user import User
 from app.schemas.pagination import Page
@@ -187,6 +187,39 @@ def _setting(ts, name: str, default: str) -> Decimal:
     """A Decimal setting, falling back when the row or column is unset."""
     raw = getattr(ts, name, None) if ts is not None else None
     return Decimal(str(raw)) if raw is not None else Decimal(default)
+
+
+def _reopen(guard) -> None:
+    """Undo a full exit's retirement when its order was never placed."""
+    if guard is None:
+        return
+    guard.closed_at = None
+    guard.closed_reason = None
+    guards.rollback_exit(guard)
+
+
+def _trim_config(ts) -> "guards.TrimConfig":
+    """The trader's exit ladder as configured — what a live trim and the
+    Simulated Prices dry run both measure against."""
+    return guards.TrimConfig(
+        trim1=guards.RungConfig(
+            _setting(ts, "discord_trim_profit_gate_pct", "20"),
+            _setting(ts, "discord_trim_stop_pct", "-25"),
+            _setting(ts, "discord_trim_qty_pct", "50"),
+        ),
+        trim2=guards.RungConfig(
+            _setting(ts, "discord_trim2_profit_gate_pct", "0"),
+            _setting(ts, "discord_trim2_stop_pct", "0"),
+            _setting(ts, "discord_trim2_qty_pct", "50"),
+        ),
+        trim3=guards.RungConfig(
+            _setting(ts, "discord_trim3_profit_gate_pct", "0"),
+            _setting(ts, "discord_trim3_stop_pct", "0"),
+            _setting(ts, "discord_trim3_qty_pct", "100"),
+        ),
+        price_threshold=_setting(ts, "discord_trim_price_threshold", "0.90"),
+        trail_amount=_setting(ts, "discord_trim_trail_amount", "0.25"),
+    )
 
 
 def _plain(value) -> str | None:
@@ -369,6 +402,7 @@ class PinnedPositionOut(BaseModel):
     option_expiry: str | None = None
     quantity: str
     broker_price: str | None = None
+    avg_entry_price: str | None = None
     pinned_price: str | None = None
     entry_price: str | None = None
     stop_price: str | None = None
@@ -376,6 +410,25 @@ class PinnedPositionOut(BaseModel):
     trail_amount: str | None = None
     peak_price: str | None = None
     rung: int = 0
+    ladder_history: list["LadderHistoryOut"] = Field(default_factory=list)
+
+
+class LadderHistoryOut(BaseModel):
+    """A ladder exit from this position's current entry onward."""
+
+    # Stable across refreshes, so the page can hide what it has already shown.
+    id: str
+    rung: int
+    quantity: str
+    filled_quantity: str
+    quantity_before: str
+    quantity_remaining: str
+    stop_quantity: str
+    fill_price: str | None = None
+    status: str
+    note: str | None = None
+    # None for a rung that only moved the stop: nothing records when it ran.
+    happened_at: datetime | None = None
 
 
 class PinIn(BaseModel):
@@ -389,14 +442,84 @@ def _require_pin_feature(user: User = Depends(require_trader)) -> None:
         raise HTTPException(503, "price_override_disabled")
 
 
-@router.get("/simulated-prices", response_model=list[PinnedPositionOut])
-def list_simulated_prices(
-    db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _f: None = Depends(_require_feature),
-    _p: None = Depends(_require_pin_feature),
-) -> list[PinnedPositionOut]:
-    """Open positions, their live price, and any pin standing on them."""
+# How long a retired guard still speaks for a position the broker reports: its
+# final exit is submitted but not yet filled. Past this, it is a previous run.
+_RETIRED_GUARD_GRACE = timedelta(minutes=15)
+
+
+def _ladder_history(guard, sells, position_qty) -> list[LadderHistoryOut]:
+    """This guard's run of the ladder, oldest first, numbered in the order it ran.
+
+    Three kinds of rung leave three kinds of trace. A rung that sold has an
+    Order. A rung that parked the rest on a trailing exit has only the guard's
+    ``armed_at``. A rung that sold nothing (an alert under its gate) only moved
+    the stop and leaves no timestamp anywhere, so it is listed untimed after
+    the rest — which keeps the count equal to the guard's ``sell_count``.
+    """
+    sells = [e for e in sells if e.created_at >= guard.created_at]
+    items: list[tuple[datetime, Order | None]] = [(e.created_at, e) for e in sells]
+    if (
+        guard.trail_qty is not None
+        and guard.armed_at is not None
+        and guard.armed_at >= guard.created_at
+    ):
+        items.append((guard.armed_at, None))
+    items.sort(key=lambda item: item[0])
+
+    # Rebuild the size before each trim from the broker's current remainder
+    # plus every fill in this run, rather than storing a second counter.
+    remaining = Decimal(str(position_qty or 0)) + sum(
+        (Decimal(str(e.filled_quantity or 0)) for e in sells), Decimal(0),
+    )
+    protected = guard.stop_price is not None or guard.trail_qty is not None
+    history: list[LadderHistoryOut] = []
+    for at, event in items:
+        rung = len(history) + 1
+        if event is None:
+            history.append(LadderHistoryOut(
+                id=f"trail:{guard.id}:{at.isoformat()}",
+                rung=rung,
+                quantity=_plain(remaining) or "0",
+                filled_quantity="0",
+                quantity_before=_plain(remaining) or "0",
+                quantity_remaining=_plain(remaining) or "0",
+                stop_quantity=_plain(guard.trail_qty) or "0",
+                status="armed",
+                note="trailing stop armed",
+                happened_at=at,
+            ))
+            continue
+        before = remaining
+        remaining = max(Decimal(0), remaining - Decimal(str(event.filled_quantity or 0)))
+        history.append(LadderHistoryOut(
+            id=str(event.id),
+            rung=rung,
+            quantity=_plain(event.quantity) or "0",
+            filled_quantity=_plain(event.filled_quantity) or "0",
+            quantity_before=_plain(before) or "0",
+            quantity_remaining=_plain(remaining) or "0",
+            stop_quantity=_plain(remaining if protected else Decimal(0)) or "0",
+            fill_price=_plain(event.filled_avg_price) or _plain(event.limit_price),
+            status=event.status.value,
+            happened_at=event.broker_filled_at or event.closed_at or event.created_at,
+        ))
+    for rung in range(len(history) + 1, (guard.sell_count or 0) + 1):
+        history.append(LadderHistoryOut(
+            id=f"stop:{guard.id}:{rung}",
+            rung=rung,
+            quantity=_plain(remaining) or "0",
+            filled_quantity="0",
+            quantity_before=_plain(remaining) or "0",
+            quantity_remaining=_plain(remaining) or "0",
+            stop_quantity=_plain(remaining if protected else Decimal(0)) or "0",
+            status="stop_only",
+            note="nothing sold — stop only",
+        ))
+    return history
+
+
+def _positions_for_screen(db: Session, user: User) -> list[tuple[str, object]]:
+    """The trader's open positions as (contract key, position); [] with no broker."""
     from app.brokers import adapter_for  # noqa: PLC0415
     from app.models.broker_account import BrokerAccount  # noqa: PLC0415
     from app.services.crypto import decrypt_json  # noqa: PLC0415
@@ -420,17 +543,93 @@ def list_simulated_prices(
         positions = adapter.get_positions(cached_ok=True)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Couldn't read positions: {exc}") from exc
+    return [
+        (price_override.contract_key(
+            pos.symbol, pos.option_strike,
+            getattr(pos, "option_right", None), pos.option_expiry,
+        ), pos)
+        for pos in positions
+    ]
 
-    out: list[PinnedPositionOut] = []
+
+@router.get("/simulated-prices", response_model=list[PinnedPositionOut])
+def list_simulated_prices(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _f: None = Depends(_require_feature),
+    _p: None = Depends(_require_pin_feature),
+) -> list[PinnedPositionOut]:
+    """Open positions, their live price, and any pin standing on them."""
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    positions = [pos for _, pos in _positions_for_screen(db, user)]
+
+    # Resolve each position's guard first: the trim query below is bounded by
+    # the oldest of them, so it reads one run's worth of sells, not all history.
+    matched = []
     for pos in positions:
         key = price_override.contract_key(
             pos.symbol, pos.option_strike,
             getattr(pos, "option_right", None), pos.option_expiry,
         )
-        right = getattr(pos.option_right, "value", pos.option_right)
         guard = guards.find(
             db, user.id, pos.symbol, pos.option_strike,
             pos.option_right, pos.option_expiry,
+        )
+        if guard is None:
+            # A final exit retires its guard as soon as it is submitted, but a
+            # broker may still report the position until that order fills. Keep
+            # that guard's history visible for the short window until it does.
+            # Anything retired earlier belongs to a previous run of this
+            # contract, and must not be shown against a position opened since.
+            guard = db.execute(
+                select(DiscordPositionGuard).where(
+                    DiscordPositionGuard.user_id == user.id,
+                    DiscordPositionGuard.symbol == pos.symbol,
+                    DiscordPositionGuard.option_strike == pos.option_strike,
+                    DiscordPositionGuard.option_right == pos.option_right,
+                    DiscordPositionGuard.option_expiry == pos.option_expiry,
+                    DiscordPositionGuard.closed_at
+                    >= datetime.now(timezone.utc) - _RETIRED_GUARD_GRACE,
+                ).order_by(DiscordPositionGuard.created_at.desc()).limit(1)
+            ).scalars().first()
+        matched.append((pos, key, guard))
+
+    # A scissors message is a synthetic auto-trim. ``is_partial_close`` is set
+    # only by the Discord trim path, and also keeps a trim whose source message
+    # has since been removed. A subquery rather than a join: a join repeats an
+    # order once per message pointing at it, subtracting its fill twice.
+    # Rejected orders are left out — placement failure hands the rung back.
+    events_by_key: dict[str, list[Order]] = {}
+    run_guards = [g for _, _, g in matched if g is not None]
+    if run_guards:
+        scissors = select(DiscordMessage.order_id).where(
+            DiscordMessage.user_id == user.id,
+            DiscordMessage.order_id.is_not(None),
+            DiscordMessage.content.like("✂️%"),
+        )
+        event_rows = db.execute(
+            select(Order).where(
+                Order.user_id == user.id,
+                Order.side == OrderSide.SELL,
+                Order.status != OrderStatus.REJECTED,
+                Order.symbol.in_(sorted({g.symbol for g in run_guards})),
+                Order.created_at >= min(g.created_at for g in run_guards),
+                or_(Order.is_partial_close.is_(True), Order.id.in_(scissors)),
+            ).order_by(Order.created_at.asc())
+        ).scalars()
+        for event in event_rows:
+            event_key = price_override.contract_key(
+                event.symbol, event.option_strike, event.option_right, event.option_expiry,
+            )
+            events_by_key.setdefault(event_key, []).append(event)
+
+    out: list[PinnedPositionOut] = []
+    for pos, key, guard in matched:
+        right = getattr(pos.option_right, "value", pos.option_right)
+        history = (
+            _ladder_history(guard, events_by_key.get(key, []), pos.quantity)
+            if guard else []
         )
         out.append(PinnedPositionOut(
             key=key,
@@ -440,6 +639,7 @@ def list_simulated_prices(
             option_expiry=pos.option_expiry.isoformat() if pos.option_expiry else None,
             quantity=_plain(pos.quantity) or "0",
             broker_price=_plain(getattr(pos, "current_price", None)),
+            avg_entry_price=_plain(getattr(pos, "avg_entry_price", None)),
             pinned_price=_plain(price_override.get_pin(user.id, key)),
             entry_price=_plain(guard.entry_price) if guard else None,
             stop_price=_plain(guard.stop_price) if guard else None,
@@ -447,8 +647,95 @@ def list_simulated_prices(
             trail_amount=_plain(guard.trail_amount) if guard else None,
             peak_price=_plain(guard.peak_price) if guard else None,
             rung=(guard.sell_count or 0) if guard else 0,
+            ladder_history=history,
         ))
     return out
+
+
+class DryRunIn(BaseModel):
+    key: str
+    buy_price: Decimal = Field(gt=0)
+    # Percent from buy, one per step. Negative is allowed: a dry run should be
+    # able to walk a position down into its stop.
+    path: list[Decimal] = Field(min_length=1, max_length=200)
+    quantity: Decimal | None = Field(default=None, gt=0)
+
+
+class DryRunEventOut(BaseModel):
+    kind: str
+    text: str
+    rung: int | None = None
+    sold: str = "0"
+
+
+class DryRunStepOut(BaseModel):
+    index: int
+    pct: str
+    price: str
+    gain_pct: str | None = None
+    held: str
+    stop: str | None = None
+    events: list[DryRunEventOut]
+
+
+class DryRunOut(BaseModel):
+    quantity: str
+    auto_trim_on: bool
+    steps: list[DryRunStepOut]
+
+
+@router.post("/simulated-prices/dry-run", response_model=DryRunOut)
+def dry_run_price_path(
+    payload: DryRunIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _f: None = Depends(_require_feature),
+) -> DryRunOut:
+    """Narrate the exit ladder along a price path. Places nothing, writes nothing.
+
+    Starts from a fresh entry at ``buy_price`` with the trader's current ladder
+    settings, so it answers "what would my ladder do on this contract" whatever
+    state the live guard is in — including no guard at all. Needs no pin
+    feature: nothing here reaches enforcement or a broker.
+    """
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    ts = db.get(TraderSettings, user.id)
+    qty = payload.quantity
+    if qty is None:
+        match = next(
+            (r for r in _positions_for_screen(db, user) if r[0] == payload.key), None,
+        )
+        if match is None:
+            raise HTTPException(404, "That position is no longer open.")
+        qty = abs(Decimal(str(match[1].quantity or 0)))
+    if qty <= 0:
+        raise HTTPException(400, "Nothing held to simulate.")
+
+    from app.services import discord_auto_trim, ladder_simulator  # noqa: PLC0415
+
+    steps = ladder_simulator.simulate(
+        ts, _trim_config(ts), payload.buy_price, qty, payload.path,
+    )
+    return DryRunOut(
+        quantity=_plain(qty) or "0",
+        auto_trim_on=discord_auto_trim._enabled(ts),
+        steps=[
+            DryRunStepOut(
+                index=st.index,
+                pct=_plain(st.pct) or "0",
+                price=_plain(st.price) or "0",
+                gain_pct=_plain(st.gain_pct.quantize(Decimal("0.01"))) if st.gain_pct is not None else None,
+                held=_plain(st.held) or "0",
+                stop=_plain(st.stop),
+                events=[
+                    DryRunEventOut(kind=e.kind, text=e.text, rung=e.rung, sold=_plain(e.sold) or "0")
+                    for e in st.events
+                ],
+            )
+            for st in steps
+        ],
+    )
 
 
 @router.post("/simulated-prices", response_model=list[PinnedPositionOut])
@@ -475,6 +762,11 @@ def set_simulated_price(
             "discord: PRICE PINNED %s = %s for user=%s — enforcement will act on this",
             payload.key, value, user.id,
         )
+        # A simulated path advances every second. Evaluate its trim gate now
+        # rather than making the tester wait up to the normal 15-second worker
+        # cadence. The price-pin feature gate above keeps this test-only.
+        from app.services import discord_auto_trim  # noqa: PLC0415
+        discord_auto_trim.tick(user.id)
     return list_simulated_prices(db, user, None, None)
 
 
@@ -823,6 +1115,266 @@ def update_discord_settings(
         ),
         reprice_pct=_plain(_setting(ts, "discord_reprice_pct", "10")),
     )
+
+
+# ── AI trimming ──────────────────────────────────────────────────────────────
+# The alternative exit engine (services/ai_trim.py). Its own endpoints rather
+# than more fields on /settings: the two engines are configured on separate
+# tabs, and the decision log has actions of its own.
+
+
+class AiTrimSettingsOut(BaseModel):
+    engine: str                 # ladder | ai
+    mode: str                   # suggest | auto
+    model: str
+    move_pct: str
+    min_interval_s: int
+    instructions: str
+    key_configured: bool        # OPENROUTER_API_KEY is set on the server
+    live_trading: bool          # Discord live trading — AI orders are paper without it
+
+
+class AiTrimSettingsIn(BaseModel):
+    engine: str | None = Field(default=None, pattern=r"^(ladder|ai)$")
+    mode: str | None = Field(default=None, pattern=r"^(suggest|auto)$")
+    model: str | None = Field(default=None, min_length=3, max_length=120)
+    move_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    min_interval_s: int | None = Field(default=None, ge=15, le=3600)
+    instructions: str | None = Field(default=None, max_length=2000)
+
+
+class AiTrimDecisionOut(BaseModel):
+    id: str
+    contract: str
+    model: str
+    mode: str
+    mark: str
+    entry_price: str | None = None
+    held: str
+    action: str
+    sell_qty: str
+    new_stop_price: str | None = None
+    reason: str
+    notes: str | None = None
+    status: str
+    order_id: str | None = None
+    created_at: datetime
+
+
+def _ai_settings_out(ts) -> AiTrimSettingsOut:
+    return AiTrimSettingsOut(
+        engine=getattr(ts, "discord_exit_engine", None) or "ladder",
+        mode=getattr(ts, "discord_ai_mode", None) or "suggest",
+        model=getattr(ts, "discord_ai_model", None) or "anthropic/claude-sonnet-5.5",
+        move_pct=_plain(_setting(ts, "discord_ai_move_pct", "5")) or "5",
+        min_interval_s=getattr(ts, "discord_ai_min_interval_s", None) or 60,
+        instructions=getattr(ts, "discord_ai_instructions", None) or "",
+        key_configured=bool(get_settings().openrouter_api_key),
+        live_trading=bool(ts is not None and ts.discord_live_trading),
+    )
+
+
+def _ai_decision_out(row) -> AiTrimDecisionOut:
+    return AiTrimDecisionOut(
+        id=str(row.id), contract=row.contract, model=row.model, mode=row.mode,
+        mark=_plain(row.mark) or "0", entry_price=_plain(row.entry_price),
+        held=_plain(row.held) or "0", action=row.action,
+        sell_qty=_plain(row.sell_qty) or "0", new_stop_price=_plain(row.new_stop_price),
+        reason=row.reason, notes=row.notes, status=row.status,
+        order_id=str(row.order_id) if row.order_id else None,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/ai-trim", response_model=AiTrimSettingsOut)
+def get_ai_trim_settings(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> AiTrimSettingsOut:
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    return _ai_settings_out(db.get(TraderSettings, user.id))
+
+
+@router.patch("/ai-trim", response_model=AiTrimSettingsOut)
+def update_ai_trim_settings(
+    payload: AiTrimSettingsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> AiTrimSettingsOut:
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    ts = db.get(TraderSettings, user.id)
+    if ts is None:
+        ts = TraderSettings(user_id=user.id)
+        db.add(ts)
+    if payload.engine is not None:
+        ts.discord_exit_engine = payload.engine
+        log.warning("discord: exit engine -> %s for user=%s", payload.engine.upper(), user.id)
+    if payload.mode is not None:
+        ts.discord_ai_mode = payload.mode
+        log.warning("discord: AI trimming mode -> %s for user=%s", payload.mode.upper(), user.id)
+    if payload.model is not None:
+        ts.discord_ai_model = payload.model.strip()
+    if payload.move_pct is not None:
+        ts.discord_ai_move_pct = payload.move_pct
+    if payload.min_interval_s is not None:
+        ts.discord_ai_min_interval_s = payload.min_interval_s
+    if payload.instructions is not None:
+        ts.discord_ai_instructions = payload.instructions.strip() or None
+    db.commit()
+    return _ai_settings_out(ts)
+
+
+@router.get("/ai-trim/decisions", response_model=list[AiTrimDecisionOut])
+def list_ai_trim_decisions(
+    limit: int = Query(30, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> list[AiTrimDecisionOut]:
+    from app.models.ai_trim_decision import AiTrimDecision  # noqa: PLC0415
+    from app.services import ai_trim  # noqa: PLC0415
+
+    rows = list(db.execute(
+        select(AiTrimDecision).where(AiTrimDecision.user_id == user.id)
+        .order_by(AiTrimDecision.created_at.desc()).limit(limit)
+    ).scalars())
+    # Age out suggestions nobody acted on, so the list never offers one whose
+    # price is long gone. Approval checks this too; this keeps the view honest.
+    now = datetime.now(timezone.utc)
+    stale = [r for r in rows if r.status == "suggested" and now - r.created_at > ai_trim.SUGGESTION_TTL]
+    for r in stale:
+        r.status = "expired"
+    if stale:
+        db.commit()
+    return [_ai_decision_out(r) for r in rows]
+
+
+def _owned_decision(db: Session, user: User, decision_id: uuid.UUID):
+    from app.models.ai_trim_decision import AiTrimDecision  # noqa: PLC0415
+
+    row = db.get(AiTrimDecision, decision_id)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(404, "No such decision.")
+    return row
+
+
+@router.post("/ai-trim/decisions/{decision_id}/approve", response_model=AiTrimDecisionOut)
+def approve_ai_trim_decision(
+    decision_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> AiTrimDecisionOut:
+    """Carry out a suggestion — re-validated against the position as it is now."""
+    from app.brokers import adapter_for  # noqa: PLC0415
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import ai_trim, discord_auto_trim  # noqa: PLC0415
+    from app.services.crypto import decrypt_json  # noqa: PLC0415
+
+    row = _owned_decision(db, user, decision_id)
+    acct = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().first()
+    if acct is None:
+        raise HTTPException(409, "No connected broker account.")
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    try:
+        # Not the cached read: this one decides what gets sold.
+        positions = adapter.get_positions()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Couldn't read positions: {exc}") from exc
+    try:
+        ai_trim.approve(
+            db, user, row, positions, adapter, acct, db.get(TraderSettings, user.id),
+            lambda ps, g: discord_auto_trim._mark_for(ps, g, user.id),
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _ai_decision_out(row)
+
+
+@router.post("/ai-trim/decisions/{decision_id}/dismiss", response_model=AiTrimDecisionOut)
+def dismiss_ai_trim_decision(
+    decision_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> AiTrimDecisionOut:
+    row = _owned_decision(db, user, decision_id)
+    if row.status != "suggested":
+        raise HTTPException(409, f"This decision is {row.status}, not waiting for approval.")
+    row.status = "dismissed"
+    row.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return _ai_decision_out(row)
+
+
+class AiModelOut(BaseModel):
+    id: str
+    name: str
+    prompt_per_m: str | None = None       # USD per million input tokens
+    completion_per_m: str | None = None   # USD per million output tokens
+
+
+@router.get("/ai-trim/models", response_model=list[AiModelOut])
+def list_ai_trim_models(
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> list[AiModelOut]:
+    """Models the AI trimming engine can use (they must support structured output)."""
+    from app.services import ai_trim  # noqa: PLC0415
+
+    try:
+        return [AiModelOut(**m) for m in ai_trim.list_models()]
+    except ai_trim.ModelError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+class AiTrimTestOut(BaseModel):
+    ok: bool
+    model: str
+    action: str | None = None
+    reason: str | None = None
+    error: str | None = None
+
+
+@router.post("/ai-trim/test", response_model=AiTrimTestOut)
+def test_ai_trim(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+    _: None = Depends(_require_feature),
+) -> AiTrimTestOut:
+    """One call against a made-up position: proves the key and the model work.
+    Records nothing and trades nothing."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import ai_trim, market_hours  # noqa: PLC0415
+
+    ts = db.get(TraderSettings, user.id)
+    settings = _ai_settings_out(ts)
+    sample = SimpleNamespace(
+        symbol="SPY", option_strike=Decimal("500"), option_right="call",
+        option_expiry=market_hours.now_et().date() + timedelta(days=2),
+        entry_price=Decimal("2.00"), stop_price=Decimal("1.50"),
+    )
+    try:
+        raw = ai_trim.ask(settings.model, ai_trim.build_messages(
+            ts, sample, Decimal("2.90"), Decimal("4"), Decimal("3.10"), [],
+            datetime.now(timezone.utc),
+        ))
+    except ai_trim.ModelError as exc:
+        return AiTrimTestOut(ok=False, model=settings.model, error=str(exc))
+    d = ai_trim.validate(raw, Decimal("4"), Decimal("2.90"), Decimal("1.50"))
+    return AiTrimTestOut(ok=True, model=settings.model, action=d.action, reason=d.reason)
 
 
 @router.patch("/{source_id}", response_model=DiscordSourceOut)
@@ -1315,26 +1867,11 @@ def _execute_signal(
     p = resolved.payload
     is_trim = False
     trim_guard = None
+    # The guard a full exit retired before placing it — reopened if the order
+    # never reaches the broker, or the position would be held and unmanaged.
+    final_guard = None
     if resolved.is_closing:
-        cfg = guards.TrimConfig(
-            trim1=guards.RungConfig(
-                _setting(ts_for_sizing, "discord_trim_profit_gate_pct", "20"),
-                _setting(ts_for_sizing, "discord_trim_stop_pct", "-25"),
-                _setting(ts_for_sizing, "discord_trim_qty_pct", "50"),
-            ),
-            trim2=guards.RungConfig(
-                _setting(ts_for_sizing, "discord_trim2_profit_gate_pct", "0"),
-                _setting(ts_for_sizing, "discord_trim2_stop_pct", "0"),
-                _setting(ts_for_sizing, "discord_trim2_qty_pct", "50"),
-            ),
-            trim3=guards.RungConfig(
-                _setting(ts_for_sizing, "discord_trim3_profit_gate_pct", "0"),
-                _setting(ts_for_sizing, "discord_trim3_stop_pct", "0"),
-                _setting(ts_for_sizing, "discord_trim3_qty_pct", "100"),
-            ),
-            price_threshold=_setting(ts_for_sizing, "discord_trim_price_threshold", "0.90"),
-            trail_amount=_setting(ts_for_sizing, "discord_trim_trail_amount", "0.25"),
-        )
+        cfg = _trim_config(ts_for_sizing)
         guard = guards.find(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
         )
@@ -1409,6 +1946,7 @@ def _execute_signal(
         p.quantity = plan.sell_qty
         is_trim = not plan.retire
         trim_guard = guard if is_trim else None
+        final_guard = guard if plan.retire else None
         detail += (" · " if detail else "") + f"trim {plan.rung}: {plan.note}"
 
     if not live:
@@ -1442,12 +1980,14 @@ def _execute_signal(
         if trim_guard is not None:
             # The slice was never sold, so don't spend the trim step on it.
             guards.rollback_exit(trim_guard)
+        _reopen(final_guard)
         discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
         log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
         return
     except Exception as exc:  # noqa: BLE001
         if trim_guard is not None:
             guards.rollback_exit(trim_guard)
+        _reopen(final_guard)
         discord_execution.mark_failed(msg, f"Order placement failed: {exc}")
         log.exception("discord: placement raised for alert %s", msg.id)
         return
