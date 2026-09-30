@@ -68,6 +68,16 @@ def test_it_runs_last_so_it_never_takes_another_formats_message():
 
 # ── execution: nearest expiry ───────────────────────────────────────────────
 
+_REAL_DATA_EXPIRIES = ex._data_account_expiries
+
+
+@pytest.fixture(autouse=True)
+def _no_data_key(monkeypatch):
+    """Broker-path tests below: no Alpaca data key, so nothing goes to the network.
+    The data-account tests patch the chain read themselves."""
+    monkeypatch.setattr(ex, "_data_account_expiries", lambda *a: None)
+
+
 def _contract(strike, right, exp):
     return SimpleNamespace(strike_price=strike, type=SimpleNamespace(value=right), expiration_date=exp)
 
@@ -99,6 +109,64 @@ def test_no_listed_contract_is_refused(monkeypatch):
     adapter = SimpleNamespace(list_option_contracts=lambda **kw: [])
     with pytest.raises(ex.ExecutionRefused):
         ex._with_nearest_expiry(adapter, "AMZN", {"strike": "245", "option_type": "put"}, [], {})
+
+
+class _FakeChainClient:
+    """Stands in for the Alpaca data client; keys by OCC symbol like the real one."""
+    def __init__(self, *a, **kw):
+        pass
+
+    def get_option_chain(self, req):
+        return {
+            "AMZN261002P00245000": object(),
+            "AMZN260930P00245000": object(),
+            "AMZN260930P00250000": object(),   # other strike: ignored
+            "AMZN260930C00245000": object(),   # a call: ignored
+        }
+
+
+def _with_data_key(monkeypatch):
+    import alpaca.data.historical.option as opt
+
+    from app import config
+
+    monkeypatch.setattr(config.get_settings(), "alpaca_data_api_key", "data-key")
+    monkeypatch.setattr(config.get_settings(), "alpaca_data_api_secret", "data-secret")
+    monkeypatch.setattr(opt, "OptionHistoricalDataClient", _FakeChainClient)
+
+
+def test_a_webull_trader_gets_the_nearest_expiry_from_the_data_account(monkeypatch):
+    """Webull can't list contracts — the data account's chain answers instead."""
+    monkeypatch.setattr(ex, "_data_account_expiries", _REAL_DATA_EXPIRIES)
+    monkeypatch.setattr(ex.market_hours, "now_et", lambda: datetime(2026, 9, 30, 9, 30))
+    _with_data_key(monkeypatch)
+    webull = SimpleNamespace()                     # no list_option_contracts
+    res = {}
+    out = ex._with_nearest_expiry(webull, "AMZN", {"strike": "245", "option_type": "put"}, [], res)
+    assert out["expiration"] == "2026-09-30" and "nearest" in res["expiration"]
+
+
+def test_the_data_account_is_asked_before_the_broker(monkeypatch):
+    monkeypatch.setattr(ex, "_data_account_expiries", _REAL_DATA_EXPIRIES)
+    monkeypatch.setattr(ex.market_hours, "now_et", lambda: datetime(2026, 9, 30, 9, 30))
+    _with_data_key(monkeypatch)
+    alpaca = SimpleNamespace(list_option_contracts=lambda **kw: pytest.fail("broker asked"))
+    out = ex._with_nearest_expiry(alpaca, "AMZN", {"strike": "245", "option_type": "put"}, [], {})
+    assert out["expiration"] == "2026-09-30"
+
+
+def test_no_data_key_and_no_broker_listing_is_refused(monkeypatch):
+    monkeypatch.setattr(ex.market_hours, "now_et", lambda: datetime(2026, 9, 30, 9, 30))
+    with pytest.raises(ex.ExecutionRefused, match="no Alpaca market-data key"):
+        ex._with_nearest_expiry(SimpleNamespace(), "AMZN",
+                                {"strike": "245", "option_type": "put"}, [], {})
+
+
+def test_occ_symbols_are_read():
+    assert ex._occ_expiry_strike_right("AMZN261002P00245000") == (
+        date(2026, 10, 2), Decimal("245"), OptionRight.PUT)
+    assert ex._occ_expiry_strike_right("SPY260930C00765500")[1] == Decimal("765.5")
+    assert ex._occ_expiry_strike_right("not-a-symbol") is None
 
 
 # ── execution: JPM Close flattens, adds resolve from the channel ───────────
