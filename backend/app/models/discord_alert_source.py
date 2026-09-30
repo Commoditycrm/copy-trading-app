@@ -74,6 +74,22 @@ class DiscordAlertSource(Base, TimestampMixin):
     # Trader on/off for THIS source. The listener only opens enabled sources.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # Set on a SUBSCRIBER's copy of a trader's channel (see
+    # services/discord_subscribers.py): the trader channel it mirrors. The copy
+    # has no Discord account, so the listener never opens it; alerts arrive by
+    # relay from the parent. On a copy, is_enabled is the subscriber's switch —
+    # off skips new entries from the channel, exits still go through.
+    #
+    # SET NULL, not CASCADE: the trader removing a channel stops the relay but
+    # must not delete the subscriber's own alert history and order links. A
+    # detached copy is re-attached if the channel comes back.
+    parent_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("discord_alert_sources.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     # ── Active window ────────────────────────────────────────────────────────
     # When to actually hold a browser session open for this channel. Outside the
     # window the assignment is withheld and the listener closes the watcher, so

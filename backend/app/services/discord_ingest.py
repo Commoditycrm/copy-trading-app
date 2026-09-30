@@ -326,6 +326,7 @@ def ingest_batch(
     messages: Iterable[dict[str, Any]],
     *,
     auto_approve: bool = False,
+    publish: bool = True,
 ) -> IngestReport:
     """Persist a batch from the listener, then queue whatever was new.
 
@@ -365,7 +366,8 @@ def ingest_batch(
         # Best-effort. The durable record already exists, so a queue failure
         # leaves the row at RECEIVED to be replayed — it is never a lost message,
         # which is why this doesn't roll the insert back.
-        if not _publish(source, raw):
+        # A subscriber's mirror copy (publish=False) is not a new message.
+        if publish and not _publish(source, raw):
             report.queue_failed.append(message_id)
 
         report.accepted.append(message_id)

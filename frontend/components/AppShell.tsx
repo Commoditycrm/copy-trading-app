@@ -153,6 +153,9 @@ const NAV_SUBSCRIBER = [
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/brokers", label: "Broker", Icon: IconLink },
+  // Subscribers of a Discord trader trade the trader's channels on their own
+  // settings; hidden for everyone else by the nav filter below.
+  { href: "/discord", label: "Discord", Icon: IconDiscord },
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 
@@ -586,7 +589,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // entry unless the trader is allow-listed.
   const nav = (user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER)
     .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access)
-    .filter((item) => !item.href.startsWith("/discord") || !!user.discord_enabled)
+    .filter((item) => !item.href.startsWith("/discord") || !!user.discord_available)
     // Testing-only screen for the Discord ladder — same gate, and hidden
     // entirely unless a trader is allow-listed for Discord.
     .filter((item) => item.href !== "/simulated-prices" || !!user.discord_enabled);

@@ -525,7 +525,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // is normally free; the fetch is only for a cold start (a hard refresh
     // straight onto the trade panel).
     const [showChannel, setShowChannel] = useState<boolean>(
-      () => !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_enabled,
+      () => !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_available,
     );
 
     // Configurable columns (per-user, synced). The functional columns —
@@ -563,7 +563,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         .then((u) => {
           if (cancelled) return;
           setSnapshot(USER_SNAPSHOT_KEY, u);
-          setShowChannel(!!u.discord_enabled);
+          setShowChannel(!!u.discord_available);
         })
         .catch(() => {});   // the table still works without it; the column hides
       return () => { cancelled = true; };

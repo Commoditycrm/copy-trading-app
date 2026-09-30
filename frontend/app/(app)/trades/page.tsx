@@ -775,10 +775,10 @@ export default function TradesPage() {
     );
   };
 
-  // The Channel column is only meaningful to a trader who has Discord — for
-  // everyone else every row reads "—", which is a column of nothing. Same
-  // gate as the Discord tab above.
-  const showChannel = !!user?.discord_enabled;
+  // The Channel column is only meaningful to someone with Discord — a Discord
+  // trader, or a subscriber trading their channels. For everyone else every
+  // row reads "—", which is a column of nothing. Same gate as the Discord tab.
+  const showChannel = !!user?.discord_available;
 
   // Configurable columns (per-user, synced). Functional columns — Symbol,
   // Actions, TP, SL — are locked so their per-row controls always render.
@@ -905,7 +905,7 @@ export default function TradesPage() {
           {STATUS_TABS
             // Discord is an admin-enabled, opt-in trader feature — hide the tab
             // unless this trader is allow-listed (mirrors the nav + /discord gate).
-            .filter(({ key }) => key !== "discord" || !!user?.discord_enabled)
+            .filter(({ key }) => key !== "discord" || !!user?.discord_available)
             .map(({ key, label }) => {
             const active = tab === key;
             const count = tabCounts[key];
