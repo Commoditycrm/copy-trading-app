@@ -1212,7 +1212,12 @@ async def close_all_subscribers_positions(
     ``_BULK_EXIT_BROKER_TIMEOUT_S``. Each close publishes an
     ``order.placed`` SSE event so the relevant subscriber's UI
     refreshes on its own.
+
+    Not for a Discord trader: their subscribers trade independently
+    (copy_engine.trades_independently).
     """
+    if copy_engine.trades_independently(user):
+        raise HTTPException(409, "Your subscribers trade your Discord channels on their own settings — their orders and positions are theirs, not yours to act on.")
     sub_ids = list(db.execute(
         select(SubscriberSettings.user_id).where(
             SubscriberSettings.following_trader_id == user.id
