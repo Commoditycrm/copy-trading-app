@@ -2189,8 +2189,18 @@ def calendar_pnl(
         marked = c.marked_pnl
         pct: Decimal | None = None
         ov = marked_by_day.get(c.day)
-        if ov is not None and not c.live:
+        if c.live:
+            # Today: marked is our live (realized + live unrealized) — moving.
+            source, quality = "calculated", "live"
+        elif ov is not None:
+            # Settled day with a finalized broker figure (Alpaca portfolio-history
+            # or an EOD snapshot) → authoritative.
             marked, pct = ov
+            source, quality = "broker_reported", "authoritative"
+        else:
+            # No broker figure for this day (e.g. a Webull historical day the
+            # broker won't give us) → our reconstruction, honestly estimated.
+            source, quality = "calculated", "estimated"
         out.append(DailyPnL(
             day=c.day,
             # Rows shown on the Calendar:
@@ -2206,6 +2216,8 @@ def calendar_pnl(
             # vs unrealized_pnl which is only the day's swing.
             open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
+            source=source,
+            quality=quality,
         ))
     return out
 

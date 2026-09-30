@@ -77,6 +77,17 @@ class DailyRealizedPnlSnapshot(Base):
     # "db_realized", or "marked" (Alpaca portfolio-history).
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="broker_activities")
 
+    # When in the trading day a broker MARKED value was captured. Only meaningful
+    # for source="marked": "eod" = captured after the session closed (the day's
+    # FINAL figure, safe to show as historical broker P&L); "intraday" = captured
+    # mid-session (a moving number that must NOT be presented as that day's
+    # settled P&L). The calendar only trusts "eod" for past days. Legacy rows
+    # (written before this column) default to "intraday" — i.e. not trusted as
+    # finalized — since we can't prove when they were captured.
+    snapshot_type: Mapped[str] = mapped_column(
+        String(12), nullable=False, server_default="intraday",
+    )
+
     # Total unrealized P&L across the account's OPEN positions, captured at
     # (approximately) this day's close by the hourly snapshot sweep. Only
     # written on the current day each pass; a past day keeps the value captured

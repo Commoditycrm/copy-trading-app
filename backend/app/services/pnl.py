@@ -762,12 +762,13 @@ def alpaca_marked_by_day(
 def frozen_marked_by_day(
     db: Session, user_id: uuid.UUID, start: date, end: date,
 ) -> dict[date, tuple[Decimal, Decimal | None]]:
-    """Broker-direct MARKED P&L per day that the snapshot job froze as each day
-    passed through "today" (``source='marked'`` rows — Alpaca and Webull Day's
+    """Broker-direct MARKED P&L per day the snapshot job FINALIZED at the close
+    (``source='marked'`` AND ``snapshot_type='eod'`` — Alpaca and Webull Day's
     P&L). Returns {day: (marked, pct)}. This is the ONLY marked source for a
     Webull account (no history endpoint), so a Webull calendar matches the broker
-    only from the first snapshot forward. Honors the soft-delete visibility
-    filter."""
+    only from the first finalized snapshot forward; intraday captures and legacy
+    rows are excluded so a mid-day figure never masquerades as settled P&L.
+    Honors the soft-delete visibility filter."""
     rows = db.execute(
         select(
             DailyRealizedPnlSnapshot.day,
@@ -778,6 +779,7 @@ def frozen_marked_by_day(
             DailyRealizedPnlSnapshot.day >= start,
             DailyRealizedPnlSnapshot.day <= end,
             DailyRealizedPnlSnapshot.source == "marked",
+            DailyRealizedPnlSnapshot.snapshot_type == "eod",
             visibility.snapshot_is_visible(),
         )
     ).all()

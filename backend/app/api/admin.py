@@ -44,7 +44,8 @@ from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.services import audit, excel_export, market_hours, visibility
 from app.services.pnl import (
-    alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_day,
+    alpaca_marked_by_day, calendar_series, frozen_marked_by_day,
+    load_eod_unrealized, realized_pnl_by_day,
 )
 from app.schemas.order import DailyPnL
 from app.services.redis_client import get_sync_redis
@@ -529,8 +530,13 @@ def admin_user_pnl_calendar(
         marked = c.marked_pnl
         pct = None
         ov = marked_by_day.get(c.day)
-        if ov is not None and not c.live:
+        if c.live:
+            source, quality = "calculated", "live"
+        elif ov is not None:
             marked, pct = ov
+            source, quality = "broker_reported", "authoritative"
+        else:
+            source, quality = "calculated", "estimated"
         out.append(DailyPnL(
             day=c.day,
             realized_pnl=c.realized_pnl,
@@ -539,7 +545,80 @@ def admin_user_pnl_calendar(
             unrealized_pnl=marked - c.realized_pnl,
             open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
+            source=source,
+            quality=quality,
         ))
+    return out
+
+
+@router.get("/users/{user_id}/pnl-reconciliation")
+def admin_user_pnl_reconciliation(
+    user_id: uuid.UUID,
+    from_: date = Query(..., alias="from"),
+    to: date = Query(...),
+    tz: str | None = Query(default=None, description="IANA tz; defaults to US/Eastern."),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[dict]:
+    """Per-day P&L reconciliation for one user — the debug view behind the
+    calendar. For each day it shows the broker-reported figure (when the broker
+    exposes one), our calculated realized, the value we display, its source /
+    quality, and the realized + unrealized-change breakdown. When the broker
+    exposes no historical figure (e.g. a Webull day) it says so explicitly
+    rather than inventing a difference against a number we can't source."""
+    if from_ > to:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="from must be <= to")
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    brokers = sorted({
+        str(b) for b in db.execute(
+            select(BrokerAccount.broker).where(BrokerAccount.user_id == user_id)
+        ).scalars()
+    })
+    mirrors_only = target.role == UserRole.SUBSCRIBER
+    series = calendar_series(db, user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only)
+    marked_by_day = frozen_marked_by_day(db, user_id, from_, to)
+    marked_by_day.update(alpaca_marked_by_day(db, user_id, from_, to, tz))
+    # End-of-day unrealized captures, to expose the unrealized change per day.
+    eod = load_eod_unrealized(db, user_id, from_ - timedelta(days=30), to)
+
+    out: list[dict] = []
+    prev_eod: Decimal | None = None
+    for c in sorted(series.values(), key=lambda x: x.day):
+        broker_reported = marked_by_day.get(c.day)
+        br_val = broker_reported[0] if broker_reported is not None else None
+        displayed = br_val if br_val is not None else c.marked_pnl
+        this_eod = eod.get(c.day)
+        unreal_change = (
+            (this_eod - prev_eod) if (this_eod is not None and prev_eod is not None) else None
+        )
+        if br_val is not None:
+            source, quality, reason = "broker_reported", "authoritative", None
+            difference = br_val - c.realized_pnl - (unreal_change or Decimal(0))
+        else:
+            source, quality = "calculated", "estimated"
+            difference = None
+            reason = "broker_does_not_expose_historical_daily_pnl"
+        out.append({
+            "date": c.day.isoformat(),
+            "brokers": brokers,
+            "broker_reported": (str(br_val) if br_val is not None else None),
+            "calculated_realized": str(c.realized_pnl),
+            "displayed_marked": str(displayed),
+            "source": source,
+            "quality": quality,
+            "reason": reason,
+            "difference": (str(difference) if difference is not None else None),
+            "realized": str(c.realized_pnl),
+            "previous_eod_unrealized": (str(prev_eod) if prev_eod is not None else None),
+            "ending_eod_unrealized": (str(this_eod) if this_eod is not None else None),
+            "unrealized_change": (str(unreal_change) if unreal_change is not None else None),
+            "trade_count": c.trade_count,
+        })
+        if this_eod is not None:
+            prev_eod = this_eod
     return out
 
 

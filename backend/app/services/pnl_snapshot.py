@@ -122,15 +122,25 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         pnl, count = vals[0], vals[1]
         pct = vals[2] if len(vals) > 2 else None
         source = source_by_day.get(day, "broker_activities")
+        # A MARKED value is only "eod" (final, safe as historical) once the
+        # session has closed; captured mid-session it's "intraday" and the
+        # calendar won't treat it as that day's settled P&L. The post-close sweep
+        # rewrites today's row to "eod"; if the box misses that sweep the row
+        # stays "intraday" and the day reads as estimated — the safe failure.
+        snapshot_type = (
+            "eod" if source == "marked" and not market_hours.in_regular_session()
+            else "intraday"
+        )
         set_ = dict(
             realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
             broker_account_id=acct.id, broker=broker,
-            source=source, computed_at=market_hours.now_et(),
+            source=source, snapshot_type=snapshot_type, computed_at=market_hours.now_et(),
         )
         stmt = pg_insert(DailyRealizedPnlSnapshot).values(
             user_id=acct.user_id, day=day,
             realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
             broker_account_id=acct.id, broker=broker, source=source,
+            snapshot_type=snapshot_type,
         )
         # A $0 from the broker feed is either a genuinely flat day or one the feed
         # hasn't surfaced yet. Never let it overwrite a durable db_fallback_lag row

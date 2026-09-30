@@ -182,6 +182,18 @@ class DailyPnL(BaseModel):
     # True on the current day when `realized_pnl` includes live unrealized — the
     # figure moves with the market and is NOT a settled number.
     live: bool = False
+    # Provenance of the MARKED value shown for this day, so the UI never presents
+    # an estimate as authoritative:
+    #   source  = "broker_reported" (the broker's own figure) | "calculated"
+    #             (our reconstruction).
+    #   quality = "authoritative" (finalized broker value: Alpaca portfolio-history
+    #             or a finalized EOD snapshot) | "estimated" (our FIFO + capture
+    #             reconstruction — e.g. a Webull historical day the broker won't
+    #             give us) | "live" (today, still moving).
+    # None on days with no marked value. Do NOT claim "authoritative" unless the
+    # number came from an authoritative broker source or a finalized snapshot.
+    source: str | None = None
+    quality: str | None = None
 
 
 class TradeScopeStats(BaseModel):
