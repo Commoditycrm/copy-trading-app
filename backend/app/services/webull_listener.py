@@ -216,9 +216,9 @@ def _build_stoppable_client(creds: dict[str, Any]):
             return super().should_retry(ctx)
 
     class _StoppableTradeEvents(TradeEventsClient):
-        def __init__(self, app_key, app_secret, region_id):
+        def __init__(self, app_key, app_secret, region_id, host=None):
             self._stop_event = threading.Event()
-            super().__init__(app_key, app_secret, region_id,
+            super().__init__(app_key, app_secret, region_id, host=host,
                              retry_policy=_StopAwareRetryPolicy(self._stop_event))
             self._grpc_channel = None
 
@@ -269,7 +269,13 @@ def _build_stoppable_client(creds: dict[str, Any]):
                     pass
                 self._grpc_channel = None
 
-    return _StoppableTradeEvents(creds["app_key"], creds["app_secret"], creds.get("region_id", "us"))
+    from app.brokers.webull import WEBULL_PAPER_EVENTS_HOST  # noqa: PLC0415
+
+    # Paper accounts stream from the sandbox events host; None = the SDK's
+    # regional default (live).
+    host = WEBULL_PAPER_EVENTS_HOST if creds.get("paper") else None
+    return _StoppableTradeEvents(creds["app_key"], creds["app_secret"],
+                                 creds.get("region_id", "us"), host)
 
 
 # ── order mapping + option resolution (Stage 3 live path) ───────────────────
@@ -391,6 +397,7 @@ def _webull_trade_client(creds: dict[str, Any]):
     from app.brokers.webull import trade_client_for  # noqa: PLC0415
     return trade_client_for(
         creds["app_key"], creds["app_secret"], creds.get("region_id", "us"),
+        bool(creds.get("paper", False)),
     )
 
 

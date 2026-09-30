@@ -290,6 +290,9 @@ export default function BrokersPage() {
   const [webullAppKey, setWebullAppKey] = useState("");
   const [webullAppSecret, setWebullAppSecret] = useState("");
   const [webullAccountId, setWebullAccountId] = useState("");
+  // Paper = Webull's test environment (a separate API host); its keys don't
+  // work against live and vice versa.
+  const [webullPaper, setWebullPaper] = useState(false);
   // Accounts fetched from the keys. One app_key reaches EVERY account under the
   // Webull login (Cash / Margin / IRA / Futures) and account_id is not the
   // number shown in the app — so this is picked, never typed. Typing it meant a
@@ -446,7 +449,7 @@ export default function BrokersPage() {
 
   function resetConnectForms() {
     setLabel(""); setApiKey(""); setApiSecret(""); setPaper(false);
-    setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId("");
+    setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId(""); setWebullPaper(false);
     setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
@@ -514,6 +517,7 @@ export default function BrokersPage() {
           app_key: webullAppKey.trim(),
           app_secret: webullAppSecret.trim(),
           region_id: "us",
+          paper: webullPaper,
         }),
       });
       setWebullAccounts(accts);
@@ -546,11 +550,12 @@ export default function BrokersPage() {
             app_secret: webullAppSecret.trim(),
             account_id: webullAccountId.trim(),
             region_id: "us",
+            paper: webullPaper,
           },
         }),
       });
       resetConnectForms();
-      notify.success("Webull connected — real-time stream starting");
+      notify.success(`Webull ${webullPaper ? "paper " : ""}connected — real-time stream starting`);
       await load();
     } catch (e) {
       notify.fromError(e, "Webull connect failed");
@@ -867,6 +872,20 @@ export default function BrokersPage() {
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
                 <input type="text" className="w-full p-2.5" placeholder="Webull (direct)" aria-label="Webull account label" value={webullLabel} onChange={e => setWebullLabel(e.target.value)} />
               </div>
+              <PaperLiveRadio
+                value={webullPaper}
+                onChange={(v) => {
+                  // A different environment has different accounts — drop any
+                  // list loaded for the other one.
+                  setWebullPaper(v);
+                  setWebullAccounts(null);
+                  setWebullAccountId("");
+                }}
+                name="webull-mode"
+                note={webullPaper
+                  ? "Paper uses Webull's test environment (api.sandbox.webull.com). Use the API keys issued for paper/test — live keys are rejected there."
+                  : "Live trades your real Webull account. Paper keys are rejected here."}
+              />
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>App key</label>
