@@ -19,8 +19,10 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.order import Fill, InstrumentType, Order, OrderSide
 from app.services import visibility
@@ -44,6 +46,10 @@ except ZoneInfoNotFoundError:
 class _Lot:
     qty: Decimal
     price: Decimal
+    # Broker that placed the opening fill — only used to time an expiry booking
+    # (Alpaca reflects it on the expiry day; Webull the next business day). None
+    # for a disconnected broker; treated as the next-business-day default.
+    broker: "BrokerName | None" = None
 
 
 def _instrument_key(o: Order) -> tuple:
@@ -56,6 +62,17 @@ def _instrument_key(o: Order) -> tuple:
             o.option_right.value if o.option_right else None,
         )
     return ("STK", o.symbol)
+
+
+def _next_business_day(d: date) -> date:
+    """The next Mon–Fri after ``d`` — where the broker reflects an option expiry
+    in the day's P&L. Webull books an expired-worthless long the NEXT business
+    day (not the expiry day itself). Holiday-agnostic: a market holiday would put
+    it one weekday early, an acceptable edge for a daily P&L calendar."""
+    nd = d + timedelta(days=1)
+    while nd.weekday() >= 5:                # Sat/Sun
+        nd += timedelta(days=1)
+    return nd
 
 
 def _dedup_fills(rows):
@@ -399,6 +416,25 @@ def realized_pnl_by_day(
     else:
         orders = orders_all
 
+    # Broker per account, to time an expiry booking (Alpaca on the expiry day,
+    # everyone else the next business day). Only needed when the user actually
+    # holds options — a stock-only history never books an expiry — and tolerant
+    # of a minimal test schema that omits broker_accounts (falls back to the
+    # next-business-day default).
+    acct_broker: dict[uuid.UUID, BrokerName] = {}
+    if any(o.instrument_type == InstrumentType.OPTION for o in orders):
+        try:
+            acct_broker = {
+                aid: br
+                for aid, br in db.execute(
+                    select(BrokerAccount.id, BrokerAccount.broker).where(
+                        BrokerAccount.user_id == user_id
+                    )
+                ).all()
+            }
+        except SQLAlchemyError:
+            acct_broker = {}
+
     # All Fill rows for those orders (one query, then bucket).
     order_ids = [o.id for o in orders]
     fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
@@ -434,6 +470,7 @@ def realized_pnl_by_day(
         key = _instrument_key(order)
         # Options P&L multiplier — 100 shares per contract for standard US options.
         unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+        broker = acct_broker.get(order.broker_account_id) if order.broker_account_id else None
         qty = fill_qty
         price = fill_price
         day = filled_at.astimezone(bucket_tz).date()
@@ -458,9 +495,9 @@ def realized_pnl_by_day(
                     daily_pnl[day] += pnl
                     closing_orders[day].add(order.id)
                 if qty > 0:
-                    open_lots[key].append(_Lot(qty=qty, price=price))
+                    open_lots[key].append(_Lot(qty=qty, price=price, broker=broker))
             else:
-                open_lots[key].append(_Lot(qty=qty, price=price))
+                open_lots[key].append(_Lot(qty=qty, price=price, broker=broker))
         else:  # SELL — close longs first
             if open_lots[key] and open_lots[key][0].qty > 0:
                 pnl = Decimal(0)
@@ -476,36 +513,52 @@ def realized_pnl_by_day(
                     daily_pnl[day] += pnl
                     closing_orders[day].add(order.id)
                 if qty > 0:
-                    open_lots[key].append(_Lot(qty=-qty, price=price))
+                    open_lots[key].append(_Lot(qty=-qty, price=price, broker=broker))
             else:
-                open_lots[key].append(_Lot(qty=-qty, price=price))
+                open_lots[key].append(_Lot(qty=-qty, price=price, broker=broker))
 
-    # ── Book expired LONG options as worthless ──────────────────────────────
-    # A LONG option still open past its expiry was let-expire — which almost
-    # always means it finished out-of-the-money and expired WORTHLESS (an ITM
-    # long gets sold or exercised, not left to lapse). The broker books the full
-    # premium loss on the expiry day, but a fill-based FIFO never sees a closing
-    # sell — so without this the loss is silently dropped and realized P&L reads
-    # too high (the Webull "+$1,339 vs +$475" gap). Only LONG lots: short and
-    # ITM/cash-settled expiries need the broker's settlement value (follow-up).
+    # ── Book expired options that were let-lapse (worthless) ─────────────────
+    # An option still open past its expiry was never closed by a fill, so a
+    # fill-based FIFO leaves the lot open forever and drops its P&L. The broker
+    # settles it at expiry, and for a lapse (finished out-of-the-money) that
+    # settlement is $0:
+    #   * a LONG lot loses the full premium it paid  (Webull "+$1,339 → +$475"),
+    #   * a SHORT lot keeps the full premium it collected (Alpaca OPEXP net=0 on
+    #     arsalan's SPXW puts — the gain our FIFO was missing).
+    # Closing every remaining lot at $0 gives both signs for free:
+    #   (0 − price) × qty × 100  →  negative for qty>0 (long), positive for qty<0.
+    # ITM / cash-settled expiries settle at a NON-zero value only the broker's
+    # settlement feed knows (Alpaca reports it as OPEXP.net_amount); none of the
+    # live accounts have one yet, so that overlay is a documented follow-up.
+    #
+    # Timing matches the broker app: Alpaca reflects the expiry ON the expiry
+    # day (OPEXP.date == expiry), Webull/SnapTrade on the NEXT business day.
     today = datetime.now(bucket_tz).date()
     for key, lots in open_lots.items():
         if not lots or key[0] != "OPT":
             continue
         exp = key[2]                        # option_expiry date from _instrument_key
-        if exp is None or exp >= today:
-            continue                        # not expired yet (or expires today — not settled)
-        if (start and exp < start) or (end and exp > end):
-            continue                        # expiry outside the queried window
-        loss = Decimal(0)
-        for lot in lots:
-            if lot.qty > 0:                 # LONG only
-                loss += (Decimal(0) - lot.price) * lot.qty * Decimal(100)
-        if loss != 0:
-            daily_pnl[exp] += loss
+        if exp is None:
+            continue
+        # Alpaca books it same-day; everyone else the next business day. Lots on
+        # one contract share a broker, so the first lot's broker decides.
+        broker = lots[0].broker
+        book_day = exp if broker == BrokerName.ALPACA else _next_business_day(exp)
+        if book_day >= today:
+            continue                        # only settled past days — never today,
+                                            # whose expired-but-not-yet-removed lot
+                                            # is still in the live-unrealized cell
+                                            # (double-count guard)
+        if (start and book_day < start) or (end and book_day > end):
+            continue                        # booking day outside the queried window
+        pnl = Decimal(0)
+        for lot in lots:                    # long AND short — settle at $0
+            pnl += (Decimal(0) - lot.price) * lot.qty * Decimal(100)
+        if pnl != 0:
+            daily_pnl[book_day] += pnl
             # One synthetic "trade" for the contract's expiry, deterministic so
             # re-runs don't inflate the count.
-            closing_orders[exp].add(uuid.uuid5(uuid.NAMESPACE_OID, f"exp:{key}"))
+            closing_orders[book_day].add(uuid.uuid5(uuid.NAMESPACE_OID, f"exp:{key}"))
 
     return {
         d: (daily_pnl.get(d, Decimal(0)), len(closing_orders[d]))
