@@ -487,11 +487,13 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
-  | "symbol" | "quantity" | "avg_entry_price" | "current_price"
+  | "channel" | "symbol" | "quantity" | "avg_entry_price" | "current_price"
   | "market_value" | "net_liq" | "unrealized_pnl" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
+    // Blank channels sort last (a high code point) rather than jumping to the top.
+    case "channel": return (p.discord_channel || "￿").toUpperCase();
     case "symbol": return p.symbol.toUpperCase();
     case "quantity": return Math.abs(Number(p.quantity)) || 0;
     case "avg_entry_price": return Number(p.avg_entry_price) || 0;
@@ -970,7 +972,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // Header metadata by column id — label + optional sort key/title. Drives the
     // ordered header render below.
     const HEADER_META: Record<string, { label: string; sortKey?: SortKey; title?: string }> = {
-      channel: { label: "Channel", title: "Discord channel whose alert opened this position" },
+      channel: { label: "Channel", sortKey: "channel", title: "Discord channel whose alert opened this position" },
       symbol: { label: "Symbol", sortKey: "symbol" },
       qty: { label: "Qty", sortKey: "quantity" },
       side: { label: "Side" },
