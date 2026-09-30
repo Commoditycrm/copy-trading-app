@@ -118,6 +118,24 @@ def _first(d: dict, *keys: str) -> Any:
     return None
 
 
+def _wb_pct(v: Any) -> Decimal | None:
+    """Webull rate fractions (-0.3916) → a display PERCENT (-39.16)."""
+    d = _dec(v)
+    return d * Decimal(100) if d is not None else None
+
+
+def _wb_day_pct(day_pnl: Decimal | None, market_value: Decimal | None) -> Decimal | None:
+    """Webull gives DAY P&L ($) but no day %. Derive it against the day-start
+    value (current market value minus today's move): day_pnl / (mv − day_pnl).
+    None when we can't (missing inputs, or a zeroed day-start)."""
+    if day_pnl is None or market_value is None:
+        return None
+    base = market_value - day_pnl
+    if base == 0:
+        return None
+    return (day_pnl / base) * Decimal(100)
+
+
 def _first_dict(d: Any, *keys: str) -> dict:
     """First element of whichever of ``keys`` holds a non-empty list of dicts
     (or the dict itself if the key holds one). ``{}`` when nothing matches — so
@@ -926,6 +944,16 @@ class WebullAdapter(BrokerAdapter):
                 market_value=_dec(_first(p, "market_value", "market_val")),
                 unrealized_pnl=_dec(_first(p, "unrealized_pnl", "unrealized_profit_loss", "open_pnl")),
                 cost_basis=_dec(_first(p, "cost_basis", "total_cost", "cost")),
+                # Webull native per-position figures. unrealized_profit_loss_rate
+                # is a fraction (-0.3916 = -39.16%); ×100 to a display percent.
+                # Webull exposes DAY P&L (day_profit_loss) but no day %, so we
+                # derive it from the day-start value (market_value − day_pnl).
+                open_pnl_pct=_wb_pct(_first(p, "unrealized_profit_loss_rate")),
+                day_pnl=_dec(_first(p, "day_profit_loss", "day_pnl")),
+                day_pnl_pct=_wb_day_pct(
+                    _dec(_first(p, "day_profit_loss", "day_pnl")),
+                    _dec(_first(p, "market_value", "market_val")),
+                ),
                 option_expiry=expiry,
                 option_strike=strike,
                 option_right=right,

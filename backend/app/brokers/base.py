@@ -36,6 +36,9 @@ class BrokerCapabilities:
     live_daily_pnl: bool = False
     # Broker reports current open-position unrealized authoritatively.
     authoritative_open_pnl: bool = False
+    # Broker exposes a native per-position DAY P&L field (Webull day_profit_loss,
+    # Alpaca unrealized_intraday_pl) — show the broker's number, not a derived one.
+    authoritative_position_day_pnl: bool = False
     # Broker exposes an authoritative realized-P&L figure via a real API field
     # (NOT our FIFO inference). Only set when verified against an actual field.
     authoritative_realized_pnl: bool = False
@@ -131,6 +134,17 @@ class BrokerPosition:
     market_value: Decimal | None
     unrealized_pnl: Decimal | None
     cost_basis: Decimal | None = None
+    # Open P&L % — the broker's own lifetime unrealized return on this position,
+    # as a PERCENT (e.g. -39.16), None when the broker doesn't expose it.
+    open_pnl_pct: Decimal | None = None
+    # Day's P&L — the position's P&L for the CURRENT trading day (not lifetime),
+    # straight from the broker's native field (Webull day_profit_loss, Alpaca
+    # unrealized_intraday_pl). None when the broker doesn't expose it — never
+    # fabricated from the lifetime figure.
+    day_pnl: Decimal | None = None
+    # Day's P&L % — as a PERCENT. Native for Alpaca (unrealized_intraday_plpc);
+    # derived for Webull (day_pnl / day-start value). None when unavailable.
+    day_pnl_pct: Decimal | None = None
     # Option-only fields parsed from OCC symbol; null for stocks.
     option_expiry: date | None = None
     option_strike: Decimal | None = None

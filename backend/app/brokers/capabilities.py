@@ -24,6 +24,7 @@ _CAPS: dict[BrokerName, BrokerCapabilities] = {
         historical_daily_pnl=True,
         live_daily_pnl=True,
         authoritative_open_pnl=True,
+        authoritative_position_day_pnl=True,  # unrealized_intraday_pl / _plpc
         portfolio_history=True,
     ),
     # SnapTrade: complete get_account_activities feed (so realized/expiry is
@@ -39,6 +40,7 @@ _CAPS: dict[BrokerName, BrokerCapabilities] = {
     BrokerName.WEBULL: BrokerCapabilities(
         live_daily_pnl=True,
         authoritative_open_pnl=True,
+        authoritative_position_day_pnl=True,  # day_profit_loss per position
     ),
     # IBKR: not verified for this app; declare nothing until checked.
     BrokerName.IBKR: BrokerCapabilities(),

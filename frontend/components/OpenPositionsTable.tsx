@@ -488,7 +488,7 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
   | "channel" | "symbol" | "quantity" | "avg_entry_price" | "current_price"
-  | "market_value" | "net_liq" | "unrealized_pnl" | "expires";
+  | "market_value" | "net_liq" | "unrealized_pnl" | "day_pnl" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
@@ -501,6 +501,7 @@ function sortValue(p: Position, key: SortKey): number | string {
     case "market_value": return Number(p.market_value) || 0;
     case "net_liq": return (Number(p.current_price) || 0) * (Number(p.quantity) || 0) * (p.instrument_type === "option" ? 100 : 1);
     case "unrealized_pnl": return Number(p.unrealized_pnl) || 0;
+    case "day_pnl": return p.day_pnl != null ? Number(p.day_pnl) : Number.NEGATIVE_INFINITY;
     case "expires": return p.option_expiry ? daysUntil(p.option_expiry) : Number.POSITIVE_INFINITY;
   }
 }
@@ -539,6 +540,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       { id: "actions", header: "Actions", locked: true },
       { id: "unrealized_pnl", header: "Unrealized P&L" },
       { id: "pnl_pct", header: "P&L %" },
+      { id: "day_pnl", header: "Day's P&L" },
       { id: "avg_entry", header: "Avg entry" },
       { id: "current_price", header: "Current price" },
       { id: "pdc", header: "PDC" },
@@ -980,6 +982,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       actions: { label: "Actions" },
       unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
       pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
+      day_pnl: { label: "Day's P&L", sortKey: "day_pnl", title: "Today's P&L on this position, straight from your broker (Webull / Alpaca)" },
       avg_entry: { label: "Avg entry", sortKey: "avg_entry_price" },
       current_price: { label: "Current price", sortKey: "current_price" },
       pdc: { label: "PDC", title: "Previous day's market close price" },
@@ -1296,6 +1299,20 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                     ),
                     unrealized_pnl: <LivePnlCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} baseline={p.unrealized_pnl} multiplier={liveMult} />,
                     pnl_pct: <LivePnlPctCell symbol={liveSym} snapshotPrice={p.current_price} quantity={p.quantity} unrealizedBaseline={p.unrealized_pnl} costBasis={p.cost_basis} multiplier={liveMult} />,
+                    // Day's P&L — the broker's OWN per-position figure (Webull /
+                    // Alpaca native), not derived. A snapshot value; null → "—".
+                    day_pnl: (
+                      <td className="px-5 py-3.5 num" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
+                        {p.day_pnl != null ? (
+                          <span style={{ color: Number(p.day_pnl) > 0 ? "var(--pnl-pos)" : Number(p.day_pnl) < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                            {fmtSignedUsd(Number(p.day_pnl))}
+                            {p.day_pnl_pct != null && (
+                              <span style={{ color: "var(--text-2)" }}>{` (${Number(p.day_pnl_pct) >= 0 ? "+" : ""}${Number(p.day_pnl_pct).toFixed(2)}%)`}</span>
+                            )}
+                          </span>
+                        ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
                     avg_entry: <td className="px-5 py-3.5 num">{fmtNum(p.avg_entry_price, 2)}</td>,
                     current_price: <LiveCurrentPriceCell symbol={liveSym} fallback={p.current_price} />,
                     pdc: <td className="px-5 py-3.5 num" style={{ color: "var(--text-2)" }} title="Previous market close price">{fmtNum(p.reference_price, 2)}</td>,

@@ -28,6 +28,7 @@ from collections.abc import Callable
 from decimal import Decimal
 
 from app.brokers import adapter_for
+from app.brokers.capabilities import capabilities_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
@@ -127,6 +128,13 @@ def list_positions(
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
+            # Whether this broker's per-position Day P&L is its own native field
+            # (so the row can be labelled authoritative rather than derived).
+            day_src = (
+                "broker_native"
+                if capabilities_for(acct.broker).authoritative_position_day_pnl
+                else None
+            )
             prev_close_fn = getattr(adapter, "get_stock_prev_close", None)
             # Display path: let concurrent readers share one broker call.
             # Webull rejects simultaneous position reads with 429, and this
@@ -151,6 +159,10 @@ def list_positions(
                     market_value=p.market_value,
                     unrealized_pnl=p.unrealized_pnl,
                     cost_basis=p.cost_basis,
+                    open_pnl_pct=p.open_pnl_pct,
+                    day_pnl=p.day_pnl,
+                    day_pnl_pct=p.day_pnl_pct,
+                    day_pnl_source=(day_src if p.day_pnl is not None else None),
                     reference_price=ref,
                     option_expiry=p.option_expiry,
                     option_strike=p.option_strike,

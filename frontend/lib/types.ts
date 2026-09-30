@@ -219,8 +219,16 @@ export interface Position {
   ladder_stop_price?: string | null;
   current_price: string | null;
   market_value: string | null;
-  unrealized_pnl: string | null;
+  unrealized_pnl: string | null;            // Open P&L ($) — broker's own value
   cost_basis: string | null;
+  /** Broker-native per-position figures (Webull / Alpaca), following the
+   *  connected broker. Percents are display percents (e.g. -39.16). day_pnl /
+   *  day_pnl_pct are the CURRENT trading day only; null when the broker doesn't
+   *  expose them. day_pnl_source = "broker_native" | null. */
+  open_pnl_pct?: string | null;
+  day_pnl?: string | null;
+  day_pnl_pct?: string | null;
+  day_pnl_source?: string | null;
   /** Previous session's market close price for this symbol (reference). */
   reference_price: string | null;
   option_expiry: string | null;
