@@ -28,12 +28,12 @@ from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.orm import Session, aliased, selectinload
 
-from app.api.deps import get_db, require_admin
+from app.api.deps import client_ip, get_db, require_admin
 from app.models.audit_log import AuditLog
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
@@ -42,7 +42,8 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
-from app.services import audit, excel_export, market_hours, visibility
+from app.config import get_settings
+from app.services import app_settings, audit, excel_export, market_hours, visibility
 from app.services.pnl import (
     alpaca_marked_by_day, calendar_series, frozen_marked_by_day,
     load_eod_unrealized, realized_pnl_by_day,
@@ -620,6 +621,75 @@ def admin_user_pnl_reconciliation(
         if this_eod is not None:
             prev_eod = this_eod
     return out
+
+
+class MarketStreamToggleIn(BaseModel):
+    """Set the live market-data stream toggles. Omit a broker to leave it
+    unchanged. Each maps to an app_settings override that beats the env default;
+    the stream supervisors pick it up on their next pass (no redeploy)."""
+    alpaca: bool | None = None
+    webull: bool | None = None
+
+
+_MARKET_STREAM_KEYS = {
+    "alpaca": "alpaca_market_stream_enabled",
+    "webull": "webull_market_stream_enabled",
+}
+
+
+def _market_stream_state(db: Session) -> dict:
+    s = get_settings()
+    out: dict = {}
+    for name, key in _MARKET_STREAM_KEYS.items():
+        env_default = bool(getattr(s, key))
+        override = app_settings.get_override(db, key)  # bool | None
+        if name == "alpaca":
+            creds = bool(s.alpaca_data_api_key and s.alpaca_data_api_secret)
+        else:
+            creds = bool(s.webull_data_app_key and s.webull_data_app_secret)
+        out[name] = {
+            # Effective on/off the supervisor will act on (creds required to run).
+            "enabled": bool((override if override is not None else env_default) and creds),
+            "override": override,          # admin-set value, or null (using env)
+            "env_default": env_default,
+            "creds_present": creds,        # false → can't actually run even if on
+        }
+    return out
+
+
+@router.get("/market-streams")
+def get_market_streams(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """Current live market-data stream toggles (Alpaca + Webull) and whether the
+    data-API credentials are present for each."""
+    return _market_stream_state(db)
+
+
+@router.post("/market-streams")
+def set_market_streams(
+    body: MarketStreamToggleIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Enable/disable a live market-data stream at runtime — no env change or
+    redeploy. Writes an override the stream supervisors read on their next pass."""
+    changed: dict[str, bool] = {}
+    if body.alpaca is not None:
+        app_settings.set_flag(db, _MARKET_STREAM_KEYS["alpaca"], body.alpaca)
+        changed["alpaca"] = body.alpaca
+    if body.webull is not None:
+        app_settings.set_flag(db, _MARKET_STREAM_KEYS["webull"], body.webull)
+        changed["webull"] = body.webull
+    if changed:
+        db.commit()
+        audit.record(
+            db, actor_user_id=admin.id, action="admin.market_streams.set",
+            metadata=changed, ip_address=client_ip(request),
+        )
+    return _market_stream_state(db)
 
 
 @router.patch("/users/{user_id}/activate")

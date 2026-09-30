@@ -163,12 +163,13 @@ _WATCH_PASS_S = 5.0
 
 def _enabled() -> bool:
     from app.config import get_settings  # noqa: PLC0415
+    from app.services import app_settings  # noqa: PLC0415
     s = get_settings()
-    return bool(
-        s.alpaca_market_stream_enabled
-        and s.alpaca_data_api_key
-        and s.alpaca_data_api_secret
+    # Admin runtime toggle overrides the env default (no redeploy needed).
+    enabled = app_settings.flag(
+        "alpaca_market_stream_enabled", default=s.alpaca_market_stream_enabled
     )
+    return bool(enabled and s.alpaca_data_api_key and s.alpaca_data_api_secret)
 
 
 # ── central store: Redis price cache ────────────────────────────────────────
