@@ -783,7 +783,7 @@ export default function TradesPage() {
   // Configurable columns (per-user, synced). Functional columns — Symbol,
   // Actions, TP, SL — are locked so their per-row controls always render.
   const columnDefs = useMemo<ColumnDef[]>(() => [
-    ...(showChannel ? [{ id: "channel", header: "Channel" }] : []),
+    ...(showChannel ? [{ id: "channel", header: "Channel", leading: true }] : []),
     { id: "symbol", header: "Symbol", locked: true },
     { id: "qty", header: "Qty" },
     { id: "side", header: "Side" },
