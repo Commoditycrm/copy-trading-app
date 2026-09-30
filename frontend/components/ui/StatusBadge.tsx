@@ -37,6 +37,7 @@ const STATUS_TONE: Record<string, Tone> = {
   reconnecting: "warn",
   disconnected: "muted",
   credentials_invalid: "bad",
+  in_use_elsewhere: "warn",
 };
 
 function labelize(s: string): string {

@@ -80,6 +80,7 @@ from app.schemas.broker import (
 )
 from app.services import audit, balance_sync, cache, listeners, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
+from app.services.notifications import create_notification
 from app.services.redis_client import get_sync_redis
 
 log = logging.getLogger(__name__)
@@ -362,6 +363,84 @@ def _deactivate_other_brokers(
             except Exception:  # noqa: BLE001
                 log.exception("stop_listener while deactivating a broker failed")
     return changed
+
+
+def _release_webull_app_key(
+    db: Session, acct: BrokerAccount, creds: dict[str, Any], actor: User, request: Request,
+) -> list[BrokerAccount]:
+    """Deactivate every OTHER connected Webull account on this app key.
+
+    Webull allows one live events subscription per app key, so two connected
+    accounts sharing a key — two users here, or the same keys entered twice —
+    leave one listener refused forever. The account being connected/activated
+    wins; the others go inactive (keys kept, one click to take back). Any user's
+    account, not just the actor's: the conflict is at Webull, per key.
+
+    Stored keys are encrypted, so each connected Webull row is decrypted and
+    compared — a handful of rows, on connect/activate only.
+    """
+    if acct.broker != BrokerName.WEBULL:
+        return []
+    key = str(creds.get("app_key") or "").strip()
+    if not key:
+        return []
+    released = []
+    for other in db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.broker == BrokerName.WEBULL,
+            BrokerAccount.connection_status == "connected",
+            BrokerAccount.id != acct.id,
+        )
+    ).scalars():
+        try:
+            other_key = str(decrypt_json(other.encrypted_credentials).get("app_key") or "").strip()
+        except Exception:  # noqa: BLE001 — unreadable keys can't be the same key
+            continue
+        if other_key != key:
+            continue
+        other.connection_status = INACTIVE
+        audit.record(
+            db, actor_user_id=actor.id, action="broker.deactivated",
+            entity_type="broker_account", entity_id=other.id,
+            metadata={"broker": other.broker.value, "label": other.label,
+                      "reason": "app_key_in_use", "owner_user_id": str(other.user_id),
+                      "taken_by_account": str(acct.id)},
+            ip_address=client_ip(request),
+        )
+        if other.user_id != actor.id:
+            try:
+                create_notification(
+                    db, user_id=other.user_id, type="broker.deactivated",
+                    message=(
+                        f"Webull ({other.broker_account_number or other.label}) was "
+                        "deactivated: its app key was activated on another account. "
+                        "Webull allows only one live connection per key."
+                    ),
+                    metadata={"broker_account_id": str(other.id), "reason": "app_key_in_use"},
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("could not notify %s of app-key release", other.user_id, exc_info=True)
+        released.append(other)
+    if released:
+        db.flush()
+    return released
+
+
+def _after_release(released: list[BrokerAccount]) -> str | None:
+    """Post-commit side of _release_webull_app_key: stop the released owners'
+    listeners (so the stream is freed for the new one) and build the toast."""
+    if not released:
+        return None
+    for other in released:
+        cache.invalidate_broker_accounts(other.user_id)
+        try:
+            listeners.stop_listener(other.user_id)   # no-op for non-traders
+        except Exception:  # noqa: BLE001
+            log.exception("stop_listener for released app key failed (%s)", other.user_id)
+    names = ", ".join(o.broker_account_number or o.label for o in released)
+    plural = "connections" if len(released) > 1 else "connection"
+    return (f"Deactivated the other Webull {plural} using this app key ({names}) — "
+            "Webull allows only one live connection per key.")
 
 
 def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
@@ -932,6 +1011,7 @@ def connect(
     else:
         db.add(acct)
     db.flush()
+    released = _release_webull_app_key(db, acct, creds, user, request)
     audit.record(
         db, actor_user_id=user.id, action="broker.connected",
         entity_type="broker_account", entity_id=acct.id,
@@ -942,6 +1022,7 @@ def connect(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
+    acct.notice = _after_release(released)
 
     # If the connecting user is a trader, spin up the listener so trades
     # placed directly at the broker propagate to subscribers. The
@@ -1151,6 +1232,7 @@ def activate_broker(
 
     _lock_user_brokers(db, user.id)
     _deactivate_other_brokers(db, user, request, keep_id=acct.id, reason="switched")
+    released = _release_webull_app_key(db, acct, creds, user, request)
     acct.connection_status = "connected"
     acct.last_error = None
     if info.broker_account_id:
@@ -1168,6 +1250,7 @@ def activate_broker(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
+    acct.notice = _after_release(released)
     _start_trader_listener(user, acct)
     return acct
 

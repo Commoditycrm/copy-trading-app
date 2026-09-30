@@ -87,6 +87,9 @@ export interface BrokerAccount {
   brokerage_name?: string | null;
   // "inactive" = kept on file but paused; exactly one account is "connected".
   connection_status: "pending" | "connected" | "error" | "inactive";
+  /** One-off toast from connect / activate (e.g. another account on the same
+   *  Webull app key was deactivated). Only on those responses. */
+  notice?: string | null;
   last_error: string | null;
   created_at: string;
 

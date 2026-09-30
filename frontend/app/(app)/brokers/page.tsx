@@ -544,7 +544,7 @@ export default function BrokersPage() {
     e.preventDefault();
     setBusy(true);
     try {
-      await api("/api/brokers", {
+      const created = await api<BrokerAccount>("/api/brokers", {
         method: "POST",
         body: JSON.stringify({
           broker: "webull",
@@ -560,6 +560,7 @@ export default function BrokersPage() {
       });
       resetConnectForms();
       notify.success(`Webull ${webullPaper ? "paper " : ""}connected — real-time stream starting`);
+      if (created?.notice) notify.warn(created.notice);
       await load();
     } catch (e) {
       notify.fromError(e, "Webull connect failed");
@@ -672,8 +673,9 @@ export default function BrokersPage() {
     if (!confirm(msg)) return;
     setSwitching(a.id);
     try {
-      await api<BrokerAccount>(`/api/brokers/${a.id}/${activate ? "activate" : "deactivate"}`, { method: "POST" });
+      const res = await api<BrokerAccount>(`/api/brokers/${a.id}/${activate ? "activate" : "deactivate"}`, { method: "POST" });
       notify.success(activate ? `${a.label} is now the active broker` : `${a.label} deactivated`);
+      if (res?.notice) notify.warn(res.notice);
       emitBrokerChanged();
       await load();
     } catch (e) {
