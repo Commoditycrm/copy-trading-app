@@ -299,23 +299,22 @@ def _with_nearest_expiry(adapter: Any, symbol: str, signal: dict, positions: lis
             if p.option_strike == strike and p.option_right == right and (p.quantity or 0) != 0]
     if held:
         return signal     # _resolve_contract fills it from the held position
-    if not hasattr(adapter, "list_option_contracts"):
-        raise ExecutionRefused("The alert names no expiry and this broker can't list contracts.")
     from datetime import timedelta  # noqa: PLC0415
 
     today = market_hours.now_et().date()
+    end = today + timedelta(days=21)
+    want_cp = "C" if right is OptionRight.CALL else "P"
     try:
-        contracts = adapter.list_option_contracts(
-            underlying=_chain_root(symbol), expiry_gte=today,
-            expiry_lte=today + timedelta(days=21), limit=2000,
-        )
+        expiries = _data_account_expiries(_chain_root(symbol), strike, right, today, end)
+        if expiries is None:
+            expiries = _broker_expiries(adapter, symbol, strike, want_cp, today, end)
     except Exception as exc:  # noqa: BLE001
         raise ExecutionRefused(f"The alert names no expiry and the option chain couldn't be read: {exc}") from exc
-    want_cp = "C" if right is OptionRight.CALL else "P"
-    expiries = sorted({
-        _date(getattr(c, "expiration_date", None)) for c in contracts
-        if _dec(getattr(c, "strike_price", None)) == strike and _contract_type(c) == want_cp
-    } - {None})
+    if expiries is None:
+        raise ExecutionRefused(
+            "The alert names no expiry, and there is no way to list contracts here "
+            "(no Alpaca market-data key, and this broker can't list them)."
+        )
     if not expiries:
         raise ExecutionRefused(
             f"The alert names no expiry and {symbol} lists no ${strike} "
@@ -323,6 +322,68 @@ def _with_nearest_expiry(adapter: Any, symbol: str, signal: dict, positions: lis
         )
     resolutions["expiration"] = f"{expiries[0]} (nearest listed — the alert gave none)"
     return {**signal, "expiration": expiries[0].isoformat()}
+
+
+def _data_account_expiries(root: str, strike: Decimal, right: OptionRight,
+                           start: date, end: date) -> list[date] | None:
+    """Expiries between ``start`` and ``end`` that list this strike and right,
+    soonest first — from the Alpaca DATA account's option chain.
+
+    Listed contracts are market data, the same whatever broker trades them, so
+    they come from the dedicated data key like every other price in the app —
+    which is also what lets a Webull (or any) trader take "AMZN245P .55". None
+    when the data key isn't configured.
+    """
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    if not (s.alpaca_data_api_key and s.alpaca_data_api_secret):
+        return None
+    from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+    from alpaca.data.requests import OptionChainRequest  # noqa: PLC0415
+    from alpaca.trading.enums import ContractType  # noqa: PLC0415
+
+    client = OptionHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+    chain = client.get_option_chain(OptionChainRequest(
+        underlying_symbol=root,
+        type=ContractType.CALL if right is OptionRight.CALL else ContractType.PUT,
+        strike_price_gte=float(strike), strike_price_lte=float(strike),
+        expiration_date_gte=start, expiration_date_lte=end,
+    ))
+    found = set()
+    for occ in (chain or {}):
+        parsed = _occ_expiry_strike_right(occ)
+        if parsed and parsed[1] == strike and parsed[2] is right and start <= parsed[0] <= end:
+            found.add(parsed[0])
+    return sorted(found)
+
+
+def _occ_expiry_strike_right(occ: str) -> tuple[date, Decimal, OptionRight] | None:
+    """"AMZN261002P00245000" → (2026-10-02, 245, PUT)."""
+    import re  # noqa: PLC0415
+    m = re.fullmatch(r"[A-Z0-9.]{1,6}(\d{6})([CP])(\d{8})", (occ or "").strip().upper())
+    if not m:
+        return None
+    ymd, cp, strike = m.groups()
+    try:
+        expiry = date(2000 + int(ymd[:2]), int(ymd[2:4]), int(ymd[4:]))
+    except ValueError:
+        return None
+    return expiry, Decimal(strike) / 1000, OptionRight.CALL if cp == "C" else OptionRight.PUT
+
+
+def _broker_expiries(adapter: Any, symbol: str, strike: Decimal, want_cp: str,
+                     start: date, end: date) -> list[date] | None:
+    """The same, from the broker's own contract list — the fallback when no
+    data key is set. None when the broker can't list contracts."""
+    if not hasattr(adapter, "list_option_contracts"):
+        return None
+    contracts = adapter.list_option_contracts(
+        underlying=_chain_root(symbol), expiry_gte=start, expiry_lte=end, limit=2000,
+    )
+    return sorted({
+        _date(getattr(c, "expiration_date", None)) for c in contracts
+        if _dec(getattr(c, "strike_price", None)) == strike and _contract_type(c) == want_cp
+    } - {None})
 
 
 def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
