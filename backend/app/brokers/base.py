@@ -16,6 +16,34 @@ from app.models.order import InstrumentType, OptionRight, OrderSide, OrderStatus
 
 
 @dataclass(frozen=True)
+class BrokerCapabilities:
+    """What a broker's API can authoritatively tell us about P&L. Core P&L logic
+    branches on these, NOT on broker names — so adding a broker is a matter of
+    declaring its capabilities, not editing pnl.py. Every flag defaults False:
+    an undeclared broker is treated as exposing nothing, which is the safe side
+    (we never fabricate confident numbers from data we don't have)."""
+
+    # A COMPLETE, authoritative record of every execution exists via the broker's
+    # API (an activity/fills feed). Only then may we FIFO realized P&L AND infer
+    # that a lot still open past expiry truly expired worthless. Without it, a
+    # remaining open lot is more likely a close we simply never received than a
+    # real expiry — see the Webull phantom-loss finding.
+    authoritative_fill_history: bool = False
+    # Broker exposes a per-day historical P&L series we can pull (e.g. Alpaca
+    # portfolio-history). False → historical days can't be reproduced exactly.
+    historical_daily_pnl: bool = False
+    # Broker reports today's live Day's P&L directly (a real API field).
+    live_daily_pnl: bool = False
+    # Broker reports current open-position unrealized authoritatively.
+    authoritative_open_pnl: bool = False
+    # Broker exposes an authoritative realized-P&L figure via a real API field
+    # (NOT our FIFO inference). Only set when verified against an actual field.
+    authoritative_realized_pnl: bool = False
+    # Broker exposes a marked portfolio-history series (Alpaca).
+    portfolio_history: bool = False
+
+
+@dataclass(frozen=True)
 class ConnectionInfo:
     broker_account_id: str | None
     supports_fractional: bool
@@ -113,6 +141,12 @@ class BrokerAdapter(ABC):
     """One instance per BrokerAccount. Hold decrypted credentials in-memory only."""
 
     name: str
+
+    # What this broker's API can authoritatively report. Concrete adapters
+    # override with their own; the default declares nothing (safe). Also exposed
+    # name-keyed via app.brokers.capabilities.capabilities_for for callers that
+    # only hold a BrokerName (e.g. pnl.py) and shouldn't build an adapter.
+    capabilities: "BrokerCapabilities" = BrokerCapabilities()
 
     def __init__(self, credentials: dict[str, Any]):
         self.credentials = credentials

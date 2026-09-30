@@ -530,12 +530,20 @@ def realized_pnl_by_day(
     #     arsalan's SPXW puts — the gain our FIFO was missing).
     # Closing every remaining lot at $0 gives both signs for free:
     #   (0 − price) × qty × 100  →  negative for qty>0 (long), positive for qty<0.
-    # ITM / cash-settled expiries settle at a NON-zero value only the broker's
-    # settlement feed knows (Alpaca reports it as OPEXP.net_amount); none of the
-    # live accounts have one yet, so that overlay is a documented follow-up.
     #
+    # CAPABILITY GATE — the load-bearing safety. This inference ("still open past
+    # expiry ⇒ expired worthless") is only valid when we have the broker's
+    # COMPLETE fill history. Without it (Webull direct), a lot looks open only
+    # because we never received its closing fill, and booking $0 invents a
+    # phantom loss — gaurav's realized read −$19,904 vs Webull's −$6,627, almost
+    # entirely from this. So we book expiries ONLY for brokers whose capability
+    # says their fill history is authoritative, keyed off the lot's broker.
+    #
+    # ITM / cash-settled expiries settle at a NON-zero value only the broker's
+    # settlement feed knows (Alpaca OPEXP.net_amount) — a documented follow-up.
     # Timing matches the broker app: Alpaca reflects the expiry ON the expiry
-    # day (OPEXP.date == expiry), Webull/SnapTrade on the NEXT business day.
+    # day (OPEXP.date == expiry), everyone else on the NEXT business day.
+    from app.brokers.capabilities import capabilities_for  # local — avoid cycle
     today = datetime.now(bucket_tz).date()
     for key, lots in open_lots.items():
         if not lots or key[0] != "OPT":
@@ -543,9 +551,11 @@ def realized_pnl_by_day(
         exp = key[2]                        # option_expiry date from _instrument_key
         if exp is None:
             continue
-        # Alpaca books it same-day; everyone else the next business day. Lots on
-        # one contract share a broker, so the first lot's broker decides.
+        # Lots on one contract share a broker, so the first lot's broker decides.
         broker = lots[0].broker
+        if not capabilities_for(broker).authoritative_fill_history:
+            continue                        # can't prove worthless expiry without
+                                            # a complete fill feed (Webull direct)
         book_day = exp if broker == BrokerName.ALPACA else _next_business_day(exp)
         if book_day >= today:
             continue                        # only settled past days — never today,

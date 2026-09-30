@@ -1,15 +1,25 @@
 from app.brokers.alpaca import AlpacaAdapter, build_occ_symbol
 from app.brokers.base import (
     BrokerAdapter,
+    BrokerCapabilities,
     BrokerOrderRequest,
     BrokerOrderResult,
     BrokerPosition,
     ConnectionInfo,
 )
+from app.brokers.capabilities import capabilities_for
 from app.brokers.fake import FakeBrokerAdapter
 from app.brokers.ibkr import IBKRAdapter
 from app.brokers.snaptrade import SnapTradeAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
+
+# Expose each broker's capabilities on its adapter class (single source is
+# app.brokers.capabilities). WebullAdapter is imported lazily inside adapter_for
+# to avoid its SDK at import time, so it reads capabilities_for(WEBULL) itself.
+AlpacaAdapter.capabilities = capabilities_for(BrokerName.ALPACA)
+SnapTradeAdapter.capabilities = capabilities_for(BrokerName.SNAPTRADE)
+IBKRAdapter.capabilities = capabilities_for(BrokerName.IBKR)
+FakeBrokerAdapter.capabilities = capabilities_for(BrokerName.FAKE)
 
 
 def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapter:
@@ -51,6 +61,8 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
 __all__ = [
     "AlpacaAdapter",
     "BrokerAdapter",
+    "BrokerCapabilities",
+    "capabilities_for",
     "BrokerOrderRequest",
     "BrokerOrderResult",
     "BrokerPosition",
