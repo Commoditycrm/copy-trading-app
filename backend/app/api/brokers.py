@@ -12,14 +12,15 @@ Supported brokers
   a single integration. Realtime via 5s polling — SnapTrade itself polls
   the upstream broker, so faster polling on our side buys nothing.
 
-One-broker-per-user
--------------------
-A user can only have one connected broker at a time. Connecting a new
-one *replaces* any existing connection — we delete the old row, stop
-its listener, and start the new one. This keeps copy-trading semantics
-unambiguous (one source of truth for the trader's fills) and matches
-the UI shape, which only shows the connect form when no broker is
-attached.
+One ACTIVE broker per user
+--------------------------
+A user can keep several brokers on file but only one is ACTIVE
+(``connection_status == "connected"``) at a time. Connecting a new one
+makes it active and switches the previous one to ``inactive`` — kept,
+keys and all, not deleted — so a trader can go back to it with Activate
+instead of re-entering keys. Deactivate pauses the active one. Everything
+that trades or listens selects ``connected`` only, so an inactive broker
+is invisible to it; one source of truth for the trader's fills remains.
 
 Flow
 ----
@@ -304,38 +305,76 @@ def _lock_user_brokers(db: Session, user_id: uuid.UUID) -> None:
     )
 
 
-def _evict_existing_brokers(
-    db: Session, user: User, request: Request
-) -> None:
-    """One-broker-per-user: delete any existing broker_account rows for
-    this user and stop their listeners. Called before inserting a new
-    one. Audits each eviction so the trail shows why the old connection
-    went away.
+INACTIVE = "inactive"
 
-    Existing Order rows survive — broker_account_id is SET NULL on
-    delete (see Order model). The trader's history doesn't disappear
-    just because they switched brokers."""
-    existing = list(db.execute(
-        select(BrokerAccount).where(BrokerAccount.user_id == user.id)
+
+def _deactivate_other_brokers(
+    db: Session, user: User, request: Request, keep_id: uuid.UUID | None = None,
+    reason: str = "replaced",
+) -> list[BrokerAccount]:
+    """One ACTIVE broker per user: switch every other connected account to
+    ``inactive`` and stop the trader's listener. Returns the accounts changed.
+    SnapTrade accounts are the exception — they are removed, not paused.
+
+    Accounts are no longer deleted when another is connected — the trader keeps
+    their keys and can switch back with Activate instead of re-entering them.
+    ``inactive`` is invisible to everything that trades: listeners, the copy
+    engine, positions, stops and balance sync all select
+    ``connection_status == "connected"``. Order history keeps its links.
+    """
+    rows = list(db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.connection_status == "connected",
+        )
     ).scalars())
-    for acct in existing:
+    changed = [a for a in rows if a.id != keep_id]
+    for acct in changed:
+        if acct.broker == BrokerName.SNAPTRADE:
+            # SnapTrade connections are never kept inactive: their link to the
+            # underlying broker stays live on SnapTrade's side (and may be
+            # billed) while paused here. Replaced exactly as before multi-broker
+            # support — the row is removed locally; order history survives
+            # (broker_account_id is SET NULL on delete).
+            audit.record(
+                db, actor_user_id=user.id, action="broker.replaced",
+                entity_type="broker_account", entity_id=acct.id,
+                metadata={"broker": acct.broker.value, "label": acct.label},
+                ip_address=client_ip(request),
+            )
+            db.delete(acct)
+            continue
+        acct.connection_status = INACTIVE
         audit.record(
-            db, actor_user_id=user.id, action="broker.replaced",
+            db, actor_user_id=user.id, action="broker.deactivated",
             entity_type="broker_account", entity_id=acct.id,
-            metadata={"broker": acct.broker.value, "label": acct.label},
+            metadata={"broker": acct.broker.value, "label": acct.label, "reason": reason},
             ip_address=client_ip(request),
         )
-        db.delete(acct)
-    if existing:
+    if changed:
         db.flush()
         # Stop whichever listener was servicing the trader. Safe to call
-        # unconditionally — listeners.stop_listener tries both Alpaca
-        # and Webull backends, no-ops when nothing is running.
+        # unconditionally — listeners.stop_listener tries every backend and
+        # no-ops when nothing is running.
         if user.role == UserRole.TRADER:
             try:
                 listeners.stop_listener(user.id)
             except Exception:  # noqa: BLE001
-                log.exception("stop_listener during broker replacement failed")
+                log.exception("stop_listener while deactivating a broker failed")
+    return changed
+
+
+def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
+    """Start the trader's listener inline when this process runs background
+    workers. In the web/worker split the worker's listeners.reconcile() picks
+    the active account up within one interval instead — the web container must
+    never run a listener of its own (duplicate poller, double-processed fills).
+    """
+    if user.role == UserRole.TRADER and get_settings().run_background_workers:
+        try:
+            listeners.start_listener(user.id, acct.id)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start listener for broker %s", acct.id)
 
 
 @router.post("/snaptrade/webhook")
@@ -481,7 +520,7 @@ def snaptrade_finish(
     Concurrency: we acquire a per-user advisory lock at the top of the
     transaction. Without it, two concurrent /finish calls (most likely
     cause: React Strict Mode double-firing the redirect-back effect)
-    both run _evict_existing_brokers before either commits, and the
+    both run _deactivate_other_brokers before either commits, and the
     user ends up with two BrokerAccount rows pointing at the same
     SnapTrade authorization — each with its own polling listener
     double-processing every trade. The advisory lock serialises per-
@@ -503,10 +542,18 @@ def snaptrade_finish(
     # rather than by authorization_id because the encrypted_credentials
     # blob is opaque to a WHERE clause — but one-broker-per-user means
     # the user_id+broker pair is unique enough.
+    #
+    # Only a CONNECTED row created moments ago counts. With several brokers on
+    # file, an older SnapTrade connection can legitimately sit INACTIVE; matching
+    # it here would hand that stale row back and the new connection would
+    # silently never be made. The race this guards against is seconds wide.
+    from datetime import timedelta  # noqa: PLC0415
     existing_snap = db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == user.id,
             BrokerAccount.broker == BrokerName.SNAPTRADE,
+            BrokerAccount.connection_status == "connected",
+            BrokerAccount.created_at >= datetime.now(timezone.utc) - timedelta(minutes=2),
         ).order_by(BrokerAccount.created_at.desc()).limit(1)
     ).scalar_one_or_none()
     if existing_snap is not None:
@@ -615,8 +662,9 @@ def snaptrade_finish(
             f"Alpaca, …) or connect Alpaca directly with API keys.",
         )
 
-    # Evict any existing broker first (one-broker-per-user).
-    _evict_existing_brokers(db, user, request)
+    # One ACTIVE broker per user: the one being connected replaces the current
+    # one as active; the old one is kept, inactive, for switching back.
+    _deactivate_other_brokers(db, user, request)
 
     acct = BrokerAccount(
         user_id=user.id,
@@ -712,10 +760,22 @@ def _webull_error_message(exc: BaseException) -> str:
             "Webull rejected this API token as invalid or expired. Generate a "
             "fresh key at developer.webull.com and reconnect."
         )
+    if "too_many_requests" in low or "too many requests" in low or "429" in raw:
+        # Every connect / "Load my accounts" click re-runs Webull's token
+        # handshake, and the same key used from two places (local and QA) shares
+        # one limit — rapid retries are what trip it.
+        return (
+            "Webull is rate-limiting this API key (too many requests). Wait a "
+            "minute or two, then try once — each attempt re-runs Webull's token "
+            "check, and the same key used elsewhere (another environment or "
+            "browser) counts against the same limit."
+        )
     if "unauthorized" in low or "invalid credentials" in low or "401" in raw:
         return (
             "Webull rejected these credentials. Check the app key and secret are "
-            "copied exactly, and that the key is enabled for the Trading API."
+            "copied exactly, that the key is enabled for the Trading API, and "
+            "that Paper / Live matches the key: paper (test) keys only work in "
+            "Paper mode and live keys only in Live."
         )
     return f"broker_error: {raw}"
 
@@ -797,7 +857,7 @@ def connect(
     )
 
     # VERIFY BEFORE EVICTING. A failed connect must leave the user's EXISTING
-    # broker exactly as it was. It previously didn't: _evict_existing_brokers ran
+    # broker exactly as it was. It previously didn't: the old eviction step ran
     # first and the failure handler's db.commit() (written to persist the audit
     # row) also committed those pending DELETEs — so a rejected attempt silently
     # disconnected the working broker and copy trading stopped with a
@@ -843,11 +903,34 @@ def connect(
     # and serialising only the write is both safe and cheap.
     _lock_user_brokers(db, user.id)
 
-    # One-broker-per-user; evicting here (before the broker.connected audit
-    # below) keeps the audit trail reading naturally: replaced → connected.
-    _evict_existing_brokers(db, user, request)
+    # One ACTIVE broker per user. The current one goes inactive (kept, not
+    # deleted); doing it before the broker.connected audit keeps the trail
+    # reading naturally: deactivated → connected.
+    _deactivate_other_brokers(db, user, request)
 
-    db.add(acct)
+    # Reconnecting an account that is already on file (same broker, same
+    # account at that broker) refreshes that row instead of adding a twin — the
+    # copy engine mirrors once per CONNECTED row, and history stays on one id.
+    same = None
+    if acct.broker_account_number:
+        same = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.broker == acct.broker,
+                BrokerAccount.broker_account_number == acct.broker_account_number,
+            )
+        ).scalars().first()
+    if same is not None:
+        for field in ("label", "is_paper", "supports_fractional", "encrypted_credentials",
+                      "connection_status"):
+            setattr(same, field, getattr(acct, field))
+        for field in ("cash", "buying_power", "total_equity", "balance_updated_at"):
+            if hasattr(acct, field) and getattr(acct, field) is not None:
+                setattr(same, field, getattr(acct, field))
+        same.last_error = None
+        acct = same
+    else:
+        db.add(acct)
     db.flush()
     audit.record(
         db, actor_user_id=user.id, action="broker.connected",
@@ -871,12 +954,7 @@ def connect(
     # fills), and it can't start a task in the worker anyway. There the
     # worker's periodic listeners.reconcile() picks the new broker up within
     # one interval.
-    if user.role == UserRole.TRADER and get_settings().run_background_workers:
-        try:
-            listeners.start_listener(user.id, acct.id)
-        except Exception:  # noqa: BLE001
-            log.exception("failed to start listener for new broker")
-
+    _start_trader_listener(user, acct)
     return acct
 
 
@@ -995,6 +1073,105 @@ def update_broker_account_settings(
     return acct
 
 
+@router.post("/{account_id}/deactivate", response_model=BrokerAccountOut)
+def deactivate_broker(
+    account_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> BrokerAccount:
+    """Pause a broker connection without deleting it.
+
+    Keys stay stored (encrypted); nothing trades, copies or listens through it
+    until it is activated again. Positions already open at that broker stay
+    open — the app just stops managing them.
+    """
+    _lock_user_brokers(db, user.id)
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if acct.broker == BrokerName.SNAPTRADE:
+        # Pausing locally would leave SnapTrade's link to the broker live (and
+        # possibly billed) with nothing using it. Disconnect instead.
+        raise HTTPException(
+            400, "SnapTrade connections can't be deactivated — disconnect it instead.",
+        )
+    if acct.connection_status == INACTIVE:
+        return acct
+    acct.connection_status = INACTIVE
+    audit.record(
+        db, actor_user_id=user.id, action="broker.deactivated",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"broker": acct.broker.value, "label": acct.label, "reason": "user"},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
+    if user.role == UserRole.TRADER:
+        try:
+            listeners.stop_listener(user.id)
+        except Exception:  # noqa: BLE001
+            log.exception("stop_listener after broker deactivate failed")
+    return acct
+
+
+@router.post("/{account_id}/activate", response_model=BrokerAccountOut)
+def activate_broker(
+    account_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> BrokerAccount:
+    """Make a stored broker the active one; the current active one goes inactive.
+
+    The stored keys are verified first — a key can expire, or a Webull token
+    lapse, while the account sat inactive — and nothing is switched unless the
+    broker accepts them, so a failed activate leaves the current broker active.
+    """
+    acct = db.get(BrokerAccount, account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if acct.connection_status == "connected":
+        return acct
+    if acct.broker == BrokerName.WEBULL and not get_settings().webull_direct_enabled:
+        raise HTTPException(400, "Direct Webull is not enabled on this server "
+                                 "(webull_direct_enabled is off).")
+
+    creds = decrypt_json(acct.encrypted_credentials)
+    # Verify outside the lock: for Webull this can include the token/2FA flow.
+    try:
+        info = adapter_for(acct, creds).verify_connection()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            400,
+            _webull_error_message(exc) if acct.broker == BrokerName.WEBULL
+            else f"broker_error: {exc}",
+        ) from exc
+
+    _lock_user_brokers(db, user.id)
+    _deactivate_other_brokers(db, user, request, keep_id=acct.id, reason="switched")
+    acct.connection_status = "connected"
+    acct.last_error = None
+    if info.broker_account_id:
+        acct.broker_account_number = info.broker_account_id
+    try:
+        _refresh_balance_into(acct, creds)
+    except Exception:  # noqa: BLE001
+        log.warning("balance refresh on activate failed for %s", acct.id, exc_info=True)
+    audit.record(
+        db, actor_user_id=user.id, action="broker.activated",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"broker": acct.broker.value, "label": acct.label},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
+    _start_trader_listener(user, acct)
+    return acct
+
+
 @router.delete("/{account_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_broker(
     account_id: uuid.UUID,
@@ -1032,7 +1209,9 @@ def delete_broker(
         metadata={"broker": acct.broker.value, "label": acct.label},
         ip_address=client_ip(request),
     )
-    was_trader = user.role == UserRole.TRADER
+    # Only the ACTIVE account has a listener. Deleting an inactive one must not
+    # stop the listener that is servicing the active broker.
+    was_active_trader = user.role == UserRole.TRADER and acct.connection_status == "connected"
     db.delete(acct)
     db.commit()
     cache.invalidate_broker_accounts(user.id)
@@ -1040,7 +1219,7 @@ def delete_broker(
     # Stop whichever listener was running for the trader (Alpaca,
     # Webull, or SnapTrade). Dispatcher tries all — safe even if none
     # was active.
-    if was_trader:
+    if was_active_trader:
         try:
             listeners.stop_listener(user.id)
         except Exception:  # noqa: BLE001

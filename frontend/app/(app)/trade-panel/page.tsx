@@ -222,8 +222,11 @@ export default function TradePanelPage() {
   useEffect(() => {
     api<BrokerAccount[]>("/api/brokers")
       .then(a => {
-        setAccts(a);
-        if (a.length && !acctId) setAcctId(a[0].id);
+        // Only the ACTIVE broker trades — an inactive one is kept on file but
+        // paused, and ordering against it would be refused.
+        const live = a.filter(x => x.connection_status === "connected");
+        setAccts(live);
+        if (live.length && !acctId) setAcctId(live[0].id);
       })
       .finally(() => setAcctsLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps

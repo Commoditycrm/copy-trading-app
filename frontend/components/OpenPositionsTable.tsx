@@ -636,7 +636,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         setUnreachable(down);
         workingRef.current = ords.some((o) => WORKING_STATUSES.has(o.status));
         if (realized) setTodayRealized(realized.realized_pnl);
-        setTotalEquity(brokers.reduce((acc, b) => acc + (Number(b.total_equity) || 0), 0));
+        // The active broker's equity — an inactive one is paused, not holding
+        // anything this app manages.
+        setTotalEquity(brokers
+          .filter(b => b.connection_status === "connected")
+          .reduce((acc, b) => acc + (Number(b.total_equity) || 0), 0));
         // Never persist a KNOWN-INCOMPLETE view. The snapshot seeds initial
         // state on return nav, so caching a truncated read makes one failed
         // broker call look like a flat account long after it recovered.

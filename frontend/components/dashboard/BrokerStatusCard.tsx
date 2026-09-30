@@ -10,6 +10,7 @@ const STATUS_META = {
   connected: { label: "Connected", color: "var(--good)", bg: "var(--good-soft)", Icon: PlugZap },
   pending: { label: "Pending", color: "var(--warn)", bg: "rgba(180,120,10,0.12)", Icon: Plug },
   error: { label: "Error", color: "var(--bad)", bg: "var(--bad-soft)", Icon: AlertTriangle },
+  inactive: { label: "Inactive", color: "var(--muted)", bg: "var(--panel)", Icon: Plug },
 } as const;
 
 function brokerLabel(b: BrokerAccount): string {

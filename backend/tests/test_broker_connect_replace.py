@@ -81,9 +81,9 @@ def _make_session():
     return db
 
 
-def _existing_broker(db, label="SnapTrade (working)") -> uuid.UUID:
+def _existing_broker(db, label="SnapTrade (working)", broker=BrokerName.SNAPTRADE) -> uuid.UUID:
     acct = BrokerAccount(
-        id=uuid.uuid4(), user_id=_USER, broker=BrokerName.SNAPTRADE, label=label,
+        id=uuid.uuid4(), user_id=_USER, broker=broker, label=label,
         is_paper=False, supports_fractional=True,
         encrypted_credentials=brokers_api.encrypt_json({"snaptrade_user_id": "u"}),
         connection_status="connected",
@@ -226,27 +226,51 @@ def test_repeated_failures_still_leave_the_broker_intact():
 
 
 # ── the designed behaviour still holds ──────────────────────────────────────
-def test_successful_connect_replaces_the_existing_broker():
+def test_a_direct_broker_is_kept_inactive_when_another_connects():
+    """One ACTIVE broker per user, but a direct connection is kept (inactive)
+    so the trader can switch back without re-entering keys."""
+    db = _make_session()
+    existing_id = _existing_broker(db, "Webull (working)", BrokerName.WEBULL)
+    acct = _connect(db, lambda: ConnectionInfo(
+        broker_account_id="ACCT-123", supports_fractional=False, extra={},
+    ))
+    by_id = {a.id: a for a in _accounts(db)}
+    assert set(by_id) == {existing_id, acct.id}
+    assert by_id[existing_id].connection_status == "inactive"
+    new = by_id[acct.id]
+    assert new.broker == BrokerName.ALPACA
+    assert new.connection_status == "connected"
+    assert new.broker_account_number == "ACCT-123"
+    assert new.supports_fractional is False   # taken from ConnectionInfo
+
+
+def test_a_snaptrade_connection_is_replaced_not_kept():
+    """SnapTrade is never left inactive — its link to the broker would stay
+    live on SnapTrade's side. Replaced exactly as before multi-broker support."""
     db = _make_session()
     existing_id = _existing_broker(db)
     acct = _connect(db, lambda: ConnectionInfo(
         broker_account_id="ACCT-123", supports_fractional=False, extra={},
     ))
     accts = _accounts(db)
-    assert len(accts) == 1
-    assert accts[0].id == acct.id != existing_id
-    assert accts[0].broker == BrokerName.ALPACA
+    assert [a.id for a in accts] == [acct.id] != [existing_id]
     assert accts[0].connection_status == "connected"
-    assert accts[0].broker_account_number == "ACCT-123"
-    assert accts[0].supports_fractional is False   # taken from ConnectionInfo
 
 
-def test_successful_connect_audits_replaced_then_connected():
-    """Eviction still happens before the new row is audited, so the trail reads
-    replaced -> connected rather than the reverse."""
+def test_successful_connect_audits_the_old_broker_first():
+    """The old broker is handled before the new row is audited, so the trail
+    reads deactivated/replaced -> connected rather than the reverse."""
+    db = _make_session()
+    _existing_broker(db, "Webull (working)", BrokerName.WEBULL)
+    actions: list[str] = []
+    _connect(db, lambda: ConnectionInfo(
+        broker_account_id="A", supports_fractional=True, extra={},
+    ), audited=actions)
+    assert actions == ["broker.deactivated", "broker.connected"]
+
     db = _make_session()
     _existing_broker(db)
-    actions: list[str] = []
+    actions = []
     _connect(db, lambda: ConnectionInfo(
         broker_account_id="A", supports_fractional=True, extra={},
     ), audited=actions)

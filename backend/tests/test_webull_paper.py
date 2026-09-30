@@ -77,3 +77,19 @@ def test_connect_and_account_listing_carry_the_flag():
     src = inspect.getsource(brokers)
     assert 'creds["paper"] = bool(payload.webull.paper)' in src
     assert '"paper": bool(payload.paper),' in src
+
+
+def test_a_rate_limit_explains_itself():
+    from app.api.brokers import _webull_error_message
+
+    msg = _webull_error_message(Exception("HTTP Status: 429, Code: TOO_MANY_REQUESTS"))
+    assert "rate-limiting" in msg and "broker_error" not in msg
+
+
+def test_an_environment_mismatch_mentions_paper_and_live():
+    from app.api.brokers import _webull_error_message
+
+    msg = _webull_error_message(Exception(
+        "HTTP Status: 401, Code: UNAUTHORIZED, Msg: Invalid credentials. Please verify "
+        "your credentials and ensure you are connecting to the correct environment"))
+    assert "Paper / Live" in msg
