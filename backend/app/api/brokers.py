@@ -943,6 +943,10 @@ def connect(
     # "skipped_no_broker". Direct Webull made that routine rather than rare: its
     # first connect normally fails while the user approves the 2FA push in the
     # Webull app, and the retry is the one that succeeds.
+    if payload.broker == BrokerName.WEBULL:
+        # The user is acting now: give them a real sign-in, not a back-off wait.
+        from app.brokers.webull import clear_sign_in_backoff  # noqa: PLC0415
+        clear_sign_in_backoff(str(creds.get("app_key") or ""))
     try:
         info = adapter_for(acct, creds).verify_connection()
         acct.broker_account_number = info.broker_account_id
@@ -1220,6 +1224,9 @@ def activate_broker(
                                  "(webull_direct_enabled is off).")
 
     creds = decrypt_json(acct.encrypted_credentials)
+    if acct.broker == BrokerName.WEBULL:
+        from app.brokers.webull import clear_sign_in_backoff  # noqa: PLC0415
+        clear_sign_in_backoff(str(creds.get("app_key") or ""))
     # Verify outside the lock: for Webull this can include the token/2FA flow.
     try:
         info = adapter_for(acct, creds).verify_connection()

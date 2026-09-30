@@ -490,6 +490,28 @@ def use_paper_endpoint(api_client, region_id: str, paper: bool) -> None:
 _trade_clients: dict[str, Any] = {}          # app_key -> (client, built_at)
 _trade_client_lock = threading.Lock()
 
+# A FAILED sign-in is remembered too. Only a successful client was cached, so
+# after a 429 every caller — the order poller, the P&L poller, the auto-trim
+# sweep, balance refresh — rebuilt the client and hit Webull's auth endpoint
+# again at once, keeping the key rate-limited indefinitely. Now a failure puts
+# the key in back-off (60s, doubling to 15 min) and callers fail fast until it
+# ends. An explicit connect / activate clears it (clear_sign_in_backoff).
+_SIGNIN_BACKOFF_BASE_S = 60.0
+_SIGNIN_BACKOFF_MAX_S = 900.0
+_signin_backoff: dict[str, tuple[float, int]] = {}   # app_key -> (retry_at, failures)
+
+
+class WebullSignInBackoff(RuntimeError):
+    """Raised instead of calling Webull while a recent sign-in failure's
+    back-off is running."""
+
+
+def clear_sign_in_backoff(app_key: str) -> None:
+    """Forget a key's sign-in failures — for a user connecting or activating it,
+    who should get a real attempt, not a wait."""
+    with _trade_client_lock:
+        _signin_backoff.pop(app_key, None)
+
 
 def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
                      paper: bool = False) -> Any:
@@ -511,6 +533,12 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
         cached = _trade_clients.get(app_key)
         if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
             return cached[0]
+        failed = _signin_backoff.get(app_key)
+        if failed is not None and now < failed[0]:
+            raise WebullSignInBackoff(
+                f"Webull sign-in is backing off for {failed[0] - now:.0f}s after "
+                f"{failed[1]} failed attempt(s) (rate limit) — try again shortly."
+            )
         from app.config import get_settings  # noqa: PLC0415
         _s = get_settings()
         api_client = ApiClient(
@@ -524,7 +552,15 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
         use_paper_endpoint(api_client, region_id, paper)
         _suppress_sdk_file_logger(api_client)
         set_per_account_token_dir(api_client, app_key)   # isolate token per app_key
-        client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+        try:
+            client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+        except Exception:
+            count = (failed[1] if failed else 0) + 1
+            wait = min(_SIGNIN_BACKOFF_BASE_S * 2 ** (count - 1), _SIGNIN_BACKOFF_MAX_S)
+            _signin_backoff[app_key] = (now + wait, count)
+            log.warning("webull sign-in failed (%d in a row); backing off %.0fs", count, wait)
+            raise
+        _signin_backoff.pop(app_key, None)
         _trade_clients[app_key] = (client, now)
         return client
 
@@ -696,7 +732,15 @@ class WebullAdapter(BrokerAdapter):
     def get_stock_latest_price(self, symbol: str) -> "Decimal | None":
         """Last traded price for a stock, or None when unavailable. Used to price
         a marketable limit (copy_engine._marketable_stock_limit) — the caller
-        treats None as 'leave the order alone', so failing is never fatal."""
+        treats None as 'leave the order alone', so failing is never fatal.
+
+        Asked of the Alpaca data account first: Webull's quote calls share the
+        key's rate limits with orders, and prices are the same from either."""
+        from app.services import market_data_stream as mds  # noqa: PLC0415
+
+        px = mds.data_stock_price(symbol)
+        if px is not None and px > 0:
+            return px
         if not self._quotes_available():
             return None
         try:
@@ -720,7 +764,14 @@ class WebullAdapter(BrokerAdapter):
         """(bid, ask) for an OCC option symbol — the exact form Webull's option
         snapshot endpoint takes (e.g. AAPL260619C00220000). Either side may be
         None on a one-sided book; (None, None) when the quote is unavailable, at
-        which point the caller falls back to trader-anchored pricing."""
+        which point the caller falls back to trader-anchored pricing.
+
+        Asked of the Alpaca data account first (see get_stock_latest_price)."""
+        from app.services import market_data_stream as mds  # noqa: PLC0415
+
+        bid, ask = mds.data_option_bid_ask(occ_symbol)
+        if bid is not None or ask is not None:
+            return (bid, ask)
         if not self._quotes_available():
             return (None, None)
         try:
