@@ -1821,6 +1821,23 @@ def _execute_signal(
 
     signal = msg.parsed_signal or {}
 
+    # "Adding .4" names no contract: it means the position THIS channel is in.
+    # Fill the contract from the channel's own latest still-held buy; with
+    # nothing held from this channel there is nothing to add to.
+    if signal.get("add_to_latest") and not signal.get("symbol"):
+        try:
+            latest = discord_execution.latest_channel_contract(db, user, msg.source_id)
+        except Exception as exc:  # noqa: BLE001
+            discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
+            log.exception("discord: add-to-latest lookup failed for alert %s", msg.id)
+            return
+        if latest is None:
+            discord_execution.mark_failed(
+                msg, "An add with no contract, and you hold nothing this channel opened to add to."
+            )
+            return
+        signal = {**signal, **latest}
+
     # An entry that never filled — even after the +10% retry — is a bid for a
     # position the trader is already exiting. Left resting it can still fill
     # later, buying into a move whose exit signal has been given, with no rung
@@ -1893,7 +1910,18 @@ def _execute_signal(
         # Before ANY rung is measured: the ladder keys every level off the entry
         # price, and until the opening order fills that is only the limit we bid.
         guards.sync_entry_price(db, guard)
-        plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
+        if signal.get("flatten"):
+            # The channel called a full close. The ladder's profit gates exist
+            # to decide how much a TRIM sells; they must not keep a position
+            # open that the author has exited (live 2026-09-30: a JPM "Close"
+            # at -13% sold nothing because rung 2 wanted +35%). Sell it all.
+            plan = guards.TrimPlan(
+                rung=guard.sell_count or 0, guard=guard, sell_qty=held,
+                exit_style=guards.MARKET, retire=True,
+                note=f"close alert — selling all {held}",
+            )
+        else:
+            plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
 
         if plan.new_stop_price is not None:
             guard.stop_price = plan.new_stop_price
