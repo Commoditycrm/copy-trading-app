@@ -9,6 +9,7 @@ const STATE_COLORS: Record<string, { bg: string; color: string }> = {
   disconnected:       { bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
   credentials_invalid:{ bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
   mfa_required:       { bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
+  in_use_elsewhere:   { bg: "rgba(249,115,22,0.12)", color: "#f97316" },
 };
 
 function StateBadge({ state }: { state: string }) {

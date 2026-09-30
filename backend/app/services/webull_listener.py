@@ -99,6 +99,25 @@ _BACKOFF_MAX = 60.0
 get_status = listener_state.get_status
 _set_state = listener_state.set_state
 
+# Webull allows ONE live events subscription per app key. A second one — the
+# same key active in another environment (QA and local, QA and prod) or another
+# app — is refused with RESOURCE_EXHAUSTED "appKey already has an active
+# subscription". Nothing here can release the other one (the environments share
+# no database), so the listener says so plainly and keeps checking: once the
+# key is deactivated over there, this one takes the stream over by itself.
+IN_USE_ELSEWHERE = "in_use_elsewhere"
+_IN_USE_MARKER = "already has an active subscription"
+_IN_USE_RETRY = 30.0
+IN_USE_MESSAGE = (
+    "This Webull app key is already live somewhere else (another environment "
+    "or app). Deactivate Webull there — this one takes over automatically "
+    "within 30 seconds."
+)
+
+
+def _in_use_elsewhere(exc: BaseException) -> bool:
+    return _IN_USE_MARKER in str(exc)
+
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
     global _main_loop
@@ -1253,6 +1272,20 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         loop.call_soon_threadsafe(_spawn)
 
 
+def _confirm_connected_later(trader_user_id: uuid.UUID, client: Any, generation: int,
+                             delay: float = 5.0) -> None:
+    """Mark the listener connected once ``client``'s stream has stayed up for
+    ``delay`` seconds — i.e. it was not refused straight away."""
+    def _check() -> None:
+        if (_clients.get(trader_user_id) is client
+                and _generation.get(trader_user_id, 0) == generation):
+            _set_state(trader_user_id, "connected")
+    try:
+        asyncio.get_running_loop().call_later(delay, _check)
+    except RuntimeError:
+        _set_state(trader_user_id, "connected")
+
+
 def stop_listener(trader_user_id: uuid.UUID) -> None:
     # Bump generation FIRST so any in-flight callback from the old client drops.
     _generation[trader_user_id] = _generation.get(trader_user_id, 0) + 1
@@ -1321,7 +1354,15 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 level, "webull-listener[%s] SDK: %s", _tid, msg,
             )
             _clients[trader_user_id] = client
-            _set_state(trader_user_id, "connected")
+            prev = get_status(trader_user_id)
+            if prev is not None and prev.state == IN_USE_ELSEWHERE:
+                # Still refused elsewhere, most likely: flashing "connected"
+                # for the moment before Webull says no again would make the
+                # badge flicker every retry. Only call it connected once the
+                # stream has stayed up.
+                _confirm_connected_later(trader_user_id, client, generation)
+            else:
+                _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
 
             # Subscribe to ALL the trader's accounts (they may trade on any).
@@ -1346,6 +1387,14 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             log.info("webull-listener[%s] cancelled", trader_user_id)
             raise
         except Exception as exc:  # noqa: BLE001
+            if _in_use_elsewhere(exc):
+                prev = get_status(trader_user_id)
+                if prev is None or prev.state != IN_USE_ELSEWHERE:
+                    log.warning("webull-listener[%s] app key is live elsewhere; "
+                                "retrying every %.0fs", trader_user_id, _IN_USE_RETRY)
+                _set_state(trader_user_id, IN_USE_ELSEWHERE, error=IN_USE_MESSAGE)
+                await asyncio.sleep(_IN_USE_RETRY)
+                continue
             log.exception("webull-listener[%s] error", trader_user_id)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 

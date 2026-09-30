@@ -77,7 +77,7 @@ def clear_disconnect_debounce(trader_user_id: uuid.UUID) -> None:
 
 
 # "connecting" | "connected" | "reconnecting" | "disconnected" |
-# "credentials_invalid" | "mfa_required"  (webull-only)
+# "credentials_invalid" | "mfa_required" | "in_use_elsewhere"  (webull-only)
 ListenerState = str
 
 

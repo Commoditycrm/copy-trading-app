@@ -136,6 +136,10 @@ class BrokerAccountOut(BaseModel):
     bring_open_orders: bool = True
     bring_filled_orders: bool = True
 
+    # One-off message for the toast after connect / activate — e.g. that another
+    # account on the same Webull app key was deactivated. Transient, never stored.
+    notice: str | None = None
+
     model_config = {"from_attributes": True}
 
 
