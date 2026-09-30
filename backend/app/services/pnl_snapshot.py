@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -96,26 +97,38 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         # calendar shows for today and the poller enforces daily limits on, so
         # there's no after-hours jump.
         daily = {}
-        try:
-            _snap = adapter.get_pnl_snapshot()
-            _tp = _snap.get("todays_pl") if _snap else None
-            if _tp is not None:
-                # Daily return % = day P&L / day-start equity, the same figure
-                # the broker's calendar shows next to the dollar amount.
-                _base = _snap.get("beginning_day_balance") if _snap else None
-                _pct = None
-                if _base not in (None, 0):
-                    _pct = (Decimal(str(_tp)) / Decimal(str(_base))) * Decimal(100)
-                daily = {end: (Decimal(str(_tp)), 0, _pct)}
-                # Ending account equity / net liq, stored for reconciliation only.
-                _eq = _snap.get("equity") if _snap else None
-                if _eq is not None:
-                    marked_net_liq = Decimal(str(_eq))
-        except Exception:  # noqa: BLE001
-            log.warning(
-                "pnl_snapshot: get_pnl_snapshot failed for acct %s", acct.id,
-                exc_info=True,
-            )
+        # Deliberate post-close finalization: after the close, a transient broker
+        # failure must not leave the day uncaptured until the next hourly sweep,
+        # so retry a few times within this pass. A genuine failure writes NOTHING
+        # (daily stays {}) — never fake/zero data — and the hourly re-run is the
+        # coarse retry that still finalizes the day.
+        _attempts = 3 if market_hours.past_regular_close() else 1
+        _snap = None
+        for _i in range(_attempts):
+            try:
+                _snap = adapter.get_pnl_snapshot()
+                if _snap is not None:
+                    break
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "pnl_snapshot: get_pnl_snapshot failed for acct %s (attempt %d/%d)",
+                    acct.id, _i + 1, _attempts, exc_info=True,
+                )
+            if _i + 1 < _attempts:
+                time.sleep(1.5)
+        _tp = _snap.get("todays_pl") if _snap else None
+        if _tp is not None:
+            # Daily return % = day P&L / day-start equity, the same figure the
+            # broker's calendar shows next to the dollar amount.
+            _base = _snap.get("beginning_day_balance")
+            _pct = None
+            if _base not in (None, 0):
+                _pct = (Decimal(str(_tp)) / Decimal(str(_base))) * Decimal(100)
+            daily = {end: (Decimal(str(_tp)), 0, _pct)}
+            # Ending account equity / net liq, stored for reconciliation only.
+            _eq = _snap.get("equity")
+            if _eq is not None:
+                marked_net_liq = Decimal(str(_eq))
         source_by_day = {d: "marked" for d in daily}
     else:
         return 0
@@ -127,13 +140,15 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         pnl, count = vals[0], vals[1]
         pct = vals[2] if len(vals) > 2 else None
         source = source_by_day.get(day, "broker_activities")
-        # A MARKED value is only "eod" (final, safe as historical) once the
-        # session has closed; captured mid-session it's "intraday" and the
-        # calendar won't treat it as that day's settled P&L. The post-close sweep
-        # rewrites today's row to "eod"; if the box misses that sweep the row
-        # stays "intraday" and the day reads as estimated — the safe failure.
+        # A MARKED value is only "eod" (final, safe as historical) AFTER the
+        # official regular-session close (16:00 ET) on a real trading day —
+        # NEVER pre-market, and never on a weekend/holiday. `past_regular_close`
+        # guarantees captured_at >= the close on a valid trading day, so a
+        # pre-market row (in_regular_session is also False then) can't be mistaken
+        # for finalized data. Mid-session / pre-market / non-trading captures stay
+        # "intraday" and the calendar won't treat them as that day's settled P&L.
         snapshot_type = (
-            "eod" if source == "marked" and not market_hours.in_regular_session()
+            "eod" if source == "marked" and market_hours.past_regular_close()
             else "intraday"
         )
         # Ending equity only on marked rows (audit; not used by the calendar).
@@ -157,10 +172,20 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
         # write — real broker values, Alpaca marked, or the fallback itself —
         # upserts unconditionally.
         broker_silence = source == "broker_activities" and pnl == 0 and count == 0
+        # A finalized EOD marked row is authoritative history — an INTRADAY marked
+        # capture (e.g. a pre-market or mid-session sweep the next day, or a late
+        # restart) must never overwrite it. An incoming EOD may replace anything
+        # (it's the newer close value).
+        intraday_marked = source == "marked" and snapshot_type != "eod"
         if broker_silence:
             stmt = stmt.on_conflict_do_update(
                 constraint="uq_daily_realized_pnl_user_day", set_=set_,
                 where=DailyRealizedPnlSnapshot.source != "db_fallback_lag",
+            )
+        elif intraday_marked:
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_daily_realized_pnl_user_day", set_=set_,
+                where=DailyRealizedPnlSnapshot.snapshot_type != "eod",
             )
         else:
             stmt = stmt.on_conflict_do_update(
