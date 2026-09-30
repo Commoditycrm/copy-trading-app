@@ -33,7 +33,7 @@ from app.services import audit, copy_engine, events, excel_export, fills_sync, m
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import (
-    calendar_series, realized_pnl_by_order,
+    alpaca_marked_by_day, calendar_series, realized_pnl_by_order,
 )
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -2175,24 +2175,35 @@ def calendar_pnl(
         db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
         live_today_unrealized=live_unreal_today,
     )
-    return [
-        DailyPnL(
+    # Match the connected broker: an Alpaca account's settled days show Alpaca's
+    # OWN marked P&L (portfolio-history — the exact figure Alpaca's app shows),
+    # not our reconstruction. Empty for non-Alpaca users, who keep the FIFO +
+    # capture marked. Today keeps the live cell (portfolio-history omits it).
+    alpaca_marked = alpaca_marked_by_day(db, target_user_id, from_, to, tz)
+    out: list[DailyPnL] = []
+    for c in sorted(series.values(), key=lambda c: c.day):
+        marked = c.marked_pnl
+        pct: Decimal | None = None
+        ov = alpaca_marked.get(c.day)
+        if ov is not None and not c.live:
+            marked, pct = ov
+        out.append(DailyPnL(
             day=c.day,
-            # Two figures per day, shown as separate rows on the Calendar:
-            #  realized_pnl   = closed-trade P&L (FIFO), matches the broker.
-            #  unrealized_pnl = that day's open-position mark-to-market swing
-            #                   (marked − realized); for TODAY it's the live swing.
+            # Rows shown on the Calendar:
+            #  realized_pnl   = closed-trade P&L (FIFO).
+            #  unrealized_pnl = marked − realized (the open-position swing); for
+            #                   an Alpaca day this makes the Marked row equal
+            #                   Alpaca's own number. For TODAY it's the live swing.
             realized_pnl=c.realized_pnl,
             trade_count=c.trade_count,
-            pct=None,
-            unrealized_pnl=c.marked_pnl - c.realized_pnl,
+            pct=pct,
+            unrealized_pnl=marked - c.realized_pnl,
             # TODAY's full current open-position unrealized (for the tooltip),
             # vs unrealized_pnl which is only the day's swing.
             open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
-        )
-        for c in sorted(series.values(), key=lambda c: c.day)
-    ]
+        ))
+    return out
 
 
 @router.post("/trades/sync-fills")
