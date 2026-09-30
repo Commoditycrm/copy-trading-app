@@ -85,7 +85,8 @@ export interface BrokerAccount {
   // "Robinhood", "IBKR"). null for direct-API brokers — `broker` itself
   // is already the real name in that case.
   brokerage_name?: string | null;
-  connection_status: "pending" | "connected" | "error";
+  // "inactive" = kept on file but paused; exactly one account is "connected".
+  connection_status: "pending" | "connected" | "error" | "inactive";
   last_error: string | null;
   created_at: string;
 

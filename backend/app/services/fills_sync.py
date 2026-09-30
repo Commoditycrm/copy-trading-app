@@ -516,7 +516,11 @@ def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
                {"k": f"fills_sync:{user_id}"})
 
     accts = list(db.execute(
-        select(BrokerAccount).where(BrokerAccount.user_id == user_id)
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user_id,
+            # An inactive (paused) broker is left untouched until reactivated.
+            BrokerAccount.connection_status != "inactive",
+        )
     ).scalars())
 
     per_account: list[dict[str, Any]] = []

@@ -69,7 +69,7 @@ export default function DashboardPage() {
   const d = useDashboard();
 
   const derived = useMemo(() => {
-    const totalEquity = sum(d.brokers, (b) => b.total_equity);
+    const totalEquity = sum(d.brokers.filter((b) => b.connection_status === "connected"), (b) => b.total_equity);
     const buyingPower = sum(d.brokers, (b) => b.buying_power);
     const unrealized = sum(d.positions, (p) => p.unrealized_pnl);
     const openPositions = d.positions.length;
@@ -124,7 +124,11 @@ export default function DashboardPage() {
       format: fmtUsd,
       icon: Wallet,
       tone: "accent",
-      sub: `Across ${d.brokers.length} broker${d.brokers.length === 1 ? "" : "s"}`,
+      sub: (() => {
+        const active = d.brokers.filter((b) => b.connection_status === "connected").length;
+        const paused = d.brokers.length - active;
+        return `Across ${active} active broker${active === 1 ? "" : "s"}` + (paused ? ` · ${paused} inactive` : "");
+      })(),
     },
     {
       label: "Realized P&L · 30d",
