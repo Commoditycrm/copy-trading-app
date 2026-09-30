@@ -34,7 +34,8 @@ Credentials shape (Fernet-encrypted in ``broker_accounts.encrypted_credentials``
       "app_key":    "<the account owner's Webull app key>",
       "app_secret": "<the account owner's Webull app secret>",
       "account_id": "<Webull account_id, NOT the account number>",
-      "region_id":  "us"
+      "region_id":  "us",
+      "paper":      false        # true = Webull's paper/test environment
     }
 
 The Webull SDK is imported LAZILY inside methods, so importing this module
@@ -452,11 +453,28 @@ def set_per_account_token_dir(api_client: Any, app_key: str | None) -> None:
 # shared volume) every path loads that token and never re-prompts. Mirrors
 # services.webull_listener._webull_trade_client.
 _TRADE_CLIENT_TTL_S = 1800.0
+# Webull's paper/test environment. Same API, different hosts; paper keys only
+# authenticate here and live keys only against the SDK's default (api.webull.com)
+# — Webull answers a mismatch with 401 "ensure you are connecting to the correct
+# environment". Host names from developer.webull.com's getting-started guide.
+WEBULL_PAPER_API_HOST = "api.sandbox.webull.com"
+WEBULL_PAPER_EVENTS_HOST = "events-api.sandbox.webull.com"
+
+
+def use_paper_endpoint(api_client, region_id: str, paper: bool) -> None:
+    """Point an SDK ApiClient at the paper host when ``paper`` is set."""
+    if paper:
+        api_client.add_endpoint(region_id, WEBULL_PAPER_API_HOST)
+
+
+# Keyed by app_key alone: a Webull key belongs to exactly one environment, so the
+# same key never needs both a paper and a live client.
 _trade_clients: dict[str, Any] = {}          # app_key -> (client, built_at)
 _trade_client_lock = threading.Lock()
 
 
-def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> Any:
+def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
+                     paper: bool = False) -> Any:
     """THE cached Webull TradeClient for an app_key — the adapter and the trader
     listener both go through here.
 
@@ -485,6 +503,7 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> An
             token_check_duration_seconds=_s.webull_token_check_duration_seconds,
             token_check_interval_seconds=_s.webull_token_check_interval_seconds,
         )
+        use_paper_endpoint(api_client, region_id, paper)
         _suppress_sdk_file_logger(api_client)
         set_per_account_token_dir(api_client, app_key)   # isolate token per app_key
         client = TradeClient(api_client)   # token flow runs HERE — once per TTL
@@ -593,10 +612,11 @@ class WebullAdapter(BrokerAdapter):
         self.app_secret = credentials.get("app_secret")
         self.account_id = credentials.get("account_id")
         self.region_id = credentials.get("region_id", "us")
+        self.paper = bool(credentials.get("paper", False))
 
     # ── client construction (lazy SDK import, cached per app_key) ─────────
     def _trade_client(self):
-        return trade_client_for(self.app_key, self.app_secret, self.region_id)
+        return trade_client_for(self.app_key, self.app_secret, self.region_id, self.paper)
 
     def _data_client(self):
         """Market-data client. Separate from the TradeClient because Webull
@@ -610,6 +630,7 @@ class WebullAdapter(BrokerAdapter):
             if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
                 return cached[0]
             api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
+            use_paper_endpoint(api_client, self.region_id, self.paper)
             _suppress_sdk_file_logger(api_client)   # DataClient writes its own ./webull_data_sdk.log
             set_per_account_token_dir(api_client, self.app_key)
             client = DataClient(api_client)

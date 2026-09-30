@@ -111,7 +111,9 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
             creds["app_secret"] = str(creds.get("app_secret", "")).strip()
             creds["account_id"] = str(creds.get("account_id", "")).strip()
             creds["region_id"] = (str(creds.get("region_id", "") or "us").strip()) or "us"
-            creds["paper"] = False   # direct real-broker connection, not a paper sim
+            # Webull's paper (test) environment is a different API host; the
+            # adapter and listener route to it when this is set.
+            creds["paper"] = bool(payload.webull.paper)
             return creds
         case BrokerName.IBKR:
             if not payload.ibkr:
@@ -751,6 +753,7 @@ def list_webull_accounts(
         "app_key": payload.app_key.strip(),
         "app_secret": payload.app_secret.strip(),
         "region_id": (payload.region_id or "us").strip() or "us",
+        "paper": bool(payload.paper),
     }
     try:
         accounts = WebullAdapter(creds).list_accounts(with_balances=True)

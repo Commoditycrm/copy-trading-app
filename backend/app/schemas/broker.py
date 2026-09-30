@@ -26,6 +26,9 @@ class WebullCredentialsIn(BaseModel):
     app_secret: str = Field(min_length=8, max_length=200)
     account_id: str = Field(min_length=4, max_length=120)
     region_id: str = Field(default="us", max_length=8)
+    # Paper keys come from Webull's test environment and only authenticate
+    # against its sandbox host; live keys only against the live one.
+    paper: bool = False
 
 
 class ListWebullAccountsIn(BaseModel):
@@ -36,6 +39,7 @@ class ListWebullAccountsIn(BaseModel):
     app_key: str = Field(min_length=8, max_length=200)
     app_secret: str = Field(min_length=8, max_length=200)
     region_id: str = Field(default="us", max_length=8)
+    paper: bool = False
 
 
 class WebullAccountOut(BaseModel):
