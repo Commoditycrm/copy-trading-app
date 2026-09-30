@@ -531,7 +531,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // Symbol, Close %, Actions, TP, SL — are locked (can't be hidden) so their
     // per-row controls always render; every data column can be toggled off.
     const columnDefs = useMemo<ColumnDef[]>(() => [
-      ...(showChannel ? [{ id: "channel", header: "Channel" }] : []),
+      ...(showChannel ? [{ id: "channel", header: "Channel", leading: true }] : []),
       { id: "symbol", header: "Symbol", locked: true },
       { id: "qty", header: "Qty" },
       { id: "side", header: "Side" },
@@ -553,8 +553,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       { id: "expires", header: "Expires in Days" },
     ], [showChannel]);
     const cols = useTableColumns("positions", columnDefs);
+    // Always re-check: the cached user can be stale if an admin has since
+    // turned Discord on or off for this trader.
     useEffect(() => {
-      if (getSnapshot<User>(USER_SNAPSHOT_KEY)) return;
       let cancelled = false;
       api<User>("/api/auth/me")
         .then((u) => {
