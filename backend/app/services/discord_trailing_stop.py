@@ -74,6 +74,46 @@ def _current_price(pos, user_id=None) -> Decimal | None:
     return price if price > 0 else None
 
 
+STOP = "stop"
+TRAIL = "trail"
+
+
+def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal] | None:
+    """What this guard's protections do at ``price``: None, or (kind, qty, level).
+
+    ``kind`` is STOP (the floor broke — everything goes) or TRAIL (the trailing
+    slice gave back its amount from the peak). ``level`` is the stop price, or
+    the peak the give-back was measured from.
+
+    No orders and no DB; the only side effect is raising ``peak_price`` on a new
+    high, which is what a trail IS. Shared with the Simulated Prices dry run, so
+    a simulated path is judged by exactly the rule the poller enforces.
+    """
+    # ── the floor, first ────────────────────────────────────────────────────
+    # Skipped when a real order rests at the broker for this level: it will
+    # fire on its own, and enforcing here as well would sell the same
+    # contracts twice.
+    stop = None if guard.stop_order_id else guard.stop_price
+    if stop is not None and price <= stop:
+        return STOP, held, stop
+
+    # ── then the trailing slice ─────────────────────────────────────────────
+    qty = guard.trail_qty
+    amount = guard.trail_amount
+    if qty is None or amount is None or amount <= 0:
+        return None
+
+    peak = guard.peak_price
+    if peak is None or price > peak:
+        guard.peak_price = price
+        return None     # a new high can't also be a give-back
+
+    if price > peak - amount:
+        return None     # still inside the trail
+
+    return TRAIL, min(qty, held), peak
+
+
 def enforce(db: Session, user_id, adapter, close_position) -> int:
     """Advance every protection this trader has live. Returns how many fired.
 
@@ -111,14 +151,28 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             guards.retire(db, guard, "position no longer held")
             continue
 
-        # ── the floor, first ────────────────────────────────────────────────
-        # Skipped when a real order rests at the broker for this level: it will
-        # fire on its own, and enforcing here as well would sell the same
-        # contracts twice.
-        stop = None if guard.stop_order_id else guard.stop_price
-        if stop is not None and price <= stop:
+        decision = decide(guard, price, held)
+        if decision is None:
+            continue
+        kind, sell, level = decision
+
+        # An exit already working for this contract (this protection's own, a
+        # trim, a manual close) has the contracts: firing again would sell them
+        # twice. Options only trade in the regular session, so an exit sent
+        # outside it would just expire.
+        from app.services import discord_stop_orders  # noqa: PLC0415
+
+        if discord_stop_orders.working_exit(db, guard) is not None:
+            continue
+        if guard.option_strike is not None:
+            from app.services import market_hours  # noqa: PLC0415
+
+            if not market_hours.in_regular_session():
+                continue
+
+        if kind == STOP:
             log.info("discord stops: %s at %s broke its %s stop — closing %s",
-                     guard.symbol, price, stop, held)
+                     guard.symbol, price, level, held)
             try:
                 close_position(pos, guard, held)
             except Exception:  # noqa: BLE001
@@ -126,39 +180,31 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
                 # failed once must not be forgotten.
                 log.exception("discord stops: stop-out failed for %s", guard.symbol)
                 continue
-            guards.retire(db, guard, f"stop hit at {price} (stop {stop})")
+            # Not retired on submit: the guard stays live until the position is
+            # gone ("position no longer held" above), so an exit that expires or
+            # is refused is sent again rather than leaving the position unwatched.
             fired += 1
             continue
 
-        # ── then the trailing slice ─────────────────────────────────────────
-        qty = guard.trail_qty
-        amount = guard.trail_amount
-        if qty is None or amount is None or amount <= 0:
-            continue
-
-        peak = guard.peak_price
-        if peak is None or price > peak:
-            guard.peak_price = price
-            continue    # a new high can't also be a give-back
-
-        if price > peak - amount:
-            continue    # still inside the trail
-
-        sell = min(qty, held)
         log.info("discord stops: %s gave back %s from %s — trailing out %s",
-                 guard.symbol, amount, peak, sell)
+                 guard.symbol, guard.trail_amount, level, sell)
         try:
             close_position(pos, guard, sell)
         except Exception:  # noqa: BLE001
             log.exception("discord stops: trailing exit failed for %s", guard.symbol)
             continue
 
-        guards.clear_trail(guard)
+        if sell < held:
+            # The rest stays under the stop.
+            guards.clear_trail(guard)
+        # A trail that took everything stays armed: that keeps the guard in
+        # ``armed()`` so the next tick retires it once the position is gone —
+        # or fires again if this exit expired or was refused. Cleared here, the
+        # guard would be neither armed nor retired, and a later re-entry of the
+        # same contract would inherit its spent ladder.
         fired += 1
-        if sell >= held:
-            guards.retire(db, guard, f"trailing exit filled at {price} (peak {peak})")
 
     return fired
 
 
-__all__ = ["enforce"]
+__all__ = ["decide", "enforce"]

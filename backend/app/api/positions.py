@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, require_sell_all_access, require_trader
+from app.api.deps import client_ip, current_user, require_sell_all_access, require_trader
 from app.api.trades import _place_trader_order
 from collections.abc import Callable
 from decimal import Decimal
@@ -29,19 +31,20 @@ from app.brokers import adapter_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
-from datetime import date
+from datetime import date, datetime, timezone
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import (
+    AveragePositionIn,
     ClosePositionIn,
     PositionOut,
     PositionsPayload,
     UnreachableAccount,
 )
 from app.models.sell_all_snapshot import SellAllSnapshot
-from app.services import trailing_stop_close
+from app.services import copy_engine, events, trailing_stop_close
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -180,6 +183,10 @@ def list_positions(
         _attach_position_channels(db, user.id, out)
     except Exception:  # noqa: BLE001
         log.warning("positions: could not attach discord channels", exc_info=True)
+    try:
+        _attach_ladder_stops(db, user.id, out)
+    except Exception:  # noqa: BLE001
+        log.warning("positions: could not attach ladder stops", exc_info=True)
     if detail:
         return PositionsPayload(positions=out, unreachable=unreachable)
     return out
@@ -398,6 +405,11 @@ def close_all_positions(
                 option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
             )
             try:
+                if reverse_side == OrderSide.SELL:
+                    # Free a resting Discord ladder stop first (see close_position).
+                    from app.services import discord_stop_orders  # noqa: PLC0415
+
+                    discord_stop_orders.release_for_position(db, user, pos)
                 order = _place_trader_order(
                     db, user, payload, acct.id, background, request,
                     skip_fanout=skip_fanout, resolve_wash_trade=True,
@@ -505,6 +517,38 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             p.option_expiry, p.option_strike, p.option_right,
         )
         p.discord_channel = by_contract.get(key)
+
+
+def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
+    """Set .ladder_stop_price from each held contract's live Discord guard.
+
+    One query over the live guards for the symbols held. A display column, so
+    the caller isolates failures the same way as the channel column.
+    """
+    for p in positions:
+        p.ladder_stop_price = None
+    symbols = {(p.symbol or "").upper() for p in positions if p.symbol}
+    if not symbols:
+        return
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    rows = db.execute(
+        select(DiscordPositionGuard).where(
+            DiscordPositionGuard.user_id == user_id,
+            DiscordPositionGuard.closed_at.is_(None),
+            DiscordPositionGuard.stop_price.is_not(None),
+            DiscordPositionGuard.symbol.in_(symbols),
+        )
+    ).scalars()
+    by_contract = {
+        (g.symbol, g.option_strike, (g.option_right or None), g.option_expiry): g.stop_price
+        for g in rows
+    }
+    for p in positions:
+        right = getattr(p.option_right, "value", p.option_right)
+        p.ladder_stop_price = by_contract.get(
+            ((p.symbol or "").upper(), p.option_strike, right or None, p.option_expiry)
+        )
 
 
 def _reentry_info(db: Session, item: dict) -> "tuple[str, Decimal | None, str | None]":
@@ -1421,6 +1465,109 @@ def _close_account_positions_sync(
     return {"closed": closed, "failed": failed}
 
 
+
+# Statuses whose UNFILLED remainder still RESERVES the position at the broker.
+# A resting order on a contract holds the shares/contracts behind it, so a close
+# placed on top is refused — Webull:
+#   OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION "This order cannot be entered
+#   because it will reverse an existing position. You may need to close an open
+#   position, or cancel an open order, before you can submit this order."
+# Alpaca does the same thing with 40310000 (held_for_orders).
+_RESERVING_STATUSES = (
+    OrderStatus.PENDING,
+    OrderStatus.SUBMITTED,
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+)
+
+# A cancel's 200 means the request was ACCEPTED, not that the broker has already
+# released the reservation. Placing the close in the same breath can still hit
+# the rejection we just cleared. One short pause is enough in practice and costs
+# no extra API calls — deliberately not a poll, because Webull's trade endpoints
+# share a ~10 req/30s budget per app_key and a verify loop would spend it at the
+# exact moment the close needs it.
+_CANCEL_SETTLE_S = 0.6
+
+
+def _cancel_working_orders_for_position(
+    db: Session, user: User, acct: BrokerAccount, adapter: Any, pos: BrokerPosition,
+) -> list[uuid.UUID]:
+    """Cancel every still-working order on the SAME contract before closing it.
+
+    Closing from the positions table used to fail outright whenever anything was
+    already resting on that contract — a protective stop, a take-profit, a
+    partially-filled limit. The broker refuses the close because the resting
+    order still reserves the position, and the user is left reading a raw
+    OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION with a working stop they did not
+    know was in the way.
+
+    So clear the contract first. BOTH sides go: a resting SELL blocks the close
+    directly, and a resting BUY would re-open the position moments after we
+    flatten it.
+
+    This is the trader-side twin of ``copy_engine._cancel_subscriber_conflicts``,
+    which already does the same thing for mirrors — the subscriber path was
+    handled and the trader's own account was not. Kept separate rather than
+    shared because that one runs in a worker thread on its own session and
+    excludes the mirror it is about to place.
+
+    Best-effort per order: a cancel that fails is logged and the rest continue,
+    because a stale id (already filled/cancelled at the broker) must not block a
+    close the user asked for. Returns the ids actually cancelled.
+    """
+    rows = db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.broker_account_id == acct.id,
+            Order.instrument_type == pos.instrument_type,
+            Order.symbol == pos.symbol,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            Order.status.in_(_RESERVING_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars().all()
+    if not rows:
+        return []
+
+    now = datetime.now(timezone.utc)
+    cancelled: list[uuid.UUID] = []
+    touched: list[Order] = []
+    for o in rows:
+        try:
+            adapter.cancel_order(o.broker_order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "close: could not cancel %s order %s (broker_order=%s) blocking the "
+                "close of %s — continuing: %s",
+                o.order_type.value, o.id, o.broker_order_id, pos.broker_symbol,
+                str(exc)[:200],
+            )
+            continue
+        o.status = OrderStatus.CANCELED
+        o.closed_at = now
+        o.reject_reason = (
+            "Cancelled automatically to free the position for a close you placed "
+            "from the positions table."
+        )[:480]
+        cancelled.append(o.id)
+        touched.append(o)
+
+    if cancelled:
+        db.commit()
+        for o in touched:
+            db.refresh(o)
+            events.publish(user.id, copy_engine._order_event("order.cancelled", o))  # noqa: SLF001
+        log.info(
+            "close: cancelled %d working order(s) on %s before closing",
+            len(cancelled), pos.broker_symbol,
+        )
+        # Give the broker a moment to release the reservation (see above).
+        time.sleep(_CANCEL_SETTLE_S)
+    return cancelled
+
+
 @router.post("/{broker_symbol}/close", response_model=OrderOut)
 def close_position(
     broker_symbol: str,
@@ -1457,6 +1604,43 @@ def close_position(
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
 
+    if payload.quantity is not None and payload.quantity <= 0:
+        raise HTTPException(422, "quantity_must_be_positive")
+
+    # A Discord ladder stop is released through the ladder FIRST, which drops
+    # the guard's link to it. The helper below cancels every resting order and
+    # commits; if the ladder's stop were cancelled there while the guard still
+    # pointed at it, a stop-reconciler tick in the gap before the close would
+    # read it as removed by the trader and forget the level — leaving whatever
+    # the close doesn't sell without a stop. Released here, the reconciler
+    # re-places a stop sized to the remainder once the close has settled.
+    if pos.quantity > 0:
+        from app.services import discord_stop_orders  # noqa: PLC0415
+
+        discord_stop_orders.release_for_position(db, user, pos)
+        db.commit()
+
+    # Anything still resting on this contract reserves the position at the
+    # broker, so the close would be refused. Clear it first — see the helper.
+    cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+
+    # RE-READ after cancelling. An order we just cancelled may have FILLED in
+    # the moments before the cancel reached the broker — a resting stop is
+    # exactly the kind that does. Sizing the close from the snapshot taken
+    # BEFORE the cancel then sells a holding that is already gone, and a close
+    # becomes a SHORT. Only pay for the extra read when we actually cancelled
+    # something; the common case (nothing resting) is unchanged.
+    if cancelled:
+        positions = adapter.get_positions()
+        pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
+        if pos is None or pos.quantity == 0:
+            # The resting order closed it for us. Nothing left to sell, and
+            # selling anyway is precisely how the short happened.
+            raise HTTPException(
+                409,
+                "position_already_closed_by_a_resting_order",
+            )
+
     # Reverse the side based on the current holding (long → sell, short → buy).
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
     full_qty = abs(pos.quantity)
@@ -1464,7 +1648,16 @@ def close_position(
     if close_qty <= 0:
         raise HTTPException(422, "quantity_must_be_positive")
     if close_qty > full_qty:
-        raise HTTPException(422, "quantity_exceeds_position")
+        # CLAMP, never reject. The size can legitimately shrink between the
+        # client's view and now (a partial fill on the stop we just cancelled,
+        # a trim elsewhere), and the user asked to get OUT — closing what is
+        # actually there is the right answer. Erroring would leave them holding
+        # it; over-selling would open a short.
+        log.info(
+            "close: clamping %s from %s to the %s actually held on %s",
+            broker_symbol, close_qty, full_qty, acct.id,
+        )
+        close_qty = full_qty
 
     # Options can't be closed with a market order — Alpaca rejects them always,
     # Webull rejects them on limited-liquidity contracts ("does not support
@@ -1523,6 +1716,299 @@ def close_position(
     _capture_exit_snapshot(db, user.id, [closed_item], new_event=False)
     db.commit()
     return order
+
+
+@router.post("/{broker_symbol}/stop")
+def set_position_stop(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    pnl_pct: Decimal = Query(..., ge=-99, le=1000, description="P&L level for the stop: -25 is 25% below entry, 0 break-even, +25 locks in 25%."),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Put the position's stop at a P&L level measured from entry.
+
+    Sets the level on the position's ladder guard (creating one, as the
+    trailing-stop action does, if the position has none). The stop reconciler
+    then keeps a real STOP order resting at that level — one mechanism for
+    every stop on the row, so a ladder stop and a second bracket stop never end
+    up competing for the same contracts.
+    """
+    from decimal import ROUND_DOWN  # noqa: PLC0415
+
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.services import audit  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.quantity < 0:
+        # The stop reconciler places SELL stops; a short needs a BUY stop.
+        raise HTTPException(422, "Stops from this row are for long positions only.")
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    entry = (guard.entry_price if guard is not None and guard.entry_price else None) \
+        or getattr(pos, "avg_entry_price", None)
+    if entry is None or Decimal(str(entry)) <= 0:
+        raise HTTPException(422, "No entry price to measure the stop from.")
+    entry = Decimal(str(entry))
+
+    # Rounded DOWN to the cent: brokers refuse sub-cent option stops, and down
+    # never tightens a stop past the level asked for.
+    price = (entry * (Decimal(1) + pnl_pct / Decimal(100))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if price <= 0:
+        raise HTTPException(422, "That level rounds to a $0 stop.")
+    mark = getattr(pos, "current_price", None)
+    if mark is not None and Decimal(str(mark)) > 0 and price >= Decimal(str(mark)):
+        # A sell stop at or above the market fires at once; Alpaca refuses it.
+        raise HTTPException(
+            422, f"A stop at {price} is at or above the current price {mark} — it would sell immediately.",
+        )
+
+    if guard is None:
+        guard = DiscordPositionGuard(
+            user_id=user.id,
+            symbol=pos.symbol.upper(),
+            option_strike=pos.option_strike,
+            option_right=(pos.option_right.value if pos.option_right else None),
+            option_expiry=pos.option_expiry,
+            entry_price=entry,
+            sell_count=0,
+        )
+        db.add(guard)
+    previous = guard.stop_price
+    guard.stop_price = price
+    audit.record(
+        db, actor_user_id=user.id, action="positions.stop_set",
+        entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
+        metadata={"broker_symbol": pos.broker_symbol, "pnl_pct": str(pnl_pct),
+                  "stop_price": str(price), "previous": str(previous) if previous is not None else None},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    log.info("positions: stop on %s set to %s (%s%% P&L)", pos.broker_symbol, price, pnl_pct)
+    return {"stop_price": str(price), "entry_price": str(entry), "pnl_pct": str(pnl_pct)}
+
+
+def _resting_stop_orders(db: Session, user_id, pos) -> list:
+    """The trader's working STOP / TRAILING_STOP sells on this contract,
+    excluding bracket legs (the bracket endpoint owns those)."""
+    return list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.parent_order_id.is_(None),
+            Order.bracket_leg.is_(None),
+            Order.symbol == pos.symbol,
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.side == OrderSide.SELL,
+            Order.order_type.in_((OrderType.STOP, OrderType.TRAILING_STOP)),
+            Order.status.in_((OrderStatus.PENDING, OrderStatus.SUBMITTED,
+                              OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)),
+        )
+    ).scalars())
+
+
+@router.post("/{broker_symbol}/stops/cancel")
+def cancel_position_stops(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Remove every stop on one position, and keep them removed.
+
+    * the ladder's stop — the resting order AND its level. Cancelling only the
+      order left the level behind, and the stop reconciler put the order
+      straight back on its next tick, even with Auto trim off;
+    * a trailing exit — the app-monitored trail (options) is disarmed;
+    * any other resting STOP / TRAILING_STOP sell on the contract (a native
+      trailing stop on a stock).
+
+    A bracket's SL leg is not touched here: the row clears that through the
+    bracket endpoint, which keeps the entry's bracket state consistent.
+    """
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.services import audit, discord_stop_orders  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None:
+        raise HTTPException(404, "position_not_found")
+
+    cancel = _cancel_stop_order(db, user)
+    removed: list[str] = []
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        pos.option_right, pos.option_expiry)
+    if guard is not None:
+        if guard.stop_price is not None:
+            removed.append(f"stop @ {guard.stop_price}")
+            discord_stop_orders.release(db, guard, cancel)
+            guard.stop_price = None
+        if guard.trail_qty is not None:
+            removed.append(f"trailing exit on {guard.trail_qty}")
+            guards.clear_trail(guard)
+            guard.trail_percent = None
+
+    others = _resting_stop_orders(db, user.id, pos)
+    for order in others:
+        cancel(order.id)
+        removed.append(f"{order.order_type.value} order")
+
+    if not removed:
+        raise HTTPException(404, "no_stops")
+    audit.record(
+        db, actor_user_id=user.id, action="positions.stops_cancelled",
+        entity_type="position", entity_id=None,
+        metadata={"broker_symbol": pos.broker_symbol, "removed": removed},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    log.warning("positions: trader removed stops on %s: %s", pos.broker_symbol, ", ".join(removed))
+    return {"removed": removed}
+
+
+@router.post("/{broker_symbol}/average", response_model=OrderOut)
+def average_position(
+    broker_symbol: str,
+    payload: AveragePositionIn,
+    request: Request,
+    background: BackgroundTasks,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Order:
+    """Add ``quantity`` more of a held position — the mirror of close_position.
+
+    At market, an option goes out as a LIMIT through the ask (brokers refuse
+    option market orders — see _option_close_limit), exactly as a close is
+    priced through the bid. It is an ordinary buy on the trader's order path,
+    so subscribers copy it like any other entry.
+
+    A Discord ladder on the contract follows the new cost basis only when this
+    averages DOWN: guards.average_in, the same rule a Discord "double up" uses.
+    Averaging UP leaves the entry where it was, so an add can never raise the
+    ladder's own stop. The resting stop re-sizes to the new quantity on its own.
+    """
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    if acct.connection_status != "connected":
+        raise HTTPException(409, "broker_not_connected")
+
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    pos = next((p for p in adapter.get_positions()
+                if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.quantity < 0:
+        raise HTTPException(422, "Averaging is for long positions — adding to a short would sell to open.")
+
+    order_type, limit = payload.order_type, payload.limit_price
+    if pos.instrument_type == InstrumentType.OPTION and order_type == OrderType.MARKET:
+        order_type, limit = OrderType.LIMIT, _option_close_limit(adapter, pos, OrderSide.BUY)
+
+    held = abs(Decimal(str(pos.quantity)))
+    is_option = pos.instrument_type == InstrumentType.OPTION
+    order = _place_trader_order(
+        db, user,
+        PlaceOrderIn(
+            instrument_type=pos.instrument_type,
+            symbol=pos.symbol,
+            side=OrderSide.BUY,
+            order_type=order_type,
+            quantity=payload.quantity,
+            limit_price=limit,
+            option_expiry=pos.option_expiry if is_option else None,
+            option_strike=pos.option_strike if is_option else None,
+            option_right=pos.option_right if is_option else None,
+        ),
+        acct.id, background, request,
+    )
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    added_price = limit if limit is not None else getattr(pos, "current_price", None)
+    if (guard is not None and guard.entry_price is not None and added_price is not None
+            and Decimal(str(added_price)) < guard.entry_price):
+        guards.average_in(db, guard, held_qty=held, added_qty=payload.quantity,
+                          added_price=Decimal(str(added_price)))
+    db.commit()
+    return order
+
+
+@router.post("/{broker_symbol}/cancel-open")
+def cancel_position_open_orders(
+    broker_symbol: str,
+    request: Request,
+    background: BackgroundTasks,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    include_subscribers: bool = Query(True, description="Also cancel subscribers' mirrors of these orders."),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel the open orders on THIS position's contract only.
+
+    The row's "Canc.Open Ord" used to call cancel-all-open, which swept every
+    open order on the account. This selects just the orders on the row's
+    contract and account, then cancels them through the same batch path
+    (broker cancel, SSE, and the cascade to subscribers' mirrors).
+
+    A Discord ladder stop on the contract is one of those orders; its level is
+    cleared too, so the ladder doesn't put it back.
+    """
+    from app.api.trades import _CANCELLABLE_STATUSES, _cancel_orders_batch  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None:
+        raise HTTPException(404, "position_not_found")
+
+    orders = _position_open_orders(db, user.id, acct.id, pos, _CANCELLABLE_STATUSES)
+    result = _cancel_orders_batch(
+        db, request, background, user, orders, include_subscribers, via="cancel-position-open",
+    )
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    if guard is not None and guard.stop_order_id in {o.id for o in orders}:
+        guard.stop_order_id = None
+        guard.stop_price = None
+        db.commit()
+    return result
+
+
+def _position_open_orders(db: Session, user_id, acct_id, pos, statuses) -> list:
+    """The caller's open orders on one contract of one account."""
+    from sqlalchemy.orm import selectinload  # noqa: PLC0415
+
+    return list(db.execute(
+        select(Order).options(selectinload(Order.fills)).where(
+            Order.user_id == user_id,
+            Order.broker_account_id == acct_id,
+            Order.instrument_type == pos.instrument_type,
+            Order.symbol == pos.symbol,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            Order.status.in_(statuses),
+        )
+    ).scalars())
 
 
 @router.post("/{broker_symbol}/trailing-stop")

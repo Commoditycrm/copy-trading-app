@@ -2,12 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { fetchAllSubscribers } from "@/lib/subscribers";
 import { getSnapshot, setSnapshot } from "@/lib/swrCache";
 import type {
   BrokerAccount,
   DailyPnL,
   Order,
-  Page,
   Position,
   SubscriberSettings,
   SubscriberSummary,
@@ -86,8 +86,7 @@ export function useDashboard(): DashboardData {
         if (user.role === "trader") {
           // /api/subscribers is paginated now — unwrap .items. High limit so the
           // active/total counts cover the whole roster, not just one page.
-          subscribers = await api<Page<SubscriberSummary>>("/api/subscribers?limit=1000")
-            .then((p) => p.items)
+          subscribers = await fetchAllSubscribers()
             .catch(() => [] as SubscriberSummary[]);
         } else if (user.role === "subscriber") {
           subSettings = await api<SubscriberSettings>("/api/settings/subscriber").catch(

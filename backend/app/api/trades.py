@@ -2178,15 +2178,17 @@ def calendar_pnl(
     return [
         DailyPnL(
             day=c.day,
-            # The day's number is REALIZED P&L only (closed trades, FIFO) — this
-            # matches what traders see on their broker's daily P&L (e.g. Alpaca).
-            # We deliberately DON'T fold in the open-position unrealized swing:
-            # carrying a big losing position used to flip a green realized day
-            # red and diverge from the broker. `unrealized_pnl` is left null.
+            # Two figures per day, shown as separate rows on the Calendar:
+            #  realized_pnl   = closed-trade P&L (FIFO), matches the broker.
+            #  unrealized_pnl = that day's open-position mark-to-market swing
+            #                   (marked − realized); for TODAY it's the live swing.
             realized_pnl=c.realized_pnl,
             trade_count=c.trade_count,
             pct=None,
-            unrealized_pnl=None,
+            unrealized_pnl=c.marked_pnl - c.realized_pnl,
+            # TODAY's full current open-position unrealized (for the tooltip),
+            # vs unrealized_pnl which is only the day's swing.
+            open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
         )
         for c in sorted(series.values(), key=lambda c: c.day)
