@@ -11,6 +11,7 @@ session" regardless of where they're sitting.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
 from app.models.order import Fill, InstrumentType, Order, OrderSide
 from app.services import visibility
+
+log = logging.getLogger(__name__)
 
 try:
     _MARKET_TZ = ZoneInfo("America/New_York")
@@ -694,6 +697,56 @@ def load_eod_unrealized(
         )
     ).all()
     return {d: Decimal(v) for d, v in rows if v is not None}
+
+
+def alpaca_marked_by_day(
+    db: Session,
+    user_id: uuid.UUID,
+    from_: date,
+    to: date,
+    tz_name: str | None = None,
+) -> dict[date, tuple[Decimal, Decimal | None]]:
+    """Alpaca's OWN per-day MARKED P&L (+ daily return %) straight from its
+    portfolio-history endpoint — the exact figure Alpaca's app shows on its
+    calendar — summed across the user's connected Alpaca accounts.
+
+    Returns {day: (marked, pct)}. Empty when the user has no connected Alpaca
+    account, or the broker call fails, so the caller keeps its own reconstructed
+    marked. Excludes TODAY: Alpaca's 1D portfolio-history omits the current
+    intraday day, so the caller keeps the live cell for today. ``pct`` is only
+    meaningful with a single Alpaca account; None when several are summed."""
+    from app.brokers import adapter_for  # local import — avoid an import cycle
+    from app.services.crypto import decrypt_json
+
+    try:
+        accts = list(db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user_id,
+                BrokerAccount.broker == BrokerName.ALPACA,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars())
+    except SQLAlchemyError:
+        return {}
+
+    out: dict[date, tuple[Decimal, Decimal | None]] = {}
+    single = len(accts) == 1
+    for acct in accts:
+        try:
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+            daily = adapter.marked_pnl_by_day(from_, to, tz_name)
+        except Exception:  # noqa: BLE001 — a bad account must not blank the calendar
+            log.warning("alpaca_marked_by_day: failed for acct %s", acct.id, exc_info=True)
+            continue
+        for d, vals in daily.items():
+            marked = Decimal(vals[0])
+            pct = vals[2] if len(vals) > 2 else None
+            if d in out:
+                prev_m, _ = out[d]
+                out[d] = (prev_m + marked, None)  # summed accounts: % is undefined
+            else:
+                out[d] = (marked, pct if single else None)
+    return out
 
 
 def today_live_cell(
