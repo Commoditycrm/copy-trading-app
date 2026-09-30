@@ -76,6 +76,7 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
     source_by_day: dict[date, str] = {}
     eod_today: Decimal | None = None
+    marked_net_liq: Decimal | None = None  # ending equity, stored on marked rows
     if hasattr(adapter, "get_account_activities"):
         daily = realized_by_day_from_broker(adapter, start, end)
         source_by_day = {d: "broker_activities" for d in daily}
@@ -106,6 +107,10 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
                 if _base not in (None, 0):
                     _pct = (Decimal(str(_tp)) / Decimal(str(_base))) * Decimal(100)
                 daily = {end: (Decimal(str(_tp)), 0, _pct)}
+                # Ending account equity / net liq, stored for reconciliation only.
+                _eq = _snap.get("equity") if _snap else None
+                if _eq is not None:
+                    marked_net_liq = Decimal(str(_eq))
         except Exception:  # noqa: BLE001
             log.warning(
                 "pnl_snapshot: get_pnl_snapshot failed for acct %s", acct.id,
@@ -131,16 +136,19 @@ def store_account_snapshots(db: Session, acct: BrokerAccount, start: date, end: 
             "eod" if source == "marked" and not market_hours.in_regular_session()
             else "intraday"
         )
+        # Ending equity only on marked rows (audit; not used by the calendar).
+        net_liq = marked_net_liq if source == "marked" else None
         set_ = dict(
             realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
             broker_account_id=acct.id, broker=broker,
-            source=source, snapshot_type=snapshot_type, computed_at=market_hours.now_et(),
+            source=source, snapshot_type=snapshot_type, net_liq=net_liq,
+            computed_at=market_hours.now_et(),
         )
         stmt = pg_insert(DailyRealizedPnlSnapshot).values(
             user_id=acct.user_id, day=day,
             realized_pnl=Decimal(pnl), trade_count=int(count), pct=pct,
             broker_account_id=acct.id, broker=broker, source=source,
-            snapshot_type=snapshot_type,
+            snapshot_type=snapshot_type, net_liq=net_liq,
         )
         # A $0 from the broker feed is either a genuinely flat day or one the feed
         # hasn't surfaced yet. Never let it overwrite a durable db_fallback_lag row

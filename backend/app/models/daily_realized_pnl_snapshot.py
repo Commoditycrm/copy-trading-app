@@ -97,6 +97,12 @@ class DailyRealizedPnlSnapshot(Base):
     #   marked(D) = realized(D) + (eod_unrealized(D) − eod_unrealized(prev day)).
     eod_unrealized: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
 
+    # Ending account equity / net liquidation value at capture (Webull
+    # total_net_liquidation_value, Alpaca equity). Stored on 'marked' rows for
+    # account-value reconciliation / audit only — it does NOT feed the calendar's
+    # displayed Day P&L. NULL on rows/brokers where we don't capture it.
+    net_liq: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+
     computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(),
         onupdate=lambda: datetime.now(timezone.utc), nullable=False,
