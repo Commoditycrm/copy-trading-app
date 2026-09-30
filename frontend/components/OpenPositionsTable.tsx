@@ -742,17 +742,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }
 
-    async function cancelAllOpenOrders() {
+    /** Cancel the open orders on THIS row's contract only — not the account.
+     *  Subscribers' mirrors of those orders are cancelled too. */
+    async function cancelPositionOpenOrders(p: Position) {
+      const label = p.symbol.toUpperCase();
       if (!confirm(
-        "Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. " +
-        "This includes Discord ladder stops, which then stay removed. Filled positions are not affected."
+        `Cancel the open orders on ${label} (${p.broker_symbol})? Only this position's orders are cancelled; ` +
+        "for a trader, subscribers' mirrors of them go too. A Discord ladder stop on it is removed and stays removed."
       )) return;
       try {
         const res = await api<{ cancelled_count?: number }>(
-          "/api/trades/cancel-all-open?include_subscribers=true", { method: "POST" },
+          `/api/positions/${encodeURIComponent(p.broker_symbol)}/cancel-open?broker_account_id=${p.broker_account_id}&include_subscribers=true`,
+          { method: "POST" },
         );
         const n = res.cancelled_count ?? 0;
-        notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
+        if (n) notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"} on ${label}`);
+        else notify.info(`No open orders on ${label}`);
         refresh();
       } catch (e) {
         notify.fromError(e, "Could not cancel open orders");
@@ -1232,7 +1237,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               labels={{ close: "Close at Market", average: "Avg. at Market" }}
                               onChange={m => setMarketMode(s => ({ ...s, [key]: m }))}
                               disabled={inFlight}
-                              actions={[{ label: "Canc.Open Ord", onClick: cancelAllOpenOrders, danger: true }]}
+                              actions={[{ label: "Canc.Open Ord", onClick: () => void cancelPositionOpenOrders(p), danger: true }]}
                             />
                           </div>
                           <div className="flex items-stretch">
