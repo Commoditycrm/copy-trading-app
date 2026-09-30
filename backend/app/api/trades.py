@@ -604,6 +604,10 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
     subscriber mirror at the subscriber's broker. Runs after the trader's HTTP
     response is sent. Per-mirror failures are audited, not raised."""
     with SessionLocal() as db:
+        # Every cancel cascade — the app's, and each broker listener's — lands
+        # here. A Discord trader's cancels never reach their subscribers.
+        if copy_engine._owner_trades_independently(db, db.get(Order, trader_order_id)):
+            return
         children = list(db.execute(
             select(Order).where(
                 Order.parent_order_id == trader_order_id,
@@ -957,7 +961,12 @@ def _place_trader_order(
     # stamp the flag on the row at creation time (immutable record of intent).
     from app.models.settings import TraderSettings  # local import — avoid cycle
     ts = db.get(TraderSettings, trader.id) if is_trader else None
-    will_fanout = is_trader and not skip_fanout and not (ts and ts.copy_paused)
+    will_fanout = (
+        is_trader and not skip_fanout and not (ts and ts.copy_paused)
+        # A Discord trader's orders are never copied (copy_engine.trades_independently)
+        # — which also keeps the "trader was rejected" notice from their subscribers.
+        and not copy_engine.trades_independently(trader)
+    )
     # Whether to actually HAND this order to fanout. We call fanout for EVERY
     # trader order (unless the caller opted out) and let fanout_async make the
     # pause decision — it forwards CLOSES to subscribers even while the trader's
@@ -1543,6 +1552,9 @@ async def cancel_all_subscribers_open_orders(
     """Trader-only: cancel every open order across EVERY subscriber
     following this trader. The trader's OWN orders are not touched.
 
+    Not for a Discord trader: their subscribers trade independently
+    (copy_engine.trades_independently), so their orders are not the trader's.
+
     Returns IMMEDIATELY with the queued count — the actual broker
     cancellations run in the background. This matters because a trader
     can easily have hundreds or thousands of open subscriber orders
@@ -1557,6 +1569,8 @@ async def cancel_all_subscribers_open_orders(
     """
     import asyncio  # noqa: PLC0415
 
+    if copy_engine.trades_independently(user):
+        raise HTTPException(409, "Your subscribers trade your Discord channels on their own settings — their orders and positions are theirs, not yours to act on.")
     sub_ids = list(db.execute(
         select(SubscriberSettings.user_id).where(
             SubscriberSettings.following_trader_id == user.id

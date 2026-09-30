@@ -1228,7 +1228,7 @@ def propagate_modify_to_mirrors(trader_order_id: uuid.UUID) -> None:
 
     with SessionLocal() as db:
         trader_order = db.get(Order, trader_order_id)
-        if trader_order is None:
+        if trader_order is None or _owner_trades_independently(db, trader_order):
             return
         children = list(db.execute(
             select(Order).where(
@@ -1525,7 +1525,7 @@ def cancel_and_replace_mirrors_for_modify(
 
     with SessionLocal() as db:
         new_order = db.get(Order, new_trader_order_id)
-        if new_order is None:
+        if new_order is None or _owner_trades_independently(db, new_order):
             return
         children = list(db.execute(
             select(Order).where(
@@ -1803,6 +1803,8 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
         # where the trader actually traded (see _ext_hours_limit_price), instead of
         # our own possibly-divergent pre-market quote.
         _trader = db.get(Order, trader_order_id)
+        if _owner_trades_independently(db, _trader):
+            return
         trader_ref_price = _trader.filled_avg_price if _trader is not None else None
         children = list(db.execute(
             select(Order).where(
@@ -2198,6 +2200,27 @@ def _trader_bracket_for_copy(trader_order: Order) -> tuple[bool, Decimal | None,
     return (True, tp_pct, sl_pct)
 
 
+def trades_independently(trader: "User | None") -> bool:
+    """A Discord trader and their subscribers are independent.
+
+    The subscribers trade the trader's Discord CHANNELS on their own settings
+    (services/discord_subscribers.py). Which channels they get is the ONLY link:
+    no order of the trader's — from Discord, the Trade Panel, a close, or the
+    broker's own app — is copied to them, and no cancel, modify or close the
+    trader makes cascades onto theirs.
+    """
+    return bool(
+        trader is not None
+        and trader.role == UserRole.TRADER
+        and getattr(trader, "discord_enabled", False)
+    )
+
+
+def _owner_trades_independently(db: Session, order: "Order | None") -> bool:
+    """trades_independently() for the trader who owns ``order``."""
+    return order is not None and trades_independently(db.get(User, order.user_id))
+
+
 def trader_can_trade(db: Session, trader: User) -> bool:
     if trader.role != UserRole.TRADER:
         return False
@@ -2248,6 +2271,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             discord_alerts.emit_trader_fill_alert(trader_order.id)
         except Exception:  # noqa: BLE001
             log.exception("discord alert (fanout) failed for %s", trader_order.id)
+
+    # A Discord trader's subscribers are independent of the trader's orders —
+    # the fill card above is the trader's own broadcast and still goes out;
+    # nothing is copied. See trades_independently.
+    if trades_independently(trader):
+        return results
 
     # Trader master pause. We DON'T skip the whole fanout here anymore: while
     # paused, the trader's OPENS are dropped (no new entries for anyone), but

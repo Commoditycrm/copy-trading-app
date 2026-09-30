@@ -286,6 +286,10 @@ export function BulkExitBar({ onActionComplete }: Props) {
   }
 
   const isTrader = user?.role === "trader";
+  // A Discord trader's subscribers trade the trader's channels on their own
+  // settings — their positions and orders aren't the trader's to act on (the
+  // API refuses too), so the subscriber buttons are hidden.
+  const actsForSubscribers = isTrader && !user?.discord_enabled;
   // Sell-All suite (Exit My Positions + trailing stop + snapshot/re-entry) is
   // admin-allow-listed per trader. Without access, hide the Exit-My-Positions
   // chip, its trail/re-entry inputs, and the Re-Enter card (the API 403s too).
@@ -424,7 +428,7 @@ export function BulkExitBar({ onActionComplete }: Props) {
             {hasSellAll && !noPositions && reentryPill}
             {renderButton("my_orders")}
           </div>
-          {isTrader && (
+          {actsForSubscribers && (
             <div className="flex items-center gap-2 shrink-0">
               {renderButton("subs_positions")}
               {renderButton("subs_orders")}
