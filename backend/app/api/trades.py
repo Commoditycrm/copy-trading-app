@@ -33,7 +33,7 @@ from app.services import audit, copy_engine, events, excel_export, fills_sync, m
 from app.services.crypto import decrypt_json
 from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
 from app.services.pnl import (
-    alpaca_marked_by_day, calendar_series, realized_pnl_by_order,
+    alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_order,
 )
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -2175,16 +2175,20 @@ def calendar_pnl(
         db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
         live_today_unrealized=live_unreal_today,
     )
-    # Match the connected broker: an Alpaca account's settled days show Alpaca's
-    # OWN marked P&L (portfolio-history — the exact figure Alpaca's app shows),
-    # not our reconstruction. Empty for non-Alpaca users, who keep the FIFO +
-    # capture marked. Today keeps the live cell (portfolio-history omits it).
-    alpaca_marked = alpaca_marked_by_day(db, target_user_id, from_, to, tz)
+    # Match the connected broker's own calendar, per broker:
+    #  * Webull (and any frozen Day's-P&L snapshot) — marked from the snapshot
+    #    the job froze as each day passed (forward-only; no broker history).
+    #  * Alpaca — its exact per-day marked from portfolio-history, which also
+    #    covers past days, so it overrides the frozen value where present.
+    # Empty for brokers that expose neither, who keep the FIFO + capture marked.
+    # Today always keeps the live cell.
+    marked_by_day = frozen_marked_by_day(db, target_user_id, from_, to)
+    marked_by_day.update(alpaca_marked_by_day(db, target_user_id, from_, to, tz))
     out: list[DailyPnL] = []
     for c in sorted(series.values(), key=lambda c: c.day):
         marked = c.marked_pnl
         pct: Decimal | None = None
-        ov = alpaca_marked.get(c.day)
+        ov = marked_by_day.get(c.day)
         if ov is not None and not c.live:
             marked, pct = ov
         out.append(DailyPnL(
