@@ -27,6 +27,7 @@ confused: ``/internal/assignments`` hands out decrypted Discord sessions.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import secrets
 import time
@@ -49,14 +50,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import require_trader
+from app.api.deps import current_user, require_trader
 from app.config import get_settings
 from app.database import get_db
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
 from app.models.order import Order, OrderSide, OrderStatus
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.pagination import Page
 from app.schemas.discord import (
     DiscordAssignmentOut,
@@ -94,6 +95,7 @@ from app.services import (
     discord_login,
     discord_pairing,
     discord_schedule,
+    discord_subscribers,
     events,
 )
 from app.services.discord_session import (
@@ -113,6 +115,27 @@ router = APIRouter(prefix="/api/discord-sources", tags=["discord-sources"])
 # list_sources filters on it long before that endpoint appears.
 _SELF_CHANNEL_ID = "self"
 _SELF_LABEL = "Self"
+
+
+def require_discord_member(
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> User:
+    """A Discord trader, or a subscriber of one.
+
+    Routes a subscriber shares with the trader — their channel switches, their
+    own alert-handling settings, signals and approvals — take this instead of
+    require_trader + _require_feature. Adding, connecting and removing channels
+    stay trader-only.
+    """
+    if not get_settings().discord_listener_enabled:
+        raise HTTPException(503, "discord_listener_disabled")
+    if user.role == UserRole.TRADER:
+        if not user.discord_enabled:
+            raise HTTPException(403, "discord_not_enabled")
+        return user
+    if discord_subscribers.followed_discord_trader(db, user) is None:
+        raise HTTPException(403, "discord_not_enabled")
+    return user
 
 
 def _require_feature(user: User = Depends(require_trader)) -> None:
@@ -327,9 +350,12 @@ def _to_out(src: DiscordAlertSource) -> DiscordSourceOut:
 @router.get("", response_model=list[DiscordSourceOut])
 def list_sources(
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> list[DiscordSourceOut]:
+    if user.role != UserRole.TRADER:
+        pairs = discord_subscribers.sync_mirrors(db, user)
+        db.commit()
+        return [_mirror_out(m, p) for m, p in pairs]
     rows = db.execute(
         select(DiscordAlertSource)
         .where(
@@ -343,6 +369,18 @@ def list_sources(
         .order_by(DiscordAlertSource.created_at.desc())
     ).scalars()
     return [_to_out(r) for r in rows]
+
+
+def _mirror_out(mirror: DiscordAlertSource, parent: DiscordAlertSource) -> DiscordSourceOut:
+    """A subscriber's view of a trader channel: the channel's live state and
+    schedule as the trader runs it, with the subscriber's own on/off switch.
+    The trader's Discord session is theirs — only whether one exists is said."""
+    out = _to_out(parent)
+    out.id = mirror.id
+    out.is_enabled = mirror.is_enabled
+    out.mirrored = True
+    out.session = DiscordSessionInfo(present=out.session.present, cookie_count=0)
+    return out
 
 
 @router.post("", response_model=DiscordSourceOut, status_code=status.HTTP_201_CREATED)
@@ -786,8 +824,7 @@ def clear_simulated_prices(
 @router.get("/signals/page", response_model=Page[DiscordSignalOut])
 def list_signals(
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
     status_filter: str | None = Query(default=None, alias="status"),
     search: str | None = Query(default=None, description="Symbol substring"),
     limit: int = Query(default=50, ge=1, le=200),
@@ -938,8 +975,7 @@ def _signal_out(
 @router.get("/settings", response_model=DiscordSettingsOut)
 def get_discord_settings(
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> DiscordSettingsOut:
     """Account-wide handling of inbound Discord alerts."""
     from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
@@ -975,8 +1011,7 @@ def get_discord_settings(
 def update_discord_settings(
     payload: DiscordSettingsIn,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> DiscordSettingsOut:
     """Switch between reviewing every alert and auto-approving parsed ones.
 
@@ -1189,8 +1224,7 @@ def _ai_decision_out(row) -> AiTrimDecisionOut:
 @router.get("/ai-trim", response_model=AiTrimSettingsOut)
 def get_ai_trim_settings(
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> AiTrimSettingsOut:
     from app.models.settings import TraderSettings  # noqa: PLC0415
 
@@ -1201,8 +1235,7 @@ def get_ai_trim_settings(
 def update_ai_trim_settings(
     payload: AiTrimSettingsIn,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> AiTrimSettingsOut:
     from app.models.settings import TraderSettings  # noqa: PLC0415
 
@@ -1232,8 +1265,7 @@ def update_ai_trim_settings(
 def list_ai_trim_decisions(
     limit: int = Query(30, ge=1, le=200),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> list[AiTrimDecisionOut]:
     from app.models.ai_trim_decision import AiTrimDecision  # noqa: PLC0415
     from app.services import ai_trim  # noqa: PLC0415
@@ -1266,8 +1298,7 @@ def _owned_decision(db: Session, user: User, decision_id: uuid.UUID):
 def approve_ai_trim_decision(
     decision_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> AiTrimDecisionOut:
     """Carry out a suggestion — re-validated against the position as it is now."""
     from app.brokers import adapter_for  # noqa: PLC0415
@@ -1305,8 +1336,7 @@ def approve_ai_trim_decision(
 def dismiss_ai_trim_decision(
     decision_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> AiTrimDecisionOut:
     row = _owned_decision(db, user, decision_id)
     if row.status != "suggested":
@@ -1326,8 +1356,7 @@ class AiModelOut(BaseModel):
 
 @router.get("/ai-trim/models", response_model=list[AiModelOut])
 def list_ai_trim_models(
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> list[AiModelOut]:
     """Models the AI trimming engine can use (they must support structured output)."""
     from app.services import ai_trim  # noqa: PLC0415
@@ -1349,8 +1378,7 @@ class AiTrimTestOut(BaseModel):
 @router.post("/ai-trim/test", response_model=AiTrimTestOut)
 def test_ai_trim(
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> AiTrimTestOut:
     """One call against a made-up position: proves the key and the model work.
     Records nothing and trades nothing."""
@@ -1382,10 +1410,25 @@ def update_source(
     source_id: uuid.UUID,
     payload: DiscordSourceUpdateIn,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> DiscordSourceOut:
     src = _get_owned(db, user, source_id)
+    if src.parent_source_id is not None or user.role != UserRole.TRADER:
+        # A subscriber's copy of a trader channel: the switch is theirs, the
+        # channel itself (name, URL, schedule, parsing) is the trader's.
+        changed = payload.model_dump(exclude_unset=True, exclude_none=True)
+        if set(changed) - {"is_enabled"}:
+            raise HTTPException(403, "Only the on/off switch can be changed on a trader's channel.")
+        if payload.is_enabled is not None:
+            src.is_enabled = payload.is_enabled
+        db.commit()
+        parent = (db.get(DiscordAlertSource, src.parent_source_id)
+                  if src.parent_source_id else None)
+        if parent is not None:
+            return _mirror_out(src, parent)
+        out = _to_out(src)
+        out.mirrored = True
+        return out
     if payload.label is not None:
         src.label = payload.label.strip()
     if payload.percent_means_exit is not None:
@@ -1689,6 +1732,25 @@ def _self_message_id() -> str:
     return str(int(time.time() * 1_000_000))
 
 
+def _run_coroutine_inline(coro) -> None:  # noqa: ANN001
+    """Run ``coro`` to completion from sync code on a worker thread."""
+    import asyncio  # noqa: PLC0415
+
+    from app.services import trade_listener  # noqa: PLC0415
+
+    loop = trade_listener._main_loop
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is not None and loop.is_running() and running is not loop:
+        asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=300)
+    elif running is None:
+        asyncio.run(coro)                      # no app loop: scripts, tests
+    else:
+        running.create_task(coro)              # on a loop thread: can't block it
+
+
 class _InlineTasks(BackgroundTasks):
     """Run "background" work inline.
 
@@ -1701,7 +1763,14 @@ class _InlineTasks(BackgroundTasks):
     """
 
     def add_task(self, func, *args, **kwargs) -> None:  # noqa: ANN001, ANN003
-        func(*args, **kwargs)
+        result = func(*args, **kwargs)
+        if inspect.iscoroutine(result):
+            # The fanout runner is async. Calling it only BUILT the coroutine —
+            # it never ran, so every order placed off the request path (the
+            # auto-trim sweep, pasted Self alerts) reached no subscriber. Run it
+            # to completion on the app's main loop, where the fanout's
+            # semaphores live (copy_engine.fanout_threadsafe).
+            _run_coroutine_inline(result)
 
 
 def submit_self_alert_text(
@@ -1757,7 +1826,7 @@ def submit_self_alert(
     request: Request,
     background: BackgroundTasks,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
+    user: User = Depends(require_discord_member),
 ) -> DiscordSelfAlertOut:
     """Replay an alert the system missed, through the normal Discord pipeline.
 
@@ -2003,6 +2072,10 @@ def _execute_signal(
             # A trim closes part of the position and keeps the rest, so the
             # subscriber fanout must not treat it as the trader leaving.
             partial_close=is_trim,
+            # Discord subscribers trade the alert themselves, on their own
+            # settings (services/discord_subscribers.py) — independent of this
+            # order, so it is not copied to them.
+            skip_fanout=True,
         )
     except HTTPException as exc:
         if trim_guard is not None:
@@ -2082,6 +2155,17 @@ def _execute_signal(
             log.warning("discord: could not expedite the stop for %s", p.symbol,
                         exc_info=True)
 
+    # The trader's fill card (their own Discord webhook) is posted by the fanout
+    # for an order already FILLED at placement — and this order skips the
+    # fanout. Later fills are covered by the listeners' fill hooks.
+    if getattr(user, "role", None) == UserRole.TRADER and order.status is OrderStatus.FILLED:
+        try:
+            from app.services import discord_alerts  # noqa: PLC0415
+
+            discord_alerts.emit_trader_fill_alert(order.id)
+        except Exception:  # noqa: BLE001
+            log.exception("discord: fill card failed for order %s", order.id)
+
     discord_execution.mark_executed(msg, order.id)
     log.info("discord: alert %s placed as order %s%s", msg.id, order.id,
              f" ({detail})" if detail else "")
@@ -2098,8 +2182,7 @@ def decide_signal(
     request: Request,
     accept: bool = Query(..., description="true = approve for execution, false = reject"),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
 ) -> DiscordDecisionOut:
     """Accept or reject one parsed alert (manual mode).
 
@@ -2148,8 +2231,7 @@ def decide_signal(
 def list_messages(
     source_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
-    _: None = Depends(_require_feature),
+    user: User = Depends(require_discord_member),
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -2336,6 +2418,13 @@ def listener_messages(
         )
 
     batch = [m.model_dump() for m in payload.messages if m.channel_id == src.channel_id]
+    # Subscribers trade the ALERT on their own settings, not the trader's order
+    # — started first, on threads of their own, so nobody waits on the trader's
+    # broker. See services/discord_subscribers.py.
+    try:
+        discord_subscribers.relay_batch(db, src, batch)
+    except Exception:  # noqa: BLE001 — never stall the trader's own feed
+        log.exception("discord: subscriber relay failed for source %s", src.id)
     auto = _auto_approve(db, src.user_id)
     report = discord_ingest.ingest_batch(db, src, batch, auto_approve=auto)
 

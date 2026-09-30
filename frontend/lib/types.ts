@@ -26,6 +26,8 @@ export interface User {
    *  Trader-only; off unless an admin allow-lists the user. Gates both the
    *  Discord nav entry and the /discord route. */
   discord_enabled: boolean;
+  /** Gets the Discord page: a Discord-enabled trader, or a subscriber of one. */
+  discord_available?: boolean;
   /** Whether the user has confirmed their email. Soft-enforced: unverified
    *  users can still use the app, but see a "verify your email" banner. */
   email_verified: boolean;

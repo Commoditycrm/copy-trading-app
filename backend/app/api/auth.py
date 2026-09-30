@@ -336,7 +336,10 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenPair:
 
 
 @router.get("/me", response_model=UserOut)
-def me(user: User = Depends(current_user)) -> User:
+def me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> User:
+    from app.services import discord_subscribers  # noqa: PLC0415
+
+    user.discord_available = discord_subscribers.has_discord(db, user)
     return user
 
 
@@ -398,6 +401,9 @@ def update_me(
             cache_svc.invalidate_subscribers_for_trader(user.id)
         except Exception:  # noqa: BLE001
             pass
+    from app.services import discord_subscribers  # noqa: PLC0415
+
+    user.discord_available = discord_subscribers.has_discord(db, user)
     return user
 
 
