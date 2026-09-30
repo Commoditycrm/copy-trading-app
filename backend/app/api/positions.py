@@ -1949,6 +1949,68 @@ def average_position(
     return order
 
 
+@router.post("/{broker_symbol}/cancel-open")
+def cancel_position_open_orders(
+    broker_symbol: str,
+    request: Request,
+    background: BackgroundTasks,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    include_subscribers: bool = Query(True, description="Also cancel subscribers' mirrors of these orders."),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel the open orders on THIS position's contract only.
+
+    The row's "Canc.Open Ord" used to call cancel-all-open, which swept every
+    open order on the account. This selects just the orders on the row's
+    contract and account, then cancels them through the same batch path
+    (broker cancel, SSE, and the cascade to subscribers' mirrors).
+
+    A Discord ladder stop on the contract is one of those orders; its level is
+    cleared too, so the ladder doesn't put it back.
+    """
+    from app.api.trades import _CANCELLABLE_STATUSES, _cancel_orders_batch  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None:
+        raise HTTPException(404, "position_not_found")
+
+    orders = _position_open_orders(db, user.id, acct.id, pos, _CANCELLABLE_STATUSES)
+    result = _cancel_orders_batch(
+        db, request, background, user, orders, include_subscribers, via="cancel-position-open",
+    )
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
+    if guard is not None and guard.stop_order_id in {o.id for o in orders}:
+        guard.stop_order_id = None
+        guard.stop_price = None
+        db.commit()
+    return result
+
+
+def _position_open_orders(db: Session, user_id, acct_id, pos, statuses) -> list:
+    """The caller's open orders on one contract of one account."""
+    from sqlalchemy.orm import selectinload  # noqa: PLC0415
+
+    return list(db.execute(
+        select(Order).options(selectinload(Order.fills)).where(
+            Order.user_id == user_id,
+            Order.broker_account_id == acct_id,
+            Order.instrument_type == pos.instrument_type,
+            Order.symbol == pos.symbol,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            Order.status.in_(statuses),
+        )
+    ).scalars())
+
+
 @router.post("/{broker_symbol}/trailing-stop")
 def arm_trailing_stop(
     broker_symbol: str,
