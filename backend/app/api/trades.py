@@ -2115,18 +2115,19 @@ def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     return total if n_got else None
 
 
-def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
-    """The broker's OWN authoritative Day's P&L for TODAY (its ``total_day_
-    profit_loss`` via get_pnl_snapshot), summed across the user's connected
-    accounts — so today's calendar cell shows the broker's number instead of our
-    reconstructed realized + unrealized swing.
+def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str] | None":
+    """The broker's OWN authoritative Day's P&L for TODAY (its live
+    get_pnl_snapshot()['todays_pl'] — Webull total_day_profit_loss, Alpaca
+    equity − last_equity), summed across the user's connected accounts, with a
+    provenance label. So today's calendar cell shows the broker's number instead
+    of our reconstructed realized + unrealized swing.
 
-    Only for brokers that expose a live day P&L but NO historical series
-    (Webull): those have no other authoritative source for today, and their
-    calendar can't be reconstructed to match. Returns None unless EVERY connected
-    account is such a broker — a broker with its own historical/marked series
-    (Alpaca) is left on its existing path, and a mixed account keeps the
-    calculated cell rather than mixing one broker's day P&L with another's."""
+    Every connected broker that exposes a live day P&L (capability
+    ``live_daily_pnl``) participates. Returns None only when the user has a
+    connected account WITHOUT that capability (e.g. IBKR/unknown) — then we keep
+    the calculated cell rather than mixing a broker's day P&L with a broker we
+    can't source — or when every snapshot fetch failed. The label is
+    ``<broker>_live`` for a single broker, else ``broker_live``."""
     from app.brokers.capabilities import capabilities_for  # local — avoid cycle
     accts = db.execute(
         select(BrokerAccount).where(
@@ -2136,10 +2137,11 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     ).scalars().all()
     if not accts:
         return None
+    brokers: set = set()
     for a in accts:
-        caps = capabilities_for(a.broker)
-        if not (caps.live_daily_pnl and not caps.historical_daily_pnl):
-            return None  # e.g. Alpaca present → keep the existing calculated cell
+        if not capabilities_for(a.broker).live_daily_pnl:
+            return None  # a broker with no live day P&L → keep the calculated cell
+        brokers.add(a.broker)
     total = Decimal(0)
     n_got = 0
     for a in accts:
@@ -2155,7 +2157,10 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
         if tp is not None:
             total += Decimal(str(tp))
             n_got += 1
-    return total if n_got else None
+    if not n_got:
+        return None
+    source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
+    return total, source
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
@@ -2244,10 +2249,11 @@ def calendar_pnl(
         ov = marked_by_day.get(c.day)
         if c.live:
             if live_day_pnl_today is not None:
-                # TODAY, Webull-type broker: show the broker's own Day's P&L
-                # (total_day_profit_loss), not our realized + swing reconstruction.
-                displayed_marked = live_day_pnl_today
-                source, quality = "webull_live", "authoritative"
+                # TODAY: show the connected broker's OWN live Day's P&L (Webull
+                # total_day_profit_loss / Alpaca equity−last_equity), not our
+                # realized + swing reconstruction.
+                displayed_marked, source = live_day_pnl_today
+                quality = "authoritative"
             else:
                 # Today, no live broker figure → our live reconstruction, moving.
                 source, quality = "calculated", "live"

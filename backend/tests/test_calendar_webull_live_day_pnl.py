@@ -48,7 +48,9 @@ def _setup(monkeypatch, day_pnl):
     monkeypatch.setattr(trades.fills_sync, "sync_user_fills",
                         lambda *a, **k: {"fills_added": 0, "orders_added": 0})
     monkeypatch.setattr(trades, "_live_unrealized_today", lambda *a, **k: Decimal("-681"))
-    monkeypatch.setattr(trades, "_live_day_pnl_today", lambda *a, **k: day_pnl)
+    # _live_day_pnl_today returns (value, source) | None.
+    monkeypatch.setattr(trades, "_live_day_pnl_today",
+                        lambda *a, **k: None if day_pnl is None else (day_pnl, "webull_live"))
     return db, user
 
 
@@ -73,6 +75,21 @@ def test_webull_today_zero_day_pnl_shows_zero(monkeypatch):
     cell = _today_cell(monkeypatch, Decimal("0"))
     assert cell.marked_pnl == Decimal("0"), "a broker 0.00 must display 0.00, not fall back"
     assert cell.source == "webull_live"
+
+
+def test_alpaca_today_uses_broker_live_source(monkeypatch):
+    """Today follows whichever broker is connected — an Alpaca account's live
+    equity−last_equity comes through with an alpaca_live source label."""
+    db, user = _setup(monkeypatch, Decimal("321.00"))
+    monkeypatch.setattr(trades, "_live_day_pnl_today",
+                        lambda *a, **k: (Decimal("321.00"), "alpaca_live"))
+    today = market_hours.now_et().date()
+    rows = trades.calendar_pnl(db=db, user=user, from_=today, to=today,
+                               tz="America/New_York", user_id=None)
+    cell = next(r for r in rows if r.day == today)
+    assert cell.marked_pnl == Decimal("321.00")
+    assert cell.source == "alpaca_live"
+    assert cell.quality == "authoritative"
 
 
 def test_no_live_day_pnl_leaves_marked_none(monkeypatch):
