@@ -208,3 +208,16 @@ def test_a_failed_full_exit_reopens_the_guard(db):
     _reopen(g)
     assert g.closed_at is None and g.closed_reason is None
     assert g.sell_count == 2
+
+
+def test_a_manual_close_releases_the_ladder_stop_before_cancelling_everything():
+    """The cancel-everything step commits. If the ladder's own stop were
+    cancelled there while the guard still pointed at it, a reconciler tick in
+    the gap would read it as removed by the trader and forget the level, so
+    the part of the position the close doesn't sell would lose its stop."""
+    from app.api import positions
+
+    src = inspect.getsource(positions.close_position)
+    assert src.index("release_for_position(db, user, pos)") < src.index(
+        "_cancel_working_orders_for_position(db, user, acct, adapter, pos)"
+    )

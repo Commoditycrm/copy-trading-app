@@ -1607,6 +1607,19 @@ def close_position(
     if payload.quantity is not None and payload.quantity <= 0:
         raise HTTPException(422, "quantity_must_be_positive")
 
+    # A Discord ladder stop is released through the ladder FIRST, which drops
+    # the guard's link to it. The helper below cancels every resting order and
+    # commits; if the ladder's stop were cancelled there while the guard still
+    # pointed at it, a stop-reconciler tick in the gap before the close would
+    # read it as removed by the trader and forget the level — leaving whatever
+    # the close doesn't sell without a stop. Released here, the reconciler
+    # re-places a stop sized to the remainder once the close has settled.
+    if pos.quantity > 0:
+        from app.services import discord_stop_orders  # noqa: PLC0415
+
+        discord_stop_orders.release_for_position(db, user, pos)
+        db.commit()
+
     # Anything still resting on this contract reserves the position at the
     # broker, so the close would be refused. Clear it first — see the helper.
     cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
@@ -1672,13 +1685,6 @@ def close_position(
         option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
-
-    # A Discord ladder stop resting on this contract reserves it; without this
-    # the close is read as opening a short and refused.
-    if reverse_side == OrderSide.SELL:
-        from app.services import discord_stop_orders  # noqa: PLC0415
-
-        discord_stop_orders.release_for_position(db, user, pos)
 
     try:
         order = _place_trader_order(
