@@ -115,10 +115,12 @@ function LiveNetLiqCell({ symbol, snapshotPrice, quantity, multiplier = 1 }: {
 type ExitMode = "close" | "average";
 
 /** The ▾ half of a split button: switches what its button does for this row
- *  between closing the position and averaging into it (buying more). */
-function ModeCaret({ mode, labels, onChange, disabled, variant }: {
+ *  between closing the position and averaging into it (buying more). Optional
+ *  one-off ``actions`` render below the modes, after a divider. */
+function ModeCaret({ mode, labels, onChange, disabled, variant, actions = [] }: {
   mode: ExitMode; labels: Record<ExitMode, string>; onChange: (m: ExitMode) => void;
   disabled?: boolean; variant: "ghost" | "solid";
+  actions?: { label: string; onClick: () => void; danger?: boolean }[];
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -162,6 +164,19 @@ function ModeCaret({ mode, labels, onChange, disabled, variant }: {
               style={{ color: mode === m ? "var(--accent)" : "var(--text-2)" }}
             >
               {labels[m]}
+            </button>
+          ))}
+          {actions.length > 0 && <div style={{ borderTop: "1px solid var(--border)", margin: "2px 0" }} />}
+          {actions.map(a => (
+            <button
+              key={a.label}
+              type="button"
+              role="menuitem"
+              onClick={() => { setOpen(false); a.onClick(); }}
+              className="block w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] whitespace-nowrap"
+              style={{ color: a.danger ? "var(--bad)" : "var(--text-2)" }}
+            >
+              {a.label}
             </button>
           ))}
         </div>
@@ -727,6 +742,23 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }
 
+    async function cancelAllOpenOrders() {
+      if (!confirm(
+        "Cancel ALL your open orders? For a trader this also cancels subscribers' mirrored orders. " +
+        "This includes Discord ladder stops, which then stay removed. Filled positions are not affected."
+      )) return;
+      try {
+        const res = await api<{ cancelled_count?: number }>(
+          "/api/trades/cancel-all-open?include_subscribers=true", { method: "POST" },
+        );
+        const n = res.cancelled_count ?? 0;
+        notify.success(`Cancelled ${n} open order${n === 1 ? "" : "s"}`);
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "Could not cancel open orders");
+      }
+    }
+
     async function averagePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
       if (type === "limit") {
@@ -1200,6 +1232,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               labels={{ close: "Close at Market", average: "Avg. at Market" }}
                               onChange={m => setMarketMode(s => ({ ...s, [key]: m }))}
                               disabled={inFlight}
+                              actions={[{ label: "Canc.Open Ord", onClick: cancelAllOpenOrders, danger: true }]}
                             />
                           </div>
                           <div className="flex items-stretch">
