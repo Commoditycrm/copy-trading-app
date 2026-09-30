@@ -311,6 +311,16 @@ class Settings(BaseSettings):
     # movement, not a way to test without consequences.
     discord_price_override_enabled: bool = False
 
+    # ── AI trimming (OpenRouter) ─────────────────────────────────────────
+    # One server-wide key; every trader who picks the AI exit engine is billed
+    # to it. Blank leaves the engine selectable but inert — each would-be call
+    # is recorded as an error, and nothing trades.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # A decision that takes longer than this is a HOLD: the price it was asked
+    # about has moved on, and the sweep holds the trader's lock meanwhile.
+    openrouter_timeout_s: float = 20.0
+
     # Cap on a single intake batch from the listener. The observer flushes in
     # small batches; anything larger is a malformed or hostile payload.
     discord_ingest_max_batch: int = 50

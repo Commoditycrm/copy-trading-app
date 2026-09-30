@@ -645,6 +645,92 @@ def _bid_for(adapter, pos) -> "Decimal | None":
         return None
 
 
+def place_exit(db, trader, live_acct, adapter, pos, quantity, *, partial: bool = False):
+    """Sell ``quantity`` of a held position so that it fills. Returns the Order.
+
+    The one exit path for protections and the AI trimming engine: a marketable
+    limit outside regular hours (options), marked as a close, never deduped.
+    """
+    from app.api.trades import _place_trader_order  # noqa: PLC0415
+    from app.models.order import InstrumentType, OrderSide, OrderType  # noqa: PLC0415
+    from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
+    from fastapi import BackgroundTasks  # noqa: PLC0415
+
+    is_option = pos.option_strike is not None
+
+    # Alpaca rejects option MARKET orders outside the regular
+    # session, so a stop that fires pre- or post-market would fail
+    # exactly when it matters. Price a marketable limit through the
+    # bid instead — it fills like a market order and is accepted.
+    # Imported here, like every other market_hours use in this
+    # module. It was referenced as a bare global and never imported,
+    # so this line raised NameError on EVERY close -- which meant no
+    # Discord position was ever closed by the poller: not a stop-out,
+    # not a trailing exit, and not the fallback that exits when the
+    # broker refuses to hold a stop. The failure was invisible
+    # because the sweep catches and logs it per account.
+    from app.services import market_hours  # noqa: PLC0415
+
+    order_type, limit_price = OrderType.MARKET, None
+    if is_option and not market_hours.in_regular_session():
+        bid = _bid_for(adapter, pos)
+        if bid is not None and bid > 0:
+            order_type = OrderType.LIMIT
+            limit_price = (bid * Decimal("0.98")).quantize(Decimal("0.01")) or bid
+        else:
+            log.warning(
+                "discord stops: no quote to price an off-session exit "
+                "for %s — sending market and letting the broker judge",
+                pos.symbol,
+            )
+
+    payload = PlaceOrderIn(
+        instrument_type=(
+            InstrumentType.OPTION if is_option else InstrumentType.STOCK
+        ),
+        symbol=pos.symbol.upper(),
+        side=OrderSide.SELL,
+        order_type=order_type,
+        limit_price=limit_price,
+        quantity=abs(Decimal(str(quantity))),
+        option_expiry=pos.option_expiry,
+        option_strike=pos.option_strike,
+        option_right=pos.option_right,
+    )
+    return _place_trader_order(
+        db, trader, payload, live_acct.id,
+        BackgroundTasks(), _PollerRequest(),
+        # A close, so the order is marked is_closing and the option
+        # SELL goes out as SELL_TO_CLOSE.
+        resolve_wash_trade=True,
+        # A protective exit must never be mistaken for a double-POST.
+        # It is shape-identical to the trim that usually precedes it
+        # by a second or two -- same symbol, side, MARKET, same 1
+        # contract -- so the 3s duplicate window swallowed it and
+        # returned the TRIM's order instead, placing nothing. The
+        # ladder then retired the guard believing it had closed,
+        # leaving the position open and no longer tracked. Live:
+        # trim 00:33:49, stop refused 00:33:51, close suppressed
+        # 00:33:52.
+        skip_dedup=True,
+        # A slice that leaves part of the position open is a trim, so the
+        # subscriber fanout keeps their working entries on the contract.
+        partial_close=partial,
+    )
+
+
+def _pinned(user_id, guard) -> bool:
+    """Whether a Simulated Prices pin is standing on this guard's contract."""
+    from app.services import price_override  # noqa: PLC0415
+
+    if not price_override.enabled():
+        return False
+    key = price_override.contract_key(
+        guard.symbol, guard.option_strike, guard.option_right, guard.option_expiry,
+    )
+    return price_override.get_pin(user_id, key) is not None
+
+
 def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
     """Advance the stops and trailing exits a Discord trim left behind.
 
@@ -657,10 +743,6 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
     monitor that follows it.
     """
     from app.brokers import adapter_for  # noqa: PLC0415
-    from app.models.order import (  # noqa: PLC0415
-        InstrumentType, OrderSide, OrderType,
-    )
-    from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
     from app.services import discord_trailing_stop  # noqa: PLC0415
     from app.services.crypto import decrypt_json  # noqa: PLC0415
 
@@ -682,69 +764,9 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                 ``quantity`` is what this protection covers: the whole position
                 for a stop-out, or just the earmarked slice for a trailing exit.
                 """
-                from app.api.trades import _place_trader_order  # noqa: PLC0415
                 from app.models.user import User  # noqa: PLC0415
-                from fastapi import BackgroundTasks  # noqa: PLC0415
 
-                trader = db.get(User, acct.user_id)
-                is_option = pos.option_strike is not None
-
-                # Alpaca rejects option MARKET orders outside the regular
-                # session, so a stop that fires pre- or post-market would fail
-                # exactly when it matters. Price a marketable limit through the
-                # bid instead — it fills like a market order and is accepted.
-                # Imported here, like every other market_hours use in this
-                # module. It was referenced as a bare global and never imported,
-                # so this line raised NameError on EVERY close -- which meant no
-                # Discord position was ever closed by the poller: not a stop-out,
-                # not a trailing exit, and not the fallback that exits when the
-                # broker refuses to hold a stop. The failure was invisible
-                # because the sweep catches and logs it per account.
-                from app.services import market_hours  # noqa: PLC0415
-
-                order_type, limit_price = OrderType.MARKET, None
-                if is_option and not market_hours.in_regular_session():
-                    bid = _bid_for(adapter, pos)
-                    if bid is not None and bid > 0:
-                        order_type = OrderType.LIMIT
-                        limit_price = (bid * Decimal("0.98")).quantize(Decimal("0.01")) or bid
-                    else:
-                        log.warning(
-                            "discord stops: no quote to price an off-session exit "
-                            "for %s — sending market and letting the broker judge",
-                            pos.symbol,
-                        )
-
-                payload = PlaceOrderIn(
-                    instrument_type=(
-                        InstrumentType.OPTION if is_option else InstrumentType.STOCK
-                    ),
-                    symbol=pos.symbol.upper(),
-                    side=OrderSide.SELL,
-                    order_type=order_type,
-                    limit_price=limit_price,
-                    quantity=abs(Decimal(str(quantity))),
-                    option_expiry=pos.option_expiry,
-                    option_strike=pos.option_strike,
-                    option_right=pos.option_right,
-                )
-                _place_trader_order(
-                    db, trader, payload, live_acct.id,
-                    BackgroundTasks(), _PollerRequest(),
-                    # A close, so the order is marked is_closing and the option
-                    # SELL goes out as SELL_TO_CLOSE.
-                    resolve_wash_trade=True,
-                    # A protective exit must never be mistaken for a double-POST.
-                    # It is shape-identical to the trim that usually precedes it
-                    # by a second or two -- same symbol, side, MARKET, same 1
-                    # contract -- so the 3s duplicate window swallowed it and
-                    # returned the TRIM's order instead, placing nothing. The
-                    # ladder then retired the guard believing it had closed,
-                    # leaving the position open and no longer tracked. Live:
-                    # trim 00:33:49, stop refused 00:33:51, close suppressed
-                    # 00:33:52.
-                    skip_dedup=True,
-                )
+                place_exit(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
 
             # Keep a REAL stop order resting at the broker for each protected
             # position. Reconciled every tick rather than placed once, so it
@@ -776,6 +798,19 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                         guard.option_right, guard.option_expiry,
                     ))
                     held = abs(Decimal(str(pos.quantity))) if pos is not None else Decimal(0)
+                    if pos is not None and _pinned(acct.user_id, guard):
+                        # A Simulated Prices pin exists only in this app; Alpaca
+                        # judges a resting stop against the REAL price. The two
+                        # disagreed live 2026-09-29: a pin said +35%, the ladder
+                        # moved the stop to break-even, Alpaca (price below
+                        # entry) refused it, and the fallback sold the rest.
+                        # While pinned, rest nothing at the broker and let the
+                        # emulated stop in discord_trailing_stop judge the pin.
+                        if guard.stop_order_id:
+                            discord_stop_orders.release(
+                                db, guard, _make_stop_canceller(db, adapter),
+                            )
+                        continue
                     try:
                         discord_stop_orders.reconcile(
                             db, guard, held,

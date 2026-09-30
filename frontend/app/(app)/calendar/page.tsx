@@ -5,11 +5,13 @@ import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info } from "lucide-react";
 import { api } from "@/lib/api";
+import { fetchAllSubscribers } from "@/lib/subscribers";
+import { notify } from "@/lib/toast";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { DailyPnL, Page, SubscriberSummary, User } from "@/lib/types";
+import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -86,9 +88,9 @@ export default function CalendarPage() {
         setSnapshot(USER_SNAPSHOT_KEY, u);
         // Only the trader gets the subscriber dropdown.
         if (u.role === "trader") {
-          api<Page<SubscriberSummary>>("/api/subscribers?limit=1000").then((p) => {
-            if (!cancelled) { setSubs(p.items); setSnapshot(CAL_SUBS_KEY, p.items); }
-          });
+          fetchAllSubscribers().then((items) => {
+            if (!cancelled) { setSubs(items); setSnapshot(CAL_SUBS_KEY, items); }
+          }).catch((e) => notify.fromError(e, "Could not load subscribers"));
         }
         // Sync our own fills — refreshes the data the calendar reads from.
         setSyncing(true);

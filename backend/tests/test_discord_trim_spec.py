@@ -26,6 +26,16 @@ import app.services.discord_trailing_stop as stops
 from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.order import InstrumentType, OptionRight
 
+
+@pytest.fixture(autouse=True)
+def _no_working_exit_and_market_open(monkeypatch):
+    """These tests are about the stop/trail rules, not the order book or the
+    clock: no exit is already working, and the regular session is open."""
+    from app.services import discord_stop_orders, market_hours
+
+    monkeypatch.setattr(discord_stop_orders, "working_exit", lambda db, guard: None)
+    monkeypatch.setattr(market_hours, "in_regular_session", lambda *a, **k: True)
+
 ENTRY = Decimal("2.00")
 CHEAP = Decimal("0.50")        # under the $0.90 threshold → exits at market
 
@@ -136,6 +146,8 @@ def test_an_expensive_contract_leaves_via_its_trailing_stops(db):
     assert plan.rung == 3
     assert plan.sell_qty == Decimal(1)           # the whole remainder
     assert L.tick("2.80") == Decimal(1)          # trails out
+    assert L.guard.closed_at is None             # live until the exit has filled...
+    L.tick("2.80")                               # ...and the next tick sees it flat
     assert L.guard.closed_at is not None
 
 
@@ -148,6 +160,8 @@ def test_the_first_trims_stop_protects_the_remainder(db):
 
     assert L.tick("0.40") == Decimal(0)          # above the stop — holds
     assert L.tick("0.36") == Decimal(2)          # broke it — the rest goes
+    assert L.guard.closed_at is None             # live until the exit has filled...
+    L.tick("0.36")                               # ...and the next tick sees it flat
     assert L.guard.closed_at is not None
 
 

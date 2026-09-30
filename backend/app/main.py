@@ -406,38 +406,33 @@ def create_app() -> FastAPI:
         # doesn't notice in time, and joining would block shutdown on
         # the (up to 10s) sleep at the bottom of the loop.
         shutdown_event.set()
-        try:
-            await listeners.stop_all_listeners()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop trade listeners cleanly")
-        try:
-            await pnl_poller.stop()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop pnl_poller cleanly")
-        try:
-            from app.services import alpaca_subscriber_reconciler
-            await alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop alpaca subscriber reconciler cleanly")
-        try:
-            from app.services import webull_subscriber_reconciler
-            await webull_subscriber_reconciler.stop_webull_subscriber_reconciler()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop webull subscriber reconciler cleanly")
-        try:
-            from app.services import market_data_stream
-            await market_data_stream.stop_market_data_stream()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop market_data_stream cleanly")
-        try:
-            from app.services import webull_market_stream
-            await webull_market_stream.stop_webull_market_stream()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to stop webull_market_stream cleanly")
-        try:
-            await close_async_redis()
-        except Exception:  # noqa: BLE001
-            log.exception("failed to close redis client cleanly")
+
+        async def _bounded(name: str, factory) -> None:
+            # Each stop gets a deadline. One that never returns (a websocket
+            # that won't close) otherwise wedges shutdown forever, and under
+            # `uvicorn --reload` that leaves the API down after any code edit
+            # with nothing to say so. Live 2026-09-29: hung for 10+ minutes.
+            try:
+                await asyncio.wait_for(factory(), timeout=10)
+            except asyncio.TimeoutError:
+                log.warning("shutdown: %s did not stop within 10s — abandoning it", name)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to stop %s cleanly", name)
+
+        from app.services import (  # noqa: PLC0415
+            alpaca_subscriber_reconciler, market_data_stream,
+            webull_market_stream, webull_subscriber_reconciler,
+        )
+
+        await _bounded("trade listeners", listeners.stop_all_listeners)
+        await _bounded("pnl_poller", pnl_poller.stop)
+        await _bounded("alpaca subscriber reconciler",
+                       alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler)
+        await _bounded("webull subscriber reconciler",
+                       webull_subscriber_reconciler.stop_webull_subscriber_reconciler)
+        await _bounded("market_data_stream", market_data_stream.stop_market_data_stream)
+        await _bounded("webull_market_stream", webull_market_stream.stop_webull_market_stream)
+        await _bounded("redis client", close_async_redis)
 
     # When this process started. Exposed because a stale backend is invisible
     # from the outside — code changes silently don't apply, and the symptom

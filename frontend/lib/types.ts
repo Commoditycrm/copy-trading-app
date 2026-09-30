@@ -214,6 +214,9 @@ export interface Position {
    *  contract against the most recent Discord entry. Null for positions
    *  opened any other way. */
   discord_channel?: string | null;
+  /** The Discord exit ladder's stop level on this position — its own order
+   *  at the broker, separate from the entry's bracket SL. Null when none. */
+  ladder_stop_price?: string | null;
   current_price: string | null;
   market_value: string | null;
   unrealized_pnl: string | null;
