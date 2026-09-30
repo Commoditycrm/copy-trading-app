@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -821,6 +822,26 @@ def _persist_and_fanout(
 # reason to keep it small.
 _DAYORDERS_PAGE_SIZE = 100
 
+# Webull's PAPER sandbox has no today-orders route: every call answers
+# 404 "Route Not Found". The poller kept asking every few seconds per account,
+# and the 404 also threw the cached client away — so each cycle re-ran the
+# sign-in too, keeping the key rate-limited. A 404 now pauses polling that
+# account (the event stream still detects orders) and keeps the client.
+_DAYORDERS_UNAVAILABLE_S = 600.0
+_dayorders_unavailable: dict[str, float] = {}     # account_id -> retry_at (monotonic)
+
+
+def _dayorders_paused(account_id: str) -> bool:
+    until = _dayorders_unavailable.get(account_id)
+    return until is not None and time.monotonic() < until
+
+
+def _is_auth_error(msg: str) -> bool:
+    """Only a genuine sign-in problem justifies rebuilding the client (which
+    re-runs Webull's token flow)."""
+    m = msg.lower()
+    return any(k in m for k in ("401", "403", "unauthor", "token", "signature", "forbidden"))
+
 
 def _list_today_orders(
     creds: dict[str, Any], account_id: str, page_size: int = _DAYORDERS_PAGE_SIZE,
@@ -840,11 +861,19 @@ def _list_today_orders(
         body = res.json() or {}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
+        if "404" in msg or "route not found" in msg.lower():
+            if not _dayorders_paused(account_id):
+                log.info("webull-poll: today-orders unavailable for %s (404 — paper "
+                         "sandbox); pausing its poll for %.0fs, the stream still "
+                         "detects orders", account_id, _DAYORDERS_UNAVAILABLE_S)
+            _dayorders_unavailable[account_id] = time.monotonic() + _DAYORDERS_UNAVAILABLE_S
+            return []
         log.warning("webull-poll: list_today_orders failed for %s: %s", account_id, msg[:160])
-        # A 429/throttle is transient — KEEP the cached client (rebuilding would
-        # re-run the token flow and pile more load on Webull's auth endpoint,
-        # exactly what caused the lockout). Rebuild only on a genuine auth error.
-        if not ("TOO_MANY" in msg or "429" in msg or "throttl" in msg.lower()):
+        # A 429, a 5xx or a network blip is transient — KEEP the cached client
+        # (rebuilding re-runs the token flow and piles more load on Webull's
+        # auth endpoint, exactly what caused the lockout). Rebuild only on a
+        # genuine auth error.
+        if _is_auth_error(msg) and "429" not in msg and "TOO_MANY" not in msg:
             _invalidate_trade_client(creds)
         return []
     if isinstance(body, list):
@@ -1055,7 +1084,8 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
-                orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
+                if not _dayorders_paused(aid):
+                    orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
                 await asyncio.sleep(gap)
 
             # First cycle: decide which of the orders already on screen are
