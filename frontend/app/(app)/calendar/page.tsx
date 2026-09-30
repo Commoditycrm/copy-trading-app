@@ -151,10 +151,12 @@ export default function CalendarPage() {
   for (let d = 1; d <= last.getDate(); d++) cells.push(new Date(cursor.getFullYear(), cursor.getMonth(), d));
   while (cells.length % 7 !== 0) cells.push(null);
 
-  const monthTotal = data.reduce((s, d) => s + Number(d.realized_pnl), 0);
-  const tradingDays = data.filter(d => d.trade_count > 0).length;
-  // Heatmap intensity is scaled to the month's largest absolute day.
-  const maxAbs = Math.max(...data.map(d => Math.abs(Number(d.realized_pnl))), 1);
+  // The calendar is broker Day's P&L — sum / count / scale on that, not our
+  // internal realized figure. Days the broker doesn't expose (day_pnl == null)
+  // don't contribute.
+  const monthTotal = data.reduce((s, d) => s + (d.day_pnl != null ? Number(d.day_pnl) : 0), 0);
+  const tradingDays = data.filter(d => d.day_pnl != null).length;
+  const maxAbs = Math.max(...data.map(d => (d.day_pnl != null ? Math.abs(Number(d.day_pnl)) : 0)), 1);
   const todayKey = iso(new Date());
 
   // Realized-only across every broker: the day's number is profit/loss from
@@ -164,7 +166,7 @@ export default function CalendarPage() {
   // held overnight is currently underwater.
   const pnlTooltip = useMemo(
     () =>
-      "Daily REALIZED P&L — profit/loss from trades you CLOSED that day (net of fees), matching your broker's daily realized number. It does NOT include unrealized gain/loss on positions still open, so holding a losing position overnight won't turn a profitable trading day negative. Today updates through the session as trades close, then locks.",
+      "Daily P&L — the SAME Day's P&L your connected broker (Webull / Alpaca) shows for each trading date. Today updates live from the broker through the session, then locks as history. Dates the broker doesn't expose show \"--\" rather than an estimate.",
     [],
   );
 
@@ -233,24 +235,19 @@ export default function CalendarPage() {
           if (!d) return <div key={i} className="h-28" />;
           const key = iso(d);
           const day = byDay[key];
-          const pnl = day ? Number(day.realized_pnl) : 0;
-          const unreal = day ? Number(day.unrealized_pnl ?? 0) : 0;
-          // Prefer the backend's authoritative Marked when present (e.g. today's
-          // Webull Day's P&L); else our realized + unrealized. `!= null` so a
-          // genuine broker 0.00 shows 0.00 instead of falling back.
-          const marked = (day && day.marked_pnl != null)
-            ? Number(day.marked_pnl)
-            : pnl + unreal;
-          // Today only: full current unrealized on all open positions (not the
-          // day's swing) — for the tooltip so "Unreal" can't be mistaken for it.
-          const openUnreal = day?.open_unrealized != null ? Number(day.open_unrealized) : null;
+          // The broker's own Day's P&L (+ %) — the ONLY figures the calendar
+          // shows. null → the broker doesn't expose it for this date ("--").
+          const dayPnl = day?.day_pnl != null ? Number(day.day_pnl) : null;
+          const dayPct = day?.day_pnl_pct != null ? Number(day.day_pnl_pct) : null;
+          const hasVal = dayPnl != null;
           const has = !!day;
           const isToday = key === todayKey;
           // Heatmap fill — green for gains / red for losses, opacity scaled to
-          // the day's magnitude vs. the month's biggest move.
-          const intensity = has ? 0.12 + 0.5 * (Math.abs(pnl) / maxAbs) : 0;
-          const bg = has
-            ? (pnl >= 0 ? `rgba(34,197,94,${intensity})` : `rgba(239,68,68,${intensity})`)
+          // the day's magnitude vs. the month's biggest move. Only for cells
+          // with a broker value.
+          const intensity = hasVal ? 0.12 + 0.5 * (Math.abs(dayPnl) / maxAbs) : 0;
+          const bg = hasVal
+            ? (dayPnl >= 0 ? `rgba(34,197,94,${intensity})` : `rgba(239,68,68,${intensity})`)
             : "var(--panel)";
           return (
             <motion.button
@@ -259,11 +256,11 @@ export default function CalendarPage() {
               onClick={has ? () => router.push(`/trades?from=${key}&to=${key}`) : undefined}
               disabled={!has}
               title={
-                has
-                  ? day.live
-                    ? `Live · Realized ${fmtSignedUsd(pnl)} (closed) · Today's unrealized swing ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)}${openUnreal != null ? ` · Open positions right now: ${fmtSignedUsd(openUnreal)}` : ""}. Click to view today's trades.`
-                    : `Realized ${fmtSignedUsd(pnl)} · Unrealized ${fmtSignedUsd(unreal)} · Marked ${fmtSignedUsd(marked)} · ${day.trade_count} trade${day.trade_count === 1 ? "" : "s"} on ${key}`
-                  : undefined
+                !has
+                  ? undefined
+                  : hasVal
+                    ? `${day.live ? (day.quality === "stale" ? "Last broker value" : "Live") : "Day's P&L"} ${fmtSignedUsd(dayPnl)}${dayPct != null ? ` (${dayPct >= 0 ? "+" : ""}${dayPct.toFixed(2)}%)` : ""} — from your broker on ${key}.${day.live ? " Click to view today's trades." : ""}`
+                    : `No broker Day's P&L available for ${key}`
               }
               whileHover={has ? { y: -2 } : undefined}
               transition={{ duration: 0.15 }}
@@ -312,29 +309,22 @@ export default function CalendarPage() {
               </div>
               {has && (
                 <div className="mt-auto">
-                  {/* Three figures: realized (closed trades) + unrealized (open
-                      positions' mark-to-market swing) + marked (their total). */}
-                  <div className="flex items-baseline justify-between gap-1 leading-tight">
-                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Real</span>
-                    <span className="num text-[12px]" style={{ color: pnl > 0 ? "var(--pnl-pos)" : pnl < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
-                      {fmtSignedUsd(pnl)}
-                    </span>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-1 leading-tight">
-                    <span className="text-[9px] uppercase tracking-wide" style={{ color: "var(--muted)" }}>Unreal</span>
-                    <span className="num text-[12px]" style={{ color: unreal > 0 ? "var(--pnl-pos)" : unreal < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
-                      {fmtSignedUsd(unreal)}
-                    </span>
-                  </div>
-                  <div className="flex items-baseline justify-between gap-1 leading-tight mt-0.5 pt-0.5" style={{ borderTop: "1px solid var(--border)" }}>
-                    <span className="text-[9px] uppercase tracking-wide font-semibold" style={{ color: "var(--muted)" }}>Marked</span>
-                    <span className="num font-semibold text-[13px]" style={{ color: marked > 0 ? "var(--pnl-pos)" : marked < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
-                      {fmtSignedUsd(marked)}
-                    </span>
-                  </div>
-                  <div className="text-[10px] mt-0.5" style={{ color: "var(--text-2)" }}>
-                    {day.trade_count} trade{day.trade_count === 1 ? "" : "s"}
-                  </div>
+                  {/* Only the broker's Day's P&L + Day's P&L % — no Real/Unreal/
+                      Marked. "--" when the broker doesn't expose this date. */}
+                  {hasVal ? (
+                    <>
+                      <div className="num font-semibold text-[15px] leading-tight" style={{ color: dayPnl > 0 ? "var(--pnl-pos)" : dayPnl < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                        {fmtSignedUsd(dayPnl)}
+                      </div>
+                      {dayPct != null && (
+                        <div className="num text-[12px] leading-tight" style={{ color: dayPnl > 0 ? "var(--pnl-pos)" : dayPnl < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                          {`${dayPct >= 0 ? "+" : ""}${dayPct.toFixed(2)}%`}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="num text-[15px] font-semibold" style={{ color: "var(--faint)" }}>—</div>
+                  )}
                 </div>
               )}
             </motion.button>

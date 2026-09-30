@@ -238,8 +238,14 @@ export interface Position {
 
 export interface DailyPnL {
   day: string;
-  /** Settled days: locked realized P&L. Today (direct Alpaca): realized-so-far
-   *  PLUS live unrealized on open positions — one combined, market-live figure. */
+  /** The connected broker's OWN Day's P&L ($) and Day's P&L % for this date,
+   *  normalized (percent = 8.88, not 0.0888). null when the broker doesn't
+   *  expose it → the cell shows "--". The calendar renders these directly and
+   *  does NO P&L math of its own. */
+  day_pnl?: string | null;
+  day_pnl_pct?: string | null;
+  /** Diagnostics (trades/admin views + reconciliation), not shown on the
+   *  calendar: closed-trade realized P&L. */
   realized_pnl: string;
   trade_count: number;
   /** Daily return %, broker-reported (Alpaca only). null when unavailable. */

@@ -162,6 +162,13 @@ class OrderOut(BaseModel):
 
 class DailyPnL(BaseModel):
     day: date
+    # ── Normalized broker Day's P&L — what the Calendar renders directly ──────
+    # The connected broker's OWN Day's P&L ($) and Day's P&L % for this date,
+    # already normalized (percent = e.g. 8.88, not 0.0888). None when the broker
+    # doesn't expose it for this date → the cell shows "--". NEVER fabricated
+    # from FIFO / realized+unrealized; the frontend does no P&L math.
+    day_pnl: Decimal | None = None
+    day_pnl_pct: Decimal | None = None
     # For SETTLED days this is locked realized P&L. For TODAY (direct Alpaca)
     # it's realized-so-far PLUS live unrealized on still-open positions — a
     # single combined figure that ticks with the market. See `unrealized_pnl`.

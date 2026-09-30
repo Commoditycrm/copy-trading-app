@@ -48,9 +48,11 @@ def _setup(monkeypatch, day_pnl):
     monkeypatch.setattr(trades.fills_sync, "sync_user_fills",
                         lambda *a, **k: {"fills_added": 0, "orders_added": 0})
     monkeypatch.setattr(trades, "_live_unrealized_today", lambda *a, **k: Decimal("-681"))
-    # _live_day_pnl_today returns (value, source) | None.
-    monkeypatch.setattr(trades, "_live_day_pnl_today",
-                        lambda *a, **k: None if day_pnl is None else (day_pnl, "webull_live"))
+    # _live_day_pnl_today returns (value, pct, source) | None.
+    monkeypatch.setattr(
+        trades, "_live_day_pnl_today",
+        lambda *a, **k: None if day_pnl is None else (day_pnl, Decimal("8.88"), "webull_live"),
+    )
     return db, user
 
 
@@ -64,16 +66,18 @@ def _today_cell(monkeypatch, day_pnl):
 
 def test_webull_today_displays_broker_day_pnl(monkeypatch):
     cell = _today_cell(monkeypatch, Decimal("-150.72"))
-    assert cell.marked_pnl == Decimal("-150.72"), "displayed marked must be the broker's Day P&L"
+    assert cell.day_pnl == Decimal("-150.72"), "Day's P&L must be the broker's value"
+    assert cell.day_pnl_pct == Decimal("8.88")
     assert cell.source == "webull_live"
-    assert cell.realized_pnl == Decimal(0), "realized stays the calculated figure"
-    # unrealized (the calculated swing) is untouched — NOT overwritten to -150.72.
+    assert cell.quality == "authoritative"
+    # Diagnostics untouched — realized stays calculated, not the broker figure.
+    assert cell.realized_pnl == Decimal(0)
     assert cell.unrealized_pnl != Decimal("-150.72")
 
 
 def test_webull_today_zero_day_pnl_shows_zero(monkeypatch):
     cell = _today_cell(monkeypatch, Decimal("0"))
-    assert cell.marked_pnl == Decimal("0"), "a broker 0.00 must display 0.00, not fall back"
+    assert cell.day_pnl == Decimal("0"), "a broker 0.00 must show 0.00, not '--'"
     assert cell.source == "webull_live"
 
 
@@ -82,41 +86,46 @@ def test_alpaca_today_uses_broker_live_source(monkeypatch):
     equity−last_equity comes through with an alpaca_live source label."""
     db, user = _setup(monkeypatch, Decimal("321.00"))
     monkeypatch.setattr(trades, "_live_day_pnl_today",
-                        lambda *a, **k: (Decimal("321.00"), "alpaca_live"))
+                        lambda *a, **k: (Decimal("321.00"), Decimal("1.23"), "alpaca_live"))
     today = market_hours.now_et().date()
     rows = trades.calendar_pnl(db=db, user=user, from_=today, to=today,
                                tz="America/New_York", user_id=None)
     cell = next(r for r in rows if r.day == today)
-    assert cell.marked_pnl == Decimal("321.00")
+    assert cell.day_pnl == Decimal("321.00")
+    assert cell.day_pnl_pct == Decimal("1.23")
     assert cell.source == "alpaca_live"
     assert cell.quality == "authoritative"
 
 
-def test_no_live_day_pnl_leaves_marked_none(monkeypatch):
-    # e.g. Alpaca / mixed account → _live_day_pnl_today returns None.
+def test_no_live_day_pnl_is_unavailable(monkeypatch):
+    # A connected broker with no live day P&L (e.g. IBKR) → unavailable, NOT the
+    # reconstruction.
     cell = _today_cell(monkeypatch, None)
-    assert cell.marked_pnl is None, "no broker figure → frontend falls back to realized+unrealized"
-    assert cell.source == "calculated"
+    assert cell.day_pnl is None
+    assert cell.source == "none"
+    assert cell.quality == "unavailable"
 
 
 def test_stale_fallback_when_live_fetch_fails(monkeypatch):
     """A failed live broker fetch → show the last-known broker value flagged
     STALE with its capture time, never a fake zero or the reconstruction."""
     db, user = _setup(monkeypatch, Decimal("-150.72"))
-    # (None, source) = broker present but the live fetch failed.
-    monkeypatch.setattr(trades, "_live_day_pnl_today", lambda *a, **k: (None, "webull_live"))
+    # (None, None, source) = broker present but the live fetch failed.
+    monkeypatch.setattr(trades, "_live_day_pnl_today",
+                        lambda *a, **k: (None, None, "webull_live"))
     today = market_hours.now_et().date()
     cap = datetime(2026, 9, 30, 18, 5, tzinfo=timezone.utc)
     db.add(DailyRealizedPnlSnapshot(
         id=uuid.uuid4(), user_id=user.id, day=today, realized_pnl=Decimal("-140.00"),
-        trade_count=0, source="marked", snapshot_type="intraday", hidden=False,
-        computed_at=cap,
+        pct=Decimal("-1.62"), trade_count=0, source="marked", snapshot_type="intraday",
+        hidden=False, computed_at=cap,
     ))
     db.flush()
     rows = trades.calendar_pnl(db=db, user=user, from_=today, to=today,
                                tz="America/New_York", user_id=None)
     cell = next(r for r in rows if r.day == today)
-    assert cell.marked_pnl == Decimal("-140.00"), "must show last-known broker value, not 0/calc"
+    assert cell.day_pnl == Decimal("-140.00"), "must show last-known broker value, not 0/calc"
+    assert cell.day_pnl_pct == Decimal("-1.62")
     assert cell.source == "webull_live"
     assert cell.quality == "stale"
     # sqlite drops tzinfo; compare the wall-clock components.
@@ -131,7 +140,7 @@ def test_historical_day_stays_finalized_during_live_refresh(monkeypatch):
     past = date(2026, 9, 15)  # a past Monday, well before "today"
     db.add(DailyRealizedPnlSnapshot(
         id=uuid.uuid4(), user_id=user.id, day=past, realized_pnl=Decimal("42"),
-        trade_count=0, source="marked", snapshot_type="eod",
+        pct=Decimal("0.5"), trade_count=0, source="marked", snapshot_type="eod",
         eod_unrealized=Decimal("-10"), hidden=False,
     ))
     db.flush()
@@ -141,12 +150,13 @@ def test_historical_day_stays_finalized_during_live_refresh(monkeypatch):
     todc = next(r for r in rows if r.day == today)
     pastc = next(r for r in rows if r.day == past)
     # Today: live broker value.
-    assert todc.live is True and todc.marked_pnl == Decimal("-150.72")
+    assert todc.live is True and todc.day_pnl == Decimal("-150.72")
     assert todc.source == "webull_live"
-    # Past: finalized, NOT live, and never tagged with the live number/source.
+    # Past: finalized from the eod snapshot, NOT live, NOT the live number/source.
     assert pastc.live is False
-    assert pastc.marked_pnl is None            # live value doesn't leak to history
-    assert pastc.source != "webull_live"
+    assert pastc.day_pnl == Decimal("42")
+    assert pastc.day_pnl_pct == Decimal("0.5")
+    assert pastc.source == "broker_reported"
 
 
 if __name__ == "__main__":

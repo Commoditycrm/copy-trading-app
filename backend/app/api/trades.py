@@ -2115,19 +2115,22 @@ def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     return total if n_got else None
 
 
-def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str] | None":
-    """The broker's OWN authoritative Day's P&L for TODAY (its live
-    get_pnl_snapshot()['todays_pl'] — Webull total_day_profit_loss, Alpaca
-    equity − last_equity), summed across the user's connected accounts, with a
+def _live_day_pnl_today(
+    db: Session, user_id: uuid.UUID,
+) -> "tuple[Decimal | None, Decimal | None, str] | None":
+    """The broker's OWN authoritative Day's P&L (and Day P&L %) for TODAY — its
+    live get_pnl_snapshot()['todays_pl'] (Webull total_day_profit_loss, Alpaca
+    equity − last_equity) — summed across the user's connected accounts, with a
     provenance label. So today's calendar cell shows the broker's number instead
     of our reconstructed realized + unrealized swing.
 
-    Every connected broker that exposes a live day P&L (capability
-    ``live_daily_pnl``) participates. Returns None only when the user has a
-    connected account WITHOUT that capability (e.g. IBKR/unknown) — then we keep
-    the calculated cell rather than mixing a broker's day P&L with a broker we
-    can't source — or when every snapshot fetch failed. The label is
-    ``<broker>_live`` for a single broker, else ``broker_live``."""
+    Returns ``(day_pnl, day_pnl_pct, source)`` on success; ``(None, None,
+    source)`` when a live-day-P&L broker is connected but every fetch failed (the
+    caller then falls back to the last stored value as STALE); and ``None`` when
+    the user has a connected account WITHOUT the ``live_daily_pnl`` capability
+    (keep the calculated cell). The % is the aggregate day return —
+    Σtodays_pl / Σday_start_balance × 100 (the broker's own day-start equity),
+    None when no day-start is available. Label ``<broker>_live`` / ``broker_live``."""
     from app.brokers.capabilities import capabilities_for  # local — avoid cycle
     accts = db.execute(
         select(BrokerAccount).where(
@@ -2144,6 +2147,7 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str]
         brokers.add(a.broker)
     source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
     total = Decimal(0)
+    day_start = Decimal(0)
     n_got = 0
     for a in accts:
         try:
@@ -2157,27 +2161,29 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str]
         tp = (snap or {}).get("todays_pl")
         if tp is not None:
             total += Decimal(str(tp))
+            base = (snap or {}).get("beginning_day_balance")
+            if base is not None:
+                day_start += Decimal(str(base))
             n_got += 1
-    # (None, source) signals "this IS a live-day-P&L broker, but the fetch
-    # failed" — the caller falls back to the last stored broker value as STALE
-    # rather than to the reconstruction. (total, source) is the fresh value.
     if not n_got:
-        return None, source
-    return total, source
+        return None, None, source
+    pct = (total / day_start * Decimal(100)) if day_start else None
+    return total, pct, source
 
 
 def _last_marked_snapshot(
     db: Session, user_id: uuid.UUID, day: date,
-) -> "tuple[Decimal, datetime] | None":
+) -> "tuple[Decimal, Decimal | None, datetime] | None":
     """The most recent broker MARKED value we froze for ``day`` (source='marked',
-    any snapshot_type), with when it was captured — the last-known-good broker
-    Day's P&L used as a STALE fallback when a live fetch fails. None if we never
-    captured one. Honors the soft-delete visibility filter."""
+    any snapshot_type) — value, %, and when it was captured — the last-known-good
+    broker Day's P&L used as a STALE fallback when a live fetch fails. None if we
+    never captured one. Honors the soft-delete visibility filter."""
     from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
     from app.services import visibility
     row = db.execute(
         select(
             DailyRealizedPnlSnapshot.realized_pnl,
+            DailyRealizedPnlSnapshot.pct,
             DailyRealizedPnlSnapshot.computed_at,
         ).where(
             DailyRealizedPnlSnapshot.user_id == user_id,
@@ -2186,7 +2192,9 @@ def _last_marked_snapshot(
             visibility.snapshot_is_visible(),
         ).order_by(DailyRealizedPnlSnapshot.computed_at.desc()).limit(1)
     ).first()
-    return (Decimal(row[0]), row[1]) if row is not None else None
+    if row is None:
+        return None
+    return Decimal(row[0]), (Decimal(row[1]) if row[1] is not None else None), row[2]
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
@@ -2243,12 +2251,11 @@ def calendar_pnl(
     # fetch the live open-position unrealized here (once, on page load) and the
     # series resets it against yesterday's close. See pnl.calendar_series.
     live_unreal_today: Decimal | None = None
-    live_day_pnl_today: Decimal | None = None
+    live_day_pnl_today: "tuple[Decimal | None, Decimal | None, str] | None" = None
     if from_ <= market_hours.now_et().date() <= to:
         live_unreal_today = _live_unrealized_today(db, target_user_id)
-        # The broker's OWN authoritative Day's P&L for today (Webull
-        # total_day_profit_loss). None for Alpaca-type brokers, which keep their
-        # existing today cell.
+        # The connected broker's OWN authoritative Day's P&L (+ %) for today
+        # (Webull total_day_profit_loss / Alpaca equity−last_equity).
         live_day_pnl_today = _live_day_pnl_today(db, target_user_id)
     series = calendar_series(
         db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
@@ -2265,59 +2272,64 @@ def calendar_pnl(
     marked_by_day.update(alpaca_marked_by_day(db, target_user_id, from_, to, tz))
     out: list[DailyPnL] = []
     for c in sorted(series.values(), key=lambda c: c.day):
-        marked = c.marked_pnl
-        pct: Decimal | None = None
-        # Authoritative marked to DISPLAY, when we have one. None → the frontend
-        # falls back to realized + unrealized (our reconstruction). Kept separate
-        # from realized_pnl / unrealized_pnl, which always stay the calculated
-        # figures shown in the Real / Unreal rows.
-        displayed_marked: Decimal | None = None
+        marked = c.marked_pnl                       # calculated marked (diagnostics)
+        pct: Decimal | None = None                  # legacy pct field
+        displayed_marked: Decimal | None = None     # legacy marked_pnl field
         last_updated_at: datetime | None = None
+        # The NORMALIZED broker Day's P&L (+ %) the calendar renders directly.
+        # None = the broker doesn't expose it for this date → the cell shows "--".
+        # We never fabricate it from FIFO / the realized+unrealized reconstruction
+        # (those stay in realized_pnl / unrealized_pnl for diagnostics only).
+        day_pnl: Decimal | None = None
+        day_pnl_pct: Decimal | None = None
         ov = marked_by_day.get(c.day)
         if c.live:
             fresh = live_day_pnl_today is not None and live_day_pnl_today[0] is not None
             failed = live_day_pnl_today is not None and live_day_pnl_today[0] is None
             if fresh:
-                # TODAY: the connected broker's OWN live Day's P&L (Webull
+                # TODAY: the connected broker's OWN live Day's P&L + % (Webull
                 # total_day_profit_loss / Alpaca equity−last_equity).
-                displayed_marked, source = live_day_pnl_today
+                day_pnl, day_pnl_pct, source = live_day_pnl_today
+                displayed_marked = day_pnl
                 quality = "authoritative"
                 last_updated_at = datetime.now(timezone.utc)
             elif failed and (stale := _last_marked_snapshot(db, target_user_id, c.day)) is not None:
-                # The live fetch failed but we have a last-known broker value —
-                # show it, flagged STALE with its capture time, rather than
-                # silently dropping to the reconstruction or a fake zero.
-                displayed_marked = stale[0]
-                source, quality = live_day_pnl_today[1], "stale"
-                last_updated_at = stale[1]
+                # Live fetch failed but we have a last-known broker value — show it
+                # flagged STALE with its capture time, never a fake zero or the
+                # reconstruction.
+                day_pnl, day_pnl_pct = stale[0], stale[1]
+                displayed_marked = day_pnl
+                source, quality = live_day_pnl_today[2], "stale"
+                last_updated_at = stale[2]
             else:
-                # No live broker figure and nothing stored → live reconstruction.
-                source, quality = "calculated", "live"
+                # A connected broker that exposes no live day P&L (e.g. IBKR) →
+                # unavailable; don't force it through the reconstruction.
+                source, quality = "none", "unavailable"
         elif ov is not None:
             # Settled day with a finalized broker figure (Alpaca portfolio-history
-            # or an EOD snapshot) → authoritative.
-            marked, pct = ov
+            # or a finalized EOD snapshot) → authoritative.
+            day_pnl, day_pnl_pct = ov
+            marked = day_pnl                        # keep legacy marked == broker value
+            pct = day_pnl_pct
+            displayed_marked = day_pnl
             source, quality = "broker_reported", "authoritative"
         else:
-            # No broker figure for this day (e.g. a Webull historical day the
-            # broker won't give us) → our reconstruction, honestly estimated.
-            source, quality = "calculated", "estimated"
+            # Historical day the broker won't give us (Webull has no history
+            # endpoint) → UNAVAILABLE, not fabricated from FIFO.
+            source, quality = "none", "unavailable"
         out.append(DailyPnL(
             day=c.day,
-            # Rows shown on the Calendar:
+            # Normalized broker Day's P&L the calendar shows (None → "--").
+            day_pnl=day_pnl,
+            day_pnl_pct=day_pnl_pct,
+            # Diagnostics, kept for the trades/admin views and reconciliation:
             #  realized_pnl   = closed-trade P&L (FIFO).
-            #  unrealized_pnl = marked − realized (the open-position swing); for
-            #                   an Alpaca day this makes the Marked row equal
-            #                   Alpaca's own number. For TODAY it's the live swing.
+            #  unrealized_pnl = calculated marked − realized (open-position swing).
             realized_pnl=c.realized_pnl,
             trade_count=c.trade_count,
             pct=pct,
             unrealized_pnl=marked - c.realized_pnl,
-            # The authoritative Marked to display when set (Webull's live Day's
-            # P&L today); None → frontend uses realized + unrealized.
             marked_pnl=displayed_marked,
-            # TODAY's full current open-position unrealized (for the tooltip),
-            # vs unrealized_pnl which is only the day's swing.
             open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
             source=source,
