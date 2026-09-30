@@ -221,7 +221,12 @@ export default function CalendarPage() {
           const day = byDay[key];
           const pnl = day ? Number(day.realized_pnl) : 0;
           const unreal = day ? Number(day.unrealized_pnl ?? 0) : 0;
-          const marked = pnl + unreal;          // realized + unrealized = the day's marked total
+          // Prefer the backend's authoritative Marked when present (e.g. today's
+          // Webull Day's P&L); else our realized + unrealized. `!= null` so a
+          // genuine broker 0.00 shows 0.00 instead of falling back.
+          const marked = (day && day.marked_pnl != null)
+            ? Number(day.marked_pnl)
+            : pnl + unreal;
           // Today only: full current unrealized on all open positions (not the
           // day's swing) — for the tooltip so "Unreal" can't be mistaken for it.
           const openUnreal = day?.open_unrealized != null ? Number(day.open_unrealized) : null;

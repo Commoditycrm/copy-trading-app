@@ -182,6 +182,11 @@ class DailyPnL(BaseModel):
     # True on the current day when `realized_pnl` includes live unrealized — the
     # figure moves with the market and is NOT a settled number.
     live: bool = False
+    # The authoritative MARKED value to DISPLAY for this day, when we have one
+    # (e.g. today's Webull Day's P&L, total_day_profit_loss). None → the client
+    # falls back to realized_pnl + unrealized_pnl. Kept separate from those two
+    # so the Real / Unreal rows keep showing the calculated figures.
+    marked_pnl: Decimal | None = None
     # Provenance of the MARKED value shown for this day, so the UI never presents
     # an estimate as authoritative:
     #   source  = "broker_reported" (the broker's own figure) | "calculated"

@@ -2115,6 +2115,49 @@ def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     return total if n_got else None
 
 
+def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
+    """The broker's OWN authoritative Day's P&L for TODAY (its ``total_day_
+    profit_loss`` via get_pnl_snapshot), summed across the user's connected
+    accounts — so today's calendar cell shows the broker's number instead of our
+    reconstructed realized + unrealized swing.
+
+    Only for brokers that expose a live day P&L but NO historical series
+    (Webull): those have no other authoritative source for today, and their
+    calendar can't be reconstructed to match. Returns None unless EVERY connected
+    account is such a broker — a broker with its own historical/marked series
+    (Alpaca) is left on its existing path, and a mixed account keeps the
+    calculated cell rather than mixing one broker's day P&L with another's."""
+    from app.brokers.capabilities import capabilities_for  # local — avoid cycle
+    accts = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user_id,
+            BrokerAccount.connection_status == "connected",
+        )
+    ).scalars().all()
+    if not accts:
+        return None
+    for a in accts:
+        caps = capabilities_for(a.broker)
+        if not (caps.live_daily_pnl and not caps.historical_daily_pnl):
+            return None  # e.g. Alpaca present → keep the existing calculated cell
+    total = Decimal(0)
+    n_got = 0
+    for a in accts:
+        try:
+            adapter = adapter_for(a, decrypt_json(a.encrypted_credentials))
+            snap = adapter.get_pnl_snapshot()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "calendar: live day-P&L fetch failed for acct %s", a.id, exc_info=True,
+            )
+            continue
+        tp = (snap or {}).get("todays_pl")
+        if tp is not None:
+            total += Decimal(str(tp))
+            n_got += 1
+    return total if n_got else None
+
+
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
 def calendar_pnl(
     db: Session = Depends(get_db),
@@ -2169,8 +2212,13 @@ def calendar_pnl(
     # fetch the live open-position unrealized here (once, on page load) and the
     # series resets it against yesterday's close. See pnl.calendar_series.
     live_unreal_today: Decimal | None = None
+    live_day_pnl_today: Decimal | None = None
     if from_ <= market_hours.now_et().date() <= to:
         live_unreal_today = _live_unrealized_today(db, target_user_id)
+        # The broker's OWN authoritative Day's P&L for today (Webull
+        # total_day_profit_loss). None for Alpaca-type brokers, which keep their
+        # existing today cell.
+        live_day_pnl_today = _live_day_pnl_today(db, target_user_id)
     series = calendar_series(
         db, target_user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only,
         live_today_unrealized=live_unreal_today,
@@ -2188,10 +2236,21 @@ def calendar_pnl(
     for c in sorted(series.values(), key=lambda c: c.day):
         marked = c.marked_pnl
         pct: Decimal | None = None
+        # Authoritative marked to DISPLAY, when we have one. None → the frontend
+        # falls back to realized + unrealized (our reconstruction). Kept separate
+        # from realized_pnl / unrealized_pnl, which always stay the calculated
+        # figures shown in the Real / Unreal rows.
+        displayed_marked: Decimal | None = None
         ov = marked_by_day.get(c.day)
         if c.live:
-            # Today: marked is our live (realized + live unrealized) — moving.
-            source, quality = "calculated", "live"
+            if live_day_pnl_today is not None:
+                # TODAY, Webull-type broker: show the broker's own Day's P&L
+                # (total_day_profit_loss), not our realized + swing reconstruction.
+                displayed_marked = live_day_pnl_today
+                source, quality = "webull_live", "authoritative"
+            else:
+                # Today, no live broker figure → our live reconstruction, moving.
+                source, quality = "calculated", "live"
         elif ov is not None:
             # Settled day with a finalized broker figure (Alpaca portfolio-history
             # or an EOD snapshot) → authoritative.
@@ -2212,6 +2271,9 @@ def calendar_pnl(
             trade_count=c.trade_count,
             pct=pct,
             unrealized_pnl=marked - c.realized_pnl,
+            # The authoritative Marked to display when set (Webull's live Day's
+            # P&L today); None → frontend uses realized + unrealized.
+            marked_pnl=displayed_marked,
             # TODAY's full current open-position unrealized (for the tooltip),
             # vs unrealized_pnl which is only the day's swing.
             open_unrealized=(live_unreal_today if c.live else None),

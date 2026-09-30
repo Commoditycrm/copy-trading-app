@@ -244,6 +244,14 @@ export interface DailyPnL {
   /** True on today's cell when realized_pnl includes live unrealized — the
    *  number ticks with the market and is not settled. */
   live?: boolean;
+  /** Authoritative Marked to display when set (e.g. today's Webull Day's P&L,
+   *  total_day_profit_loss). null → fall back to realized_pnl + unrealized_pnl. */
+  marked_pnl?: string | null;
+  /** Provenance of the displayed marked: "webull_live" | "broker_reported" |
+   *  "calculated". */
+  source?: string | null;
+  /** Confidence of the displayed marked: "authoritative" | "estimated" | "live". */
+  quality?: string | null;
 }
 
 /** One scope's order-history totals, computed in the DB (GET
