@@ -255,11 +255,15 @@ export interface DailyPnL {
   /** Authoritative Marked to display when set (e.g. today's Webull Day's P&L,
    *  total_day_profit_loss). null → fall back to realized_pnl + unrealized_pnl. */
   marked_pnl?: string | null;
-  /** Provenance of the displayed marked: "webull_live" | "broker_reported" |
-   *  "calculated". */
+  /** Provenance of the displayed marked: "webull_live" | "alpaca_live" |
+   *  "broker_live" | "broker_reported" | "calculated". */
   source?: string | null;
-  /** Confidence of the displayed marked: "authoritative" | "estimated" | "live". */
+  /** Confidence of the displayed marked: "authoritative" | "estimated" | "live"
+   *  | "stale" (a live broker fetch failed → last-known value). */
   quality?: string | null;
+  /** When the displayed marked was captured (ISO). Set for today's live/stale
+   *  cell. */
+  last_updated_at?: string | null;
 }
 
 /** One scope's order-history totals, computed in the DB (GET

@@ -2142,6 +2142,7 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str]
         if not capabilities_for(a.broker).live_daily_pnl:
             return None  # a broker with no live day P&L → keep the calculated cell
         brokers.add(a.broker)
+    source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
     total = Decimal(0)
     n_got = 0
     for a in accts:
@@ -2157,10 +2158,35 @@ def _live_day_pnl_today(db: Session, user_id: uuid.UUID) -> "tuple[Decimal, str]
         if tp is not None:
             total += Decimal(str(tp))
             n_got += 1
+    # (None, source) signals "this IS a live-day-P&L broker, but the fetch
+    # failed" — the caller falls back to the last stored broker value as STALE
+    # rather than to the reconstruction. (total, source) is the fresh value.
     if not n_got:
-        return None
-    source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
+        return None, source
     return total, source
+
+
+def _last_marked_snapshot(
+    db: Session, user_id: uuid.UUID, day: date,
+) -> "tuple[Decimal, datetime] | None":
+    """The most recent broker MARKED value we froze for ``day`` (source='marked',
+    any snapshot_type), with when it was captured — the last-known-good broker
+    Day's P&L used as a STALE fallback when a live fetch fails. None if we never
+    captured one. Honors the soft-delete visibility filter."""
+    from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
+    from app.services import visibility
+    row = db.execute(
+        select(
+            DailyRealizedPnlSnapshot.realized_pnl,
+            DailyRealizedPnlSnapshot.computed_at,
+        ).where(
+            DailyRealizedPnlSnapshot.user_id == user_id,
+            DailyRealizedPnlSnapshot.day == day,
+            DailyRealizedPnlSnapshot.source == "marked",
+            visibility.snapshot_is_visible(),
+        ).order_by(DailyRealizedPnlSnapshot.computed_at.desc()).limit(1)
+    ).first()
+    return (Decimal(row[0]), row[1]) if row is not None else None
 
 
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
@@ -2246,16 +2272,26 @@ def calendar_pnl(
         # from realized_pnl / unrealized_pnl, which always stay the calculated
         # figures shown in the Real / Unreal rows.
         displayed_marked: Decimal | None = None
+        last_updated_at: datetime | None = None
         ov = marked_by_day.get(c.day)
         if c.live:
-            if live_day_pnl_today is not None:
-                # TODAY: show the connected broker's OWN live Day's P&L (Webull
-                # total_day_profit_loss / Alpaca equity−last_equity), not our
-                # realized + swing reconstruction.
+            fresh = live_day_pnl_today is not None and live_day_pnl_today[0] is not None
+            failed = live_day_pnl_today is not None and live_day_pnl_today[0] is None
+            if fresh:
+                # TODAY: the connected broker's OWN live Day's P&L (Webull
+                # total_day_profit_loss / Alpaca equity−last_equity).
                 displayed_marked, source = live_day_pnl_today
                 quality = "authoritative"
+                last_updated_at = datetime.now(timezone.utc)
+            elif failed and (stale := _last_marked_snapshot(db, target_user_id, c.day)) is not None:
+                # The live fetch failed but we have a last-known broker value —
+                # show it, flagged STALE with its capture time, rather than
+                # silently dropping to the reconstruction or a fake zero.
+                displayed_marked = stale[0]
+                source, quality = live_day_pnl_today[1], "stale"
+                last_updated_at = stale[1]
             else:
-                # Today, no live broker figure → our live reconstruction, moving.
+                # No live broker figure and nothing stored → live reconstruction.
                 source, quality = "calculated", "live"
         elif ov is not None:
             # Settled day with a finalized broker figure (Alpaca portfolio-history
@@ -2286,6 +2322,7 @@ def calendar_pnl(
             live=c.live,
             source=source,
             quality=quality,
+            last_updated_at=last_updated_at,
         ))
     return out
 

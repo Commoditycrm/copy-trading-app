@@ -292,12 +292,23 @@ export default function CalendarPage() {
                 </div>
                 {/* Today's realized figure is still moving as trades close —
                     flag it so it reads as live, not settled. */}
-                {day?.live && (
+                {day?.live && (day.quality === "stale" ? (
+                  // The broker refresh failed — this is the last-known value, not
+                  // live. Show it as stale (muted, no pulse) instead of "Live".
+                  <span
+                    className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide"
+                    style={{ color: "var(--muted)" }}
+                    title={`Last broker value${day.last_updated_at ? ` from ${new Date(day.last_updated_at).toLocaleTimeString()}` : ""} — live refresh unavailable`}
+                  >
+                    <span style={{ width: 6, height: 6, borderRadius: 9999, background: "var(--muted)", display: "inline-block" }} aria-hidden />
+                    Stale
+                  </span>
+                ) : (
                   <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide" style={{ color: "var(--text)" }}>
                     <span className="animate-pulse" style={{ width: 6, height: 6, borderRadius: 9999, background: "var(--accent)", display: "inline-block" }} aria-hidden />
                     Live
                   </span>
-                )}
+                ))}
               </div>
               {has && (
                 <div className="mt-auto">

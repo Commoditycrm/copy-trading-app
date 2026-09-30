@@ -197,8 +197,13 @@ class DailyPnL(BaseModel):
     #             give us) | "live" (today, still moving).
     # None on days with no marked value. Do NOT claim "authoritative" unless the
     # number came from an authoritative broker source or a finalized snapshot.
+    #   quality "stale" = a live broker fetch failed, so this is the last-known
+    #   broker value captured at `last_updated_at` (never a fake zero).
     source: str | None = None
     quality: str | None = None
+    # When the displayed marked was captured. Set for the live/stale today cell;
+    # None otherwise.
+    last_updated_at: datetime | None = None
 
 
 class TradeScopeStats(BaseModel):

@@ -10,7 +10,7 @@ Real in-memory SQLite + the actual endpoint function; broker calls monkeypatched
 import os
 import sys
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,6 +97,31 @@ def test_no_live_day_pnl_leaves_marked_none(monkeypatch):
     cell = _today_cell(monkeypatch, None)
     assert cell.marked_pnl is None, "no broker figure → frontend falls back to realized+unrealized"
     assert cell.source == "calculated"
+
+
+def test_stale_fallback_when_live_fetch_fails(monkeypatch):
+    """A failed live broker fetch → show the last-known broker value flagged
+    STALE with its capture time, never a fake zero or the reconstruction."""
+    db, user = _setup(monkeypatch, Decimal("-150.72"))
+    # (None, source) = broker present but the live fetch failed.
+    monkeypatch.setattr(trades, "_live_day_pnl_today", lambda *a, **k: (None, "webull_live"))
+    today = market_hours.now_et().date()
+    cap = datetime(2026, 9, 30, 18, 5, tzinfo=timezone.utc)
+    db.add(DailyRealizedPnlSnapshot(
+        id=uuid.uuid4(), user_id=user.id, day=today, realized_pnl=Decimal("-140.00"),
+        trade_count=0, source="marked", snapshot_type="intraday", hidden=False,
+        computed_at=cap,
+    ))
+    db.flush()
+    rows = trades.calendar_pnl(db=db, user=user, from_=today, to=today,
+                               tz="America/New_York", user_id=None)
+    cell = next(r for r in rows if r.day == today)
+    assert cell.marked_pnl == Decimal("-140.00"), "must show last-known broker value, not 0/calc"
+    assert cell.source == "webull_live"
+    assert cell.quality == "stale"
+    # sqlite drops tzinfo; compare the wall-clock components.
+    assert cell.last_updated_at is not None
+    assert cell.last_updated_at.replace(tzinfo=None) == cap.replace(tzinfo=None)
 
 
 def test_historical_day_stays_finalized_during_live_refresh(monkeypatch):
