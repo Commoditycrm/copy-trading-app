@@ -193,7 +193,7 @@ const LADDER_ROWS: LadderRow[] = [
  *  the 2nd and 3rd trims use on an expensive contract, so they keep their own
  *  row rather than pretending to belong to one rung. */
 const TRAIL_FIELDS: LadderField[] = [
-  { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
+  { key: "trim_price_threshold", label: "Trail when entry is above", prefix: "$", step: "0.05" },
   { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
 ];
 
