@@ -236,10 +236,10 @@ def test_a_broker_read_failure_is_refused_not_treated_as_flat(monkeypatch):
         ex.resolve(None, _User(), _signal(action="SELL", limit_price="2.50"))
 
 
-def test_an_alert_with_no_quantity_is_refused(monkeypatch):
-    _wire(monkeypatch, _Adapter())
-    with pytest.raises(ex.ExecutionRefused, match="no quantity"):
-        ex.resolve(None, _User(), _signal(quantity=None))
+def test_an_alert_with_no_quantity_buys_your_contracts_per_alert(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(None, _User(), _signal(quantity=None), ex.Sizing(multiplier=2))
+    assert r.payload.quantity == Decimal("2")
 
 
 # ── idempotency ──────────────────────────────────────────────────────────────
@@ -338,11 +338,18 @@ def test_an_adapter_without_chain_support_is_skipped(monkeypatch):
 
 # ── Sizing: multiplier and the per-order dollar ceiling ──────────────────────
 
-def test_the_multiplier_scales_an_entry(monkeypatch):
+def test_an_entry_is_exactly_your_contracts_per_alert(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(None, _User(), _signal(quantity="1"), ex.Sizing(multiplier=3))
     assert r.payload.quantity == Decimal("3")
-    assert r.resolutions["quantity"] == "3 (1 x 3 multiplier)"
+    assert r.resolutions["quantity"] == "3 (your Contracts per alert; the alert said 1)"
+
+
+def test_the_alerts_stated_size_is_ignored(monkeypatch):
+    """"BTO 5 SPY …" is the author's size, not yours: your setting decides."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    r = ex.resolve(None, _User(), _signal(quantity="5"), ex.Sizing(multiplier=2))
+    assert r.payload.quantity == Decimal("2")
 
 
 def test_the_multiplier_never_scales_a_close(monkeypatch):
@@ -367,7 +374,7 @@ def test_an_affordable_contract_is_not_resized(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="5"),      # $1.90 x 100 = $190 each
-        ex.Sizing(max_per_contract=Decimal("500")),
+        ex.Sizing(multiplier=5, max_per_contract=Decimal("500")),
     )
     assert r.payload.quantity == Decimal("5")
 
@@ -396,7 +403,7 @@ def test_the_ceiling_is_per_contract_not_per_order(monkeypatch):
 
 def test_no_ceiling_means_no_limit(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
-    r = ex.resolve(None, _User(), _signal(quantity="7"), ex.Sizing(max_per_contract=None))
+    r = ex.resolve(None, _User(), _signal(quantity="7"), ex.Sizing(multiplier=7, max_per_contract=None))
     assert r.payload.quantity == Decimal("7")
 
 
@@ -641,7 +648,7 @@ def test_an_order_inside_the_ceiling_goes_through(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="5"),
-        ex.Sizing(max_per_order=Decimal("1000")),
+        ex.Sizing(multiplier=5, max_per_order=Decimal("1000")),
     )
     assert r.payload.quantity == Decimal("5")
 
@@ -652,7 +659,7 @@ def test_an_order_at_exactly_the_ceiling_goes_through(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="5"),
-        ex.Sizing(max_per_order=Decimal("950")),
+        ex.Sizing(multiplier=5, max_per_order=Decimal("950")),
     )
     assert r.payload.quantity == Decimal("5")
 
@@ -665,7 +672,7 @@ def test_an_order_over_the_ceiling_is_skipped_not_trimmed(monkeypatch):
     with pytest.raises(ex.ExecutionRefused, match="max per order"):
         ex.resolve(
             None, _User(), _signal(quantity="6"),   # $1.90 x 100 x 6 = $1,140
-            ex.Sizing(max_per_order=Decimal("1000")),
+            ex.Sizing(multiplier=6, max_per_order=Decimal("1000")),
         )
 
 
@@ -682,7 +689,7 @@ def test_the_multiplier_counts_toward_the_order_ceiling(monkeypatch):
 
 def test_no_order_ceiling_means_no_check(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
-    r = ex.resolve(None, _User(), _signal(quantity="50"), ex.Sizing(max_per_order=None))
+    r = ex.resolve(None, _User(), _signal(quantity="50"), ex.Sizing(multiplier=50, max_per_order=None))
     assert r.payload.quantity == Decimal("50")
 
 
@@ -695,7 +702,7 @@ def test_a_cheap_contract_can_still_be_too_big_an_order(monkeypatch):
     with pytest.raises(ex.ExecutionRefused, match="max per order"):
         ex.resolve(
             None, _User(), _signal(quantity="10"),
-            ex.Sizing(max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+            ex.Sizing(multiplier=10, max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
         )
 
 
@@ -715,7 +722,7 @@ def test_both_ceilings_set_and_both_satisfied(monkeypatch):
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="2"),        # $190 each, $380 total
-        ex.Sizing(max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+        ex.Sizing(multiplier=2, max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
     )
     assert r.payload.quantity == Decimal("2")
 
@@ -752,16 +759,15 @@ def test_the_same_alert_without_the_flag_is_full_size(monkeypatch):
     assert r.payload.quantity == Decimal("4")
 
 
-def test_halving_happens_after_the_multiplier(monkeypatch):
-    """Halving the ALERT's quantity first would let the multiplier scale it
-    straight back up — 1 -> 1 -> x4 = 4, the full size the author said not to
-    take. The instruction is about what actually gets placed."""
+def test_light_halves_your_contracts_per_alert(monkeypatch):
+    """"Light" halves what would actually be placed — your setting, not the
+    alert's stated size."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="3", half_size=True),
-        ex.Sizing(multiplier=4),           # 3 x 4 = 12, halved = 6
+        ex.Sizing(multiplier=4),           # your 4, halved = 2
     )
-    assert r.payload.quantity == Decimal("6")
+    assert r.payload.quantity == Decimal("2")
 
 
 def test_a_single_contract_stays_one(monkeypatch):
@@ -778,7 +784,7 @@ def test_an_odd_size_rounds_down(monkeypatch):
     """5 -> 2, not 3. "Light" asks for less risk, so the rounding goes that way."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
-        None, _User(), _signal(quantity="5", half_size=True), ex.Sizing(),
+        None, _User(), _signal(quantity="5", half_size=True), ex.Sizing(multiplier=5),
     )
     assert r.payload.quantity == Decimal("2")
 
