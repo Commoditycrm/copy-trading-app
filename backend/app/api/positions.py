@@ -247,6 +247,35 @@ def today_realized(
     return {"realized_pnl": float(day.realized_pnl) if day else 0.0}
 
 
+@router.get("/day-pnl")
+def account_day_pnl(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Account-level Day's P&L for TODAY — the SAME broker-aware value today's
+    Calendar cell shows (Webull total_day_profit_loss / Alpaca equity−last_equity),
+    produced by the calendar's OWN live resolver (no formula is recreated here).
+    This is NOT realized P&L and NOT a sum of position P&L. ``day_pnl`` is None
+    when the broker exposes no live day figure (UI shows '--'); a genuine broker
+    0.00 comes back as 0.0; a failed live fetch falls back to the last-known
+    broker value flagged stale — mirroring the calendar exactly."""
+    from app.api.trades import _last_marked_snapshot, _live_day_pnl_today  # reuse resolver
+    from app.services import market_hours  # noqa: PLC0415
+    today = market_hours.now_et().date()
+    res = _live_day_pnl_today(db, user.id)  # (value, pct, source) | (None, None, source) | None
+    if res is not None and res[0] is not None:
+        return {"day_pnl": float(res[0]),
+                "day_pnl_pct": float(res[1]) if res[1] is not None else None,
+                "source": res[2], "quality": "authoritative"}
+    if res is not None and res[0] is None:
+        stale = _last_marked_snapshot(db, user.id, today)
+        if stale is not None:
+            return {"day_pnl": float(stale[0]),
+                    "day_pnl_pct": float(stale[1]) if stale[1] is not None else None,
+                    "source": res[2], "quality": "stale"}
+    return {"day_pnl": None, "day_pnl_pct": None, "source": "none", "quality": "unavailable"}
+
+
 @router.post("/close-all")
 def close_all_positions(
     request: Request,

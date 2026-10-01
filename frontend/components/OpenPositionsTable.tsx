@@ -578,7 +578,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // hold nothing", which is exactly the wrong thing to tell someone whose
     // broker just failed to answer.
     const [unreachable, setUnreachable] = useState<UnreachableAccount[]>([]);
-    const [todayRealized, setTodayRealized] = useState<number | null>(null);
+    // Account-level broker Day's P&L for today (same value the Calendar shows).
+    // null = broker exposes no live day figure → '--'. A genuine 0.00 stays 0.
+    const [dayPnl, setDayPnl] = useState<number | null>(null);
     // Total account value = sum of total_equity across broker accounts (same
     // source as the dashboard "Total equity" KPI). null until first fetch.
     const [totalEquity, setTotalEquity] = useState<number | null>(null);
@@ -622,12 +624,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const refresh = useCallback(async () => {
       const seq = ++reqSeq.current;
       try {
-        const [payload, ords, realized, brokers] = await Promise.all([
+        const [payload, ords, dpnl, brokers] = await Promise.all([
           // ?detail=1 returns { positions, unreachable } so a broker that
           // failed to answer is distinguishable from one holding nothing.
           api<PositionsPayload>("/api/positions?detail=1"),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
-          api<{ realized_pnl: number }>("/api/positions/today-realized").catch(() => null),
+          api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null),
           api<BrokerAccount[]>("/api/brokers").catch(() => [] as BrokerAccount[]),
         ]);
         // A newer refresh already landed — drop this one rather than undo it.
@@ -638,7 +640,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         setOrders(ords);
         setUnreachable(down);
         workingRef.current = ords.some((o) => WORKING_STATUSES.has(o.status));
-        if (realized) setTodayRealized(realized.realized_pnl);
+        // dpnl.day_pnl may be a number, or null (broker exposes no live day
+        // figure → '--'); a failed fetch (dpnl === null) keeps the last value.
+        if (dpnl) setDayPnl(dpnl.day_pnl);
         // The active broker's equity — an inactive one is paused, not holding
         // anything this app manages.
         setTotalEquity(brokers
@@ -1042,12 +1046,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         )}
         {/* Summary strip */}
         <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
-          <SummaryTile label="P&L · Today"
-            tone={todayRealized == null ? "neutral" : todayRealized > 0 ? "good" : todayRealized < 0 ? "bad" : "neutral"}
-            node={todayRealized == null
+          <SummaryTile label="Day's P&L"
+            tone={dayPnl == null ? "neutral" : dayPnl > 0 ? "good" : dayPnl < 0 ? "bad" : "neutral"}
+            node={dayPnl == null
               ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
-              : <AnimatedNumber value={todayRealized} format={fmtSignedUsd} className="num" />}
-            sub="Matches Calendar" />
+              : <AnimatedNumber value={dayPnl} format={fmtSignedUsd} className="num" />}
+            sub="Your broker's account Day's P&L" />
           <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv}
             mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
           <SummaryTile label="Account value" tone="neutral"
