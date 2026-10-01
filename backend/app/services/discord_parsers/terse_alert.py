@@ -48,6 +48,16 @@ _EDITED_RE = re.compile(r"\(edited\)", re.IGNORECASE)
 
 # "AMZN245P", "$SPY765.5C" — ticker, strike and right with no spaces.
 _GLUED_RE = re.compile(r"(?<![A-Za-z0-9])\$?(?P<sym>[A-Z]{1,5})(?P<strike>\d{1,5}(?:\.\d+)?)(?P<right>[CP])(?![A-Za-z0-9])")
+# "In SPY 763P 1.01" — ticker and contract SPACED, which only counts as an
+# entry when the message opens with an entry word: spaced, the same text is
+# also how commentary names a contract ("SPY 763P hit 1.50").
+_SPACED_ENTRY_RE = re.compile(
+    # BTO / Buy / Bought / Long / Entered are the free-text parser's: it runs
+    # first and requires an explicit expiry. "In" and "Entry" reach here.
+    r"^\s*(?:in|entry)\b[\s:]+"
+    r"(?-i:\$?(?P<sym>[A-Z]{1,5}))\s+(?P<strike>\d{1,5}(?:\.\d+)?)(?P<right>[CcPp])(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 # A bare option price: ".55", "0.55", "1.2", "@.63". Not a percentage.
 _PRICE_RE = re.compile(r"(?<![\w.%])@?\s*\$?(?P<price>\d*\.\d+)(?!\s*%)(?![\w.])")
 # "Adding .4" / "add 0.40" at the START — an add that names no contract.
@@ -89,6 +99,7 @@ class TerseAlertParser(Parser):
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
             or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text)
+            or _SPACED_ENTRY_RE.match(text)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -125,7 +136,7 @@ class TerseAlertParser(Parser):
                 parser=self.name,
             ))
 
-        glued = _GLUED_RE.search(text)
+        glued = _GLUED_RE.search(text) or _SPACED_ENTRY_RE.match(text)
         if glued:
             rest = text[:glued.start()] + " " + text[glued.end():]
             price_m = _PRICE_RE.search(rest)
@@ -138,7 +149,7 @@ class TerseAlertParser(Parser):
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
                 symbol=glued.group("sym"),
-                option_type=OptionType.CALL if glued.group("right") == "C" else OptionType.PUT,
+                option_type=OptionType.CALL if glued.group("right").upper() == "C" else OptionType.PUT,
                 strike=to_decimal(glued.group("strike")),
                 quantity=_ENTRY_QTY,
                 order_type=OrderKind.LIMIT,

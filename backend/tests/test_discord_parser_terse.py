@@ -246,3 +246,25 @@ def test_execution_refuses_when_no_spy_contract_is_held():
     sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
     with pytest.raises(ex.ExecutionRefused, match="no matching position"):
         ex._resolve_contract(sig, [], {})
+
+
+# ── "In SPY 763P 1.01": a spaced contract after an entry word ───────────────
+
+@pytest.mark.parametrize("text,sym,strike,right,price", [
+    ("In SPY 763P @here @Sniper 1.01", "SPY", "763", "PUT", "1.01"),
+    ("Entry: QQQ 600P @0.95", "QQQ", "600", "PUT", "0.95"),
+    ("In $SPY 765c .80", "SPY", "765", "CALL", "0.80"),
+])
+def test_an_entry_word_then_a_spaced_contract_is_an_entry(text, sym, strike, right, price):
+    s = parse_message(ParsedMessage(content=text)).signals[0]
+    assert (s.action.value, s.symbol, str(s.strike), s.option_type.value) == ("BUY", sym, strike, right)
+    assert str(s.limit_price) == price and s.nearest_expiry is True
+
+
+@pytest.mark.parametrize("text", ["SPY 763P hit 1.50", "I'm in SPY 763P 1.01", "watching SPY 763P 1.01"])
+def test_a_spaced_contract_without_a_leading_entry_word_is_not_an_entry(text):
+    assert parse_message(ParsedMessage(content=text)).status is ParseStatus.IGNORED
+
+
+def test_an_entry_with_no_price_is_refused():
+    assert parse_message(ParsedMessage(content="In SPY 763P")).status is ParseStatus.IGNORED
