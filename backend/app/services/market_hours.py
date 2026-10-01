@@ -58,6 +58,86 @@ def is_trading_weekday(dt_et: datetime | None = None) -> bool:
     return (dt_et or now_et()).weekday() < 5
 
 
+def _easter(year: int) -> date:
+    """Gregorian Easter Sunday (Anonymous/Meeus algorithm). Used only to derive
+    Good Friday, a US market holiday."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    m = (32 + 2 * e + 2 * i - h - k) % 7
+    n = (a + 11 * h + 22 * m) // 451
+    month = (h + m - 7 * n + 114) // 31
+    day = ((h + m - 7 * n + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The n-th ``weekday`` (0=Mon) of ``month`` (e.g. 3rd Monday of January)."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return date(year, month, 1 + offset + (n - 1) * 7)
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """The last ``weekday`` (0=Mon) of ``month`` (e.g. last Monday of May)."""
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed(d: date) -> date:
+    """NYSE observed date for a fixed holiday: Sat → prior Fri, Sun → next Mon."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def is_market_holiday(d: date) -> bool:
+    """True on a US equity-market (NYSE) full-day holiday. Covers the fixed
+    holidays (observed) and the floating ones incl. Good Friday. Early-close days
+    (e.g. day after Thanksgiving) are NOT holidays — they still have an official
+    close. Juneteenth is included for all years (a no-op before it existed, and
+    we only classify forward-dated captures)."""
+    y = d.year
+    fixed = {
+        _observed(date(y, 1, 1)),    # New Year's Day
+        _observed(date(y, 6, 19)),   # Juneteenth
+        _observed(date(y, 7, 4)),    # Independence Day
+        _observed(date(y, 12, 25)),  # Christmas Day
+    }
+    floating = {
+        _nth_weekday(y, 1, 0, 3),        # MLK Day — 3rd Mon Jan
+        _nth_weekday(y, 2, 0, 3),        # Presidents' Day — 3rd Mon Feb
+        _easter(y) - timedelta(days=2),  # Good Friday
+        _last_weekday(y, 5, 0),          # Memorial Day — last Mon May
+        _nth_weekday(y, 9, 0, 1),        # Labor Day — 1st Mon Sep
+        _nth_weekday(y, 11, 3, 4),       # Thanksgiving — 4th Thu Nov
+    }
+    return d in fixed or d in floating
+
+
+def is_regular_trading_day(dt_et: datetime | None = None) -> bool:
+    """A real US regular-session trading day: a weekday that is NOT a market
+    holiday. (Early-close days still count — they have an official close.)"""
+    dt = dt_et or now_et()
+    return is_trading_weekday(dt) and not is_market_holiday(dt.date())
+
+
+def past_regular_close(dt_et: datetime | None = None) -> bool:
+    """True only AFTER the official regular-session close (16:00 ET) on a real
+    trading day. False in pre-market, during the session, and on weekends /
+    holidays — so an EOD finalization can never be a premarket or non-trading-day
+    capture."""
+    dt = dt_et or now_et()
+    return is_regular_trading_day(dt) and dt.time() >= MARKET_CLOSE
+
+
 def in_eod_close_window(
     dt_et: datetime | None = None, *, minutes: int = DEFAULT_EOD_MINUTES
 ) -> bool:

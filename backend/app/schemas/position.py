@@ -17,8 +17,17 @@ class PositionOut(BaseModel):
     avg_entry_price: Decimal | None
     current_price: Decimal | None
     market_value: Decimal | None
-    unrealized_pnl: Decimal | None
+    unrealized_pnl: Decimal | None            # Open P&L ($) — broker's own value
     cost_basis: Decimal | None
+    # Broker-native per-position figures, following the connected broker (Webull
+    # / Alpaca) — never derived to imitate another broker. Percents are display
+    # percents (e.g. -39.16). day_pnl / day_pnl_pct are the CURRENT trading day
+    # only; None when the broker doesn't expose them. day_pnl_source names the
+    # provenance so the UI can show it as broker-authoritative.
+    open_pnl_pct: Decimal | None = None
+    day_pnl: Decimal | None = None
+    day_pnl_pct: Decimal | None = None
+    day_pnl_source: str | None = None         # "broker_native" | None
     # Reference price: the previous session's official market CLOSE for this
     # symbol (Alpaca previous_daily_bar). Lets the user compare the live price to
     # yesterday's close. None for options / when unavailable.

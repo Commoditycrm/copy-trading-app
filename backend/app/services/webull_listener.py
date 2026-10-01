@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -98,6 +99,25 @@ _BACKOFF_MAX = 60.0
 
 get_status = listener_state.get_status
 _set_state = listener_state.set_state
+
+# Webull allows ONE live events subscription per app key. A second one — the
+# same key active in another environment (QA and local, QA and prod) or another
+# app — is refused with RESOURCE_EXHAUSTED "appKey already has an active
+# subscription". Nothing here can release the other one (the environments share
+# no database), so the listener says so plainly and keeps checking: once the
+# key is deactivated over there, this one takes the stream over by itself.
+IN_USE_ELSEWHERE = "in_use_elsewhere"
+_IN_USE_MARKER = "already has an active subscription"
+_IN_USE_RETRY = 30.0
+IN_USE_MESSAGE = (
+    "This Webull app key is already live somewhere else (another environment "
+    "or app). Deactivate Webull there — this one takes over automatically "
+    "within 30 seconds."
+)
+
+
+def _in_use_elsewhere(exc: BaseException) -> bool:
+    return _IN_USE_MARKER in str(exc)
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -216,9 +236,9 @@ def _build_stoppable_client(creds: dict[str, Any]):
             return super().should_retry(ctx)
 
     class _StoppableTradeEvents(TradeEventsClient):
-        def __init__(self, app_key, app_secret, region_id):
+        def __init__(self, app_key, app_secret, region_id, host=None):
             self._stop_event = threading.Event()
-            super().__init__(app_key, app_secret, region_id,
+            super().__init__(app_key, app_secret, region_id, host=host,
                              retry_policy=_StopAwareRetryPolicy(self._stop_event))
             self._grpc_channel = None
 
@@ -269,7 +289,13 @@ def _build_stoppable_client(creds: dict[str, Any]):
                     pass
                 self._grpc_channel = None
 
-    return _StoppableTradeEvents(creds["app_key"], creds["app_secret"], creds.get("region_id", "us"))
+    from app.brokers.webull import WEBULL_PAPER_EVENTS_HOST  # noqa: PLC0415
+
+    # Paper accounts stream from the sandbox events host; None = the SDK's
+    # regional default (live).
+    host = WEBULL_PAPER_EVENTS_HOST if creds.get("paper") else None
+    return _StoppableTradeEvents(creds["app_key"], creds["app_secret"],
+                                 creds.get("region_id", "us"), host)
 
 
 # ── order mapping + option resolution (Stage 3 live path) ───────────────────
@@ -391,6 +417,7 @@ def _webull_trade_client(creds: dict[str, Any]):
     from app.brokers.webull import trade_client_for  # noqa: PLC0415
     return trade_client_for(
         creds["app_key"], creds["app_secret"], creds.get("region_id", "us"),
+        bool(creds.get("paper", False)),
     )
 
 
@@ -795,6 +822,26 @@ def _persist_and_fanout(
 # reason to keep it small.
 _DAYORDERS_PAGE_SIZE = 100
 
+# Webull's PAPER sandbox has no today-orders route: every call answers
+# 404 "Route Not Found". The poller kept asking every few seconds per account,
+# and the 404 also threw the cached client away — so each cycle re-ran the
+# sign-in too, keeping the key rate-limited. A 404 now pauses polling that
+# account (the event stream still detects orders) and keeps the client.
+_DAYORDERS_UNAVAILABLE_S = 600.0
+_dayorders_unavailable: dict[str, float] = {}     # account_id -> retry_at (monotonic)
+
+
+def _dayorders_paused(account_id: str) -> bool:
+    until = _dayorders_unavailable.get(account_id)
+    return until is not None and time.monotonic() < until
+
+
+def _is_auth_error(msg: str) -> bool:
+    """Only a genuine sign-in problem justifies rebuilding the client (which
+    re-runs Webull's token flow)."""
+    m = msg.lower()
+    return any(k in m for k in ("401", "403", "unauthor", "token", "signature", "forbidden"))
+
 
 def _list_today_orders(
     creds: dict[str, Any], account_id: str, page_size: int = _DAYORDERS_PAGE_SIZE,
@@ -814,11 +861,19 @@ def _list_today_orders(
         body = res.json() or {}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
+        if "404" in msg or "route not found" in msg.lower():
+            if not _dayorders_paused(account_id):
+                log.info("webull-poll: today-orders unavailable for %s (404 — paper "
+                         "sandbox); pausing its poll for %.0fs, the stream still "
+                         "detects orders", account_id, _DAYORDERS_UNAVAILABLE_S)
+            _dayorders_unavailable[account_id] = time.monotonic() + _DAYORDERS_UNAVAILABLE_S
+            return []
         log.warning("webull-poll: list_today_orders failed for %s: %s", account_id, msg[:160])
-        # A 429/throttle is transient — KEEP the cached client (rebuilding would
-        # re-run the token flow and pile more load on Webull's auth endpoint,
-        # exactly what caused the lockout). Rebuild only on a genuine auth error.
-        if not ("TOO_MANY" in msg or "429" in msg or "throttl" in msg.lower()):
+        # A 429, a 5xx or a network blip is transient — KEEP the cached client
+        # (rebuilding re-runs the token flow and piles more load on Webull's
+        # auth endpoint, exactly what caused the lockout). Rebuild only on a
+        # genuine auth error.
+        if _is_auth_error(msg) and "429" not in msg and "TOO_MANY" not in msg:
             _invalidate_trade_client(creds)
         return []
     if isinstance(body, list):
@@ -1029,7 +1084,8 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
-                orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
+                if not _dayorders_paused(aid):
+                    orders.extend(await asyncio.to_thread(_list_today_orders, creds, aid))
                 await asyncio.sleep(gap)
 
             # First cycle: decide which of the orders already on screen are
@@ -1246,6 +1302,20 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         loop.call_soon_threadsafe(_spawn)
 
 
+def _confirm_connected_later(trader_user_id: uuid.UUID, client: Any, generation: int,
+                             delay: float = 5.0) -> None:
+    """Mark the listener connected once ``client``'s stream has stayed up for
+    ``delay`` seconds — i.e. it was not refused straight away."""
+    def _check() -> None:
+        if (_clients.get(trader_user_id) is client
+                and _generation.get(trader_user_id, 0) == generation):
+            _set_state(trader_user_id, "connected")
+    try:
+        asyncio.get_running_loop().call_later(delay, _check)
+    except RuntimeError:
+        _set_state(trader_user_id, "connected")
+
+
 def stop_listener(trader_user_id: uuid.UUID) -> None:
     # Bump generation FIRST so any in-flight callback from the old client drops.
     _generation[trader_user_id] = _generation.get(trader_user_id, 0) + 1
@@ -1314,7 +1384,15 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 level, "webull-listener[%s] SDK: %s", _tid, msg,
             )
             _clients[trader_user_id] = client
-            _set_state(trader_user_id, "connected")
+            prev = get_status(trader_user_id)
+            if prev is not None and prev.state == IN_USE_ELSEWHERE:
+                # Still refused elsewhere, most likely: flashing "connected"
+                # for the moment before Webull says no again would make the
+                # badge flicker every retry. Only call it connected once the
+                # stream has stayed up.
+                _confirm_connected_later(trader_user_id, client, generation)
+            else:
+                _set_state(trader_user_id, "connected")
             backoff = _BACKOFF_INITIAL
 
             # Subscribe to ALL the trader's accounts (they may trade on any).
@@ -1339,6 +1417,14 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             log.info("webull-listener[%s] cancelled", trader_user_id)
             raise
         except Exception as exc:  # noqa: BLE001
+            if _in_use_elsewhere(exc):
+                prev = get_status(trader_user_id)
+                if prev is None or prev.state != IN_USE_ELSEWHERE:
+                    log.warning("webull-listener[%s] app key is live elsewhere; "
+                                "retrying every %.0fs", trader_user_id, _IN_USE_RETRY)
+                _set_state(trader_user_id, IN_USE_ELSEWHERE, error=IN_USE_MESSAGE)
+                await asyncio.sleep(_IN_USE_RETRY)
+                continue
             log.exception("webull-listener[%s] error", trader_user_id)
             _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
 

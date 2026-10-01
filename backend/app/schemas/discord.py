@@ -118,6 +118,10 @@ class DiscordSourceOut(BaseModel):
     # might not.
     session: DiscordSessionInfo = DiscordSessionInfo(present=False, cookie_count=0)
 
+    # A subscriber's copy of a trader channel: only is_enabled is theirs to
+    # change; everything else describes the trader's channel.
+    mirrored: bool = False
+
     model_config = {"from_attributes": True}
 
 

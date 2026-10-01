@@ -218,5 +218,9 @@ class UserOut(BaseModel):
     sell_all_access: bool = False
     # Admin-controlled access to the inbound Discord alert-copying feature.
     discord_enabled: bool = False
+    # Whether this user gets the Discord page: a Discord-enabled trader, or a
+    # subscriber following one (they trade the trader's channels on their own
+    # settings). Derived on /me; the frontend gates Discord UI on it.
+    discord_available: bool = False
 
     model_config = {"from_attributes": True}

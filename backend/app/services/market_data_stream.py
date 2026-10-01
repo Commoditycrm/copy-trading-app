@@ -163,12 +163,13 @@ _WATCH_PASS_S = 5.0
 
 def _enabled() -> bool:
     from app.config import get_settings  # noqa: PLC0415
+    from app.services import app_settings  # noqa: PLC0415
     s = get_settings()
-    return bool(
-        s.alpaca_market_stream_enabled
-        and s.alpaca_data_api_key
-        and s.alpaca_data_api_secret
+    # Admin runtime toggle overrides the env default (no redeploy needed).
+    enabled = app_settings.flag(
+        "alpaca_market_stream_enabled", default=s.alpaca_market_stream_enabled
     )
+    return bool(enabled and s.alpaca_data_api_key and s.alpaca_data_api_secret)
 
 
 # ── central store: Redis price cache ────────────────────────────────────────
@@ -222,6 +223,58 @@ def get_live_price(symbol: str, max_age_s: float = _MAX_AGE_S) -> Decimal | None
         return Decimal(str(obj["p"]))
     except (InvalidOperation, ValueError, KeyError, TypeError, Exception):  # noqa: BLE001
         return None
+
+
+# ── prices for broker adapters (Alpaca data account first) ─────────────────
+# Brokers' own quote APIs (Webull's especially) share their tight rate limits
+# with order placement and detection. Prices are the same whoever quotes them,
+# and this app takes them from the Alpaca DATA account — so adapters ask here
+# first and only fall back to their broker when this returns nothing.
+
+_OPTION_QUOTE_MEMO_S = 2.0
+_option_quote_memo: dict[str, tuple[float, Any, Any]] = {}
+
+
+def data_stock_price(symbol: str) -> Decimal | None:
+    """A stock's price from the Alpaca data account: the live cache, else one
+    REST quote. None when no data key is configured or there is no quote."""
+    px = get_live_price(symbol, max_age_s=15.0)
+    return px if px is not None else fetch_rest_quote(symbol)
+
+
+def data_option_bid_ask(occ_symbol: str) -> tuple[Decimal | None, Decimal | None]:
+    """(bid, ask) for an OCC option symbol from the Alpaca data account, briefly
+    memoised. (None, None) when no data key is configured or there is no quote."""
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    if not (s.alpaca_data_api_key and s.alpaca_data_api_secret):
+        return (None, None)
+    sym = (occ_symbol or "").upper().replace(" ", "")
+    now = time.monotonic()
+    hit = _option_quote_memo.get(sym)
+    if hit is not None and now - hit[0] < _OPTION_QUOTE_MEMO_S:
+        return (hit[1], hit[2])
+
+    def _px(v: Any) -> Decimal | None:
+        try:
+            d = Decimal(str(v))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        return d if d > 0 else None
+
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+        from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: PLC0415
+        c = OptionHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+        res = c.get_option_latest_quote(OptionLatestQuoteRequest(symbol_or_symbols=sym))
+        q = res.get(sym) if isinstance(res, dict) else res
+        bid = _px(getattr(q, "bid_price", None)) if q is not None else None
+        ask = _px(getattr(q, "ask_price", None)) if q is not None else None
+    except Exception:  # noqa: BLE001
+        log.warning("market_data_stream: option quote %s failed", sym)
+        return (None, None)
+    _option_quote_memo[sym] = (now, bid, ask)
+    return (bid, ask)
 
 
 # ── on-demand watch (trade panel) ───────────────────────────────────────────

@@ -25,6 +25,87 @@ interface Usage {
 
 const REFRESH_MS = 3000;
 
+interface StreamState {
+  enabled: boolean;        // effective on/off the supervisor acts on
+  override: boolean | null; // admin-set value, or null = using env default
+  env_default: boolean;
+  creds_present: boolean;   // false → can't run even if enabled
+}
+type MarketStreams = Record<"alpaca" | "webull", StreamState>;
+
+/** Admin toggle for the live market-data streams — flips a DB flag the stream
+ *  supervisors read on their next pass, so no env change / redeploy is needed. */
+function MarketStreamsCard() {
+  const [s, setS] = useState<MarketStreams | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try { setS(await api<MarketStreams>("/api/admin/market-streams")); }
+    catch (e) { notify.fromError(e, "Could not load market-stream settings"); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function toggle(broker: "alpaca" | "webull", next: boolean) {
+    setBusy(broker);
+    try {
+      const r = await api<MarketStreams>("/api/admin/market-streams", {
+        method: "POST", body: JSON.stringify({ [broker]: next }),
+      });
+      setS(r);
+      notify.success(`${broker[0].toUpperCase() + broker.slice(1)} live data ${next ? "enabled" : "disabled"}`);
+    } catch (e) {
+      notify.fromError(e, "Could not update market stream");
+    } finally { setBusy(null); }
+  }
+
+  const rowStyle = { background: "var(--panel-2)", border: "1px solid var(--border)" };
+  return (
+    <div className="rounded-xl p-4" style={rowStyle}>
+      <div className="text-sm font-semibold mb-1" style={{ color: "var(--text-2)" }}>Live market data</div>
+      <p className="text-xs mb-3" style={{ color: "var(--muted)" }}>
+        Enable/disable the broker price streams at runtime — no env change or redeploy.
+        Takes effect within a few seconds.
+      </p>
+      <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
+        {(["alpaca", "webull"] as const).map((b) => {
+          const st = s?.[b];
+          const on = !!st?.enabled;
+          return (
+            <div key={b} className="flex items-center justify-between rounded-lg px-3 py-2.5" style={rowStyle}>
+              <div>
+                <div className="text-sm font-medium capitalize">{b}</div>
+                <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                  {!st ? "…" : !st.creds_present
+                    ? "no data-API credentials"
+                    : st.override === null ? `env default (${st.env_default ? "on" : "off"})` : "admin override"}
+                </div>
+              </div>
+              <button
+                role="switch"
+                aria-checked={on}
+                disabled={!st || busy === b || (st && !st.creds_present)}
+                onClick={() => toggle(b, !on)}
+                title={st && !st.creds_present ? "Data-API credentials not configured" : undefined}
+                className="relative inline-flex items-center rounded-full transition-colors"
+                style={{
+                  width: 42, height: 24, opacity: busy === b || (st && !st.creds_present) ? 0.5 : 1,
+                  background: on ? "var(--good, #16794a)" : "var(--border)",
+                  cursor: !st || (st && !st.creds_present) ? "not-allowed" : "pointer",
+                }}
+              >
+                <span
+                  className="inline-block rounded-full bg-white transition-transform"
+                  style={{ width: 18, height: 18, transform: `translateX(${on ? 21 : 3}px)` }}
+                />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function fmtBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -117,6 +198,8 @@ export default function SystemUsagePage() {
           {live ? "⏸ Pause" : "▶ Resume"} live
         </button>
       </div>
+
+      <MarketStreamsCard />
 
       {err && !u && (
         <div className="rounded-xl p-4 text-sm" style={{ background: "var(--panel-2)", border: "1px solid var(--bad, #b3261e)", color: "var(--bad, #b3261e)" }}>

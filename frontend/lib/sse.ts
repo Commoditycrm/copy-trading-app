@@ -51,7 +51,9 @@ export interface NotificationEventPayload {
 }
 
 export interface ListenerStatus {
-  state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader" | "no_broker";
+  state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader" | "no_broker"
+    // Webull: the app key's one live stream is held by another environment/app.
+    | "in_use_elsewhere";
   last_event_at: string | null;
   state_changed_at: string | null;
   last_error: string | null;

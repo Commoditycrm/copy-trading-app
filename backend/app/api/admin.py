@@ -28,12 +28,12 @@ from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.orm import Session, aliased, selectinload
 
-from app.api.deps import get_db, require_admin
+from app.api.deps import client_ip, get_db, require_admin
 from app.models.audit_log import AuditLog
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
@@ -42,9 +42,11 @@ from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
-from app.services import audit, excel_export, market_hours, visibility
+from app.config import get_settings
+from app.services import app_settings, audit, excel_export, market_hours, visibility
 from app.services.pnl import (
-    alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_day,
+    alpaca_marked_by_day, calendar_series, frozen_marked_by_day,
+    load_eod_unrealized, realized_pnl_by_day,
 )
 from app.schemas.order import DailyPnL
 from app.services.redis_client import get_sync_redis
@@ -529,8 +531,13 @@ def admin_user_pnl_calendar(
         marked = c.marked_pnl
         pct = None
         ov = marked_by_day.get(c.day)
-        if ov is not None and not c.live:
+        if c.live:
+            source, quality = "calculated", "live"
+        elif ov is not None:
             marked, pct = ov
+            source, quality = "broker_reported", "authoritative"
+        else:
+            source, quality = "calculated", "estimated"
         out.append(DailyPnL(
             day=c.day,
             realized_pnl=c.realized_pnl,
@@ -539,8 +546,150 @@ def admin_user_pnl_calendar(
             unrealized_pnl=marked - c.realized_pnl,
             open_unrealized=(live_unreal_today if c.live else None),
             live=c.live,
+            source=source,
+            quality=quality,
         ))
     return out
+
+
+@router.get("/users/{user_id}/pnl-reconciliation")
+def admin_user_pnl_reconciliation(
+    user_id: uuid.UUID,
+    from_: date = Query(..., alias="from"),
+    to: date = Query(...),
+    tz: str | None = Query(default=None, description="IANA tz; defaults to US/Eastern."),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[dict]:
+    """Per-day P&L reconciliation for one user — the debug view behind the
+    calendar. For each day it shows the broker-reported figure (when the broker
+    exposes one), our calculated realized, the value we display, its source /
+    quality, and the realized + unrealized-change breakdown. When the broker
+    exposes no historical figure (e.g. a Webull day) it says so explicitly
+    rather than inventing a difference against a number we can't source."""
+    if from_ > to:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="from must be <= to")
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+
+    brokers = sorted({
+        str(b) for b in db.execute(
+            select(BrokerAccount.broker).where(BrokerAccount.user_id == user_id)
+        ).scalars()
+    })
+    mirrors_only = target.role == UserRole.SUBSCRIBER
+    series = calendar_series(db, user_id, from_, to, tz_name=tz, mirrors_only=mirrors_only)
+    marked_by_day = frozen_marked_by_day(db, user_id, from_, to)
+    marked_by_day.update(alpaca_marked_by_day(db, user_id, from_, to, tz))
+    # End-of-day unrealized captures, to expose the unrealized change per day.
+    eod = load_eod_unrealized(db, user_id, from_ - timedelta(days=30), to)
+
+    out: list[dict] = []
+    prev_eod: Decimal | None = None
+    for c in sorted(series.values(), key=lambda x: x.day):
+        broker_reported = marked_by_day.get(c.day)
+        br_val = broker_reported[0] if broker_reported is not None else None
+        displayed = br_val if br_val is not None else c.marked_pnl
+        this_eod = eod.get(c.day)
+        unreal_change = (
+            (this_eod - prev_eod) if (this_eod is not None and prev_eod is not None) else None
+        )
+        if br_val is not None:
+            source, quality, reason = "broker_reported", "authoritative", None
+            difference = br_val - c.realized_pnl - (unreal_change or Decimal(0))
+        else:
+            source, quality = "calculated", "estimated"
+            difference = None
+            reason = "broker_does_not_expose_historical_daily_pnl"
+        out.append({
+            "date": c.day.isoformat(),
+            "brokers": brokers,
+            "broker_reported": (str(br_val) if br_val is not None else None),
+            "calculated_realized": str(c.realized_pnl),
+            "displayed_marked": str(displayed),
+            "source": source,
+            "quality": quality,
+            "reason": reason,
+            "difference": (str(difference) if difference is not None else None),
+            "realized": str(c.realized_pnl),
+            "previous_eod_unrealized": (str(prev_eod) if prev_eod is not None else None),
+            "ending_eod_unrealized": (str(this_eod) if this_eod is not None else None),
+            "unrealized_change": (str(unreal_change) if unreal_change is not None else None),
+            "trade_count": c.trade_count,
+        })
+        if this_eod is not None:
+            prev_eod = this_eod
+    return out
+
+
+class MarketStreamToggleIn(BaseModel):
+    """Set the live market-data stream toggles. Omit a broker to leave it
+    unchanged. Each maps to an app_settings override that beats the env default;
+    the stream supervisors pick it up on their next pass (no redeploy)."""
+    alpaca: bool | None = None
+    webull: bool | None = None
+
+
+_MARKET_STREAM_KEYS = {
+    "alpaca": "alpaca_market_stream_enabled",
+    "webull": "webull_market_stream_enabled",
+}
+
+
+def _market_stream_state(db: Session) -> dict:
+    s = get_settings()
+    out: dict = {}
+    for name, key in _MARKET_STREAM_KEYS.items():
+        env_default = bool(getattr(s, key))
+        override = app_settings.get_override(db, key)  # bool | None
+        if name == "alpaca":
+            creds = bool(s.alpaca_data_api_key and s.alpaca_data_api_secret)
+        else:
+            creds = bool(s.webull_data_app_key and s.webull_data_app_secret)
+        out[name] = {
+            # Effective on/off the supervisor will act on (creds required to run).
+            "enabled": bool((override if override is not None else env_default) and creds),
+            "override": override,          # admin-set value, or null (using env)
+            "env_default": env_default,
+            "creds_present": creds,        # false → can't actually run even if on
+        }
+    return out
+
+
+@router.get("/market-streams")
+def get_market_streams(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    """Current live market-data stream toggles (Alpaca + Webull) and whether the
+    data-API credentials are present for each."""
+    return _market_stream_state(db)
+
+
+@router.post("/market-streams")
+def set_market_streams(
+    body: MarketStreamToggleIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Enable/disable a live market-data stream at runtime — no env change or
+    redeploy. Writes an override the stream supervisors read on their next pass."""
+    changed: dict[str, bool] = {}
+    if body.alpaca is not None:
+        app_settings.set_flag(db, _MARKET_STREAM_KEYS["alpaca"], body.alpaca)
+        changed["alpaca"] = body.alpaca
+    if body.webull is not None:
+        app_settings.set_flag(db, _MARKET_STREAM_KEYS["webull"], body.webull)
+        changed["webull"] = body.webull
+    if changed:
+        db.commit()
+        audit.record(
+            db, actor_user_id=admin.id, action="admin.market_streams.set",
+            metadata=changed, ip_address=client_ip(request),
+        )
+    return _market_stream_state(db)
 
 
 @router.patch("/users/{user_id}/activate")

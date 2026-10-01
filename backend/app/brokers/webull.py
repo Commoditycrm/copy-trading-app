@@ -34,7 +34,8 @@ Credentials shape (Fernet-encrypted in ``broker_accounts.encrypted_credentials``
       "app_key":    "<the account owner's Webull app key>",
       "app_secret": "<the account owner's Webull app secret>",
       "account_id": "<Webull account_id, NOT the account number>",
-      "region_id":  "us"
+      "region_id":  "us",
+      "paper":      false        # true = Webull's paper/test environment
     }
 
 The Webull SDK is imported LAZILY inside methods, so importing this module
@@ -115,6 +116,24 @@ def _first(d: dict, *keys: str) -> Any:
         if isinstance(d, dict) and d.get(k) not in (None, ""):
             return d[k]
     return None
+
+
+def _wb_pct(v: Any) -> Decimal | None:
+    """Webull rate fractions (-0.3916) → a display PERCENT (-39.16)."""
+    d = _dec(v)
+    return d * Decimal(100) if d is not None else None
+
+
+def _wb_day_pct(day_pnl: Decimal | None, market_value: Decimal | None) -> Decimal | None:
+    """Webull gives DAY P&L ($) but no day %. Derive it against the day-start
+    value (current market value minus today's move): day_pnl / (mv − day_pnl).
+    None when we can't (missing inputs, or a zeroed day-start)."""
+    if day_pnl is None or market_value is None:
+        return None
+    base = market_value - day_pnl
+    if base == 0:
+        return None
+    return (day_pnl / base) * Decimal(100)
 
 
 def _first_dict(d: Any, *keys: str) -> dict:
@@ -452,11 +471,50 @@ def set_per_account_token_dir(api_client: Any, app_key: str | None) -> None:
 # shared volume) every path loads that token and never re-prompts. Mirrors
 # services.webull_listener._webull_trade_client.
 _TRADE_CLIENT_TTL_S = 1800.0
+# Webull's paper/test environment. Same API, different hosts; paper keys only
+# authenticate here and live keys only against the SDK's default (api.webull.com)
+# — Webull answers a mismatch with 401 "ensure you are connecting to the correct
+# environment". Host names from developer.webull.com's getting-started guide.
+WEBULL_PAPER_API_HOST = "api.sandbox.webull.com"
+WEBULL_PAPER_EVENTS_HOST = "events-api.sandbox.webull.com"
+
+
+def use_paper_endpoint(api_client, region_id: str, paper: bool) -> None:
+    """Point an SDK ApiClient at the paper host when ``paper`` is set."""
+    if paper:
+        api_client.add_endpoint(region_id, WEBULL_PAPER_API_HOST)
+
+
+# Keyed by app_key alone: a Webull key belongs to exactly one environment, so the
+# same key never needs both a paper and a live client.
 _trade_clients: dict[str, Any] = {}          # app_key -> (client, built_at)
 _trade_client_lock = threading.Lock()
 
+# A FAILED sign-in is remembered too. Only a successful client was cached, so
+# after a 429 every caller — the order poller, the P&L poller, the auto-trim
+# sweep, balance refresh — rebuilt the client and hit Webull's auth endpoint
+# again at once, keeping the key rate-limited indefinitely. Now a failure puts
+# the key in back-off (60s, doubling to 15 min) and callers fail fast until it
+# ends. An explicit connect / activate clears it (clear_sign_in_backoff).
+_SIGNIN_BACKOFF_BASE_S = 60.0
+_SIGNIN_BACKOFF_MAX_S = 900.0
+_signin_backoff: dict[str, tuple[float, int]] = {}   # app_key -> (retry_at, failures)
 
-def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> Any:
+
+class WebullSignInBackoff(RuntimeError):
+    """Raised instead of calling Webull while a recent sign-in failure's
+    back-off is running."""
+
+
+def clear_sign_in_backoff(app_key: str) -> None:
+    """Forget a key's sign-in failures — for a user connecting or activating it,
+    who should get a real attempt, not a wait."""
+    with _trade_client_lock:
+        _signin_backoff.pop(app_key, None)
+
+
+def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
+                     paper: bool = False) -> Any:
     """THE cached Webull TradeClient for an app_key — the adapter and the trader
     listener both go through here.
 
@@ -475,6 +533,12 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> An
         cached = _trade_clients.get(app_key)
         if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
             return cached[0]
+        failed = _signin_backoff.get(app_key)
+        if failed is not None and now < failed[0]:
+            raise WebullSignInBackoff(
+                f"Webull sign-in is backing off for {failed[0] - now:.0f}s after "
+                f"{failed[1]} failed attempt(s) (rate limit) — try again shortly."
+            )
         from app.config import get_settings  # noqa: PLC0415
         _s = get_settings()
         api_client = ApiClient(
@@ -485,9 +549,18 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us") -> An
             token_check_duration_seconds=_s.webull_token_check_duration_seconds,
             token_check_interval_seconds=_s.webull_token_check_interval_seconds,
         )
+        use_paper_endpoint(api_client, region_id, paper)
         _suppress_sdk_file_logger(api_client)
         set_per_account_token_dir(api_client, app_key)   # isolate token per app_key
-        client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+        try:
+            client = TradeClient(api_client)   # token flow runs HERE — once per TTL
+        except Exception:
+            count = (failed[1] if failed else 0) + 1
+            wait = min(_SIGNIN_BACKOFF_BASE_S * 2 ** (count - 1), _SIGNIN_BACKOFF_MAX_S)
+            _signin_backoff[app_key] = (now + wait, count)
+            log.warning("webull sign-in failed (%d in a row); backing off %.0fs", count, wait)
+            raise
+        _signin_backoff.pop(app_key, None)
         _trade_clients[app_key] = (client, now)
         return client
 
@@ -593,10 +666,11 @@ class WebullAdapter(BrokerAdapter):
         self.app_secret = credentials.get("app_secret")
         self.account_id = credentials.get("account_id")
         self.region_id = credentials.get("region_id", "us")
+        self.paper = bool(credentials.get("paper", False))
 
     # ── client construction (lazy SDK import, cached per app_key) ─────────
     def _trade_client(self):
-        return trade_client_for(self.app_key, self.app_secret, self.region_id)
+        return trade_client_for(self.app_key, self.app_secret, self.region_id, self.paper)
 
     def _data_client(self):
         """Market-data client. Separate from the TradeClient because Webull
@@ -610,6 +684,7 @@ class WebullAdapter(BrokerAdapter):
             if cached is not None and (now - cached[1]) < _TRADE_CLIENT_TTL_S:
                 return cached[0]
             api_client = ApiClient(self.app_key, self.app_secret, self.region_id)
+            use_paper_endpoint(api_client, self.region_id, self.paper)
             _suppress_sdk_file_logger(api_client)   # DataClient writes its own ./webull_data_sdk.log
             set_per_account_token_dir(api_client, self.app_key)
             client = DataClient(api_client)
@@ -657,7 +732,15 @@ class WebullAdapter(BrokerAdapter):
     def get_stock_latest_price(self, symbol: str) -> "Decimal | None":
         """Last traded price for a stock, or None when unavailable. Used to price
         a marketable limit (copy_engine._marketable_stock_limit) — the caller
-        treats None as 'leave the order alone', so failing is never fatal."""
+        treats None as 'leave the order alone', so failing is never fatal.
+
+        Asked of the Alpaca data account first: Webull's quote calls share the
+        key's rate limits with orders, and prices are the same from either."""
+        from app.services import market_data_stream as mds  # noqa: PLC0415
+
+        px = mds.data_stock_price(symbol)
+        if px is not None and px > 0:
+            return px
         if not self._quotes_available():
             return None
         try:
@@ -681,7 +764,14 @@ class WebullAdapter(BrokerAdapter):
         """(bid, ask) for an OCC option symbol — the exact form Webull's option
         snapshot endpoint takes (e.g. AAPL260619C00220000). Either side may be
         None on a one-sided book; (None, None) when the quote is unavailable, at
-        which point the caller falls back to trader-anchored pricing."""
+        which point the caller falls back to trader-anchored pricing.
+
+        Asked of the Alpaca data account first (see get_stock_latest_price)."""
+        from app.services import market_data_stream as mds  # noqa: PLC0415
+
+        bid, ask = mds.data_option_bid_ask(occ_symbol)
+        if bid is not None or ask is not None:
+            return (bid, ask)
         if not self._quotes_available():
             return (None, None)
         try:
@@ -905,6 +995,16 @@ class WebullAdapter(BrokerAdapter):
                 market_value=_dec(_first(p, "market_value", "market_val")),
                 unrealized_pnl=_dec(_first(p, "unrealized_pnl", "unrealized_profit_loss", "open_pnl")),
                 cost_basis=_dec(_first(p, "cost_basis", "total_cost", "cost")),
+                # Webull native per-position figures. unrealized_profit_loss_rate
+                # is a fraction (-0.3916 = -39.16%); ×100 to a display percent.
+                # Webull exposes DAY P&L (day_profit_loss) but no day %, so we
+                # derive it from the day-start value (market_value − day_pnl).
+                open_pnl_pct=_wb_pct(_first(p, "unrealized_profit_loss_rate")),
+                day_pnl=_dec(_first(p, "day_profit_loss", "day_pnl")),
+                day_pnl_pct=_wb_day_pct(
+                    _dec(_first(p, "day_profit_loss", "day_pnl")),
+                    _dec(_first(p, "market_value", "market_val")),
+                ),
                 option_expiry=expiry,
                 option_strike=strike,
                 option_right=right,

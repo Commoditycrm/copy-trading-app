@@ -162,6 +162,13 @@ class OrderOut(BaseModel):
 
 class DailyPnL(BaseModel):
     day: date
+    # ── Normalized broker Day's P&L — what the Calendar renders directly ──────
+    # The connected broker's OWN Day's P&L ($) and Day's P&L % for this date,
+    # already normalized (percent = e.g. 8.88, not 0.0888). None when the broker
+    # doesn't expose it for this date → the cell shows "--". NEVER fabricated
+    # from FIFO / realized+unrealized; the frontend does no P&L math.
+    day_pnl: Decimal | None = None
+    day_pnl_pct: Decimal | None = None
     # For SETTLED days this is locked realized P&L. For TODAY (direct Alpaca)
     # it's realized-so-far PLUS live unrealized on still-open positions — a
     # single combined figure that ticks with the market. See `unrealized_pnl`.
@@ -182,6 +189,28 @@ class DailyPnL(BaseModel):
     # True on the current day when `realized_pnl` includes live unrealized — the
     # figure moves with the market and is NOT a settled number.
     live: bool = False
+    # The authoritative MARKED value to DISPLAY for this day, when we have one
+    # (e.g. today's Webull Day's P&L, total_day_profit_loss). None → the client
+    # falls back to realized_pnl + unrealized_pnl. Kept separate from those two
+    # so the Real / Unreal rows keep showing the calculated figures.
+    marked_pnl: Decimal | None = None
+    # Provenance of the MARKED value shown for this day, so the UI never presents
+    # an estimate as authoritative:
+    #   source  = "broker_reported" (the broker's own figure) | "calculated"
+    #             (our reconstruction).
+    #   quality = "authoritative" (finalized broker value: Alpaca portfolio-history
+    #             or a finalized EOD snapshot) | "estimated" (our FIFO + capture
+    #             reconstruction — e.g. a Webull historical day the broker won't
+    #             give us) | "live" (today, still moving).
+    # None on days with no marked value. Do NOT claim "authoritative" unless the
+    # number came from an authoritative broker source or a finalized snapshot.
+    #   quality "stale" = a live broker fetch failed, so this is the last-known
+    #   broker value captured at `last_updated_at` (never a fake zero).
+    source: str | None = None
+    quality: str | None = None
+    # When the displayed marked was captured. Set for the live/stale today cell;
+    # None otherwise.
+    last_updated_at: datetime | None = None
 
 
 class TradeScopeStats(BaseModel):

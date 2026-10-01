@@ -117,6 +117,19 @@ class TradeSignal:
     # because "double up" is a statement about what you hold, not about the
     # author's conviction. Acted on in discord_execution._resolve_quantity.
     double_up: bool = False
+    # The channel said CLOSE and means all of it (JPM's "Close" card). Sells
+    # the whole position at market instead of taking the ladder's next rung,
+    # whose profit gate could otherwise leave it open. Acted on in
+    # discord_sources._execute_signal.
+    flatten: bool = False
+    # An add that names no contract at all ("Adding .4"): it means the
+    # position this CHANNEL most recently opened. Resolved at execution from
+    # the channel's own orders — never from a guess across the account.
+    add_to_latest: bool = False
+    # An entry that names a strike and right but no expiry ("AMZN245P .55").
+    # Opt-in per parser: execution buys the NEAREST listed expiry when set, and
+    # refuses (as before) when not.
+    nearest_expiry: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -161,6 +174,9 @@ class TradeSignal:
             "position_closed": self.position_closed,
             "half_size": self.half_size,
             "double_up": self.double_up,
+            "flatten": self.flatten,
+            "add_to_latest": self.add_to_latest,
+            "nearest_expiry": self.nearest_expiry,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,

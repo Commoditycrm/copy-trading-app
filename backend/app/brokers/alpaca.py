@@ -76,6 +76,12 @@ def _dec_or_none(v: Any) -> Decimal | None:
         return None
 
 
+def _pct(v: Any) -> Decimal | None:
+    """Alpaca return fractions (0.53608) → a display PERCENT (53.608)."""
+    d = _dec_or_none(v)
+    return d * Decimal(100) if d is not None else None
+
+
 _OCC_RE = re.compile(r"^([A-Z.]{1,6})(\d{6})([CP])(\d{8})$")
 
 
@@ -397,6 +403,11 @@ class AlpacaAdapter(BrokerAdapter):
                 market_value=_dec_or_none(getattr(p, "market_value", None)),
                 unrealized_pnl=_dec_or_none(getattr(p, "unrealized_pl", None)),
                 cost_basis=_dec_or_none(getattr(p, "cost_basis", None)),
+                # Alpaca's native per-position figures. The *_plpc values are
+                # fractions (0.53608 = 53.608%); ×100 to a display percent.
+                open_pnl_pct=_pct(getattr(p, "unrealized_plpc", None)),
+                day_pnl=_dec_or_none(getattr(p, "unrealized_intraday_pl", None)),
+                day_pnl_pct=_pct(getattr(p, "unrealized_intraday_plpc", None)),
                 option_expiry=expiry,
                 option_strike=strike,
                 option_right=right,

@@ -203,7 +203,7 @@ export interface ListenerHealthRow {
   trader_id: string;
   trader_email: string | null;
   trader_name: string | null;
-  state: string; // connecting | connected | reconnecting | disconnected | credentials_invalid | mfa_required
+  state: string; // connecting | connected | reconnecting | disconnected | credentials_invalid | mfa_required | in_use_elsewhere
   last_event_at: string | null;
   state_changed_at: string | null;
   last_error: string | null;

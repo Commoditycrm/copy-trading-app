@@ -74,6 +74,8 @@ type LoginSession = {
 };
 
 type DiscordSource = {
+  /** A subscriber's copy of a trader channel — only the switch is theirs. */
+  mirrored?: boolean;
   id: string;
   label: string;
   channel_id: string;
@@ -191,7 +193,7 @@ const LADDER_ROWS: LadderRow[] = [
  *  the 2nd and 3rd trims use on an expensive contract, so they keep their own
  *  row rather than pretending to belong to one rung. */
 const TRAIL_FIELDS: LadderField[] = [
-  { key: "trim_price_threshold", label: "Trail above entry", prefix: "$", step: "0.05" },
+  { key: "trim_price_threshold", label: "Trail when entry is above", prefix: "$", step: "0.05" },
   { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
 ];
 
@@ -302,11 +304,12 @@ export default function DiscordPage() {
     (async () => {
       try {
         const u = await api<User>("/api/auth/me");
-        // Discord is an opt-in, admin-enabled trader feature. Anyone without it
-        // (subscribers, or traders not allow-listed) is bounced to the dashboard
-        // so typing /discord directly can't reach the page. The nav entry is
-        // hidden the same way in AppShell.
-        if (u.role !== "trader" || !u.discord_enabled) {
+        // Discord is an opt-in, admin-enabled trader feature — and a subscriber
+        // of such a trader gets it too, to trade the trader's channels on their
+        // own settings. Anyone else is bounced to the dashboard so typing
+        // /discord directly can't reach the page. The nav entry is hidden the
+        // same way in AppShell.
+        if (!u.discord_available) {
           router.replace("/dashboard");
           return;
         }
@@ -323,7 +326,7 @@ export default function DiscordPage() {
   // The listener reports status out-of-band, so poll while the page is open —
   // a source can go connecting → connected without any action from the user.
   useEffect(() => {
-    if (!user || user.role !== "trader") return;
+    if (!user) return;
     const t = setInterval(load, 15000);
     return () => clearInterval(t);
   }, [user]);
@@ -665,16 +668,10 @@ export default function DiscordPage() {
 
   if (loading || !user) return <PageLoading />;
 
-  if (user.role !== "trader") {
-    return (
-      <div className="max-w-[820px]">
-        <div className="card p-8 text-center text-sm" style={{ color: "var(--muted)" }}>
-          Connecting a Discord alert channel is a trader feature — it reads a channel you connect and
-          (later) places its alerts as trades on your account.
-        </div>
-      </div>
-    );
-  }
+  // A subscriber sees the channels of the trader they follow, and trades them
+  // on their own alert-handling settings below. The channels themselves are
+  // the trader's: the only thing a subscriber changes on one is the switch.
+  const isSub = user.role !== "trader";
 
   // The Connect card acts on the first channel still waiting for a sign-in, so
   // the button always has an unambiguous target rather than asking the trader
@@ -766,7 +763,13 @@ export default function DiscordPage() {
       </div>
 
       {/* Channel list beside the actions that feed it. */}
-      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-4 items-start">
+      <div
+        className={
+          isSub
+            ? "grid grid-cols-1 gap-4 items-start"
+            : "grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] gap-4 items-start"
+        }
+      >
         <div className="min-w-0 space-y-4">
         {/* Watched channels — one row per source. Everything about a channel
             lives in its row: identity, live state, when it runs, and what you
@@ -779,6 +782,11 @@ export default function DiscordPage() {
             <h3 className="text-sm font-semibold" style={{ color: "var(--text)" }}>
               Watched channels
             </h3>
+            {isSub && (
+              <span className="text-[11px] ml-auto mr-2" style={{ color: "var(--muted)" }}>
+                Your trader&apos;s channels — off skips new entries; exits still go through
+              </span>
+            )}
             {sources.length > 0 && (
               <span
                 className="text-[11px] px-2 py-0.5 rounded-full"
@@ -802,7 +810,9 @@ export default function DiscordPage() {
               </div>
               <p className="text-sm" style={{ color: "var(--text-2)" }}>No channels yet</p>
               <p className="text-[12px] mt-1" style={{ color: "var(--muted)" }}>
-                Add one on the right, then connect your Discord account.
+                {isSub
+                  ? "Your trader hasn't added a Discord channel yet."
+                  : "Add one on the right, then connect your Discord account."}
               </p>
             </div>
           ) : (
@@ -859,7 +869,13 @@ export default function DiscordPage() {
                       {/* On/off for this channel */}
                       <label
                         className="flex items-center gap-2 text-[11px] cursor-pointer select-none shrink-0"
-                        title={s.is_enabled ? "Monitoring on" : "Monitoring off"}
+                        title={
+                          isSub
+                            ? s.is_enabled
+                              ? "On — new entries from this channel are traded on your account"
+                              : "Off — new entries are skipped; exits for positions you hold still go through"
+                            : s.is_enabled ? "Monitoring on" : "Monitoring off"
+                        }
                       >
                         <input
                           type="checkbox"
@@ -874,7 +890,8 @@ export default function DiscordPage() {
                     </div>
 
                     {/* When to watch — pills, so the choice is visible rather
-                        than hidden behind a dropdown. */}
+                        than hidden behind a dropdown. The trader's to set. */}
+                    {!isSub && (
                     <div className="flex items-center gap-2 flex-wrap pl-[46px]">
                       <span className="text-[11px]" style={{ color: "var(--muted)" }}>Watch</span>
                       {/* Separate pills rather than one segmented block — each
@@ -932,8 +949,10 @@ export default function DiscordPage() {
                         </span>
                       )} */}
                     </div>
+                    )}
 
-                    {/* Actions */}
+                    {/* Actions — the trader's; a subscriber only has the switch. */}
+                    {!isSub && (
                     <div className="flex items-center gap-1.5 flex-wrap pl-[46px]">
                       <button
                         type="button"
@@ -977,6 +996,7 @@ export default function DiscordPage() {
                         <Trash2 size={13} />
                       </button>
                     </div>
+                    )}
 
                     {/* Inline channel repoint */}
                     {editingId === s.id && (
@@ -1015,7 +1035,9 @@ export default function DiscordPage() {
                     )}
                     {s.status === "needs_login" && (
                       <div className="text-[11px] pl-[46px]" style={{ color: "var(--warn, #b45309)" }}>
-                        Waiting for a Discord sign-in — connect once on the right.
+                        {isSub
+                          ? "Your trader's Discord is signed out — alerts resume once they reconnect."
+                          : "Waiting for a Discord sign-in — connect once on the right."}
                       </div>
                     )}
                   </div>
@@ -1554,7 +1576,9 @@ export default function DiscordPage() {
         </div>
 
         {/* Sidebar: the two things you DO, in order. Sticky so they stay put
-            while a long channel list scrolls. */}
+            while a long channel list scrolls. Trader-only: a subscriber's
+            channels are the trader's. */}
+        {!isSub && (
         <aside className="space-y-4 lg:sticky lg:top-4">
           {/* Step 1 — add a channel */}
           <form onSubmit={addSource} className="card p-5 space-y-3.5">
@@ -1601,6 +1625,7 @@ export default function DiscordPage() {
 
         
         </aside>
+        )}
       </div>
 
       {/* Connector pairing dialog — the primary way to connect Discord */}

@@ -26,6 +26,9 @@ class ColumnConfig(BaseModel):
     hidden: list[str] = Field(default_factory=list)
     # Column id → pixel width.
     widths: dict[str, int] = Field(default_factory=dict)
+    # Column ids the user has dragged — a "leading" column (Channel) keeps the
+    # user's slot instead of being put back first.
+    moved: list[str] = Field(default_factory=list)
 
 
 def _get_row(db: Session, user_id) -> UserUiPrefs | None:
