@@ -230,7 +230,7 @@ def relay_for_subscriber(db: Session, subscriber: User, parent: DiscordAlertSour
         return
     mirror = ensure_mirror(db, subscriber, parent)
     ensure_settings(db, subscriber, trader)
-    auto = discord_sources._auto_approve(db, subscriber.id)
+    auto = discord_sources._auto_approve(db, subscriber.id, mirror.id)
     report = discord_ingest.ingest_batch(db, mirror, batch, auto_approve=auto, publish=False)
 
     for msg in report.stored:

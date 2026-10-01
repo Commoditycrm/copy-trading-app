@@ -481,6 +481,21 @@ class DiscordSettingsIn(BaseModel):
 
 # ── the "Self" channel: manually replaying an alert the system missed ────────
 
+class ChannelSettingsOut(DiscordSettingsOut):
+    """One channel's Alert handling, plus the two channel-only switches."""
+
+    # True: the channel follows the account's settings (the values above ARE the
+    # account's). False: the values above are the channel's own.
+    use_account_settings: bool = True
+    # "limit" — entries at the alert's price (default) — or "market".
+    entry_order_type: str = "limit"
+
+
+class ChannelSettingsIn(DiscordSettingsIn):
+    use_account_settings: bool | None = None
+    entry_order_type: str | None = Field(default=None, pattern=r"^(limit|market)$")
+
+
 class DiscordSelfAlertIn(BaseModel):
     """One alert the trader is submitting by hand.
 

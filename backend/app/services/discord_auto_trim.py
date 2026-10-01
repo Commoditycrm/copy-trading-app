@@ -283,8 +283,14 @@ def _sweep_trader(db, trader_id, rows) -> None:
     ts = db.get(TraderSettings, trader_id)
     # The AI engine runs whether or not ladder auto-trim is on; with it selected
     # the ladder's rungs are never auto-fired, so two engines can't both sell.
+    # The engine is account-wide; the LADDER (gates, auto-trim on/off) is per
+    # position — the settings of the channel that opened it.
     engine = _engine(ts)
-    if engine == "ladder" and not _enabled(ts):
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+
+    guard_ts = {g.id: (dcs.for_guard(db, trader_id, g) or ts) for g in rows}
+    # Nothing has auto-trim on: skip before the broker read (rate limits).
+    if engine == "ladder" and not any(_enabled(t) for t in guard_ts.values()):
         return
     user = db.get(User, trader_id)
     if user is None:
@@ -354,7 +360,7 @@ def _sweep_trader(db, trader_id, rows) -> None:
                 db.commit()
 
             mark = _mark_for(positions, guard, trader_id)
-            rung = due_rung(ts, guard, mark)
+            rung = due_rung(guard_ts.get(guard.id, ts), guard, mark)
             if rung is None:
                 continue
 

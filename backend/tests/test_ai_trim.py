@@ -204,7 +204,7 @@ def test_the_ai_engine_replaces_the_ladder_sweep():
     import inspect
 
     src = inspect.getsource(at._sweep_trader)
-    assert 'engine == "ladder" and not _enabled(ts)' in src
+    assert 'engine == "ladder" and not any(_enabled(t) for t in guard_ts.values())' in src
     ai_branch = src[src.index('if engine == "ai":'):]
     assert "ai_trim.sweep(" in ai_branch
     # ...and returns before the ladder's rung loop can run.

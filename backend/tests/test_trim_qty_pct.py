@@ -161,9 +161,9 @@ def test_the_api_accepts_a_negative_stop():
     the DEFAULT, so flooring at 0 would reject the shipped ladder."""
     import inspect
 
-    from app.api.discord_sources import update_discord_settings
+    from app.api.discord_sources import _apply_settings
 
-    src = inspect.getsource(update_discord_settings)
+    src = inspect.getsource(_apply_settings)
     for field in ("trim_stop_pct", "trim2_stop_pct", "trim3_stop_pct"):
         assert f'("{field}", "discord_{field}", Decimal(100), _SIGNED)' in src
     # The gates and sizes are NOT signed — a negative there is meaningless.

@@ -263,6 +263,15 @@ export default function DiscordPage() {
   const [ladder, setLadder] = useState<Record<string, string>>(LADDER_DEFAULTS);
   const [savedLadder, setSavedLadder] = useState<Record<string, string>>(ladder);
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
+  // Which settings the Alert handling card edits: null = the account's, else a
+  // channel's. A channel follows the account until "Use account settings" is
+  // turned off; it also has its own Market / Limit for entries.
+  const [scope, setScope] = useState<string | null>(null);
+  const scopeRef = useRef<string | null>(null);
+  const [followsAccount, setFollowsAccount] = useState(true);
+  const [entryType, setEntryType] = useState<"limit" | "market">("limit");
+  const settingsUrl = (id: string | null = scopeRef.current) =>
+    id ? `/api/discord-sources/${id}/settings` : "/api/discord-sources/settings";
   const [pair, setPair] = useState<Pairing | null>(null);
 
   // One hidden file input, retargeted at whichever source is uploading.
@@ -276,12 +285,23 @@ export default function DiscordPage() {
       // card showing the default until something else happened to refresh it.
       const [list, settings, ai] = await Promise.all([
         api<DiscordSource[]>("/api/discord-sources"),
-        api<DiscordSettings>("/api/discord-sources/settings"),
+        api<DiscordSettings & { use_account_settings?: boolean; entry_order_type?: string }>(settingsUrl()),
         // Only for which engine is active; the AI tab loads its own settings.
         api<{ engine: "ladder" | "ai" }>("/api/discord-sources/ai-trim").catch(() => null),
       ]);
       setSources(list);
       if (ai) setExitEngine(ai.engine);
+      applySettings(settings);
+    } catch (e) {
+      notify.fromError(e, "Failed to load Discord channels");
+    }
+  }
+
+  function applySettings(
+    settings: DiscordSettings & { use_account_settings?: boolean; entry_order_type?: string },
+  ) {
+      setFollowsAccount(settings.use_account_settings ?? true);
+      setEntryType(settings.entry_order_type === "market" ? "market" : "limit");
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
       setAutoTrim(!!settings.auto_trim);
@@ -293,10 +313,29 @@ export default function DiscordPage() {
       const nextLadder = ladderFrom(settings);
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
-      setSavedMaxPerContract(settings.max_per_contract ?? "");
-      setSavedMaxPerOrder(settings.max_per_order ?? "");
+  }
+
+  async function changeScope(id: string | null) {
+    scopeRef.current = id;
+    setScope(id);
+    if (id !== null) setExitTab("ladder");          // the AI tab is account-only
+    try {
+      applySettings(await api(settingsUrl(id)));
     } catch (e) {
-      notify.fromError(e, "Failed to load Discord channels");
+      notify.fromError(e, "Could not load those settings");
+    }
+  }
+
+  async function patchChannel(body: Record<string, unknown>, done: string) {
+    if (!scope) return;
+    setModeBusy(true);
+    try {
+      applySettings(await api(settingsUrl(scope), { method: "PATCH", body: JSON.stringify(body) }));
+      notify.success(done);
+    } catch (e) {
+      notify.fromError(e, "Could not save that");
+    } finally {
+      setModeBusy(false);
     }
   }
 
@@ -394,7 +433,7 @@ export default function DiscordPage() {
     setModeBusy(true);
     try {
       const next = await api<{ execution_mode: string; live_trading: boolean }>(
-        "/api/discord-sources/settings",
+        settingsUrl(),
         { method: "PATCH", body: JSON.stringify({ execution_mode: mode }) }
       );
       setExecMode(next.execution_mode);
@@ -416,7 +455,7 @@ export default function DiscordPage() {
   async function saveSizing(patch: Record<string, unknown>) {
     setModeBusy(true);
     try {
-      const r = await api<DiscordSettings>("/api/discord-sources/settings", {
+      const r = await api<DiscordSettings>(settingsUrl(), {
         method: "PATCH",
         body: JSON.stringify(patch),
       });
@@ -446,7 +485,7 @@ export default function DiscordPage() {
     setModeBusy(true);
     try {
       const r = await api<{ execution_mode: string; live_trading: boolean }>(
-        "/api/discord-sources/settings",
+        settingsUrl(),
         { method: "PATCH", body: JSON.stringify({ live_trading: next }) }
       );
       setLiveTrading(!!r.live_trading);
@@ -464,7 +503,7 @@ export default function DiscordPage() {
     setAutoTrim(next);
     try {
       const r = await api<{ auto_trim: boolean }>(
-        "/api/discord-sources/settings",
+        settingsUrl(),
         { method: "PATCH", body: JSON.stringify({ auto_trim: next }) }
       );
       setAutoTrim(!!r.auto_trim);
@@ -1047,10 +1086,10 @@ export default function DiscordPage() {
           )}
         </div>
 
-        {/* Alert handling — what happens to an alert once it's parsed.
-            Sits below the channel list because it's account-wide policy, not a
-            per-channel control, and it needs the width for three side-by-side
-            decisions. */}
+        {/* Alert handling — what happens to an alert once it's parsed. The
+            account's settings, or one channel's ("Settings for"): a channel
+            follows the account until it is given its own. Below the channel
+            list because it needs the width for three side-by-side decisions. */}
         <div className="card overflow-hidden">
           <div
             className="flex items-center justify-between px-5 py-3.5"
@@ -1074,6 +1113,83 @@ export default function DiscordPage() {
           </div>
 
           <div className="p-5 space-y-5">
+            {/* Whose settings these are: the account's, or one channel's. */}
+            <div
+              className="rounded-xl px-4 py-3 flex items-center gap-x-5 gap-y-2.5 flex-wrap"
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+            >
+              <label className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-2)" }}>
+                Settings for
+                <select
+                  value={scope ?? ""}
+                  onChange={(e) => void changeScope(e.target.value || null)}
+                  className="rounded-md border px-2 py-1 text-[12px] bg-transparent focus-ring"
+                  style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                >
+                  <option value="">Account (every channel that follows it)</option>
+                  {sources.map((s) => (
+                    <option key={s.id} value={s.id}>{s.label}</option>
+                  ))}
+                </select>
+              </label>
+              {scope && (
+                <>
+                  <label className="flex items-center gap-2 text-[12px] cursor-pointer select-none" style={{ color: "var(--text-2)" }}>
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 cursor-pointer"
+                      style={{ accentColor: "var(--accent)" }}
+                      checked={followsAccount}
+                      disabled={modeBusy}
+                      onChange={(e) => void patchChannel(
+                        { use_account_settings: e.target.checked },
+                        e.target.checked
+                          ? "This channel follows the account settings again"
+                          : "This channel now has its own settings, starting from the account's",
+                      )}
+                    />
+                    Use account settings
+                  </label>
+                  <div className="flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-2)" }}>
+                    Entries
+                    {(["limit", "market"] as const).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        disabled={modeBusy}
+                        onClick={() => void patchChannel(
+                          { entry_order_type: t },
+                          t === "market" ? "Entries from this channel go at market"
+                            : "Entries from this channel use the alert's price",
+                        )}
+                        className="px-2.5 py-0.5 text-[11px] font-medium rounded-full disabled:opacity-60"
+                        style={{
+                          background: entryType === t ? "var(--accent-glow)" : "transparent",
+                          border: `1px solid ${entryType === t ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                          color: entryType === t ? "var(--accent-2)" : "var(--muted)",
+                        }}
+                        title={t === "market"
+                          ? "Buy at market in the regular session (outside it, the alert's limit is kept). Exits still follow the exit ladder."
+                          : "Buy at the alert's price, as before"}
+                      >
+                        {t === "limit" ? "Limit" : "Market"}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-[11px] w-full" style={{ color: "var(--muted)" }}>
+                    {followsAccount
+                      ? "Following the account settings below. Turn the switch off to give this channel its own."
+                      : "This channel's own settings — changes here affect only this channel. AI trimming stays account-wide."}
+                  </span>
+                </>
+              )}
+            </div>
+
+            <fieldset
+              disabled={!!scope && followsAccount}
+              className="space-y-5 disabled:opacity-60"
+              style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
+            >
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
             {/* 1 — does it spend money (Execution comes first so Approval,
                 which is only meaningful in Live, reads as the follow-on step) */}
@@ -1122,7 +1238,7 @@ export default function DiscordPage() {
               })}
 
               <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                Applies to every connected channel, from now on.
+                {scope ? "Applies to this channel, from now on." : "Applies to every channel that follows the account, from now on."}
               </p>
             </div>
 
@@ -1343,10 +1459,10 @@ export default function DiscordPage() {
               >
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <div role="tablist" aria-label="Exit engine" className="flex gap-1">
-                      {([
-                        ["ladder", "Exit ladder"],
-                        ["ai", "AI trimming"],
-                      ] as const).map(([value, label]) => (
+                      {(scope
+                        ? ([["ladder", "Exit ladder"]] as const)
+                        : ([["ladder", "Exit ladder"], ["ai", "AI trimming"]] as const)
+                      ).map(([value, label]) => (
                         <button
                           key={value}
                           type="button"
@@ -1570,6 +1686,7 @@ export default function DiscordPage() {
               </div>
             </div>
             </div>
+          </fieldset>
           </div>
         </div>
         </div>
