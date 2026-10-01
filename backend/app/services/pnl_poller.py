@@ -330,6 +330,26 @@ def _load_active_accounts() -> list[BrokerAccount]:
         return accts
 
 
+def _has_discord_ladder_work(db, user_id) -> bool:
+    """A live Discord guard with a stop level or an armed trail — the same
+    selection the trader gate below uses."""
+    from sqlalchemy import or_ as _or  # noqa: PLC0415
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    return db.execute(
+        _select(DiscordPositionGuard.id).where(
+            DiscordPositionGuard.user_id == user_id,
+            DiscordPositionGuard.closed_at.is_(None),
+            _or(
+                DiscordPositionGuard.stop_price.isnot(None),
+                DiscordPositionGuard.trail_qty.isnot(None),
+            ),
+        ).limit(1)
+    ).scalar_one_or_none() is not None
+
+
 def _has_active_policies(s: SubscriberSettings) -> bool:
     """Return True if the subscriber has at least one enforcement policy
     configured. When False, the poller can skip the broker call entirely
@@ -378,6 +398,10 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
             return ("other", False)
         if u.role == UserRole.SUBSCRIBER:
             s = db.get(SubscriberSettings, user_id)
+            # A Discord subscriber runs their own exit ladder, whose stops and
+            # trailing exits this poller enforces — work even with no policy set.
+            if _has_discord_ladder_work(db, user_id):
+                return ("subscriber", True)
             if s is None:
                 return ("subscriber", False)
             return ("subscriber", _has_active_policies(s))
@@ -466,6 +490,9 @@ def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
         else:
             _enforce_one(acct)
             _reconcile_brackets_for_subscriber(acct)
+            # Their own Discord ladder (stops, trailing exits) — a no-op
+            # without a live guard.
+            _enforce_discord_trailing_stops(acct)
     except Exception:  # noqa: BLE001
         log.exception(
             "pnl_poller: enforce failed for account %s (user %s, role=%s)",
@@ -567,7 +594,8 @@ def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
 
 def _make_stop_placer(db, live_acct, acct, guard):
     """Place a real STOP sell for this contract, routed through the normal order
-    path so it is tracked, audited and fanned out like any other order."""
+    path so it is tracked and audited like any other order (never fanned out:
+    Discord subscribers hold their own stops)."""
     def _place(quantity, stop_price):
         from app.api.trades import _place_trader_order  # noqa: PLC0415
         from app.models.order import (  # noqa: PLC0415
@@ -599,6 +627,8 @@ def _make_stop_placer(db, live_acct, acct, guard):
             db, db.get(User, acct.user_id), payload, live_acct.id,
             BackgroundTasks(), _PollerRequest(),
             resolve_wash_trade=True,      # a close, so option SELLs go SELL_TO_CLOSE
+            # A Discord ladder stop — subscribers hold their own (see place_exit).
+            skip_fanout=True,
         )
         return order.id
     return _place
@@ -713,9 +743,11 @@ def place_exit(db, trader, live_acct, adapter, pos, quantity, *, partial: bool =
         # trim 00:33:49, stop refused 00:33:51, close suppressed
         # 00:33:52.
         skip_dedup=True,
-        # A slice that leaves part of the position open is a trim, so the
-        # subscriber fanout keeps their working entries on the contract.
+        # A slice that leaves part of the position open is a trim.
         partial_close=partial,
+        # A Discord ladder / AI exit. Subscribers run their own ladder on the
+        # same alerts (services/discord_subscribers.py), so it is never copied.
+        skip_fanout=True,
     )
 
 

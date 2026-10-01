@@ -26,6 +26,8 @@ export interface User {
    *  Trader-only; off unless an admin allow-lists the user. Gates both the
    *  Discord nav entry and the /discord route. */
   discord_enabled: boolean;
+  /** Gets the Discord page: a Discord-enabled trader, or a subscriber of one. */
+  discord_available?: boolean;
   /** Whether the user has confirmed their email. Soft-enforced: unverified
    *  users can still use the app, but see a "verify your email" banner. */
   email_verified: boolean;
@@ -85,7 +87,11 @@ export interface BrokerAccount {
   // "Robinhood", "IBKR"). null for direct-API brokers — `broker` itself
   // is already the real name in that case.
   brokerage_name?: string | null;
-  connection_status: "pending" | "connected" | "error";
+  // "inactive" = kept on file but paused; exactly one account is "connected".
+  connection_status: "pending" | "connected" | "error" | "inactive";
+  /** One-off toast from connect / activate (e.g. another account on the same
+   *  Webull app key was deactivated). Only on those responses. */
+  notice?: string | null;
   last_error: string | null;
   created_at: string;
 
@@ -219,8 +225,16 @@ export interface Position {
   ladder_stop_price?: string | null;
   current_price: string | null;
   market_value: string | null;
-  unrealized_pnl: string | null;
+  unrealized_pnl: string | null;            // Open P&L ($) — broker's own value
   cost_basis: string | null;
+  /** Broker-native per-position figures (Webull / Alpaca), following the
+   *  connected broker. Percents are display percents (e.g. -39.16). day_pnl /
+   *  day_pnl_pct are the CURRENT trading day only; null when the broker doesn't
+   *  expose them. day_pnl_source = "broker_native" | null. */
+  open_pnl_pct?: string | null;
+  day_pnl?: string | null;
+  day_pnl_pct?: string | null;
+  day_pnl_source?: string | null;
   /** Previous session's market close price for this symbol (reference). */
   reference_price: string | null;
   option_expiry: string | null;
@@ -230,8 +244,14 @@ export interface Position {
 
 export interface DailyPnL {
   day: string;
-  /** Settled days: locked realized P&L. Today (direct Alpaca): realized-so-far
-   *  PLUS live unrealized on open positions — one combined, market-live figure. */
+  /** The connected broker's OWN Day's P&L ($) and Day's P&L % for this date,
+   *  normalized (percent = 8.88, not 0.0888). null when the broker doesn't
+   *  expose it → the cell shows "--". The calendar renders these directly and
+   *  does NO P&L math of its own. */
+  day_pnl?: string | null;
+  day_pnl_pct?: string | null;
+  /** Diagnostics (trades/admin views + reconciliation), not shown on the
+   *  calendar: closed-trade realized P&L. */
   realized_pnl: string;
   trade_count: number;
   /** Daily return %, broker-reported (Alpaca only). null when unavailable. */
@@ -244,6 +264,18 @@ export interface DailyPnL {
   /** True on today's cell when realized_pnl includes live unrealized — the
    *  number ticks with the market and is not settled. */
   live?: boolean;
+  /** Authoritative Marked to display when set (e.g. today's Webull Day's P&L,
+   *  total_day_profit_loss). null → fall back to realized_pnl + unrealized_pnl. */
+  marked_pnl?: string | null;
+  /** Provenance of the displayed marked: "webull_live" | "alpaca_live" |
+   *  "broker_live" | "broker_reported" | "calculated". */
+  source?: string | null;
+  /** Confidence of the displayed marked: "authoritative" | "estimated" | "live"
+   *  | "stale" (a live broker fetch failed → last-known value). */
+  quality?: string | null;
+  /** When the displayed marked was captured (ISO). Set for today's live/stale
+   *  cell. */
+  last_updated_at?: string | null;
 }
 
 /** One scope's order-history totals, computed in the DB (GET

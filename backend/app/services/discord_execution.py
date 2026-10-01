@@ -108,6 +108,9 @@ def resolve(
     positions = _positions(adapter, symbol) if is_option else []
 
     if is_option:
+        if (not is_closing and signal.get("nearest_expiry")
+                and signal.get("expiration") is None):
+            signal = _with_nearest_expiry(adapter, symbol, signal, positions, resolutions)
         strike, right, expiry = _resolve_contract(signal, positions, resolutions)
         _check_expiry(expiry)
         # Confirm the contract actually EXISTS before sending. An alert can name
@@ -277,6 +280,149 @@ def _positions(adapter: Any, symbol: str) -> list:
         return [p for p in adapter.get_positions() if (p.symbol or "").upper() == symbol]
     except Exception as exc:  # noqa: BLE001
         raise ExecutionRefused(f"Couldn't read your positions from the broker: {exc}") from exc
+
+
+def _with_nearest_expiry(adapter: Any, symbol: str, signal: dict, positions: list,
+                         resolutions: dict) -> dict:
+    """Fill an entry's missing expiry with the NEAREST listed one.
+
+    For channels that post "AMZN245P .55" with no date. A contract already held
+    at that strike/right wins (the alert is most likely about it); otherwise
+    the soonest expiry at or after today that actually lists this strike and
+    right. Only ever reached when the parser opted in (``nearest_expiry``).
+    """
+    strike = _dec(signal.get("strike"))
+    right = _right(signal.get("option_type"))
+    if strike is None or right is None:
+        return signal
+    held = [p for p in positions
+            if p.option_strike == strike and p.option_right == right and (p.quantity or 0) != 0]
+    if held:
+        return signal     # _resolve_contract fills it from the held position
+    from datetime import timedelta  # noqa: PLC0415
+
+    today = market_hours.now_et().date()
+    end = today + timedelta(days=21)
+    want_cp = "C" if right is OptionRight.CALL else "P"
+    try:
+        expiries = _data_account_expiries(_chain_root(symbol), strike, right, today, end)
+        if expiries is None:
+            expiries = _broker_expiries(adapter, symbol, strike, want_cp, today, end)
+    except Exception as exc:  # noqa: BLE001
+        raise ExecutionRefused(f"The alert names no expiry and the option chain couldn't be read: {exc}") from exc
+    if expiries is None:
+        raise ExecutionRefused(
+            "The alert names no expiry, and there is no way to list contracts here "
+            "(no Alpaca market-data key, and this broker can't list them)."
+        )
+    if not expiries:
+        raise ExecutionRefused(
+            f"The alert names no expiry and {symbol} lists no ${strike} "
+            f"{'call' if want_cp == 'C' else 'put'} in the next three weeks."
+        )
+    resolutions["expiration"] = f"{expiries[0]} (nearest listed — the alert gave none)"
+    return {**signal, "expiration": expiries[0].isoformat()}
+
+
+def _data_account_expiries(root: str, strike: Decimal, right: OptionRight,
+                           start: date, end: date) -> list[date] | None:
+    """Expiries between ``start`` and ``end`` that list this strike and right,
+    soonest first — from the Alpaca DATA account's option chain.
+
+    Listed contracts are market data, the same whatever broker trades them, so
+    they come from the dedicated data key like every other price in the app —
+    which is also what lets a Webull (or any) trader take "AMZN245P .55". None
+    when the data key isn't configured.
+    """
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    if not (s.alpaca_data_api_key and s.alpaca_data_api_secret):
+        return None
+    from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: PLC0415
+    from alpaca.data.requests import OptionChainRequest  # noqa: PLC0415
+    from alpaca.trading.enums import ContractType  # noqa: PLC0415
+
+    client = OptionHistoricalDataClient(s.alpaca_data_api_key, s.alpaca_data_api_secret)
+    chain = client.get_option_chain(OptionChainRequest(
+        underlying_symbol=root,
+        type=ContractType.CALL if right is OptionRight.CALL else ContractType.PUT,
+        strike_price_gte=float(strike), strike_price_lte=float(strike),
+        expiration_date_gte=start, expiration_date_lte=end,
+    ))
+    found = set()
+    for occ in (chain or {}):
+        parsed = _occ_expiry_strike_right(occ)
+        if parsed and parsed[1] == strike and parsed[2] is right and start <= parsed[0] <= end:
+            found.add(parsed[0])
+    return sorted(found)
+
+
+def _occ_expiry_strike_right(occ: str) -> tuple[date, Decimal, OptionRight] | None:
+    """"AMZN261002P00245000" → (2026-10-02, 245, PUT)."""
+    import re  # noqa: PLC0415
+    m = re.fullmatch(r"[A-Z0-9.]{1,6}(\d{6})([CP])(\d{8})", (occ or "").strip().upper())
+    if not m:
+        return None
+    ymd, cp, strike = m.groups()
+    try:
+        expiry = date(2000 + int(ymd[:2]), int(ymd[2:4]), int(ymd[4:]))
+    except ValueError:
+        return None
+    return expiry, Decimal(strike) / 1000, OptionRight.CALL if cp == "C" else OptionRight.PUT
+
+
+def _broker_expiries(adapter: Any, symbol: str, strike: Decimal, want_cp: str,
+                     start: date, end: date) -> list[date] | None:
+    """The same, from the broker's own contract list — the fallback when no
+    data key is set. None when the broker can't list contracts."""
+    if not hasattr(adapter, "list_option_contracts"):
+        return None
+    contracts = adapter.list_option_contracts(
+        underlying=_chain_root(symbol), expiry_gte=start, expiry_lte=end, limit=2000,
+    )
+    return sorted({
+        _date(getattr(c, "expiration_date", None)) for c in contracts
+        if _dec(getattr(c, "strike_price", None)) == strike and _contract_type(c) == want_cp
+    } - {None})
+
+
+def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
+    """The contract this CHANNEL most recently bought that is still held.
+
+    For "Adding .4": an add that names nothing means the position the channel
+    is in. Taken from the channel's own filled/working BUY orders, newest first,
+    and only if the broker still reports it held — never a guess across other
+    channels' positions.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderSide  # noqa: PLC0415
+
+    orders = db.execute(
+        select(Order).join(DiscordMessage, DiscordMessage.order_id == Order.id).where(
+            DiscordMessage.source_id == source_id,
+            Order.user_id == user.id,
+            Order.side == OrderSide.BUY,
+        ).order_by(Order.created_at.desc()).limit(20)
+    ).scalars().all()
+    if not orders:
+        return None
+    acct = _broker_account(db, user)
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    for o in orders:
+        held = [p for p in _positions(adapter, o.symbol)
+                if p.option_strike == o.option_strike and p.option_right == o.option_right
+                and p.option_expiry == o.option_expiry and (p.quantity or 0) > 0]
+        if held:
+            return {
+                "symbol": o.symbol,
+                "asset_type": "OPTION" if o.option_strike is not None else "STOCK",
+                "strike": str(o.option_strike) if o.option_strike is not None else None,
+                "option_type": o.option_right.value if o.option_right else None,
+                "expiration": o.option_expiry.isoformat() if o.option_expiry else None,
+            }
+    return None
 
 
 def _resolve_contract(signal: dict, positions: list, resolutions: dict):

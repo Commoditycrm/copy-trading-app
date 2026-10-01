@@ -15,6 +15,9 @@ export interface ColumnDef {
   defaultHidden?: boolean;
   /** Cannot be hidden or moved (e.g. Symbol / Actions). */
   locked?: boolean;
+  /** Sits first: by default, and over a saved order too — unless the user has
+   *  moved this column themselves (e.g. Channel for Discord traders). */
+  leading?: boolean;
   minWidth?: number;
   defaultWidth?: number;
 }
@@ -27,6 +30,8 @@ interface StoredConfig {
   order?: string[];
   hidden?: string[];
   widths?: Record<string, number>;
+  /** Columns the user has dragged; a `leading` column here keeps their slot. */
+  moved?: string[];
 }
 
 export interface TableColumns {
@@ -42,6 +47,28 @@ export interface TableColumns {
 
 const DEFAULT_WIDTH = 120;
 
+/** Reconcile a (saved) order with the current defs: drop ids that no longer
+ *  exist, put ids missing from it in their default slot (after the column that
+ *  precedes them by default), and bring `leading` columns to the front unless
+ *  the user moved them. A column can appear after the first render — Channel
+ *  shows once the user is known to have Discord — so this runs on def changes
+ *  too, not just on load. */
+function placeOrder(order: string[], defs: ColumnDef[], moved: Set<string>): string[] {
+  const known = new Set(defs.map((d) => d.id));
+  const out = order.filter((id) => known.has(id));
+  defs.forEach((d, i) => {
+    if (out.includes(d.id)) return;
+    let at = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      const k = out.indexOf(defs[j].id);
+      if (k >= 0) { at = k + 1; break; }
+    }
+    out.splice(at, 0, d.id);
+  });
+  const lead = defs.filter((d) => d.leading && !moved.has(d.id)).map((d) => d.id);
+  return [...lead, ...out.filter((id) => !lead.includes(id))];
+}
+
 export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumns {
   const defsById = useMemo(() => {
     const m = new Map<string, ColumnDef>();
@@ -51,6 +78,7 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
   const defaultOrder = useMemo(() => defs.map((d) => d.id), [defs]);
 
   const [order, setOrder] = useState<string[]>(defaultOrder);
+  const [moved, setMoved] = useState<Set<string>>(() => new Set());
   const [hidden, setHidden] = useState<Set<string>>(
     () => new Set(defs.filter((d) => d.defaultHidden).map((d) => d.id)),
   );
@@ -65,13 +93,10 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
         if (!alive) return;
         const cfg = res.columns?.[tableId];
         if (cfg) {
-          // Merge saved order with defs: keep known ids in saved order, then
-          // append any new columns that didn't exist when the user last saved.
-          const known = new Set(defaultOrder);
-          const merged = (cfg.order ?? []).filter((id) => known.has(id));
-          for (const id of defaultOrder) if (!merged.includes(id)) merged.push(id);
-          setOrder(merged);
-          if (cfg.hidden) setHidden(new Set(cfg.hidden.filter((id) => known.has(id))));
+          const savedMoved = new Set(cfg.moved ?? []);
+          setMoved(savedMoved);
+          setOrder(placeOrder(cfg.order ?? [], defs, savedMoved));
+          if (cfg.hidden) setHidden(new Set(cfg.hidden.filter((id) => defsById.has(id))));
           if (cfg.widths) setWidths(cfg.widths);
         }
       })
@@ -81,6 +106,12 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tableId]);
 
+  // Columns added or removed after mount (see placeOrder).
+  useEffect(() => {
+    setOrder((prev) => placeOrder(prev, defs, moved));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [defaultOrder]);
+
   // Debounced save whenever the user changes anything (after initial load).
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const save = useCallback(() => {
@@ -88,14 +119,14 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
     saveTimer.current = setTimeout(() => {
       api(`/api/ui-prefs/columns/${encodeURIComponent(tableId)}`, {
         method: "PUT",
-        body: JSON.stringify({ order, hidden: Array.from(hidden), widths }),
+        body: JSON.stringify({ order, hidden: Array.from(hidden), widths, moved: Array.from(moved) }),
       }).catch(() => {});
     }, 600);
-  }, [tableId, order, hidden, widths]);
+  }, [tableId, order, hidden, widths, moved]);
   useEffect(() => {
     if (loaded) save();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [order, hidden, widths, loaded]);
+  }, [order, hidden, widths, moved, loaded]);
 
   const toggle = useCallback((id: string) => {
     if (defsById.get(id)?.locked) return;
@@ -108,6 +139,7 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
 
   const move = useCallback((id: string, toIndex: number) => {
     if (defsById.get(id)?.locked) return;
+    setMoved((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
     setOrder((prev) => {
       const from = prev.indexOf(id);
       if (from < 0) return prev;
@@ -127,6 +159,7 @@ export function useTableColumns(tableId: string, defs: ColumnDef[]): TableColumn
     setOrder(defaultOrder);
     setHidden(new Set(defs.filter((d) => d.defaultHidden).map((d) => d.id)));
     setWidths({});
+    setMoved(new Set());
   }, [defaultOrder, defs]);
 
   const allInOrder = useMemo<ResolvedColumn[]>(

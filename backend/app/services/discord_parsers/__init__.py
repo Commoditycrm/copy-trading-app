@@ -37,6 +37,7 @@ from .base import (
     TradeSignal,
 )
 from .generic_text import GenericTextParser
+from .terse_alert import TerseAlertParser
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,10 @@ PARSERS: list[Parser] = [
     # word, so the generic parser would ignore it entirely.
     CompactAlertParser(),
     GenericTextParser(),
+    # LAST: terse chatty alerts ("AMZN245P .55", "Adding .4", "... trim ...
+    # AMZN 25%") that every parser above ignores. Being last, it never reads a
+    # message another format already understands.
+    TerseAlertParser(),
 ]
 
 _BY_NAME = {p.name: p for p in PARSERS}

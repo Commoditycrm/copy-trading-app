@@ -98,12 +98,13 @@ def _is_connected() -> bool:
 
 def _enabled() -> bool:
     from app.config import get_settings  # noqa: PLC0415
+    from app.services import app_settings  # noqa: PLC0415
     s = get_settings()
-    return bool(
-        s.webull_market_stream_enabled
-        and s.webull_data_app_key
-        and s.webull_data_app_secret
+    # Admin runtime toggle overrides the env default (no redeploy needed).
+    enabled = app_settings.flag(
+        "webull_market_stream_enabled", default=s.webull_market_stream_enabled
     )
+    return bool(enabled and s.webull_data_app_key and s.webull_data_app_secret)
 
 
 def _parse_invalid_symbols(err_msg: str) -> set[str]:

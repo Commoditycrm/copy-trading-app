@@ -16,10 +16,11 @@
  * mount + the periodic poll (that SSE is about a trader's listener, so it never
  * drives a subscriber's pill).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { useEventStream, type ListenerStatus } from "@/lib/sse";
 import { onBrokerChanged } from "@/lib/traderSync";
+import { notify } from "@/lib/toast";
 
 interface StatusPayload extends ListenerStatus {
   trader_id: string | null;
@@ -39,6 +40,7 @@ const STATE_LABEL: Record<ListenerStatus["state"], string> = {
   credentials_invalid: "Broker disconnected",
   no_trader: "No trader followed",
   no_broker: "No broker",
+  in_use_elsewhere: "Live elsewhere",
 };
 
 const STATE_COLOR: Record<ListenerStatus["state"], string> = {
@@ -49,6 +51,7 @@ const STATE_COLOR: Record<ListenerStatus["state"], string> = {
   credentials_invalid: "#ef4444",
   no_trader: "#94a3b8",
   no_broker: "#94a3b8",
+  in_use_elsewhere: "#f97316",
 };
 
 /* The maps above are typed against the union so a state added to ListenerStatus
@@ -128,6 +131,16 @@ export function ListenerPill({ role }: Props) {
   }, [sse.state]);
 
   const s = status?.state ?? "disconnected";
+
+  // Say it once, when it happens: the app key is live in another environment,
+  // so this one can't stream until it is deactivated there.
+  const prevState = useRef<string | null>(null);
+  useEffect(() => {
+    if (s === "in_use_elsewhere" && prevState.current !== s) {
+      notify.warn(status?.last_error || "Webull is live somewhere else — deactivate it there.");
+    }
+    prevState.current = s;
+  }, [s, status?.last_error]);
   const color = colorFor(s);
   const label = labelFor(s);
   // Both roles now describe THEIR OWN broker.
@@ -137,6 +150,7 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_broker") return "Connect a broker on the Brokers page";
     if (s === "no_trader") return "Pick a trader to follow on the Settings page";
     if (s === "credentials_invalid") return "Broker credentials missing or revoked";
+    if (s === "in_use_elsewhere") return status?.last_error || "Webull is live somewhere else";
     const last = status?.last_event_at ? `last event ${fmtRel(status.last_event_at)}` : "no events yet";
     return `${prefix} ${label.toLowerCase()} · ${last}`;
   })();
@@ -153,6 +167,7 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_broker") return "No broker";
     if (s === "no_trader") return "No trader followed";
     if (s === "credentials_invalid") return `${prefix} disconnected`;
+    if (s === "in_use_elsewhere") return "Webull live elsewhere";
     return `${prefix} ${label.toLowerCase()}`;
   })();
 

@@ -90,7 +90,7 @@ function StatusPill({ status }: { status: BrokerAccount["connection_status"] }) 
         className="inline-block rounded-full"
         style={{ width: 6, height: 6, background: "currentColor" }}
       />
-      {status}
+      {status === "connected" ? "active" : status}
     </span>
   );
 }
@@ -290,6 +290,9 @@ export default function BrokersPage() {
   const [webullAppKey, setWebullAppKey] = useState("");
   const [webullAppSecret, setWebullAppSecret] = useState("");
   const [webullAccountId, setWebullAccountId] = useState("");
+  // Paper = Webull's test environment (a separate API host); its keys don't
+  // work against live and vice versa.
+  const [webullPaper, setWebullPaper] = useState(false);
   // Accounts fetched from the keys. One app_key reaches EVERY account under the
   // Webull login (Cash / Margin / IRA / Futures) and account_id is not the
   // number shown in the app — so this is picked, never typed. Typing it meant a
@@ -360,7 +363,8 @@ export default function BrokersPage() {
       // cached snapshot + a 30s wait for the first poll tick. Silent = no
       // toast / no audit, same as an auto-poll tick. The 30s cycle then keeps
       // them live from here.
-      for (const a of accts) void refreshBalance(a.id, { silent: true });
+      // Only the active broker — an inactive one is left untouched.
+      for (const a of accts) if (a.connection_status === "connected") void refreshBalance(a.id, { silent: true });
     } finally {
       setLoading(false);
     }
@@ -382,7 +386,9 @@ export default function BrokersPage() {
 
     const tick = () => {
       if (typeof document !== "undefined" && document.hidden) return;
-      for (const a of accountsRef.current) void refreshBalance(a.id, { silent: true });
+      for (const a of accountsRef.current) {
+        if (a.connection_status === "connected") void refreshBalance(a.id, { silent: true });
+      }
     };
     const start = () => { if (!timer) timer = setInterval(tick, POLL_MS); };
     const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
@@ -445,8 +451,9 @@ export default function BrokersPage() {
   }, [searchParams]);
 
   function resetConnectForms() {
+    setAddingBroker(false);
     setLabel(""); setApiKey(""); setApiSecret(""); setPaper(false);
-    setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId("");
+    setWebullLabel(""); setWebullAppKey(""); setWebullAppSecret(""); setWebullAccountId(""); setWebullPaper(false);
     setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
@@ -514,6 +521,7 @@ export default function BrokersPage() {
           app_key: webullAppKey.trim(),
           app_secret: webullAppSecret.trim(),
           region_id: "us",
+          paper: webullPaper,
         }),
       });
       setWebullAccounts(accts);
@@ -536,7 +544,7 @@ export default function BrokersPage() {
     e.preventDefault();
     setBusy(true);
     try {
-      await api("/api/brokers", {
+      const created = await api<BrokerAccount>("/api/brokers", {
         method: "POST",
         body: JSON.stringify({
           broker: "webull",
@@ -546,11 +554,13 @@ export default function BrokersPage() {
             app_secret: webullAppSecret.trim(),
             account_id: webullAccountId.trim(),
             region_id: "us",
+            paper: webullPaper,
           },
         }),
       });
       resetConnectForms();
-      notify.success("Webull connected — real-time stream starting");
+      notify.success(`Webull ${webullPaper ? "paper " : ""}connected — real-time stream starting`);
+      if (created?.notice) notify.warn(created.notice);
       await load();
     } catch (e) {
       notify.fromError(e, "Webull connect failed");
@@ -648,7 +658,38 @@ export default function BrokersPage() {
     }
   }
 
+  const [switching, setSwitching] = useState<string | null>(null);
+  // The connect form is always reachable; with brokers on file it starts
+  // collapsed behind "Add another broker".
+  const [addingBroker, setAddingBroker] = useState(false);
+
+  async function setActive(a: BrokerAccount, activate: boolean) {
+    const current = accounts.find(x => x.connection_status === "connected" && x.id !== a.id);
+    const msg = activate
+      ? `Make ${a.label} the active broker?` +
+        (current ? ` ${current.label} will be deactivated.` : "") +
+        " Its saved keys are checked with the broker first."
+      : `Deactivate ${a.label}? Its keys stay saved, but nothing trades, copies or listens through it until you activate it again. Open positions at the broker are not closed.`;
+    if (!confirm(msg)) return;
+    setSwitching(a.id);
+    try {
+      const res = await api<BrokerAccount>(`/api/brokers/${a.id}/${activate ? "activate" : "deactivate"}`, { method: "POST" });
+      notify.success(activate ? `${a.label} is now the active broker` : `${a.label} deactivated`);
+      if (res?.notice) notify.warn(res.notice);
+      emitBrokerChanged();
+      await load();
+    } catch (e) {
+      notify.fromError(e, activate ? "Could not activate that broker" : "Could not deactivate that broker");
+    } finally {
+      setSwitching(null);
+    }
+  }
+
   const hasConnected = accounts.length > 0;
+  // Active broker first, then the rest in the order they came back.
+  const sortedAccounts = [...accounts].sort(
+    (x, y) => Number(y.connection_status === "connected") - Number(x.connection_status === "connected"),
+  );
 
   // Centered loading view — hides the page until the initial fetch
   // settles, so we don't render the picker briefly before the connected
@@ -666,7 +707,10 @@ export default function BrokersPage() {
           Broker connections
         </h1>
         <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-          One broker per account — connecting a new one replaces the previous.
+          Keep several brokers on file — only one is active at a time. Connecting a
+          new one makes it active and deactivates the current one (its keys stay saved).
+          SnapTrade connections can&apos;t be deactivated — connecting another broker
+          replaces them.
         </p>
         <span className="chip mt-2.5 inline-flex items-center gap-1.5">
           <Lock size={12} /> Keys encrypted at rest with Fernet (AES-128) — never leave the server
@@ -674,13 +718,14 @@ export default function BrokersPage() {
       </motion.div>
 
       {/* ── Connected account(s) ──────────────────────────────────────── */}
-      {accounts.map(a => {
+      {sortedAccounts.map(a => {
         const meta = brokerMeta(a.broker);
+        const active = a.connection_status === "connected";
         return (
           <motion.div
             key={a.id}
             initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
+            animate={{ opacity: active ? 1 : 0.72, y: 0 }}
             transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
             className="card p-5"
           >
@@ -714,12 +759,36 @@ export default function BrokersPage() {
                   )}
                 </div>
               </div>
-              <button
-                onClick={() => remove(a.id)}
-                className="btn-danger-soft px-3 py-1.5 text-xs font-medium shrink-0"
-              >
-                Disconnect
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                {active && a.broker === "snaptrade" ? null : active ? (
+                  // SnapTrade is never paused: its link to the broker would stay
+                  // live on SnapTrade's side. Disconnect is the way off it.
+                  <button
+                    onClick={() => void setActive(a, false)}
+                    disabled={switching !== null}
+                    className="btn-ghost px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                    title="Pause this broker — keys stay saved"
+                  >
+                    {switching === a.id ? "Deactivating…" : "Deactivate"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => void setActive(a, true)}
+                    disabled={switching !== null}
+                    className="btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                    title="Make this the active broker"
+                  >
+                    {switching === a.id ? "Activating…" : "Activate"}
+                  </button>
+                )}
+                <button
+                  onClick={() => remove(a.id)}
+                  disabled={switching !== null}
+                  className="btn-danger-soft px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                >
+                  Disconnect
+                </button>
+              </div>
             </div>
 
             {/* Balance row */}
@@ -748,14 +817,17 @@ export default function BrokersPage() {
         );
       })}
 
-      {hasConnected && (
-        <p className="text-xs" style={{ color: "var(--faint)" }}>
-          Want a different broker? Disconnect the one above first — only one
-          broker can be active per account.
-        </p>
+      {hasConnected && !addingBroker && (
+        <button
+          type="button"
+          onClick={() => setAddingBroker(true)}
+          className="btn-ghost px-3 py-1.5 text-xs font-medium"
+        >
+          + Add another broker
+        </button>
       )}
 
-      {hasConnected ? null : (
+      {hasConnected && !addingBroker ? null : (
       <section className="card p-5 space-y-5">
         {/* Broker picker — clickable tiles. Switching wipes the in-progress
             form for the other broker so we don't post stale fields. */}
@@ -867,6 +939,20 @@ export default function BrokersPage() {
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
                 <input type="text" className="w-full p-2.5" placeholder="Webull (direct)" aria-label="Webull account label" value={webullLabel} onChange={e => setWebullLabel(e.target.value)} />
               </div>
+              <PaperLiveRadio
+                value={webullPaper}
+                onChange={(v) => {
+                  // A different environment has different accounts — drop any
+                  // list loaded for the other one.
+                  setWebullPaper(v);
+                  setWebullAccounts(null);
+                  setWebullAccountId("");
+                }}
+                name="webull-mode"
+                note={webullPaper
+                  ? "Paper uses Webull's test environment (api.sandbox.webull.com). Use the API keys issued for paper/test — live keys are rejected there."
+                  : "Live trades your real Webull account. Paper keys are rejected here."}
+              />
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>App key</label>

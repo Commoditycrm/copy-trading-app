@@ -16,6 +16,37 @@ from app.models.order import InstrumentType, OptionRight, OrderSide, OrderStatus
 
 
 @dataclass(frozen=True)
+class BrokerCapabilities:
+    """What a broker's API can authoritatively tell us about P&L. Core P&L logic
+    branches on these, NOT on broker names — so adding a broker is a matter of
+    declaring its capabilities, not editing pnl.py. Every flag defaults False:
+    an undeclared broker is treated as exposing nothing, which is the safe side
+    (we never fabricate confident numbers from data we don't have)."""
+
+    # A COMPLETE, authoritative record of every execution exists via the broker's
+    # API (an activity/fills feed). Only then may we FIFO realized P&L AND infer
+    # that a lot still open past expiry truly expired worthless. Without it, a
+    # remaining open lot is more likely a close we simply never received than a
+    # real expiry — see the Webull phantom-loss finding.
+    authoritative_fill_history: bool = False
+    # Broker exposes a per-day historical P&L series we can pull (e.g. Alpaca
+    # portfolio-history). False → historical days can't be reproduced exactly.
+    historical_daily_pnl: bool = False
+    # Broker reports today's live Day's P&L directly (a real API field).
+    live_daily_pnl: bool = False
+    # Broker reports current open-position unrealized authoritatively.
+    authoritative_open_pnl: bool = False
+    # Broker exposes a native per-position DAY P&L field (Webull day_profit_loss,
+    # Alpaca unrealized_intraday_pl) — show the broker's number, not a derived one.
+    authoritative_position_day_pnl: bool = False
+    # Broker exposes an authoritative realized-P&L figure via a real API field
+    # (NOT our FIFO inference). Only set when verified against an actual field.
+    authoritative_realized_pnl: bool = False
+    # Broker exposes a marked portfolio-history series (Alpaca).
+    portfolio_history: bool = False
+
+
+@dataclass(frozen=True)
 class ConnectionInfo:
     broker_account_id: str | None
     supports_fractional: bool
@@ -103,6 +134,17 @@ class BrokerPosition:
     market_value: Decimal | None
     unrealized_pnl: Decimal | None
     cost_basis: Decimal | None = None
+    # Open P&L % — the broker's own lifetime unrealized return on this position,
+    # as a PERCENT (e.g. -39.16), None when the broker doesn't expose it.
+    open_pnl_pct: Decimal | None = None
+    # Day's P&L — the position's P&L for the CURRENT trading day (not lifetime),
+    # straight from the broker's native field (Webull day_profit_loss, Alpaca
+    # unrealized_intraday_pl). None when the broker doesn't expose it — never
+    # fabricated from the lifetime figure.
+    day_pnl: Decimal | None = None
+    # Day's P&L % — as a PERCENT. Native for Alpaca (unrealized_intraday_plpc);
+    # derived for Webull (day_pnl / day-start value). None when unavailable.
+    day_pnl_pct: Decimal | None = None
     # Option-only fields parsed from OCC symbol; null for stocks.
     option_expiry: date | None = None
     option_strike: Decimal | None = None
@@ -113,6 +155,12 @@ class BrokerAdapter(ABC):
     """One instance per BrokerAccount. Hold decrypted credentials in-memory only."""
 
     name: str
+
+    # What this broker's API can authoritatively report. Concrete adapters
+    # override with their own; the default declares nothing (safe). Also exposed
+    # name-keyed via app.brokers.capabilities.capabilities_for for callers that
+    # only hold a BrokerName (e.g. pnl.py) and shouldn't build an adapter.
+    capabilities: "BrokerCapabilities" = BrokerCapabilities()
 
     def __init__(self, credentials: dict[str, Any]):
         self.credentials = credentials

@@ -28,6 +28,7 @@ from collections.abc import Callable
 from decimal import Decimal
 
 from app.brokers import adapter_for
+from app.brokers.capabilities import capabilities_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
@@ -127,6 +128,13 @@ def list_positions(
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
+            # Whether this broker's per-position Day P&L is its own native field
+            # (so the row can be labelled authoritative rather than derived).
+            day_src = (
+                "broker_native"
+                if capabilities_for(acct.broker).authoritative_position_day_pnl
+                else None
+            )
             prev_close_fn = getattr(adapter, "get_stock_prev_close", None)
             # Display path: let concurrent readers share one broker call.
             # Webull rejects simultaneous position reads with 429, and this
@@ -151,6 +159,10 @@ def list_positions(
                     market_value=p.market_value,
                     unrealized_pnl=p.unrealized_pnl,
                     cost_basis=p.cost_basis,
+                    open_pnl_pct=p.open_pnl_pct,
+                    day_pnl=p.day_pnl,
+                    day_pnl_pct=p.day_pnl_pct,
+                    day_pnl_source=(day_src if p.day_pnl is not None else None),
                     reference_price=ref,
                     option_expiry=p.option_expiry,
                     option_strike=p.option_strike,
@@ -468,13 +480,23 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
     "Most recent" matters: re-entering the same contract from a different
     channel should show the channel that opened the position you are holding
     NOW, not the first one that ever traded it.
+
+    Self on top of another channel reads "<Channel>-Self" (e.g. "Clint-Self"):
+    the trader added by hand to a position a channel opened, and both are in
+    it. Only entries of the CURRENT holding count — from the order that opened
+    the contract's live exit ladder on — so a Clint trade on an earlier, closed
+    holding of the same contract is never glued onto a fresh Self one. With no
+    live ladder there is no way to tell holdings apart, and the most recent
+    entry's channel is shown as before.
     """
     if not positions:
         return
     from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
     from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
     from app.models.order import Order, OrderSide, OrderStatus  # noqa: PLC0415
     from sqlalchemy import func  # noqa: PLC0415
+    from app.api.discord_sources import _SELF_CHANNEL_ID  # noqa: PLC0415
 
     for p in positions:
         p.discord_channel = None
@@ -482,11 +504,13 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
     if not symbols:
         return
 
+    placed_at = func.coalesce(Order.submitted_at, Order.created_at)
     rows = db.execute(
         select(
             Order.symbol, Order.instrument_type, Order.option_expiry,
             Order.option_strike, Order.option_right,
             DiscordAlertSource.label, DiscordAlertSource.channel_name,
+            DiscordAlertSource.channel_id, placed_at,
         )
         .join(DiscordMessage, DiscordMessage.order_id == Order.id)
         .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id,
@@ -499,24 +523,56 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
         )
         # Newest first, so the first row seen per contract is the one that wins.
-        .order_by(func.coalesce(Order.submitted_at, Order.created_at).desc())
+        .order_by(placed_at.desc())
     ).all()
 
-    by_contract: dict = {}
-    for sym, itype, expiry, strike, right, label, channel_name in rows:
-        key = ((sym or "").upper(), itype, expiry, strike, right)
-        if key in by_contract:
-            continue                      # an older entry for the same contract
+    # Where each contract's current holding began: the order that opened its
+    # live ladder, else the ladder's own creation.
+    holding_start: dict = {}
+    for g_sym, g_strike, g_right, g_expiry, g_created, entry_at in db.execute(
+        select(
+            DiscordPositionGuard.symbol, DiscordPositionGuard.option_strike,
+            DiscordPositionGuard.option_right, DiscordPositionGuard.option_expiry,
+            DiscordPositionGuard.created_at,
+            func.coalesce(Order.submitted_at, Order.created_at),
+        )
+        .join(Order, Order.id == DiscordPositionGuard.entry_order_id, isouter=True)
+        .where(
+            DiscordPositionGuard.user_id == user_id,
+            DiscordPositionGuard.closed_at.is_(None),
+            DiscordPositionGuard.symbol.in_(symbols),
+        )
+    ).all():
+        right = getattr(g_right, "value", g_right) or None
+        holding_start[((g_sym or "").upper(), g_strike, right, g_expiry)] = entry_at or g_created
+
+    # contract -> [(name, is_self, placed_at)], newest first
+    entries: dict = {}
+    for sym, itype, expiry, strike, right, label, channel_name, channel_id, at in rows:
         name = (label or "").strip() or (channel_name or "").strip()
-        if name:
-            by_contract[key] = name
+        if not name:
+            continue
+        key = ((sym or "").upper(), itype, expiry, strike, right)
+        entries.setdefault(key, []).append((name, channel_id == _SELF_CHANNEL_ID, at))
 
     for p in positions:
+        right = getattr(p.option_right, "value", p.option_right) or None
         key = (
             (p.symbol or "").upper(), p.instrument_type,
             p.option_expiry, p.option_strike, p.option_right,
         )
-        p.discord_channel = by_contract.get(key)
+        found = entries.get(key)
+        if not found:
+            continue
+        p.discord_channel = found[0][0]
+        start = holding_start.get(((p.symbol or "").upper(), p.option_strike, right, p.option_expiry))
+        if start is None:
+            continue
+        current = [e for e in found if e[2] is not None and e[2] >= start]
+        others = [e for e in current if not e[1]]
+        if others and any(e[1] for e in current):
+            # The channel that opened the holding: the oldest non-Self entry.
+            p.discord_channel = f"{others[-1][0]}-Self"
 
 
 def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
@@ -1156,7 +1212,12 @@ async def close_all_subscribers_positions(
     ``_BULK_EXIT_BROKER_TIMEOUT_S``. Each close publishes an
     ``order.placed`` SSE event so the relevant subscriber's UI
     refreshes on its own.
+
+    Not for a Discord trader: their subscribers trade independently
+    (copy_engine.trades_independently).
     """
+    if copy_engine.trades_independently(user):
+        raise HTTPException(409, "Your subscribers trade your Discord channels on their own settings — their orders and positions are theirs, not yours to act on.")
     sub_ids = list(db.execute(
         select(SubscriberSettings.user_id).where(
             SubscriberSettings.following_trader_id == user.id

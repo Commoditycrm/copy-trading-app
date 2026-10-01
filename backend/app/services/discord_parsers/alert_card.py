@@ -13,6 +13,17 @@ Observed live in a real feed:
     desc   Sold 1 @ $23.05 · +$705 · +44%
            Position closed · total +$1,815 · +38%
 
+A second, terser house style (JPM / ALTORI) puts only the ACTION in the title
+and the whole contract on one description line:
+
+    title  Open      desc  SPY 09/30 765P @.96
+    title  Update    desc  SPY 09/30 765P @1.11 (+15%)
+    title  Close     desc  SPY 09/30 765P @.83
+
+Read by contract alone, all three looked like the same buy — so an "Update"
+added to the position instead of trimming it (live, 2026-09-30). The title is
+the action; it is read here before any looser parser gets the message.
+
 These carry EMPTY message content — everything is in the embed. A parser reading
 only ``content`` would reject every alert in the feed, which is why this one
 works off the embed's title and description.
@@ -82,6 +93,25 @@ _NOTIONAL_RE = re.compile(rf"[·|]\s*\$\s*(?P<amt>{_NUM})(?!\s*%)")
 _POSITION_CLOSED_RE = re.compile(r"position\s+closed", re.IGNORECASE)
 _TOTAL_RE = re.compile(rf"total\s*(?P<sign>[+\-−])?\s*\$\s*(?P<amt>{_NUM})", re.IGNORECASE)
 
+# JPM-style card: the title is just the action...
+_SIMPLE_TITLE_RE = re.compile(r"^\s*(?P<action>open|update|close)\s*$", re.IGNORECASE)
+# ...and the description is "SYMBOL MM/DD STRIKE(C|P) @PRICE [(+N%)]".
+_SIMPLE_BODY_RE = re.compile(
+    r"^\s*\$?(?P<symbol>[A-Z][A-Z0-9.\-]{0,9})\s+"
+    r"(?P<expiry>[0-9]{1,2}/[0-9]{1,2}(?:/[0-9]{2,4})?)\s+"
+    r"\$?(?P<strike>\d+(?:\.\d+)?)\s*(?P<right>CALL|PUT|C|P)\b\s*"
+    r"@\s*\$?(?P<price>\d*\.?\d+)"
+    r"(?:\s*\(\s*(?P<pct>[+\-−]?\s*\d+(?:\.\d+)?)\s*%\s*\))?",
+    re.IGNORECASE,
+)
+# Open = a new position. Update = a trim at a gain (the channel's running
+# update IS its trim call). Close = exit what is left. Named after the card
+# actions above so everything downstream reads them the same way.
+_SIMPLE_ACTION = {"OPEN": "ENTERING", "UPDATE": "TRIMMING", "CLOSE": "CLOSING"}
+# No size on these cards: an entry is one contract (scaled by the trader's
+# multiplier, like compact alerts); an exit is sized from the position held.
+_SIMPLE_ENTRY_QTY = Decimal(1)
+
 _OPENING = {"ENTERING", "ADDING"}
 _CLOSING = {"TRIMMING", "CLOSING"}
 
@@ -95,9 +125,14 @@ class AlertCardParser(Parser):
     def matches(self, message: ParsedMessage) -> bool:
         return any(
             _TITLE_RE.match(t) or _TITLE_STOCK_RE.match(t) for t in self._titles(message)
-        )
+        ) or any(_simple_card(e) for e in (message.embeds or []))
 
     def parse(self, message: ParsedMessage) -> ParseResult:
+        for embed in message.embeds or []:
+            simple = _simple_card(embed)
+            if simple is not None:
+                return self._parse_simple(message, *simple)
+
         for embed in message.embeds or []:
             title = (embed.get("title") or "").strip()
             m = _TITLE_RE.match(title)
@@ -182,6 +217,59 @@ class AlertCardParser(Parser):
             return ParseResult.parsed(signal)
 
         return ParseResult.ignored("no alert card in this message")
+
+
+    def _parse_simple(self, message: ParsedMessage, title_m, body_m) -> ParseResult:
+        """A JPM-style card: action in the title, contract in the description."""
+        source_action = _SIMPLE_ACTION[title_m.group("action").upper()]
+        strike = to_decimal(body_m.group("strike"))
+        if strike is None or strike <= 0:
+            return ParseResult.invalid("couldn't read the strike from the card")
+        expiry, exp_err = parse_expiry(body_m.group("expiry"), posted_at=message.posted_at)
+        if exp_err:
+            return ParseResult.invalid(exp_err)
+        price = to_decimal(body_m.group("price"))
+        opening = source_action in _OPENING
+        right = body_m.group("right").upper()
+        signal = TradeSignal(
+            action=SignalAction.BUY if opening else SignalAction.SELL,
+            asset_type=AssetType.OPTION,
+            symbol=body_m.group("symbol").upper(),
+            option_type=OptionType.CALL if right.startswith("C") else OptionType.PUT,
+            strike=strike,
+            expiration=expiry,
+            # Exits are sized from the position the trader holds, not the card.
+            quantity=_SIMPLE_ENTRY_QTY if opening else None,
+            # Exits go to market — see compact_alert. A limit sell can sit
+            # unfilled while the position moves against you.
+            order_type=OrderKind.LIMIT if opening else OrderKind.MARKET,
+            limit_price_unspecified=price is None,
+            limit_price=price,
+            source_action=source_action,
+            parser=self.name,
+        )
+        if source_action == "TRIMMING":
+            signal.is_partial_close = True
+        elif source_action == "CLOSING":
+            signal.position_closed = True
+            # JPM's Close means out — all of it, not the ladder's next rung.
+            signal.flatten = True
+        pct = body_m.group("pct")
+        if pct:
+            sign = "-" if pct.strip()[0] in "-−" else "+"
+            signal.pnl_percent = _signed(sign, pct.strip().lstrip("+-−").strip())
+        return ParseResult.parsed(signal)
+
+
+def _simple_card(embed: dict):
+    """(title match, body match) for a JPM-style card, or None."""
+    title_m = _SIMPLE_TITLE_RE.match((embed.get("title") or "").strip())
+    if not title_m:
+        return None
+    body_m = _SIMPLE_BODY_RE.match((embed.get("description") or "").strip())
+    if not body_m:
+        return None
+    return title_m, body_m
 
 
 def _fields_text(embed: dict) -> str:

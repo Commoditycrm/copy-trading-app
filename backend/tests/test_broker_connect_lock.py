@@ -154,12 +154,12 @@ class _Recorder:
             "adapter_for": brokers_api.adapter_for,
             "_refresh_balance_into": brokers_api._refresh_balance_into,
             "_lock_user_brokers": brokers_api._lock_user_brokers,
-            "_evict_existing_brokers": brokers_api._evict_existing_brokers,
+            "_deactivate_other_brokers": brokers_api._deactivate_other_brokers,
             "cache_invalidate": brokers_api.cache.invalidate_broker_accounts,
             "stop_listener": brokers_api.listeners.stop_listener,
         }
         calls, verify = self.calls, self._verify
-        real_evict = self._saved["_evict_existing_brokers"]
+        real_evict = self._saved["_deactivate_other_brokers"]
 
         class _Adapter:
             def verify_connection(self):
@@ -169,14 +169,14 @@ class _Recorder:
         def _lock(db, user_id):
             calls.append("lock")
 
-        def _evict(db, user, request):
+        def _evict(db, user, request, **kw):
             calls.append("evict")
-            return real_evict(db, user, request)
+            return real_evict(db, user, request, **kw)
 
         brokers_api.adapter_for = lambda acct, creds: _Adapter()
         brokers_api._refresh_balance_into = lambda acct, creds: None
         brokers_api._lock_user_brokers = _lock
-        brokers_api._evict_existing_brokers = _evict
+        brokers_api._deactivate_other_brokers = _evict
         brokers_api.cache.invalidate_broker_accounts = lambda uid: None
         brokers_api.listeners.stop_listener = lambda uid: None
         return self
@@ -231,7 +231,11 @@ def test_sequential_connects_never_leave_two_accounts():
     rows = list(db.execute(
         select(BrokerAccount).where(BrokerAccount.user_id == _USER)
     ).scalars())
-    assert len(rows) == 1 and rows[0].id == ids[-1]   # last writer wins
+    # Same broker account each time, so the row is refreshed, not duplicated —
+    # and in any case only ONE may be connected (the copy engine mirrors once
+    # per connected row).
+    assert len(rows) == 1 and rows[0].id == ids[-1]
+    assert [r.connection_status for r in rows] == ["connected"]
 
 
 def test_lock_helper_no_ops_off_postgres():
