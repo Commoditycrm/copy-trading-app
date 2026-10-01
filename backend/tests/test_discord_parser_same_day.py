@@ -57,3 +57,18 @@ def test_today_without_a_timestamp_is_refused():
 
 def test_no_expiry_at_all_is_still_refused():
     assert _parse("BTO SPY 767 Calls @1.46").status is ParseStatus.INVALID
+
+
+def test_an_entry_with_no_stated_size_is_one_contract():
+    """QA 2026-10-01: refused at execution as "The alert states no quantity"."""
+    s = _parse("BTO SPY 770 Calls Today Expiry @1.38 filled").signals[0]
+    assert str(s.quantity) == "1"
+
+
+def test_a_stated_size_is_kept():
+    assert str(_parse("BTO 3 SPY 770 Calls Today Expiry @1.38").signals[0].quantity) == "3"
+
+
+def test_an_exit_stays_sized_from_the_position():
+    s = _parse("STC SPY 770 Calls Today Expiry @1.60").signals[0]
+    assert s.action.value == "SELL" and s.quantity is None
