@@ -668,41 +668,54 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }, []);
 
-    // Lightweight Day's P&L refetch — ONE broker call (GET /account), the same
-    // broker-aware resolver the Calendar's today cell uses. Used for the steady
-    // high-frequency poll and the focus/visibility/reconnect triggers so those
-    // don't drag the heavier full positions refresh every tick. A failed fetch
-    // keeps the last value (never a fake 0 / '--').
-    const refreshDayPnl = useCallback(async () => {
+    // Lightweight LIVE refetch for the steady poll + focus/visibility/reconnect
+    // triggers. Updates the financial fields that move intraday — the POSITION
+    // rows (day_pnl, day_pnl_pct, unrealized_pnl, open_pnl_pct, current_price,
+    // market_value, all straight from /api/positions) AND the account card
+    // (/api/positions/day-pnl) — WITHOUT the heavier /api/trades + /api/brokers
+    // calls the full refresh() makes. Broker cost is the same one coalesced
+    // get_positions the display already uses, plus the one-call account snapshot.
+    // Row UI state (close %, search, menus, expanded) lives in separate keyed
+    // state, so replacing the positions array leaves it intact — no page reset.
+    // reqSeq-guarded against the full refresh() so neither clobbers the other;
+    // a transient failure keeps the last values rather than blanking the table.
+    const refreshLive = useCallback(async () => {
+      const seq = ++reqSeq.current;
       try {
-        const d = await api<{ day_pnl: number | null }>("/api/positions/day-pnl");
-        setDayPnl(d.day_pnl);
-      } catch { /* keep last known value */ }
+        const [payload, dpnl] = await Promise.all([
+          api<PositionsPayload>("/api/positions?detail=1"),
+          api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null),
+        ]);
+        if (seq !== reqSeq.current) return;
+        setPositions(payload.positions ?? []);
+        setUnreachable(payload.unreachable ?? []);
+        if (dpnl) setDayPnl(dpnl.day_pnl);
+      } catch { /* keep last known values — a hiccup must not blank the table */ }
     }, []);
 
     useEffect(() => { refresh(); }, [refresh]);
 
-    // Steady Day's P&L cadence at the broker-chosen interval (Alpaca 10s, Webull
-    // 30s — `pollMs`), VISIBLE tabs only; plus an immediate refetch on focus,
-    // reconnect (online) and the tab becoming visible. A hidden tab doesn't poll
-    // (the interval is gated and the browser throttles it anyway); on return to
-    // visible it refetches at once, then resumes the interval. Full positions
-    // refresh stays event-driven (mount + SSE) — this only keeps the card fresh.
+    // Steady LIVE cadence at the broker-chosen interval (Alpaca 10s, Webull 30s —
+    // `pollMs`), VISIBLE tabs only; plus an immediate refetch on focus, reconnect
+    // (online) and the tab becoming visible. A hidden tab doesn't poll (gated +
+    // the browser throttles it); on return to visible it refetches at once, then
+    // resumes. This keeps BOTH the position-row Day P&L and the account card
+    // live; the full refresh() (with orders) stays event-driven (mount + SSE).
     useEffect(() => {
       const id = setInterval(() => {
-        if (document.visibilityState === "visible") refreshDayPnl();
+        if (document.visibilityState === "visible") refreshLive();
       }, pollMs);
-      const onVisible = () => { if (document.visibilityState === "visible") refreshDayPnl(); };
-      window.addEventListener("focus", refreshDayPnl);
-      window.addEventListener("online", refreshDayPnl);
+      const onVisible = () => { if (document.visibilityState === "visible") refreshLive(); };
+      window.addEventListener("focus", refreshLive);
+      window.addEventListener("online", refreshLive);
       document.addEventListener("visibilitychange", onVisible);
       return () => {
         clearInterval(id);
-        window.removeEventListener("focus", refreshDayPnl);
-        window.removeEventListener("online", refreshDayPnl);
+        window.removeEventListener("focus", refreshLive);
+        window.removeEventListener("online", refreshLive);
         document.removeEventListener("visibilitychange", onVisible);
       };
-    }, [pollMs, refreshDayPnl]);
+    }, [pollMs, refreshLive]);
 
     useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
