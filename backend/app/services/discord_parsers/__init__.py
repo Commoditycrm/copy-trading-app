@@ -48,7 +48,12 @@ log = logging.getLogger(__name__)
 # Word-bounded on purpose. A bare "light" must not fire on "lighten", which is
 # the opposite instruction (trim a position), nor on "delight" or "flashlight".
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
-_HALF_SIZE_RE = re.compile(r"\bnot[\s-]+heavy\b|\blight\b", re.IGNORECASE)
+# Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
+# "small(er) size" and "half size".
+_HALF_SIZE_RE = re.compile(
+    r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b",
+    re.IGNORECASE,
+)
 
 
 def _is_half_size(text: str) -> bool:

@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 
 from ._util import parse_expiry, to_decimal
-from .compact_alert import DEFAULT_QUANTITY
+from .compact_alert import DEFAULT_QUANTITY, _next_trading_day
 from .base import (
     AssetType,
     OptionType,
@@ -63,6 +63,14 @@ _SAME_DAY_RE = re.compile(
     r"EXP(?:IRY|IRING|IRES)?\s+TODAY)\b",
     re.IGNORECASE,
 )
+# Next-day expiry in words: "Tomorrow Expiry" and its common misspellings
+# ("Tommorow", "Tomorow", "Tommorrow"), "tmrw", "1DTE". Resolved to the next
+# trading day after the alert's ET posting date (weekends skipped).
+_NEXT_DAY_RE = re.compile(
+    r"\b(?:1DTE|TMRW|TOM+OR+OW(?:'?S)?(?:\s+EXP(?:IRY|IRATION|IRING|IRES)?)?|"
+    r"EXP(?:IRY|IRING|IRES)?\s+TOM+OR+OW)\b",
+    re.IGNORECASE,
+)
 _PRICE_RE = re.compile(r"@\s*\$?(?P<price>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)")
 _QTY_RE = re.compile(r"\b(?:X\s*)?(?P<qty>\d{1,5})\s*(?:CONTRACTS?|SHARES?|LOTS?)\b", re.IGNORECASE)
 _ACTION_QTY_RE = re.compile(rf"\b(?:{_BUY_WORDS}|{_SELL_WORDS})\s+(?P<qty>\d{{1,5}})\b", re.IGNORECASE)
@@ -76,7 +84,7 @@ _NOT_TICKERS = {
     "LONG", "SHORT", "CLOSE", "CLOSED", "CLOSING", "EXIT", "TRIM", "ADD", "ENTER", "LOTS",
     "CONTRACTS", "SHARES", "OPEN", "TP", "SL", "RISKY", "LOTTO", "SWING", "DAY",
     "TRIMMING", "TRIMMED", "CLOSING", "ENTERING", "ENTERED", "ADDING", "ADDED",
-    "TODAY", "FILLED", "ODTE",
+    "TODAY", "FILLED", "ODTE", "TOMORROW", "TOMMOROW", "TOMOROW", "TOMMORROW", "TMRW",
     "HERE", "MORE", "AGAIN", "BACK", "SOON", "JUST", "ANOTHER",
     "SOON", "NOW", "HERE", "OUT", "IN", "ALL", "SOME", "MORE", "AT", "TO", "THE",
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT", "OCT", "NOV", "DEC",
@@ -182,6 +190,10 @@ class GenericTextParser(Parser):
             if message.posted_at is None:
                 return ParseResult.invalid("the alert says today's expiry but has no timestamp")
             expiry = _et_date(message.posted_at)
+        elif _NEXT_DAY_RE.search(text):
+            if message.posted_at is None:
+                return ParseResult.invalid("the alert says tomorrow's expiry but has no timestamp")
+            expiry = _next_trading_day(_et_date(message.posted_at))
         else:
             return ParseResult.invalid("the alert has no expiry")
 
