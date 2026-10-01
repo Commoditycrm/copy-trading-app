@@ -183,6 +183,9 @@ export interface Order {
   /** Realized P&L this closing order produced (FIFO). Null for opening orders
    *  or anything that realized nothing. Decimal as string. */
   realized_pnl?: string | null;
+  /** True for a sell-to-close / buy-to-close: an order that took contracts or
+   *  shares OFF a position (exits, trims, closes). */
+  is_closing?: boolean;
   /** True when this order was placed by a Sell-All Re-Enter (from a snapshot). */
   is_reentry?: boolean;
   /** Discord channel whose alert placed this order. Null for everything

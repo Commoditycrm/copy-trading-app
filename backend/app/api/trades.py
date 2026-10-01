@@ -191,6 +191,10 @@ def list_trades(
     user: User = Depends(current_user),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
+    # Orders that FILLED on/after this ET date, whenever they were placed — a
+    # take-profit left working overnight that fills today counts as today's.
+    # The Positions page's "Closed today" table uses it; `from` goes by placement.
+    filled_from: date | None = Query(default=None),
     limit: int = Query(default=200, le=1000),
 ) -> list[Order]:
     q = (
@@ -210,6 +214,11 @@ def list_trades(
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+    if filled_from:
+        q = q.where(
+            func.coalesce(Order.broker_filled_at, Order.closed_at)
+            >= datetime.combine(filled_from, datetime.min.time(), tzinfo=_ET)
+        )
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
     _attach_reentry_flag(db, user, orders)
