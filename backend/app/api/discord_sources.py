@@ -1879,6 +1879,10 @@ def _execute_signal(
     if discord_execution.already_executed(msg):
         return  # one alert, one order
 
+    if (msg.parsed_signal or {}).get("close_all_matching"):
+        _close_all_from_channel(db, user, msg, background, request)
+        return
+
     from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
 
     ts_for_sizing = db.get(TraderSettings, user.id)
@@ -2173,6 +2177,60 @@ def _execute_signal(
         user.id,
         {"type": "discord.order_placed", "message_id": str(msg.id), "order_id": str(order.id)},
     )
+
+
+def _close_all_from_channel(
+    db: Session, user: User, msg: DiscordMessage, background: BackgroundTasks,
+    request: Request,
+) -> None:
+    """"Stopped out of rest of SPY calls": close, in full and at market, every
+    matching contract this channel opened that is still held.
+
+    Each contract goes through the ordinary full-close path (_execute_signal
+    with flatten), so ladders retire, paper mode stays paper and subscribers
+    behave exactly as for any close. One alert normally means one order; here
+    the alert keeps the first order and a line per contract.
+    """
+    sig = dict(msg.parsed_signal or {})
+    what = f"{sig.get('symbol')} {(sig.get('option_type') or '').lower() + 's' if sig.get('option_type') else 'options'}"
+    try:
+        contracts = discord_execution.channel_held_contracts(
+            db, user, msg.source_id, sig.get("symbol") or "",
+            option_type=sig.get("option_type"),
+            strike=discord_execution._dec(sig.get("strike")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        discord_execution.mark_failed(msg, f"Couldn't look up this channel's positions: {exc}")
+        log.exception("discord: stop-out lookup failed for alert %s", msg.id)
+        return
+    if not contracts:
+        discord_execution.mark_failed(msg, f"Stopped out — you hold no {what} opened from this channel.")
+        return
+
+    original = msg.parsed_signal
+    lines: list[str] = []
+    first_order = None
+    try:
+        for c in contracts:
+            msg.parsed_signal = {**sig, **c, "close_all_matching": False,
+                                 "flatten": True, "position_closed": True,
+                                 "contract_unspecified": False, "expiry_unspecified": False}
+            msg.order_id = None
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = None
+            _execute_signal(db, user, msg, background, request)
+            label = f"{c['symbol']} {c['strike']}{c['option_type'][0].upper()} {c['expiration']}"
+            if msg.order_id is not None:
+                first_order = first_order or msg.order_id
+                lines.append(f"{label}: closed")
+            else:
+                lines.append(f"{label}: {msg.status_reason or 'not closed'}")
+    finally:
+        msg.parsed_signal = original
+    msg.order_id = first_order
+    msg.status = (DiscordMessageStatus.ORDER_CREATED if first_order is not None
+                  else DiscordMessageStatus.ORDER_FAILED)
+    msg.status_reason = ("Stopped out — " + "; ".join(lines))[:480]
 
 
 @router.post("/signals/{message_id}/decision", response_model=DiscordDecisionOut)
