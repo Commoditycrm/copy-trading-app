@@ -425,6 +425,52 @@ def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
     return None
 
 
+def channel_held_contracts(db: Session, user: User, source_id, symbol: str,
+                           option_type: str | None = None,
+                           strike: Decimal | None = None) -> list[dict]:
+    """Every contract THIS channel bought, matching ``symbol`` (and call/put and
+    strike when given), that the broker still reports held — for "Stopped out
+    of rest of SPY calls". Only this channel's own positions: a matching
+    contract opened by hand or from another channel is left alone.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderSide  # noqa: PLC0415
+
+    right = _right(option_type) if option_type else None
+    orders = db.execute(
+        select(Order).join(DiscordMessage, DiscordMessage.order_id == Order.id).where(
+            DiscordMessage.source_id == source_id,
+            Order.user_id == user.id,
+            Order.side == OrderSide.BUY,
+            Order.symbol == symbol.upper(),
+        ).order_by(Order.created_at.desc()).limit(200)
+    ).scalars().all()
+    wanted = {
+        (o.option_strike, o.option_right, o.option_expiry) for o in orders
+        if o.option_strike is not None
+        and (right is None or o.option_right == right)
+        and (strike is None or o.option_strike == strike)
+    }
+    if not wanted:
+        return []
+    acct = _broker_account(db, user)
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    out = []
+    for p in _positions(adapter, symbol):
+        key = (p.option_strike, p.option_right, p.option_expiry)
+        if key in wanted and (p.quantity or 0) > 0:
+            out.append({
+                "symbol": symbol.upper(),
+                "strike": str(p.option_strike),
+                "option_type": p.option_right.value,
+                "expiration": p.option_expiry.isoformat(),
+            })
+            wanted.discard(key)
+    return out
+
+
 def _resolve_contract(signal: dict, positions: list, resolutions: dict):
     """Pin down strike / right / expiry, filling gaps from the open position."""
     strike = _dec(signal.get("strike"))

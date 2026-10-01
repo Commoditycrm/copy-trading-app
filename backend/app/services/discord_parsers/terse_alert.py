@@ -56,6 +56,12 @@ _ADD_RE = re.compile(r"^\s*add(?:ing)?\s+@?\s*\$?(?P<price>\d*\.\d+|\d+(?:\.\d+)
 _TRIM_RE = re.compile(r"\btrim(?:med|ming|s)?\b", re.IGNORECASE)
 # "Average down on SPY @.80" / "averaging down $SPY 0.80" / "avg down SPY .8":
 # double the ONE open position in that symbol. The price is required.
+# "Stopped out of rest of SPY calls" / "stopped out on $SPY puts" / "Stopped
+# out SPY": the author is fully out — close everything matching from this
+# channel. The ticker must be written as one (capitals or $).
+_STOPPED_RE = re.compile(r"\bstopped\s+out\b", re.IGNORECASE)
+_STOP_TICKER_RE = re.compile(r"(?<![A-Za-z0-9])\$?(?P<sym>[A-Z]{1,5})(?![A-Za-z0-9])")
+_RIGHT_WORD_RE = re.compile(r"\b(?P<right>calls?|puts?)\b", re.IGNORECASE)
 _AVG_DOWN_RE = re.compile(
     # The ticker as tickers are written — capitals or $ — so "I might average
     # down later" is chatter, not an order for LATER.
@@ -82,7 +88,7 @@ class TerseAlertParser(Parser):
         text = _clean(message.content)
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
-            or _AVG_DOWN_RE.search(text)
+            or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -90,6 +96,9 @@ class TerseAlertParser(Parser):
 
         # Trim first: "what an add trim ... AMZN 25%" is an exit, whatever
         # else the sentence says.
+        if _STOPPED_RE.search(text):
+            return self._stopped_out(text)
+
         if _TRIM_RE.search(text):
             return self._trim(text)
 
@@ -141,6 +150,40 @@ class TerseAlertParser(Parser):
             ))
 
         return ParseResult.ignored("not a terse alert")
+
+    def _stopped_out(self, text: str) -> ParseResult:
+        """The author was stopped out: close every matching position this
+        channel opened, at market. Execution finds them; none held = refused."""
+        glued = _GLUED_RE.search(text)
+        tickers = {m.group("sym") for m in _STOP_TICKER_RE.finditer(text)
+                   if m.group("sym") not in _NOT_TICKERS}
+        if glued:
+            tickers = {glued.group("sym")}
+        if len(tickers) != 1:
+            return ParseResult.invalid(
+                "a stop-out that doesn't name exactly one ticker — nothing to close"
+            )
+        right_m = _RIGHT_WORD_RE.search(text)
+        right = (glued.group("right") if glued else
+                 (right_m.group("right")[0].upper() if right_m else None))
+        return ParseResult.parsed(TradeSignal(
+            action=SignalAction.SELL,
+            asset_type=AssetType.OPTION,
+            symbol=tickers.pop(),
+            option_type=(None if right is None else
+                         OptionType.CALL if right == "C" else OptionType.PUT),
+            strike=to_decimal(glued.group("strike")) if glued else None,
+            quantity=None,                  # everything held
+            order_type=OrderKind.MARKET,
+            limit_price_unspecified=True,
+            position_closed=True,
+            flatten=True,
+            close_all_matching=True,
+            expiry_unspecified=True,
+            contract_unspecified=True,
+            source_action="STOPPED_OUT",
+            parser=self.name,
+        ))
 
     def _average_down(self, text: str, m: re.Match) -> ParseResult:
         """Double the one open position in the named symbol, at the stated price.

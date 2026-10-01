@@ -130,6 +130,10 @@ class TradeSignal:
     # Opt-in per parser: execution buys the NEAREST listed expiry when set, and
     # refuses (as before) when not.
     nearest_expiry: bool = False
+    # "Stopped out of rest of SPY calls": close EVERY contract matching the
+    # symbol (and call/put, when named) that this channel opened and is still
+    # held — at market, in full. Several contracts are expected, not refused.
+    close_all_matching: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -177,6 +181,7 @@ class TradeSignal:
             "flatten": self.flatten,
             "add_to_latest": self.add_to_latest,
             "nearest_expiry": self.nearest_expiry,
+            "close_all_matching": self.close_all_matching,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,
