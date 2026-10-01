@@ -32,6 +32,39 @@ function fmtNum(n: string | null | undefined, dp = 2): string {
  *  ticker for stocks / the OCC for options (both streamed now), or null when
  *  unbuildable — then it falls through to the fallback. Own component so the
  *  hook stays out of the row's .map(). */
+/** The row's Limit box. Until the trader types in it, it shows — and follows —
+ *  the same live price as the Current price column, so a Close / Avg. at limit
+ *  starts from where the contract is trading. Once they edit it their value
+ *  sticks; ``onDefault`` hands the shown price to the buttons. */
+function LimitPriceInput({
+  symbol, fallback, value, onChange, onDefault, ariaLabel, className, style,
+}: {
+  symbol: string | null;
+  fallback: string | null;
+  value: string | undefined;
+  onChange: (v: string) => void;
+  onDefault: (v: string) => void;
+  ariaLabel: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  const live = useLivePrice(symbol, fallback);
+  const px = live == null ? Number(fallback) : Number(live);
+  const shown = Number.isFinite(px) && px > 0 ? px.toFixed(2) : "";
+  useEffect(() => { onDefault(shown); }, [shown]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <input
+      type="number" step="0.01" min="0.01"
+      placeholder="Limit"
+      aria-label={ariaLabel}
+      value={value ?? shown}
+      onChange={(e) => onChange(e.target.value)}
+      className={className}
+      style={style}
+    />
+  );
+}
+
 function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fallback: string | null }) {
   const live = useLivePrice(symbol, fallback);
   return <td className="px-5 py-3.5 num">{fmtNum(live == null ? fallback : String(live), 2)}</td>;
@@ -435,9 +468,22 @@ function optionExpiryShort(isoDate: string): string {
   return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
+/** The direction of the bet, not of the holding: a put you BOUGHT (or a call
+ *  you sold) gains when the price falls, so it reads "Short"; a call you bought
+ *  (or a put you sold) reads "Long". Stocks: the sign of the quantity. */
+function positionDirection(
+  p: Pick<Position, "quantity" | "instrument_type" | "option_right">,
+): "long" | "short" {
+  const holds = Number(p.quantity) > 0;
+  const bearishContract = p.instrument_type === "option" && p.option_right === "put";
+  return holds !== bearishContract ? "long" : "short";
+}
+
 /** Full descriptor shown in the Symbol column, Webull style:
  *  stock  → "META";  option → "META C $372 10 Jul 26". */
-function positionSymbolLabel(p: Position): string {
+export function positionSymbolLabel(
+  p: Pick<Position, "symbol" | "instrument_type" | "option_right" | "option_strike" | "option_expiry">,
+): string {
   if (p.instrument_type !== "option") return p.symbol.toUpperCase();
   const cp = p.option_right === "call" ? "C" : p.option_right === "put" ? "P" : "";
   const strike = p.option_strike != null && p.option_strike !== ""
@@ -594,6 +640,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+    // The live price each row's Limit box shows while the trader hasn't typed
+    // in it (LimitPriceInput). A ref: it follows every tick without re-rendering.
+    const limitDefaults = useRef<Record<string, string>>({});
+    const limitFor = (key: string) => closeLimitPrices[key] ?? limitDefaults.current[key] ?? "";
+    // Back to following the live price (after an order went out).
+    const resetLimit = (key: string) =>
+      setCloseLimitPrices((s) => { const n = { ...s }; delete n[key]; return n; });
     // Positions whose stop row (down arrow in Actions) is open.
     const [expanded, setExpanded] = useState<Record<string, boolean>>({});
     // Per row, what each split button does: close the position, or average
@@ -782,7 +835,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     async function closePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
       if (type === "limit") {
-        const price = closeLimitPrices[key];
+        const price = limitFor(key);
         if (!price || Number(price) <= 0) {
           notify.warn("Enter a limit price");
           return;
@@ -798,13 +851,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       try {
         const body: Record<string, unknown> = { order_type: type };
         if (pct < 100) body.quantity = String(qty);   // 100% lets the backend default to full size
-        if (type === "limit") body.limit_price = closeLimitPrices[key];
+        if (type === "limit") body.limit_price = limitFor(key);
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
         notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} ×${qty} (${type})`);
-        if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+        if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
         notify.fromError(e, "close failed");
@@ -838,7 +891,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     async function averagePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
       if (type === "limit") {
-        const price = closeLimitPrices[key];
+        const price = limitFor(key);
         if (!price || Number(price) <= 0) {
           notify.warn("Enter a limit price");
           return;
@@ -851,18 +904,18 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         notify.warn(`Can't average ${pct}% of this position — would round to zero.`);
         return;
       }
-      const at = type === "limit" ? `at ${closeLimitPrices[key]}` : "at market";
+      const at = type === "limit" ? `at ${limitFor(key)}` : "at market";
       if (!confirm(`Average into ${p.symbol.toUpperCase()}: BUY ${qty} more ${at} (${pct}% of what you hold)?`)) return;
       setClosing({ key, kind: type });
       try {
         const body: Record<string, unknown> = { order_type: type, quantity: String(qty) };
-        if (type === "limit") body.limit_price = closeLimitPrices[key];
+        if (type === "limit") body.limit_price = limitFor(key);
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/average?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
         notify.success(`Average placed: BUY ${order.symbol} ×${qty} (${type})`);
-        if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+        if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
         notify.fromError(e, "average failed");
@@ -978,7 +1031,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       for (const p of visible) {
         mv += Number(p.market_value) || 0;
         pnl += Number(p.unrealized_pnl) || 0;
-        if (Number(p.quantity) >= 0) longs++; else shorts++;
+        if (positionDirection(p) === "long") longs++; else shorts++;
       }
       return { mv, pnl, longs, shorts, count: visible.length };
     }, [visible]);
@@ -1269,13 +1322,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       </td>
                     ),
                     qty: <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>,
-                    side: (
-                      <td className="px-5 py-3.5">
-                        <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
-                          {isLong ? "Long" : "Short"}
-                        </span>
-                      </td>
-                    ),
+                    side: (() => {
+                      const dirLong = positionDirection(p) === "long";
+                      return (
+                        <td className="px-5 py-3.5">
+                          <span
+                            className="chip uppercase font-semibold"
+                            style={{ background: dirLong ? "var(--good-soft)" : "var(--bad-soft)", color: dirLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}
+                            title={p.instrument_type === "option"
+                              ? `${isLong ? "Bought" : "Sold"} ${p.option_right === "put" ? "puts" : "calls"} — ${dirLong ? "gains if the price rises" : "gains if the price falls"}`
+                              : undefined}
+                          >
+                            {dirLong ? "Long" : "Short"}
+                          </span>
+                        </td>
+                      );
+                    })(),
                     close_pct: (
                       <td className="px-5 py-3.5">
                         <div className="flex gap-1">
@@ -1332,12 +1394,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             />
                           </div>
                           <div className="flex items-stretch">
-                            <input
-                              type="number" step="0.01" min="0.01"
-                              placeholder="Limit"
-                              aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
-                              value={closeLimitPrices[key] ?? ""}
-                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
+                            <LimitPriceInput
+                              symbol={liveSym}
+                              fallback={p.current_price}
+                              ariaLabel={`Limit price for ${p.symbol.toUpperCase()}`}
+                              value={closeLimitPrices[key]}
+                              onChange={v => setCloseLimitPrices(s => ({ ...s, [key]: v }))}
+                              onDefault={v => { limitDefaults.current[key] = v; }}
                               className="w-20 px-2 py-1 text-xs border"
                               style={{
                                 borderColor: "var(--border)",
@@ -1350,7 +1413,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               }}
                             />
                             <button
-                              disabled={inFlight || !closeLimitPrices[key]}
+                              disabled={inFlight || !(closeLimitPrices[key] ?? (p.current_price || ""))}
                               onClick={() => (lMode === "average" ? averagePosition(p, "limit") : closePosition(p, "limit"))}
                               className="btn-accent-solid px-2 py-1 text-xs font-medium inline-flex items-center justify-center gap-1"
                               style={{

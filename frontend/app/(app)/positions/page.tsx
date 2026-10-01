@@ -8,6 +8,7 @@ import { BulkExitBar } from "@/components/BulkExitBar";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { PageLoading } from "@/components/PageLoading";
 import { WebullUsage } from "@/components/WebullUsage";
+import { ClosedTodayTable } from "@/components/ClosedTodayTable";
 import type { User } from "@/lib/types";
 
 export default function PositionsPage() {
@@ -32,6 +33,10 @@ export default function PositionsPage() {
         {/* Requests going to Webull and what made them (hidden without Webull). */}
         <WebullUsage />
         <OpenPositionsTable ref={tableRef} fillHeight className="flex-1 min-h-0" />
+        {/* Today's exits — what came off a position today (no actions). */}
+        <div className="shrink-0 max-h-[40vh] overflow-y-auto">
+          <ClosedTodayTable />
+        </div>
       </div>
     </div>
   );

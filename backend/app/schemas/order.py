@@ -146,6 +146,9 @@ class OrderOut(BaseModel):
     # opening orders / anything that realized nothing. Populated by the trades
     # endpoints from pnl.realized_pnl_by_order; not a DB column.
     realized_pnl: Decimal | None = None
+    # A sell-to-close / buy-to-close — an order that took contracts or shares
+    # OFF a position (exits, trims, closes).
+    is_closing: bool = False
     # True when this order was placed by a Sell-All Re-Enter (from a snapshot).
     # Transient flag attached by trades.py; not a DB column.
     is_reentry: bool = False
