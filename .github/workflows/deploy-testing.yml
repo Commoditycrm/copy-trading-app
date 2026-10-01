@@ -43,6 +43,12 @@ jobs:
             PROJECT_DIR="$HOME/copy-trading-app"
             cd "$PROJECT_DIR"
 
+            # The QA-only discord-listener lives behind `profiles: [discord]`.
+            # Export the profile for every compose command so `up -d
+            # --remove-orphans` keeps it running instead of stopping it as an
+            # orphan each deploy (that's what took the Discord channels down).
+            export COMPOSE_PROFILES=discord
+
             echo "── git pull qa-branch ───────────────────────────────────"
             git fetch --prune origin qa-branch
             git reset --hard origin/qa-branch
@@ -52,7 +58,8 @@ jobs:
             # Build worker too — it shares ./backend but is a separate image;
             # omitting it leaves the worker on stale code after a deploy while
             # the DB migrates forward (schema/code drift, e.g. missing columns).
-            docker compose build backend worker frontend
+            # discord-listener is built explicitly so its image is fresh too.
+            docker compose build backend worker frontend discord-listener
 
             echo "── alembic upgrade head ─────────────────────────────────"
             docker compose run --rm backend alembic upgrade head
