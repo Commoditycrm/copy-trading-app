@@ -32,7 +32,7 @@ export default function PositionsPage() {
         <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
         {/* Requests going to Webull and what made them (hidden without Webull). */}
         <WebullUsage />
-        <OpenPositionsTable ref={tableRef} fillHeight className="flex-1 min-h-0" />
+        <OpenPositionsTable ref={tableRef} fillHeight statsInHeader className="flex-1 min-h-0" />
         {/* Today's exits — what came off a position today (no actions). */}
         <div className="shrink-0 max-h-[40vh] overflow-y-auto">
           <ClosedTodayTable />

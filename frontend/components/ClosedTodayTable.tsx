@@ -45,6 +45,11 @@ function timeEt(iso: string | null | undefined): string {
   return d.toLocaleTimeString("en-US", { timeZone: ET, hour: "numeric", minute: "2-digit", second: "2-digit" });
 }
 
+function fillMs(o: Order): number {
+  const t = Date.parse(o.broker_filled_at || o.closed_at || "");
+  return Number.isNaN(t) ? 0 : t;
+}
+
 function isClosedToday(o: Order): boolean {
   const traded = o.status === "filled" || o.status === "partially_filled";
   const closing = !!o.is_closing || (o.realized_pnl != null && o.realized_pnl !== "");
@@ -69,7 +74,8 @@ export function ClosedTodayTable() {
   const load = useCallback(async () => {
     try {
       const rows = await api<Order[]>(`/api/trades?filled_from=${todayEt()}&limit=500`);
-      setOrders(rows.filter(isClosedToday));
+      // Newest fill first (the API orders by placement time).
+      setOrders(rows.filter(isClosedToday).sort((a, b) => fillMs(b) - fillMs(a)));
     } catch {
       /* keep the last list — a blip must not blank it */
     }
