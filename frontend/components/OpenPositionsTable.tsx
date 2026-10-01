@@ -16,7 +16,7 @@ import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { BrokerAccount, Order, Position, PositionsPayload, UnreachableAccount, User } from "@/lib/types";
+import type { BrokerAccount, Order, Position, PositionsPayload, StaleAccount, UnreachableAccount, User } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -579,6 +579,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // hold nothing", which is exactly the wrong thing to tell someone whose
     // broker just failed to answer.
     const [unreachable, setUnreachable] = useState<UnreachableAccount[]>([]);
+    // Accounts listed from the last snapshot because the broker rate-limited
+    // the live read — shown, with their age, rather than left out.
+    const [stale, setStale] = useState<StaleAccount[]>([]);
     // Account-level broker Day's P&L for today (same value the Calendar shows).
     // null = broker exposes no live day figure → '--'. A genuine 0.00 stays 0.
     const [dayPnl, setDayPnl] = useState<number | null>(null);
@@ -643,6 +646,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         setPositions(pos);
         setOrders(ords);
         setUnreachable(down);
+        setStale(payload.stale ?? []);
         workingRef.current = ords.some((o) => WORKING_STATUSES.has(o.status));
         // dpnl.day_pnl may be a number, or null (broker exposes no live day
         // figure → '--'); a failed fetch (dpnl === null) keeps the last value.
@@ -689,6 +693,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         if (seq !== reqSeq.current) return;
         setPositions(payload.positions ?? []);
         setUnreachable(payload.unreachable ?? []);
+        setStale(payload.stale ?? []);
         if (dpnl) setDayPnl(dpnl.day_pnl);
       } catch { /* keep last known values — a hiccup must not blank the table */ }
     }, []);
@@ -1092,6 +1097,25 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   <span style={{ color: "var(--muted)" }}>
                     {" "}Positions from this account are not shown below.
                   </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {stale.length > 0 && (
+          <div
+            role="status"
+            className="mb-3 flex items-start gap-2 rounded-lg px-3 py-2 text-[12px]"
+            style={{ background: "var(--panel-2)", color: "var(--text-2)", border: "1px solid var(--border)" }}
+          >
+            <AlertTriangle size={14} style={{ color: "var(--muted)", flexShrink: 0, marginTop: 1 }} />
+            <div className="flex flex-col gap-0.5">
+              {stale.map((s) => (
+                <div key={s.broker_account_id}>
+                  <span style={{ fontWeight: 600, textTransform: "capitalize" }}>{s.label || s.broker}</span>
+                  {" — rate limited by the broker; showing positions from "}
+                  {s.age_s < 60 ? `${s.age_s}s` : `${Math.round(s.age_s / 60)} min`}
+                  {" ago. They refresh on their own."}
                 </div>
               ))}
             </div>

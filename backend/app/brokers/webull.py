@@ -50,6 +50,7 @@ import os
 import re
 import tempfile
 import threading
+import dataclasses
 import time
 import uuid
 from datetime import date, datetime, timezone
@@ -598,10 +599,134 @@ def _positions_lock_for(key: str) -> threading.Lock:
         return _positions_locks.setdefault(key, threading.Lock())
 
 
+# ── shared snapshot, across processes ──────────────────────────────────────
+# The cache above lives in ONE process. On QA/prod the positions page runs in
+# the web process while the P&L poller and the auto-trim sweep run in the
+# worker, so their reads could never be shared and the page kept losing the
+# race to Webull's limit ("Rate limited by the broker — retrying. Positions
+# from this account are not shown", QA 2026-10-01).
+#
+# Every successful live read — any path, any process — is also written to Redis.
+# A display read (and the auto-trim trigger check, which re-reads live before
+# acting) reuses one up to _SNAPSHOT_FRESH_S old instead of calling Webull. And
+# when Webull still says 429, the page shows the last snapshot (up to
+# _SNAPSHOT_KEEP_S old, marked with its age) rather than nothing.
+_SNAPSHOT_FRESH_S = 10.0
+_SNAPSHOT_KEEP_S = 300.0
+_SNAPSHOT_KEY = "webull:positions:{}"
+
+
+class StalePositions(list):
+    """Positions served from the shared snapshot because Webull rate-limited
+    the live read. ``stale_age_s`` says how old they are."""
+
+    stale_age_s: float = 0.0
+
+
+def _snapshot_id(app_key: str | None, account_id: str | None) -> str:
+    import hashlib  # noqa: PLC0415
+
+    # Hashed: the app key is a credential and has no business in a Redis key.
+    return hashlib.sha256(f"{app_key}:{account_id}".encode()).hexdigest()[:32]
+
+
+def _position_to_json(p) -> dict:
+    out = {}
+    for f in dataclasses.fields(p):
+        v = getattr(p, f.name)
+        if isinstance(v, Decimal):
+            v = str(v)
+        elif isinstance(v, date):
+            v = v.isoformat()
+        elif hasattr(v, "value"):          # InstrumentType / OptionRight
+            v = v.value
+        out[f.name] = v
+    return out
+
+
+def _position_from_json(d: dict) -> BrokerPosition:
+    from app.models.order import InstrumentType, OptionRight  # noqa: PLC0415
+
+    kw: dict[str, Any] = {}
+    for f in dataclasses.fields(BrokerPosition):
+        v = d.get(f.name)
+        if v is not None:
+            if f.name == "instrument_type":
+                v = InstrumentType(v)
+            elif f.name == "option_right":
+                v = OptionRight(v)
+            elif f.name == "option_expiry":
+                v = date.fromisoformat(v)
+            elif f.name not in ("broker_symbol", "symbol"):
+                v = Decimal(v)
+        kw[f.name] = v
+    return BrokerPosition(**kw)
+
+
+def _snapshot_write(app_key, account_id, positions: list) -> None:
+    import json  # noqa: PLC0415
+
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+        get_sync_redis().set(
+            _SNAPSHOT_KEY.format(_snapshot_id(app_key, account_id)),
+            json.dumps({"t": time.time(), "fresh": True,
+                        "positions": [_position_to_json(p) for p in positions]}),
+            ex=int(_SNAPSHOT_KEEP_S),
+        )
+    except Exception:  # noqa: BLE001 — best effort; the live read already succeeded
+        log.debug("webull positions snapshot write failed", exc_info=True)
+
+
+def _snapshot_read(app_key, account_id) -> "tuple[float, bool, list] | None":
+    """(age_s, fresh, positions) of the shared snapshot, or None."""
+    import json  # noqa: PLC0415
+
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+        raw = get_sync_redis().get(_SNAPSHOT_KEY.format(_snapshot_id(app_key, account_id)))
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        return (time.time() - float(obj["t"]), bool(obj.get("fresh", True)),
+                [_position_from_json(d) for d in obj.get("positions") or []])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _snapshot_mark_stale(app_key, account_id=None) -> None:
+    """After a fill or close: keep the snapshot for a 429 fallback, but never
+    reuse it as a fresh read."""
+    import json  # noqa: PLC0415
+
+    if account_id is None:
+        return
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+        r = get_sync_redis()
+        key = _SNAPSHOT_KEY.format(_snapshot_id(app_key, account_id))
+        raw = r.get(key)
+        if raw:
+            obj = json.loads(raw)
+            obj["fresh"] = False
+            r.set(key, json.dumps(obj), keepttl=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "429" in msg or "TOO_MANY_REQUESTS" in msg.upper()
+
+
 def invalidate_positions_cache(app_key: str | None, account_id: str | None = None) -> None:
     """Drop the cached positions for an account. Call after anything that
     CHANGES the position (a fill, a close) so the next display read is fresh
     rather than up to _POSITIONS_TTL_S stale."""
+    _snapshot_mark_stale(app_key, account_id)
     with _positions_lock_guard:
         if account_id is None:
             for k in [k for k in _positions_cache if k.startswith(f"{app_key}:")]:
@@ -902,16 +1027,32 @@ class WebullAdapter(BrokerAdapter):
         must leave it False and read live.
         """
         if not cached_ok:
-            return self._fetch_positions()
+            out = self._fetch_positions()
+            _snapshot_write(self.app_key, self.account_id, out)
+            return out
         key = f"{self.app_key}:{self.account_id}"
         with _positions_lock_for(key):
             hit = _positions_cache.get(key)
             if hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
                 return hit[1]
+            # Another process read it moments ago: reuse that, no broker call.
+            snap = _snapshot_read(self.app_key, self.account_id)
+            if snap is not None and snap[1] and snap[0] <= _SNAPSHOT_FRESH_S:
+                return snap[2]
             # A failure is NOT cached: the next caller retries. It is still
             # serialised by the lock, which is the part that prevents the 429.
-            out = self._fetch_positions()
+            try:
+                out = self._fetch_positions()
+            except Exception as exc:
+                # Rate limited: show the last positions, marked with their age,
+                # rather than an empty table.
+                if _is_rate_limit(exc) and snap is not None and snap[0] <= _SNAPSHOT_KEEP_S:
+                    stale = StalePositions(snap[2])
+                    stale.stale_age_s = snap[0]
+                    return stale
+                raise
             _positions_cache[key] = (time.monotonic(), out)
+            _snapshot_write(self.app_key, self.account_id, out)
             return out
 
     def _fetch_positions(self) -> list[BrokerPosition]:

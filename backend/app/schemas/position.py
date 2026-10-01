@@ -61,6 +61,16 @@ class UnreachableAccount(BaseModel):
     detail: str
 
 
+class StaleAccount(BaseModel):
+    """A broker account whose positions ARE listed, but from a recent snapshot:
+    the live read was rate-limited (Webull 429). Shown with its age rather than
+    leaving the account out."""
+    broker_account_id: uuid.UUID
+    broker: str
+    label: str | None = None
+    age_s: int
+
+
 class PositionsPayload(BaseModel):
     """Detailed form of GET /api/positions (``?detail=1``).
 
@@ -68,6 +78,7 @@ class PositionsPayload(BaseModel):
     only the UI that needs to SAY something about a failure opts in."""
     positions: list[PositionOut]
     unreachable: list[UnreachableAccount] = []
+    stale: list[StaleAccount] = []
 
 
 class AveragePositionIn(BaseModel):

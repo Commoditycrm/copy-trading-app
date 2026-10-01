@@ -313,7 +313,13 @@ def _sweep_trader(db, trader_id, rows) -> None:
     # against that list. Reading them per-guard made N broker calls per
     # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
     try:
-        positions = adapter.get_positions()
+        # A TRIGGER check, not an order: a trim it fires re-reads live positions
+        # before placing anything. So it may share a read another loop made
+        # seconds ago (Webull's limits — see webull.py, shared snapshot).
+        try:
+            positions = adapter.get_positions(cached_ok=True)
+        except TypeError:                 # brokers without the cached read
+            positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
         log.warning("auto-trim: could not read positions for user %s", trader_id, exc_info=True)
         return

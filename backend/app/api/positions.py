@@ -42,6 +42,7 @@ from app.schemas.position import (
     ClosePositionIn,
     PositionOut,
     PositionsPayload,
+    StaleAccount,
     UnreachableAccount,
 )
 from app.models.sell_all_snapshot import SellAllSnapshot
@@ -124,6 +125,7 @@ def list_positions(
 
     out: list[PositionOut] = []
     unreachable: list[UnreachableAccount] = []
+    stale: list[StaleAccount] = []
     for acct in accts:
         try:
             creds = decrypt_json(acct.encrypted_credentials)
@@ -140,7 +142,15 @@ def list_positions(
             # Webull rejects simultaneous position reads with 429, and this
             # endpoint is called up to four times per order event by the
             # positions table alone, plus the calendar independently.
-            for p in adapter.get_positions(cached_ok=True):
+            held = adapter.get_positions(cached_ok=True)
+            stale_age = getattr(held, "stale_age_s", None)
+            if stale_age is not None:
+                # Rate limited: these are the last positions read, not live.
+                stale.append(StaleAccount(
+                    broker_account_id=acct.id, broker=acct.broker.value,
+                    label=acct.label, age_s=int(stale_age),
+                ))
+            for p in held:
                 # Reference = previous session's market CLOSE for this stock.
                 ref = None
                 if prev_close_fn is not None and p.instrument_type == InstrumentType.STOCK:
@@ -200,7 +210,7 @@ def list_positions(
     except Exception:  # noqa: BLE001
         log.warning("positions: could not attach ladder stops", exc_info=True)
     if detail:
-        return PositionsPayload(positions=out, unreachable=unreachable)
+        return PositionsPayload(positions=out, unreachable=unreachable, stale=stale)
     return out
 
 
