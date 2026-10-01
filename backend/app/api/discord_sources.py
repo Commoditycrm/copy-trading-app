@@ -55,7 +55,7 @@ from app.config import get_settings
 from app.database import get_db
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
-from app.models.order import Order, OrderSide, OrderStatus
+from app.models.order import Order, OrderSide, OrderStatus, OrderType
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus, SignalDecision
 from app.models.user import User, UserRole
 from app.schemas.pagination import Page
@@ -83,6 +83,8 @@ from app.schemas.discord import (
     DiscordSourceIn,
     DiscordSourceOut,
     DiscordSourceUpdateIn,
+    ChannelSettingsIn,
+    ChannelSettingsOut,
     DiscordSelfAlertIn,
     DiscordSelfAlertOut,
 )
@@ -91,6 +93,7 @@ from app.services import (
     discord_position_guard as guards,
     price_override,
     discord_edit,
+    discord_channel_settings,
     discord_ingest,
     discord_login,
     discord_pairing,
@@ -259,16 +262,14 @@ def _plain(value) -> str | None:
     return format(_D(str(value)).normalize(), "f")
 
 
-def _auto_approve(db: Session, user_id: uuid.UUID) -> bool:
-    """Is this trader's Discord execution mode set to auto?
+def _auto_approve(db: Session, user_id: uuid.UUID, source_id: uuid.UUID | None = None) -> bool:
+    """Is Discord execution set to auto — for this channel, when given (its own
+    setting, or the account's while it follows them), else for the account?
 
-    One setting for the whole account. Defaults to manual when no settings row
-    exists — an alert must never be cleared for execution because a row was
-    missing.
+    Defaults to manual when no settings row exists — an alert must never be
+    cleared for execution because a row was missing.
     """
-    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
-
-    ts = db.get(TraderSettings, user_id)
+    ts = discord_channel_settings.effective(db, user_id, source_id)
     return bool(ts and (ts.discord_execution_mode or "manual").lower() == "auto")
 
 
@@ -972,17 +973,13 @@ def _signal_out(
 
 # NOTE: registered BEFORE "/{source_id}" on purpose — FastAPI matches in
 # registration order, and a literal segment must win over the UUID converter.
-@router.get("/settings", response_model=DiscordSettingsOut)
-def get_discord_settings(
-    db: Session = Depends(get_db),
-    user: User = Depends(require_discord_member),
-) -> DiscordSettingsOut:
-    """Account-wide handling of inbound Discord alerts."""
-    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
-
-    ts = db.get(TraderSettings, user.id)
+def _settings_out(ts) -> DiscordSettingsOut:
+    """The Alert handling values in ``ts`` (account row or a channel's own)."""
     return DiscordSettingsOut(
-        execution_mode="auto" if _auto_approve(db, user.id) else "manual",
+        execution_mode=(
+            "auto" if ts is not None and (ts.discord_execution_mode or "manual").lower() == "auto"
+            else "manual"
+        ),
         live_trading=bool(ts and ts.discord_live_trading),
         auto_trim=bool(ts and getattr(ts, "discord_auto_trim", False)),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
@@ -1007,24 +1004,10 @@ def get_discord_settings(
     )
 
 
-@router.patch("/settings", response_model=DiscordSettingsOut)
-def update_discord_settings(
-    payload: DiscordSettingsIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(require_discord_member),
-) -> DiscordSettingsOut:
-    """Switch between reviewing every alert and auto-approving parsed ones.
-
-    Applies to alerts arriving from now on. Decisions already recorded keep the
-    mode that applied at the time — switching to auto must not retroactively
-    approve alerts the trader never saw.
-    """
-    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
-
-    ts = db.get(TraderSettings, user.id)
-    if ts is None:
-        ts = TraderSettings(user_id=user.id)
-        db.add(ts)
+def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
+    """Validate and apply a settings PATCH onto ``ts`` — the account's row, or a
+    channel's own values (discord_channel_settings.ChannelSettings), which read
+    and write exactly like the row. Caller commits."""
     if payload.execution_mode is not None:
         ts.discord_execution_mode = payload.execution_mode
     if payload.quantity_multiplier is not None:
@@ -1125,31 +1108,103 @@ def update_discord_settings(
             "discord: LIVE TRADING %s for user=%s",
             "ENABLED" if payload.live_trading else "disabled", user.id,
         )
+
+
+@router.get("/settings", response_model=DiscordSettingsOut)
+def get_discord_settings(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> DiscordSettingsOut:
+    """Account-wide handling of inbound Discord alerts."""
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    return _settings_out(db.get(TraderSettings, user.id))
+
+
+@router.patch("/settings", response_model=DiscordSettingsOut)
+def update_discord_settings(
+    payload: DiscordSettingsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> DiscordSettingsOut:
+    """Account-wide Alert handling. Applies to alerts arriving from now on, on
+    every channel that follows the account. Decisions already recorded keep the
+    mode that applied at the time — switching to auto must not retroactively
+    approve alerts the trader never saw.
+    """
+    from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
+
+    ts = db.get(TraderSettings, user.id)
+    if ts is None:
+        ts = TraderSettings(user_id=user.id)
+        db.add(ts)
+    _apply_settings(ts, payload, user)
     db.commit()
-    return DiscordSettingsOut(
-        execution_mode=ts.discord_execution_mode,
-        live_trading=bool(ts.discord_live_trading),
-        auto_trim=bool(getattr(ts, "discord_auto_trim", False)),
-        quantity_multiplier=ts.discord_quantity_multiplier or 1,
-        max_per_contract=_plain(ts.discord_max_per_contract),
-        max_per_order=_plain(ts.discord_max_per_order),
-        trail_percent=_plain(ts.discord_trail_percent) or "20",
-        trim_profit_gate_pct=_plain(_setting(ts, "discord_trim_profit_gate_pct", "20")),
-        trim_stop_pct=_plain(_setting(ts, "discord_trim_stop_pct", "-25")),
-        trim2_profit_gate_pct=_plain(_setting(ts, "discord_trim2_profit_gate_pct", "0")),
-        trim2_stop_pct=_plain(_setting(ts, "discord_trim2_stop_pct", "0")),
-        trim3_profit_gate_pct=_plain(_setting(ts, "discord_trim3_profit_gate_pct", "0")),
-        trim3_stop_pct=_plain(_setting(ts, "discord_trim3_stop_pct", "0")),
-        trim_qty_pct=_plain(_setting(ts, "discord_trim_qty_pct", "50")),
-        trim2_qty_pct=_plain(_setting(ts, "discord_trim2_qty_pct", "50")),
-        trim3_qty_pct=_plain(_setting(ts, "discord_trim3_qty_pct", "100")),
-        trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
-        trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
-        reprice_after_seconds=(
-            getattr(ts, "discord_reprice_after_seconds", None) or 30 if ts else 30
-        ),
-        reprice_pct=_plain(_setting(ts, "discord_reprice_pct", "10")),
+    return _settings_out(ts)
+
+
+# ── Per-channel alert handling ───────────────────────────────────────────────
+# A channel follows the account's settings until its "Use account settings"
+# switch is turned off; then it has its own copy (services/discord_channel_settings).
+
+def _channel_settings_out(db: Session, user: User, src: DiscordAlertSource) -> ChannelSettingsOut:
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    eff = discord_channel_settings.effective(db, user.id, src.id)
+    base = _settings_out(eff if eff is not None else db.get(TraderSettings, user.id))
+    return ChannelSettingsOut(
+        **base.model_dump(),
+        use_account_settings=bool(src.use_account_settings),
+        entry_order_type=discord_channel_settings.entry_order_type(db, src.id),
     )
+
+
+@router.get("/{source_id}/settings", response_model=ChannelSettingsOut)
+def get_channel_settings(
+    source_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> ChannelSettingsOut:
+    """This channel's Alert handling: the account's values while it follows the
+    account, else its own."""
+    return _channel_settings_out(db, user, _get_owned(db, user, source_id))
+
+
+@router.patch("/{source_id}/settings", response_model=ChannelSettingsOut)
+def update_channel_settings(
+    source_id: uuid.UUID,
+    payload: ChannelSettingsIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> ChannelSettingsOut:
+    """Turn "Use account settings" off (the channel gets a copy of the account's
+    values) or on (back to the account's), set Market / Limit entries, or edit
+    the channel's own values."""
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    src = _get_owned(db, user, source_id)
+    if payload.entry_order_type is not None:
+        src.entry_order_type = payload.entry_order_type
+    if payload.use_account_settings is not None and payload.use_account_settings != src.use_account_settings:
+        if not payload.use_account_settings:
+            # Start from the account's values as they are right now.
+            src.channel_settings = discord_channel_settings.snapshot(db.get(TraderSettings, user.id))
+        src.use_account_settings = payload.use_account_settings
+    edits = DiscordSettingsIn(**payload.model_dump(
+        exclude={"use_account_settings", "entry_order_type"}, exclude_unset=True,
+    ))
+    if edits.model_dump(exclude_none=True):
+        if src.use_account_settings:
+            raise HTTPException(
+                409, "This channel uses the account settings — turn that off to edit its own."
+            )
+        own = discord_channel_settings.ChannelSettings(
+            db.get(TraderSettings, user.id), src.channel_settings or {},
+        )
+        _apply_settings(own, edits, user)
+        src.channel_settings = own.to_json()     # reassign so the JSON change is saved
+    db.commit()
+    return _channel_settings_out(db, user, src)
 
 
 # ── AI trimming ──────────────────────────────────────────────────────────────
@@ -1885,7 +1940,9 @@ def _execute_signal(
 
     from app.models.settings import TraderSettings  # noqa: PLC0415 — avoid a cycle
 
-    ts_for_sizing = db.get(TraderSettings, user.id)
+    # The alert's channel decides an ENTRY: its own settings, or the account's
+    # while it follows them. An exit switches to the opening channel's below.
+    ts_for_sizing = discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None))
     sizing = discord_execution.Sizing(
         multiplier=(ts_for_sizing.discord_quantity_multiplier if ts_for_sizing else 1) or 1,
         max_per_contract=(ts_for_sizing.discord_max_per_contract if ts_for_sizing else None),
@@ -1977,6 +2034,14 @@ def _execute_signal(
         elif guard.entry_price is None and resolved.position_entry_price is not None:
             guard.entry_price = resolved.position_entry_price
 
+        # An exit runs on the ladder — and test/live — of the channel that
+        # OPENED the position, not the one posting the exit: an auto-trim fires
+        # through Self, and must still trim a Clint position on Clint's ladder.
+        origin = discord_channel_settings.for_guard(db, user.id, guard)
+        if origin is not None:
+            cfg = _trim_config(origin)
+            live = bool(getattr(origin, "discord_live_trading", False))
+
         # resolve() sized this as a full close, so payload.quantity is the
         # whole position — which is exactly what the ladder measures against.
         held = Decimal(str(p.quantity))
@@ -2050,13 +2115,31 @@ def _execute_signal(
         final_guard = guard if plan.retire else None
         detail += (" · " if detail else "") + f"trim {plan.rung}: {plan.note}"
 
+    # Market entries, where the channel asks for them. The alert's price stays
+    # the reference: the dollar caps were checked against it in resolve(), and
+    # it is the ladder's provisional entry until the fill replaces it.
+    entry_ref_price = p.limit_price
+    if (not resolved.is_closing
+            and discord_channel_settings.entry_order_type(db, getattr(msg, "source_id", None)) == "market"):
+        from app.services import market_hours  # noqa: PLC0415
+
+        if market_hours.in_regular_session():
+            resolved.payload = p = p.model_copy(
+                update={"order_type": OrderType.MARKET, "limit_price": None}
+            )
+            detail += (" · " if detail else "") + "at market (channel setting)"
+        else:
+            # Market orders don't trade outside the regular session; a market
+            # entry there would just sit until the open. Keep the alert's limit.
+            detail += (" · " if detail else "") + "limit — market entries need the regular session"
+
     if not live:
         # Paper: everything above ran for real; only the broker call is skipped.
         discord_execution.mark_failed(
             msg,
             "Paper mode — not sent to the broker. Would have placed: "
             f"{resolved.payload.side.value.upper()} {resolved.payload.quantity} "
-            f"{resolved.payload.symbol} @ {resolved.payload.limit_price}"
+            f"{resolved.payload.symbol} @ {resolved.payload.limit_price or 'market'}"
             + (f" ({detail})" if detail else ""),
         )
         msg.status = DiscordMessageStatus.PARSED   # not a failure — nothing was attempted
@@ -2119,7 +2202,7 @@ def _execute_signal(
             # placement. The real fill replaces it via sync_entry_price once the
             # order fills -- which matters because the +10% reprice can fill
             # ABOVE this limit, and then it is a price we never paid.
-            entry_price=p.limit_price,
+            entry_price=entry_ref_price,
             entry_order_id=order.id,
         )
         # An AVERAGING-DOWN add deliberately lowers the cost basis, so the
@@ -2133,7 +2216,7 @@ def _execute_signal(
             guards.average_in(
                 db, opened,
                 held_qty=p.quantity, added_qty=p.quantity,
-                added_price=p.limit_price,
+                added_price=entry_ref_price,
             )
 
     # A trim leaves a REMAINDER, and that remainder is unprotected until the
@@ -2483,7 +2566,7 @@ def listener_messages(
         discord_subscribers.relay_batch(db, src, batch)
     except Exception:  # noqa: BLE001 — never stall the trader's own feed
         log.exception("discord: subscriber relay failed for source %s", src.id)
-    auto = _auto_approve(db, src.user_id)
+    auto = _auto_approve(db, src.user_id, src.id)
     report = discord_ingest.ingest_batch(db, src, batch, auto_approve=auto)
 
     # Auto mode: a parse IS the approval, so place it now. Each alert is handled
