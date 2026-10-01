@@ -129,6 +129,20 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Count every Webull request and tag it with the page / API route that made
+    # it (services/webull_usage.py). Background loops tag themselves.
+    from app.services import webull_usage
+
+    webull_usage.install()
+
+    @app.middleware("http")
+    async def _tag_webull_caller(request, call_next):  # noqa: ANN001, ANN202
+        token = webull_usage.set_request_caller(request.method, request.url.path)
+        try:
+            return await call_next(request)
+        finally:
+            webull_usage.reset_request_caller(token)
+
     app.include_router(admin_api.router)
     app.include_router(auth.router)
     app.include_router(brokers.router)

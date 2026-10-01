@@ -421,3 +421,9 @@ def poll_loop(shutdown_check=None) -> None:
         except Exception:  # noqa: BLE001
             log.exception("discord_auto_trim: tick failed")
         time.sleep(POLL_INTERVAL_S)
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+tick = webull_usage.tagged("Auto-trim")(tick)
