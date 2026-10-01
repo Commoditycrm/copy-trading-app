@@ -399,6 +399,16 @@ def create_app() -> FastAPI:
                 daemon=True,
             ).start()
 
+            # Tell the trader (in-app + SMS) when their Discord channels stop
+            # being read — a channel error, or the whole listener going quiet.
+            from app.services import discord_watchdog
+            threading.Thread(
+                target=discord_watchdog.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="discord-watchdog",
+                daemon=True,
+            ).start()
+
     @app.on_event("shutdown")
     async def _stop_listeners() -> None:
         # Signal the retry scheduler to exit at its next poll tick. We

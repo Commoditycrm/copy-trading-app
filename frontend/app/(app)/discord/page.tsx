@@ -76,6 +76,9 @@ type LoginSession = {
 type DiscordSource = {
   /** A subscriber's copy of a trader channel — only the switch is theirs. */
   mirrored?: boolean;
+  /** Pills beside the status: how entries go out, what drives exits. */
+  entry_summary?: string | null;
+  exit_summary?: string | null;
   id: string;
   label: string;
   channel_id: string;
@@ -315,6 +318,16 @@ export default function DiscordPage() {
       setSavedLadder(nextLadder);
   }
 
+  // The channel list alone — so the Entry / Exit pills reflect a settings
+  // change at once, without reloading (and overwriting) the settings in view.
+  async function refreshSources() {
+    try {
+      setSources(await api<DiscordSource[]>("/api/discord-sources"));
+    } catch {
+      /* the 15s refresh will catch up */
+    }
+  }
+
   async function changeScope(id: string | null) {
     scopeRef.current = id;
     setScope(id);
@@ -332,6 +345,7 @@ export default function DiscordPage() {
     try {
       applySettings(await api(settingsUrl(scope), { method: "PATCH", body: JSON.stringify(body) }));
       notify.success(done);
+      void refreshSources();
     } catch (e) {
       notify.fromError(e, "Could not save that");
     } finally {
@@ -397,7 +411,10 @@ export default function DiscordPage() {
         method: "PATCH",
         body: JSON.stringify({ is_enabled: next }),
       });
-      setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+      setSources((prev) => prev.map((x) => (x.id === s.id
+        ? { ...updated, entry_summary: updated.entry_summary ?? x.entry_summary,
+            exit_summary: updated.exit_summary ?? x.exit_summary }
+        : x)));
     } catch (e) {
       setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, is_enabled: !next } : x)));
       notify.fromError(e, "Could not update");
@@ -438,6 +455,7 @@ export default function DiscordPage() {
       );
       setExecMode(next.execution_mode);
       setLiveTrading(!!next.live_trading);
+      void refreshSources();
       notify.success(
         mode === "auto"
           ? "Parsed alerts will be approved automatically"
@@ -468,6 +486,7 @@ export default function DiscordPage() {
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
       notify.success("Saved");
+      void refreshSources();
     } catch (e) {
       notify.fromError(e, "Could not save that setting");
     } finally {
@@ -490,6 +509,7 @@ export default function DiscordPage() {
       );
       setLiveTrading(!!r.live_trading);
       notify.success(next ? "Live trading enabled" : "Back to paper — nothing reaches your broker");
+      void refreshSources();
     } catch (e) {
       notify.fromError(e, "Could not change that");
     } finally {
@@ -507,6 +527,7 @@ export default function DiscordPage() {
         { method: "PATCH", body: JSON.stringify({ auto_trim: next }) }
       );
       setAutoTrim(!!r.auto_trim);
+      void refreshSources();
       notify.success(
         next
           ? "Auto trim on — rungs fire at their own Min profit"
@@ -898,6 +919,26 @@ export default function DiscordPage() {
                             />
                             {STATUS_LABEL[s.status] ?? s.status}
                           </span>
+                          {/* How this channel trades: its own settings, or the
+                              account's while it follows them. */}
+                          {([["Entry", s.entry_summary], ["Exit", s.exit_summary]] as const).map(
+                            ([name, value]) => value ? (
+                              <span
+                                key={name}
+                                className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full"
+                                style={{
+                                  color: "var(--text-2)",
+                                  background: "var(--panel-2)",
+                                  border: "1px solid var(--border)",
+                                }}
+                                title={name === "Entry"
+                                  ? "How entries from this channel are placed"
+                                  : "What closes positions this channel opened"}
+                              >
+                                <span style={{ color: "var(--muted)" }}>{name}:</span> {value}
+                              </span>
+                            ) : null,
+                          )}
                         </div>
                         <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--muted)" }}>
                           {s.guild_name ? `${s.guild_name} · ` : ""}
