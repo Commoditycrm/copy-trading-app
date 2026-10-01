@@ -151,7 +151,10 @@ class Settings(BaseSettings):
     # account count (≈3.3s × accounts) — see webull_listener._safe_poll_interval.
     # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
     # 4s also works (7.5 / 30s). Don't go below 3.5s.
-    webull_poll_interval_seconds: float = 5.0
+    # 15s, not 5s: the live events stream detects orders first; this poll is the
+    # backstop, and at 5s it was the largest share of a Webull key's request
+    # budget (every account under the key, every 5s).
+    webull_poll_interval_seconds: float = 15.0
     # ── Webull token authorisation wait ──────────────────────────────────
     # Webull's SDK creates an access token in PENDING status and then BLOCKS,
     # polling until the account owner authorises it in their Webull app. Its own
