@@ -628,21 +628,17 @@ def _resolve_quantity(
         resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
         return qty
 
-    qty = _dec(signal.get("quantity"))
-    if qty is None or qty <= 0:
-        raise ExecutionRefused("The alert states no quantity.")
+    # An ENTRY is exactly the trader's "Contracts per alert" (sizing.multiplier).
+    # A size the alert states is the AUTHOR's, not yours, and is ignored — so
+    # "BTO 3 SPY …" and "BTO SPY …" both buy your setting. Closes returned
+    # above: an exit sells what is held, whatever the alert or the setting say.
+    scaled = Decimal(max(1, int(sizing.multiplier or 1)))
+    stated = _dec(signal.get("quantity"))
+    note = (f"your Contracts per alert; the alert said {stated}"
+            if stated is not None and stated > 0 and stated != scaled else None)
 
-    # Scale the ENTRY. Closes returned above and are never multiplied — an exit
-    # sells what is held, whatever the alert or the multiplier say.
-    multiplier = max(1, int(sizing.multiplier or 1))
-    scaled = qty * multiplier if multiplier > 1 else qty
-    note = f"{qty} x {multiplier} multiplier" if multiplier > 1 else None
-
-    # The author called this one "light" / "not heavy": take half the size we
-    # otherwise would. Applied AFTER the multiplier, so it halves what would
-    # actually have been placed — a size of 4 becomes 2, which is what the
-    # instruction means. Halving the alert's own quantity first would let the
-    # multiplier scale it straight back up.
+    # The author called this one "light" / "not heavy": take half of your size,
+    # rounded down — never below one contract.
     if signal.get("half_size"):
         halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_FLOOR)
         # Never round down to nothing. You cannot buy half a contract, and

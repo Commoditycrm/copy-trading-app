@@ -1201,7 +1201,7 @@ export default function DiscordPage() {
                       Contracts per alert
                     </label>
                     <span className="text-[11px] tabular-nums" style={{ color: "var(--accent-2)" }}>
-                      {qtyMultiplier}x
+                      {qtyMultiplier} {qtyMultiplier === 1 ? "contract" : "contracts"}
                     </span>
                   </div>
                   <div className="flex gap-1 mt-2 flex-wrap">
@@ -1227,7 +1227,7 @@ export default function DiscordPage() {
                     })}
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Entries only — a close always sells the position you hold.
+                    Every entry buys exactly this many, whatever size the alert says. A close always sells the position you hold.
                   </p>
                 </div>
 
