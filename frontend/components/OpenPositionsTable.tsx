@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
+import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
 import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -8,6 +9,7 @@ import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh"
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
+import { HEADER_STATS_SLOT_ID } from "@/lib/headerSlot";
 import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
 import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
@@ -407,8 +409,8 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
  *  Own component so a tick only re-renders these tiles, not the whole table.
  *  Sums each visible stock row's live delta (same signed_qty × Δprice as the
  *  per-row cells) on top of the backend baseline; 0 until ticks arrive. */
-function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
-  positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string;
+function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub, compact }: {
+  positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string; compact?: boolean;
 }) {
   // Each streamable row → its cache key (ticker or OCC), contract multiplier,
   // snapshot price and signed qty. Stocks and options both stream now.
@@ -438,10 +440,10 @@ function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
     <>
       <SummaryTile label="Unrealized P&L" tone={pnl > 0 ? "good" : pnl < 0 ? "bad" : "neutral"}
         node={<AnimatedNumber value={pnl} format={fmtSignedUsd} className="num" />}
-        sub="On open positions" />
+        sub="On open positions" compact={compact} />
       <SummaryTile label="Market value" tone="neutral"
         node={<AnimatedNumber value={mv} format={fmtUsd} className="num" />}
-        sub={mvSub} />
+        sub={mvSub} compact={compact} />
     </>
   );
 }
@@ -562,8 +564,14 @@ export interface OpenPositionsTableHandle {
  *  fill, so the positions view can still change. */
 const WORKING_STATUSES = new Set(["pending", "submitted", "accepted", "partially_filled"]);
 
-export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string; fillHeight?: boolean }>(
-  function OpenPositionsTable({ className, fillHeight }, ref) {
+export const OpenPositionsTable = forwardRef<
+  OpenPositionsTableHandle,
+  // statsInHeader: show the summary figures in the app header (AppShell's
+  // HEADER_STATS_SLOT_ID) instead of as tiles above the table, on screens wide
+  // enough for it. Same numbers, same fetches — no extra broker calls.
+  { className?: string; fillHeight?: boolean; statsInHeader?: boolean }
+>(
+  function OpenPositionsTable({ className, fillHeight, statsInHeader }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
     // return nav, then refresh() below revalidates. Cleared on logout.
     // The Channel column is only meaningful to a trader who has Discord — for
@@ -1027,13 +1035,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     // summary over the currently-visible rows
     const summary = useMemo(() => {
-      let mv = 0, pnl = 0, longs = 0, shorts = 0;
+      let mv = 0, pnl = 0;
       for (const p of visible) {
         mv += Number(p.market_value) || 0;
         pnl += Number(p.unrealized_pnl) || 0;
-        if (positionDirection(p) === "long") longs++; else shorts++;
       }
-      return { mv, pnl, longs, shorts, count: visible.length };
+      return { mv, pnl, count: visible.length };
     }, [visible]);
 
     function toggleSort(key: SortKey) {
@@ -1124,6 +1131,30 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // conditional, so this is too.
     const COLSPAN = cols.columns.length;
 
+    // The header slot exists once AppShell has mounted; look it up after ours.
+    const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null);
+    useEffect(() => {
+      if (statsInHeader) setHeaderSlot(document.getElementById(HEADER_STATS_SLOT_ID));
+    }, [statsInHeader]);
+
+    const renderStats = (compact: boolean) => (
+      <>
+        <SummaryTile label="Day's P&L" compact={compact}
+          tone={dayPnl == null ? "neutral" : dayPnl > 0 ? "good" : dayPnl < 0 ? "bad" : "neutral"}
+          node={dayPnl == null
+            ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+            : <AnimatedNumber value={dayPnl} format={fmtSignedUsd} className="num" />}
+          sub="Your broker's account Day's P&L" />
+        <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv} compact={compact}
+          mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
+        <SummaryTile label="Account value" tone="neutral" compact={compact}
+          node={totalEquity == null
+            ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+            : <AnimatedNumber value={totalEquity} format={fmtUsd} className="num" />}
+          sub="Total equity" />
+      </>
+    );
+
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
         {/* A broker we could not read. Without this the table just renders
@@ -1174,24 +1205,11 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             </div>
           </div>
         )}
-        {/* Summary strip */}
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
-          <SummaryTile label="Day's P&L"
-            tone={dayPnl == null ? "neutral" : dayPnl > 0 ? "good" : dayPnl < 0 ? "bad" : "neutral"}
-            node={dayPnl == null
-              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
-              : <AnimatedNumber value={dayPnl} format={fmtSignedUsd} className="num" />}
-            sub="Your broker's account Day's P&L" />
-          <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv}
-            mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
-          <SummaryTile label="Account value" tone="neutral"
-            node={totalEquity == null
-              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
-              : <AnimatedNumber value={totalEquity} format={fmtUsd} className="num" />}
-            sub="Total equity" />
-          <SummaryTile label="Long / Short" tone="neutral"
-            node={<span className="num">{summary.longs} / {summary.shorts}</span>}
-            sub="Direction split" />
+        {/* Summary strip — in the app header on the Positions page (wide
+            screens), as tiles here otherwise. */}
+        {headerSlot && createPortal(renderStats(true), headerSlot)}
+        <div className={`grid grid-cols-2 lg:grid-cols-4 gap-2.5 mb-4 ${headerSlot ? "xl:hidden" : ""}`.trim()}>
+          {renderStats(false)}
         </div>
 
         {/* Toolbar: type tabs + symbol search */}
@@ -1538,13 +1556,25 @@ function SummaryTile({
   node,
   sub,
   tone,
+  compact,
 }: {
   label: string;
   node: React.ReactNode;
   sub?: string;
   tone: "neutral" | "good" | "bad";
+  /** One figure in the app header: label over value, no card. */
+  compact?: boolean;
 }) {
   const color = tone === "good" ? "var(--good)" : tone === "bad" ? "var(--bad)" : "var(--text)";
+  if (compact) {
+    return (
+      <div className="flex flex-col gap-0.5 px-3 leading-none whitespace-nowrap" title={sub}
+        style={{ borderLeft: "1px solid var(--border)" }}>
+        <span className="text-[9px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</span>
+        <span className="text-[14px] font-semibold tabular-nums" style={{ color }}>{node}</span>
+      </div>
+    );
+  }
   void sub; // subtitle dropped — cards match the Order History summary size
   return (
     <motion.div

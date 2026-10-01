@@ -9,6 +9,7 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { HEADER_STATS_SLOT_ID } from "@/lib/headerSlot";
 import { CopyDiscordPromptModal } from "@/components/CopyDiscordPromptModal";
 import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
@@ -798,6 +799,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="hidden sm:block">
               <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
             </div>
+            {/* A page's headline figures (the Positions page puts its Day's P&L,
+                Unrealized P&L, Market value and Account value here). Empty elsewhere. */}
+            <div id={HEADER_STATS_SLOT_ID} className="hidden xl:flex items-center ml-1 min-w-0" />
           </div>
           {/* Right: theme toggle + bell + who's signed in + role chip. */}
           <div className="flex items-center gap-2 sm:gap-3">
