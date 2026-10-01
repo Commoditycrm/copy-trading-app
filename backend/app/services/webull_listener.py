@@ -1436,3 +1436,10 @@ __all__ = [
     "bind_loop", "start_all_listeners", "start_listener", "stop_listener",
     "stop_all_listeners", "has_running_listener", "running_trader_ids", "get_status",
 ]
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+_run_poller = webull_usage.tagged("Order poll")(_run_poller)
+_run_listener = webull_usage.tagged("Order stream")(_run_listener)

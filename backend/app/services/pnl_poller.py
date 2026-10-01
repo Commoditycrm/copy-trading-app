@@ -476,11 +476,15 @@ def _enforce_one_safe(acct: BrokerAccount) -> None:
     if not should_run:
         return
 
-    if acct.broker == BrokerName.SNAPTRADE:
-        with _SNAPTRADE_SEM:
-            _enforce_one_inner(acct, role)
-        return
-    _enforce_one_inner(acct, role)
+    # Count this loop's Webull calls under its own name (services/webull_usage.py).
+    from app.services import webull_usage  # noqa: PLC0415
+
+    with webull_usage.tag("P&L poller"):
+        if acct.broker == BrokerName.SNAPTRADE:
+            with _SNAPTRADE_SEM:
+                _enforce_one_inner(acct, role)
+            return
+        _enforce_one_inner(acct, role)
 
 
 def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
