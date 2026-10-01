@@ -75,13 +75,15 @@ def test_an_exit_stays_sized_from_the_position():
 
 
 @pytest.mark.parametrize("words", ["filled lightly", "light", "not heavy", "small size",
-                                   "smaller size", "half size", "half-size"])
+                                   "smaller size", "half size", "half-size", "lotto", "LOTTO play",
+                                   "lottos"])
 def test_wordings_that_mean_half_size(words):
     s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
     assert s.half_size is True
 
 
-@pytest.mark.parametrize("words", ["filled", "lighten up", "lightening", "flashlight", "delight", "size up"])
+@pytest.mark.parametrize("words", ["filled", "lighten up", "lightening", "flashlight", "delight", "size up",
+                                   "lottery"])
 def test_wordings_that_do_not(words):
     s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
     assert s.half_size is False

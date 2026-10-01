@@ -49,9 +49,11 @@ log = logging.getLogger(__name__)
 # the opposite instruction (trim a position), nor on "delight" or "flashlight".
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
 # Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
-# "small(er) size" and "half size".
+# "small(er) size" and "half size". And "lotto" / "lottos" — a long-shot
+# entry, so half the size too.
 _HALF_SIZE_RE = re.compile(
-    r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b",
+    r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b"
+    r"|\blottos?\b",
     re.IGNORECASE,
 )
 
