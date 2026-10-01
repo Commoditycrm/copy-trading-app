@@ -188,3 +188,61 @@ def test_add_to_latest_is_resolved_before_the_order_is_built():
 
     src = inspect.getsource(discord_sources._execute_signal)
     assert src.index("latest_channel_contract(") < src.index("discord_execution.resolve(db, user, signal, sizing)")
+
+
+# ── "Average down on SPY @0.80" ─────────────────────────────────────────────
+
+def _avg(text):
+    return parse_message(ParsedMessage(content=text))
+
+
+@pytest.mark.parametrize("text,price", [
+    ("Average down on SPY @0.80", "0.80"),
+    ("averaging down $SPY .8", "0.8"),
+    ("avg down on SPY 0.75 @here", "0.75"),
+])
+def test_average_down_doubles_the_open_position(text, price):
+    s = _avg(text).signals[0]
+    assert (s.action.value, s.symbol, s.double_up, s.contract_unspecified) == ("BUY", "SPY", True, True)
+    assert str(s.limit_price) == price and s.quantity is None
+
+
+def test_average_down_without_a_price_is_refused():
+    r = _avg("Average down on SPY")
+    assert r.status is ParseStatus.INVALID and "no price" in r.reason
+
+
+def test_chatter_about_averaging_down_is_ignored():
+    assert _avg("I might average down later").status is ParseStatus.IGNORED
+
+
+def test_an_at_price_is_never_stripped_as_a_mention():
+    s = _avg("AMZN245P @0.55").signals[0]
+    assert str(s.limit_price) == "0.55"
+
+
+def _held(strike, right, qty=3):
+    return SimpleNamespace(option_strike=Decimal(strike), option_right=right,
+                           option_expiry=date(2026, 10, 1), quantity=Decimal(qty))
+
+
+def test_execution_doubles_the_one_held_spy_contract():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    held = [_held("767", OptionRight.CALL, 3)]
+    res = {}
+    strike, right, expiry = ex._resolve_contract(sig, held, res)
+    assert (strike, right) == (Decimal("767"), OptionRight.CALL)
+    qty = ex._resolve_quantity(sig, held, strike, right, expiry, False, ex.Sizing(multiplier=4), res)
+    assert qty == Decimal(3)          # doubles the 3 held — not your Contracts per alert
+
+
+def test_execution_refuses_when_two_spy_contracts_are_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="2 of your open contracts"):
+        ex._resolve_contract(sig, [_held("767", OptionRight.CALL), _held("760", OptionRight.PUT)], {})
+
+
+def test_execution_refuses_when_no_spy_contract_is_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="no matching position"):
+        ex._resolve_contract(sig, [], {})

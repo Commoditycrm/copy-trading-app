@@ -72,3 +72,30 @@ def test_a_stated_size_is_kept():
 def test_an_exit_stays_sized_from_the_position():
     s = _parse("STC SPY 770 Calls Today Expiry @1.60").signals[0]
     assert s.action.value == "SELL" and s.quantity is None
+
+
+@pytest.mark.parametrize("words", ["filled lightly", "light", "not heavy", "small size",
+                                   "smaller size", "half size", "half-size"])
+def test_wordings_that_mean_half_size(words):
+    s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
+    assert s.half_size is True
+
+
+@pytest.mark.parametrize("words", ["filled", "lighten up", "lightening", "flashlight", "delight", "size up"])
+def test_wordings_that_do_not(words):
+    s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
+    assert s.half_size is False
+
+
+
+@pytest.mark.parametrize("words", ["Tommorow Expiry", "Tomorrow Expiry", "tomorrow's expiry",
+                                   "Tomorow exp", "Tommorrow", "tmrw", "1DTE", "expiring tomorrow"])
+def test_tomorrow_wordings_are_the_next_trading_day(words):
+    s = _parse(f"BTO SPY 764 Calls {words} @2.41 filled lightly").signals[0]
+    assert s.expiration == date(2026, 10, 2)          # posted Thu 2026-10-01
+    assert s.half_size is True
+
+
+def test_a_friday_tomorrow_is_monday():
+    friday = datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc)
+    assert _parse("BTO SPY 764 Calls Tomorrow Expiry @2.41", friday).signals[0].expiration == date(2026, 10, 5)

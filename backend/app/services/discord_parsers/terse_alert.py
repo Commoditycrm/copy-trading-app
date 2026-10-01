@@ -42,7 +42,8 @@ from .base import (
 )
 
 # Discord mentions and the client's "(edited)" marker are noise, not content.
-_MENTION_RE = re.compile(r"@\S+")
+# Never "@0.80" or "@$1.10": that's a price, not a mention.
+_MENTION_RE = re.compile(r"@(?![\d.$])\S+")
 _EDITED_RE = re.compile(r"\(edited\)", re.IGNORECASE)
 
 # "AMZN245P", "$SPY765.5C" — ticker, strike and right with no spaces.
@@ -53,6 +54,14 @@ _PRICE_RE = re.compile(r"(?<![\w.%])@?\s*\$?(?P<price>\d*\.\d+)(?!\s*%)(?![\w.])
 _ADD_RE = re.compile(r"^\s*add(?:ing)?\s+@?\s*\$?(?P<price>\d*\.\d+|\d+(?:\.\d+)?)(?![\w.%])",
                      re.IGNORECASE)
 _TRIM_RE = re.compile(r"\btrim(?:med|ming|s)?\b", re.IGNORECASE)
+# "Average down on SPY @.80" / "averaging down $SPY 0.80" / "avg down SPY .8":
+# double the ONE open position in that symbol. The price is required.
+_AVG_DOWN_RE = re.compile(
+    # The ticker as tickers are written — capitals or $ — so "I might average
+    # down later" is chatter, not an order for LATER.
+    r"\b(?:average|averaging|avg)\s+down\s+(?:on\s+|in\s+)?(?-i:\$?(?P<sym>[A-Z]{1,5}))\b",
+    re.IGNORECASE,
+)
 _PCT_RE = re.compile(r"(?P<sign>[+\-−])?\s*(?P<pct>\d+(?:\.\d+)?)\s*%")
 # A bare ticker in a trim ("... AMZN 25%"): an all-caps word of 2-5 letters.
 _TICKER_RE = re.compile(r"(?<![A-Za-z0-9$])\$?(?P<sym>[A-Z]{2,5})(?![A-Za-z0-9])")
@@ -73,6 +82,7 @@ class TerseAlertParser(Parser):
         text = _clean(message.content)
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
+            or _AVG_DOWN_RE.search(text)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -82,6 +92,10 @@ class TerseAlertParser(Parser):
         # else the sentence says.
         if _TRIM_RE.search(text):
             return self._trim(text)
+
+        avg = _AVG_DOWN_RE.search(text)
+        if avg and avg.group("sym").upper() not in _NOT_TICKERS:
+            return self._average_down(text, avg)
 
         add = _ADD_RE.match(text)
         if add and not _GLUED_RE.search(text):
@@ -127,6 +141,36 @@ class TerseAlertParser(Parser):
             ))
 
         return ParseResult.ignored("not a terse alert")
+
+    def _average_down(self, text: str, m: re.Match) -> ParseResult:
+        """Double the one open position in the named symbol, at the stated price.
+
+        Execution fills the contract from the position held (refusing when there
+        is none, or more than one) and sizes it as the holding (double_up). With
+        no price there is nothing safe to bid, so it is refused, not guessed.
+        """
+        rest = text[:m.start()] + " " + text[m.end():]
+        glued = _GLUED_RE.search(rest)
+        price_m = _PRICE_RE.search(rest[:glued.start()] + " " + rest[glued.end():] if glued else rest)
+        price = to_decimal(price_m.group("price")) if price_m else None
+        if price is None or price <= 0:
+            return ParseResult.invalid("an average-down with no price — add one, e.g. @0.80")
+        return ParseResult.parsed(TradeSignal(
+            action=SignalAction.BUY,
+            asset_type=AssetType.OPTION,
+            symbol=m.group("sym").upper(),
+            option_type=(None if not glued else
+                         OptionType.CALL if glued.group("right") == "C" else OptionType.PUT),
+            strike=to_decimal(glued.group("strike")) if glued else None,
+            quantity=None,              # sized from the position (double_up)
+            order_type=OrderKind.LIMIT,
+            limit_price=price,
+            double_up=True,
+            expiry_unspecified=True,
+            contract_unspecified=glued is None,
+            source_action="AVERAGE_DOWN",
+            parser=self.name,
+        ))
 
     def _trim(self, text: str) -> ParseResult:
         glued = _GLUED_RE.search(text)
