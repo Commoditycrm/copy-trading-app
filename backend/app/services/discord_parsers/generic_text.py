@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 
 from ._util import parse_expiry, to_decimal
+from .compact_alert import DEFAULT_QUANTITY
 from .base import (
     AssetType,
     OptionType,
@@ -192,7 +193,17 @@ class GenericTextParser(Parser):
                 option_type=right,
                 strike=strike,
                 expiration=expiry,
-                quantity=qty,
+                # An option ENTRY that states no size is one contract, as in
+                # every other parser (compact_alert.DEFAULT_QUANTITY); your
+                # "Contracts per alert" then scales it. Without this,
+                # "BTO SPY 770 Calls Today Expiry @1.38" was refused at
+                # execution as "The alert states no quantity." An exit stays
+                # unsized: it is sized from the position held.
+                quantity=(
+                    qty if qty is not None
+                    else DEFAULT_QUANTITY if action is SignalAction.BUY
+                    else None
+                ),
                 # Exits go to market — see compact_alert. A limit sell can sit
                 # unfilled while the position moves against you.
                 order_type=(
