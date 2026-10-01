@@ -9,6 +9,7 @@ Real in-memory SQLite + the actual endpoint function; broker calls monkeypatched
 """
 import os
 import sys
+import types
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -173,13 +174,26 @@ def _filled(db, acct, side, qty, price, when):
     db.flush()
 
 
+def _pin_cutover(monkeypatch, d: date):
+    """Force the authoritative-history cutover to ``d`` regardless of env —
+    calendar_pnl only reads .authoritative_history_start off the settings."""
+    monkeypatch.setattr(
+        trades, "get_settings",
+        lambda: types.SimpleNamespace(authoritative_history_start=d),
+    )
+
+
 def test_webull_historical_legacy_fallback(monkeypatch):
-    """A Webull historical day with NO finalized broker figure but with trades
-    falls back to the old FIFO value, flagged legacy_calculated / estimated —
-    restoring visibility without claiming authority."""
+    """A Webull historical day from BEFORE the cutover, with NO finalized broker
+    figure but with trades, falls back to the exact number the OLD calendar
+    showed in its bold headline — "Marked" = realized + the day's unrealized
+    swing — flagged legacy_calculated / estimated, restoring visibility without
+    claiming authority. (Here the position closes same-day so marked == realized
+    == +10.)"""
     db, user = _setup(monkeypatch, Decimal("0"))
     acct = db.query(BrokerAccount).filter(BrokerAccount.user_id == user.id).first()
-    past = date(2026, 9, 15)  # a past Monday
+    _pin_cutover(monkeypatch, date(2026, 10, 1))
+    past = date(2026, 9, 15)  # a past Monday, BEFORE the cutover
     t = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
     _filled(db, acct, OrderSide.BUY, 1, 100, t)
     _filled(db, acct, OrderSide.SELL, 1, 110, t)  # realizes +10
@@ -187,7 +201,7 @@ def test_webull_historical_legacy_fallback(monkeypatch):
     rows = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
                                tz="America/New_York", user_id=None)
     cell = next(r for r in rows if r.day == past)
-    assert cell.day_pnl == Decimal("10"), "legacy value = FIFO realized"
+    assert cell.day_pnl == Decimal("10"), "legacy value = old 'Marked' headline"
     assert cell.source == "legacy_calculated"
     assert cell.quality == "estimated"
     assert cell.day_pnl_pct is None, "no fabricated % for legacy days"
@@ -203,6 +217,41 @@ def test_webull_historical_legacy_fallback(monkeypatch):
     cell2 = next(r for r in rows2 if r.day == past)
     assert cell2.day_pnl == Decimal("99") and cell2.source == "broker_reported", \
         "finalized EOD snapshot overrides legacy"
+
+
+def test_after_cutover_missing_eod_is_unavailable_not_legacy(monkeypatch):
+    """REGRESSION: a settled day ON/AFTER the authoritative-EOD cutover, with
+    trades but NO finalized EOD snapshot, is a genuine gap (outage / missed
+    finalization). It MUST read '--' (unavailable) and MUST NOT silently fall
+    back to the FIFO/legacy reconstruction — otherwise a future missed snapshot
+    would masquerade as real history."""
+    db, user = _setup(monkeypatch, Decimal("0"))
+    acct = db.query(BrokerAccount).filter(BrokerAccount.user_id == user.id).first()
+    # Pin the cutover BEFORE the test day so the day counts as "after cutover".
+    _pin_cutover(monkeypatch, date(2026, 9, 1))
+    past = date(2026, 9, 15)  # >= cutover(2026-09-01), still a past day
+    t = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
+    _filled(db, acct, OrderSide.BUY, 1, 100, t)
+    _filled(db, acct, OrderSide.SELL, 1, 110, t)  # realizes +10 — would be legacy pre-cutover
+    today = market_hours.now_et().date()
+    rows = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
+                               tz="America/New_York", user_id=None)
+    cell = next(r for r in rows if r.day == past)
+    assert cell.day_pnl is None, "missing EOD after cutover must be '--', not FIFO"
+    assert cell.source == "none"
+    assert cell.quality == "unavailable"
+    # And a real finalized EOD snapshot for that same after-cutover day still works.
+    db.add(DailyRealizedPnlSnapshot(
+        id=uuid.uuid4(), user_id=user.id, day=past, realized_pnl=Decimal("55"),
+        pct=Decimal("0.9"), trade_count=0, source="marked", snapshot_type="eod",
+        hidden=False,
+    ))
+    db.flush()
+    rows2 = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
+                                tz="America/New_York", user_id=None)
+    cell2 = next(r for r in rows2 if r.day == past)
+    assert cell2.day_pnl == Decimal("55") and cell2.source == "broker_reported", \
+        "a real EOD snapshot after cutover resolves authoritative"
 
 
 if __name__ == "__main__":

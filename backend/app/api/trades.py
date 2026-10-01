@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
+from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
@@ -2284,6 +2285,10 @@ def calendar_pnl(
     # Today always keeps the live cell.
     marked_by_day = frozen_marked_by_day(db, target_user_id, from_, to)
     marked_by_day.update(alpaca_marked_by_day(db, target_user_id, from_, to, tz))
+    # Legacy FIFO fallback is allowed ONLY for settled days from BEFORE the
+    # finalized-EOD system went live. On/after this a missing EOD is a real gap
+    # (outage / missed finalization), shown as '--', not silently reconstructed.
+    cutover = get_settings().authoritative_history_start
     out: list[DailyPnL] = []
     for c in sorted(series.values(), key=lambda c: c.day):
         marked = c.marked_pnl                       # calculated marked (diagnostics)
@@ -2327,21 +2332,24 @@ def calendar_pnl(
             pct = day_pnl_pct
             displayed_marked = day_pnl
             source, quality = "broker_reported", "authoritative"
-        elif c.trade_count > 0:
-            # No authoritative broker figure for this settled day (e.g. a Webull
-            # date before finalized EOD snapshots existed — Webull has no history
-            # endpoint). Rather than lose historical visibility entirely, fall
-            # back to the value the OLD calendar showed: our FIFO over the day's
-            # closing trades. For Webull this is capability-gated to PURE closes
-            # (no synthetic expiry losses), so nothing is fabricated or
+        elif c.trade_count > 0 and c.day < cutover:
+            # A settled day from BEFORE the finalized-EOD system existed, with no
+            # authoritative broker figure (e.g. a Webull date — Webull has no
+            # history endpoint). Rather than lose historical visibility entirely,
+            # fall back to the exact number the OLD calendar showed in its bold
+            # headline: "Marked" = realized + that day's unrealized swing
+            # (reconstruction). For Webull realized is capability-gated to PURE
+            # closes (no synthetic expiry losses), so nothing is fabricated or
             # recomputed with new expiry logic. Flagged LEGACY / ESTIMATED — never
             # authoritative — and an EOD snapshot (the `ov` branch) always wins.
             # No % (the old FIFO calendar had no reliable denominator).
-            day_pnl = c.realized_pnl
+            day_pnl = marked
             day_pnl_pct = None
             source, quality = "legacy_calculated", "estimated"
         else:
-            # Truly no data for this day (no broker figure, no trades) → '--'.
+            # Either truly no data (no broker figure, no trades), or a settled day
+            # ON/AFTER the cutover whose EOD snapshot is missing — a real gap we
+            # must NOT paper over with a FIFO reconstruction. Both → '--'.
             source, quality = "none", "unavailable"
         out.append(DailyPnL(
             day=c.day,

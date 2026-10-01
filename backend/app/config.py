@@ -1,3 +1,4 @@
+from datetime import date
 from functools import lru_cache
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -329,6 +330,17 @@ class Settings(BaseSettings):
     # is the realistic duplicate window. The durable guard is the DB unique
     # constraint added in step 3; this only spares us the round-trip.
     discord_ingest_dedup_ttl_s: int = 86400
+
+    # ── Calendar legacy-history cutover ──────────────────────────────────
+    # The day the authoritative finalized-EOD snapshot system went live in
+    # production. BEFORE this date there are no EOD snapshots and never will
+    # be (Webull has no history endpoint), so a settled day with trades may
+    # fall back to the old FIFO reconstruction, flagged legacy/estimated. ON
+    # or AFTER this date a settled day with no EOD snapshot is a real gap
+    # (missed finalization / outage) and must read '--' (unavailable) — never
+    # a silent FIFO fallback that would masquerade as history. Override with
+    # AUTHORITATIVE_HISTORY_START if the deploy date differs per environment.
+    authoritative_history_start: date = date(2026, 10, 1)
 
     @property
     def cors_origins_list(self) -> list[str]:
