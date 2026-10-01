@@ -50,10 +50,10 @@ log = logging.getLogger(__name__)
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
 # Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
 # "small(er) size" and "half size". And "lotto" / "lottos" — a long-shot
-# entry, so half the size too.
+# entry — and "risky", so half the size too.
 _HALF_SIZE_RE = re.compile(
     r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b"
-    r"|\blottos?\b",
+    r"|\blottos?\b|\brisky\b",
     re.IGNORECASE,
 )
 
