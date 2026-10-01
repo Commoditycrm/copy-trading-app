@@ -122,6 +122,13 @@ class DiscordSourceOut(BaseModel):
     # change; everything else describes the trader's channel.
     mirrored: bool = False
 
+    # One-line summaries of how this channel trades, for the pills beside its
+    # status: what an entry does ("Market · 3 contracts · Test") and what
+    # drives exits ("Auto-trim 20% / 35% / 60%", "On trim alerts", "AI
+    # trimming"). Filled on the channel list; None elsewhere.
+    entry_summary: str | None = None
+    exit_summary: str | None = None
+
     model_config = {"from_attributes": True}
 
 

@@ -356,7 +356,7 @@ def list_sources(
     if user.role != UserRole.TRADER:
         pairs = discord_subscribers.sync_mirrors(db, user)
         db.commit()
-        return [_mirror_out(m, p) for m, p in pairs]
+        return [_with_pills(db, user, m.id, _mirror_out(m, p)) for m, p in pairs]
     rows = db.execute(
         select(DiscordAlertSource)
         .where(
@@ -369,7 +369,40 @@ def list_sources(
         )
         .order_by(DiscordAlertSource.created_at.desc())
     ).scalars()
-    return [_to_out(r) for r in rows]
+    return [_with_pills(db, user, r.id, _to_out(r)) for r in rows]
+
+
+def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOut) -> DiscordSourceOut:
+    """Fill the Entry / Exit pills from the settings that apply to this channel
+    (its own, or the account's while it follows them)."""
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+
+    eff = discord_channel_settings.effective(db, user.id, src_id)
+    account = db.get(TraderSettings, user.id)
+    n = int(getattr(eff, "discord_quantity_multiplier", None) or 1)
+    kind = "Market" if discord_channel_settings.entry_order_type(db, src_id) == "market" else "Limit"
+    entry = f"{kind} · {n} contract{'s' if n != 1 else ''}"
+    if not getattr(eff, "discord_live_trading", False):
+        entry += " · Test"
+    if (getattr(eff, "discord_execution_mode", None) or "manual").lower() != "auto":
+        entry += " · Review"
+
+    if getattr(account, "discord_exit_engine", None) == "ai":
+        exit_ = "AI trimming"
+    elif getattr(eff, "discord_auto_trim", False):
+        gates = [
+            g for g in (
+                getattr(eff, "discord_trim_profit_gate_pct", None),
+                getattr(eff, "discord_trim2_profit_gate_pct", None),
+                getattr(eff, "discord_trim3_profit_gate_pct", None),
+            ) if g is not None and Decimal(str(g)) > 0
+        ]
+        exit_ = ("Auto-trim " + " / ".join(f"{_plain(g)}%" for g in gates)) if gates \
+            else "Auto-trim (no profit targets set)"
+    else:
+        exit_ = "On trim alerts"
+    out.entry_summary, out.exit_summary = entry, exit_
+    return out
 
 
 def _mirror_out(mirror: DiscordAlertSource, parent: DiscordAlertSource) -> DiscordSourceOut:
