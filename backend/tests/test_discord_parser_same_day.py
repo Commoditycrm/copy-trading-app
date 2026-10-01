@@ -76,14 +76,14 @@ def test_an_exit_stays_sized_from_the_position():
 
 @pytest.mark.parametrize("words", ["filled lightly", "light", "not heavy", "small size",
                                    "smaller size", "half size", "half-size", "lotto", "LOTTO play",
-                                   "lottos"])
+                                   "lottos", "Risky!", "risky"])
 def test_wordings_that_mean_half_size(words):
     s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
     assert s.half_size is True
 
 
 @pytest.mark.parametrize("words", ["filled", "lighten up", "lightening", "flashlight", "delight", "size up",
-                                   "lottery"])
+                                   "lottery", "risk", "riskier"])
 def test_wordings_that_do_not(words):
     s = _parse(f"BTO SPY 764 Calls Today Expiry @1.02 {words}").signals[0]
     assert s.half_size is False
@@ -101,3 +101,9 @@ def test_tomorrow_wordings_are_the_next_trading_day(words):
 def test_a_friday_tomorrow_is_monday():
     friday = datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc)
     assert _parse("BTO SPY 764 Calls Tomorrow Expiry @2.41", friday).signals[0].expiration == date(2026, 10, 5)
+
+
+def test_risky_on_its_own_line_is_half_size():
+    """Live 2026-10-01: "$SPY 761 CALL 0DTE @0.95" then "Risky!" on the next line."""
+    s = _parse("$SPY 761 CALL 0DTE @0.95\nRisky!").signals[0]
+    assert (s.action.value, s.symbol, str(s.strike), s.half_size) == ("BUY", "SPY", "761", True)
