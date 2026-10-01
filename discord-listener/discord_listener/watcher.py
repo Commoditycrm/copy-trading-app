@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,16 @@ class ChannelWatcher:
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
         self._failures = 0
+        # When the page was (re)opened, and how long to keep it before
+        # recycling — jittered per watcher so they don't all recycle at once.
+        self._connected_at: float | None = None
+        self._max_age_s: float | None = (
+            config.context_max_age_s + random.uniform(0, 1800)
+            if getattr(config, "context_max_age_s", 0) else None
+        )
+        # Set when the run loop ENDS (signed out, or crashed) — the runner
+        # starts a fresh watcher after restart_stopped_after_s.
+        self.finished_at: float | None = None
 
     # ── identity ────────────────────────────────────────────────────────────
 
@@ -133,6 +144,17 @@ class ChannelWatcher:
 
     async def _run(self) -> None:
         """Connect, supervise, and reconnect with backoff until stopped."""
+        try:
+            await self._run_loop()
+        finally:
+            if not self._stopping.is_set():
+                self.finished_at = time.monotonic()
+
+    def is_finished(self) -> bool:
+        """The run loop ended on its own — not stopped by the runner."""
+        return self.finished_at is not None
+
+    async def _run_loop(self) -> None:
         while not self._stopping.is_set():
             try:
                 await self._client.post_status(self.source_id, "connecting")
@@ -141,6 +163,12 @@ class ChannelWatcher:
                 await self._supervise()
             except asyncio.CancelledError:
                 raise
+            except _Recycle:
+                # Planned: a fresh page caps the Discord tab's memory growth.
+                log.info("source=%s recycling its page after %.0f min",
+                         self.source_id, (self._max_age_s or 0) / 60)
+                await self._close_context()
+                continue
             except _SessionExpired as exc:
                 # Terminal without trader action: report and stop retrying.
                 log.warning("source=%s session no longer valid", self.source_id)
@@ -205,6 +233,7 @@ class ChannelWatcher:
         await self._inject_observer()
 
         await self._set_baseline()
+        self._connected_at = time.monotonic()
 
         names = await self._read_names()
         await self._client.post_status(
@@ -220,12 +249,31 @@ class ChannelWatcher:
 
         We never attempt to log in: if the session is dead, only the trader can
         fix it by signing in again themselves.
+
+        One look at the URL is not enough. Discord's client passes through its
+        login route while it reloads (an update, a renderer that crashed under
+        memory pressure), and taking that as a sign-out stopped the watcher for
+        good — the channel stayed down until it was toggled off and on, when the
+        same session connected fine. So a login page is re-checked once, after a
+        pause and a fresh load of the channel, before it counts.
         """
-        url = self._page.url or ""
-        if any(marker in url for marker in _LOGIN_MARKERS):
+        if not self._on_login_page():
+            return
+        log.info("source=%s saw Discord's login page; re-checking before giving up",
+                 self.source_id)
+        await asyncio.sleep(getattr(self._config, "session_recheck_s", 5))
+        try:
+            await self._page.goto(self.channel_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:  # noqa: BLE001 — judged on where the page ends up
+            log.debug("re-check navigation failed", exc_info=True)
+        if self._on_login_page():
             raise _SessionExpired(
                 "Discord signed this session out. Run the login helper again to reconnect."
             )
+
+    def _on_login_page(self) -> bool:
+        url = (self._page.url if self._page is not None else "") or ""
+        return any(marker in url for marker in _LOGIN_MARKERS)
 
     async def _await_channel(self) -> None:
         """Wait for the message list to render, which is what proves the account
@@ -345,6 +393,10 @@ class ChannelWatcher:
 
             if self._page is None or self._page.is_closed():
                 raise _WatcherLost("browser page closed")
+
+            if (self._max_age_s and self._connected_at is not None
+                    and time.monotonic() - self._connected_at > self._max_age_s):
+                raise _Recycle()
 
             # Discord navigated us elsewhere (client reload, channel deleted,
             # session bounce). Go back before the observer's context is gone.
@@ -477,3 +529,7 @@ class _ChannelUnavailable(Exception):
 
 class _WatcherLost(Exception):
     """The browser page went away underneath us."""
+
+
+class _Recycle(Exception):
+    """Planned: the page has been open long enough — re-open it."""

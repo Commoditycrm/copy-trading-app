@@ -16,6 +16,7 @@ channel doesn't take the others down.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 import signal
 from typing import Any
@@ -123,6 +124,17 @@ class ListenerRunner:
                 await self._stop_watcher(source_id)
             elif not watcher.matches(assignment):
                 log.info("source=%s channel changed, restarting watcher", source_id)
+                await self._stop_watcher(source_id, report=False)
+            elif watcher.is_finished() and (
+                time.monotonic() - watcher.finished_at
+                >= self._config.restart_stopped_after_s
+            ):
+                # Its run loop ended on its own (it saw a sign-out, or crashed)
+                # but the channel is still assigned. Before, a stopped watcher
+                # stayed in this map and nothing ever restarted it, so the
+                # channel was down until the trader toggled it off and on. Start
+                # a fresh one: a real sign-out just reports itself again.
+                log.info("source=%s watcher had stopped; starting a fresh one", source_id)
                 await self._stop_watcher(source_id, report=False)
 
         for source_id, assignment in wanted.items():
