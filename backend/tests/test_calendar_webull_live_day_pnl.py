@@ -21,7 +21,9 @@ from sqlalchemy.orm import Session
 from app.api import trades
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.daily_realized_pnl_snapshot import DailyRealizedPnlSnapshot
-from app.models.order import Fill, Order
+from app.models.order import (
+    Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType,
+)
 from app.models.user import User, UserRole
 from app.services import market_hours
 
@@ -157,6 +159,50 @@ def test_historical_day_stays_finalized_during_live_refresh(monkeypatch):
     assert pastc.day_pnl == Decimal("42")
     assert pastc.day_pnl_pct == Decimal("0.5")
     assert pastc.source == "broker_reported"
+
+
+def _filled(db, acct, side, qty, price, when):
+    o = Order(
+        id=uuid.uuid4(), user_id=acct.user_id, broker_account_id=acct.id,
+        instrument_type=InstrumentType.STOCK, symbol="AAA", side=side,
+        order_type=OrderType.MARKET, quantity=Decimal(str(qty)), status=OrderStatus.FILLED,
+        filled_quantity=Decimal(str(qty)), filled_avg_price=Decimal(str(price)),
+        created_at=when, closed_at=when,
+    )
+    db.add(o)
+    db.flush()
+
+
+def test_webull_historical_legacy_fallback(monkeypatch):
+    """A Webull historical day with NO finalized broker figure but with trades
+    falls back to the old FIFO value, flagged legacy_calculated / estimated —
+    restoring visibility without claiming authority."""
+    db, user = _setup(monkeypatch, Decimal("0"))
+    acct = db.query(BrokerAccount).filter(BrokerAccount.user_id == user.id).first()
+    past = date(2026, 9, 15)  # a past Monday
+    t = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+    _filled(db, acct, OrderSide.BUY, 1, 100, t)
+    _filled(db, acct, OrderSide.SELL, 1, 110, t)  # realizes +10
+    today = market_hours.now_et().date()
+    rows = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
+                               tz="America/New_York", user_id=None)
+    cell = next(r for r in rows if r.day == past)
+    assert cell.day_pnl == Decimal("10"), "legacy value = FIFO realized"
+    assert cell.source == "legacy_calculated"
+    assert cell.quality == "estimated"
+    assert cell.day_pnl_pct is None, "no fabricated % for legacy days"
+    # A real finalized EOD snapshot still WINS over legacy.
+    db.add(DailyRealizedPnlSnapshot(
+        id=uuid.uuid4(), user_id=user.id, day=past, realized_pnl=Decimal("99"),
+        pct=Decimal("1.5"), trade_count=0, source="marked", snapshot_type="eod",
+        hidden=False,
+    ))
+    db.flush()
+    rows2 = trades.calendar_pnl(db=db, user=user, from_=past, to=today,
+                                tz="America/New_York", user_id=None)
+    cell2 = next(r for r in rows2 if r.day == past)
+    assert cell2.day_pnl == Decimal("99") and cell2.source == "broker_reported", \
+        "finalized EOD snapshot overrides legacy"
 
 
 if __name__ == "__main__":

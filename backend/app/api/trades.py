@@ -2327,9 +2327,21 @@ def calendar_pnl(
             pct = day_pnl_pct
             displayed_marked = day_pnl
             source, quality = "broker_reported", "authoritative"
+        elif c.trade_count > 0:
+            # No authoritative broker figure for this settled day (e.g. a Webull
+            # date before finalized EOD snapshots existed — Webull has no history
+            # endpoint). Rather than lose historical visibility entirely, fall
+            # back to the value the OLD calendar showed: our FIFO over the day's
+            # closing trades. For Webull this is capability-gated to PURE closes
+            # (no synthetic expiry losses), so nothing is fabricated or
+            # recomputed with new expiry logic. Flagged LEGACY / ESTIMATED — never
+            # authoritative — and an EOD snapshot (the `ov` branch) always wins.
+            # No % (the old FIFO calendar had no reliable denominator).
+            day_pnl = c.realized_pnl
+            day_pnl_pct = None
+            source, quality = "legacy_calculated", "estimated"
         else:
-            # Historical day the broker won't give us (Webull has no history
-            # endpoint) → UNAVAILABLE, not fabricated from FIFO.
+            # Truly no data for this day (no broker figure, no trades) → '--'.
             source, quality = "none", "unavailable"
         out.append(DailyPnL(
             day=c.day,

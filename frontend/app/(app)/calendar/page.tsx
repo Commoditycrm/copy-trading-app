@@ -258,9 +258,13 @@ export default function CalendarPage() {
               title={
                 !has
                   ? undefined
-                  : hasVal
-                    ? `${day.live ? (day.quality === "stale" ? "Last broker value" : "Live") : "Day's P&L"} ${fmtSignedUsd(dayPnl)}${dayPct != null ? ` (${dayPct >= 0 ? "+" : ""}${dayPct.toFixed(2)}%)` : ""} — from your broker on ${key}.${day.live ? " Click to view today's trades." : ""}`
-                    : `No broker Day's P&L available for ${key}`
+                  : !hasVal
+                    ? `No Day's P&L available for ${key}`
+                    : day.live
+                      ? `${day.quality === "stale" ? "Last broker value" : "Live"} ${fmtSignedUsd(dayPnl)}${dayPct != null ? ` (${dayPct >= 0 ? "+" : ""}${dayPct.toFixed(2)}%)` : ""} — from your broker on ${key}.${day.quality === "stale" ? "" : " Click to view today's trades."}`
+                      : day.quality === "estimated"
+                        ? `Day's P&L ${fmtSignedUsd(dayPnl)} — ESTIMATED from your trade history (no finalized broker record for ${key}).`
+                        : `Day's P&L ${fmtSignedUsd(dayPnl)}${dayPct != null ? ` (${dayPct >= 0 ? "+" : ""}${dayPct.toFixed(2)}%)` : ""} — from your broker on ${key}.`
               }
               whileHover={has ? { y: -2 } : undefined}
               transition={{ duration: 0.15 }}
@@ -306,6 +310,12 @@ export default function CalendarPage() {
                     Live
                   </span>
                 ))}
+                {/* Settled day restored from our own trade history (no finalized
+                    broker record) — flag it as an estimate, not authoritative. */}
+                {has && !day?.live && day?.quality === "estimated" && (
+                  <span className="text-[9px] font-semibold uppercase tracking-wide"
+                    style={{ color: "var(--muted)" }} title="Estimated from trade history">est</span>
+                )}
               </div>
               {has && (
                 <div className="mt-auto">
