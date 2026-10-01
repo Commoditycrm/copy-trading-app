@@ -55,6 +55,13 @@ _EXPIRY_RE = re.compile(
     r"\d{1,2}\s*(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC))\b",
     re.IGNORECASE,
 )
+# Same-day expiry said in words: "Today Expiry", "today's expiry", "expiring
+# today", "0DTE", "same day". Resolved to the ET date the alert was POSTED.
+_SAME_DAY_RE = re.compile(
+    r"\b(?:0DTE|ODTE|SAME[-\s]?DAY|TODAY(?:'?S)?(?:\s+EXP(?:IRY|IRATION|IRING|IRES)?)?|"
+    r"EXP(?:IRY|IRING|IRES)?\s+TODAY)\b",
+    re.IGNORECASE,
+)
 _PRICE_RE = re.compile(r"@\s*\$?(?P<price>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)")
 _QTY_RE = re.compile(r"\b(?:X\s*)?(?P<qty>\d{1,5})\s*(?:CONTRACTS?|SHARES?|LOTS?)\b", re.IGNORECASE)
 _ACTION_QTY_RE = re.compile(rf"\b(?:{_BUY_WORDS}|{_SELL_WORDS})\s+(?P<qty>\d{{1,5}})\b", re.IGNORECASE)
@@ -68,10 +75,21 @@ _NOT_TICKERS = {
     "LONG", "SHORT", "CLOSE", "CLOSED", "CLOSING", "EXIT", "TRIM", "ADD", "ENTER", "LOTS",
     "CONTRACTS", "SHARES", "OPEN", "TP", "SL", "RISKY", "LOTTO", "SWING", "DAY",
     "TRIMMING", "TRIMMED", "CLOSING", "ENTERING", "ENTERED", "ADDING", "ADDED",
+    "TODAY", "FILLED", "ODTE",
     "HERE", "MORE", "AGAIN", "BACK", "SOON", "JUST", "ANOTHER",
     "SOON", "NOW", "HERE", "OUT", "IN", "ALL", "SOME", "MORE", "AT", "TO", "THE",
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT", "OCT", "NOV", "DEC",
 }
+
+
+def _et_date(ts):
+    """The US/Eastern calendar date of ``ts`` — an option's "today" is the
+    market's, and an evening ET post is already tomorrow in UTC."""
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    if ts.tzinfo is None:
+        return ts.date()
+    return ts.astimezone(ZoneInfo("America/New_York")).date()
 
 
 class GenericTextParser(Parser):
@@ -155,11 +173,16 @@ class GenericTextParser(Parser):
             return ParseResult.invalid("the alert names a strike but not call or put")
 
         exp_m = _EXPIRY_RE.search(text)
-        if not exp_m:
+        if exp_m:
+            expiry, exp_err = parse_expiry(exp_m.group("exp"), posted_at=message.posted_at)
+            if exp_err:
+                return ParseResult.invalid(exp_err)
+        elif _SAME_DAY_RE.search(text):
+            if message.posted_at is None:
+                return ParseResult.invalid("the alert says today's expiry but has no timestamp")
+            expiry = _et_date(message.posted_at)
+        else:
             return ParseResult.invalid("the alert has no expiry")
-        expiry, exp_err = parse_expiry(exp_m.group("exp"), posted_at=message.posted_at)
-        if exp_err:
-            return ParseResult.invalid(exp_err)
 
         return ParseResult.parsed(
             TradeSignal(
