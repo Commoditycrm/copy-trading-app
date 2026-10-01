@@ -1327,8 +1327,7 @@ export default function DiscordPage() {
                     </button>
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Skips an entry when the whole order&apos;s value (quantity × price,
-                    × 100 for options) is above this. Closes always go through.
+                    Cuts an entry to the most contracts that fit under this total (quantity × price, × 100 for options); skips it only if not even one fits. Closes always go through.
                   </p>
                 </div>
               </div>

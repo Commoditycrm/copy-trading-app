@@ -664,27 +664,43 @@ def test_an_order_at_exactly_the_ceiling_goes_through(monkeypatch):
     assert r.payload.quantity == Decimal("5")
 
 
-def test_an_order_over_the_ceiling_is_skipped_not_trimmed(monkeypatch):
-    """Same choice as the per-contract cap: a ceiling says how much the trader
-    will put into ONE alert, not a budget to spend down. Trimming would take
-    the trade anyway at a size they never chose."""
+def test_an_order_over_the_ceiling_is_trimmed_to_fit(monkeypatch):
+    """6 x $190 = $1,140 is over $1,000; 5 contracts ($950) fit, so 5 are placed."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
-    with pytest.raises(ex.ExecutionRefused, match="max per order"):
+    r = ex.resolve(
+        None, _User(), _signal(quantity="6"),
+        ex.Sizing(multiplier=6, max_per_order=Decimal("1000")),
+    )
+    assert r.payload.quantity == Decimal("5")
+    assert "cut from 6" in r.resolutions["quantity"]
+
+
+def test_an_order_is_skipped_only_when_not_one_contract_fits(monkeypatch):
+    """$190 a contract against a $150 ceiling: nothing fits."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
+    with pytest.raises(ex.ExecutionRefused, match="single contract is worth \\$190.00"):
         ex.resolve(
-            None, _User(), _signal(quantity="6"),   # $1.90 x 100 x 6 = $1,140
-            ex.Sizing(multiplier=6, max_per_order=Decimal("1000")),
+            None, _User(), _signal(quantity="1"),
+            ex.Sizing(multiplier=3, max_per_order=Decimal("150")),
         )
+
+
+def test_a_stock_order_is_trimmed_to_whole_shares():
+    res = {}
+    assert ex._apply_max_per_order(
+        Decimal(10), Decimal("120"), False, ex.Sizing(max_per_order=Decimal("500")), res,
+    ) == Decimal(4)
 
 
 def test_the_multiplier_counts_toward_the_order_ceiling(monkeypatch):
     """The cap is on what actually gets PLACED, so it sees the multiplied size —
     otherwise a 10x multiplier would spend 10x the stated ceiling."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
-    with pytest.raises(ex.ExecutionRefused, match="max per order"):
-        ex.resolve(
-            None, _User(), _signal(quantity="1"),
-            ex.Sizing(multiplier=10, max_per_order=Decimal("1000")),
-        )
+    r = ex.resolve(
+        None, _User(), _signal(quantity="1"),
+        ex.Sizing(multiplier=10, max_per_order=Decimal("1000")),   # 10 x $190, cut to 5
+    )
+    assert r.payload.quantity == Decimal("5")
 
 
 def test_no_order_ceiling_means_no_check(monkeypatch):
@@ -699,11 +715,11 @@ def test_a_cheap_contract_can_still_be_too_big_an_order(monkeypatch):
     """The case the per-contract cap cannot express: each contract is $190,
     well under a $500 per-contract ceiling, but ten of them is a $1,900 order."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
-    with pytest.raises(ex.ExecutionRefused, match="max per order"):
-        ex.resolve(
-            None, _User(), _signal(quantity="10"),
-            ex.Sizing(multiplier=10, max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
-        )
+    r = ex.resolve(
+        None, _User(), _signal(quantity="10"),
+        ex.Sizing(multiplier=10, max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
+    )
+    assert r.payload.quantity == Decimal("5")          # $1,900 cut to $950
 
 
 def test_a_small_order_of_an_expensive_contract_still_fails_per_contract(monkeypatch):
