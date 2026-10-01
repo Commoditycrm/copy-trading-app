@@ -1086,6 +1086,12 @@ def list_my_brokers(
                 pass  # refresh is best-effort; never block the list
     if dirty:
         db.commit()
+    # Attach each account's effective Day P&L refresh interval (transient — not a
+    # column) so the frontend reads one broker-chosen cadence instead of
+    # branching on broker names. Alpaca reuses the runtime knob.
+    from app.brokers.capabilities import effective_day_pnl_interval_s  # noqa: PLC0415
+    for acct in accts:
+        acct.day_pnl_refresh_interval_s = effective_day_pnl_interval_s(acct.broker)
     return accts
 
 

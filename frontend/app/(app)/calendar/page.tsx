@@ -11,7 +11,8 @@ import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { PageLoading } from "@/components/PageLoading";
 import { SearchableSelect } from "@/components/SearchableSelect";
 import { fmtSignedUsd } from "@/lib/format";
-import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
+import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
+import type { BrokerAccount, DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
 function endOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
@@ -52,6 +53,11 @@ export default function CalendarPage() {
   // Sync status — auto-sync fills on mount.
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  // Broker-chosen steady refresh cadence for today's live cell (Alpaca 10s,
+  // Webull 30s) — read from broker metadata, not hardcoded. The fastest
+  // connected account wins. Only set for the SELF view (a subscriber's cell
+  // follows their own brokers, which the trader isn't polling here).
+  const [pollMs, setPollMs] = useState(DEFAULT_DAY_PNL_INTERVAL_MS);
 
   const range = useMemo(() => ({ from: iso(startOfMonth(cursor)), to: iso(endOfMonth(cursor)) }), [cursor]);
 
@@ -92,6 +98,11 @@ export default function CalendarPage() {
             if (!cancelled) { setSubs(items); setSnapshot(CAL_SUBS_KEY, items); }
           }).catch((e) => notify.fromError(e, "Could not load subscribers"));
         }
+        // Read the broker-chosen Day P&L cadence from the existing broker
+        // metadata endpoint (no dedicated polling-config request).
+        api<BrokerAccount[]>("/api/brokers")
+          .then((accts) => { if (!cancelled) setPollMs(dayPnlIntervalMs(accts)); })
+          .catch(() => { /* keep the default cadence */ });
         // Sync our own fills — refreshes the data the calendar reads from.
         setSyncing(true);
         try {
@@ -113,18 +124,19 @@ export default function CalendarPage() {
 
   // Today's cell is LIVE (the broker's own Day's P&L — Webull
   // total_day_profit_loss — or realized + open-position unrealized). While the
-  // month in view contains today, quietly re-fetch every 30s (visible tabs
-  // only), and also on window focus / reconnect / becoming visible, so the
-  // figure stays current after the tab was backgrounded — without flashing the
-  // loader or reloading the page. Only today's month polls; historical-only
-  // months don't (nothing there moves).
+  // month in view contains today, quietly re-fetch at the broker-chosen cadence
+  // (Alpaca 10s, Webull 30s — `pollMs`), VISIBLE tabs only, and also on window
+  // focus / reconnect / becoming visible, so the figure stays current after the
+  // tab was backgrounded — without flashing the loader. A hidden tab doesn't
+  // poll; on becoming visible it refetches immediately, then resumes the
+  // interval. Only today's month polls; historical-only months don't.
   useEffect(() => {
     const today = iso(new Date());
     if (!(range.from <= today && today <= range.to)) return;
     const refresh = () => loadPnL(true);
     const id = setInterval(() => {
       if (document.visibilityState === "visible") refresh();
-    }, 30_000);
+    }, pollMs);
     const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
     window.addEventListener("focus", refresh);
     window.addEventListener("online", refresh);
@@ -135,7 +147,7 @@ export default function CalendarPage() {
       window.removeEventListener("online", refresh);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [range.from, range.to, loadPnL]);
+  }, [range.from, range.to, loadPnL, pollMs]);
 
   const byDay = useMemo(() => {
     const m: Record<string, DailyPnL> = {};

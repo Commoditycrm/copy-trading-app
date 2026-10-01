@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef,
 import { motion } from "framer-motion";
 import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
@@ -581,6 +582,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // Account-level broker Day's P&L for today (same value the Calendar shows).
     // null = broker exposes no live day figure → '--'. A genuine 0.00 stays 0.
     const [dayPnl, setDayPnl] = useState<number | null>(null);
+    // Broker-chosen steady cadence for the Day's P&L card (Alpaca 10s, Webull
+    // 30s), read from broker metadata — same effective value the Calendar uses.
+    const [pollMs, setPollMs] = useState(DEFAULT_DAY_PNL_INTERVAL_MS);
     // Total account value = sum of total_equity across broker accounts (same
     // source as the dashboard "Total equity" KPI). null until first fetch.
     const [totalEquity, setTotalEquity] = useState<number | null>(null);
@@ -648,6 +652,8 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         setTotalEquity(brokers
           .filter(b => b.connection_status === "connected")
           .reduce((acc, b) => acc + (Number(b.total_equity) || 0), 0));
+        // Adopt the broker-chosen Day P&L cadence (same source the Calendar uses).
+        setPollMs(dayPnlIntervalMs(brokers));
         // Never persist a KNOWN-INCOMPLETE view. The snapshot seeds initial
         // state on return nav, so caching a truncated read makes one failed
         // broker call look like a flat account long after it recovered.
@@ -662,7 +668,41 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }, []);
 
+    // Lightweight Day's P&L refetch — ONE broker call (GET /account), the same
+    // broker-aware resolver the Calendar's today cell uses. Used for the steady
+    // high-frequency poll and the focus/visibility/reconnect triggers so those
+    // don't drag the heavier full positions refresh every tick. A failed fetch
+    // keeps the last value (never a fake 0 / '--').
+    const refreshDayPnl = useCallback(async () => {
+      try {
+        const d = await api<{ day_pnl: number | null }>("/api/positions/day-pnl");
+        setDayPnl(d.day_pnl);
+      } catch { /* keep last known value */ }
+    }, []);
+
     useEffect(() => { refresh(); }, [refresh]);
+
+    // Steady Day's P&L cadence at the broker-chosen interval (Alpaca 10s, Webull
+    // 30s — `pollMs`), VISIBLE tabs only; plus an immediate refetch on focus,
+    // reconnect (online) and the tab becoming visible. A hidden tab doesn't poll
+    // (the interval is gated and the browser throttles it anyway); on return to
+    // visible it refetches at once, then resumes the interval. Full positions
+    // refresh stays event-driven (mount + SSE) — this only keeps the card fresh.
+    useEffect(() => {
+      const id = setInterval(() => {
+        if (document.visibilityState === "visible") refreshDayPnl();
+      }, pollMs);
+      const onVisible = () => { if (document.visibilityState === "visible") refreshDayPnl(); };
+      window.addEventListener("focus", refreshDayPnl);
+      window.addEventListener("online", refreshDayPnl);
+      document.addEventListener("visibilitychange", onVisible);
+      return () => {
+        clearInterval(id);
+        window.removeEventListener("focus", refreshDayPnl);
+        window.removeEventListener("online", refreshDayPnl);
+        document.removeEventListener("visibilitychange", onVisible);
+      };
+    }, [pollMs, refreshDayPnl]);
 
     useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 

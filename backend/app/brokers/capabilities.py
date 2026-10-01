@@ -26,6 +26,8 @@ _CAPS: dict[BrokerName, BrokerCapabilities] = {
         authoritative_open_pnl=True,
         authoritative_position_day_pnl=True,  # unrealized_intraday_pl / _plpc
         portfolio_history=True,
+        account_pnl_push=False,             # TradingStream/SSE triggers a refresh, not the value
+        recommended_refresh_interval_s=10,  # per-account key, 200 req/min — ample headroom
     ),
     # SnapTrade: complete get_account_activities feed (so realized/expiry is
     # sourceable) + current balances/positions. No marked history series.
@@ -41,6 +43,8 @@ _CAPS: dict[BrokerName, BrokerCapabilities] = {
         live_daily_pnl=True,
         authoritative_open_pnl=True,
         authoritative_position_day_pnl=True,  # day_profit_loss per position
+        account_pnl_push=False,
+        recommended_refresh_interval_s=30,  # 2 reads / 2s window — no room to poll faster
     ),
     # IBKR: not verified for this app; declare nothing until checked.
     BrokerName.IBKR: BrokerCapabilities(),
@@ -61,3 +65,23 @@ def capabilities_for(broker: BrokerName | None) -> BrokerCapabilities:
     if broker is None:
         return BrokerCapabilities()
     return _CAPS.get(broker, BrokerCapabilities())
+
+
+def effective_day_pnl_interval_s(broker: BrokerName | None) -> int:
+    """The single effective client refresh interval for a broker's account Day
+    P&L surfaces, surfaced to the frontend so it never invents its own value.
+
+    Alpaca reuses the EXISTING admin/runtime knob (Redis-backed, clamped
+    1–300s, default 10) so there is exactly one Alpaca interval across backend
+    polling and the UI; every other broker uses its static
+    ``recommended_refresh_interval_s``."""
+    caps = capabilities_for(broker)
+    if broker == BrokerName.ALPACA:
+        try:
+            from app.services.platform_config import (  # noqa: PLC0415
+                get_alpaca_pnl_poll_interval_sync,
+            )
+            return int(get_alpaca_pnl_poll_interval_sync())
+        except Exception:  # noqa: BLE001 — knob unreachable → static default
+            return caps.recommended_refresh_interval_s
+    return caps.recommended_refresh_interval_s

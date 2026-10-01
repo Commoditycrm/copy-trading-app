@@ -140,6 +140,12 @@ class BrokerAccountOut(BaseModel):
     # account on the same Webull app key was deactivated. Transient, never stored.
     notice: str | None = None
 
+    # Effective steady refresh interval (seconds) for this account's Day P&L
+    # surfaces (calendar today + top card). From broker capabilities (Alpaca
+    # reuses the runtime knob); the frontend reads it here instead of hardcoding
+    # per-broker intervals. 30 is the safe default.
+    day_pnl_refresh_interval_s: int = 30
+
     model_config = {"from_attributes": True}
 
 

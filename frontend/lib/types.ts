@@ -106,6 +106,10 @@ export interface BrokerAccount {
   auto_pull_orders: boolean;
   bring_open_orders: boolean;
   bring_filled_orders: boolean;
+
+  // Broker-chosen steady refresh interval (seconds) for this account's Day P&L
+  // surfaces. The UI reads this instead of hardcoding per-broker intervals.
+  day_pnl_refresh_interval_s?: number;
 }
 
 

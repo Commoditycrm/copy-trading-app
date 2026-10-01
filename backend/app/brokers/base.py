@@ -44,6 +44,19 @@ class BrokerCapabilities:
     authoritative_realized_pnl: bool = False
     # Broker exposes a marked portfolio-history series (Alpaca).
     portfolio_history: bool = False
+    # Broker PUSHES the authoritative ACCOUNT Day P&L metric to us directly (a
+    # stream that carries account equity / Day P&L, not just order events).
+    # False for every broker we integrate today: Alpaca's TradingStream and our
+    # order SSE are an immediate REFRESH TRIGGER, not the P&L source itself, so
+    # the account figure is always a polled GET. Keep False unless a real
+    # account-P&L push exists.
+    account_pnl_push: bool = False
+    # Steady client refresh interval (seconds) for the account Day P&L surfaces
+    # (calendar today cell + top card). Chosen per broker from its rate limits:
+    # Alpaca 10s (200 req/min per-account key, ample headroom), Webull 30s (its
+    # 2-reads/2s window gives no room to poll faster). The frontend reads this
+    # from broker metadata rather than branching on broker names.
+    recommended_refresh_interval_s: int = 30
 
 
 @dataclass(frozen=True)
