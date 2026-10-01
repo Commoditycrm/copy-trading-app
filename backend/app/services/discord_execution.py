@@ -856,17 +856,16 @@ def order_value(qty: Decimal, limit_price: Decimal, is_option: bool) -> Decimal:
 
 
 def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> Decimal:
-    """Skip an entry whose TOTAL cost is above the trader's ceiling.
+    """Fit an entry under the trader's ceiling on the WHOLE order's value.
 
     Distinct from _apply_max_per_contract, and deliberately so: that one asks
     what a single contract costs, this one asks what the whole order costs. Ten
     contracts at $50 is a cheap contract and a $500 order, so an alert can pass
     either check and fail the other. Neither reads the other's value.
 
-    Skipped rather than trimmed, for the same reason as the per-contract cap: a
-    ceiling like this says how much the trader is willing to put into ONE alert,
-    not a budget to spend down. Trimming would take the trade anyway at a size
-    they never chose.
+    Over the ceiling, the order is TRIMMED to the most whole contracts (shares)
+    that fit, so the trade still happens at a size within the limit. Only when
+    not even one fits is it skipped.
 
     Applies to stocks as well as options — an order's value is an order's value
     — and never to a close: you must always be able to exit what you hold.
@@ -877,13 +876,22 @@ def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> De
     if qty is None or qty <= 0:
         return qty
 
-    total = order_value(Decimal(str(qty)), limit_price, is_option)
-    if total > cap:
+    qty = Decimal(str(qty))
+    total = order_value(qty, limit_price, is_option)
+    if total <= cap:
+        return qty
+    per_unit = order_value(Decimal(1), limit_price, is_option)
+    fit = (cap / per_unit).to_integral_value(rounding=ROUND_FLOOR)
+    if fit < 1:
         raise ExecutionRefused(
-            f"This order is worth ${total:.2f}, above your "
-            f"${cap:.2f} max per order."
+            f"A single {'contract' if is_option else 'share'} is worth ${per_unit:.2f}, "
+            f"above your ${cap:.2f} max per order."
         )
-    return qty
+    resolutions["quantity"] = (
+        f"{fit} (cut from {qty} to stay within your ${cap:.2f} max per order — "
+        f"${order_value(fit, limit_price, is_option):.2f})"
+    )
+    return fit
 
 
 def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side, resolutions):
