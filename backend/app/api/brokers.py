@@ -1043,6 +1043,34 @@ def connect(
     return acct
 
 
+@router.get("/webull-usage")
+def webull_usage_summary(
+    minutes: int = Query(5, ge=1, le=60),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """How many requests went to Webull for YOUR app key(s) in the last
+    ``minutes``, split by what made them (Positions page, order poll, P&L poller,
+    auto-trim, sign-in …) and by Webull endpoint. Counted across the web and
+    worker processes; see services/webull_usage.py. Reads only our own counters
+    — it never calls Webull itself."""
+    from app.services import webull_usage  # noqa: PLC0415
+
+    keys = []
+    for acct in db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id, BrokerAccount.broker == BrokerName.WEBULL,
+        )
+    ).scalars():
+        try:
+            keys.append(str(decrypt_json(acct.encrypted_credentials).get("app_key") or ""))
+        except Exception:  # noqa: BLE001
+            continue
+    out = webull_usage.summary(keys, minutes)
+    out["has_webull"] = bool(keys)
+    return out
+
+
 @router.get("/features")
 def broker_features(user: User = Depends(current_user)) -> dict:
     """Client-facing broker feature flags for the Brokers page. Lets the picker

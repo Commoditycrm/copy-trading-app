@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -187,6 +187,15 @@ class TraderSettings(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False,
     )
 
+    # Manual exits: Kopyya never sells a position on its own. The channel's exit
+    # alerts are recorded but not acted on, auto-trim does not fire and AI
+    # trimming leaves the position alone — the trader closes it by hand (the
+    # Positions page, or an exit typed into the alert composer). The third
+    # choice beside "wait for the alert" and discord_auto_trim; when set it wins.
+    discord_manual_exit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # How much of what is STILL HELD each rung sells. Of the remainder, not of
     # the original position — that is what makes the rungs compose: 50/50/100
     # works a position of 4 down as 2, then 1, then 1, which is what the ladder
@@ -201,6 +210,32 @@ class TraderSettings(Base, TimestampMixin):
     discord_trim3_qty_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("100"), server_default="100", nullable=False,
     )
+
+    # Take-profit orders: each trim rests at the broker as a real limit order
+    # (paired with its stop where the broker links the two), instead of Kopyya
+    # watching the price and selling at market. The fourth exit choice; Manual
+    # wins over it, and it wins over discord_auto_trim. On a broker with no
+    # linked take-profit/stop pair it behaves as auto-trim does.
+    discord_tp_orders: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
+    # ── a ladder of any length ───────────────────────────────────────────────
+    # How many trims the ladder has. The first three live in the columns above
+    # (so a ladder nobody has touched reads exactly as it always did); trims
+    # past the third are in ``discord_extra_trims``, one
+    # {"profit_gate_pct", "stop_pct", "qty_pct"} object each, in order.
+    # Read them through services/discord_ladder.rungs(), never directly.
+    discord_trim_count: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False,
+    )
+    discord_extra_trims: Mapped[list] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), default=list, server_default="[]", nullable=False,
+    )
+    # "On Fill": where the stop goes the moment the entry fills, as a return
+    # from entry (-25 = 25% below). NULL = no stop until the first trim, which
+    # is how the ladder behaved before this existed.
+    discord_fill_stop_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
 
     # Entry price above which an exit trails instead of going to market.
     discord_trim_price_threshold: Mapped[Decimal] = mapped_column(

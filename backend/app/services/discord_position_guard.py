@@ -32,7 +32,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from sqlalchemy import or_ as sa_or, select
 from sqlalchemy.orm import Session
@@ -91,11 +91,24 @@ class TrimConfig:
     trim3: RungConfig = RungConfig(Decimal("0"), Decimal("0"), Decimal("100"))
     price_threshold: Decimal = Decimal("0.90")  # above this, exits trail
     trail_amount: Decimal = Decimal("0.25")     # dollar give-back that triggers
+    # The whole ladder, when it is not the classic three: any number of trims,
+    # in order (services/discord_ladder builds it from the settings). When set
+    # it is the ladder; trim1..trim3 above are then not consulted.
+    rungs: tuple[RungConfig, ...] | None = None
+
+    def ladder(self) -> tuple[RungConfig, ...]:
+        return self.rungs if self.rungs else (self.trim1, self.trim2, self.trim3)
+
+    @property
+    def count(self) -> int:
+        """How many trims the ladder has."""
+        return len(self.ladder())
 
     def rung(self, n: int) -> RungConfig:
-        """This rung's settings. Rungs past the third reuse the third's — the
-        ladder has three steps and anything beyond is a repeat of the last."""
-        return {1: self.trim1, 2: self.trim2}.get(n, self.trim3)
+        """This rung's settings. Rungs past the last reuse the last one's — an
+        exit alert that arrives after the ladder is spent repeats its final step."""
+        seq = self.ladder()
+        return seq[n - 1] if 1 <= n <= len(seq) else seq[-1]
 
 
 @dataclass
@@ -139,6 +152,40 @@ def _slice(held: Decimal, pct: Decimal | None) -> Decimal:
         return Decimal(0)
     want = (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_CEILING)
     return want if want < held else held
+
+
+# In a plan's note when the last trim rounded down to nothing: the rung is spent
+# on purpose (auto-trim must not hand it back and fire it again every sweep).
+RUNNER_NOTE = "runner left"
+
+
+def _slice_down(held: Decimal, pct: Decimal | None) -> Decimal:
+    """``pct`` percent of what is still held, rounded DOWN to a whole contract.
+
+    The LAST trim's rule when it is not 100%: whatever the percentage does not
+    cleanly take stays on as a runner. Every earlier trim rounds UP (see _slice)
+    so it can never be a no-op; the last one is where the trader has said they
+    want something left, so it never takes more than asked — 50% of 3 sells 1
+    and leaves 2, and 50% of 1 sells nothing and leaves the 1.
+    """
+    if held <= 0:
+        return Decimal(0)
+    pct = Decimal(str(pct if pct is not None else 50))
+    if pct <= 0:
+        return Decimal(0)
+    return (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_FLOOR)
+
+
+def rung_quantity(cfg: "TrimConfig", rung: int, held: Decimal) -> tuple[Decimal, bool]:
+    """How many contracts this trim sells out of ``held``, and whether it is a
+    last trim that leaves a runner. One rule for a trim fired by an alert, by
+    auto-trim, and for a take-profit order resting at the broker — the three
+    must agree on the size or the ladder walks differently depending on how a
+    trim happened to fire."""
+    rung_cfg = cfg.rung(rung)
+    leaves_runner = rung >= cfg.count and Decimal(str(rung_cfg.qty_pct)) < Decimal(100)
+    sell = _slice_down(held, rung_cfg.qty_pct) if leaves_runner else _slice(held, rung_cfg.qty_pct)
+    return sell, leaves_runner
 
 
 def plan_exit(
@@ -220,7 +267,18 @@ def plan_exit(
     # How much leaves: this rung's configured share of what is still held.
     # The defaults (50 / 50 / 100) reproduce the ladder exactly as it behaved
     # before the size was configurable.
-    sell = _slice(held, rung_cfg.qty_pct)
+    #
+    # The LAST trim, when it is not 100%, rounds DOWN and leaves the balance as
+    # a runner, still protected by this trim's stop.
+    sell, leaves_runner = rung_quantity(cfg, rung, held)
+    if leaves_runner and sell <= 0:
+        return TrimPlan(
+            rung=rung, guard=guard,
+            new_stop_price=_armable_stop(stop, mark),
+            note=(f"trim {rung}: last trim at {rung_cfg.qty_pct.normalize():f}% of {held} "
+                  f"rounds down to 0 — {RUNNER_NOTE}"
+                  + (f", stop {stop.quantize(Decimal('0.0001'))}" if stop is not None else "")),
+        )
 
     # The 1st trim always goes to market. Later rungs ride an expensive contract
     # out on a trailing give-back instead — a cheap one isn't worth trailing.
@@ -240,7 +298,8 @@ def plan_exit(
         # Nothing left to protect if this rung takes the whole position.
         new_stop_price=(None if takes_everything else _armable_stop(stop, mark)),
         retire=(takes_everything and style == MARKET),
-        note=f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}",
+        note=(f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}"
+              + (f" — {held - sell} {RUNNER_NOTE}" if leaves_runner and sell < held else "")),
     )
 
 
@@ -326,6 +385,25 @@ def find(db: Session, user_id: uuid.UUID, symbol: str, strike, right, expiry):
     return db.execute(
         _match(select(DiscordPositionGuard), user_id, symbol, strike, right, expiry)
     ).scalars().first()
+
+
+def assigned(db: Session, user_id: uuid.UUID, symbol: str | None = None) -> list[DiscordPositionGuard]:
+    """Live guards the trader assigned to a channel by hand (``source_id`` set),
+    newest first — optionally only one symbol's."""
+    q = select(DiscordPositionGuard).where(
+        DiscordPositionGuard.user_id == user_id,
+        DiscordPositionGuard.closed_at.is_(None),
+        DiscordPositionGuard.source_id.isnot(None),
+    )
+    if symbol:
+        q = q.where(DiscordPositionGuard.symbol == symbol.upper())
+    return list(db.execute(q.order_by(DiscordPositionGuard.created_at.desc())).scalars())
+
+
+def contract_key(strike, right, expiry) -> tuple:
+    """(strike, right, expiry) with the right as its plain value — a guard
+    stores "call"/"put", a broker position carries the enum."""
+    return (strike, getattr(right, "value", right) or None, expiry)
 
 
 def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
@@ -459,6 +537,7 @@ def on_buy(
             )
             guard.entry_price = entry_price
             guard.entry_order_id = entry_order_id
+            guard.fill_stop_done = False      # a new holding: its On Fill stop is still to come
         elif guard.entry_order_id is None and entry_order_id is not None:
             guard.entry_order_id = entry_order_id
         return guard
@@ -555,6 +634,18 @@ def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
     history survives and a new position can reuse the same contract."""
     guard.closed_at = datetime.now(timezone.utc)
     guard.closed_reason = reason[:120]
+
+
+def live(db: Session, user_id: uuid.UUID) -> list[DiscordPositionGuard]:
+    """Every live guard of one trader, armed or not."""
+    return list(
+        db.execute(
+            select(DiscordPositionGuard).where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.closed_at.is_(None),
+            )
+        ).scalars()
+    )
 
 
 def armed(db: Session) -> list[DiscordPositionGuard]:

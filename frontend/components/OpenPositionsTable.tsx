@@ -1,22 +1,25 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
+import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import { fmtDate, fmtDateTimeMs, fmtDuration, fmtUsd, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
+import { HEADER_STATS_SLOT_ID } from "@/lib/headerSlot";
 import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
 import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
 import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
+import { DiscordAlertComposer } from "@/components/DiscordAlertComposer";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { BrokerAccount, Order, Position, PositionsPayload, UnreachableAccount, User } from "@/lib/types";
+import type { BrokerAccount, Order, Position, PositionsPayload, StaleAccount, UnreachableAccount, User } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -32,6 +35,39 @@ function fmtNum(n: string | null | undefined, dp = 2): string {
  *  ticker for stocks / the OCC for options (both streamed now), or null when
  *  unbuildable — then it falls through to the fallback. Own component so the
  *  hook stays out of the row's .map(). */
+/** The row's Limit box. Until the trader types in it, it shows — and follows —
+ *  the same live price as the Current price column, so a Close / Avg. at limit
+ *  starts from where the contract is trading. Once they edit it their value
+ *  sticks; ``onDefault`` hands the shown price to the buttons. */
+function LimitPriceInput({
+  symbol, fallback, value, onChange, onDefault, ariaLabel, className, style,
+}: {
+  symbol: string | null;
+  fallback: string | null;
+  value: string | undefined;
+  onChange: (v: string) => void;
+  onDefault: (v: string) => void;
+  ariaLabel: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  const live = useLivePrice(symbol, fallback);
+  const px = live == null ? Number(fallback) : Number(live);
+  const shown = Number.isFinite(px) && px > 0 ? px.toFixed(2) : "";
+  useEffect(() => { onDefault(shown); }, [shown]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <input
+      type="number" step="0.01" min="0.01"
+      placeholder="Limit"
+      aria-label={ariaLabel}
+      value={value ?? shown}
+      onChange={(e) => onChange(e.target.value)}
+      className={className}
+      style={style}
+    />
+  );
+}
+
 function LiveCurrentPriceCell({ symbol, fallback }: { symbol: string | null; fallback: string | null }) {
   const live = useLivePrice(symbol, fallback);
   return <td className="px-5 py-3.5 num">{fmtNum(live == null ? fallback : String(live), 2)}</td>;
@@ -374,8 +410,8 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
  *  Own component so a tick only re-renders these tiles, not the whole table.
  *  Sums each visible stock row's live delta (same signed_qty × Δprice as the
  *  per-row cells) on top of the backend baseline; 0 until ticks arrive. */
-function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
-  positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string;
+function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub, compact }: {
+  positions: Position[]; baselinePnl: number; baselineMv: number; mvSub: string; compact?: boolean;
 }) {
   // Each streamable row → its cache key (ticker or OCC), contract multiplier,
   // snapshot price and signed qty. Stocks and options both stream now.
@@ -405,10 +441,10 @@ function LiveTotalsTiles({ positions, baselinePnl, baselineMv, mvSub }: {
     <>
       <SummaryTile label="Unrealized P&L" tone={pnl > 0 ? "good" : pnl < 0 ? "bad" : "neutral"}
         node={<AnimatedNumber value={pnl} format={fmtSignedUsd} className="num" />}
-        sub="On open positions" />
+        sub="On open positions" compact={compact} />
       <SummaryTile label="Market value" tone="neutral"
         node={<AnimatedNumber value={mv} format={fmtUsd} className="num" />}
-        sub={mvSub} />
+        sub={mvSub} compact={compact} />
     </>
   );
 }
@@ -435,9 +471,22 @@ function optionExpiryShort(isoDate: string): string {
   return `${d.getUTCDate()} ${mon} ${String(d.getUTCFullYear()).slice(-2)}`;
 }
 
+/** The direction of the bet, not of the holding: a put you BOUGHT (or a call
+ *  you sold) gains when the price falls, so it reads "Short"; a call you bought
+ *  (or a put you sold) reads "Long". Stocks: the sign of the quantity. */
+function positionDirection(
+  p: Pick<Position, "quantity" | "instrument_type" | "option_right">,
+): "long" | "short" {
+  const holds = Number(p.quantity) > 0;
+  const bearishContract = p.instrument_type === "option" && p.option_right === "put";
+  return holds !== bearishContract ? "long" : "short";
+}
+
 /** Full descriptor shown in the Symbol column, Webull style:
  *  stock  → "META";  option → "META C $372 10 Jul 26". */
-function positionSymbolLabel(p: Position): string {
+export function positionSymbolLabel(
+  p: Pick<Position, "symbol" | "instrument_type" | "option_right" | "option_strike" | "option_expiry">,
+): string {
   if (p.instrument_type !== "option") return p.symbol.toUpperCase();
   const cp = p.option_right === "call" ? "C" : p.option_right === "put" ? "P" : "";
   const strike = p.option_strike != null && p.option_strike !== ""
@@ -489,7 +538,7 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
   | "channel" | "symbol" | "quantity" | "avg_entry_price" | "current_price"
-  | "market_value" | "net_liq" | "unrealized_pnl" | "day_pnl" | "expires";
+  | "market_value" | "net_liq" | "unrealized_pnl" | "day_pnl" | "day_pnl_pct" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
@@ -503,6 +552,7 @@ function sortValue(p: Position, key: SortKey): number | string {
     case "net_liq": return (Number(p.current_price) || 0) * (Number(p.quantity) || 0) * (p.instrument_type === "option" ? 100 : 1);
     case "unrealized_pnl": return Number(p.unrealized_pnl) || 0;
     case "day_pnl": return p.day_pnl != null ? Number(p.day_pnl) : Number.NEGATIVE_INFINITY;
+    case "day_pnl_pct": return p.day_pnl_pct != null ? Number(p.day_pnl_pct) : Number.NEGATIVE_INFINITY;
     case "expires": return p.option_expiry ? daysUntil(p.option_expiry) : Number.POSITIVE_INFINITY;
   }
 }
@@ -516,8 +566,21 @@ export interface OpenPositionsTableHandle {
  *  fill, so the positions view can still change. */
 const WORKING_STATUSES = new Set(["pending", "submitted", "accepted", "partially_filled"]);
 
-export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { className?: string; fillHeight?: boolean }>(
-  function OpenPositionsTable({ className, fillHeight }, ref) {
+export const OpenPositionsTable = forwardRef<
+  OpenPositionsTableHandle,
+  // statsInHeader: show the summary figures in the app header (AppShell's
+  // HEADER_STATS_SLOT_ID) instead of as tiles above the table, on screens wide
+  // enough for it. Same numbers, same fetches — no extra broker calls.
+  // discordComposer: put the Discord alert composer (button + popup) left of
+  // the symbol search — for accounts with Discord trading only.
+  // toolbarActions: extra controls placed right after the All / Options / Stocks
+  // pills (the Positions page puts the bulk exit / cancel buttons there).
+  {
+    className?: string; fillHeight?: boolean; statsInHeader?: boolean; discordComposer?: boolean;
+    toolbarActions?: React.ReactNode;
+  }
+>(
+  function OpenPositionsTable({ className, fillHeight, statsInHeader, discordComposer, toolbarActions }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
     // return nav, then refresh() below revalidates. Cleared on logout.
     // The Channel column is only meaningful to a trader who has Discord — for
@@ -542,6 +605,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       { id: "unrealized_pnl", header: "Unrealized P&L" },
       { id: "pnl_pct", header: "P&L %" },
       { id: "day_pnl", header: "Day's P&L" },
+      { id: "day_pnl_pct", header: "Day's P&L %" },
       { id: "avg_entry", header: "Avg entry" },
       { id: "current_price", header: "Current price" },
       { id: "pdc", header: "PDC" },
@@ -579,6 +643,9 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // hold nothing", which is exactly the wrong thing to tell someone whose
     // broker just failed to answer.
     const [unreachable, setUnreachable] = useState<UnreachableAccount[]>([]);
+    // Accounts listed from the last snapshot because the broker rate-limited
+    // the live read — shown, with their age, rather than left out.
+    const [stale, setStale] = useState<StaleAccount[]>([]);
     // Account-level broker Day's P&L for today (same value the Calendar shows).
     // null = broker exposes no live day figure → '--'. A genuine 0.00 stays 0.
     const [dayPnl, setDayPnl] = useState<number | null>(null);
@@ -589,8 +656,26 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // source as the dashboard "Total equity" KPI). null until first fetch.
     const [totalEquity, setTotalEquity] = useState<number | null>(null);
     const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
+    // The user's Discord channels, for the editable Channel cell.
+    const [channels, setChannels] = useState<{ id: string; label: string }[]>([]);
+    const [channelBusy, setChannelBusy] = useState<string | null>(null);
+    // The row whose Channel cell is showing its dropdown (opened by the pencil).
+    const [editingChannel, setEditingChannel] = useState<string | null>(null);
+    useEffect(() => {
+      if (!showChannel) return;
+      api<{ id: string; label: string | null; channel_name?: string | null }[]>("/api/discord-sources")
+        .then((rows) => setChannels(rows.map((r) => ({ id: r.id, label: r.label?.trim() || r.channel_name?.trim() || "Channel" }))))
+        .catch(() => { /* Self and the current name are still offered */ });
+    }, [showChannel]);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
+    // The live price each row's Limit box shows while the trader hasn't typed
+    // in it (LimitPriceInput). A ref: it follows every tick without re-rendering.
+    const limitDefaults = useRef<Record<string, string>>({});
+    const limitFor = (key: string) => closeLimitPrices[key] ?? limitDefaults.current[key] ?? "";
+    // Back to following the live price (after an order went out).
+    const resetLimit = (key: string) =>
+      setCloseLimitPrices((s) => { const n = { ...s }; delete n[key]; return n; });
     // Positions whose stop row (down arrow in Actions) is open.
     const [expanded, setExpanded] = useState<Record<string, boolean>>({});
     // Per row, what each split button does: close the position, or average
@@ -643,6 +728,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         setPositions(pos);
         setOrders(ords);
         setUnreachable(down);
+        setStale(payload.stale ?? []);
         workingRef.current = ords.some((o) => WORKING_STATUSES.has(o.status));
         // dpnl.day_pnl may be a number, or null (broker exposes no live day
         // figure → '--'); a failed fetch (dpnl === null) keeps the last value.
@@ -668,41 +754,55 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }, []);
 
-    // Lightweight Day's P&L refetch — ONE broker call (GET /account), the same
-    // broker-aware resolver the Calendar's today cell uses. Used for the steady
-    // high-frequency poll and the focus/visibility/reconnect triggers so those
-    // don't drag the heavier full positions refresh every tick. A failed fetch
-    // keeps the last value (never a fake 0 / '--').
-    const refreshDayPnl = useCallback(async () => {
+    // Lightweight LIVE refetch for the steady poll + focus/visibility/reconnect
+    // triggers. Updates the financial fields that move intraday — the POSITION
+    // rows (day_pnl, day_pnl_pct, unrealized_pnl, open_pnl_pct, current_price,
+    // market_value, all straight from /api/positions) AND the account card
+    // (/api/positions/day-pnl) — WITHOUT the heavier /api/trades + /api/brokers
+    // calls the full refresh() makes. Broker cost is the same one coalesced
+    // get_positions the display already uses, plus the one-call account snapshot.
+    // Row UI state (close %, search, menus, expanded) lives in separate keyed
+    // state, so replacing the positions array leaves it intact — no page reset.
+    // reqSeq-guarded against the full refresh() so neither clobbers the other;
+    // a transient failure keeps the last values rather than blanking the table.
+    const refreshLive = useCallback(async () => {
+      const seq = ++reqSeq.current;
       try {
-        const d = await api<{ day_pnl: number | null }>("/api/positions/day-pnl");
-        setDayPnl(d.day_pnl);
-      } catch { /* keep last known value */ }
+        const [payload, dpnl] = await Promise.all([
+          api<PositionsPayload>("/api/positions?detail=1"),
+          api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null),
+        ]);
+        if (seq !== reqSeq.current) return;
+        setPositions(payload.positions ?? []);
+        setUnreachable(payload.unreachable ?? []);
+        setStale(payload.stale ?? []);
+        if (dpnl) setDayPnl(dpnl.day_pnl);
+      } catch { /* keep last known values — a hiccup must not blank the table */ }
     }, []);
 
     useEffect(() => { refresh(); }, [refresh]);
 
-    // Steady Day's P&L cadence at the broker-chosen interval (Alpaca 10s, Webull
-    // 30s — `pollMs`), VISIBLE tabs only; plus an immediate refetch on focus,
-    // reconnect (online) and the tab becoming visible. A hidden tab doesn't poll
-    // (the interval is gated and the browser throttles it anyway); on return to
-    // visible it refetches at once, then resumes the interval. Full positions
-    // refresh stays event-driven (mount + SSE) — this only keeps the card fresh.
+    // Steady LIVE cadence at the broker-chosen interval (Alpaca 10s, Webull 30s —
+    // `pollMs`), VISIBLE tabs only; plus an immediate refetch on focus, reconnect
+    // (online) and the tab becoming visible. A hidden tab doesn't poll (gated +
+    // the browser throttles it); on return to visible it refetches at once, then
+    // resumes. This keeps BOTH the position-row Day P&L and the account card
+    // live; the full refresh() (with orders) stays event-driven (mount + SSE).
     useEffect(() => {
       const id = setInterval(() => {
-        if (document.visibilityState === "visible") refreshDayPnl();
+        if (document.visibilityState === "visible") refreshLive();
       }, pollMs);
-      const onVisible = () => { if (document.visibilityState === "visible") refreshDayPnl(); };
-      window.addEventListener("focus", refreshDayPnl);
-      window.addEventListener("online", refreshDayPnl);
+      const onVisible = () => { if (document.visibilityState === "visible") refreshLive(); };
+      window.addEventListener("focus", refreshLive);
+      window.addEventListener("online", refreshLive);
       document.addEventListener("visibilitychange", onVisible);
       return () => {
         clearInterval(id);
-        window.removeEventListener("focus", refreshDayPnl);
-        window.removeEventListener("online", refreshDayPnl);
+        window.removeEventListener("focus", refreshLive);
+        window.removeEventListener("online", refreshLive);
         document.removeEventListener("visibilitychange", onVisible);
       };
-    }, [pollMs, refreshDayPnl]);
+    }, [pollMs, refreshLive]);
 
     useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
@@ -764,7 +864,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     async function closePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
       if (type === "limit") {
-        const price = closeLimitPrices[key];
+        const price = limitFor(key);
         if (!price || Number(price) <= 0) {
           notify.warn("Enter a limit price");
           return;
@@ -780,13 +880,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       try {
         const body: Record<string, unknown> = { order_type: type };
         if (pct < 100) body.quantity = String(qty);   // 100% lets the backend default to full size
-        if (type === "limit") body.limit_price = closeLimitPrices[key];
+        if (type === "limit") body.limit_price = limitFor(key);
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
         notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} ×${qty} (${type})`);
-        if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+        if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
         notify.fromError(e, "close failed");
@@ -817,10 +917,46 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }
     }
 
+    /** Assign this position to a channel ("self", a channel id, or "auto" to go
+     *  back to the channel whose alert opened it). */
+    async function assignChannel(p: Position, value: string) {
+      if (!value) return;
+      const key = posKey(p);
+      const name = value === "self" ? "Self"
+        : value === "auto" ? null
+        : channels.find((c) => c.id === value)?.label ?? "that channel";
+      const what = positionSymbolLabel(p);
+      const ask = name
+        ? `Assign ${what} to ${name}? ${name}'s exit settings will manage this position from now on.`
+        : `Reset ${what} to the channel that opened it?`;
+      if (!confirm(ask)) return;
+      setChannelBusy(key);
+      try {
+        const isOption = p.instrument_type === "option";
+        await api("/api/positions/channel", {
+          method: "POST",
+          body: JSON.stringify({
+            symbol: p.symbol,
+            option_strike: isOption ? p.option_strike : null,
+            option_right: isOption ? p.option_right : null,
+            option_expiry: isOption && p.option_expiry ? p.option_expiry.slice(0, 10) : null,
+            channel: value,
+            entry_price: Number(p.avg_entry_price) > 0 ? p.avg_entry_price : null,
+          }),
+        });
+        notify.success(name ? `${what} assigned to ${name}` : `${what} reset to its opening channel`);
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "Could not change the channel");
+      } finally {
+        setChannelBusy(null);
+      }
+    }
+
     async function averagePosition(p: Position, type: "market" | "limit") {
       const key = posKey(p);
       if (type === "limit") {
-        const price = closeLimitPrices[key];
+        const price = limitFor(key);
         if (!price || Number(price) <= 0) {
           notify.warn("Enter a limit price");
           return;
@@ -833,18 +969,18 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         notify.warn(`Can't average ${pct}% of this position — would round to zero.`);
         return;
       }
-      const at = type === "limit" ? `at ${closeLimitPrices[key]}` : "at market";
+      const at = type === "limit" ? `at ${limitFor(key)}` : "at market";
       if (!confirm(`Average into ${p.symbol.toUpperCase()}: BUY ${qty} more ${at} (${pct}% of what you hold)?`)) return;
       setClosing({ key, kind: type });
       try {
         const body: Record<string, unknown> = { order_type: type, quantity: String(qty) };
-        if (type === "limit") body.limit_price = closeLimitPrices[key];
+        if (type === "limit") body.limit_price = limitFor(key);
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/average?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
         notify.success(`Average placed: BUY ${order.symbol} ×${qty} (${type})`);
-        if (type === "limit") setCloseLimitPrices(s => ({ ...s, [key]: "" }));
+        if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
         notify.fromError(e, "average failed");
@@ -956,13 +1092,12 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     // summary over the currently-visible rows
     const summary = useMemo(() => {
-      let mv = 0, pnl = 0, longs = 0, shorts = 0;
+      let mv = 0, pnl = 0;
       for (const p of visible) {
         mv += Number(p.market_value) || 0;
         pnl += Number(p.unrealized_pnl) || 0;
-        if (Number(p.quantity) >= 0) longs++; else shorts++;
       }
-      return { mv, pnl, longs, shorts, count: visible.length };
+      return { mv, pnl, count: visible.length };
     }, [visible]);
 
     function toggleSort(key: SortKey) {
@@ -1032,6 +1167,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
       pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
       day_pnl: { label: "Day's P&L", sortKey: "day_pnl", title: "Today's P&L on this position, straight from your broker (Webull / Alpaca)" },
+      day_pnl_pct: { label: "Day's P&L %", sortKey: "day_pnl_pct", title: "Today's P&L on this position as a %, straight from your broker" },
       avg_entry: { label: "Avg entry", sortKey: "avg_entry_price" },
       current_price: { label: "Current price", sortKey: "current_price" },
       pdc: { label: "PDC", title: "Previous day's market close price" },
@@ -1052,6 +1188,30 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     // rendered three phantom cells wider than the header. Channel is
     // conditional, so this is too.
     const COLSPAN = cols.columns.length;
+
+    // The header slot exists once AppShell has mounted; look it up after ours.
+    const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null);
+    useEffect(() => {
+      if (statsInHeader) setHeaderSlot(document.getElementById(HEADER_STATS_SLOT_ID));
+    }, [statsInHeader]);
+
+    const renderStats = (compact: boolean) => (
+      <>
+        <SummaryTile label="Day's P&L" compact={compact}
+          tone={dayPnl == null ? "neutral" : dayPnl > 0 ? "good" : dayPnl < 0 ? "bad" : "neutral"}
+          node={dayPnl == null
+            ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+            : <AnimatedNumber value={dayPnl} format={fmtSignedUsd} className="num" />}
+          sub="Your broker's account Day's P&L" />
+        <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv} compact={compact}
+          mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
+        <SummaryTile label="Account value" tone="neutral" compact={compact}
+          node={totalEquity == null
+            ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
+            : <AnimatedNumber value={totalEquity} format={fmtUsd} className="num" />}
+          sub="Total equity" />
+      </>
+    );
 
     return (
       <div className={`${className ?? ""} ${fillHeight ? "flex flex-col min-h-0" : ""}`.trim()}>
@@ -1084,34 +1244,44 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             </div>
           </div>
         )}
-        {/* Summary strip */}
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2.5 mb-4">
-          <SummaryTile label="Day's P&L"
-            tone={dayPnl == null ? "neutral" : dayPnl > 0 ? "good" : dayPnl < 0 ? "bad" : "neutral"}
-            node={dayPnl == null
-              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
-              : <AnimatedNumber value={dayPnl} format={fmtSignedUsd} className="num" />}
-            sub="Your broker's account Day's P&L" />
-          <LiveTotalsTiles positions={visible} baselinePnl={summary.pnl} baselineMv={summary.mv}
-            mvSub={filter === "all" ? "All instruments" : filter === "option" ? "Options" : "Stocks"} />
-          <SummaryTile label="Account value" tone="neutral"
-            node={totalEquity == null
-              ? <span className="num" style={{ color: "var(--muted)" }}>—</span>
-              : <AnimatedNumber value={totalEquity} format={fmtUsd} className="num" />}
-            sub="Total equity" />
-          <SummaryTile label="Long / Short" tone="neutral"
-            node={<span className="num">{summary.longs} / {summary.shorts}</span>}
-            sub="Direction split" />
+        {stale.length > 0 && (
+          <div
+            role="status"
+            className="mb-3 flex items-start gap-2 rounded-lg px-3 py-2 text-[12px]"
+            style={{ background: "var(--panel-2)", color: "var(--text-2)", border: "1px solid var(--border)" }}
+          >
+            <AlertTriangle size={14} style={{ color: "var(--muted)", flexShrink: 0, marginTop: 1 }} />
+            <div className="flex flex-col gap-0.5">
+              {stale.map((s) => (
+                <div key={s.broker_account_id}>
+                  <span style={{ fontWeight: 600, textTransform: "capitalize" }}>{s.label || s.broker}</span>
+                  {" — rate limited by the broker; showing positions from "}
+                  {s.age_s < 60 ? `${s.age_s}s` : `${Math.round(s.age_s / 60)} min`}
+                  {" ago. They refresh on their own."}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {/* Summary strip — in the app header on the Positions page (wide
+            screens), as tiles here otherwise. */}
+        {headerSlot && createPortal(renderStats(true), headerSlot)}
+        <div className={`grid grid-cols-2 lg:grid-cols-4 gap-2.5 mb-4 ${headerSlot ? "xl:hidden" : ""}`.trim()}>
+          {renderStats(false)}
         </div>
 
         {/* Toolbar: type tabs + symbol search */}
         <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {tabBtn("all", "All")}
             {tabBtn("option", "Options")}
             {tabBtn("stock", "Stocks")}
+            {toolbarActions}
           </div>
           <div className="flex items-center gap-2">
+            {/* Type or paste a Discord alert without leaving Positions — the
+                same composer as Order History. */}
+            {discordComposer && showChannel && <DiscordAlertComposer onSent={() => refresh()} />}
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
               <input
@@ -1218,11 +1388,64 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                   // Each column's cell keyed by id; rendered below in the user's
                   // configured order (reorderable) and visibility (show/hide).
                   const cell: Record<string, React.ReactNode> = {
-                    channel: (
-                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }} title={p.discord_channel ?? undefined}>
-                        {p.discord_channel || "—"}
-                      </td>
-                    ),
+                    channel: (() => {
+                      // The channel this position belongs to. Shown as text
+                      // with a pencil; the pencil opens the dropdown. A derived
+                      // name that is no single channel ("Clint-Self", or none)
+                      // is the dropdown's own first option.
+                      const current = p.discord_channel === "Self"
+                        ? "self"
+                        : channels.find((c) => c.label === p.discord_channel)?.id ?? "";
+                      if (editingChannel !== key) {
+                        // The name, with a pencil that opens the dropdown.
+                        return (
+                          <td className="px-5 py-3.5 whitespace-nowrap" title={p.discord_channel ?? undefined}>
+                            <span className="inline-flex items-center gap-1.5">
+                              <span style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}>
+                                {p.discord_channel || "—"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setEditingChannel(key)}
+                                disabled={channelBusy === key}
+                                aria-label={`Change channel for ${p.symbol.toUpperCase()}`}
+                                title="Change the channel this position belongs to"
+                                className="focus-ring rounded p-0.5 opacity-60 hover:opacity-100 disabled:opacity-30"
+                                style={{ color: "var(--muted)" }}
+                              >
+                                {channelBusy === key ? <Spinner /> : <Pencil size={12} />}
+                              </button>
+                            </span>
+                          </td>
+                        );
+                      }
+                      return (
+                        <td className="px-5 py-3.5 whitespace-nowrap">
+                          <select
+                            autoFocus
+                            value={current}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setEditingChannel(null);
+                              void assignChannel(p, v);
+                            }}
+                            onBlur={() => setEditingChannel(null)}
+                            onKeyDown={(e) => { if (e.key === "Escape") setEditingChannel(null); }}
+                            aria-label={`Channel for ${p.symbol.toUpperCase()}`}
+                            title="The channel this position belongs to. Its exit settings manage the position, and its alerts reach it."
+                            className="rounded-md border px-1.5 py-1 text-[13px] bg-transparent focus-ring max-w-[150px]"
+                            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                          >
+                            {current === "" && <option value="">{p.discord_channel || "—"}</option>}
+                            {channels.map((c) => (
+                              <option key={c.id} value={c.id}>{c.label}</option>
+                            ))}
+                            <option value="self">Self</option>
+                            <option value="auto">Reset to opening channel</option>
+                          </select>
+                        </td>
+                      );
+                    })(),
                     symbol: (
                       <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                         <span className="inline-flex items-center gap-1.5">
@@ -1232,13 +1455,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                       </td>
                     ),
                     qty: <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>,
-                    side: (
-                      <td className="px-5 py-3.5">
-                        <span className="chip uppercase font-semibold" style={{ background: isLong ? "var(--good-soft)" : "var(--bad-soft)", color: isLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}>
-                          {isLong ? "Long" : "Short"}
-                        </span>
-                      </td>
-                    ),
+                    side: (() => {
+                      const dirLong = positionDirection(p) === "long";
+                      return (
+                        <td className="px-5 py-3.5">
+                          <span
+                            className="chip uppercase font-semibold"
+                            style={{ background: dirLong ? "var(--good-soft)" : "var(--bad-soft)", color: dirLong ? "var(--good)" : "var(--bad)", borderColor: "transparent" }}
+                            title={p.instrument_type === "option"
+                              ? `${isLong ? "Bought" : "Sold"} ${p.option_right === "put" ? "puts" : "calls"} — ${dirLong ? "gains if the price rises" : "gains if the price falls"}`
+                              : undefined}
+                          >
+                            {dirLong ? "Long" : "Short"}
+                          </span>
+                        </td>
+                      );
+                    })(),
                     close_pct: (
                       <td className="px-5 py-3.5">
                         <div className="flex gap-1">
@@ -1295,12 +1527,13 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             />
                           </div>
                           <div className="flex items-stretch">
-                            <input
-                              type="number" step="0.01" min="0.01"
-                              placeholder="Limit"
-                              aria-label={`Limit price for ${p.symbol.toUpperCase()}`}
-                              value={closeLimitPrices[key] ?? ""}
-                              onChange={e => setCloseLimitPrices(s => ({ ...s, [key]: e.target.value }))}
+                            <LimitPriceInput
+                              symbol={liveSym}
+                              fallback={p.current_price}
+                              ariaLabel={`Limit price for ${p.symbol.toUpperCase()}`}
+                              value={closeLimitPrices[key]}
+                              onChange={v => setCloseLimitPrices(s => ({ ...s, [key]: v }))}
+                              onDefault={v => { limitDefaults.current[key] = v; }}
                               className="w-20 px-2 py-1 text-xs border"
                               style={{
                                 borderColor: "var(--border)",
@@ -1313,7 +1546,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                               }}
                             />
                             <button
-                              disabled={inFlight || !closeLimitPrices[key]}
+                              disabled={inFlight || !(closeLimitPrices[key] ?? (p.current_price || ""))}
                               onClick={() => (lMode === "average" ? averagePosition(p, "limit") : closePosition(p, "limit"))}
                               className="btn-accent-solid px-2 py-1 text-xs font-medium inline-flex items-center justify-center gap-1"
                               style={{
@@ -1351,13 +1584,21 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                     // Day's P&L — the broker's OWN per-position figure (Webull /
                     // Alpaca native), not derived. A snapshot value; null → "—".
                     day_pnl: (
-                      <td className="px-5 py-3.5 num" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
+                      // The dollar amount only — its % has a column of its own,
+                      // so neither wraps onto a second line.
+                      <td className="px-5 py-3.5 num whitespace-nowrap" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
                         {p.day_pnl != null ? (
                           <span style={{ color: Number(p.day_pnl) > 0 ? "var(--pnl-pos)" : Number(p.day_pnl) < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
                             {fmtSignedUsd(Number(p.day_pnl))}
-                            {p.day_pnl_pct != null && (
-                              <span style={{ color: "var(--text-2)" }}>{` (${Number(p.day_pnl_pct) >= 0 ? "+" : ""}${Number(p.day_pnl_pct).toFixed(2)}%)`}</span>
-                            )}
+                          </span>
+                        ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    day_pnl_pct: (
+                      <td className="px-5 py-3.5 num whitespace-nowrap" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
+                        {p.day_pnl_pct != null ? (
+                          <span style={{ color: Number(p.day_pnl_pct) > 0 ? "var(--pnl-pos)" : Number(p.day_pnl_pct) < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                            {`${Number(p.day_pnl_pct) >= 0 ? "+" : ""}${Number(p.day_pnl_pct).toFixed(2)}%`}
                           </span>
                         ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
@@ -1438,13 +1679,25 @@ function SummaryTile({
   node,
   sub,
   tone,
+  compact,
 }: {
   label: string;
   node: React.ReactNode;
   sub?: string;
   tone: "neutral" | "good" | "bad";
+  /** One figure in the app header: label over value, no card. */
+  compact?: boolean;
 }) {
   const color = tone === "good" ? "var(--good)" : tone === "bad" ? "var(--bad)" : "var(--text)";
+  if (compact) {
+    return (
+      <div className="flex flex-col gap-0.5 px-3 leading-none whitespace-nowrap" title={sub}
+        style={{ borderLeft: "1px solid var(--border)" }}>
+        <span className="text-[9px] font-medium uppercase tracking-wider" style={{ color: "var(--muted)" }}>{label}</span>
+        <span className="text-[14px] font-semibold tabular-nums" style={{ color }}>{node}</span>
+      </div>
+    );
+  }
   void sub; // subtitle dropped — cards match the Order History summary size
   return (
     <motion.div

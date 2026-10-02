@@ -67,6 +67,8 @@ class _AutoTrimOn:
     def __getattr__(self, name):
         if name == "discord_auto_trim":
             return True
+        if name == "discord_manual_exit":
+            return False               # the dry run shows the ladder regardless
         return getattr(self._ts, name, None)
 
 

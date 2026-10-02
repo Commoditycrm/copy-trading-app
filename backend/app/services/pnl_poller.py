@@ -476,11 +476,15 @@ def _enforce_one_safe(acct: BrokerAccount) -> None:
     if not should_run:
         return
 
-    if acct.broker == BrokerName.SNAPTRADE:
-        with _SNAPTRADE_SEM:
-            _enforce_one_inner(acct, role)
-        return
-    _enforce_one_inner(acct, role)
+    # Count this loop's Webull calls under its own name (services/webull_usage.py).
+    from app.services import webull_usage  # noqa: PLC0415
+
+    with webull_usage.tag("P&L poller"):
+        if acct.broker == BrokerName.SNAPTRADE:
+            with _SNAPTRADE_SEM:
+                _enforce_one_inner(acct, role)
+            return
+        _enforce_one_inner(acct, role)
 
 
 def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
@@ -634,6 +638,123 @@ def _make_stop_placer(db, live_acct, acct, guard):
     return _place
 
 
+def _make_limit_placer(db, live_acct, acct, guard):
+    """Place a take-profit: a resting LIMIT sell for this contract, through the
+    normal order path like the ladder stop (tracked, audited, never fanned out)."""
+    def _place(quantity, price):
+        from app.api.trades import _place_trader_order  # noqa: PLC0415
+        from app.models.order import (  # noqa: PLC0415
+            InstrumentType, OptionRight, OrderSide, OrderType,
+        )
+        from app.models.user import User  # noqa: PLC0415
+        from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
+        from fastapi import BackgroundTasks  # noqa: PLC0415
+
+        right = guard.option_right
+        payload = PlaceOrderIn(
+            instrument_type=(
+                InstrumentType.OPTION if guard.option_strike is not None
+                else InstrumentType.STOCK
+            ),
+            symbol=guard.symbol.upper(),
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=quantity,
+            limit_price=Decimal(str(price)).quantize(Decimal("0.01")),
+            option_expiry=guard.option_expiry,
+            option_strike=guard.option_strike,
+            option_right=OptionRight(right) if right else None,
+        )
+        order = _place_trader_order(
+            db, db.get(User, acct.user_id), payload, live_acct.id,
+            BackgroundTasks(), _PollerRequest(),
+            resolve_wash_trade=True,      # a close, so option SELLs go SELL_TO_CLOSE
+            partial_close=True,
+            skip_fanout=True,
+            skip_dedup=True,
+        )
+        return order.id
+    return _place
+
+
+def _make_pair_placer(db, live_acct, acct, adapter, guard):
+    """Place a take-profit LIMIT and its linked STOP on the same contracts, in
+    one broker call (BrokerAdapter.place_exit_pair). Returns both order ids.
+
+    Not through _place_trader_order: that places ONE order, and its close-path
+    recovery (cancel whatever conflicts, then retry) is exactly wrong for a pair
+    that is meant to sit beside the ladder stop. Two rows, one call; a refusal
+    is recorded and raised, and nothing else is touched.
+    """
+    def _place(quantity, price, stop_price):
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        from app.api.trades import broker_request_for  # noqa: PLC0415
+        from app.models.order import (  # noqa: PLC0415
+            InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType,
+        )
+        from app.services import audit, copy_engine, events, order_intent  # noqa: PLC0415
+
+        now = datetime.now(timezone.utc)
+        right = guard.option_right
+        common = dict(
+            user_id=acct.user_id, broker_account_id=live_acct.id,
+            instrument_type=InstrumentType.OPTION, symbol=guard.symbol.upper(),
+            option_expiry=guard.option_expiry, option_strike=guard.option_strike,
+            option_right=OptionRight(right) if right else None,
+            side=OrderSide.SELL, quantity=quantity, status=OrderStatus.PENDING,
+            is_closing=True, is_partial_close=True, fanned_out_to_subscribers=False,
+            trader_submitted_at=now,
+        )
+        tp = Order(order_type=OrderType.LIMIT,
+                   limit_price=Decimal(str(price)).quantize(Decimal("0.01")), **common)
+        sl = Order(order_type=OrderType.STOP,
+                   stop_price=Decimal(str(stop_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+                   **common)
+        db.add_all([tp, sl])
+        db.flush()
+        # Before the broker call, as for any order of ours: the listener must
+        # not take the echo for an order placed elsewhere and import it twice.
+        order_intent.mark_app_originated(tp.id)
+        order_intent.mark_app_originated(sl.id)
+        try:
+            r_tp, r_sl = adapter.place_exit_pair(
+                broker_request_for(tp, False), broker_request_for(sl, False))
+        except Exception as exc:  # noqa: BLE001
+            tp.status = OrderStatus.REJECTED
+            tp.reject_reason = str(exc)[:480]
+            tp.closed_at = now
+            # The stop leg never existed. Left behind as a REJECTED STOP it
+            # would read to the stop reconciler as "the broker refuses stops on
+            # this contract", whose answer is to close the position.
+            db.delete(sl)
+            audit.record(
+                db, actor_user_id=acct.user_id, action="discord.take_profit_rejected",
+                entity_type="order", entity_id=tp.id, metadata={"error": str(exc)[:480]},
+            )
+            db.commit()
+            raise
+        for order, result in ((tp, r_tp), (sl, r_sl)):
+            order.broker_order_id = result.broker_order_id
+            order.status = result.status
+            order.submitted_at = result.submitted_at
+            order.broker_accepted_at = now
+        audit.record(
+            db, actor_user_id=acct.user_id, action="discord.take_profit_placed",
+            entity_type="order", entity_id=tp.id,
+            metadata={"symbol": tp.symbol, "qty": str(quantity), "limit": str(tp.limit_price),
+                      "stop": str(sl.stop_price), "stop_order_id": str(sl.id)},
+        )
+        db.commit()
+        for order in (tp, sl):
+            try:
+                events.publish(acct.user_id, copy_engine._order_event("order.placed", order))
+            except Exception:  # noqa: BLE001
+                log.warning("take-profit: order event failed for %s", order.id, exc_info=True)
+        return tp.id, sl.id
+    return _place
+
+
 def _make_stop_canceller(db, adapter):
     """Cancel a resting stop by our order id, and mark the row cancelled."""
     def _cancel(order_id):
@@ -781,8 +902,26 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
     try:
         with SessionLocal() as db:
             from app.services import discord_position_guard as _guards  # noqa: PLC0415
+            from app.services import discord_channel_settings as _dcs  # noqa: PLC0415
+            from app.services import discord_take_profit as _tp  # noqa: PLC0415
+            from app.models.settings import TraderSettings as _TS  # noqa: PLC0415
 
-            if not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
+            # Holdings whose channel rests take-profit orders need a pass even
+            # with no stop set yet — the first take-profit goes on at the fill.
+            _account_ts = db.get(_TS, acct.user_id)
+            _ladder_engine = getattr(_account_ts, "discord_exit_engine", None) != "ai"
+
+            def _settings_for(g):
+                return _dcs.for_guard(db, acct.user_id, g) or _account_ts
+
+            _tp_possible = _ladder_engine and _tp.possible(db, acct.user_id, _account_ts)
+            _tp_waiting = [
+                g for g in _guards.live(db, acct.user_id)
+                if g.option_strike is not None
+                and (g.tp_order_id is not None or g.tp_stop_order_id is not None
+                     or (_tp_possible and _tp.enabled(_settings_for(g))))
+            ]
+            if not _tp_waiting and not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
                 return  # nothing armed for this trader
 
             live_acct = db.get(BrokerAccount, acct.id)
@@ -824,7 +963,12 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                     ): p
                     for p in positions
                 }
-                for guard in [g for g in _g.armed(db) if g.user_id == acct.user_id]:
+                _armed = [g for g in _g.armed(db) if g.user_id == acct.user_id]
+                _seen = {g.id for g in _armed}
+                _canceller = _make_stop_canceller(db, adapter)
+                from app.services import market_hours as _mh  # noqa: PLC0415
+
+                for guard in _armed + [g for g in _tp_waiting if g.id not in _seen]:
                     pos = by_key.get((
                         (guard.symbol or "").upper(), guard.option_strike,
                         guard.option_right, guard.option_expiry,
@@ -842,20 +986,48 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                             discord_stop_orders.release(
                                 db, guard, _make_stop_canceller(db, adapter),
                             )
+                        _tp.release(db, guard, _canceller)      # same reason
                         continue
                     try:
-                        discord_stop_orders.reconcile(
-                            db, guard, held,
-                            place_stop=_make_stop_placer(db, live_acct, acct, guard),
-                            cancel_stop=_make_stop_canceller(db, adapter),
-                            # If the broker refuses the stop, exit instead of
-                            # holding the position with nothing protecting it.
-                            # Same market exit a fired stop would have taken.
-                            close_position=(
-                                (lambda q, _p=pos, _g=guard: _close(_p, _g, q))
-                                if pos is not None else None
-                            ),
-                        )
+                        def _reconcile_stop(_guard=guard, _pos=pos, _held=held) -> str:
+                            return discord_stop_orders.reconcile(
+                                db, _guard, _held,
+                                place_stop=_make_stop_placer(db, live_acct, acct, _guard),
+                                cancel_stop=_canceller,
+                                # If the broker refuses the stop, exit instead of
+                                # holding the position with nothing protecting it.
+                                # Same market exit a fired stop would have taken.
+                                close_position=(
+                                    (lambda q, _p=_pos, _g=_guard: _close(_p, _g, q))
+                                    if _pos is not None else None
+                                ),
+                            )
+
+                        ts_g = _settings_for(guard)
+                        if (_ladder_engine and guard.option_strike is not None
+                                and _tp.active(ts_g, adapter)):
+                            # Take-profit orders: the next trim rests at the
+                            # broker, and the stop is sized around it. The fill
+                            # price first — the target is measured from it.
+                            _g.sync_entry_price(db, guard)
+                            outcome = _tp.reconcile(
+                                db, guard, held, ts_g,
+                                Decimal(str(pos.current_price)) if pos is not None
+                                and getattr(pos, "current_price", None) else None,
+                                place_limit=_make_limit_placer(db, live_acct, acct, guard),
+                                place_pair=_make_pair_placer(db, live_acct, acct, adapter, guard),
+                                cancel=_canceller,
+                                reconcile_stop=_reconcile_stop,
+                                in_session=_mh.in_regular_session(),
+                            )
+                            log.info("take-profit: %s — %s", guard.symbol, outcome)
+                        else:
+                            # The mode was switched off (or never on) with an
+                            # order still resting: take it down, then the stop.
+                            if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+                                _tp.release(db, guard, _canceller)
+                            guard.tp_qty = None
+                            _reconcile_stop()
                         # Reconcile first so a resting stop is CANCELLED on
                         # the way out; retiring the guard alone would leave the
                         # order behind with nothing tracking it.

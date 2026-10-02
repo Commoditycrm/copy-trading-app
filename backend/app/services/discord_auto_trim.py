@@ -65,8 +65,17 @@ _LOCK_TTL_S = 120
 _LOCK_WAIT_S = 10
 
 
+def _manual(ts) -> bool:
+    """Exits are the trader's own under these settings — nothing auto-fires."""
+    return bool(ts is not None and getattr(ts, "discord_manual_exit", False))
+
+
 def _enabled(ts) -> bool:
-    return bool(ts is not None and getattr(ts, "discord_auto_trim", False))
+    """Should rungs fire off the price for these settings? Auto trim — and
+    Take-profit orders too, which runs as auto-trim on a broker that cannot
+    link a take-profit to a stop (the sweep skips it where the broker can)."""
+    on = getattr(ts, "discord_auto_trim", False) or getattr(ts, "discord_tp_orders", False)
+    return bool(ts is not None and on) and not _manual(ts)
 
 
 def _engine(ts) -> str:
@@ -75,17 +84,20 @@ def _engine(ts) -> str:
 
 
 def _gate_for(ts, rung: int) -> Decimal:
-    """This rung's Min Profit to Trim, as configured. 0 means "no minimum"."""
-    field = {
-        1: "discord_trim_profit_gate_pct",
-        2: "discord_trim2_profit_gate_pct",
-        3: "discord_trim3_profit_gate_pct",
-    }.get(rung, "discord_trim3_profit_gate_pct")
-    raw = getattr(ts, field, None)
+    """This rung's Profit target, as configured. 0 means "no minimum"."""
+    from app.services import discord_ladder  # noqa: PLC0415
+
     try:
-        return Decimal(str(raw)) if raw is not None else Decimal(0)
+        ladder = discord_ladder.rungs(ts)
+        return ladder[rung - 1].profit_gate_pct if 1 <= rung <= len(ladder) else Decimal(0)
     except Exception:  # noqa: BLE001
         return Decimal(0)
+
+
+def _trim_count(ts) -> int:
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    return discord_ladder.count(ts)
 
 
 def gain_pct(entry: Decimal | None, mark: Decimal | None) -> Decimal | None:
@@ -103,14 +115,62 @@ def gain_pct(entry: Decimal | None, mark: Decimal | None) -> Decimal | None:
     return (mark - entry) / entry * Decimal(100)
 
 
+def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder") -> bool:
+    """The "On Fill" stop: once the entry has filled, put the stop at the
+    configured return from entry. Returns True when a stop level was set — the
+    stop reconciler then rests a real order there on its next pass.
+
+    One-shot per holding (``fill_stop_done``): decided the first time the entry
+    is seen filled, and never revisited. So a stop the trader later cancels by
+    hand stays cancelled, and switching a setting does not reach back and put a
+    stop on a position that has been open for hours.
+
+    Nothing is set when exits are Manual or AI trimming runs them, when no On
+    Fill stop is configured, or when the holding has no opening order of ours to
+    wait on (adopted from the broker, or assigned to a channel by hand).
+    """
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+    from app.services import discord_ladder  # noqa: PLC0415
+    from app.services import discord_position_guard as pg  # noqa: PLC0415
+
+    if guard.fill_stop_done or guard.closed_at is not None:
+        return False
+    if guard.entry_order_id is None:
+        guard.fill_stop_done = True
+        return False
+    order = db.get(Order, guard.entry_order_id)
+    if order is None:
+        guard.fill_stop_done = True
+        return False
+    if order.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        return False                      # still working (or never filled): nothing to protect yet
+
+    guard.fill_stop_done = True
+    pct = discord_ladder.fill_stop_pct(ts)
+    if pct is None or engine != "ladder" or _manual(ts):
+        return False
+    if (guard.sell_count or 0) > 0 or guard.stop_price is not None:
+        return False                      # a trim, or the trader, already set one
+    pg.sync_entry_price(db, guard)        # the FILL, not the limit we bid
+    entry = guard.entry_price
+    if entry is None or entry <= 0:
+        return False
+    stop = pg._to_tick(Decimal(str(entry)) * (Decimal(1) + pct / Decimal(100)))
+    if stop is None or stop <= 0:
+        return False                      # rounds to $0 on a very cheap contract: not a stop
+    guard.stop_price = stop
+    log.info("on-fill stop: %s filled at %s — stop set at %s (%s%%)", guard.symbol, entry, stop, pct)
+    return True
+
+
 def due_rung(ts, guard: DiscordPositionGuard, mark: Decimal | None) -> int | None:
     """The rung to fire now, or None. Pure — no DB, no broker."""
     if not _enabled(ts):
         return None
     rung = (guard.sell_count or 0) + 1
-    if rung > 3:
-        # The ladder has three steps. Past the third there is nothing left to
-        # automate: the final rung exits what remains.
+    if rung > _trim_count(ts):
+        # Past the last trim there is nothing left to automate: the final rung
+        # exits what remains, or leaves a runner for the trader to manage.
         return None
     gate = _gate_for(ts, rung)
     if gate <= 0:
@@ -283,8 +343,27 @@ def _sweep_trader(db, trader_id, rows) -> None:
     ts = db.get(TraderSettings, trader_id)
     # The AI engine runs whether or not ladder auto-trim is on; with it selected
     # the ladder's rungs are never auto-fired, so two engines can't both sell.
+    # The engine is account-wide; the LADDER (gates, auto-trim on/off) is per
+    # position — the settings of the channel that opened it.
     engine = _engine(ts)
-    if engine == "ladder" and not _enabled(ts):
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+
+    guard_ts = {g.id: (dcs.for_guard(db, trader_id, g) or ts) for g in rows}
+    # On Fill stops first, and before the early return below: they apply with
+    # Auto trim off too, and need no broker read.
+    try:
+        touched = False
+        for g in rows:
+            if not g.fill_stop_done:
+                apply_fill_stop(db, g, guard_ts.get(g.id, ts), engine)
+                touched = True
+        if touched:
+            db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.exception("on-fill stop: sweep failed for user %s", trader_id)
+    # Nothing has auto-trim on: skip before the broker read (rate limits).
+    if engine == "ladder" and not any(_enabled(t) for t in guard_ts.values()):
         return
     user = db.get(User, trader_id)
     if user is None:
@@ -307,7 +386,13 @@ def _sweep_trader(db, trader_id, rows) -> None:
     # against that list. Reading them per-guard made N broker calls per
     # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
     try:
-        positions = adapter.get_positions()
+        # A TRIGGER check, not an order: a trim it fires re-reads live positions
+        # before placing anything. So it may share a read another loop made
+        # seconds ago (Webull's limits — see webull.py, shared snapshot).
+        try:
+            positions = adapter.get_positions(cached_ok=True)
+        except TypeError:                 # brokers without the cached read
+            positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
         log.warning("auto-trim: could not read positions for user %s", trader_id, exc_info=True)
         return
@@ -318,7 +403,9 @@ def _sweep_trader(db, trader_id, rows) -> None:
         live = []
         for guard in rows:
             db.refresh(guard)
-            if guard.closed_at is None:
+            # A position whose channel has Manual exits is the trader's to
+            # close — the model is never asked about it.
+            if guard.closed_at is None and not _manual(guard_ts.get(guard.id, ts)):
                 live.append(guard)
         ai_trim.sweep(
             db, user, ts, acct, adapter, live, positions,
@@ -353,8 +440,16 @@ def _sweep_trader(db, trader_id, rows) -> None:
             if pg.sync_entry_price(db, guard):
                 db.commit()
 
+            # Take-profit orders, on a broker that links them to a stop: this
+            # trim is resting at the broker (discord_take_profit) and fills
+            # there. Firing it here as well would sell the same contracts twice.
+            from app.services import discord_take_profit  # noqa: PLC0415
+
+            if discord_take_profit.active(guard_ts.get(guard.id, ts), adapter):
+                continue
+
             mark = _mark_for(positions, guard, trader_id)
-            rung = due_rung(ts, guard, mark)
+            rung = due_rung(guard_ts.get(guard.id, ts), guard, mark)
             if rung is None:
                 continue
 
@@ -387,6 +482,10 @@ def _sweep_trader(db, trader_id, rows) -> None:
             did_something = (
                 (msg is not None and msg.order_id is not None)
                 or guard.trail_qty != before_trail
+                # The LAST trim rounded down to nothing and left a runner. That
+                # is the rung doing its job — hand it back and it would fire
+                # again on every sweep for as long as the price holds.
+                or (msg is not None and pg.RUNNER_NOTE in (msg.status_reason or ""))
             )
             if not did_something and (guard.sell_count or 0) > before_rung:
                 log.info(
@@ -409,3 +508,9 @@ def poll_loop(shutdown_check=None) -> None:
         except Exception:  # noqa: BLE001
             log.exception("discord_auto_trim: tick failed")
         time.sleep(POLL_INTERVAL_S)
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+tick = webull_usage.tagged("Auto-trim")(tick)

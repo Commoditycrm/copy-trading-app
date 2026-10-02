@@ -39,6 +39,7 @@ _SMS_DEEP_LINK = {
     "order.rejected": "/trades",
     "copy.auto_liquidated": "/positions",
     "broker.disconnected": "/broker",
+    "discord.disconnected": "/discord",
 }
 
 # Notification type → the User column that gates its SMS.
@@ -56,6 +57,9 @@ _SMS_PREF_EXACT = {
     "copy.rejected": "sms_on_trade_rejected",
     "trader.order_rejected": "sms_on_trade_rejected",
     "broker.disconnected": "sms_on_broker_connection",
+    # Same category and wording style as the broker disconnect: losing the
+    # Discord connection stops copying exactly the way losing a broker does.
+    "discord.disconnected": "sms_on_broker_connection",
 }
 
 # These types are built with f-strings (e.g. f"copy.auto_paused_{reason}"), so

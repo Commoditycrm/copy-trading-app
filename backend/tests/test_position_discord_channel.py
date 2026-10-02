@@ -25,14 +25,16 @@ T0 = datetime(2026, 9, 30, 14, 0, tzinfo=timezone.utc)
 
 class _DB:
     """First query: Discord entries, newest first. Second: live exit ladders
-    as (symbol, strike, right, expiry, created_at, entry order placed_at)."""
+    as (symbol, strike, right, expiry, created_at, entry order placed_at).
+    Third: holdings assigned to a channel by hand, as
+    (symbol, strike, right, expiry, label, channel_name)."""
 
-    def __init__(self, rows, guards=()):
-        self._results = [list(rows), list(guards)]
+    def __init__(self, rows, guards=(), assigned=()):
+        self._results = [list(rows), list(guards), list(assigned)]
         self.queries = 0
 
     def execute(self, stmt):
-        rows = self._results[self.queries] if self.queries < 2 else []
+        rows = self._results[self.queries] if self.queries < 3 else []
         self.queries += 1
         return SimpleNamespace(all=lambda: rows)
 
@@ -120,7 +122,7 @@ def test_one_query_covers_every_account():
     ps = [_pos(strike=str(s)) for s in range(100, 130)]
     db = _DB([_row(strike=str(s)) for s in range(100, 130)])
     _attach_position_channels(db, USER, ps)
-    assert db.queries == 2          # entries + live ladders, however many rows
+    assert db.queries == 3          # entries + live ladders + hand-assigned, however many rows
     assert all(p.discord_channel == "Clint" for p in ps)
 
 
@@ -208,3 +210,29 @@ def test_the_ladder_is_matched_per_contract():
     rows = [_self(T0 + timedelta(minutes=30)), _row(at=T0)]
     _attach_position_channels(_DB(rows, [_guard(T0, strike="200")]), USER, [p])
     assert p.discord_channel == "Self"
+
+
+# ── a channel assigned by hand (Positions → Channel) ─────────────────────────
+
+def test_an_assigned_channel_wins_over_the_one_that_opened_it():
+    p = _pos()
+    db = _DB([_row()], guards=[_guard()],
+             assigned=[("MSFT", Decimal("100"), "call", EXP, "Julia", "julia-alerts")])
+    _attach_position_channels(db, USER, [p])
+    assert p.discord_channel == "Julia"
+
+
+def test_a_hand_opened_position_shows_its_assigned_channel():
+    """No alert opened it, so nothing is derived — the assignment is the channel."""
+    p = _pos()
+    db = _DB([], assigned=[("MSFT", Decimal("100"), "call", EXP, "Self", "Self")])
+    _attach_position_channels(db, USER, [p])
+    assert p.discord_channel == "Self"
+
+
+def test_an_assignment_on_another_contract_does_not_leak():
+    p = _pos(strike="105")
+    db = _DB([_row(strike="105")],
+             assigned=[("MSFT", Decimal("100"), "call", EXP, "Julia", "julia-alerts")])
+    _attach_position_channels(db, USER, [p])
+    assert p.discord_channel == "Clint"

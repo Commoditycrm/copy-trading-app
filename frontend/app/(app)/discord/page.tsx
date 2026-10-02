@@ -2,7 +2,7 @@
 
 import { Fragment, FormEvent, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Hash, Radio, ScanLine, Receipt, ShieldCheck, Clock, Eye, PlugZap, Check, Trash2 } from "lucide-react";
+import { Hash, Radio, ScanLine, Receipt, ShieldCheck, Clock, Eye, PlugZap, Check, Trash2, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -45,12 +45,36 @@ const CONNECTOR_RELEASES = "https://github.com/Commoditycrm/kopyya-connector/rel
 const CONNECTOR_WINDOWS = `${CONNECTOR_RELEASES}/Kopyya-Connector-Windows.exe`;
 const CONNECTOR_MAC = `${CONNECTOR_RELEASES}/Kopyya-Connector-macOS.zip`;
 
+type ExitMode = "alerts" | "auto" | "orders" | "manual";
+
+const EXIT_MODES: { value: ExitMode; label: string; detail: string; toast: string }[] = [
+  { value: "alerts", label: "On alerts",
+    detail: "Each trim waits for the channel's exit alert; its Profit target is the minimum that alert has to meet.",
+    toast: "Exits on alerts — each trim waits for its Discord alert" },
+  { value: "auto", label: "Auto trim",
+    detail: "Each trim fires at its own Profit target, without waiting for an alert. A trim left at 0% keeps waiting.",
+    toast: "Auto trim on — each trim fires at its own Profit target" },
+  { value: "orders", label: "Take-profit orders",
+    detail: "Each trim rests at the broker as a take-profit order, with its stop linked. Webull options; on other brokers it works like Auto trim.",
+    toast: "Take-profit orders on — each trim rests at the broker at its Profit target" },
+  { value: "manual", label: "Manual",
+    detail: "Kopyya never sells. Exit alerts are recorded but not acted on — you close from Positions.",
+    toast: "Manual exits — exit alerts are ignored; close from Positions" },
+];
+
 type DiscordSettings = {
   execution_mode: string;
   live_trading: boolean;
   /** Fire each ladder rung when its Min profit is reached, instead of
    *  waiting for that rung's Discord alert. */
   auto_trim: boolean;
+  /** How a position leaves: on the channel's exit alerts, by auto-trim, or
+   *  never on its own (the trader closes it). */
+  exit_mode?: ExitMode;
+  /** The whole exit ladder, in order — any number of trims. */
+  trims?: TrimRow[];
+  /** "On Fill" stop as a return from entry; null = no stop until the first trim. */
+  fill_stop_pct?: string | null;
   quantity_multiplier: number;
   max_per_contract: string | null;
   max_per_order: string | null;
@@ -76,6 +100,9 @@ type LoginSession = {
 type DiscordSource = {
   /** A subscriber's copy of a trader channel — only the switch is theirs. */
   mirrored?: boolean;
+  /** Pills beside the status: how entries go out, what drives exits. */
+  entry_summary?: string | null;
+  exit_summary?: string | null;
   id: string;
   label: string;
   channel_id: string;
@@ -134,88 +161,68 @@ type LadderField = {
 };
 
 
-// One group per rung, because each rung's gate and stop are set independently —
-// changing the 1st trim leaves the 2nd and 3rd exactly where they were. Laying
-// them out as one flat list of six made it read like six knobs on one thing.
-//
-// 0 is a meaningful value in both columns: a gate of 0 means no minimum profit,
-// and a stop 0% below entry is break-even.
-/** The ladder as a matrix — one ROW per setting, one COLUMN per trim.
- *
- *  Laid out this way because that is how the ladder is actually reasoned
- *  about: "what does each trim take?" is one question across three rungs, and
- *  the old per-trim grouping made you read three separate blocks to answer it.
- *  Reading down a column gives one rung; reading across a row compares the
- *  same setting at every rung.
- */
-type LadderRow = {
-  label: string;
-  hint?: string;
-  /** Column order: 1st, 2nd, 3rd trim. */
-  keys: [string, string, string];
-  suffix?: string;
-  prefix?: string;
-  step: string;
-  /** Lowest value the field accepts. Defaults to 0; the Stop row allows a
-   *  negative so a drawdown can be written the way it is spoken. */
-  min?: string;
-};
+/** One trim of the exit ladder, as typed. */
+type TrimRow = { profit_gate_pct: string; qty_pct: string; stop_pct: string };
 
-const LADDER_ROWS: LadderRow[] = [
-  {
-    label: "Profit target",
-    hint: "minimum gain over entry before this trim sells",
-    keys: ["trim_profit_gate_pct", "trim2_profit_gate_pct", "trim3_profit_gate_pct"],
-    suffix: "%",
-    step: "5",
-  },
-  {
-    label: "Qty",
-    hint: "share of what is still held, not of the original position",
-    keys: ["trim_qty_pct", "trim2_qty_pct", "trim3_qty_pct"],
-    suffix: "%",
-    step: "5",
-  },
-  {
-    label: "Stop",
-    hint: "where the stop sits, as a return from entry: -25% is 25% below, "
-      + "0% is break-even, +10% locks in profit",
-    keys: ["trim_stop_pct", "trim2_stop_pct", "trim3_stop_pct"],
-    suffix: "%",
-    step: "5",
-    // A drawdown is usually said with a minus sign, so let it be typed that
-    // way. The ladder reads the distance, not the sign.
-    min: "-100",
-  },
+/** The ladder as a table — one ROW per stage, one COLUMN per setting:
+ *
+ *      On Fill   —              —                 stop
+ *      Trim 1    profit target  trim of rem. qty  stop
+ *      Trim 2    …              as many as the trader adds
+ *
+ *  Read across a row for what happens at that stage. On Fill has no target and
+ *  no quantity — nothing is sold when the entry fills; it only places the stop.
+ */
+const TRIM_COLUMNS: { key: keyof TrimRow; label: string; hint: string; min: string; max?: string }[] = [
+  { key: "profit_gate_pct", label: "Profit target", min: "0",
+    hint: "minimum gain over entry before this trim sells (0 = no minimum)" },
+  { key: "qty_pct", label: "Trim of rem. qty", min: "0", max: "100",
+    hint: "share of what is STILL held, not of the original position" },
+  { key: "stop_pct", label: "Stop", min: "-100",
+    hint: "where the stop sits after this stage, as a return from entry: -25% is 25% below, "
+      + "0% is break-even, +10% locks in profit" },
 ];
 
-/** Not part of the per-trim matrix: these two describe the trailing exit that
- *  the 2nd and 3rd trims use on an expensive contract, so they keep their own
- *  row rather than pretending to belong to one rung. */
+const MAX_TRIMS = 10;
+const DEFAULT_TRIMS: TrimRow[] = [
+  { profit_gate_pct: "20", qty_pct: "50", stop_pct: "-25" },
+  { profit_gate_pct: "0", qty_pct: "50", stop_pct: "0" },
+  { profit_gate_pct: "0", qty_pct: "100", stop_pct: "0" },
+];
+/** What "Add trim" appends: sell the rest, stop at break-even. */
+const NEW_TRIM: TrimRow = { profit_gate_pct: "0", qty_pct: "100", stop_pct: "0" };
+
+/** The ladder from a settings response (older responses carry only the three
+ *  per-trim fields). */
+function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
+  if (s.trims && s.trims.length > 0) return s.trims.map((t) => ({ ...t }));
+  const v = s as Record<string, string | undefined>;
+  return [
+    { profit_gate_pct: v.trim_profit_gate_pct ?? "20", qty_pct: v.trim_qty_pct ?? "50", stop_pct: v.trim_stop_pct ?? "-25" },
+    { profit_gate_pct: v.trim2_profit_gate_pct ?? "0", qty_pct: v.trim2_qty_pct ?? "50", stop_pct: v.trim2_stop_pct ?? "0" },
+    { profit_gate_pct: v.trim3_profit_gate_pct ?? "0", qty_pct: v.trim3_qty_pct ?? "100", stop_pct: v.trim3_stop_pct ?? "0" },
+  ];
+}
+
+const sameTrims = (a: TrimRow[], b: TrimRow[]) =>
+  a.length === b.length && a.every((t, i) => TRIM_COLUMNS.every((c) => t[c.key] === b[i][c.key]));
+
+/** Not part of the per-trim table: these two describe the trailing exit that
+ *  every trim after the first uses on an expensive contract, so they keep
+ *  their own row rather than pretending to belong to one trim. */
 const TRAIL_FIELDS: LadderField[] = [
   { key: "trim_price_threshold", label: "Trail when entry is above", prefix: "$", step: "0.05" },
   { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
 ];
 
-const TRIM_COLUMNS = ["1st trim", "2nd trim", "3rd trim"];
-
-// Flat view of the same fields, for the dirty check and for building state.
-const LADDER_FIELDS: LadderField[] = [
-  ...LADDER_ROWS.flatMap((r) =>
-    r.keys.map((key) => ({ key, label: r.label, suffix: r.suffix, step: r.step })),
-  ),
-  ...TRAIL_FIELDS,
-];
+// The two trailing-exit fields, for the dirty check and for building state.
+const LADDER_FIELDS: LadderField[] = TRAIL_FIELDS;
 
 const LADDER_DEFAULTS: Record<string, string> = {
-  trim_profit_gate_pct: "20", trim_stop_pct: "-25",
-  trim2_profit_gate_pct: "0", trim2_stop_pct: "0",
-  trim3_profit_gate_pct: "0", trim3_stop_pct: "0",
-  trim_qty_pct: "50", trim2_qty_pct: "50", trim3_qty_pct: "100",
   trim_price_threshold: "0.90", trim_trail_amount: "0.25",
 };
 
-/** Ladder values from a settings response, falling back to the defaults. */
+/** Trailing-exit values from a settings response, falling back to the defaults. */
 function ladderFrom(s: Partial<DiscordSettings>): Record<string, string> {
   return Object.fromEntries(
     LADDER_FIELDS.map((f) => [
@@ -248,8 +255,8 @@ export default function DiscordPage() {
   const [modeBusy, setModeBusy] = useState(false);
   // Paper until the server says otherwise — never show "live" optimistically.
   const [liveTrading, setLiveTrading] = useState(false);
-  const [autoTrim, setAutoTrim] = useState(false);
-  const [autoTrimBusy, setAutoTrimBusy] = useState(false);
+  const [exitMode, setExitMode] = useState<ExitMode>("alerts");
+  const [exitModeBusy, setExitModeBusy] = useState(false);
   // Which tab of the exits card is open, and which engine actually runs.
   const [exitTab, setExitTab] = useState<"ladder" | "ai">("ladder");
   const [exitEngine, setExitEngine] = useState<"ladder" | "ai">("ladder");
@@ -262,7 +269,28 @@ export default function DiscordPage() {
   const [savedMaxPerOrder, setSavedMaxPerOrder] = useState("");
   const [ladder, setLadder] = useState<Record<string, string>>(LADDER_DEFAULTS);
   const [savedLadder, setSavedLadder] = useState<Record<string, string>>(ladder);
+  // The exit ladder: the On Fill stop, then one row per trim.
+  const [trims, setTrims] = useState<TrimRow[]>(DEFAULT_TRIMS);
+  const [savedTrims, setSavedTrims] = useState<TrimRow[]>(DEFAULT_TRIMS);
+  const [fillStop, setFillStop] = useState("");
+  const [savedFillStop, setSavedFillStop] = useState("");
+  const adoptLadder = (r: Partial<DiscordSettings>) => {
+    const t = trimsFrom(r);
+    setTrims(t);
+    setSavedTrims(t);
+    setFillStop(r.fill_stop_pct ?? "");
+    setSavedFillStop(r.fill_stop_pct ?? "");
+  };
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
+  // Which settings the Alert handling card edits: null = the account's, else a
+  // channel's. A channel follows the account until "Use account settings" is
+  // turned off; it also has its own Market / Limit for entries.
+  const [scope, setScope] = useState<string | null>(null);
+  const scopeRef = useRef<string | null>(null);
+  const [followsAccount, setFollowsAccount] = useState(true);
+  const [entryType, setEntryType] = useState<"limit" | "market">("limit");
+  const settingsUrl = (id: string | null = scopeRef.current) =>
+    id ? `/api/discord-sources/${id}/settings` : "/api/discord-sources/settings";
   const [pair, setPair] = useState<Pairing | null>(null);
 
   // One hidden file input, retargeted at whichever source is uploading.
@@ -276,27 +304,69 @@ export default function DiscordPage() {
       // card showing the default until something else happened to refresh it.
       const [list, settings, ai] = await Promise.all([
         api<DiscordSource[]>("/api/discord-sources"),
-        api<DiscordSettings>("/api/discord-sources/settings"),
+        api<DiscordSettings & { use_account_settings?: boolean; entry_order_type?: string }>(settingsUrl()),
         // Only for which engine is active; the AI tab loads its own settings.
         api<{ engine: "ladder" | "ai" }>("/api/discord-sources/ai-trim").catch(() => null),
       ]);
       setSources(list);
       if (ai) setExitEngine(ai.engine);
+      applySettings(settings);
+    } catch (e) {
+      notify.fromError(e, "Failed to load Discord channels");
+    }
+  }
+
+  function applySettings(
+    settings: DiscordSettings & { use_account_settings?: boolean; entry_order_type?: string },
+  ) {
+      setFollowsAccount(settings.use_account_settings ?? true);
+      setEntryType(settings.entry_order_type === "market" ? "market" : "limit");
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
-      setAutoTrim(!!settings.auto_trim);
+      setExitMode(settings.exit_mode ?? (settings.auto_trim ? "auto" : "alerts"));
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
       setMaxPerOrder(settings.max_per_order ?? "");
       setSavedMaxPerOrder(settings.max_per_order ?? "");
+      adoptLadder(settings);
       const nextLadder = ladderFrom(settings);
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
-      setSavedMaxPerContract(settings.max_per_contract ?? "");
-      setSavedMaxPerOrder(settings.max_per_order ?? "");
+  }
+
+  // The channel list alone — so the Entry / Exit pills reflect a settings
+  // change at once, without reloading (and overwriting) the settings in view.
+  async function refreshSources() {
+    try {
+      setSources(await api<DiscordSource[]>("/api/discord-sources"));
+    } catch {
+      /* the 15s refresh will catch up */
+    }
+  }
+
+  async function changeScope(id: string | null) {
+    scopeRef.current = id;
+    setScope(id);
+    if (id !== null) setExitTab("ladder");          // the AI tab is account-only
+    try {
+      applySettings(await api(settingsUrl(id)));
     } catch (e) {
-      notify.fromError(e, "Failed to load Discord channels");
+      notify.fromError(e, "Could not load those settings");
+    }
+  }
+
+  async function patchChannel(body: Record<string, unknown>, done: string) {
+    if (!scope) return;
+    setModeBusy(true);
+    try {
+      applySettings(await api(settingsUrl(scope), { method: "PATCH", body: JSON.stringify(body) }));
+      notify.success(done);
+      void refreshSources();
+    } catch (e) {
+      notify.fromError(e, "Could not save that");
+    } finally {
+      setModeBusy(false);
     }
   }
 
@@ -358,7 +428,10 @@ export default function DiscordPage() {
         method: "PATCH",
         body: JSON.stringify({ is_enabled: next }),
       });
-      setSources((prev) => prev.map((x) => (x.id === s.id ? updated : x)));
+      setSources((prev) => prev.map((x) => (x.id === s.id
+        ? { ...updated, entry_summary: updated.entry_summary ?? x.entry_summary,
+            exit_summary: updated.exit_summary ?? x.exit_summary }
+        : x)));
     } catch (e) {
       setSources((prev) => prev.map((x) => (x.id === s.id ? { ...x, is_enabled: !next } : x)));
       notify.fromError(e, "Could not update");
@@ -394,11 +467,12 @@ export default function DiscordPage() {
     setModeBusy(true);
     try {
       const next = await api<{ execution_mode: string; live_trading: boolean }>(
-        "/api/discord-sources/settings",
+        settingsUrl(),
         { method: "PATCH", body: JSON.stringify({ execution_mode: mode }) }
       );
       setExecMode(next.execution_mode);
       setLiveTrading(!!next.live_trading);
+      void refreshSources();
       notify.success(
         mode === "auto"
           ? "Parsed alerts will be approved automatically"
@@ -411,12 +485,16 @@ export default function DiscordPage() {
     }
   }
 
-  const ladderDirty = LADDER_FIELDS.some((f) => ladder[f.key] !== savedLadder[f.key]);
+  const ladderDirty = LADDER_FIELDS.some((f) => ladder[f.key] !== savedLadder[f.key])
+    || !sameTrims(trims, savedTrims) || fillStop !== savedFillStop;
+  /** Everything the exit ladder's Save sends: the whole ladder at once. */
+  const ladderPatch = () => ({ ...ladder, trims, fill_stop_pct: fillStop.trim() });
+  const lastTrimLeavesRunner = Number(trims[trims.length - 1]?.qty_pct) < 100;
 
   async function saveSizing(patch: Record<string, unknown>) {
     setModeBusy(true);
     try {
-      const r = await api<DiscordSettings>("/api/discord-sources/settings", {
+      const r = await api<DiscordSettings>(settingsUrl(), {
         method: "PATCH",
         body: JSON.stringify(patch),
       });
@@ -425,10 +503,12 @@ export default function DiscordPage() {
       setSavedMaxPerContract(r.max_per_contract ?? "");
       setMaxPerOrder(r.max_per_order ?? "");
       setSavedMaxPerOrder(r.max_per_order ?? "");
+      adoptLadder(r);
       const nextLadder = ladderFrom(r);
       setLadder(nextLadder);
       setSavedLadder(nextLadder);
       notify.success("Saved");
+      void refreshSources();
     } catch (e) {
       notify.fromError(e, "Could not save that setting");
     } finally {
@@ -446,11 +526,12 @@ export default function DiscordPage() {
     setModeBusy(true);
     try {
       const r = await api<{ execution_mode: string; live_trading: boolean }>(
-        "/api/discord-sources/settings",
+        settingsUrl(),
         { method: "PATCH", body: JSON.stringify({ live_trading: next }) }
       );
       setLiveTrading(!!r.live_trading);
       notify.success(next ? "Live trading enabled" : "Back to paper — nothing reaches your broker");
+      void refreshSources();
     } catch (e) {
       notify.fromError(e, "Could not change that");
     } finally {
@@ -458,26 +539,24 @@ export default function DiscordPage() {
     }
   }
 
-  async function toggleAutoTrim(next: boolean) {
-    setAutoTrimBusy(true);
-    const prev = autoTrim;
-    setAutoTrim(next);
+  async function changeExitMode(next: ExitMode) {
+    if (next === exitMode) return;
+    setExitModeBusy(true);
+    const prev = exitMode;
+    setExitMode(next);
     try {
-      const r = await api<{ auto_trim: boolean }>(
-        "/api/discord-sources/settings",
-        { method: "PATCH", body: JSON.stringify({ auto_trim: next }) }
+      const r = await api<{ exit_mode?: ExitMode }>(
+        settingsUrl(),
+        { method: "PATCH", body: JSON.stringify({ exit_mode: next }) }
       );
-      setAutoTrim(!!r.auto_trim);
-      notify.success(
-        next
-          ? "Auto trim on — rungs fire at their own Min profit"
-          : "Auto trim off — rungs wait for their Discord alert"
-      );
+      setExitMode(r.exit_mode ?? next);
+      void refreshSources();
+      notify.success(EXIT_MODES.find((m) => m.value === next)!.toast);
     } catch (e) {
-      setAutoTrim(prev);
+      setExitMode(prev);
       notify.fromError(e, "Could not change that");
     } finally {
-      setAutoTrimBusy(false);
+      setExitModeBusy(false);
     }
   }
 
@@ -859,6 +938,26 @@ export default function DiscordPage() {
                             />
                             {STATUS_LABEL[s.status] ?? s.status}
                           </span>
+                          {/* How this channel trades: its own settings, or the
+                              account's while it follows them. */}
+                          {([["Entry", s.entry_summary], ["Exit", s.exit_summary]] as const).map(
+                            ([name, value]) => value ? (
+                              <span
+                                key={name}
+                                className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full"
+                                style={{
+                                  color: "var(--text-2)",
+                                  background: "var(--panel-2)",
+                                  border: "1px solid var(--border)",
+                                }}
+                                title={name === "Entry"
+                                  ? "How entries from this channel are placed"
+                                  : "What closes positions this channel opened"}
+                              >
+                                <span style={{ color: "var(--muted)" }}>{name}:</span> {value}
+                              </span>
+                            ) : null,
+                          )}
                         </div>
                         <div className="text-[12px] truncate mt-0.5" style={{ color: "var(--muted)" }}>
                           {s.guild_name ? `${s.guild_name} · ` : ""}
@@ -1047,10 +1146,10 @@ export default function DiscordPage() {
           )}
         </div>
 
-        {/* Alert handling — what happens to an alert once it's parsed.
-            Sits below the channel list because it's account-wide policy, not a
-            per-channel control, and it needs the width for three side-by-side
-            decisions. */}
+        {/* Alert handling — what happens to an alert once it's parsed. The
+            account's settings, or one channel's ("Settings for"): a channel
+            follows the account until it is given its own. Below the channel
+            list because it needs the width for three side-by-side decisions. */}
         <div className="card overflow-hidden">
           <div
             className="flex items-center justify-between px-5 py-3.5"
@@ -1074,6 +1173,83 @@ export default function DiscordPage() {
           </div>
 
           <div className="p-5 space-y-5">
+            {/* Whose settings these are: the account's, or one channel's. */}
+            <div
+              className="rounded-xl px-4 py-3 flex items-center gap-x-5 gap-y-2.5 flex-wrap"
+              style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+            >
+              <label className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-2)" }}>
+                Settings for
+                <select
+                  value={scope ?? ""}
+                  onChange={(e) => void changeScope(e.target.value || null)}
+                  className="rounded-md border px-2 py-1 text-[12px] bg-transparent focus-ring"
+                  style={{ borderColor: "var(--border)", color: "var(--text)" }}
+                >
+                  <option value="">Account (every channel that follows it)</option>
+                  {sources.map((s) => (
+                    <option key={s.id} value={s.id}>{s.label}</option>
+                  ))}
+                </select>
+              </label>
+              {scope && (
+                <>
+                  <label className="flex items-center gap-2 text-[12px] cursor-pointer select-none" style={{ color: "var(--text-2)" }}>
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 cursor-pointer"
+                      style={{ accentColor: "var(--accent)" }}
+                      checked={followsAccount}
+                      disabled={modeBusy}
+                      onChange={(e) => void patchChannel(
+                        { use_account_settings: e.target.checked },
+                        e.target.checked
+                          ? "This channel follows the account settings again"
+                          : "This channel now has its own settings, starting from the account's",
+                      )}
+                    />
+                    Use account settings
+                  </label>
+                  <div className="flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-2)" }}>
+                    Entries
+                    {(["limit", "market"] as const).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        disabled={modeBusy}
+                        onClick={() => void patchChannel(
+                          { entry_order_type: t },
+                          t === "market" ? "Entries from this channel go at market"
+                            : "Entries from this channel use the alert's price",
+                        )}
+                        className="px-2.5 py-0.5 text-[11px] font-medium rounded-full disabled:opacity-60"
+                        style={{
+                          background: entryType === t ? "var(--accent-glow)" : "transparent",
+                          border: `1px solid ${entryType === t ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                          color: entryType === t ? "var(--accent-2)" : "var(--muted)",
+                        }}
+                        title={t === "market"
+                          ? "Buy at market in the regular session (outside it, the alert's limit is kept). Exits still follow the exit ladder."
+                          : "Buy at the alert's price, as before"}
+                      >
+                        {t === "limit" ? "Limit" : "Market"}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-[11px] w-full" style={{ color: "var(--muted)" }}>
+                    {followsAccount
+                      ? "Following the account settings below. Turn the switch off to give this channel its own."
+                      : "This channel's own settings — changes here affect only this channel. AI trimming stays account-wide."}
+                  </span>
+                </>
+              )}
+            </div>
+
+            <fieldset
+              disabled={!!scope && followsAccount}
+              className="space-y-5 disabled:opacity-60"
+              style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
+            >
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
             {/* 1 — does it spend money (Execution comes first so Approval,
                 which is only meaningful in Live, reads as the follow-on step) */}
@@ -1122,7 +1298,7 @@ export default function DiscordPage() {
               })}
 
               <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                Applies to every connected channel, from now on.
+                {scope ? "Applies to this channel, from now on." : "Applies to every channel that follows the account, from now on."}
               </p>
             </div>
 
@@ -1201,7 +1377,7 @@ export default function DiscordPage() {
                       Contracts per alert
                     </label>
                     <span className="text-[11px] tabular-nums" style={{ color: "var(--accent-2)" }}>
-                      {qtyMultiplier}x
+                      {qtyMultiplier} {qtyMultiplier === 1 ? "contract" : "contracts"}
                     </span>
                   </div>
                   <div className="flex gap-1 mt-2 flex-wrap">
@@ -1227,7 +1403,7 @@ export default function DiscordPage() {
                     })}
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Entries only — a close always sells the position you hold.
+                    Every entry buys exactly this many, whatever size the alert says. A close always sells the position you hold.
                   </p>
                 </div>
 
@@ -1327,8 +1503,7 @@ export default function DiscordPage() {
                     </button>
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Skips an entry when the whole order&apos;s value (quantity × price,
-                    × 100 for options) is above this. Closes always go through.
+                    Cuts an entry to the most contracts that fit under this total (quantity × price, × 100 for options); skips it only if not even one fits. Closes always go through.
                   </p>
                 </div>
               </div>
@@ -1344,10 +1519,10 @@ export default function DiscordPage() {
               >
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <div role="tablist" aria-label="Exit engine" className="flex gap-1">
-                      {([
-                        ["ladder", "Exit ladder"],
-                        ["ai", "AI trimming"],
-                      ] as const).map(([value, label]) => (
+                      {(scope
+                        ? ([["ladder", "Exit ladder"]] as const)
+                        : ([["ladder", "Exit ladder"], ["ai", "AI trimming"]] as const)
+                      ).map(([value, label]) => (
                         <button
                           key={value}
                           type="button"
@@ -1386,112 +1561,166 @@ export default function DiscordPage() {
                     </p>
                   )}
 
-                  {/* Auto trim. Off, a rung waits for its Discord alert and the
-                      Min profit below is the condition that alert has to meet.
-                      On, there is no alert to wait for — the rung fires the
-                      moment its Min profit is reached. */}
-                  <label
-                    className="mt-2 flex items-start gap-2 text-[11px] cursor-pointer select-none"
-                    title="Fire each rung at its Min profit instead of waiting for an alert"
-                  >
-                    <input
-                      type="checkbox"
-                      className="h-3.5 w-3.5 cursor-pointer mt-[1px]"
-                      style={{ accentColor: "var(--accent)" }}
-                      checked={autoTrim}
-                      disabled={autoTrimBusy}
-                      onChange={(e) => toggleAutoTrim(e.target.checked)}
-                    />
-                    <span style={{ color: "var(--text-2)" }}>
-                      Auto trim
-                      <span style={{ color: "var(--muted)" }}>
-                        {" — "}fire each rung at its Min profit, without waiting for an
-                        alert. A rung left at 0% keeps waiting: 0 means &ldquo;no
-                        minimum&rdquo;, which is a threshold nothing can reach.
-                      </span>
-                    </span>
-                  </label>
+                  {/* What makes a position leave. On alerts: a rung waits for
+                      its Discord alert and the Profit target below is the
+                      condition that alert has to meet. Auto trim: no alert to
+                      wait for — the rung fires the moment its target is
+                      reached. Manual: nothing sells on its own. */}
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4" role="radiogroup" aria-label="Exits">
+                    {EXIT_MODES.map(({ value, label, detail }) => {
+                      const active = exitMode === value;
+                      return (
+                        <button
+                          key={value}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          disabled={exitModeBusy}
+                          onClick={() => void changeExitMode(value)}
+                          className="text-left rounded-lg px-3 py-2 transition-colors disabled:opacity-60"
+                          style={{
+                            background: active ? "var(--accent-glow)" : "transparent",
+                            border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                          }}
+                        >
+                          <div className="flex items-center gap-2">
+                            <RadioDot active={active} />
+                            <span className="text-[12px] font-semibold"
+                                  style={{ color: active ? "var(--accent-2)" : "var(--text)" }}>
+                              {label}
+                            </span>
+                          </div>
+                          <p className="text-[11px] mt-0.5 leading-snug pl-[22px]" style={{ color: "var(--muted)" }}>
+                            {detail}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {exitMode === "manual" && (
+                    <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                      The trims below are not used while exits are Manual — except for an exit you
+                      type into the alert composer yourself, which still runs on them.
+                    </p>
+                  )}
 
-                  {/* One ROW per setting, one COLUMN per trim — read down a
-                      column for a single rung, across a row to compare the same
-                      setting at every rung.
+                  {/* One ROW per stage, one COLUMN per setting — read across a
+                      row for what happens at that stage.
 
                       No overflow wrapper: "overflow-x-auto" makes an element a
                       scroll container in BOTH axes, and .focus-ring draws its
                       outline 2px OUTSIDE the input, so the ring was clipped on
                       every cell. The columns are minmax(0,1fr) and shrink on
                       their own, so nothing needed to scroll. */}
-                  <div className="mt-3 grid gap-x-2 gap-y-2"
-                       style={{ gridTemplateColumns: "78px repeat(3, minmax(0, 1fr))" }}>
-                    {/* Header: the trim names. */}
+                  <div className="mt-3 grid gap-x-2 gap-y-2 items-center"
+                       style={{ gridTemplateColumns: "64px repeat(3, minmax(0, 1fr)) 22px" }}>
+                    {/* Header: the settings. */}
                     <span />
-                      {TRIM_COLUMNS.map((c) => (
-                        <span
-                          key={c}
-                          className="text-[10px] font-medium uppercase tracking-wide text-center"
-                          style={{ color: "var(--text-2)" }}
-                        >
-                          {c}
-                        </span>
-                      ))}
+                    {TRIM_COLUMNS.map((c) => (
+                      <span
+                        key={c.key}
+                        className="text-[10px] font-medium uppercase tracking-wide text-center"
+                        style={{ color: "var(--text-2)" }}
+                        title={c.hint}
+                      >
+                        {c.label}
+                      </span>
+                    ))}
+                    <span />
 
-                      {LADDER_ROWS.map((row) => (
-                        <Fragment key={row.label}>
-                          <label
-                            className="text-[11px] self-center"
+                    {/* On Fill: nothing is sold when the entry fills, so the
+                        target and quantity are blank, with no box to type in.
+                        Only the stop is set here. */}
+                    <span className="text-[11px]" style={{ color: "var(--muted)" }}
+                          title="When the entry fills: the stop that goes on straight away">
+                      On Fill
+                    </span>
+                    <span aria-hidden="true" />
+                    <span aria-hidden="true" />
+                    <div className="relative">
+                      <input
+                        id="ladder-fill-stop"
+                        aria-label="Stop, On Fill"
+                        type="number"
+                        min="-99"
+                        max="-1"
+                        step="5"
+                        placeholder="none"
+                        value={fillStop}
+                        disabled={modeBusy}
+                        onChange={(e) => setFillStop(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
+                        title="Stop placed as soon as the entry fills, as a return from entry: -25 is 25% below. Leave empty for no stop until the first trim."
+                        className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
+                        style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 8, paddingRight: 20 }}
+                      />
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
+                    </div>
+                    <span />
+
+                    {trims.map((t, i) => (
+                      <Fragment key={i}>
+                        <span className="text-[11px]" style={{ color: "var(--muted)" }}>Trim {i + 1}</span>
+                        {TRIM_COLUMNS.map((c) => (
+                          <div key={c.key} className="relative">
+                            <input
+                              id={`ladder-trim${i + 1}-${c.key}`}
+                              aria-label={`${c.label}, Trim ${i + 1}`}
+                              type="number"
+                              min={c.min}
+                              max={c.max}
+                              step="5"
+                              value={t[c.key]}
+                              disabled={modeBusy}
+                              onChange={(e) =>
+                                setTrims((rows) => rows.map((r, j) => (j === i ? { ...r, [c.key]: e.target.value } : r)))
+                              }
+                              onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
+                              className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
+                              style={{
+                                // --border is 6% white in dark, which on a panel
+                                // reads as no edge at all. An input people are
+                                // meant to type into needs the stronger token.
+                                borderColor: "var(--border-strong)",
+                                color: "var(--text)",
+                                paddingLeft: 8,
+                                paddingRight: 20,
+                              }}
+                            />
+                            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
+                          </div>
+                        ))}
+                        {trims.length > 1 ? (
+                          <button
+                            type="button"
+                            disabled={modeBusy}
+                            onClick={() => setTrims((rows) => rows.filter((_, j) => j !== i))}
+                            aria-label={`Remove Trim ${i + 1}`}
+                            title={`Remove Trim ${i + 1}`}
+                            className="focus-ring rounded p-0.5 opacity-60 hover:opacity-100 disabled:opacity-30"
                             style={{ color: "var(--muted)" }}
-                            title={row.hint}
                           >
-                            {row.label}
-                          </label>
-                          {row.keys.map((key) => (
-                            <div key={key} className="relative">
-                              {row.prefix && (
-                                <span
-                                  className="absolute left-2 top-1/2 -translate-y-1/2 text-[13px]"
-                                  style={{ color: "var(--muted)" }}
-                                >
-                                  {row.prefix}
-                                </span>
-                              )}
-                              <input
-                                id={`ladder-${key}`}
-                                aria-label={`${row.label}, ${TRIM_COLUMNS[row.keys.indexOf(key)]}`}
-                                type="number"
-                                min={row.min ?? "0"}
-                                step={row.step}
-                                value={ladder[key]}
-                                disabled={modeBusy}
-                                onChange={(e) =>
-                                  setLadder((l) => ({ ...l, [key]: e.target.value }))
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") saveSizing({ [key]: ladder[key] });
-                                }}
-                                className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
-                                style={{
-                                  // --border is 6% white in dark, which on a
-                                  // panel reads as no edge at all. An input
-                                  // people are meant to type into needs the
-                                  // stronger token.
-                                  borderColor: "var(--border-strong)",
-                                  color: "var(--text)",
-                                  paddingLeft: row.prefix ? 18 : 8,
-                                  paddingRight: row.suffix ? 20 : 8,
-                                }}
-                              />
-                              {row.suffix && (
-                                <span
-                                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]"
-                                  style={{ color: "var(--muted)" }}
-                                >
-                                  {row.suffix}
-                                </span>
-                              )}
-                            </div>
-                          ))}
+                            <X size={13} />
+                          </button>
+                        ) : <span />}
                       </Fragment>
                     ))}
+                  </div>
+
+                  <div className="mt-2 flex items-center gap-3 flex-wrap">
+                    <button
+                      type="button"
+                      disabled={modeBusy || trims.length >= MAX_TRIMS}
+                      onClick={() => setTrims((rows) => [...rows, { ...NEW_TRIM }])}
+                      className="btn-ghost px-2.5 py-1 text-[11px] disabled:opacity-40"
+                      title={trims.length >= MAX_TRIMS ? `A ladder can have up to ${MAX_TRIMS} trims` : "Add another trim after the last one"}
+                    >
+                      + Add trim
+                    </button>
+                    <p className="text-[11px] leading-snug"
+                       style={{ color: lastTrimLeavesRunner ? "var(--warn, #b45309)" : "var(--muted)" }}>
+                      If the last trim is not 100% then it will round down and leave runners.
+                    </p>
                   </div>
 
                   {/* The trailing exit is not per-rung: it is the style the 2nd
@@ -1505,7 +1734,7 @@ export default function DiscordPage() {
                       Trailing exit
                     </span>
                     <span className="text-[10px] ml-2" style={{ color: "var(--muted)" }}>
-                      2nd and 3rd trims
+                      every trim after the first
                     </span>
                     <div className="grid grid-cols-2 gap-2 mt-1.5">
                       {TRAIL_FIELDS.map((f) => (
@@ -1535,7 +1764,7 @@ export default function DiscordPage() {
                                 setLadder((l) => ({ ...l, [f.key]: e.target.value }))
                               }
                               onKeyDown={(e) => {
-                                if (e.key === "Enter") saveSizing({ [f.key]: ladder[f.key] });
+                                if (e.key === "Enter") saveSizing(ladderPatch());
                               }}
                               className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
                               style={{
@@ -1555,15 +1784,15 @@ export default function DiscordPage() {
                     <button
                       type="button"
                       disabled={modeBusy || !ladderDirty}
-                      onClick={() => saveSizing(ladder)}
+                      onClick={() => saveSizing(ladderPatch())}
                       className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
                     >
                       {modeBusy ? <Spinner /> : "Save"}
                     </button>
                     <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                      Qty is a share of what is STILL held, so 50 / 50 / 100 works a
+                      Trim of rem. qty is a share of what is STILL held, so 50 / 50 / 100 works a
                       position of 4 down as 2, then 1, then 1. A trim only fires above
-                      its profit target; the stop applies to whatever is left after it.
+                      its profit target; its stop applies to whatever is left after it.
                     </p>
                   </div>
                   </>
@@ -1571,6 +1800,7 @@ export default function DiscordPage() {
               </div>
             </div>
             </div>
+          </fieldset>
           </div>
         </div>
         </div>

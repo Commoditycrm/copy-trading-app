@@ -12,7 +12,7 @@ Two audiences share this module, and the split matters:
 """
 import uuid
 from datetime import datetime, time
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -121,6 +121,13 @@ class DiscordSourceOut(BaseModel):
     # A subscriber's copy of a trader channel: only is_enabled is theirs to
     # change; everything else describes the trader's channel.
     mirrored: bool = False
+
+    # One-line summaries of how this channel trades, for the pills beside its
+    # status: what an entry does ("Market · 3 contracts · Test") and what
+    # drives exits ("Auto-trim 20% / 35% / 60%", "On trim alerts", "AI
+    # trimming"). Filled on the channel list; None elsewhere.
+    entry_summary: str | None = None
+    exit_summary: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -404,6 +411,18 @@ class DiscordSignalOut(BaseModel):
     order_id: uuid.UUID | None = None
 
 
+class DiscordTrimRow(BaseModel):
+    """One trim of the exit ladder. Strings, like every other ladder field: one
+    validation path for what the user typed."""
+
+    # Minimum gain over entry before this trim sells (0 = no minimum).
+    profit_gate_pct: str
+    # Share of what is STILL HELD that this trim sells.
+    qty_pct: str
+    # Where the stop sits after this trim, as a return from entry.
+    stop_pct: str
+
+
 class DiscordSettingsOut(BaseModel):
     """Account-wide handling of inbound Discord alerts."""
 
@@ -414,6 +433,11 @@ class DiscordSettingsOut(BaseModel):
     # True  — live: approved alerts place real orders
     live_trading: bool = False
     auto_trim: bool = False
+    # How a position leaves: "alerts" (each rung waits for the channel's exit
+    # alert), "auto" (auto-trim fires each rung at its profit target) or
+    # "manual" (Kopyya never sells; the trader closes it).
+    # … or "orders": each trim rests at the broker as a take-profit order.
+    exit_mode: Literal["alerts", "auto", "orders", "manual"] = "alerts"
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
@@ -442,6 +466,12 @@ class DiscordSettingsOut(BaseModel):
     trim_price_threshold: str = "0.90"
     # Dollar give-back from the peak that triggers a trailing exit.
     trim_trail_amount: str = "0.25"
+    # The WHOLE ladder, in order — any number of trims. The trim*/trim2*/trim3*
+    # fields above are the first three of these, kept for older clients.
+    trims: list[DiscordTrimRow] = []
+    # "On Fill": the stop set the moment the entry fills, as a return from entry
+    # (-25 = 25% below). Null = no stop until the first trim.
+    fill_stop_pct: str | None = None
 
     # ── chasing an entry that didn't fill ───────────────────────────────────
     # Seconds an unfilled buy rests before its one repriced attempt.
@@ -457,6 +487,9 @@ class DiscordSettingsIn(BaseModel):
     # waiting for that rung's Discord alert. A rung whose gate is 0 is
     # never auto-fired -- see TraderSettings.discord_auto_trim.
     auto_trim: bool | None = None
+    # Sets auto_trim and manual exits together; wins over auto_trim when both
+    # are sent.
+    exit_mode: Literal["alerts", "auto", "orders", "manual"] | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
@@ -475,11 +508,31 @@ class DiscordSettingsIn(BaseModel):
     trim_stop_pct: str | None = None
     trim_price_threshold: str | None = None
     trim_trail_amount: str | None = None
+    # Replaces the WHOLE ladder (1 to 10 trims, in order). Wins over the
+    # per-trim fields above when both are sent.
+    trims: list[DiscordTrimRow] | None = Field(default=None, min_length=1, max_length=10)
+    # "On Fill" stop; "" clears it (no stop until the first trim).
+    fill_stop_pct: str | None = None
     reprice_after_seconds: int | None = Field(default=None, ge=5, le=600)
     reprice_pct: str | None = None
 
 
 # ── the "Self" channel: manually replaying an alert the system missed ────────
+
+class ChannelSettingsOut(DiscordSettingsOut):
+    """One channel's Alert handling, plus the two channel-only switches."""
+
+    # True: the channel follows the account's settings (the values above ARE the
+    # account's). False: the values above are the channel's own.
+    use_account_settings: bool = True
+    # "limit" — entries at the alert's price (default) — or "market".
+    entry_order_type: str = "limit"
+
+
+class ChannelSettingsIn(DiscordSettingsIn):
+    use_account_settings: bool | None = None
+    entry_order_type: str | None = Field(default=None, pattern=r"^(limit|market)$")
+
 
 class DiscordSelfAlertIn(BaseModel):
     """One alert the trader is submitting by hand.
@@ -489,9 +542,14 @@ class DiscordSelfAlertIn(BaseModel):
     this goes through the SAME parser and the same execution path as a real
     alert. Letting the caller supply a parsed signal would be a second, untested
     way into the order pipeline.
+
+    ``source_id`` picks the channel the alert is handled AS — its sizing, entry
+    type and exit settings apply and the position shows that channel. Omitted,
+    it is the trader's own Self channel.
     """
 
     content: str = Field(min_length=1, max_length=8000)
+    source_id: uuid.UUID | None = None
 
 
 class DiscordSelfAlertOut(BaseModel):

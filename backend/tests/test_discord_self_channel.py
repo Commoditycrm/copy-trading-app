@@ -39,13 +39,16 @@ def test_it_never_accepts_a_pre_parsed_signal():
     """Only the TEXT is taken. Letting a caller hand in a parsed signal would
     be a second, untested way to reach the broker."""
     fields = set(ds.DiscordSelfAlertIn.model_fields)
-    assert fields == {"content"}
+    # The text, and which of the trader's channels to handle it AS — never a
+    # parsed signal, a symbol, a quantity or a price.
+    assert fields == {"content", "source_id"}
 
 
 def test_it_honours_the_traders_execution_mode():
     """"As if Discord had delivered it" includes the auto/manual gate — in
     manual it must land awaiting approval, not place."""
-    assert "_auto_approve(db, user.id)" in _SRC
+    # …the chosen channel's own mode, when the alert is typed as a channel.
+    assert "_auto_approve(db, user.id, src.id if typed_into_channel else None)" in _SRC
     assert "if auto and msg.decision is SignalDecision.APPROVED:" in _SRC
     # The composer never forces approval — only auto-trim does, and only
     # because turning auto-trim on IS the approval.
@@ -155,7 +158,39 @@ def test_hiding_it_does_not_hide_its_orders():
     """The Channel column resolves the name by joining messages to sources
     directly, so an order placed through Self still reads "Self" in Order
     History even though the channel list never mentions it."""
-    from app.api.trades import _fill_channels
+    import uuid
+    from types import SimpleNamespace
 
-    src = inspect.getsource(_fill_channels)
-    assert "_SELF" not in src and "self" not in src.replace("isouter", "")
+    from app.api.trades import _attach_discord_channel
+
+    order = SimpleNamespace(id=uuid.uuid4(), discord_channel=None)
+    rows = [(order.id, "Self", "Self", "self")]
+    db = SimpleNamespace(execute=lambda stmt: SimpleNamespace(all=lambda: rows))
+    _attach_discord_channel(db, [order])
+    assert order.discord_channel == "Self"
+
+
+# ── typed AS a channel (the composer's channel picker) ───────────────────────
+
+def test_an_alert_can_be_typed_as_one_of_the_traders_channels():
+    """It is stored on THAT channel, so its settings size and manage the trade
+    and the position shows it — but only a channel the trader owns."""
+    assert "_get_owned(db, user, source_id) if source_id is not None else _self_source(db, user)" in _SRC
+
+
+def test_a_typed_alert_is_not_the_channels_heartbeat():
+    """ingest_batch treats an arriving message as proof the watcher is live. A
+    typed one proves nothing about the watcher, and the disconnect watchdog
+    reads that heartbeat — so the channel's watcher markers are put back."""
+    assert "src.last_heartbeat_at, src.last_message_at, src.last_seen_message_id = watcher_state" in _SRC
+
+
+def test_typed_alerts_are_recognised_whatever_channel_they_were_typed_as():
+    """Manual exits let through what the trader types. The composer signs each
+    alert with the trader's own id as author — a real Discord author never is."""
+    import uuid
+    uid = uuid.uuid4()
+    typed = SimpleNamespace(author_id=str(uid), user_id=uid, source_id=uuid.uuid4())
+    assert ds._is_self_alert(None, typed) is True
+    from_discord = SimpleNamespace(author_id="112233445566778899", user_id=uid, source_id=None)
+    assert ds._is_self_alert(None, from_discord) is False

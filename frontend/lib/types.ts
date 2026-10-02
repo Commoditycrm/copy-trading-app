@@ -183,6 +183,9 @@ export interface Order {
   /** Realized P&L this closing order produced (FIFO). Null for opening orders
    *  or anything that realized nothing. Decimal as string. */
   realized_pnl?: string | null;
+  /** True for a sell-to-close / buy-to-close: an order that took contracts or
+   *  shares OFF a position (exits, trims, closes). */
+  is_closing?: boolean;
   /** True when this order was placed by a Sell-All Re-Enter (from a snapshot). */
   is_reentry?: boolean;
   /** Discord channel whose alert placed this order. Null for everything
@@ -198,6 +201,15 @@ export interface Order {
  *  returned 200 with the failed account simply absent, so the table drew an
  *  empty view and told the user they were flat while they held real
  *  positions (prod, 2026-09-21: Webull answering 429 to a position read). */
+/** An account whose positions are listed from a recent snapshot because the
+ *  live read was rate-limited by the broker (Webull 429). */
+export interface StaleAccount {
+  broker_account_id: string;
+  broker: string;
+  label: string | null;
+  age_s: number;
+}
+
 export interface UnreachableAccount {
   broker_account_id: string;
   broker: string;
@@ -211,6 +223,7 @@ export interface UnreachableAccount {
 export interface PositionsPayload {
   positions: Position[];
   unreachable: UnreachableAccount[];
+  stale?: StaleAccount[];
 }
 
 export interface Position {

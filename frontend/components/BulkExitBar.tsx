@@ -13,6 +13,7 @@
  *    `onActionComplete` hook (typically a table-refresh) and forget.
  */
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -90,10 +91,25 @@ interface Props {
   /** Called after a bulk action completes successfully — typically a
    *  `tableRef.current?.refresh()` so the positions list re-renders. */
   onActionComplete?: () => void;
+  /** Render just the buttons, with no card and no "Bulk Exit" heading, to sit
+   *  in a toolbar (the Positions page puts them beside the All / Options /
+   *  Stocks pills). The "Re-Enter Last Exit" strip, when there is one, then
+   *  renders into the element with id BULK_REENTER_SLOT_ID. */
+  inline?: boolean;
 }
 
-export function BulkExitBar({ onActionComplete }: Props) {
+/** Where the inline variant puts its "Re-Enter Last Exit" strip. */
+export const BULK_REENTER_SLOT_ID = "bulk-reenter-slot";
+
+export function BulkExitBar({ onActionComplete, inline }: Props) {
   const [user, setUser] = useState<User | null>(null);
+  // Inline only: the host page's slot for the "Re-Enter Last Exit" strip. Found
+  // after mount — the slot is the page's, and may not be in the DOM on the
+  // first render.
+  const [reenterSlot, setReenterSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (inline) setReenterSlot(document.getElementById(BULK_REENTER_SLOT_ID));
+  }, [inline]);
   const [pending, setPending] = useState<ExitKey | null>(null);
   const [busy, setBusy] = useState(false);
   // Optional trailing-stop trail (%) for "Exit My Positions". Empty = market
@@ -402,42 +418,26 @@ export function BulkExitBar({ onActionComplete }: Props) {
     </div>
   );
 
-  return (
+  // Who gets which buttons: everyone can cancel their own orders; Exit My
+  // Positions (and its Exit-as / Re-enter controls) needs Sell-All access; the
+  // two subscriber buttons are for traders whose subscribers copy them — not
+  // Discord traders, whose subscribers trade on their own.
+  const myButtons = (
     <>
-      <div
-        className="rounded-xl px-3 py-2.5 flex flex-col gap-2.5"
-        style={cardStyle}
-      >
-        {/* Label — top-left, on its own line. */}
-        <div className="flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--bad)" }} />
-          <span
-            className="text-[10px] uppercase tracking-[0.2em] font-semibold"
-            style={{ color: "var(--text-2)" }}
-          >
-            Bulk Exit
-          </span>
-        </div>
-        {/* One line below the label — your actions hug the left, the subscriber
-            actions hug the right, so the row fills the width with no trailing gap.
-            Scrolls horizontally only if the panel is very narrow. */}
-        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
-          <div className="flex items-center gap-2 shrink-0">
-            {hasSellAll && !noPositions && exitModePill}
-            {hasSellAll && renderButton("my_positions")}
-            {hasSellAll && !noPositions && reentryPill}
-            {renderButton("my_orders")}
-          </div>
-          {actsForSubscribers && (
-            <div className="flex items-center gap-2 shrink-0">
-              {renderButton("subs_positions")}
-              {renderButton("subs_orders")}
-            </div>
-          )}
-        </div>
-      </div>
+      {hasSellAll && !noPositions && exitModePill}
+      {hasSellAll && renderButton("my_positions")}
+      {hasSellAll && !noPositions && reentryPill}
+      {renderButton("my_orders")}
+    </>
+  );
+  const subscriberButtons = actsForSubscribers && (
+    <>
+      {renderButton("subs_positions")}
+      {renderButton("subs_orders")}
+    </>
+  );
 
-      {hasSellAll && snapshot && snapshot.summary.total > 0 && (
+  const reenterStrip = hasSellAll && snapshot && snapshot.summary.total > 0 && (
         <div
           className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
           style={cardStyle}
@@ -508,8 +508,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
             </button>
           </div>
         </div>
-      )}
+      );
 
+  const modal = (
       <ConfirmModal
         open={pending !== null}
         title={pending ? EXIT_DEFS[pending].title : ""}
@@ -526,6 +527,51 @@ export function BulkExitBar({ onActionComplete }: Props) {
         onConfirm={confirmRun}
         onCancel={() => { if (!busy) setPending(null); }}
       />
+  );
+
+  if (inline) {
+    // No card, no heading: the buttons sit in the host's toolbar. The strip
+    // goes to its slot above the table, when the page provides one.
+    return (
+      <>
+        {myButtons}
+        {subscriberButtons}
+        {reenterStrip && reenterSlot ? createPortal(reenterStrip, reenterSlot) : null}
+        {modal}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div
+        className="rounded-xl px-3 py-2.5 flex flex-col gap-2.5"
+        style={cardStyle}
+      >
+        {/* Label — top-left, on its own line. */}
+        <div className="flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--bad)" }} />
+          <span
+            className="text-[10px] uppercase tracking-[0.2em] font-semibold"
+            style={{ color: "var(--text-2)" }}
+          >
+            Bulk Exit
+          </span>
+        </div>
+        {/* One line below the label — your actions hug the left, the subscriber
+            actions hug the right, so the row fills the width with no trailing gap.
+            Scrolls horizontally only if the panel is very narrow. */}
+        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
+          <div className="flex items-center gap-2 shrink-0">{myButtons}</div>
+          {subscriberButtons && (
+            <div className="flex items-center gap-2 shrink-0">{subscriberButtons}</div>
+          )}
+        </div>
+      </div>
+
+      {reenterStrip}
+
+      {modal}
     </>
   );
 }

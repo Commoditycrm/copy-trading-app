@@ -188,3 +188,83 @@ def test_add_to_latest_is_resolved_before_the_order_is_built():
 
     src = inspect.getsource(discord_sources._execute_signal)
     assert src.index("latest_channel_contract(") < src.index("discord_execution.resolve(db, user, signal, sizing)")
+
+
+# ── "Average down on SPY @0.80" ─────────────────────────────────────────────
+
+def _avg(text):
+    return parse_message(ParsedMessage(content=text))
+
+
+@pytest.mark.parametrize("text,price", [
+    ("Average down on SPY @0.80", "0.80"),
+    ("averaging down $SPY .8", "0.8"),
+    ("avg down on SPY 0.75 @here", "0.75"),
+])
+def test_average_down_doubles_the_open_position(text, price):
+    s = _avg(text).signals[0]
+    assert (s.action.value, s.symbol, s.double_up, s.contract_unspecified) == ("BUY", "SPY", True, True)
+    assert str(s.limit_price) == price and s.quantity is None
+
+
+def test_average_down_without_a_price_is_refused():
+    r = _avg("Average down on SPY")
+    assert r.status is ParseStatus.INVALID and "no price" in r.reason
+
+
+def test_chatter_about_averaging_down_is_ignored():
+    assert _avg("I might average down later").status is ParseStatus.IGNORED
+
+
+def test_an_at_price_is_never_stripped_as_a_mention():
+    s = _avg("AMZN245P @0.55").signals[0]
+    assert str(s.limit_price) == "0.55"
+
+
+def _held(strike, right, qty=3):
+    return SimpleNamespace(option_strike=Decimal(strike), option_right=right,
+                           option_expiry=date(2026, 10, 1), quantity=Decimal(qty))
+
+
+def test_execution_doubles_the_one_held_spy_contract():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    held = [_held("767", OptionRight.CALL, 3)]
+    res = {}
+    strike, right, expiry = ex._resolve_contract(sig, held, res)
+    assert (strike, right) == (Decimal("767"), OptionRight.CALL)
+    qty = ex._resolve_quantity(sig, held, strike, right, expiry, False, ex.Sizing(multiplier=4), res)
+    assert qty == Decimal(3)          # doubles the 3 held — not your Contracts per alert
+
+
+def test_execution_refuses_when_two_spy_contracts_are_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="2 of your open contracts"):
+        ex._resolve_contract(sig, [_held("767", OptionRight.CALL), _held("760", OptionRight.PUT)], {})
+
+
+def test_execution_refuses_when_no_spy_contract_is_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="no matching position"):
+        ex._resolve_contract(sig, [], {})
+
+
+# ── "In SPY 763P 1.01": a spaced contract after an entry word ───────────────
+
+@pytest.mark.parametrize("text,sym,strike,right,price", [
+    ("In SPY 763P @here @Sniper 1.01", "SPY", "763", "PUT", "1.01"),
+    ("Entry: QQQ 600P @0.95", "QQQ", "600", "PUT", "0.95"),
+    ("In $SPY 765c .80", "SPY", "765", "CALL", "0.80"),
+])
+def test_an_entry_word_then_a_spaced_contract_is_an_entry(text, sym, strike, right, price):
+    s = parse_message(ParsedMessage(content=text)).signals[0]
+    assert (s.action.value, s.symbol, str(s.strike), s.option_type.value) == ("BUY", sym, strike, right)
+    assert str(s.limit_price) == price and s.nearest_expiry is True
+
+
+@pytest.mark.parametrize("text", ["SPY 763P hit 1.50", "I'm in SPY 763P 1.01", "watching SPY 763P 1.01"])
+def test_a_spaced_contract_without_a_leading_entry_word_is_not_an_entry(text):
+    assert parse_message(ParsedMessage(content=text)).status is ParseStatus.IGNORED
+
+
+def test_an_entry_with_no_price_is_refused():
+    assert parse_message(ParsedMessage(content="In SPY 763P")).status is ParseStatus.IGNORED

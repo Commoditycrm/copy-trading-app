@@ -61,6 +61,16 @@ class UnreachableAccount(BaseModel):
     detail: str
 
 
+class StaleAccount(BaseModel):
+    """A broker account whose positions ARE listed, but from a recent snapshot:
+    the live read was rate-limited (Webull 429). Shown with its age rather than
+    leaving the account out."""
+    broker_account_id: uuid.UUID
+    broker: str
+    label: str | None = None
+    age_s: int
+
+
 class PositionsPayload(BaseModel):
     """Detailed form of GET /api/positions (``?detail=1``).
 
@@ -68,6 +78,24 @@ class PositionsPayload(BaseModel):
     only the UI that needs to SAY something about a failure opts in."""
     positions: list[PositionOut]
     unreachable: list[UnreachableAccount] = []
+    stale: list[StaleAccount] = []
+
+
+class PositionChannelIn(BaseModel):
+    """Assign a held position to a Discord channel (Positions → Channel).
+
+    ``channel`` is a channel's id, "self" for the trader's own Self channel, or
+    "auto" to go back to the channel whose alert opened the position.
+    ``entry_price`` is the position's average cost as the page shows it — used
+    only to start an exit ladder on a position that has none yet.
+    """
+
+    symbol: str = Field(min_length=1, max_length=40)
+    option_strike: Decimal | None = None
+    option_right: OptionRight | None = None
+    option_expiry: date | None = None
+    channel: str = Field(min_length=1, max_length=40)
+    entry_price: Decimal | None = Field(default=None, gt=0)
 
 
 class AveragePositionIn(BaseModel):

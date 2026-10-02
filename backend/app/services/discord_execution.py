@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -75,6 +76,10 @@ class Resolved:
     # What the broker says this position averaged in at. Used only as a fallback
     # reference for a position the trim ladder never saw open.
     position_entry_price: Decimal | None = None
+    # For an averaging-down add: how much was held BEFORE it. The add is no
+    # longer always the same size as the holding (see light_entry_quantity), and
+    # the ladder needs both to re-average its cost basis.
+    held_quantity: Decimal | None = None
 
 
 def resolve(
@@ -122,9 +127,25 @@ def resolve(
     else:
         strike = right = expiry = None
 
-    quantity = _resolve_quantity(
-        signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+    # An averaging-down add into a position that was OPENED light adds the
+    # opening size again instead of doubling whatever is held now.
+    light_original = (
+        light_entry_quantity(db, user, symbol, strike, right, expiry)
+        if signal.get("double_up") and not is_closing else None
     )
+    quantity = _resolve_quantity(
+        signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
+        light_original=light_original,
+    )
+    held_quantity = None
+    if signal.get("double_up") and not is_closing:
+        _held = next(
+            (p for p in positions
+             if p.option_strike == strike and p.option_right == right
+             and p.option_expiry == expiry),
+            None,
+        )
+        held_quantity = abs(Decimal(str(_held.quantity))) if _held is not None else None
     # Exits go to market so they always fill; entries are limit so they never
     # pay through a wide spread.
     #
@@ -249,7 +270,45 @@ def resolve(
         resolutions=resolutions,
         mark_price=mark_price,
         position_entry_price=position_entry_price,
+        held_quantity=held_quantity,
     )
+
+
+def light_entry_quantity(db, user: User, symbol: str, strike, right, expiry) -> Decimal | None:
+    """The size this holding was OPENED with, when its entry was a half-size one
+    — the author called it "light", "not heavy", a "lotto" or "risky". None for
+    an ordinary entry, or when the opening order isn't known.
+
+    Read from the live ladder's opening order and the alert that placed it.
+    Never raises: without an answer an average simply doubles, as it always has.
+    """
+    if db is None:
+        return None
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+        guard = guards.find(db, user.id, symbol, strike, right, expiry)
+        if guard is None or guard.entry_order_id is None:
+            return None
+        row = db.execute(
+            select(Order.filled_quantity, Order.quantity, DiscordMessage.parsed_signal)
+            .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+            .where(Order.id == guard.entry_order_id)
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+        filled, ordered, parsed = row
+        if not (parsed or {}).get("half_size"):
+            return None
+        qty = filled if filled and filled > 0 else ordered
+        return Decimal(str(qty)) if qty and qty > 0 else None
+    except Exception:  # noqa: BLE001
+        log.warning("discord: could not read the opening size for %s", symbol, exc_info=True)
+        return None
 
 
 # ── the individual checks ───────────────────────────────────────────────────
@@ -406,11 +465,31 @@ def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
             Order.side == OrderSide.BUY,
         ).order_by(Order.created_at.desc()).limit(20)
     ).scalars().all()
-    if not orders:
+    # Positions the trader ASSIGNED to a channel by hand (Positions → Channel):
+    # one assigned here counts as this channel's, newest first; one assigned
+    # elsewhere is no longer this channel's, whoever opened it.
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    assigned = guards.assigned(db, user.id)
+    elsewhere = {
+        (g.symbol, *guards.contract_key(g.option_strike, g.option_right, g.option_expiry))
+        for g in assigned if g.source_id != source_id
+    }
+    candidates = [
+        SimpleNamespace(symbol=g.symbol, option_strike=g.option_strike,
+                        option_right=_right(getattr(g.option_right, "value", g.option_right)),
+                        option_expiry=g.option_expiry)
+        for g in assigned if g.source_id == source_id
+    ] + [
+        o for o in orders
+        if (o.symbol, *guards.contract_key(o.option_strike, o.option_right, o.option_expiry))
+        not in elsewhere
+    ]
+    if not candidates:
         return None
     acct = _broker_account(db, user)
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-    for o in orders:
+    for o in candidates:
         held = [p for p in _positions(adapter, o.symbol)
                 if p.option_strike == o.option_strike and p.option_right == o.option_right
                 and p.option_expiry == o.option_expiry and (p.quantity or 0) > 0]
@@ -423,6 +502,65 @@ def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
                 "expiration": o.option_expiry.isoformat() if o.option_expiry else None,
             }
     return None
+
+
+def channel_held_contracts(db: Session, user: User, source_id, symbol: str,
+                           option_type: str | None = None,
+                           strike: Decimal | None = None) -> list[dict]:
+    """Every contract THIS channel bought, matching ``symbol`` (and call/put and
+    strike when given), that the broker still reports held — for "Stopped out
+    of rest of SPY calls". Only this channel's own positions: a matching
+    contract opened by hand or from another channel is left alone.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderSide  # noqa: PLC0415
+
+    right = _right(option_type) if option_type else None
+    orders = db.execute(
+        select(Order).join(DiscordMessage, DiscordMessage.order_id == Order.id).where(
+            DiscordMessage.source_id == source_id,
+            Order.user_id == user.id,
+            Order.side == OrderSide.BUY,
+            Order.symbol == symbol.upper(),
+        ).order_by(Order.created_at.desc()).limit(200)
+    ).scalars().all()
+    wanted = {
+        (o.option_strike, o.option_right, o.option_expiry) for o in orders
+        if o.option_strike is not None
+        and (right is None or o.option_right == right)
+        and (strike is None or o.option_strike == strike)
+    }
+    # A position the trader assigned by hand belongs to the channel it was
+    # assigned to: added here if that is this channel, dropped if it is another.
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    for g in guards.assigned(db, user.id, symbol):
+        g_right = _right(getattr(g.option_right, "value", g.option_right))
+        key = (g.option_strike, g_right, g.option_expiry)
+        if g.source_id != source_id:
+            wanted.discard(key)
+        elif (g.option_strike is not None
+              and (right is None or g_right == right)
+              and (strike is None or g.option_strike == strike)):
+            wanted.add(key)
+    if not wanted:
+        return []
+    acct = _broker_account(db, user)
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    out = []
+    for p in _positions(adapter, symbol):
+        key = (p.option_strike, p.option_right, p.option_expiry)
+        if key in wanted and (p.quantity or 0) > 0:
+            out.append({
+                "symbol": symbol.upper(),
+                "strike": str(p.option_strike),
+                "option_type": p.option_right.value,
+                "expiration": p.option_expiry.isoformat(),
+            })
+            wanted.discard(key)
+    return out
 
 
 def _resolve_contract(signal: dict, positions: list, resolutions: dict):
@@ -579,7 +717,8 @@ def _check_expiry(expiry: date | None) -> None:
 
 
 def _resolve_quantity(
-    signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+    signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
+    light_original: Decimal | None = None,
 ) -> Decimal:
     """How many contracts.
 
@@ -625,24 +764,30 @@ def _resolve_quantity(
                 "This is an averaging-down alert, but you hold no position in "
                 "that contract to average into."
             )
+        # A position opened LIGHT (light / not heavy / lotto / risky) is one the
+        # author sized down on purpose. Doubling it on every average grows it
+        # geometrically — 1, 2, 4, 8 — so it adds the opening size again
+        # instead: 1, 2, 3, 4.
+        if light_original is not None and light_original > 0:
+            resolutions["quantity"] = (
+                f"{light_original} (your opening size — the entry was light, "
+                f"so not doubling your {qty} held)"
+            )
+            return light_original
         resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
         return qty
 
-    qty = _dec(signal.get("quantity"))
-    if qty is None or qty <= 0:
-        raise ExecutionRefused("The alert states no quantity.")
+    # An ENTRY is exactly the trader's "Contracts per alert" (sizing.multiplier).
+    # A size the alert states is the AUTHOR's, not yours, and is ignored — so
+    # "BTO 3 SPY …" and "BTO SPY …" both buy your setting. Closes returned
+    # above: an exit sells what is held, whatever the alert or the setting say.
+    scaled = Decimal(max(1, int(sizing.multiplier or 1)))
+    stated = _dec(signal.get("quantity"))
+    note = (f"your Contracts per alert; the alert said {stated}"
+            if stated is not None and stated > 0 and stated != scaled else None)
 
-    # Scale the ENTRY. Closes returned above and are never multiplied — an exit
-    # sells what is held, whatever the alert or the multiplier say.
-    multiplier = max(1, int(sizing.multiplier or 1))
-    scaled = qty * multiplier if multiplier > 1 else qty
-    note = f"{qty} x {multiplier} multiplier" if multiplier > 1 else None
-
-    # The author called this one "light" / "not heavy": take half the size we
-    # otherwise would. Applied AFTER the multiplier, so it halves what would
-    # actually have been placed — a size of 4 becomes 2, which is what the
-    # instruction means. Halving the alert's own quantity first would let the
-    # multiplier scale it straight back up.
+    # The author called this one "light" / "not heavy": take half of your size,
+    # rounded down — never below one contract.
     if signal.get("half_size"):
         halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_FLOOR)
         # Never round down to nothing. You cannot buy half a contract, and
@@ -814,17 +959,16 @@ def order_value(qty: Decimal, limit_price: Decimal, is_option: bool) -> Decimal:
 
 
 def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> Decimal:
-    """Skip an entry whose TOTAL cost is above the trader's ceiling.
+    """Fit an entry under the trader's ceiling on the WHOLE order's value.
 
     Distinct from _apply_max_per_contract, and deliberately so: that one asks
     what a single contract costs, this one asks what the whole order costs. Ten
     contracts at $50 is a cheap contract and a $500 order, so an alert can pass
     either check and fail the other. Neither reads the other's value.
 
-    Skipped rather than trimmed, for the same reason as the per-contract cap: a
-    ceiling like this says how much the trader is willing to put into ONE alert,
-    not a budget to spend down. Trimming would take the trade anyway at a size
-    they never chose.
+    Over the ceiling, the order is TRIMMED to the most whole contracts (shares)
+    that fit, so the trade still happens at a size within the limit. Only when
+    not even one fits is it skipped.
 
     Applies to stocks as well as options — an order's value is an order's value
     — and never to a close: you must always be able to exit what you hold.
@@ -835,13 +979,22 @@ def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> De
     if qty is None or qty <= 0:
         return qty
 
-    total = order_value(Decimal(str(qty)), limit_price, is_option)
-    if total > cap:
+    qty = Decimal(str(qty))
+    total = order_value(qty, limit_price, is_option)
+    if total <= cap:
+        return qty
+    per_unit = order_value(Decimal(1), limit_price, is_option)
+    fit = (cap / per_unit).to_integral_value(rounding=ROUND_FLOOR)
+    if fit < 1:
         raise ExecutionRefused(
-            f"This order is worth ${total:.2f}, above your "
-            f"${cap:.2f} max per order."
+            f"A single {'contract' if is_option else 'share'} is worth ${per_unit:.2f}, "
+            f"above your ${cap:.2f} max per order."
         )
-    return qty
+    resolutions["quantity"] = (
+        f"{fit} (cut from {qty} to stay within your ${cap:.2f} max per order — "
+        f"${order_value(fit, limit_price, is_option):.2f})"
+    )
+    return fit
 
 
 def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side, resolutions):

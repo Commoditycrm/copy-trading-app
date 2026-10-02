@@ -45,6 +45,10 @@ def desired_quantity(held: Decimal, guard) -> Decimal:
     rejected for insufficient quantity when it fires.
     """
     earmarked = Decimal(str(guard.trail_qty or 0))
+    # …and minus the slice a resting take-profit holds (discord_take_profit):
+    # that slice carries its own linked stop, and a second sell on the same
+    # contracts would be refused.
+    earmarked += Decimal(str(getattr(guard, "tp_qty", None) or 0))
     return max(Decimal(0), held - earmarked)
 
 
@@ -332,9 +336,14 @@ def working_exit(db: Session, guard):
     from sqlalchemy import select  # noqa: PLC0415
 
     since = datetime.now(timezone.utc) - timedelta(seconds=_WORKING_EXIT_MAX_AGE_S)
+    # The ladder's own resting take-profit is not an exit in progress: it sits
+    # there by design, and its contracts are already kept out of the stop's size
+    # (tp_qty). Counting it would stop every stop being placed while it rests.
+    own_tp = getattr(guard, "tp_order_id", None)
     return db.execute(
         select(Order).where(
             Order.user_id == guard.user_id,
+            *([Order.id != own_tp] if own_tp is not None else []),
             Order.parent_order_id.is_(None),
             Order.symbol == guard.symbol,
             Order.option_strike.is_not_distinct_from(guard.option_strike),
@@ -363,11 +372,22 @@ def release_for_position(db: Session, user, pos) -> bool:
         db, user.id, pos.symbol, pos.option_strike,
         getattr(pos, "option_right", None), pos.option_expiry,
     )
-    if guard is None or not guard.stop_order_id:
+    if guard is None:
         return False
     from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
 
-    return release(db, guard, _cancel_stop_order(db, user))
+    cancel = _cancel_stop_order(db, user)
+    freed = False
+    # A resting take-profit and its linked stop reserve contracts exactly as the
+    # ladder stop does.
+    if getattr(guard, "tp_order_id", None) is not None or getattr(guard, "tp_stop_order_id", None) is not None:
+        from app.services import discord_take_profit  # noqa: PLC0415
+
+        freed = discord_take_profit.release(db, guard, cancel)
+        guard.tp_qty = None
+    if not guard.stop_order_id:
+        return freed
+    return release(db, guard, cancel) or freed
 
 
 def release(db: Session, guard, cancel_stop) -> bool:

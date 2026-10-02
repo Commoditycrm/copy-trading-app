@@ -128,8 +128,9 @@ def test_safe_poll_interval_respects_rate_limit():
         in_window = math.floor(WINDOW_S / gap) + 1
         assert in_window <= WINDOW_CAP, (n, gap, in_window)
 
-    # and it must not have become gratuitously slow in the other direction
-    assert wl._safe_poll_interval(1) <= 6.0
+    # A backstop to the live events stream, so a 15s default — never slower
+    # than that for a single account.
+    assert wl._safe_poll_interval(1) <= 15.0
 
 
 def test_order_fingerprint_catches_modify():

@@ -93,7 +93,10 @@ def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal]
     # Skipped when a real order rests at the broker for this level: it will
     # fire on its own, and enforcing here as well would sell the same
     # contracts twice.
-    stop = None if guard.stop_order_id else guard.stop_price
+    # A take-profit's linked stop counts too: on the last trim it is the ONLY
+    # stop resting, covering everything held.
+    rests = guard.stop_order_id or getattr(guard, "tp_stop_order_id", None)
+    stop = None if rests else guard.stop_price
     if stop is not None and price <= stop:
         return STOP, held, stop
 

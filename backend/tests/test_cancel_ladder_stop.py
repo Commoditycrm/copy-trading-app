@@ -138,11 +138,28 @@ def _call_set_stop(db, monkeypatch, pct, mark="2.40", avg="2.00"):
     )
 
 
-def test_stop_levels_are_measured_from_the_ladders_entry(db, monkeypatch):
-    g = _guard(db, stop=None)                        # ladder entry 2.00
+def test_stop_levels_are_measured_from_the_average_price(db, monkeypatch):
+    g = _guard(db, stop=None)                        # ladder entry 2.00, average 2.00
     out = _call_set_stop(db, monkeypatch, "-25")
     assert Decimal(out["stop_price"]) == Decimal("1.50")
     assert g.stop_price == Decimal("1.50")           # the reconciler places it
+
+
+def test_a_break_even_stop_uses_the_average_not_the_opening_price(db, monkeypatch):
+    """Opened at 2.00, added lower: the position now averages 1.60, which is what
+    the row shows and what 0% was previewed against. The ladder still remembers
+    2.00 — a stop there is not break-even (and above a 1.90 market it is refused)."""
+    g = _guard(db, stop=None)                        # ladder entry 2.00
+    out = _call_set_stop(db, monkeypatch, "0", avg="1.60", mark="1.90")
+    assert Decimal(out["stop_price"]) == Decimal("1.60") == g.stop_price
+    assert Decimal(out["entry_price"]) == Decimal("1.60")
+    assert g.entry_price == Decimal("2.00")          # the ladder's own reference is untouched
+
+
+def test_the_ladders_entry_is_the_fallback_when_the_broker_gives_no_average(db, monkeypatch):
+    g = _guard(db, stop=None)                        # ladder entry 2.00
+    out = _call_set_stop(db, monkeypatch, "0", avg="0", mark="2.40")
+    assert Decimal(out["stop_price"]) == Decimal("2.00") == g.stop_price
 
 
 def test_break_even_and_profit_levels_are_allowed_below_the_market(db, monkeypatch):
