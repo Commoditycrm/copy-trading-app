@@ -583,11 +583,16 @@ def realized_pnl_by_order(
     db: Session, user_id: uuid.UUID, mirrors_only: bool = False,
 ) -> dict[uuid.UUID, Decimal]:
     """Realized P&L attributed to each CLOSING order — the order whose fill
-    reduced/closed a position — using the SAME FIFO as realized_pnl_by_day.
+    reduced/closed a position — by the same FIFO walk as realized_pnl_by_day.
 
     Opening orders never appear (they realize nothing until closed). Lets the UI
     show a per-trade P&L. Walks the user's whole history so cost basis is right,
     then returns only orders that produced a non-zero realized amount.
+
+    One difference from the by-day walk: an order flagged ``is_closing`` never
+    OPENS a lot here (see the loop). Per-order attribution is what the trader
+    reads row by row, and one close with no known entry must not shift every
+    later P&L on that contract from the exits onto the entries.
     """
     conds = [
         Order.user_id == user_id,
@@ -621,34 +626,24 @@ def realized_pnl_by_order(
         key = _instrument_key(order)
         unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
         qty, price = fill_qty, fill_price
-        if order.side == OrderSide.BUY:
-            if open_lots[key] and open_lots[key][0].qty < 0:  # cover shorts
-                while qty > 0 and open_lots[key] and open_lots[key][0].qty < 0:
-                    lot = open_lots[key][0]
-                    take = min(qty, -lot.qty)
-                    by_order[order.id] += (lot.price - price) * take * unit
-                    lot.qty += take
-                    qty -= take
-                    if lot.qty == 0:
-                        open_lots[key].popleft()
-                if qty > 0:
-                    open_lots[key].append(_Lot(qty=qty, price=price))
-            else:
-                open_lots[key].append(_Lot(qty=qty, price=price))
-        else:  # SELL — close longs
-            if open_lots[key] and open_lots[key][0].qty > 0:
-                while qty > 0 and open_lots[key] and open_lots[key][0].qty > 0:
-                    lot = open_lots[key][0]
-                    take = min(qty, lot.qty)
-                    by_order[order.id] += (price - lot.price) * take * unit
-                    lot.qty -= take
-                    qty -= take
-                    if lot.qty == 0:
-                        open_lots[key].popleft()
-                if qty > 0:
-                    open_lots[key].append(_Lot(qty=-qty, price=price))
-            else:
-                open_lots[key].append(_Lot(qty=-qty, price=price))
+        lots = open_lots[key]
+        buying = order.side == OrderSide.BUY
+        # A buy covers shorts, a sell closes longs — oldest lot first.
+        while qty > 0 and lots and (lots[0].qty < 0 if buying else lots[0].qty > 0):
+            lot = lots[0]
+            take = min(qty, abs(lot.qty))
+            by_order[order.id] += ((lot.price - price) if buying else (price - lot.price)) * take * unit
+            lot.qty += take if buying else -take
+            qty -= take
+            if lot.qty == 0:
+                lots.popleft()
+        # What is left over opens a position — unless the order is a CLOSE. A
+        # close whose entry isn't in this history (hidden, or opened outside the
+        # app) realizes nothing we can price; booking it as a new short would
+        # make the NEXT buy look like the close, and every later exit on the
+        # contract would show no P&L while its entries did.
+        if qty > 0 and not order.is_closing:
+            lots.append(_Lot(qty=qty if buying else -qty, price=price))
 
     return {oid: p for oid, p in by_order.items() if p != 0}
 

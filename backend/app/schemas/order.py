@@ -89,6 +89,14 @@ class FillOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReEnterIn(BaseModel):
+    """Buy back what a filled close took off, at a limit (Positions page →
+    Closed today → Re-enter)."""
+
+    quantity: Decimal = Field(gt=0)
+    limit_price: Decimal = Field(gt=0)
+
+
 class OrderOut(BaseModel):
     id: uuid.UUID
     parent_order_id: uuid.UUID | None
