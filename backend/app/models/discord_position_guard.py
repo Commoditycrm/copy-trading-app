@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -89,6 +89,13 @@ class DiscordPositionGuard(Base, TimestampMixin):
     source_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("discord_alert_sources.id", ondelete="SET NULL"),
         nullable=True,
+    )
+
+    # The "On Fill" stop has been dealt with for this holding — set, or found
+    # not to apply. One-shot: without it a stop the trader cancelled by hand
+    # would be put straight back on the next sweep.
+    fill_stop_done: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
     )
 
     # Hard stop on whatever is still held, as an absolute price. Set below entry
