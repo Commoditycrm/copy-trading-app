@@ -71,7 +71,11 @@ def _manual(ts) -> bool:
 
 
 def _enabled(ts) -> bool:
-    return bool(ts is not None and getattr(ts, "discord_auto_trim", False)) and not _manual(ts)
+    """Should rungs fire off the price for these settings? Auto trim — and
+    Take-profit orders too, which runs as auto-trim on a broker that cannot
+    link a take-profit to a stop (the sweep skips it where the broker can)."""
+    on = getattr(ts, "discord_auto_trim", False) or getattr(ts, "discord_tp_orders", False)
+    return bool(ts is not None and on) and not _manual(ts)
 
 
 def _engine(ts) -> str:
@@ -435,6 +439,14 @@ def _sweep_trader(db, trader_id, rows) -> None:
             # the reference is simply correct sooner.
             if pg.sync_entry_price(db, guard):
                 db.commit()
+
+            # Take-profit orders, on a broker that links them to a stop: this
+            # trim is resting at the broker (discord_take_profit) and fills
+            # there. Firing it here as well would sell the same contracts twice.
+            from app.services import discord_take_profit  # noqa: PLC0415
+
+            if discord_take_profit.active(guard_ts.get(guard.id, ts), adapter):
+                continue
 
             mark = _mark_for(positions, guard, trader_id)
             rung = due_rung(guard_ts.get(guard.id, ts), guard, mark)

@@ -45,7 +45,7 @@ const CONNECTOR_RELEASES = "https://github.com/Commoditycrm/kopyya-connector/rel
 const CONNECTOR_WINDOWS = `${CONNECTOR_RELEASES}/Kopyya-Connector-Windows.exe`;
 const CONNECTOR_MAC = `${CONNECTOR_RELEASES}/Kopyya-Connector-macOS.zip`;
 
-type ExitMode = "alerts" | "auto" | "manual";
+type ExitMode = "alerts" | "auto" | "orders" | "manual";
 
 const EXIT_MODES: { value: ExitMode; label: string; detail: string; toast: string }[] = [
   { value: "alerts", label: "On alerts",
@@ -54,6 +54,9 @@ const EXIT_MODES: { value: ExitMode; label: string; detail: string; toast: strin
   { value: "auto", label: "Auto trim",
     detail: "Each trim fires at its own Profit target, without waiting for an alert. A trim left at 0% keeps waiting.",
     toast: "Auto trim on — each trim fires at its own Profit target" },
+  { value: "orders", label: "Take-profit orders",
+    detail: "Each trim rests at the broker as a take-profit order, with its stop linked. Webull options; on other brokers it works like Auto trim.",
+    toast: "Take-profit orders on — each trim rests at the broker at its Profit target" },
   { value: "manual", label: "Manual",
     detail: "Kopyya never sells. Exit alerts are recorded but not acted on — you close from Positions.",
     toast: "Manual exits — exit alerts are ignored; close from Positions" },
@@ -1563,7 +1566,7 @@ export default function DiscordPage() {
                       condition that alert has to meet. Auto trim: no alert to
                       wait for — the rung fires the moment its target is
                       reached. Manual: nothing sells on its own. */}
-                  <div className="mt-2 grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Exits">
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4" role="radiogroup" aria-label="Exits">
                     {EXIT_MODES.map(({ value, label, detail }) => {
                       const active = exitMode === value;
                       return (

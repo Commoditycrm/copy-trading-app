@@ -785,6 +785,10 @@ class WebullAdapter(BrokerAdapter):
     # this the reprice is skipped here entirely — see services/discord_reprice.
     supports_replace = True
 
+    # A linked take-profit + stop on an option position already held — see
+    # place_exit_pair. Verified on paper 2026-10-02.
+    supports_exit_pair = True
+
     def __init__(self, credentials: dict[str, Any]):
         super().__init__(credentials)
         self.app_key = credentials.get("app_key")
@@ -1239,6 +1243,53 @@ class WebullAdapter(BrokerAdapter):
             submitted_at=datetime.now(timezone.utc),
             filled_quantity=Decimal(0),
             filled_avg_price=None,
+        )
+
+    def place_exit_pair(
+        self, take_profit: BrokerOrderRequest, stop_loss: BrokerOrderRequest,
+    ) -> tuple[BrokerOrderResult, BrokerOrderResult]:
+        """A take-profit LIMIT and a STOP on the same held option contracts,
+        linked: when one fills Webull cancels the other.
+
+        Webull's OCO / OTO / OTOCO combos are equity-only ("invalid combo_type"
+        on an option). What options do have is the take-profit / stop-loss pair
+        — combo_type STOP_PROFIT + STOP_LOSS under one client_combo_order_id —
+        and it is accepted on a position ALREADY held, with no entry attached.
+        Established on the paper account, 2026-10-02:
+
+          * both legs rest on the same contracts (a pair on 1 of 2 held);
+          * the take-profit filling cancelled its stop on its own;
+          * each leg can be cancelled individually by its client_order_id;
+          * both legs must carry the SAME time-in-force, and GTC is refused for
+            the combo — so both are DAY, and a pair held overnight has to be
+            placed again the next session;
+          * the take-profit must be ABOVE the current market, the stop below.
+
+        Each leg keeps its own client_order_id (our Order row's id), so status
+        polling and cancels work exactly as for a single order.
+        """
+        if not self.account_id:
+            raise RuntimeError("webull place_exit_pair: no account_id configured")
+        if take_profit.instrument_type != InstrumentType.OPTION:
+            raise RuntimeError("webull place_exit_pair: options only")
+        trade = self._trade_client()
+        tp_coid = self._client_order_id(take_profit)
+        sl_coid = self._client_order_id(stop_loss)
+        tp = self._build_option_order(take_profit, tp_coid)
+        sl = self._build_option_order(stop_loss, sl_coid)
+        tp["combo_type"], sl["combo_type"] = "STOP_PROFIT", "STOP_LOSS"
+        tp["time_in_force"] = sl["time_in_force"] = "DAY"
+        resp = trade.order_v2.place_option(
+            self.account_id, [tp, sl], client_combo_order_id=uuid.uuid4().hex,
+        )
+        self._raise_for_status(resp, "place_exit_pair")
+        now = datetime.now(timezone.utc)
+        return tuple(                                   # type: ignore[return-value]
+            BrokerOrderResult(
+                broker_order_id=coid, status=OrderStatus.SUBMITTED, submitted_at=now,
+                filled_quantity=Decimal(0), filled_avg_price=None,
+            )
+            for coid in (tp_coid, sl_coid)
         )
 
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:

@@ -240,6 +240,21 @@ class BrokerAdapter(ABC):
     # broker that hasn't implemented it is never handed a trailing stop.
     supports_trailing_stop: bool = False
 
+    # A take-profit LIMIT and a STOP resting on the SAME contracts, linked by
+    # the broker: when one fills the other is cancelled. Webull has it for
+    # options (a STOP_PROFIT + STOP_LOSS pair on a held position); a plain OCO
+    # there is stocks-only. Without it the two orders would each reserve the
+    # contracts, and the broker would refuse the second.
+    supports_exit_pair: bool = False
+
+    def place_exit_pair(
+        self, take_profit: "BrokerOrderRequest", stop_loss: "BrokerOrderRequest",
+    ) -> "tuple[BrokerOrderResult, BrokerOrderResult]":
+        """Place a linked take-profit / stop-loss pair on a held position, in
+        one broker call. Both requests are closes of the same contract and the
+        same quantity. Only on adapters with ``supports_exit_pair = True``."""
+        raise NotImplementedError
+
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Modify a WORKING order's price/quantity in place, atomically, returning
         the resulting (replacement) order. Only defined for adapters with

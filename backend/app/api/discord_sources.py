@@ -378,12 +378,13 @@ def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOu
         exit_ = "Manual"
     elif getattr(account, "discord_exit_engine", None) == "ai":
         exit_ = "AI trimming"
-    elif getattr(eff, "discord_auto_trim", False):
+    elif getattr(eff, "discord_auto_trim", False) or getattr(eff, "discord_tp_orders", False):
         from app.services import discord_ladder  # noqa: PLC0415
 
         gates = [r.profit_gate_pct for r in discord_ladder.rungs(eff) if r.profit_gate_pct > 0]
-        exit_ = ("Auto-trim " + " / ".join(f"{_plain(g)}%" for g in gates)) if gates \
-            else "Auto-trim (no profit targets set)"
+        kind = "Take-profit orders" if getattr(eff, "discord_tp_orders", False) else "Auto-trim"
+        exit_ = (f"{kind} " + " / ".join(f"{_plain(g)}%" for g in gates)) if gates \
+            else f"{kind} (no profit targets set)"
     else:
         exit_ = "On trim alerts"
     out.entry_summary, out.exit_summary = entry, exit_
@@ -1160,6 +1161,7 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
         ts.discord_auto_trim = payload.auto_trim
         if payload.auto_trim:
             ts.discord_manual_exit = False     # auto-trim on means exits are not manual
+            ts.discord_tp_orders = False       # …and not resting take-profit orders
         log.info(
             "discord: auto-trim %s for user %s",
             "ENABLED" if payload.auto_trim else "disabled", user.id,
@@ -1170,6 +1172,7 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
     if payload.exit_mode is not None:
         ts.discord_auto_trim = payload.exit_mode == "auto"
         ts.discord_manual_exit = payload.exit_mode == "manual"
+        ts.discord_tp_orders = payload.exit_mode == "orders"
         log.info("discord: exits set to %s for user %s", payload.exit_mode, user.id)
 
     if payload.live_trading is not None:
@@ -2206,6 +2209,13 @@ def _execute_signal(
             discord_stop_orders.release(
                 db, guard, _cancel_stop_order(db, user)
             )
+        # A resting take-profit (and its linked stop) reserves contracts just
+        # the same. The poller puts back whatever should rest afterwards.
+        if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+            from app.services import discord_take_profit  # noqa: PLC0415
+
+            discord_take_profit.release(db, guard, _cancel_stop_order(db, user))
+            guard.tp_qty = None
 
         # Market exit of this rung's slice.
         p.quantity = plan.sell_qty

@@ -98,6 +98,29 @@ class DiscordPositionGuard(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False,
     )
 
+    # ── the resting take-profit for the NEXT trim (services/discord_take_profit) ─
+    # tp_order_id        the LIMIT sell resting at the trim's target
+    # tp_stop_order_id   its paired STOP on the same contracts, where the broker
+    #                    links the two (Webull) — one fills, the other cancels
+    # tp_rung            which trim that order is
+    # tp_qty             contracts earmarked for it: the plain ladder stop is
+    #                    sized to what is left, since a resting sell reserves
+    #                    the contracts it covers
+    # tp_off             the trader cancelled the take-profit — not re-placed
+    # tp_backoff_until   the broker refused one; no new attempt before this
+    tp_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    tp_stop_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    tp_rung: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tp_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    tp_off: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+    tp_backoff_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Hard stop on whatever is still held, as an absolute price. Set below entry
     # by the first trim and lifted to break-even by the second. Emulated, like
     # everything else here — Alpaca won't hold a resting stop on an option.
