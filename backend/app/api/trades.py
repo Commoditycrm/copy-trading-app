@@ -17,7 +17,7 @@ from app.brokers import BrokerOrderRequest, adapter_for
 from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import (
@@ -26,6 +26,7 @@ from app.schemas.order import (
     DailyPnL,
     OrderOut,
     PlaceOrderIn,
+    ReEnterIn,
     TradeScopeStats,
     TradeStatsOut,
 )
@@ -1278,6 +1279,66 @@ def place_trade(
     trader: User = Depends(require_trader),
 ) -> Order:
     return _place_trader_order(db, trader, payload, broker_account_id, background, request)
+
+
+@router.post("/trades/{order_id}/re-enter", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def re_enter_trade(
+    order_id: uuid.UUID,
+    payload: ReEnterIn,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Order:
+    """Buy back the contract (or stock) a filled close took off: a LIMIT buy of
+    ``quantity`` at ``limit_price``, on the account the close was placed on.
+
+    An ordinary buy on the user's own order path — the same one the Trade Panel
+    and "Average" use — so it is sized, risk-checked and copied like any entry.
+    Long positions only: re-entering a closed short would sell to open.
+    """
+    src = db.get(Order, order_id)
+    if src is None or src.user_id != user.id or src.hidden_at is not None:
+        raise HTTPException(404, "not_found")
+    if not src.filled_quantity or src.filled_quantity <= 0:
+        raise HTTPException(409, "That order never filled — there is nothing to re-enter.")
+    if src.side != OrderSide.SELL:
+        raise HTTPException(422, "Re-enter is for closed long positions — re-entering a short would sell to open.")
+    is_option = src.instrument_type == InstrumentType.OPTION
+    if is_option:
+        if src.option_expiry is not None and src.option_expiry < market_hours.now_et().date():
+            raise HTTPException(422, "This contract has expired — it can't be bought back.")
+        if payload.quantity != payload.quantity.to_integral_value():
+            raise HTTPException(422, "Options trade in whole contracts.")
+
+    # The account the close went out on; if that connection is gone, the one
+    # connected now (a reconnect replaces the account row).
+    acct = db.get(BrokerAccount, src.broker_account_id) if src.broker_account_id else None
+    if acct is None or acct.user_id != user.id or acct.connection_status != "connected":
+        acct = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars().first()
+    if acct is None:
+        raise HTTPException(409, "broker_not_connected")
+
+    return _place_trader_order(
+        db, user,
+        PlaceOrderIn(
+            instrument_type=src.instrument_type,
+            symbol=src.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=payload.quantity,
+            limit_price=payload.limit_price,
+            option_expiry=src.option_expiry if is_option else None,
+            option_strike=src.option_strike if is_option else None,
+            option_right=src.option_right if is_option else None,
+        ),
+        acct.id, background, request,
+    )
 
 
 @router.post("/trades/{order_id}/cancel", response_model=OrderOut)
