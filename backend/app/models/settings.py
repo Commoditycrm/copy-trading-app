@@ -211,6 +211,15 @@ class TraderSettings(Base, TimestampMixin):
         Numeric(9, 4), default=Decimal("100"), server_default="100", nullable=False,
     )
 
+    # Take-profit orders: each trim rests at the broker as a real limit order
+    # (paired with its stop where the broker links the two), instead of Kopyya
+    # watching the price and selling at market. The fourth exit choice; Manual
+    # wins over it, and it wins over discord_auto_trim. On a broker with no
+    # linked take-profit/stop pair it behaves as auto-trim does.
+    discord_tp_orders: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # ── a ladder of any length ───────────────────────────────────────────────
     # How many trims the ladder has. The first three live in the columns above
     # (so a ladder nobody has touched reads exactly as it always did); trims

@@ -436,7 +436,8 @@ class DiscordSettingsOut(BaseModel):
     # How a position leaves: "alerts" (each rung waits for the channel's exit
     # alert), "auto" (auto-trim fires each rung at its profit target) or
     # "manual" (Kopyya never sells; the trader closes it).
-    exit_mode: Literal["alerts", "auto", "manual"] = "alerts"
+    # … or "orders": each trim rests at the broker as a take-profit order.
+    exit_mode: Literal["alerts", "auto", "orders", "manual"] = "alerts"
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
@@ -488,7 +489,7 @@ class DiscordSettingsIn(BaseModel):
     auto_trim: bool | None = None
     # Sets auto_trim and manual exits together; wins over auto_trim when both
     # are sent.
-    exit_mode: Literal["alerts", "auto", "manual"] | None = None
+    exit_mode: Literal["alerts", "auto", "orders", "manual"] | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.

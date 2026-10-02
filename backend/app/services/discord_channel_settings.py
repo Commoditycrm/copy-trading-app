@@ -46,6 +46,7 @@ CHANNEL_FIELDS = (
     "discord_trim3_stop_pct",
     "discord_auto_trim",
     "discord_manual_exit",
+    "discord_tp_orders",
     "discord_trim_qty_pct",
     "discord_trim2_qty_pct",
     "discord_trim3_qty_pct",
@@ -158,10 +159,13 @@ def exits_manual(ts: Any) -> bool:
 
 
 def exit_mode(ts: Any) -> str:
-    """"manual", "auto" (auto-trim) or "alerts" (wait for the channel's exit
-    alerts). Manual wins over auto-trim."""
+    """"manual", "orders" (take-profit orders resting at the broker), "auto"
+    (auto-trim) or "alerts" (wait for the channel's exit alerts). Manual wins,
+    then take-profit orders, then auto-trim."""
     if exits_manual(ts):
         return "manual"
+    if getattr(ts, "discord_tp_orders", False):
+        return "orders"
     return "auto" if getattr(ts, "discord_auto_trim", False) else "alerts"
 
 

@@ -176,6 +176,18 @@ def _slice_down(held: Decimal, pct: Decimal | None) -> Decimal:
     return (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_FLOOR)
 
 
+def rung_quantity(cfg: "TrimConfig", rung: int, held: Decimal) -> tuple[Decimal, bool]:
+    """How many contracts this trim sells out of ``held``, and whether it is a
+    last trim that leaves a runner. One rule for a trim fired by an alert, by
+    auto-trim, and for a take-profit order resting at the broker — the three
+    must agree on the size or the ladder walks differently depending on how a
+    trim happened to fire."""
+    rung_cfg = cfg.rung(rung)
+    leaves_runner = rung >= cfg.count and Decimal(str(rung_cfg.qty_pct)) < Decimal(100)
+    sell = _slice_down(held, rung_cfg.qty_pct) if leaves_runner else _slice(held, rung_cfg.qty_pct)
+    return sell, leaves_runner
+
+
 def plan_exit(
     guard: DiscordPositionGuard,
     held: Decimal,
@@ -258,8 +270,7 @@ def plan_exit(
     #
     # The LAST trim, when it is not 100%, rounds DOWN and leaves the balance as
     # a runner, still protected by this trim's stop.
-    leaves_runner = rung >= cfg.count and Decimal(str(rung_cfg.qty_pct)) < Decimal(100)
-    sell = _slice_down(held, rung_cfg.qty_pct) if leaves_runner else _slice(held, rung_cfg.qty_pct)
+    sell, leaves_runner = rung_quantity(cfg, rung, held)
     if leaves_runner and sell <= 0:
         return TrimPlan(
             rung=rung, guard=guard,
@@ -623,6 +634,18 @@ def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
     history survives and a new position can reuse the same contract."""
     guard.closed_at = datetime.now(timezone.utc)
     guard.closed_reason = reason[:120]
+
+
+def live(db: Session, user_id: uuid.UUID) -> list[DiscordPositionGuard]:
+    """Every live guard of one trader, armed or not."""
+    return list(
+        db.execute(
+            select(DiscordPositionGuard).where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.closed_at.is_(None),
+            )
+        ).scalars()
+    )
 
 
 def armed(db: Session) -> list[DiscordPositionGuard]:
