@@ -65,8 +65,13 @@ _LOCK_TTL_S = 120
 _LOCK_WAIT_S = 10
 
 
+def _manual(ts) -> bool:
+    """Exits are the trader's own under these settings — nothing auto-fires."""
+    return bool(ts is not None and getattr(ts, "discord_manual_exit", False))
+
+
 def _enabled(ts) -> bool:
-    return bool(ts is not None and getattr(ts, "discord_auto_trim", False))
+    return bool(ts is not None and getattr(ts, "discord_auto_trim", False)) and not _manual(ts)
 
 
 def _engine(ts) -> str:
@@ -330,7 +335,9 @@ def _sweep_trader(db, trader_id, rows) -> None:
         live = []
         for guard in rows:
             db.refresh(guard)
-            if guard.closed_at is None:
+            # A position whose channel has Manual exits is the trader's to
+            # close — the model is never asked about it.
+            if guard.closed_at is None and not _manual(guard_ts.get(guard.id, ts)):
                 live.append(guard)
         ai_trim.sweep(
             db, user, ts, acct, adapter, live, positions,

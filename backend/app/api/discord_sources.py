@@ -387,7 +387,9 @@ def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOu
     if (getattr(eff, "discord_execution_mode", None) or "manual").lower() != "auto":
         entry += " · Review"
 
-    if getattr(account, "discord_exit_engine", None) == "ai":
+    if discord_channel_settings.exits_manual(eff):
+        exit_ = "Manual"
+    elif getattr(account, "discord_exit_engine", None) == "ai":
         exit_ = "AI trimming"
     elif getattr(eff, "discord_auto_trim", False):
         gates = [
@@ -1015,6 +1017,7 @@ def _settings_out(ts) -> DiscordSettingsOut:
         ),
         live_trading=bool(ts and ts.discord_live_trading),
         auto_trim=bool(ts and getattr(ts, "discord_auto_trim", False)),
+        exit_mode=discord_channel_settings.exit_mode(ts),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
@@ -1130,10 +1133,19 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
 
     if payload.auto_trim is not None:
         ts.discord_auto_trim = payload.auto_trim
+        if payload.auto_trim:
+            ts.discord_manual_exit = False     # auto-trim on means exits are not manual
         log.info(
             "discord: auto-trim %s for user %s",
             "ENABLED" if payload.auto_trim else "disabled", user.id,
         )
+
+    # The three-way choice: wait for the alert, auto-trim, or leave it to the
+    # trader. Applied after auto_trim so it wins when both are sent.
+    if payload.exit_mode is not None:
+        ts.discord_auto_trim = payload.exit_mode == "auto"
+        ts.discord_manual_exit = payload.exit_mode == "manual"
+        log.info("discord: exits set to %s for user %s", payload.exit_mode, user.id)
 
     if payload.live_trading is not None:
         ts.discord_live_trading = payload.live_trading
@@ -2055,6 +2067,24 @@ def _execute_signal(
         guard = guards.find(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry
         )
+        # Manual exits: the channel that OPENED the position leaves every exit
+        # to the trader, so an exit alert is recorded and nothing is sold. An
+        # exit the trader types into the composer (the Self channel) IS them
+        # closing by hand, so it goes through.
+        exit_ts = (discord_channel_settings.for_guard(db, user.id, guard)
+                   if guard is not None else None) or ts_for_sizing
+        if discord_channel_settings.exits_manual(exit_ts) and not _is_self_alert(db, msg):
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                "Exits are manual for this channel — this exit alert was not acted on. "
+                "Close it from Positions."
+            )
+            log.info("discord: exit alert %s for %s skipped — manual exits", msg.id, p.symbol)
+            events.publish(user.id, {
+                "type": "discord.trim_skipped", "message_id": str(msg.id),
+                "symbol": p.symbol, "rung": 0, "reason": "exits are manual for this channel",
+            })
+            return
         if guard is None:
             # A position the ladder never saw open — opened by hand, or before
             # this feature. Start it on rung one against the broker's own cost
@@ -2295,6 +2325,22 @@ def _execute_signal(
     )
 
 
+def _is_self_alert(db: Session, msg: DiscordMessage) -> bool:
+    """Did this alert come from the trader's own composer (the Self channel)?"""
+    source_id = getattr(msg, "source_id", None)
+    if source_id is None:
+        return False
+    src = db.get(DiscordAlertSource, source_id)
+    return src is not None and src.channel_id == _SELF_CHANNEL_ID
+
+
+def _channel_exits_manual(db: Session, user: User, msg: DiscordMessage) -> bool:
+    """Does the alert's own channel leave exits to the trader? Never true for
+    the Self channel: an exit typed there is the trader closing by hand."""
+    ts = discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None))
+    return discord_channel_settings.exits_manual(ts) and not _is_self_alert(db, msg)
+
+
 def _close_all_from_channel(
     db: Session, user: User, msg: DiscordMessage, background: BackgroundTasks,
     request: Request,
@@ -2309,6 +2355,15 @@ def _close_all_from_channel(
     """
     sig = dict(msg.parsed_signal or {})
     what = f"{sig.get('symbol')} {(sig.get('option_type') or '').lower() + 's' if sig.get('option_type') else 'options'}"
+    # Everything this closes was opened by this channel, so its settings decide:
+    # with Manual exits a stop-out is recorded and nothing is sold.
+    if _channel_exits_manual(db, user, msg):
+        msg.status = DiscordMessageStatus.PARSED
+        msg.status_reason = (
+            f"Exits are manual for this channel — this stop-out of {what} was not acted on. "
+            "Close it from Positions."
+        )
+        return
     try:
         contracts = discord_execution.channel_held_contracts(
             db, user, msg.source_id, sig.get("symbol") or "",
