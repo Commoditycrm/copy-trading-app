@@ -1817,7 +1817,7 @@ def set_position_stop(
     db: Session = Depends(get_db),
     user: User = Depends(require_trader),
 ) -> dict:
-    """Put the position's stop at a P&L level measured from entry.
+    """Put the position's stop at a P&L level measured from its average price.
 
     Sets the level on the position's ladder guard (creating one, as the
     trailing-stop action does, if the position has none). The stop reconciler
@@ -1843,8 +1843,15 @@ def set_position_stop(
         raise HTTPException(422, "Stops from this row are for long positions only.")
 
     guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
-    entry = (guard.entry_price if guard is not None and guard.entry_price else None) \
-        or getattr(pos, "avg_entry_price", None)
+    # Measured from the position's AVERAGE price — the broker's, the "Avg entry"
+    # the row shows and the price the level was previewed against. The ladder's
+    # own entry is the OPENING order's price and stays put when the position is
+    # added to, so after an add the two differ: a 0% stop asked for at the
+    # average landed at the opening price instead (QA 2026-10-02). The ladder's
+    # entry is only the fallback, for a broker that reports no average.
+    avg = getattr(pos, "avg_entry_price", None)
+    entry = avg if avg is not None and Decimal(str(avg)) > 0 else (
+        guard.entry_price if guard is not None else None)
     if entry is None or Decimal(str(entry)) <= 0:
         raise HTTPException(422, "No entry price to measure the stop from.")
     entry = Decimal(str(entry))
