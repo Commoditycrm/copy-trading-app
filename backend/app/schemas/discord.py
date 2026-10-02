@@ -411,6 +411,18 @@ class DiscordSignalOut(BaseModel):
     order_id: uuid.UUID | None = None
 
 
+class DiscordTrimRow(BaseModel):
+    """One trim of the exit ladder. Strings, like every other ladder field: one
+    validation path for what the user typed."""
+
+    # Minimum gain over entry before this trim sells (0 = no minimum).
+    profit_gate_pct: str
+    # Share of what is STILL HELD that this trim sells.
+    qty_pct: str
+    # Where the stop sits after this trim, as a return from entry.
+    stop_pct: str
+
+
 class DiscordSettingsOut(BaseModel):
     """Account-wide handling of inbound Discord alerts."""
 
@@ -453,6 +465,12 @@ class DiscordSettingsOut(BaseModel):
     trim_price_threshold: str = "0.90"
     # Dollar give-back from the peak that triggers a trailing exit.
     trim_trail_amount: str = "0.25"
+    # The WHOLE ladder, in order — any number of trims. The trim*/trim2*/trim3*
+    # fields above are the first three of these, kept for older clients.
+    trims: list[DiscordTrimRow] = []
+    # "On Fill": the stop set the moment the entry fills, as a return from entry
+    # (-25 = 25% below). Null = no stop until the first trim.
+    fill_stop_pct: str | None = None
 
     # ── chasing an entry that didn't fill ───────────────────────────────────
     # Seconds an unfilled buy rests before its one repriced attempt.
@@ -489,6 +507,11 @@ class DiscordSettingsIn(BaseModel):
     trim_stop_pct: str | None = None
     trim_price_threshold: str | None = None
     trim_trail_amount: str | None = None
+    # Replaces the WHOLE ladder (1 to 10 trims, in order). Wins over the
+    # per-trim fields above when both are sent.
+    trims: list[DiscordTrimRow] | None = Field(default=None, min_length=1, max_length=10)
+    # "On Fill" stop; "" clears it (no stop until the first trim).
+    fill_stop_pct: str | None = None
     reprice_after_seconds: int | None = Field(default=None, ge=5, le=600)
     reprice_pct: str | None = None
 

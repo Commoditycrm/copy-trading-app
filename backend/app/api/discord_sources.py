@@ -72,6 +72,7 @@ from app.schemas.discord import (
     DiscordDecisionOut,
     DiscordSettingsIn,
     DiscordSettingsOut,
+    DiscordTrimRow,
     DiscordPairOut,
     DiscordSignalOut,
     DiscordIngestOut,
@@ -95,6 +96,7 @@ from app.services import (
     discord_edit,
     discord_channel_settings,
     discord_ingest,
+    discord_ladder,
     discord_login,
     discord_pairing,
     discord_schedule,
@@ -226,26 +228,11 @@ def _reopen(guard) -> None:
 
 def _trim_config(ts) -> "guards.TrimConfig":
     """The trader's exit ladder as configured — what a live trim and the
-    Simulated Prices dry run both measure against."""
-    return guards.TrimConfig(
-        trim1=guards.RungConfig(
-            _setting(ts, "discord_trim_profit_gate_pct", "20"),
-            _setting(ts, "discord_trim_stop_pct", "-25"),
-            _setting(ts, "discord_trim_qty_pct", "50"),
-        ),
-        trim2=guards.RungConfig(
-            _setting(ts, "discord_trim2_profit_gate_pct", "0"),
-            _setting(ts, "discord_trim2_stop_pct", "0"),
-            _setting(ts, "discord_trim2_qty_pct", "50"),
-        ),
-        trim3=guards.RungConfig(
-            _setting(ts, "discord_trim3_profit_gate_pct", "0"),
-            _setting(ts, "discord_trim3_stop_pct", "0"),
-            _setting(ts, "discord_trim3_qty_pct", "100"),
-        ),
-        price_threshold=_setting(ts, "discord_trim_price_threshold", "0.90"),
-        trail_amount=_setting(ts, "discord_trim_trail_amount", "0.25"),
-    )
+    Simulated Prices dry run both measure against. Any number of trims; read
+    through services/discord_ladder so the storage split never leaks."""
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    return discord_ladder.trim_config(ts)
 
 
 def _plain(value) -> str | None:
@@ -392,13 +379,9 @@ def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOu
     elif getattr(account, "discord_exit_engine", None) == "ai":
         exit_ = "AI trimming"
     elif getattr(eff, "discord_auto_trim", False):
-        gates = [
-            g for g in (
-                getattr(eff, "discord_trim_profit_gate_pct", None),
-                getattr(eff, "discord_trim2_profit_gate_pct", None),
-                getattr(eff, "discord_trim3_profit_gate_pct", None),
-            ) if g is not None and Decimal(str(g)) > 0
-        ]
+        from app.services import discord_ladder  # noqa: PLC0415
+
+        gates = [r.profit_gate_pct for r in discord_ladder.rungs(eff) if r.profit_gate_pct > 0]
         exit_ = ("Auto-trim " + " / ".join(f"{_plain(g)}%" for g in gates)) if gates \
             else "Auto-trim (no profit targets set)"
     else:
@@ -1033,6 +1016,12 @@ def _settings_out(ts) -> DiscordSettingsOut:
         trim3_qty_pct=_plain(_setting(ts, "discord_trim3_qty_pct", "100")),
         trim_price_threshold=_plain(_setting(ts, "discord_trim_price_threshold", "0.90")),
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
+        trims=[
+            DiscordTrimRow(profit_gate_pct=_plain(r.profit_gate_pct), qty_pct=_plain(r.qty_pct),
+                           stop_pct=_plain(r.stop_pct))
+            for r in discord_ladder.rungs(ts)
+        ],
+        fill_stop_pct=_plain(discord_ladder.fill_stop_pct(ts)),
         reprice_after_seconds=(
             getattr(ts, "discord_reprice_after_seconds", None) or 30 if ts else 30
         ),
@@ -1130,6 +1119,42 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
 
     if payload.reprice_after_seconds is not None:
         ts.discord_reprice_after_seconds = payload.reprice_after_seconds
+
+    def _pct(raw, what: str, low: Decimal, high: Decimal) -> Decimal:
+        try:
+            value = Decimal(str(raw).strip())
+        except (InvalidOperation, ValueError, AttributeError):
+            raise HTTPException(400, f"{what} is not a number")
+        if not value.is_finite() or value < low or value > high:
+            raise HTTPException(400, f"{what} must be between {low} and {high}")
+        return value
+
+    # The whole ladder at once: any number of trims, in order. After the
+    # per-trim fields above, so it wins when both are sent.
+    if payload.trims is not None:
+        discord_ladder.store(ts, [
+            (
+                _pct(t.profit_gate_pct, f"Trim {i} profit target", Decimal(0), Decimal(1000)),
+                _pct(t.stop_pct, f"Trim {i} stop", Decimal(-100), Decimal(1000)),
+                _pct(t.qty_pct, f"Trim {i} quantity", Decimal(0), Decimal(100)),
+            )
+            for i, t in enumerate(payload.trims, 1)
+        ])
+        log.info("discord: ladder set to %d trim(s) for user %s", len(payload.trims), user.id)
+
+    # "On Fill" stop. Sent as "" to clear — so "not sent" and "cleared" differ.
+    if "fill_stop_pct" in payload.model_fields_set:
+        raw = (payload.fill_stop_pct or "").strip()
+        if raw == "":
+            ts.discord_fill_stop_pct = None
+        else:
+            value = _pct(raw, "On Fill stop", Decimal(-99), Decimal(1000))
+            if value >= 0:
+                # At fill the price IS the entry, so a stop at or above it is
+                # already through the market and would sell the position at once.
+                raise HTTPException(
+                    400, "The On Fill stop sits below entry — enter it as a negative, like -25.")
+            ts.discord_fill_stop_pct = value
 
     if payload.auto_trim is not None:
         ts.discord_auto_trim = payload.auto_trim

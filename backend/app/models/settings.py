@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -210,6 +210,23 @@ class TraderSettings(Base, TimestampMixin):
     discord_trim3_qty_pct: Mapped[Decimal] = mapped_column(
         Numeric(9, 4), default=Decimal("100"), server_default="100", nullable=False,
     )
+
+    # ── a ladder of any length ───────────────────────────────────────────────
+    # How many trims the ladder has. The first three live in the columns above
+    # (so a ladder nobody has touched reads exactly as it always did); trims
+    # past the third are in ``discord_extra_trims``, one
+    # {"profit_gate_pct", "stop_pct", "qty_pct"} object each, in order.
+    # Read them through services/discord_ladder.rungs(), never directly.
+    discord_trim_count: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False,
+    )
+    discord_extra_trims: Mapped[list] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), default=list, server_default="[]", nullable=False,
+    )
+    # "On Fill": where the stop goes the moment the entry fills, as a return
+    # from entry (-25 = 25% below). NULL = no stop until the first trim, which
+    # is how the ladder behaved before this existed.
+    discord_fill_stop_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
 
     # Entry price above which an exit trails instead of going to market.
     discord_trim_price_threshold: Mapped[Decimal] = mapped_column(
