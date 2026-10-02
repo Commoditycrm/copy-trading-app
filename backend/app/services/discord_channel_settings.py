@@ -45,6 +45,7 @@ CHANNEL_FIELDS = (
     "discord_trim3_profit_gate_pct",
     "discord_trim3_stop_pct",
     "discord_auto_trim",
+    "discord_manual_exit",
     "discord_trim_qty_pct",
     "discord_trim2_qty_pct",
     "discord_trim3_qty_pct",
@@ -143,6 +144,21 @@ def for_guard(db: Session, user_id: uuid.UUID, guard) -> Any | None:
     return effective(db, user_id, source_id)
 
 
+def exits_manual(ts: Any) -> bool:
+    """Are exits left to the trader under these settings (account row or a
+    channel's own)? Then nothing sells on its own: not an exit alert, not
+    auto-trim, not AI trimming."""
+    return bool(ts is not None and getattr(ts, "discord_manual_exit", False))
+
+
+def exit_mode(ts: Any) -> str:
+    """"manual", "auto" (auto-trim) or "alerts" (wait for the channel's exit
+    alerts). Manual wins over auto-trim."""
+    if exits_manual(ts):
+        return "manual"
+    return "auto" if getattr(ts, "discord_auto_trim", False) else "alerts"
+
+
 def entry_order_type(db: Session, source_id: uuid.UUID | None) -> str:
     """"limit" (the default) or "market" for entries from this channel."""
     if source_id is None:
@@ -154,5 +170,5 @@ def entry_order_type(db: Session, source_id: uuid.UUID | None) -> str:
 
 __all__ = [
     "CHANNEL_FIELDS", "ChannelSettings", "snapshot", "effective",
-    "source_for_order", "for_guard", "entry_order_type",
+    "source_for_order", "for_guard", "entry_order_type", "exits_manual", "exit_mode",
 ]

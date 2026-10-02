@@ -123,6 +123,7 @@ def test_each_contract_is_closed_in_full_and_summarised(monkeypatch):
         {"symbol": "SPY", "strike": "770", "option_type": "call", "expiration": "2026-10-01"},
     ]
     monkeypatch.setattr(ex, "channel_held_contracts", lambda *a, **k: contracts)
+    monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
     seen = []
     first = uuid.uuid4()
 
@@ -149,6 +150,7 @@ def test_each_contract_is_closed_in_full_and_summarised(monkeypatch):
 
 def test_nothing_held_from_the_channel_is_refused(monkeypatch):
     monkeypatch.setattr(ex, "channel_held_contracts", lambda *a, **k: [])
+    monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
     sig = parse_message(ParsedMessage(content="Stopped out of rest of SPY calls")).signals[0].as_dict()
     msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), parsed_signal=sig,
                           order_id=None, status=None, status_reason=None)

@@ -45,12 +45,29 @@ const CONNECTOR_RELEASES = "https://github.com/Commoditycrm/kopyya-connector/rel
 const CONNECTOR_WINDOWS = `${CONNECTOR_RELEASES}/Kopyya-Connector-Windows.exe`;
 const CONNECTOR_MAC = `${CONNECTOR_RELEASES}/Kopyya-Connector-macOS.zip`;
 
+type ExitMode = "alerts" | "auto" | "manual";
+
+const EXIT_MODES: { value: ExitMode; label: string; detail: string; toast: string }[] = [
+  { value: "alerts", label: "On alerts",
+    detail: "Each trim waits for the channel's exit alert; its Profit target is the minimum that alert has to meet.",
+    toast: "Exits on alerts — each trim waits for its Discord alert" },
+  { value: "auto", label: "Auto trim",
+    detail: "Each trim fires at its own Profit target, without waiting for an alert. A trim left at 0% keeps waiting.",
+    toast: "Auto trim on — each trim fires at its own Profit target" },
+  { value: "manual", label: "Manual",
+    detail: "Kopyya never sells. Exit alerts are recorded but not acted on — you close from Positions.",
+    toast: "Manual exits — exit alerts are ignored; close from Positions" },
+];
+
 type DiscordSettings = {
   execution_mode: string;
   live_trading: boolean;
   /** Fire each ladder rung when its Min profit is reached, instead of
    *  waiting for that rung's Discord alert. */
   auto_trim: boolean;
+  /** How a position leaves: on the channel's exit alerts, by auto-trim, or
+   *  never on its own (the trader closes it). */
+  exit_mode?: ExitMode;
   quantity_multiplier: number;
   max_per_contract: string | null;
   max_per_order: string | null;
@@ -251,8 +268,8 @@ export default function DiscordPage() {
   const [modeBusy, setModeBusy] = useState(false);
   // Paper until the server says otherwise — never show "live" optimistically.
   const [liveTrading, setLiveTrading] = useState(false);
-  const [autoTrim, setAutoTrim] = useState(false);
-  const [autoTrimBusy, setAutoTrimBusy] = useState(false);
+  const [exitMode, setExitMode] = useState<ExitMode>("alerts");
+  const [exitModeBusy, setExitModeBusy] = useState(false);
   // Which tab of the exits card is open, and which engine actually runs.
   const [exitTab, setExitTab] = useState<"ladder" | "ai">("ladder");
   const [exitEngine, setExitEngine] = useState<"ladder" | "ai">("ladder");
@@ -307,7 +324,7 @@ export default function DiscordPage() {
       setEntryType(settings.entry_order_type === "market" ? "market" : "limit");
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
-      setAutoTrim(!!settings.auto_trim);
+      setExitMode(settings.exit_mode ?? (settings.auto_trim ? "auto" : "alerts"));
       setQtyMultiplier(settings.quantity_multiplier || 1);
       setMaxPerContract(settings.max_per_contract ?? "");
       setSavedMaxPerContract(settings.max_per_contract ?? "");
@@ -517,27 +534,24 @@ export default function DiscordPage() {
     }
   }
 
-  async function toggleAutoTrim(next: boolean) {
-    setAutoTrimBusy(true);
-    const prev = autoTrim;
-    setAutoTrim(next);
+  async function changeExitMode(next: ExitMode) {
+    if (next === exitMode) return;
+    setExitModeBusy(true);
+    const prev = exitMode;
+    setExitMode(next);
     try {
-      const r = await api<{ auto_trim: boolean }>(
+      const r = await api<{ exit_mode?: ExitMode }>(
         settingsUrl(),
-        { method: "PATCH", body: JSON.stringify({ auto_trim: next }) }
+        { method: "PATCH", body: JSON.stringify({ exit_mode: next }) }
       );
-      setAutoTrim(!!r.auto_trim);
+      setExitMode(r.exit_mode ?? next);
       void refreshSources();
-      notify.success(
-        next
-          ? "Auto trim on — rungs fire at their own Min profit"
-          : "Auto trim off — rungs wait for their Discord alert"
-      );
+      notify.success(EXIT_MODES.find((m) => m.value === next)!.toast);
     } catch (e) {
-      setAutoTrim(prev);
+      setExitMode(prev);
       notify.fromError(e, "Could not change that");
     } finally {
-      setAutoTrimBusy(false);
+      setExitModeBusy(false);
     }
   }
 
@@ -1542,31 +1556,48 @@ export default function DiscordPage() {
                     </p>
                   )}
 
-                  {/* Auto trim. Off, a rung waits for its Discord alert and the
-                      Min profit below is the condition that alert has to meet.
-                      On, there is no alert to wait for — the rung fires the
-                      moment its Min profit is reached. */}
-                  <label
-                    className="mt-2 flex items-start gap-2 text-[11px] cursor-pointer select-none"
-                    title="Fire each rung at its Min profit instead of waiting for an alert"
-                  >
-                    <input
-                      type="checkbox"
-                      className="h-3.5 w-3.5 cursor-pointer mt-[1px]"
-                      style={{ accentColor: "var(--accent)" }}
-                      checked={autoTrim}
-                      disabled={autoTrimBusy}
-                      onChange={(e) => toggleAutoTrim(e.target.checked)}
-                    />
-                    <span style={{ color: "var(--text-2)" }}>
-                      Auto trim
-                      <span style={{ color: "var(--muted)" }}>
-                        {" — "}fire each rung at its Min profit, without waiting for an
-                        alert. A rung left at 0% keeps waiting: 0 means &ldquo;no
-                        minimum&rdquo;, which is a threshold nothing can reach.
-                      </span>
-                    </span>
-                  </label>
+                  {/* What makes a position leave. On alerts: a rung waits for
+                      its Discord alert and the Profit target below is the
+                      condition that alert has to meet. Auto trim: no alert to
+                      wait for — the rung fires the moment its target is
+                      reached. Manual: nothing sells on its own. */}
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Exits">
+                    {EXIT_MODES.map(({ value, label, detail }) => {
+                      const active = exitMode === value;
+                      return (
+                        <button
+                          key={value}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          disabled={exitModeBusy}
+                          onClick={() => void changeExitMode(value)}
+                          className="text-left rounded-lg px-3 py-2 transition-colors disabled:opacity-60"
+                          style={{
+                            background: active ? "var(--accent-glow)" : "transparent",
+                            border: `1px solid ${active ? "rgba(44,147,197,0.45)" : "var(--border)"}`,
+                          }}
+                        >
+                          <div className="flex items-center gap-2">
+                            <RadioDot active={active} />
+                            <span className="text-[12px] font-semibold"
+                                  style={{ color: active ? "var(--accent-2)" : "var(--text)" }}>
+                              {label}
+                            </span>
+                          </div>
+                          <p className="text-[11px] mt-0.5 leading-snug pl-[22px]" style={{ color: "var(--muted)" }}>
+                            {detail}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {exitMode === "manual" && (
+                    <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                      The trims below are not used while exits are Manual — except for an exit you
+                      type into the alert composer yourself, which still runs on them.
+                    </p>
+                  )}
 
                   {/* One ROW per setting, one COLUMN per trim — read down a
                       column for a single rung, across a row to compare the same

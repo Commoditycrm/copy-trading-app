@@ -12,7 +12,7 @@ Two audiences share this module, and the split matters:
 """
 import uuid
 from datetime import datetime, time
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -421,6 +421,10 @@ class DiscordSettingsOut(BaseModel):
     # True  — live: approved alerts place real orders
     live_trading: bool = False
     auto_trim: bool = False
+    # How a position leaves: "alerts" (each rung waits for the channel's exit
+    # alert), "auto" (auto-trim fires each rung at its profit target) or
+    # "manual" (Kopyya never sells; the trader closes it).
+    exit_mode: Literal["alerts", "auto", "manual"] = "alerts"
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
@@ -464,6 +468,9 @@ class DiscordSettingsIn(BaseModel):
     # waiting for that rung's Discord alert. A rung whose gate is 0 is
     # never auto-fired -- see TraderSettings.discord_auto_trim.
     auto_trim: bool | None = None
+    # Sets auto_trim and manual exits together; wins over auto_trim when both
+    # are sent.
+    exit_mode: Literal["alerts", "auto", "manual"] | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.

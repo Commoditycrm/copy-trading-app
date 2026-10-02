@@ -187,6 +187,15 @@ class TraderSettings(Base, TimestampMixin):
         Boolean, default=False, server_default="false", nullable=False,
     )
 
+    # Manual exits: Kopyya never sells a position on its own. The channel's exit
+    # alerts are recorded but not acted on, auto-trim does not fire and AI
+    # trimming leaves the position alone — the trader closes it by hand (the
+    # Positions page, or an exit typed into the alert composer). The third
+    # choice beside "wait for the alert" and discord_auto_trim; when set it wins.
+    discord_manual_exit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+
     # How much of what is STILL HELD each rung sells. Of the remainder, not of
     # the original position — that is what makes the rungs compose: 50/50/100
     # works a position of 4 down as 2, then 1, then 1, which is what the ladder
