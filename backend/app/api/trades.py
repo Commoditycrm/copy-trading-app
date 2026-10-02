@@ -175,15 +175,103 @@ def _fill_channels(db: Session, by_id: dict) -> None:
 
     rows = db.execute(
         select(DiscordMessage.order_id, DiscordAlertSource.label,
-               DiscordAlertSource.channel_name)
+               DiscordAlertSource.channel_name, DiscordAlertSource.channel_id)
         .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id,
               isouter=True)
         .where(DiscordMessage.order_id.in_(list(by_id)))
     ).all()
-    for order_id, label, channel_name in rows:
+    via_self: set = set()
+    for order_id, label, channel_name, channel_id in rows:
         name = (label or "").strip() or (channel_name or "").strip()
         if name and order_id in by_id:
             by_id[order_id].discord_channel = name
+            if channel_id == "self":
+                via_self.add(order_id)
+    _fill_closing_channels(db, by_id, via_self)
+
+
+def _fill_closing_channels(db: Session, by_id: dict, via_self: set) -> None:
+    """A CLOSE shows the channel of the position it closed.
+
+    A close made from the Positions page has no alert behind it, and an
+    auto-trim fires through Self — so on their own these read blank or "Self",
+    which says nothing about whose trade it was. Use, in order: the channel the
+    trader assigned the holding to, else the channel of the most recent Discord
+    entry on that contract at or before the close. A close that came from a
+    real channel's own exit alert keeps that channel.
+    """
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    closes = [
+        o for o in by_id.values()
+        if getattr(o, "is_closing", False)
+        and (getattr(o, "discord_channel", None) is None or o.id in via_self)
+    ]
+    if not closes:
+        return
+    user_ids = {o.user_id for o in closes}
+    symbols = {(o.symbol or "").upper() for o in closes}
+
+    def _key(user_id, symbol, strike, right, expiry) -> tuple:
+        return (user_id, (symbol or "").upper(), strike, getattr(right, "value", right) or None, expiry)
+
+    def _when(o) -> datetime | None:
+        return o.submitted_at or o.created_at
+
+    placed_at = func.coalesce(Order.submitted_at, Order.created_at)
+    entries: dict = {}
+    for user_id, sym, strike, right, expiry, label, channel_name, at in db.execute(
+        select(
+            Order.user_id, Order.symbol, Order.option_strike, Order.option_right,
+            Order.option_expiry, DiscordAlertSource.label, DiscordAlertSource.channel_name,
+            placed_at,
+        )
+        .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id)
+        .where(
+            Order.user_id.in_(user_ids), Order.symbol.in_(symbols),
+            Order.side == OrderSide.BUY, Order.is_closing.is_(False),
+            Order.filled_quantity > 0,
+        )
+        .order_by(placed_at.desc())                 # newest first
+    ).all():
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name:
+            entries.setdefault(_key(user_id, sym, strike, right, expiry), []).append((at, name))
+
+    assigned: dict = {}
+    for user_id, sym, strike, right, expiry, opened, closed, label, channel_name in db.execute(
+        select(
+            DiscordPositionGuard.user_id, DiscordPositionGuard.symbol,
+            DiscordPositionGuard.option_strike, DiscordPositionGuard.option_right,
+            DiscordPositionGuard.option_expiry, DiscordPositionGuard.created_at,
+            DiscordPositionGuard.closed_at, DiscordAlertSource.label,
+            DiscordAlertSource.channel_name,
+        )
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordPositionGuard.source_id)
+        .where(DiscordPositionGuard.user_id.in_(user_ids), DiscordPositionGuard.symbol.in_(symbols))
+        .order_by(DiscordPositionGuard.created_at.desc())
+    ).all():
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name:
+            assigned.setdefault(_key(user_id, sym, strike, right, expiry), []).append((opened, closed, name))
+
+    # A full exit retires its ladder just BEFORE the order goes out.
+    slack = timedelta(minutes=5)
+    for o in closes:
+        at = _when(o)
+        key = _key(o.user_id, o.symbol, o.option_strike, o.option_right, o.option_expiry)
+        name = None
+        if at is not None:
+            name = next(
+                (n for opened, closed, n in assigned.get(key, ())
+                 if (opened is None or opened <= at) and (closed is None or closed >= at - slack)),
+                None,
+            ) or next((n for e_at, n in entries.get(key, ()) if e_at is not None and e_at <= at), None)
+        if name:
+            o.discord_channel = name
 
 
 @router.get("/trades", response_model=list[OrderOut])

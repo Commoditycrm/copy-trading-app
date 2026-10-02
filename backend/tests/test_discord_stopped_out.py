@@ -24,6 +24,7 @@ from app.api import discord_sources
 from app.models.discord_account import DiscordAccount
 from app.models.discord_alert_source import DiscordAlertSource
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
+from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.user import User, UserRole
 from app.services import discord_execution as ex
@@ -65,7 +66,7 @@ EXP = date(2026, 10, 1)
 
 def _db():
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    for m in (User, DiscordAccount, DiscordAlertSource, DiscordMessage, Order):
+    for m in (User, DiscordAccount, DiscordAlertSource, DiscordMessage, Order, DiscordPositionGuard):
         m.__table__.create(eng)
     db = sessionmaker(bind=eng)()
     db.add(User(id=USER, email="u@x.com", password_hash="x", role=UserRole.TRADER, is_active=True))
@@ -113,6 +114,34 @@ def test_only_this_channels_matching_calls_still_held(broker):
                    _pos("760", OptionRight.PUT), _pos("765", OptionRight.CALL)])
     got = ex.channel_held_contracts(db, db.get(User, USER), clint.id, "SPY", "CALL")
     assert sorted(c["strike"] for c in got) == ["767", "770"]
+
+
+def _assign(db, source, strike, right):
+    """The trader assigned this held contract to ``source`` (Positions → Channel)."""
+    db.add(DiscordPositionGuard(user_id=USER, symbol="SPY", option_strike=Decimal(strike),
+                                option_right=right.value, option_expiry=EXP, sell_count=0,
+                                source_id=source.id))
+    db.commit()
+
+
+def test_a_position_assigned_to_this_channel_counts_as_its_own(broker):
+    db, clint, other = _db()
+    _bought(db, other, "765", OptionRight.CALL, "1")      # opened by another channel…
+    _assign(db, clint, "765", OptionRight.CALL)           # …then assigned to Clint
+    broker.append(_pos("765", OptionRight.CALL))
+    got = ex.channel_held_contracts(db, db.get(User, USER), clint.id, "SPY", "CALL")
+    assert [c["strike"] for c in got] == ["765"]
+    assert ex.channel_held_contracts(db, db.get(User, USER), other.id, "SPY", "CALL") == []
+
+
+def test_a_position_assigned_away_is_no_longer_this_channels(broker):
+    db, clint, other = _db()
+    _bought(db, clint, "767", OptionRight.CALL, "1")
+    _bought(db, clint, "770", OptionRight.CALL, "2")
+    _assign(db, other, "770", OptionRight.CALL)
+    broker.extend([_pos("767", OptionRight.CALL), _pos("770", OptionRight.CALL)])
+    got = ex.channel_held_contracts(db, db.get(User, USER), clint.id, "SPY", "CALL")
+    assert [c["strike"] for c in got] == ["767"]
 
 
 # ── closing them all, one line each ─────────────────────────────────────────

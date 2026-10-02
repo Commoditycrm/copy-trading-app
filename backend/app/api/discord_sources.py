@@ -1881,8 +1881,11 @@ def submit_self_alert_text(
     background: BackgroundTasks | None = None,
     request: Request | None = None,
     approve: bool = False,
+    source_id: uuid.UUID | None = None,
 ) -> DiscordMessage | None:
-    """Put ``content`` through the Discord pipeline as a Self-channel alert.
+    """Put ``content`` through the Discord pipeline as a Self-channel alert —
+    or, with ``source_id``, as an alert of that channel of the user's (the
+    composer's channel picker): that channel's settings size and manage it.
 
     The one place an alert can be injected without Discord — used by the
     composer in Order History and by auto-trim. Returns the stored message so
@@ -1894,7 +1897,12 @@ def submit_self_alert_text(
     it was watching for. The composer leaves it False, so a pasted alert behaves
     exactly as if Discord had delivered it.
     """
-    src = _self_source(db, user)
+    src = _get_owned(db, user, source_id) if source_id is not None else _self_source(db, user)
+    typed_into_channel = src.channel_id != _SELF_CHANNEL_ID
+    # A typed alert is not the channel's watcher reporting in: it must not look
+    # like a heartbeat (the disconnect watchdog reads these) or move the
+    # channel's own "latest message" markers.
+    watcher_state = (src.last_heartbeat_at, src.last_message_at, src.last_seen_message_id)
     raw = {
         "message_id": _self_message_id(),
         "channel_id": src.channel_id,
@@ -1907,8 +1915,10 @@ def submit_self_alert_text(
         "embeds": [],
     }
 
-    auto = approve or _auto_approve(db, user.id)
+    auto = approve or _auto_approve(db, user.id, src.id if typed_into_channel else None)
     report = discord_ingest.ingest_batch(db, src, [raw], auto_approve=auto)
+    if typed_into_channel:
+        src.last_heartbeat_at, src.last_message_at, src.last_seen_message_id = watcher_state
     if not report.stored:
         return None
 
@@ -1941,6 +1951,7 @@ def submit_self_alert(
     """
     msg = submit_self_alert_text(
         db, user, payload.content, background=background, request=request,
+        source_id=payload.source_id,
     )
     if msg is None:
         # ingest_batch only rejects a message with no id, which cannot happen
@@ -2273,12 +2284,14 @@ def _execute_signal(
         # adds on purpose (averaging UP must not raise its own stop); this is
         # the opposite case and it is stated explicitly rather than inferred.
         #
-        # The order was sized FROM the position, so the quantity we just placed
-        # is also the quantity that was held.
+        # Normally the order was sized FROM the position, so what we placed is
+        # also what was held — but not always (a light position adds its opening
+        # size; a dollar cap can cut the add), so the held quantity is carried.
         if signal.get("double_up"):
             guards.average_in(
                 db, opened,
-                held_qty=p.quantity, added_qty=p.quantity,
+                held_qty=getattr(resolved, "held_quantity", None) or p.quantity,
+                added_qty=p.quantity,
                 added_price=entry_ref_price,
             )
 
@@ -2326,7 +2339,12 @@ def _execute_signal(
 
 
 def _is_self_alert(db: Session, msg: DiscordMessage) -> bool:
-    """Did this alert come from the trader's own composer (the Self channel)?"""
+    """Did the trader type this alert themselves? Either it sits on the Self
+    channel, or it was typed into the composer AS another channel — the
+    composer signs every alert with the trader's own id as its author."""
+    author = getattr(msg, "author_id", None)
+    if author and str(author) == str(getattr(msg, "user_id", None)):
+        return True
     source_id = getattr(msg, "source_id", None)
     if source_id is None:
         return False

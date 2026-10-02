@@ -914,3 +914,67 @@ def test_an_average_down_still_obeys_the_order_ceiling(monkeypatch):
             None, _User(), _signal(double_up=True),
             ex.Sizing(max_per_order=Decimal("100")),   # 5 x 1.90 x 100 = $950
         )
+
+
+# ── averaging into a position that was opened LIGHT ──────────────────────────
+# light / not heavy / lotto / risky entries are sized down on purpose. Doubling
+# one on every average grows it 1, 2, 4, 8; it adds the opening size instead.
+
+def test_an_average_into_a_light_position_adds_the_opening_size(monkeypatch):
+    """Opened light with 2, averaged once already (4 held): the next average
+    adds 2 again, not 4."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="4")]))
+    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: Decimal("2"))
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=4))
+    assert r.payload.quantity == Decimal("2")
+    assert r.held_quantity == Decimal("4")
+    assert "opening size" in r.resolutions["quantity"]
+
+
+def test_an_average_into_an_ordinary_position_still_doubles(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="4")]))
+    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: None)
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    assert r.payload.quantity == Decimal("4") and r.held_quantity == Decimal("4")
+
+
+def test_a_light_average_with_nothing_held_is_still_refused(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
+    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: Decimal("2"))
+    with pytest.raises(ex.ExecutionRefused):
+        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+
+
+class _LightDB:
+    """The opening order's (filled, ordered, parsed alert) row."""
+
+    def __init__(self, row):
+        self._row = row
+
+    def execute(self, _stmt):
+        row = self._row
+        return type("R", (), {"first": lambda self: row})()
+
+
+@pytest.mark.parametrize("row, guard_order, expected", [
+    ((Decimal("2"), Decimal("2"), {"half_size": True}), True, Decimal("2")),    # light entry
+    ((Decimal("0"), Decimal("3"), {"half_size": True}), True, Decimal("3")),    # not filled yet: what was ordered
+    ((Decimal("2"), Decimal("2"), {"half_size": False}), True, None),           # ordinary entry
+    ((Decimal("2"), Decimal("2"), None), True, None),                           # no alert behind it
+    (None, True, None),                                                         # opening order not from an alert
+    ((Decimal("2"), Decimal("2"), {"half_size": True}), False, None),           # no opening order known
+])
+def test_light_entry_quantity_reads_the_opening_order(monkeypatch, row, guard_order, expected):
+    import types
+    import uuid as _uuid
+
+    import app.services.discord_position_guard as guards
+
+    guard = types.SimpleNamespace(entry_order_id=_uuid.uuid4() if guard_order else None)
+    monkeypatch.setattr(guards, "find", lambda *a, **k: guard)
+    got = ex.light_entry_quantity(_LightDB(row), _User(), "SPY", Decimal("764"), None, None)
+    assert got == expected
+
+
+def test_light_entry_quantity_without_a_ladder_or_a_db():
+    assert ex.light_entry_quantity(None, _User(), "SPY", None, None, None) is None

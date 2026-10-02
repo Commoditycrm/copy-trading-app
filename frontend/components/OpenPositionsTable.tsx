@@ -646,6 +646,15 @@ export const OpenPositionsTable = forwardRef<
     // source as the dashboard "Total equity" KPI). null until first fetch.
     const [totalEquity, setTotalEquity] = useState<number | null>(null);
     const [loading, setLoading] = useState(() => getSnapshot<PosSnap>(POS_KEY) === undefined);
+    // The user's Discord channels, for the editable Channel cell.
+    const [channels, setChannels] = useState<{ id: string; label: string }[]>([]);
+    const [channelBusy, setChannelBusy] = useState<string | null>(null);
+    useEffect(() => {
+      if (!showChannel) return;
+      api<{ id: string; label: string | null; channel_name?: string | null }[]>("/api/discord-sources")
+        .then((rows) => setChannels(rows.map((r) => ({ id: r.id, label: r.label?.trim() || r.channel_name?.trim() || "Channel" }))))
+        .catch(() => { /* Self and the current name are still offered */ });
+    }, [showChannel]);
     const [closing, setClosing] = useState<{ key: string; kind: "market" | "limit" } | null>(null);
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
     // The live price each row's Limit box shows while the trader hasn't typed
@@ -893,6 +902,42 @@ export const OpenPositionsTable = forwardRef<
         refresh();
       } catch (e) {
         notify.fromError(e, "Could not cancel open orders");
+      }
+    }
+
+    /** Assign this position to a channel ("self", a channel id, or "auto" to go
+     *  back to the channel whose alert opened it). */
+    async function assignChannel(p: Position, value: string) {
+      if (!value) return;
+      const key = posKey(p);
+      const name = value === "self" ? "Self"
+        : value === "auto" ? null
+        : channels.find((c) => c.id === value)?.label ?? "that channel";
+      const what = positionSymbolLabel(p);
+      const ask = name
+        ? `Assign ${what} to ${name}? ${name}'s exit settings will manage this position from now on.`
+        : `Reset ${what} to the channel that opened it?`;
+      if (!confirm(ask)) return;
+      setChannelBusy(key);
+      try {
+        const isOption = p.instrument_type === "option";
+        await api("/api/positions/channel", {
+          method: "POST",
+          body: JSON.stringify({
+            symbol: p.symbol,
+            option_strike: isOption ? p.option_strike : null,
+            option_right: isOption ? p.option_right : null,
+            option_expiry: isOption && p.option_expiry ? p.option_expiry.slice(0, 10) : null,
+            channel: value,
+            entry_price: Number(p.avg_entry_price) > 0 ? p.avg_entry_price : null,
+          }),
+        });
+        notify.success(name ? `${what} assigned to ${name}` : `${what} reset to its opening channel`);
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "Could not change the channel");
+      } finally {
+        setChannelBusy(null);
       }
     }
 
@@ -1326,11 +1371,34 @@ export const OpenPositionsTable = forwardRef<
                   // Each column's cell keyed by id; rendered below in the user's
                   // configured order (reorderable) and visibility (show/hide).
                   const cell: Record<string, React.ReactNode> = {
-                    channel: (
-                      <td className="px-5 py-3.5 whitespace-nowrap" style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }} title={p.discord_channel ?? undefined}>
-                        {p.discord_channel || "—"}
-                      </td>
-                    ),
+                    channel: (() => {
+                      // The channel this position belongs to — editable. A
+                      // derived name that is no single channel ("Clint-Self",
+                      // or none) shows as its own first option.
+                      const current = p.discord_channel === "Self"
+                        ? "self"
+                        : channels.find((c) => c.label === p.discord_channel)?.id ?? "";
+                      return (
+                        <td className="px-5 py-3.5 whitespace-nowrap">
+                          <select
+                            value={current}
+                            disabled={channelBusy === key}
+                            onChange={(e) => void assignChannel(p, e.target.value)}
+                            aria-label={`Channel for ${p.symbol.toUpperCase()}`}
+                            title="The channel this position belongs to. Its exit settings manage the position, and its alerts reach it."
+                            className="rounded-md border px-1.5 py-1 text-[13px] bg-transparent focus-ring max-w-[150px] disabled:opacity-60"
+                            style={{ borderColor: "var(--border)", color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
+                          >
+                            {current === "" && <option value="">{p.discord_channel || "—"}</option>}
+                            {channels.map((c) => (
+                              <option key={c.id} value={c.id}>{c.label}</option>
+                            ))}
+                            <option value="self">Self</option>
+                            <option value="auto">Reset to opening channel</option>
+                          </select>
+                        </td>
+                      );
+                    })(),
                     symbol: (
                       <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                         <span className="inline-flex items-center gap-1.5">

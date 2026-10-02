@@ -40,6 +40,7 @@ from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import (
     AveragePositionIn,
     ClosePositionIn,
+    PositionChannelIn,
     PositionOut,
     PositionsPayload,
     StaleAccount,
@@ -613,6 +614,33 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             # The channel that opened the holding: the oldest non-Self entry.
             p.discord_channel = f"{others[-1][0]}-Self"
 
+    # A channel the trader assigned by hand wins over everything derived above —
+    # including for a position no alert opened at all.
+    assigned = {
+        ((sym or "").upper(), strike, getattr(right, "value", right) or None, expiry):
+            (label or "").strip() or (channel_name or "").strip()
+        for sym, strike, right, expiry, label, channel_name in db.execute(
+            select(
+                DiscordPositionGuard.symbol, DiscordPositionGuard.option_strike,
+                DiscordPositionGuard.option_right, DiscordPositionGuard.option_expiry,
+                DiscordAlertSource.label, DiscordAlertSource.channel_name,
+            )
+            .join(DiscordAlertSource, DiscordAlertSource.id == DiscordPositionGuard.source_id)
+            .where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.closed_at.is_(None),
+                DiscordPositionGuard.symbol.in_(symbols),
+            )
+        ).all()
+    }
+    for p in positions:
+        name = assigned.get((
+            (p.symbol or "").upper(), p.option_strike,
+            getattr(p.option_right, "value", p.option_right) or None, p.option_expiry,
+        ))
+        if name:
+            p.discord_channel = name
+
 
 def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
     """Set .ladder_stop_price from each held contract's live Discord guard.
@@ -1005,6 +1033,61 @@ def delete_snapshot_position(
     snap.positions = poss   # reassign so JSONB persists
     db.commit()
     return {"ok": True, "remaining": len(poss), "snapshot_deleted": False}
+
+
+@router.post("/channel")
+def assign_position_channel(
+    payload: PositionChannelIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Assign a held position to one of the user's Discord channels, to Self, or
+    back to "auto" (the channel whose alert opened it).
+
+    More than a label: the assigned channel's exit settings and ladder apply to
+    the position from here on, and that channel's "adding" / "stopped out"
+    alerts reach it — exactly as if its alert had opened it. A position with no
+    exit ladder yet (opened by hand) gets one, starting from ``entry_price``.
+    """
+    from app.api import discord_sources  # noqa: PLC0415 — cycle
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    discord_sources.require_discord_member(user=user, db=db)   # 403 without Discord trading
+
+    is_option = payload.option_strike is not None
+    args = (
+        payload.symbol.upper(),
+        payload.option_strike if is_option else None,
+        payload.option_right if is_option else None,
+        payload.option_expiry if is_option else None,
+    )
+    guard = guards.find(db, user.id, *args)
+
+    choice = payload.channel.strip().lower()
+    if choice == "auto":
+        if guard is not None and guard.source_id is not None:
+            guard.source_id = None
+            db.commit()
+        return {"channel": "auto", "discord_channel": None}
+
+    if choice == "self":
+        src = discord_sources._self_source(db, user)
+    else:
+        try:
+            src = db.get(DiscordAlertSource, uuid.UUID(payload.channel))
+        except ValueError:
+            src = None
+        if src is None or src.user_id != user.id:
+            raise HTTPException(404, "channel_not_found")
+
+    if guard is None:
+        guard = guards.on_buy(db, user.id, *args, entry_price=payload.entry_price)
+    guard.source_id = src.id
+    db.commit()
+    log.info("positions: %s assigned %s to channel %s", user.id, payload.symbol, src.id)
+    name = (src.label or "").strip() or (src.channel_name or "").strip() or None
+    return {"channel": str(src.id), "discord_channel": name}
 
 
 @router.post("/re-enter")

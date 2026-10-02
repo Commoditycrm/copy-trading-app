@@ -328,6 +328,25 @@ def find(db: Session, user_id: uuid.UUID, symbol: str, strike, right, expiry):
     ).scalars().first()
 
 
+def assigned(db: Session, user_id: uuid.UUID, symbol: str | None = None) -> list[DiscordPositionGuard]:
+    """Live guards the trader assigned to a channel by hand (``source_id`` set),
+    newest first — optionally only one symbol's."""
+    q = select(DiscordPositionGuard).where(
+        DiscordPositionGuard.user_id == user_id,
+        DiscordPositionGuard.closed_at.is_(None),
+        DiscordPositionGuard.source_id.isnot(None),
+    )
+    if symbol:
+        q = q.where(DiscordPositionGuard.symbol == symbol.upper())
+    return list(db.execute(q.order_by(DiscordPositionGuard.created_at.desc())).scalars())
+
+
+def contract_key(strike, right, expiry) -> tuple:
+    """(strike, right, expiry) with the right as its plain value — a guard
+    stores "call"/"put", a broker position carries the enum."""
+    return (strike, getattr(right, "value", right) or None, expiry)
+
+
 def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
     """Adopt the opening order's ACTUAL fill price. Returns True if it moved.
 

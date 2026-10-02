@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -75,6 +76,10 @@ class Resolved:
     # What the broker says this position averaged in at. Used only as a fallback
     # reference for a position the trim ladder never saw open.
     position_entry_price: Decimal | None = None
+    # For an averaging-down add: how much was held BEFORE it. The add is no
+    # longer always the same size as the holding (see light_entry_quantity), and
+    # the ladder needs both to re-average its cost basis.
+    held_quantity: Decimal | None = None
 
 
 def resolve(
@@ -122,9 +127,25 @@ def resolve(
     else:
         strike = right = expiry = None
 
-    quantity = _resolve_quantity(
-        signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+    # An averaging-down add into a position that was OPENED light adds the
+    # opening size again instead of doubling whatever is held now.
+    light_original = (
+        light_entry_quantity(db, user, symbol, strike, right, expiry)
+        if signal.get("double_up") and not is_closing else None
     )
+    quantity = _resolve_quantity(
+        signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
+        light_original=light_original,
+    )
+    held_quantity = None
+    if signal.get("double_up") and not is_closing:
+        _held = next(
+            (p for p in positions
+             if p.option_strike == strike and p.option_right == right
+             and p.option_expiry == expiry),
+            None,
+        )
+        held_quantity = abs(Decimal(str(_held.quantity))) if _held is not None else None
     # Exits go to market so they always fill; entries are limit so they never
     # pay through a wide spread.
     #
@@ -249,7 +270,45 @@ def resolve(
         resolutions=resolutions,
         mark_price=mark_price,
         position_entry_price=position_entry_price,
+        held_quantity=held_quantity,
     )
+
+
+def light_entry_quantity(db, user: User, symbol: str, strike, right, expiry) -> Decimal | None:
+    """The size this holding was OPENED with, when its entry was a half-size one
+    — the author called it "light", "not heavy", a "lotto" or "risky". None for
+    an ordinary entry, or when the opening order isn't known.
+
+    Read from the live ladder's opening order and the alert that placed it.
+    Never raises: without an answer an average simply doubles, as it always has.
+    """
+    if db is None:
+        return None
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+        guard = guards.find(db, user.id, symbol, strike, right, expiry)
+        if guard is None or guard.entry_order_id is None:
+            return None
+        row = db.execute(
+            select(Order.filled_quantity, Order.quantity, DiscordMessage.parsed_signal)
+            .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+            .where(Order.id == guard.entry_order_id)
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+        filled, ordered, parsed = row
+        if not (parsed or {}).get("half_size"):
+            return None
+        qty = filled if filled and filled > 0 else ordered
+        return Decimal(str(qty)) if qty and qty > 0 else None
+    except Exception:  # noqa: BLE001
+        log.warning("discord: could not read the opening size for %s", symbol, exc_info=True)
+        return None
 
 
 # ── the individual checks ───────────────────────────────────────────────────
@@ -406,11 +465,31 @@ def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
             Order.side == OrderSide.BUY,
         ).order_by(Order.created_at.desc()).limit(20)
     ).scalars().all()
-    if not orders:
+    # Positions the trader ASSIGNED to a channel by hand (Positions → Channel):
+    # one assigned here counts as this channel's, newest first; one assigned
+    # elsewhere is no longer this channel's, whoever opened it.
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    assigned = guards.assigned(db, user.id)
+    elsewhere = {
+        (g.symbol, *guards.contract_key(g.option_strike, g.option_right, g.option_expiry))
+        for g in assigned if g.source_id != source_id
+    }
+    candidates = [
+        SimpleNamespace(symbol=g.symbol, option_strike=g.option_strike,
+                        option_right=_right(getattr(g.option_right, "value", g.option_right)),
+                        option_expiry=g.option_expiry)
+        for g in assigned if g.source_id == source_id
+    ] + [
+        o for o in orders
+        if (o.symbol, *guards.contract_key(o.option_strike, o.option_right, o.option_expiry))
+        not in elsewhere
+    ]
+    if not candidates:
         return None
     acct = _broker_account(db, user)
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-    for o in orders:
+    for o in candidates:
         held = [p for p in _positions(adapter, o.symbol)
                 if p.option_strike == o.option_strike and p.option_right == o.option_right
                 and p.option_expiry == o.option_expiry and (p.quantity or 0) > 0]
@@ -453,6 +532,19 @@ def channel_held_contracts(db: Session, user: User, source_id, symbol: str,
         and (right is None or o.option_right == right)
         and (strike is None or o.option_strike == strike)
     }
+    # A position the trader assigned by hand belongs to the channel it was
+    # assigned to: added here if that is this channel, dropped if it is another.
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    for g in guards.assigned(db, user.id, symbol):
+        g_right = _right(getattr(g.option_right, "value", g.option_right))
+        key = (g.option_strike, g_right, g.option_expiry)
+        if g.source_id != source_id:
+            wanted.discard(key)
+        elif (g.option_strike is not None
+              and (right is None or g_right == right)
+              and (strike is None or g.option_strike == strike)):
+            wanted.add(key)
     if not wanted:
         return []
     acct = _broker_account(db, user)
@@ -625,7 +717,8 @@ def _check_expiry(expiry: date | None) -> None:
 
 
 def _resolve_quantity(
-    signal, positions, strike, right, expiry, is_closing, sizing, resolutions
+    signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
+    light_original: Decimal | None = None,
 ) -> Decimal:
     """How many contracts.
 
@@ -671,6 +764,16 @@ def _resolve_quantity(
                 "This is an averaging-down alert, but you hold no position in "
                 "that contract to average into."
             )
+        # A position opened LIGHT (light / not heavy / lotto / risky) is one the
+        # author sized down on purpose. Doubling it on every average grows it
+        # geometrically — 1, 2, 4, 8 — so it adds the opening size again
+        # instead: 1, 2, 3, 4.
+        if light_original is not None and light_original > 0:
+            resolutions["quantity"] = (
+                f"{light_original} (your opening size — the entry was light, "
+                f"so not doubling your {qty} held)"
+            )
+            return light_original
         resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
         return qty
 
