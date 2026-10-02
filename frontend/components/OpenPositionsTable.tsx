@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, Search, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
@@ -14,6 +14,7 @@ import { useEventStream } from "@/lib/sse";
 import { useLivePrice, useLivePrices, peekLivePrice } from "@/lib/livePrices";
 import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
 import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
+import { DiscordAlertComposer } from "@/components/DiscordAlertComposer";
 import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
@@ -569,9 +570,11 @@ export const OpenPositionsTable = forwardRef<
   // statsInHeader: show the summary figures in the app header (AppShell's
   // HEADER_STATS_SLOT_ID) instead of as tiles above the table, on screens wide
   // enough for it. Same numbers, same fetches — no extra broker calls.
-  { className?: string; fillHeight?: boolean; statsInHeader?: boolean }
+  // discordComposer: put the Discord alert composer (button + popup) left of
+  // the symbol search — for accounts with Discord trading only.
+  { className?: string; fillHeight?: boolean; statsInHeader?: boolean; discordComposer?: boolean }
 >(
-  function OpenPositionsTable({ className, fillHeight, statsInHeader }, ref) {
+  function OpenPositionsTable({ className, fillHeight, statsInHeader, discordComposer }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
     // return nav, then refresh() below revalidates. Cleared on logout.
     // The Channel column is only meaningful to a trader who has Discord — for
@@ -649,6 +652,8 @@ export const OpenPositionsTable = forwardRef<
     // The user's Discord channels, for the editable Channel cell.
     const [channels, setChannels] = useState<{ id: string; label: string }[]>([]);
     const [channelBusy, setChannelBusy] = useState<string | null>(null);
+    // The row whose Channel cell is showing its dropdown (opened by the pencil).
+    const [editingChannel, setEditingChannel] = useState<string | null>(null);
     useEffect(() => {
       if (!showChannel) return;
       api<{ id: string; label: string | null; channel_name?: string | null }[]>("/api/discord-sources")
@@ -1265,6 +1270,9 @@ export const OpenPositionsTable = forwardRef<
             {tabBtn("stock", "Stocks")}
           </div>
           <div className="flex items-center gap-2">
+            {/* Type or paste a Discord alert without leaving Positions — the
+                same composer as Order History. */}
+            {discordComposer && showChannel && <DiscordAlertComposer onSent={() => refresh()} />}
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
               <input
@@ -1372,22 +1380,52 @@ export const OpenPositionsTable = forwardRef<
                   // configured order (reorderable) and visibility (show/hide).
                   const cell: Record<string, React.ReactNode> = {
                     channel: (() => {
-                      // The channel this position belongs to — editable. A
-                      // derived name that is no single channel ("Clint-Self",
-                      // or none) shows as its own first option.
+                      // The channel this position belongs to. Shown as text
+                      // with a pencil; the pencil opens the dropdown. A derived
+                      // name that is no single channel ("Clint-Self", or none)
+                      // is the dropdown's own first option.
                       const current = p.discord_channel === "Self"
                         ? "self"
                         : channels.find((c) => c.label === p.discord_channel)?.id ?? "";
+                      if (editingChannel !== key) {
+                        // The name, with a pencil that opens the dropdown.
+                        return (
+                          <td className="px-5 py-3.5 whitespace-nowrap" title={p.discord_channel ?? undefined}>
+                            <span className="inline-flex items-center gap-1.5">
+                              <span style={{ color: p.discord_channel ? "var(--text)" : "var(--muted)" }}>
+                                {p.discord_channel || "—"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setEditingChannel(key)}
+                                disabled={channelBusy === key}
+                                aria-label={`Change channel for ${p.symbol.toUpperCase()}`}
+                                title="Change the channel this position belongs to"
+                                className="focus-ring rounded p-0.5 opacity-60 hover:opacity-100 disabled:opacity-30"
+                                style={{ color: "var(--muted)" }}
+                              >
+                                {channelBusy === key ? <Spinner /> : <Pencil size={12} />}
+                              </button>
+                            </span>
+                          </td>
+                        );
+                      }
                       return (
                         <td className="px-5 py-3.5 whitespace-nowrap">
                           <select
+                            autoFocus
                             value={current}
-                            disabled={channelBusy === key}
-                            onChange={(e) => void assignChannel(p, e.target.value)}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setEditingChannel(null);
+                              void assignChannel(p, v);
+                            }}
+                            onBlur={() => setEditingChannel(null)}
+                            onKeyDown={(e) => { if (e.key === "Escape") setEditingChannel(null); }}
                             aria-label={`Channel for ${p.symbol.toUpperCase()}`}
                             title="The channel this position belongs to. Its exit settings manage the position, and its alerts reach it."
-                            className="rounded-md border px-1.5 py-1 text-[13px] bg-transparent focus-ring max-w-[150px] disabled:opacity-60"
-                            style={{ borderColor: "var(--border)", color: p.discord_channel ? "var(--text)" : "var(--muted)" }}
+                            className="rounded-md border px-1.5 py-1 text-[13px] bg-transparent focus-ring max-w-[150px]"
+                            style={{ borderColor: "var(--border)", color: "var(--text)" }}
                           >
                             {current === "" && <option value="">{p.discord_channel || "—"}</option>}
                             {channels.map((c) => (
