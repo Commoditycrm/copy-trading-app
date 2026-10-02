@@ -146,7 +146,7 @@ export function ClosedTodayTable() {
 
   const th = "px-4 py-2 text-left text-[11px] font-medium uppercase tracking-wide";
   const td = "px-4 py-2.5 text-[13px]";
-  const inputCls = "w-20 px-2 py-1 text-xs border rounded-[var(--r-sm)] text-right num";
+  const inputCls = "px-2 py-1 text-xs border rounded-[var(--r-sm)] text-right num";
   const inputStyle = { borderColor: "var(--border)", background: "var(--bg)", color: "var(--text)" } as const;
 
   return (
@@ -196,9 +196,7 @@ export function ClosedTodayTable() {
                 <th className={th}>Type</th>
                 <th className={`${th} text-right`}>Fill price</th>
                 <th className={`${th} text-right`}>Realized P&amp;L</th>
-                <th className={`${th} text-right`}>Re-enter qty</th>
-                <th className={`${th} text-right`}>Re-enter price</th>
-                <th className={th}><span className="sr-only">Re-enter</span></th>
+                <th className={th}>Re-enter · qty @ price</th>
               </tr>
             </thead>
             <tbody>
@@ -217,36 +215,38 @@ export function ClosedTodayTable() {
                     <td className={`${td} num text-right`} style={{ color: pnl == null ? "var(--muted)" : pnl > 0 ? "var(--good)" : pnl < 0 ? "var(--bad)" : "var(--text)" }}>
                       {pnl == null ? "—" : fmtSignedUsd(pnl)}
                     </td>
-                    <td className={`${td} text-right`}>
-                      <input
-                        type="number" min={isOption ? 1 : 0.000001} step={isOption ? 1 : "any"}
-                        aria-label={`Re-enter quantity for ${label}`}
-                        value={reQty[o.id] ?? defaultQty(o)}
-                        onChange={(e) => setReQty((s) => ({ ...s, [o.id]: e.target.value }))}
-                        disabled={!!blocked}
-                        className={`${inputCls} disabled:opacity-50`} style={inputStyle}
-                      />
-                    </td>
-                    <td className={`${td} text-right`}>
-                      <input
-                        type="number" min="0.01" step="0.01"
-                        aria-label={`Re-enter price for ${label}`}
-                        value={rePrice[o.id] ?? defaultPrice(o)}
-                        onChange={(e) => setRePrice((s) => ({ ...s, [o.id]: e.target.value }))}
-                        disabled={!!blocked}
-                        className={`${inputCls} disabled:opacity-50`} style={inputStyle}
-                      />
-                    </td>
-                    <td className={`${td} text-right whitespace-nowrap`}>
-                      <button
-                        type="button"
-                        onClick={() => void reEnter(o)}
-                        disabled={!!blocked || busyId === o.id}
-                        title={blocked ?? "Buy this back: a limit order for the quantity and price on the left"}
-                        className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
-                      >
-                        {busyId === o.id ? "Placing…" : "Re-enter"}
-                      </button>
+                    {/* Qty, price and the button as one group, side by side. */}
+                    <td className={`${td} whitespace-nowrap`}>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="number" min={isOption ? 1 : 0.000001} step={isOption ? 1 : "any"}
+                          aria-label={`Re-enter quantity for ${label}`}
+                          title="Re-enter quantity"
+                          value={reQty[o.id] ?? defaultQty(o)}
+                          onChange={(e) => setReQty((s) => ({ ...s, [o.id]: e.target.value }))}
+                          disabled={!!blocked}
+                          className={`${inputCls} w-16 disabled:opacity-50`} style={inputStyle}
+                        />
+                        <span className="text-[11px]" style={{ color: "var(--muted)" }}>@</span>
+                        <input
+                          type="number" min="0.01" step="0.01"
+                          aria-label={`Re-enter price for ${label}`}
+                          title="Re-enter price (limit)"
+                          value={rePrice[o.id] ?? defaultPrice(o)}
+                          onChange={(e) => setRePrice((s) => ({ ...s, [o.id]: e.target.value }))}
+                          disabled={!!blocked}
+                          className={`${inputCls} w-20 disabled:opacity-50`} style={inputStyle}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void reEnter(o)}
+                          disabled={!!blocked || busyId === o.id}
+                          title={blocked ?? "Buy this back: a limit order for this quantity and price"}
+                          className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
+                        >
+                          {busyId === o.id ? "Placing…" : "Re-enter"}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
