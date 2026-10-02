@@ -538,7 +538,7 @@ function fmtExpiresIn(isoDate: string | null): { text: string; color: string } {
 // ── Sorting ───────────────────────────────────────────────────────────────
 type SortKey =
   | "channel" | "symbol" | "quantity" | "avg_entry_price" | "current_price"
-  | "market_value" | "net_liq" | "unrealized_pnl" | "day_pnl" | "expires";
+  | "market_value" | "net_liq" | "unrealized_pnl" | "day_pnl" | "day_pnl_pct" | "expires";
 
 function sortValue(p: Position, key: SortKey): number | string {
   switch (key) {
@@ -552,6 +552,7 @@ function sortValue(p: Position, key: SortKey): number | string {
     case "net_liq": return (Number(p.current_price) || 0) * (Number(p.quantity) || 0) * (p.instrument_type === "option" ? 100 : 1);
     case "unrealized_pnl": return Number(p.unrealized_pnl) || 0;
     case "day_pnl": return p.day_pnl != null ? Number(p.day_pnl) : Number.NEGATIVE_INFINITY;
+    case "day_pnl_pct": return p.day_pnl_pct != null ? Number(p.day_pnl_pct) : Number.NEGATIVE_INFINITY;
     case "expires": return p.option_expiry ? daysUntil(p.option_expiry) : Number.POSITIVE_INFINITY;
   }
 }
@@ -604,6 +605,7 @@ export const OpenPositionsTable = forwardRef<
       { id: "unrealized_pnl", header: "Unrealized P&L" },
       { id: "pnl_pct", header: "P&L %" },
       { id: "day_pnl", header: "Day's P&L" },
+      { id: "day_pnl_pct", header: "Day's P&L %" },
       { id: "avg_entry", header: "Avg entry" },
       { id: "current_price", header: "Current price" },
       { id: "pdc", header: "PDC" },
@@ -1165,6 +1167,7 @@ export const OpenPositionsTable = forwardRef<
       unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
       pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
       day_pnl: { label: "Day's P&L", sortKey: "day_pnl", title: "Today's P&L on this position, straight from your broker (Webull / Alpaca)" },
+      day_pnl_pct: { label: "Day's P&L %", sortKey: "day_pnl_pct", title: "Today's P&L on this position as a %, straight from your broker" },
       avg_entry: { label: "Avg entry", sortKey: "avg_entry_price" },
       current_price: { label: "Current price", sortKey: "current_price" },
       pdc: { label: "PDC", title: "Previous day's market close price" },
@@ -1581,13 +1584,21 @@ export const OpenPositionsTable = forwardRef<
                     // Day's P&L — the broker's OWN per-position figure (Webull /
                     // Alpaca native), not derived. A snapshot value; null → "—".
                     day_pnl: (
-                      <td className="px-5 py-3.5 num" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
+                      // The dollar amount only — its % has a column of its own,
+                      // so neither wraps onto a second line.
+                      <td className="px-5 py-3.5 num whitespace-nowrap" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
                         {p.day_pnl != null ? (
                           <span style={{ color: Number(p.day_pnl) > 0 ? "var(--pnl-pos)" : Number(p.day_pnl) < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
                             {fmtSignedUsd(Number(p.day_pnl))}
-                            {p.day_pnl_pct != null && (
-                              <span style={{ color: "var(--text-2)" }}>{` (${Number(p.day_pnl_pct) >= 0 ? "+" : ""}${Number(p.day_pnl_pct).toFixed(2)}%)`}</span>
-                            )}
+                          </span>
+                        ) : <span style={{ color: "var(--faint)" }}>—</span>}
+                      </td>
+                    ),
+                    day_pnl_pct: (
+                      <td className="px-5 py-3.5 num whitespace-nowrap" title={p.day_pnl_source === "broker_native" ? "From your broker" : undefined}>
+                        {p.day_pnl_pct != null ? (
+                          <span style={{ color: Number(p.day_pnl_pct) > 0 ? "var(--pnl-pos)" : Number(p.day_pnl_pct) < 0 ? "var(--pnl-neg)" : "var(--text-2)" }}>
+                            {`${Number(p.day_pnl_pct) >= 0 ? "+" : ""}${Number(p.day_pnl_pct).toFixed(2)}%`}
                           </span>
                         ) : <span style={{ color: "var(--faint)" }}>—</span>}
                       </td>
