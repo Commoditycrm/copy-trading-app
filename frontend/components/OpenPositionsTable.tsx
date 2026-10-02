@@ -572,9 +572,14 @@ export const OpenPositionsTable = forwardRef<
   // enough for it. Same numbers, same fetches — no extra broker calls.
   // discordComposer: put the Discord alert composer (button + popup) left of
   // the symbol search — for accounts with Discord trading only.
-  { className?: string; fillHeight?: boolean; statsInHeader?: boolean; discordComposer?: boolean }
+  // toolbarActions: extra controls placed right after the All / Options / Stocks
+  // pills (the Positions page puts the bulk exit / cancel buttons there).
+  {
+    className?: string; fillHeight?: boolean; statsInHeader?: boolean; discordComposer?: boolean;
+    toolbarActions?: React.ReactNode;
+  }
 >(
-  function OpenPositionsTable({ className, fillHeight, statsInHeader, discordComposer }, ref) {
+  function OpenPositionsTable({ className, fillHeight, statsInHeader, discordComposer, toolbarActions }, ref) {
     // Stale-while-revalidate: paint the last positions/orders instantly on
     // return nav, then refresh() below revalidates. Cleared on logout.
     // The Channel column is only meaningful to a trader who has Discord — for
@@ -1264,10 +1269,11 @@ export const OpenPositionsTable = forwardRef<
 
         {/* Toolbar: type tabs + symbol search */}
         <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {tabBtn("all", "All")}
             {tabBtn("option", "Options")}
             {tabBtn("stock", "Stocks")}
+            {toolbarActions}
           </div>
           <div className="flex items-center gap-2">
             {/* Type or paste a Discord alert without leaving Positions — the

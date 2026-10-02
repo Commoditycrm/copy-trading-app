@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
-import { BulkExitBar } from "@/components/BulkExitBar";
+import { BulkExitBar, BULK_REENTER_SLOT_ID } from "@/components/BulkExitBar";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { PageLoading } from "@/components/PageLoading";
 import { WebullUsage } from "@/components/WebullUsage";
@@ -21,18 +21,24 @@ export default function PositionsPage() {
     api<User>("/api/auth/me").then((u) => { setUser(u); setSnapshot(USER_SNAPSHOT_KEY, u); }).catch(() => {});
   }, []);
 
-  // Hold the page until `user` lands — the BulkExitBar gates which chips
-  // render off role, and we don't want a brief flash of the "my-only" set
-  // before the trader-targeted ones appear.
+  // Hold the page until `user` lands — the bulk exit buttons (in the table's
+  // toolbar) are gated off role, and we don't want a brief flash of the
+  // "my-only" set before the trader-targeted ones appear.
   if (!user) return <PageLoading />;
 
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex flex-col gap-4 flex-1 min-h-0">
-        <BulkExitBar onActionComplete={() => tableRef.current?.refresh()} />
+        {/* "Re-Enter Last Exit" appears here after an Exit My Positions; empty
+            (and hidden) otherwise. The exit / cancel buttons themselves sit in
+            the table's toolbar, beside the All / Options / Stocks pills. */}
+        <div id={BULK_REENTER_SLOT_ID} className="empty:hidden" />
         {/* Requests going to Webull and what made them (hidden without Webull). */}
         <WebullUsage />
-        <OpenPositionsTable ref={tableRef} fillHeight statsInHeader discordComposer className="flex-1 min-h-0" />
+        <OpenPositionsTable
+          ref={tableRef} fillHeight statsInHeader discordComposer className="flex-1 min-h-0"
+          toolbarActions={<BulkExitBar inline onActionComplete={() => tableRef.current?.refresh()} />}
+        />
         {/* Today's exits — what came off a position today (no actions). */}
         <div className="shrink-0 max-h-[40vh] overflow-y-auto">
           <ClosedTodayTable />
