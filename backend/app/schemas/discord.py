@@ -518,9 +518,14 @@ class DiscordSelfAlertIn(BaseModel):
     this goes through the SAME parser and the same execution path as a real
     alert. Letting the caller supply a parsed signal would be a second, untested
     way into the order pipeline.
+
+    ``source_id`` picks the channel the alert is handled AS — its sizing, entry
+    type and exit settings apply and the position shows that channel. Omitted,
+    it is the trader's own Self channel.
     """
 
     content: str = Field(min_length=1, max_length=8000)
+    source_id: uuid.UUID | None = None
 
 
 class DiscordSelfAlertOut(BaseModel):

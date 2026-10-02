@@ -831,6 +831,17 @@ export default function TradesPage() {
   const [selfOpen, setSelfOpen] = useState(false);
   const [selfText, setSelfText] = useState("");
   const [selfBusy, setSelfBusy] = useState(false);
+  // Which channel the alert is handled AS: "" is the trader's own Self channel,
+  // otherwise one of their channels — its sizing, entry type and exit settings
+  // then apply and the position shows that channel.
+  const [selfChannel, setSelfChannel] = useState("");
+  const [selfChannels, setSelfChannels] = useState<{ id: string; label: string }[]>([]);
+  useEffect(() => {
+    if (!selfOpen) return;
+    api<{ id: string; label: string | null; channel_name?: string | null }[]>("/api/discord-sources")
+      .then((rows) => setSelfChannels(rows.map((r) => ({ id: r.id, label: r.label?.trim() || r.channel_name?.trim() || "Channel" }))))
+      .catch(() => { /* Self alone still works */ });
+  }, [selfOpen]);
 
   const sendSelfAlert = useCallback(async () => {
     const content = selfText.trim();
@@ -839,7 +850,7 @@ export default function TradesPage() {
     try {
       const r = await api<SelfAlertResult>("/api/discord-sources/self/alert", {
         method: "POST",
-        body: JSON.stringify({ content }),
+        body: JSON.stringify(selfChannel ? { content, source_id: selfChannel } : { content }),
       });
       // The alert's own verdict decides the tone. A parse that produced no
       // trade, or an order the executor refused, is NOT a success — saying
@@ -867,7 +878,7 @@ export default function TradesPage() {
     } finally {
       setSelfBusy(false);
     }
-  }, [selfText, selfBusy, loadPage, loadStats]);
+  }, [selfText, selfBusy, selfChannel, loadPage, loadStats]);
 
   // Must match the number of <Th> cells below — it sizes the loading skeleton
   // and the empty-state row, both of which misalign if a column is added or
@@ -1611,6 +1622,24 @@ export default function TradesPage() {
               a live channel and follows your Discord settings — so in manual
               mode it waits for your approval rather than placing.
             </p>
+
+            <label className="flex items-center gap-2 text-xs" style={{ color: "var(--text-2)" }}>
+              Channel
+              <select
+                value={selfChannel}
+                onChange={(e) => setSelfChannel(e.target.value)}
+                disabled={selfBusy}
+                aria-label="Channel to handle this alert as"
+                title="The alert is handled as this channel's: its contracts, entry type and exit settings apply, and the position shows this channel"
+                className="rounded-md border px-2 py-1 text-xs bg-transparent focus-ring"
+                style={{ borderColor: "var(--border)", color: "var(--text)" }}
+              >
+                <option value="">Self</option>
+                {selfChannels.map((c) => (
+                  <option key={c.id} value={c.id}>{c.label}</option>
+                ))}
+              </select>
+            </label>
 
             <textarea
               value={selfText}

@@ -138,7 +138,10 @@ def for_guard(db: Session, user_id: uuid.UUID, guard) -> Any | None:
     """The settings of the channel that OPENED this position (its exit ladder),
     or None when the opening order isn't a channel's — the caller then uses the
     alert's own channel."""
-    source_id = source_for_order(db, getattr(guard, "entry_order_id", None))
+    # A channel the trader assigned by hand (Positions → Channel) wins over the
+    # one whose alert opened the position.
+    source_id = getattr(guard, "source_id", None) or source_for_order(
+        db, getattr(guard, "entry_order_id", None))
     if source_id is None:
         return None
     return effective(db, user_id, source_id)

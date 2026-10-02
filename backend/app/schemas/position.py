@@ -81,6 +81,23 @@ class PositionsPayload(BaseModel):
     stale: list[StaleAccount] = []
 
 
+class PositionChannelIn(BaseModel):
+    """Assign a held position to a Discord channel (Positions → Channel).
+
+    ``channel`` is a channel's id, "self" for the trader's own Self channel, or
+    "auto" to go back to the channel whose alert opened the position.
+    ``entry_price`` is the position's average cost as the page shows it — used
+    only to start an exit ladder on a position that has none yet.
+    """
+
+    symbol: str = Field(min_length=1, max_length=40)
+    option_strike: Decimal | None = None
+    option_right: OptionRight | None = None
+    option_expiry: date | None = None
+    channel: str = Field(min_length=1, max_length=40)
+    entry_price: Decimal | None = Field(default=None, gt=0)
+
+
 class AveragePositionIn(BaseModel):
     """Add to an open position (average it) at market or at a limit."""
 

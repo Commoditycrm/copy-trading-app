@@ -81,6 +81,16 @@ class DiscordPositionGuard(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
     )
 
+    # The channel this holding was ASSIGNED to by the trader (Positions page →
+    # Channel). NULL — the usual case — means "the channel whose alert opened
+    # it". When set it wins everywhere the opening channel is used: the Channel
+    # column, whose exit settings and ladder apply, and which channel's
+    # "stopped out" / "adding" alerts reach the position.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("discord_alert_sources.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # Hard stop on whatever is still held, as an absolute price. Set below entry
     # by the first trim and lifted to break-even by the second. Emulated, like
     # everything else here — Alpaca won't hold a resting stop on an option.
