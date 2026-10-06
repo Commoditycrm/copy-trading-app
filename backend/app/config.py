@@ -152,6 +152,19 @@ class Settings(BaseSettings):
     # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
     # 4s also works (7.5 / 30s). Don't go below 3.5s.
     webull_poll_interval_seconds: float = 5.0
+    # ── Market-closed polling slowdown ───────────────────────────────────
+    # Outside tradable hours (weekends + weekday <04:00 / ≥20:00 ET) prices,
+    # positions and account P&L can't move, so the data pollers back off to cut
+    # CPU + broker API calls. They return to full cadence automatically in
+    # pre-market (04:00 ET). Copy-trading/risk behaviour during tradable hours
+    # is unchanged. See market_hours.is_tradable_now.
+    #
+    # Webull order poll when the market is CLOSED. The faster "active" value is
+    # used when the trader still has working/pending orders worth monitoring.
+    webull_poll_interval_closed_seconds: float = 120.0
+    webull_poll_interval_closed_active_seconds: float = 20.0
+    # P&L poller (all brokers, incl. Alpaca REST) floor when the market is CLOSED.
+    pnl_poll_interval_closed_seconds: float = 180.0
     # ── Webull token authorisation wait ──────────────────────────────────
     # Webull's SDK creates an access token in PENDING status and then BLOCKS,
     # polling until the account owner authorises it in their Webull app. Its own

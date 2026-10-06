@@ -48,7 +48,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import listener_state, order_intent
+from app.services import listener_state, market_hours, order_intent
 from app.brokers.webull import _first, _looks_like_occ  # noqa: PLC2701
 from app.services.crypto import decrypt_json
 
@@ -178,6 +178,50 @@ def _safe_poll_interval(num_accounts: int) -> float:
     One list_today_orders call per account per cycle all draw on the SAME
     10-req/30s app-id budget, so more accounts ⇒ a longer cycle."""
     return max(_poll_interval(), _DAYORDERS_PER_ACCOUNT_S * max(1, num_accounts))
+
+
+# Orders still live at the broker — worth monitoring at a faster cadence even
+# after hours (they can be cancelled/modified, or fill in a later session).
+_WORKING_STATUSES = (
+    OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+)
+
+
+def _has_working_orders(trader_user_id: uuid.UUID) -> bool:
+    """True if the trader has any still-working order. Only consulted while the
+    market is CLOSED, to decide between the slow idle cadence and a faster one
+    that keeps monitoring outstanding orders. On any DB error, assume True (the
+    safer, faster side)."""
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+        with SessionLocal() as db:
+            row = db.execute(
+                select(Order.id)
+                .where(Order.user_id == trader_user_id,
+                       Order.status.in_(_WORKING_STATUSES))
+                .limit(1)
+            ).first()
+            return row is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _effective_poll_interval(num_accounts: int, trader_user_id: uuid.UUID) -> float:
+    """Poll cadence for THIS cycle. Full rate while the market is tradable
+    (regular + extended hours); when closed, back off to the idle interval —
+    or the faster 'active' interval if the trader still has working orders.
+    Never goes below the rate-limit floor (``_safe_poll_interval``)."""
+    base = _safe_poll_interval(num_accounts)
+    if market_hours.is_tradable_now():
+        return base
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    closed = (
+        float(s.webull_poll_interval_closed_active_seconds)
+        if _has_working_orders(trader_user_id)
+        else float(s.webull_poll_interval_closed_seconds)
+    )
+    return max(base, closed)
 
 
 # ── credentials ─────────────────────────────────────────────────────────────
@@ -1081,6 +1125,12 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             # the 3rd 429'd 32×/hr, 2026-08-13). One call every interval/N keeps
             # the window under the cap. Per-account poll frequency is unchanged
             # (still once per `interval`), so detection latency is too.
+            #
+            # Recompute the cadence every cycle so it tracks market state: full
+            # rate during regular + extended hours, and a backed-off idle rate
+            # overnight / weekends (faster if the trader still has working
+            # orders). Returns to full rate automatically in pre-market.
+            interval = _effective_poll_interval(len(account_ids), trader_user_id)
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
