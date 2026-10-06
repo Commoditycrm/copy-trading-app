@@ -62,12 +62,29 @@ def test_session_us_holiday_on_a_weekday():
     assert mh.market_session(_et(2026, 12, 25, 11, 0)) == mh.CLOSED
 
 
+def test_session_observed_holiday_is_closed():
+    # An OBSERVED holiday (shifted off the literal date) is CLOSED all day, both
+    # shift directions: Independence Day 2026-07-04 is a Saturday → observed the
+    # prior Friday (07-03); 2027-07-04 is a Sunday → observed the next Monday
+    # (07-05). Tested directly on market_session (not just is_market_holiday).
+    assert mh.is_market_holiday(date(2026, 7, 3)) is True
+    assert mh.market_session(_et(2026, 7, 3, 11, 0)) == mh.CLOSED   # Sat → prior Fri
+    assert mh.is_market_holiday(date(2027, 7, 5)) is True
+    assert mh.market_session(_et(2027, 7, 5, 11, 0)) == mh.CLOSED   # Sun → next Mon
+
+
 def test_session_early_close_day_before_and_after_close():
-    # Black Friday 2026-11-27 is a half day: regular ends 13:00, after-hours to 17:00.
+    # Black Friday 2026-11-27 is a half day: the REGULAR session ends early at
+    # 13:00, but AFTER_HOURS continues to 20:00 ET (same boundary as
+    # in_extended_hours), so polling stays at full cadence while the app still
+    # considers extended-hours trading active.
     assert mh.is_early_close_day(date(2026, 11, 27)) is True
-    assert mh.market_session(_et(2026, 11, 27, 12, 30)) == mh.REGULAR      # before 13:00
-    assert mh.market_session(_et(2026, 11, 27, 14, 0)) == mh.AFTER_HOURS   # 13:00–17:00
-    assert mh.market_session(_et(2026, 11, 27, 18, 0)) == mh.CLOSED        # after 17:00
+    assert mh.market_session(_et(2026, 11, 27, 12, 59)) == mh.REGULAR      # before the early close
+    assert mh.market_session(_et(2026, 11, 27, 13, 1)) == mh.AFTER_HOURS   # just after 13:00
+    assert mh.market_session(_et(2026, 11, 27, 17, 0)) == mh.AFTER_HOURS   # still extended hours
+    assert mh.market_session(_et(2026, 11, 27, 18, 0)) == mh.AFTER_HOURS
+    assert mh.market_session(_et(2026, 11, 27, 19, 59)) == mh.AFTER_HOURS  # last extended-hours minute
+    assert mh.market_session(_et(2026, 11, 27, 20, 0)) == mh.CLOSED        # 20:00 → closed
     # A normal day at 14:00 is still REGULAR (contrast with the half day).
     assert mh.market_session(_et(2026, 11, 24, 14, 0)) == mh.REGULAR
 
