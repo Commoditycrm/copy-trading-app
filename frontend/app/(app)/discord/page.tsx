@@ -204,6 +204,9 @@ function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
   ];
 }
 
+/** The boxes on this page that hold typing until Save. */
+type EditedField = "trims" | "fill" | "trail" | "maxPerContract" | "maxPerOrder";
+
 const sameTrims = (a: TrimRow[], b: TrimRow[]) =>
   a.length === b.length && a.every((t, i) => TRIM_COLUMNS.every((c) => t[c.key] === b[i][c.key]));
 
@@ -274,13 +277,14 @@ export default function DiscordPage() {
   const [savedTrims, setSavedTrims] = useState<TrimRow[]>(DEFAULT_TRIMS);
   const [fillStop, setFillStop] = useState("");
   const [savedFillStop, setSavedFillStop] = useState("");
-  const adoptLadder = (r: Partial<DiscordSettings>) => {
-    const t = trimsFrom(r);
-    setTrims(t);
-    setSavedTrims(t);
-    setFillStop(r.fill_stop_pct ?? "");
-    setSavedFillStop(r.fill_stop_pct ?? "");
-  };
+  // What the server last said for every field you type into, as a ref: the
+  // 15s background reload runs a stale closure, so state can't tell it whether
+  // a box holds an unsaved edit. It used to overwrite them all — an edited
+  // ladder reverted 15s later unless Save had been clicked by then.
+  const savedRef = useRef({
+    trims: DEFAULT_TRIMS, fill: "", trail: LADDER_DEFAULTS as Record<string, string>,
+    maxPerContract: "", maxPerOrder: "",
+  });
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   // Which settings the Alert handling card edits: null = the account's, else a
   // channel's. A channel follows the account until "Use account settings" is
@@ -316,23 +320,44 @@ export default function DiscordPage() {
     }
   }
 
+  /** Show the server's settings. ``force`` replaces what you typed: ``true``
+   *  for everything (switching which settings are shown), or just the fields a
+   *  save sent. Otherwise — the background reload — a box you have edited and
+   *  not saved keeps your edit, and only boxes you haven't touched follow the
+   *  server. */
   function applySettings(
     settings: DiscordSettings & { use_account_settings?: boolean; entry_order_type?: string },
+    force: boolean | EditedField[] = false,
   ) {
+      const forced = (f: EditedField) => force === true || (Array.isArray(force) && force.includes(f));
       setFollowsAccount(settings.use_account_settings ?? true);
       setEntryType(settings.entry_order_type === "market" ? "market" : "limit");
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
       setExitMode(settings.exit_mode ?? (settings.auto_trim ? "auto" : "alerts"));
       setQtyMultiplier(settings.quantity_multiplier || 1);
-      setMaxPerContract(settings.max_per_contract ?? "");
-      setSavedMaxPerContract(settings.max_per_contract ?? "");
-      setMaxPerOrder(settings.max_per_order ?? "");
-      setSavedMaxPerOrder(settings.max_per_order ?? "");
-      adoptLadder(settings);
-      const nextLadder = ladderFrom(settings);
-      setLadder(nextLadder);
-      setSavedLadder(nextLadder);
+
+      const prev = savedRef.current;
+      const next = {
+        trims: trimsFrom(settings),
+        fill: settings.fill_stop_pct ?? "",
+        trail: ladderFrom(settings),
+        maxPerContract: settings.max_per_contract ?? "",
+        maxPerOrder: settings.max_per_order ?? "",
+      };
+      savedRef.current = next;
+      const sameRecord = (a: Record<string, string>, b: Record<string, string>) =>
+        Object.keys(b).every((k) => a[k] === b[k]);
+      setTrims((cur) => (forced("trims") || sameTrims(cur, prev.trims) ? next.trims : cur));
+      setSavedTrims(next.trims);
+      setFillStop((cur) => (forced("fill") || cur === prev.fill ? next.fill : cur));
+      setSavedFillStop(next.fill);
+      setLadder((cur) => (forced("trail") || sameRecord(cur, prev.trail) ? next.trail : cur));
+      setSavedLadder(next.trail);
+      setMaxPerContract((cur) => (forced("maxPerContract") || cur === prev.maxPerContract ? next.maxPerContract : cur));
+      setSavedMaxPerContract(next.maxPerContract);
+      setMaxPerOrder((cur) => (forced("maxPerOrder") || cur === prev.maxPerOrder ? next.maxPerOrder : cur));
+      setSavedMaxPerOrder(next.maxPerOrder);
   }
 
   // The channel list alone — so the Entry / Exit pills reflect a settings
@@ -350,7 +375,7 @@ export default function DiscordPage() {
     setScope(id);
     if (id !== null) setExitTab("ladder");          // the AI tab is account-only
     try {
-      applySettings(await api(settingsUrl(id)));
+      applySettings(await api(settingsUrl(id)), true);    // other settings: replace everything
     } catch (e) {
       notify.fromError(e, "Could not load those settings");
     }
@@ -360,7 +385,7 @@ export default function DiscordPage() {
     if (!scope) return;
     setModeBusy(true);
     try {
-      applySettings(await api(settingsUrl(scope), { method: "PATCH", body: JSON.stringify(body) }));
+      applySettings(await api(settingsUrl(scope), { method: "PATCH", body: JSON.stringify(body) }), true);
       notify.success(done);
       void refreshSources();
     } catch (e) {
@@ -498,15 +523,15 @@ export default function DiscordPage() {
         method: "PATCH",
         body: JSON.stringify(patch),
       });
-      setQtyMultiplier(r.quantity_multiplier || 1);
-      setMaxPerContract(r.max_per_contract ?? "");
-      setSavedMaxPerContract(r.max_per_contract ?? "");
-      setMaxPerOrder(r.max_per_order ?? "");
-      setSavedMaxPerOrder(r.max_per_order ?? "");
-      adoptLadder(r);
-      const nextLadder = ladderFrom(r);
-      setLadder(nextLadder);
-      setSavedLadder(nextLadder);
+      // What was saved IS now the server's value: those boxes take it. Anything
+      // else being edited (the ladder, while saving Max per order) is left be.
+      const sent: EditedField[] = [];
+      if ("trims" in patch) sent.push("trims");
+      if ("fill_stop_pct" in patch) sent.push("fill");
+      if ("trim_price_threshold" in patch || "trim_trail_amount" in patch) sent.push("trail");
+      if ("max_per_contract" in patch) sent.push("maxPerContract");
+      if ("max_per_order" in patch) sent.push("maxPerOrder");
+      applySettings(r, sent);
       notify.success("Saved");
       void refreshSources();
     } catch (e) {

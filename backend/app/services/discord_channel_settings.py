@@ -60,6 +60,18 @@ CHANNEL_FIELDS = (
 )
 _FIELDS = frozenset(CHANNEL_FIELDS)
 
+# Channel fields added AFTER channels could have their own settings. A channel
+# whose own copy predates them must not borrow the account's value: it would
+# get a ladder that is half its own and half the account's — its own Trims 1-3
+# plus the account's Trims 4+, On Fill stop and Take-profit mode. Read as they
+# were before they existed instead.
+_ADDED_LATER: dict[str, Any] = {
+    "discord_trim_count": 3,
+    "discord_extra_trims": [],
+    "discord_fill_stop_pct": None,
+    "discord_tp_orders": False,
+}
+
 
 def _from_json(name: str, raw: Any) -> Any:
     """A stored override back in the column's own Python type."""
@@ -95,6 +107,9 @@ class ChannelSettings:
         values = object.__getattribute__(self, "_values")
         if name in _FIELDS and name in values:
             return _from_json(name, values[name])
+        if name in _ADDED_LATER:
+            default = _ADDED_LATER[name]
+            return list(default) if isinstance(default, list) else default
         return getattr(object.__getattribute__(self, "_account"), name, None)
 
     def __setattr__(self, name: str, value: Any) -> None:
