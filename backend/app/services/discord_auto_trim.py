@@ -252,12 +252,11 @@ def _mark_for(positions, guard, user_id=None) -> Decimal | None:
         # Test-only pins from Simulated Prices must exercise the automatic
         # trim ladder too, not just stop/trailing enforcement. Pins are scoped
         # by trader and contract and are disabled outside a test-enabled env.
-        if user_id is not None:
-            from app.services import price_override  # noqa: PLC0415
-            pinned = price_override.apply_to(user_id, p)
-            if pinned is not None:
-                return pinned
-        return _dec(getattr(p, "current_price", None))
+        # The position says it is held; the PRICE is Alpaca's live quote (a pin
+        # first, the broker's mark last) — see services/live_marks.
+        from app.services import live_marks  # noqa: PLC0415
+
+        return live_marks.position_mark(p, user_id)
     return None
 
 
