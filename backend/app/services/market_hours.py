@@ -173,6 +173,15 @@ def in_extended_hours(dt_et: datetime | None = None) -> bool:
     return (PREMARKET_START <= t < REGULAR_OPEN) or (MARKET_CLOSE <= t < POSTMARKET_END)
 
 
+def is_tradable_now(dt_et: datetime | None = None) -> bool:
+    """True whenever a trade could actually happen — the regular session OR
+    extended hours (weekday 04:00–20:00 ET). Background pollers run at full
+    cadence while this is True and slow down when it's False (overnight +
+    weekends), since prices, positions and account P&L can't move then."""
+    dt = dt_et or now_et()
+    return in_regular_session(dt) or in_extended_hours(dt)
+
+
 def is_same_day_expiry(option_expiry: date | None, dt_et: datetime | None = None) -> bool:
     """True when an option expires on today's ET date (0DTE). False for stocks
     (``option_expiry is None``) and for any later-dated contract."""
