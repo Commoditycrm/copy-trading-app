@@ -134,6 +134,24 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
 }
 
 
+# Floor for the market-closed P&L cadence, so a bad config value (0/negative/
+# invalid) can never tighten the poll — also guarded by max(base, …) below.
+_MIN_PNL_CLOSED_S = 30.0
+
+
+def _closed_pnl_interval() -> float:
+    """Configured closed-market P&L interval (``pnl_poll_interval_closed_seconds``),
+    floored to a safe minimum. Invalid/non-positive values fall back to 180s."""
+    from app.config import get_settings  # noqa: PLC0415
+    try:
+        v = float(get_settings().pnl_poll_interval_closed_seconds)
+    except (TypeError, ValueError):
+        v = 180.0
+    if v <= 0:
+        v = 180.0
+    return max(_MIN_PNL_CLOSED_S, v)
+
+
 def _base_interval_for_broker(broker: BrokerName) -> float:
     """The full-cadence per-tick interval for ``broker``, reading any runtime
     override every call. For Alpaca this checks Redis (~0.5ms); for everything
@@ -164,8 +182,7 @@ def _interval_for_broker(broker: BrokerName) -> float:
     base = _base_interval_for_broker(broker)
     from app.services import market_hours  # noqa: PLC0415
     if not market_hours.is_tradable_now():
-        from app.config import get_settings  # noqa: PLC0415
-        return max(base, float(get_settings().pnl_poll_interval_closed_seconds))
+        return max(base, _closed_pnl_interval())
     return base
 
 # Per-account monotonic timestamp of the earliest time the account is
@@ -287,6 +304,27 @@ async def stop() -> None:
     _task = None
 
 
+_last_session_log: str | None = None
+
+
+def _maybe_log_session() -> None:
+    """Log once when the market session changes (e.g. after-hours → closed),
+    with the resulting P&L cadence — never every tick."""
+    global _last_session_log
+    from app.services import market_hours  # noqa: PLC0415
+    session = market_hours.market_session()
+    if session == _last_session_log:
+        return
+    _last_session_log = session
+    log.info(
+        "pnl_poller: worker=pnl_poller market_session=%s tradable=%s "
+        "alpaca_interval=%.0fs webull_interval=%.0fs",
+        session, session != market_hours.CLOSED,
+        _interval_for_broker(BrokerName.ALPACA),
+        _interval_for_broker(BrokerName.WEBULL),
+    )
+
+
 async def _run() -> None:
     """Outer loop ticks every POLL_INTERVAL_S. On each tick:
 
@@ -300,6 +338,7 @@ async def _run() -> None:
     """
     while True:
         try:
+            _maybe_log_session()
             accts = await asyncio.to_thread(_load_active_accounts)
             now = time.monotonic()
             due = [a for a in accts if _next_due_at.get(a.id, 0.0) <= now]
