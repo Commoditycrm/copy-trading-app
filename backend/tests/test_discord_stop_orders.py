@@ -128,8 +128,13 @@ def test_a_moved_level_replaces_the_resting_order(db, broker):
     order = _Order(2, "1.50"); db.add(order)
     g = _Guard(stop="2.30", stop_order_id=order.id)
 
+    # Two passes: cancel now, place next pass — a stop placed in the same
+    # instant asks for contracts the old one still holds (QA 2026-10-06).
+    out = so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
+    assert broker["cancelled"] == [order.id] and broker["placed"] == []
+    assert g.stop_order_id is None and "next pass" in out
+    order.status = OrderStatus.CANCELED                # the cancel completed
     so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
-    assert broker["cancelled"] == [order.id]
     assert broker["placed"] == [(Decimal(2), Decimal("2.30"))]
 
 
@@ -139,6 +144,9 @@ def test_a_changed_position_size_replaces_the_resting_order(db, broker):
     order = _Order(4, "1.50"); db.add(order)
     g = _Guard(stop="1.50", stop_order_id=order.id)
 
+    so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
+    assert broker["cancelled"] == [order.id] and broker["placed"] == []
+    order.status = OrderStatus.CANCELED
     so.reconcile(db, g, Decimal(2), broker["place"], broker["cancel"])
     assert broker["placed"] == [(Decimal(2), Decimal("1.50"))]
 
@@ -391,9 +399,9 @@ def test_a_rate_limit_does_not_liquidate(monkeypatch):
     assert g.closed_at is None
 
 
-def test_a_refusal_while_REPLACING_also_closes(monkeypatch):
-    """The old stop is cancelled first, so a refusal here leaves the position
-    barer than a failed first placement would."""
+def test_replacing_cancels_first_and_places_on_the_next_pass(monkeypatch):
+    """Nothing is placed in the pass that cancels — so nothing can be refused
+    for contracts the old stop still holds, and nothing is closed over it."""
     from app.models.order import (
         InstrumentType, Order, OrderSide, OrderStatus, OrderType,
     )
@@ -416,8 +424,7 @@ def test_a_refusal_while_REPLACING_also_closes(monkeypatch):
         close_position=closed.append,
     )
     assert cancelled == [resting.id]        # the old one went first
-    assert closed == [Decimal(1)]
-    assert "closed" in out
+    assert closed == [] and "next pass" in out
 
 
 def test_without_a_close_callback_the_refusal_still_propagates(monkeypatch):
@@ -504,3 +511,61 @@ def test_a_refusal_with_no_stored_reason_still_backs_off(db, broker):
     )
     assert broker["placed"] == []
     assert out == "backing off (recent rejection)"
+
+
+
+# ── refused because the contracts were still held (QA 2026-10-06, SPY 779C) ──
+# Moving the stop 0.75 -> 1.01: the new stop went out while the old one still
+# held all 5 contracts. Webull read it as opening a naked call and refused it,
+# and the refusal was taken for "the price is through the stop": the position
+# was sold at market, below every trim.
+
+WEBULL_NAKED_CALL = ("HTTP Status: 417, Code: OPENAPI_NAKED_CALL_NET_MOENY_NOT_ENOUGH, "
+                     "Msg: Since the net liquidation value in your account is less than "
+                     "$10000, you cannot open additional naked call positions.")
+
+
+@pytest.mark.parametrize("text, conflict", [
+    (WEBULL_NAKED_CALL, True),
+    ("insufficient options buying power for cash-secured put", True),       # Alpaca's version
+    ("OPENAPI_POSITION_ORDER_INTENT_MISMATCH Close intent mismatches position direction", True),
+    ("OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE", False),           # genuinely through the stop
+    ("TOO_MANY_REQUESTS", False),
+    (True, False),                                                         # no text stored
+])
+def test_which_refusals_mean_the_contracts_are_still_held(text, conflict):
+    assert so.is_reservation_conflict(text) is conflict
+
+
+def test_a_held_contracts_refusal_never_closes_the_position(monkeypatch):
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: None)
+    closed = []
+    with pytest.raises(Exception):
+        so.reconcile(
+            _StopDB(None), _stop_guard(), Decimal(5),
+            place_stop=_refusing_placer(_broker_refusal(WEBULL_NAKED_CALL)),
+            cancel_stop=lambda oid: None,
+            close_position=closed.append,
+        )
+    assert closed == []                      # retried later, not sold
+
+
+def test_after_a_held_contracts_refusal_it_waits_then_places_again(monkeypatch):
+    """The persisted refusal must not read as "the broker won't hold a stop"
+    on the next pass either — that path closes the position too."""
+    monkeypatch.setattr(so, "_recent_rejection_reason", lambda db, g: WEBULL_NAKED_CALL)
+    closed, placed = [], []
+
+    def _place(q, p):
+        placed.append((q, p))
+        return uuid.uuid4()
+
+    monkeypatch.setattr(so, "_recent_rejection_age_s", lambda db, g: 5)
+    out = so.reconcile(_StopDB(None), _stop_guard(), Decimal(5), place_stop=_place,
+                       cancel_stop=lambda oid: None, close_position=closed.append)
+    assert "waiting" in out and placed == [] and closed == []
+
+    monkeypatch.setattr(so, "_recent_rejection_age_s", lambda db, g: 120)
+    so.reconcile(_StopDB(None), _stop_guard(), Decimal(5), place_stop=_place,
+                 cancel_stop=lambda oid: None, close_position=closed.append)
+    assert len(placed) == 1 and closed == []

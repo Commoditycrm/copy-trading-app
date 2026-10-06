@@ -52,6 +52,9 @@ _CENT = Decimal("0.01")
 # After a refused take-profit: long enough that a persistent cause produces a
 # handful of orders a day, not one every pass.
 BACKOFF = timedelta(minutes=15)
+# …but a refusal because the contracts were still held by the order being
+# replaced is retried as soon as that order has had time to go.
+CONFLICT_BACKOFF = timedelta(seconds=45)
 
 
 def enabled(ts) -> bool:
@@ -314,22 +317,31 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     settled = settle(db, guard, ts, cancel, in_session=in_session)
 
     want = plan(guard, held, ts, mark)
+    released = False
     if not in_sync(db, guard, want):
-        release(db, guard, cancel)
+        released = release(db, guard, cancel)
     resting = guard.tp_order_id is not None
 
     # Nothing new goes out while the market is closed (a DAY order would only
     # expire) or while backing off after a refusal — but what rests stays.
     backing_off = guard.tp_backoff_until is not None and guard.tp_backoff_until > now
-    will_place = want is not None and not resting and in_session and not backing_off
+    # Not in the pass that cancelled the old one: the broker frees its
+    # contracts only once the cancel completes, and a new sell placed in the
+    # same instant is refused as opening a naked call (QA 2026-10-06).
+    will_place = (want is not None and not resting and in_session
+                  and not backing_off and not released)
 
-    # Earmark only contracts a take-profit actually holds, or is about to.
-    guard.tp_qty = want.quantity if (want is not None and (resting or will_place)) else None
+    # Earmark only contracts a take-profit actually holds, or is about to —
+    # including the one going out next pass, so the stop is sized around it now.
+    guard.tp_qty = (want.quantity if (want is not None and (resting or will_place or released))
+                    else None)
     stop_outcome = reconcile_stop()
     if want is None:
         return settled or f"no take-profit (stop: {stop_outcome})"
     if resting:
         return settled or f"in sync (stop: {stop_outcome})"
+    if released and want is not None and not resting:
+        return settled or "replacing — the new take-profit goes out next pass"
     if not will_place:
         return settled or ("market closed" if not in_session else "backing off")
     if stop_outcome.startswith("closed") or stop_outcome == "exit sent":
@@ -345,7 +357,10 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
         # Nothing rests, so nothing is earmarked: the ladder stop grows back to
         # the whole position on the next pass.
         guard.tp_qty = None
-        guard.tp_backoff_until = now + BACKOFF
+        from app.services.discord_stop_orders import is_reservation_conflict  # noqa: PLC0415
+
+        guard.tp_backoff_until = now + (
+            CONFLICT_BACKOFF if is_reservation_conflict(str(exc)) else BACKOFF)
         log.warning("take-profit: %s trim %s refused (%s) — retrying after %s",
                     guard.symbol, want.rung, str(exc)[:200], guard.tp_backoff_until)
         return "refused — backing off"
@@ -356,5 +371,5 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     return (f"{settled}; " if settled else "") + f"placed trim {want.rung}: {want.quantity} @ {want.price}"
 
 
-__all__ = ["enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
+__all__ = ["CONFLICT_BACKOFF", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
            "in_sync", "reconcile", "BACKOFF"]

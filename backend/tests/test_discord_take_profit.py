@@ -294,8 +294,12 @@ def test_an_add_that_changes_the_size_replaces_the_order():
     book, g = _Book(), _guard(stop_price=D("0.75"))
     _run(book, g, 4)
     first_tp, first_sl = g.tp_order_id, g.tp_stop_order_id
-    _run(book, g, 8)                                               # the position doubled
+    out, earmark = _run(book, g, 8)                                # the position doubled
     assert book.orders[first_tp].status == book.orders[first_sl].status == OrderStatus.CANCELED
+    # Placed on the NEXT pass, once the broker has freed the contracts — but
+    # the stop is already sized around it.
+    assert "next pass" in out and earmark == D(4) and len([c for c in book.calls if c[0] == "pair"]) == 1
+    _run(book, g, 8)
     assert [c for c in book.calls if c[0] == "pair"][-1] == ("pair", D(4), D("1.20"), D("0.75"))
     assert g.tp_off is False                                       # our own cancel, not the trader's
 
@@ -305,6 +309,7 @@ def test_moving_the_stop_level_replaces_the_pair():
     _run(book, g, 4)
     g.stop_price = D("0.90")                                       # set by hand from Positions
     _run(book, g, 4)
+    _run(book, g, 4)                                               # placed the pass after the cancel
     assert [c for c in book.calls if c[0] == "pair"][-1] == ("pair", D(2), D("1.20"), D("0.90"))
 
 
@@ -430,3 +435,17 @@ def test_a_refused_pair_leaves_no_rejected_stop_behind(monkeypatch):
     rows = db.query(Order).all()
     assert [(r.order_type, r.status) for r in rows] == [(OrderType.LIMIT, OrderStatus.REJECTED)]
     assert "STOP_PROFIT_PRICE" in rows[0].reject_reason
+
+
+
+def test_a_take_profit_refused_for_held_contracts_is_retried_soon():
+    """Not the 15-minute back-off of a real refusal: the old order is just
+    still going. QA 2026-10-06: SPY 779C's Trim 1 never rested again."""
+    book, g = _Book(), _guard()
+
+    def _naked_call(*a):
+        raise RuntimeError("OPENAPI_NAKED_CALL_NET_MOENY_NOT_ENOUGH: cannot open additional naked call positions")
+
+    book.place_limit = _naked_call
+    out, _ = _run(book, g, 4)
+    assert out == "refused — backing off" and g.tp_backoff_until == NOW + tp.CONFLICT_BACKOFF
