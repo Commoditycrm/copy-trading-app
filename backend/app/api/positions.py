@@ -258,6 +258,61 @@ def today_realized(
     return {"realized_pnl": float(day.realized_pnl) if day else 0.0}
 
 
+# The account Day's P&L, shared for this long by every tab and process asking.
+# Each ask is a broker read (Webull: the balance endpoint, 2 calls per 2s per
+# key), and the Positions page asks from every open tab, on its own cadence and
+# again after every order event. Uncached, four tabs and a burst of order
+# events were ~500 Webull calls an hour, a sixth of them refused (QA 2026-10-06).
+_DAY_PNL_SHARE_S = 10
+_DAY_PNL_LOCK_S = 5          # one request computes; the rest wait for its answer
+_DAY_PNL_WAIT_S = 3.0
+
+
+def _day_pnl_key(user_id) -> str:
+    return f"positions:day_pnl:{user_id}"
+
+
+def _shared_day_pnl(user_id, compute: Callable[[], dict]) -> dict:
+    """``compute()`` at most once per _DAY_PNL_SHARE_S per user, across every
+    tab and process. A burst that arrives together waits for the one request
+    computing it rather than each asking the broker. Redis trouble just means
+    computing directly — never a failed page."""
+    import json  # noqa: PLC0415
+
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    key = _day_pnl_key(user_id)
+    try:
+        r = get_sync_redis()
+        hit = r.get(key)
+        if hit:
+            return json.loads(hit)
+        if not r.set(key + ":lock", "1", nx=True, ex=_DAY_PNL_LOCK_S):
+            deadline = time.monotonic() + _DAY_PNL_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                hit = r.get(key)
+                if hit:
+                    return json.loads(hit)
+    except Exception:  # noqa: BLE001
+        log.debug("day-pnl: shared read unavailable", exc_info=True)
+        return compute()
+    try:
+        out = compute()
+        try:
+            r.set(key, json.dumps(out), ex=_DAY_PNL_SHARE_S)
+            r.delete(key + ":lock")
+        except Exception:  # noqa: BLE001
+            log.debug("day-pnl: shared write failed", exc_info=True)
+        return out
+    except Exception:
+        try:
+            r.delete(key + ":lock")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
 @router.get("/day-pnl")
 def account_day_pnl(
     db: Session = Depends(get_db),
@@ -270,16 +325,21 @@ def account_day_pnl(
     when the broker exposes no live day figure (UI shows '--'); a genuine broker
     0.00 comes back as 0.0; a failed live fetch falls back to the last-known
     broker value flagged stale — mirroring the calendar exactly."""
+    return _shared_day_pnl(user.id, lambda: _account_day_pnl_now(db, user.id))
+
+
+def _account_day_pnl_now(db: Session, user_id) -> dict:
+    """The live figure, straight from the broker — see account_day_pnl."""
     from app.api.trades import _last_marked_snapshot, _live_day_pnl_today  # reuse resolver
     from app.services import market_hours  # noqa: PLC0415
     today = market_hours.now_et().date()
-    res = _live_day_pnl_today(db, user.id)  # (value, pct, source) | (None, None, source) | None
+    res = _live_day_pnl_today(db, user_id)  # (value, pct, source) | (None, None, source) | None
     if res is not None and res[0] is not None:
         return {"day_pnl": float(res[0]),
                 "day_pnl_pct": float(res[1]) if res[1] is not None else None,
                 "source": res[2], "quality": "authoritative"}
     if res is not None and res[0] is None:
-        stale = _last_marked_snapshot(db, user.id, today)
+        stale = _last_marked_snapshot(db, user_id, today)
         if stale is not None:
             return {"day_pnl": float(stale[0]),
                     "day_pnl_pct": float(stale[1]) if stale[1] is not None else None,

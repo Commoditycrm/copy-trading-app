@@ -710,7 +710,12 @@ export const OpenPositionsTable = forwardRef<
     // from the staggered refresh schedule below.
     const workingRef = useRef(false);
 
-    const refresh = useCallback(async () => {
+    // `withDayPnl` false skips the account Day's P&L read — the follow-up
+    // refreshes after an order event want positions and orders, and asking the
+    // broker for the account figure four times per event is what had Webull
+    // refusing a sixth of these calls (QA 2026-10-06). The steady live refresh
+    // keeps that figure current anyway.
+    const refresh = useCallback(async (withDayPnl: boolean = true) => {
       const seq = ++reqSeq.current;
       try {
         const [payload, ords, dpnl, brokers] = await Promise.all([
@@ -718,7 +723,9 @@ export const OpenPositionsTable = forwardRef<
           // failed to answer is distinguishable from one holding nothing.
           api<PositionsPayload>("/api/positions?detail=1"),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
-          api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null),
+          withDayPnl
+            ? api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null)
+            : Promise.resolve(null),
           api<BrokerAccount[]>("/api/brokers").catch(() => [] as BrokerAccount[]),
         ]);
         // A newer refresh already landed — drop this one rather than undo it.
@@ -847,9 +854,11 @@ export const OpenPositionsTable = forwardRef<
         evt.type !== "position.auto_closed"
       ) return;
       clearTimers();
-      for (const ms of SCHEDULE_MS) {
+      for (const [i, ms] of SCHEDULE_MS.entries()) {
         ssTimers.current.push(setTimeout(async () => {
-          await refresh();
+          // Only the first refresh of the burst asks for the account Day's
+          // P&L; the later ones are there to catch a fill.
+          await refresh(i === 0);
           // The stagger exists to catch a fill we get no SSE for. Once nothing
           // is working any more there is nothing left to catch, so cancel the
           // rest instead of firing them blind. Each one costs a broker call,
