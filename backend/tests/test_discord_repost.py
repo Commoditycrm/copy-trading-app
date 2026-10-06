@@ -168,3 +168,218 @@ def test_a_re_posted_alert_places_no_order(monkeypatch):
     monkeypatch.setattr(ex, "already_executed", lambda m: False)
     ds._execute_signal(SimpleNamespace(), SimpleNamespace(id=USER), msg, None, None)
     assert msg.status is DiscordMessageStatus.PARSED and "not bought again" in msg.status_reason
+
+
+# ── a switched contract ──────────────────────────────────────────────────────
+
+@pytest.fixture
+def quiet(monkeypatch):
+    """No broker, no copy mirrors, no notification table: record what was asked."""
+    seen = SimpleNamespace(fanout=[], notes=[])
+    monkeypatch.setattr(discord_repost, "_fanout", lambda oid, bg: seen.fanout.append(oid))
+    monkeypatch.setattr(discord_repost, "_notify", lambda db, uid, text, **meta: seen.notes.append(text))
+    return seen
+
+
+def test_the_same_channel_switching_strikes_is_found(db):
+    clint = _source(db, "Clint")
+    _, first = _entry(db, clint, strike="781")
+    hit = discord_repost.find_switched_entry(db, _new_msg(clint), _signal(strike="780"), now=NOW, window_s=180)
+    assert hit is not None and hit[1].id == first.id
+    # calls -> puts on the same strike is a switch too
+    assert discord_repost.find_switched_entry(db, _new_msg(clint), _signal(right="put"), now=NOW, window_s=180) is not None
+
+
+@pytest.mark.parametrize("why", ["same contract", "other channel", "outside window", "an average", "stock"])
+def test_not_a_switch_when(db, why):
+    clint, mark = _source(db, "Clint"), _source(db, "Mark")
+    _entry(db, clint, ago_s=400 if why == "outside window" else 30)
+    src = mark if why == "other channel" else clint
+    sig = _signal(strike="781" if why == "same contract" else "780")
+    if why == "an average":
+        sig["double_up"] = True
+    if why == "stock":
+        sig = {"action": "BUY", "symbol": "SPY", "asset_type": "STOCK", "limit_price": "670"}
+    assert discord_repost.find_switched_entry(db, _new_msg(src), sig, now=NOW, window_s=180) is None
+
+
+def test_switching_off_an_unfilled_entry_cancels_it(db, quiet):
+    clint = _source(db, "Clint")
+    prior_msg, first = _entry(db, clint, status=OrderStatus.SUBMITTED, filled="0",
+                              otype=OrderType.LIMIT, limit="0.63")
+    note = discord_repost.supersede(db, _new_msg(clint), prior_msg, first, _signal(strike="780"), now=NOW)
+    assert first.status is OrderStatus.CANCELED
+    assert quiet.fanout == [first.id] and quiet.notes == []
+    assert "cancelled" in note and "SPY 781C" in note and "SPY 780C" in note
+    assert prior_msg.status_reason.startswith("Superseded")
+
+
+def test_switching_off_a_filled_entry_keeps_it_and_says_so(db, quiet):
+    clint = _source(db, "Clint")
+    prior_msg, first = _entry(db, clint)                     # filled 2
+    note = discord_repost.supersede(db, _new_msg(clint), prior_msg, first, _signal(strike="780"), now=NOW)
+    assert first.status is OrderStatus.FILLED and quiet.fanout == []
+    assert "still held" in note
+    assert len(quiet.notes) == 1 and "You still hold 2 SPY 781C" in quiet.notes[0] and "not sold" in quiet.notes[0]
+
+
+def test_a_switch_whose_cancel_the_broker_refuses_is_flagged(db, quiet, monkeypatch):
+    clint = _source(db, "Clint")
+    prior_msg, first = _entry(db, clint, status=OrderStatus.SUBMITTED, filled="0")
+    monkeypatch.setattr(discord_repost, "cancel_entry", lambda db_, o: "the broker says it already finished")
+    note = discord_repost.supersede(db, _new_msg(clint), prior_msg, first, _signal(strike="780"), now=NOW)
+    assert first.status is OrderStatus.SUBMITTED and quiet.fanout == []
+    assert "could not be cancelled" in note and len(quiet.notes) == 1
+
+
+def test_a_switch_still_trades_the_new_contract(monkeypatch):
+    import app.api.discord_sources as ds
+    import app.services.discord_execution as ex
+
+    switched = (SimpleNamespace(created_at=NOW), SimpleNamespace(id=uuid.uuid4()))
+    calls = []
+    monkeypatch.setattr(discord_repost, "find_recent_entry", lambda db, msg, signal: None)
+    monkeypatch.setattr(discord_repost, "find_switched_entry", lambda db, msg, signal: switched)
+    monkeypatch.setattr(discord_repost, "supersede", lambda db, msg, pm, o, sig, background=None: calls.append("supersede") or "switched")
+    monkeypatch.setattr(ex, "cancel_stale_entries_for_signal", lambda *a: [])
+
+    class Placed(Exception):
+        pass
+
+    def _resolve(*a, **k):
+        calls.append("resolve")
+        raise Placed
+
+    monkeypatch.setattr(ex, "resolve", _resolve)
+    monkeypatch.setattr(ds.discord_channel_settings, "effective", lambda *a, **k: None)
+    monkeypatch.setattr(ex, "already_executed", lambda m: False)
+    msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), user_id=USER, order_id=None,
+                          status=DiscordMessageStatus.PARSED, status_reason=None,
+                          parsed_signal=_signal(strike="780"), decision=None)
+    ds._execute_signal(SimpleNamespace(), SimpleNamespace(id=USER), msg, None, None)
+    assert calls == ["supersede", "resolve"]
+
+
+# ── an edit that switches the contract ───────────────────────────────────────
+
+def _edited(db, src, *, ago_s=30, decision=None, **entry):
+    from app.models.discord_message import SignalDecision
+
+    msg, order = _entry(db, src, ago_s=ago_s, **entry)
+    msg.parsed_signal = _signal(strike="780", price="0.50")
+    msg.decision = decision or SignalDecision.APPROVED
+    db.commit()
+    return msg, order
+
+
+def test_an_edit_to_another_contract_cancels_the_unfilled_entry_and_trades_it(db, quiet):
+    clint = _source(db, "Clint")
+    msg, first = _edited(db, clint, status=OrderStatus.SUBMITTED, filled="0")
+    outcome, trade = discord_repost.switch_on_edit(db, msg, now=NOW)
+    assert trade is True and first.status is OrderStatus.CANCELED
+    assert msg.order_id is None and msg.status is DiscordMessageStatus.PARSED
+    assert "SPY 781C" in outcome and "SPY 780C" in outcome and quiet.fanout == [first.id]
+
+
+def test_in_manual_mode_the_edited_contract_awaits_approval(db, quiet):
+    from app.models.discord_message import SignalDecision
+
+    clint = _source(db, "Clint")
+    msg, first = _edited(db, clint, status=OrderStatus.SUBMITTED, filled="0", decision=SignalDecision.PENDING)
+    outcome, trade = discord_repost.switch_on_edit(db, msg, now=NOW)
+    assert trade is False and first.status is OrderStatus.CANCELED and "awaits your approval" in outcome
+
+
+def test_an_edit_to_another_contract_after_a_fill_is_flagged_only(db, quiet):
+    clint = _source(db, "Clint")
+    msg, first = _edited(db, clint)                          # filled 2
+    outcome, trade = discord_repost.switch_on_edit(db, msg, now=NOW)
+    assert trade is False and msg.order_id == first.id and first.status is OrderStatus.FILLED
+    assert "still held" in outcome and len(quiet.notes) == 1
+
+
+def test_a_late_edit_to_another_contract_is_not_traded(db, quiet, monkeypatch):
+    monkeypatch.setattr(discord_repost, "_window_s", lambda: 180)
+    clint = _source(db, "Clint")
+    msg, first = _edited(db, clint, ago_s=900, status=OrderStatus.SUBMITTED, filled="0")
+    outcome, trade = discord_repost.switch_on_edit(db, msg, now=NOW)
+    assert trade is False and first.status is OrderStatus.SUBMITTED and "too long after" in outcome
+
+
+# ── a deleted alert ──────────────────────────────────────────────────────────
+
+def test_deleting_an_alert_cancels_its_unfilled_entry(db, quiet):
+    clint = _source(db, "Clint")
+    msg, order = _entry(db, clint, status=OrderStatus.SUBMITTED, filled="0")
+    outcome = discord_repost.apply_delete(db, msg)
+    assert order.status is OrderStatus.CANCELED and quiet.fanout == [order.id]
+    assert "cancelled" in outcome and quiet.notes == []
+
+
+def test_deleting_an_alert_you_are_in_sells_nothing_and_says_so(db, quiet):
+    clint = _source(db, "Clint")
+    msg, order = _entry(db, clint)                           # filled 2
+    outcome = discord_repost.apply_delete(db, msg)
+    assert order.status is OrderStatus.FILLED and quiet.fanout == []
+    assert "not sold" in outcome and len(quiet.notes) == 1 and "deleted in Discord" in quiet.notes[0]
+
+
+def test_delete_and_re_post_keeps_the_order(db, quiet, monkeypatch):
+    """Clint deletes @0.63 after re-posting @0.56: the re-post was folded into the
+    same order (absorb), so the order is the re-post's now."""
+    monkeypatch.setattr(discord_repost, "_window_s", lambda: 180)
+    clint = _source(db, "Clint")
+    msg, order = _entry(db, clint, ago_s=40, status=OrderStatus.SUBMITTED, filled="0")
+    db.add(DiscordMessage(id=uuid.uuid4(), source_id=clint.id, user_id=USER, discord_message_id="99",
+                          discord_channel_id=clint.channel_id, content="$SPY 781 CALL 0DTE @0.56",
+                          status=DiscordMessageStatus.PARSED, parsed_signal=_signal(price="0.56"),
+                          status_reason="Re-posted entry — ...", created_at=NOW - timedelta(seconds=10)))
+    db.commit()
+    outcome = discord_repost.apply_delete(db, msg)
+    assert order.status is OrderStatus.SUBMITTED and quiet.fanout == [] and "re-posted" in outcome
+
+
+def test_deleting_an_exit_alert_leaves_the_exit_alone(db, quiet):
+    clint = _source(db, "Clint")
+    msg, order = _entry(db, clint, status=OrderStatus.SUBMITTED, filled="0")
+    order.side, order.is_closing = OrderSide.SELL, True
+    db.commit()
+    assert "exit" in discord_repost.apply_delete(db, msg) and order.status is OrderStatus.SUBMITTED
+
+
+def test_ingest_routes_a_deletion_once(db, monkeypatch):
+    from app.services import discord_ingest
+
+    monkeypatch.setattr(discord_ingest, "_emit", lambda *a, **k: None)
+    clint = _source(db, "Clint")
+    msg, _ = _entry(db, clint)
+    gone = {"message_id": msg.discord_message_id, "channel_id": clint.channel_id, "content": "", "is_delete": True}
+    report = discord_ingest.ingest_batch(db, clint, [gone], publish=False)
+    assert report.deleted == [msg] and not report.accepted
+    msg.status_reason = f"{discord_repost.DELETED_PREFIX} — handled"
+    db.commit()
+    again = discord_ingest.ingest_batch(db, clint, [gone], publish=False)   # a reconnect replays it
+    assert again.deleted == [] and again.duplicates == [msg.discord_message_id]
+    unknown = discord_ingest.ingest_batch(db, clint, [{**gone, "message_id": "12345"}], publish=False)
+    assert unknown.deleted == [] and not unknown.accepted
+
+
+def test_the_intake_trades_an_edit_that_switched_contracts(monkeypatch):
+    import app.api.discord_sources as ds
+
+    placed = []
+    monkeypatch.setattr(ds.discord_edit, "apply_price_edit", lambda db, m: discord_edit.DIFFERENT_CONTRACT)
+    monkeypatch.setattr(discord_repost, "switch_on_edit", lambda db, m, background=None: ("switched from SPY 781C to SPY 780C", True))
+    monkeypatch.setattr(ds, "_execute_signal", lambda db, u, m, bg, rq: placed.append(m))
+    msg = SimpleNamespace(discord_message_id="1", status=DiscordMessageStatus.ORDER_CREATED, status_reason=None)
+    ds._handle_edits(SimpleNamespace(), SimpleNamespace(id=USER), [msg], None, None)
+    assert placed == [msg] and msg.status_reason == "Edited alert: switched from SPY 781C to SPY 780C"
+
+
+def test_the_intake_marks_a_deleted_alert(monkeypatch):
+    import app.api.discord_sources as ds
+
+    monkeypatch.setattr(discord_repost, "apply_delete", lambda db, m, background=None: "the unfilled SPY 781C entry was cancelled")
+    msg = SimpleNamespace(discord_message_id="1", status_reason=None)
+    ds._handle_deletions(SimpleNamespace(), [msg], None)
+    assert msg.status_reason == "Deleted in Discord — the unfilled SPY 781C entry was cancelled"

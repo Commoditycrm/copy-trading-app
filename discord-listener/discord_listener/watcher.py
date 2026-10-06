@@ -454,15 +454,21 @@ class ChannelWatcher:
             self._queue.put_nowait(batch)
             return
         if report.get("accepted"):
-            newest = max((m["message_id"] for m in batch), key=int, default=None)
+            # A deletion names an old message; it never moves the resume point.
+            newest = max(
+                (m["message_id"] for m in batch if not m.get("is_delete")), key=int, default=None
+            )
             if newest and (self._last_seen is None or int(newest) > int(self._last_seen)):
                 self._last_seen = newest
         log.info(
             "source=%s ingested accepted=%s duplicates=%s",
             self.source_id, report.get("accepted"), report.get("duplicates"),
         )
+        for m in batch:
+            if m.get("is_delete"):
+                log.info("source=%s message %s was deleted in Discord", self.source_id, m.get("message_id"))
         if self._config.log_messages and report.get("accepted"):
-            self._log_messages(batch)
+            self._log_messages([m for m in batch if not m.get("is_delete")])
 
     def _log_messages(self, batch: list[dict]) -> None:
         """Print what was actually observed, not just how many.
