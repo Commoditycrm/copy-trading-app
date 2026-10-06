@@ -121,6 +121,13 @@ class DiscordPositionGuard(Base, TimestampMixin):
     )
     tp_backoff_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # The stop TRAILS (a ladder row set to Trail): ``stop_price`` is raised as
+    # the price makes new highs, to ``stop_peak`` less ``stop_trail_pct`` %.
+    # Only ever raised, so the resting stop order follows it up and never down.
+    # NULL = a fixed stop.
+    stop_trail_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+    stop_peak: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+
     # Hard stop on whatever is still held, as an absolute price. Set below entry
     # by the first trim and lifted to break-even by the second. Emulated, like
     # everything else here — Alpaca won't hold a resting stop on an option.

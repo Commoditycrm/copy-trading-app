@@ -10,7 +10,9 @@ TraderSettings (a ladder nobody has edited reads exactly as it always did), and
 trims past the third are JSON in ``discord_extra_trims``. ``discord_trim_count``
 says how many are in use. Everything reads the ladder through here — the
 settings API, the exit planner, auto-trim, the simulator — so that split never
-leaks. ``ts`` is a TraderSettings row or a channel's own settings
+leaks. Which stops TRAIL rather than sit at a fixed level is
+``discord_stop_trails`` ({"fill": bool, "trims": [bool, ...]}); a trailing
+stop's value is a give-back from the high, not a return from entry. ``ts`` is a TraderSettings row or a channel's own settings
 (discord_channel_settings.ChannelSettings); both read the same way.
 """
 from __future__ import annotations
@@ -52,6 +54,24 @@ def count(ts) -> int:
     return max(1, min(MAX_TRIMS, n))
 
 
+def _trails(ts) -> dict:
+    raw = getattr(ts, "discord_stop_trails", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def stop_trails(ts) -> list[bool]:
+    """Per trim, in order: does its stop trail?"""
+    flags = _trails(ts).get("trims")
+    flags = flags if isinstance(flags, list) else []
+    n = count(ts)
+    return [bool(flags[i]) if i < len(flags) else False for i in range(n)]
+
+
+def fill_stop_trails(ts) -> bool:
+    """Does the On Fill stop trail?"""
+    return bool(_trails(ts).get("fill"))
+
+
 def rungs(ts) -> list[guards.RungConfig]:
     """Every trim, in order."""
     out = [
@@ -74,7 +94,11 @@ def rungs(ts) -> list[guards.RungConfig]:
     n = count(ts)
     while len(out) < n:                       # count says more than is stored
         out.append(guards.RungConfig(*(Decimal(x) for x in NEW_TRIM)))
-    return out[:n]
+    out = out[:n]
+    for i, trail in enumerate(stop_trails(ts)):
+        if trail:
+            out[i] = guards.RungConfig(out[i].profit_gate_pct, out[i].stop_pct, out[i].qty_pct, True)
+    return out
 
 
 def fill_stop_pct(ts) -> Decimal | None:
@@ -92,14 +116,19 @@ def trim_config(ts) -> guards.TrimConfig:
     """The ladder a live trim and the Simulated Prices dry run measure against."""
     return guards.TrimConfig(
         rungs=tuple(rungs(ts)),
+        # Trailing is set per trim on the STOP now; trims themselves sell at
+        # market. (The old "Trailing exit" section is gone from settings.)
+        trail_exits=False,
         price_threshold=_dec(getattr(ts, "discord_trim_price_threshold", None), "0.90"),
         trail_amount=_dec(getattr(ts, "discord_trim_trail_amount", None), "0.25"),
     )
 
 
-def store(ts, trims: list[tuple[Decimal, Decimal, Decimal]]) -> None:
+def store(ts, trims: list[tuple[Decimal, Decimal, Decimal]],
+          trails: list[bool] | None = None) -> None:
     """Write the whole ladder: ``trims`` is (profit target, stop, qty) per trim,
-    in order. The first three go to their columns, the rest to JSON."""
+    in order, and ``trails`` which of their stops trail (None keeps none). The
+    first three go to their columns, the rest to JSON."""
     for (gate_col, stop_col, qty_col), (gate, stop, qty) in zip(_COLUMNS, trims):
         setattr(ts, gate_col, gate)
         setattr(ts, stop_col, stop)
@@ -109,6 +138,13 @@ def store(ts, trims: list[tuple[Decimal, Decimal, Decimal]]) -> None:
         for gate, stop, qty in trims[3:]
     ]
     ts.discord_trim_count = len(trims)
+    flags = [bool(t) for t in (trails or [])][:len(trims)]
+    ts.discord_stop_trails = {**_trails(ts), "trims": flags + [False] * (len(trims) - len(flags))}
 
 
-__all__ = ["MAX_TRIMS", "count", "rungs", "fill_stop_pct", "trim_config", "store"]
+def store_fill_trail(ts, trail: bool) -> None:
+    ts.discord_stop_trails = {**_trails(ts), "fill": bool(trail)}
+
+
+__all__ = ["MAX_TRIMS", "count", "rungs", "fill_stop_pct", "fill_stop_trails", "stop_trails",
+           "trim_config", "store", "store_fill_trail"]

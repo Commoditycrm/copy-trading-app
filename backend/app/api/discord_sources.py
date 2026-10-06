@@ -1019,10 +1019,11 @@ def _settings_out(ts) -> DiscordSettingsOut:
         trim_trail_amount=_plain(_setting(ts, "discord_trim_trail_amount", "0.25")),
         trims=[
             DiscordTrimRow(profit_gate_pct=_plain(r.profit_gate_pct), qty_pct=_plain(r.qty_pct),
-                           stop_pct=_plain(r.stop_pct))
+                           stop_pct=_plain(r.stop_pct), stop_trail=r.stop_trail)
             for r in discord_ladder.rungs(ts)
         ],
         fill_stop_pct=_plain(discord_ladder.fill_stop_pct(ts)),
+        fill_stop_trail=discord_ladder.fill_stop_trails(ts),
         reprice_after_seconds=(
             getattr(ts, "discord_reprice_after_seconds", None) or 30 if ts else 30
         ),
@@ -1132,23 +1133,38 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
 
     # The whole ladder at once: any number of trims, in order. After the
     # per-trim fields above, so it wins when both are sent.
+    def _trail_pct(raw, what: str) -> Decimal:
+        """A trailing stop's give-back: 15 (or "-15", as people write a drop) is
+        15% below the high. Stored positive."""
+        value = abs(_pct(raw, what, Decimal(-99), Decimal(99)))
+        if value < 1:
+            raise HTTPException(400, f"{what} trails by a give-back between 1 and 99%")
+        return value
+
     if payload.trims is not None:
         discord_ladder.store(ts, [
             (
                 _pct(t.profit_gate_pct, f"Trim {i} profit target", Decimal(0), Decimal(1000)),
-                _pct(t.stop_pct, f"Trim {i} stop", Decimal(-100), Decimal(1000)),
+                (_trail_pct(t.stop_pct, f"Trim {i} trailing stop") if t.stop_trail
+                 else _pct(t.stop_pct, f"Trim {i} stop", Decimal(-100), Decimal(1000))),
                 _pct(t.qty_pct, f"Trim {i} quantity", Decimal(0), Decimal(100)),
             )
             for i, t in enumerate(payload.trims, 1)
-        ])
+        ], [t.stop_trail for t in payload.trims])
         log.info("discord: ladder set to %d trim(s) for user %s", len(payload.trims), user.id)
 
     # "On Fill" stop. Sent as "" to clear — so "not sent" and "cleared" differ.
     if "fill_stop_pct" in payload.model_fields_set:
         raw = (payload.fill_stop_pct or "").strip()
+        trailing = bool(payload.fill_stop_trail)
         if raw == "":
             ts.discord_fill_stop_pct = None
+            discord_ladder.store_fill_trail(ts, False)
+        elif trailing:
+            ts.discord_fill_stop_pct = _trail_pct(raw, "On Fill trailing stop")
+            discord_ladder.store_fill_trail(ts, True)
         else:
+            discord_ladder.store_fill_trail(ts, False)
             value = _pct(raw, "On Fill stop", Decimal(-99), Decimal(1000))
             if value >= 0:
                 # At fill the price IS the entry, so a stop at or above it is
@@ -2202,8 +2218,7 @@ def _execute_signal(
         else:
             plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
 
-        if plan.new_stop_price is not None:
-            guard.stop_price = plan.new_stop_price
+        guards.apply_stop(guard, plan)
         if plan.retire:
             guards.retire(db, guard, f"trim {plan.rung}: {plan.note}"[:120])
 
