@@ -2078,6 +2078,19 @@ def _execute_signal(
         # Never let this check stop an alert: it is a guard, not the trade.
         log.exception("discord: re-post check failed for alert %s", msg.id)
 
+    # The same channel switching to a DIFFERENT contract on this ticker within
+    # the window: cancel the first entry if it never filled, flag it if it did,
+    # then trade this one as usual. Never sells.
+    try:
+        from app.services import discord_repost  # noqa: PLC0415
+
+        switched = discord_repost.find_switched_entry(db, msg, signal)
+        if switched is not None:
+            note = discord_repost.supersede(db, msg, *switched, signal, background=background)
+            log.info("discord: alert %s %s", msg.id, note)
+    except Exception:  # noqa: BLE001
+        log.exception("discord: contract-switch check failed for alert %s", msg.id)
+
     # An entry that never filled — even after the +10% retry — is a bid for a
     # position the trader is already exiting. Left resting it can still fill
     # later, buying into a move whose exit signal has been given, with no rung
@@ -2691,6 +2704,49 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
     return out
 
 
+def _handle_edits(db: Session, user: User | None, edited, background, request) -> None:
+    """An EDITED alert is a correction to the trade it already placed, never a
+    new one — so it bypasses execution and repoints the resting order instead.
+    An edit that switches the CONTRACT cancels the unfilled entry and trades the
+    edited one (services/discord_repost.switch_on_edit).
+
+    Handled per message: one failure must not stop the rest of the batch, and a
+    bad edit must never fail the listener's POST. The outcome is recorded on the
+    row, not just logged — "the edit did nothing" and "the edit was never seen"
+    look identical in an order history and mean completely different things."""
+    from app.services import discord_repost  # noqa: PLC0415
+
+    for msg in edited:
+        try:
+            outcome = discord_edit.apply_price_edit(db, msg)
+            if outcome == discord_edit.DIFFERENT_CONTRACT:
+                outcome, trade = discord_repost.switch_on_edit(db, msg, background=background)
+                if trade and user is not None:
+                    _execute_signal(db, user, msg, background, request)
+                    if msg.status is DiscordMessageStatus.ORDER_FAILED:
+                        outcome += f"; the new contract was not placed — {msg.status_reason}"
+            msg.status_reason = f"Edited alert: {outcome}"[:480]
+            log.info("discord: edited alert %s — %s", msg.discord_message_id, outcome)
+        except Exception as exc:  # noqa: BLE001
+            msg.status_reason = f"Edited alert: handling failed — {exc}"[:480]
+            log.exception("discord: edit handling failed for %s", msg.discord_message_id)
+
+
+def _handle_deletions(db: Session, deleted, background) -> None:
+    """The author deleted an alert: withdraw the entry it placed if that never
+    filled; flag it if it did. Never sells. Per message, never raises."""
+    from app.services import discord_repost  # noqa: PLC0415
+
+    for msg in deleted:
+        try:
+            outcome = discord_repost.apply_delete(db, msg, background=background)
+        except Exception as exc:  # noqa: BLE001
+            outcome = f"handling failed — {exc}"
+            log.exception("discord: delete handling failed for %s", msg.discord_message_id)
+        msg.status_reason = f"{discord_repost.DELETED_PREFIX} — {outcome}"[:480]
+        log.info("discord: deleted alert %s — %s", msg.discord_message_id, outcome)
+
+
 @router.post(
     "/internal/messages",
     response_model=DiscordIngestOut,
@@ -2754,22 +2810,9 @@ def listener_messages(
                 if msg.decision is SignalDecision.APPROVED:
                     _execute_signal(db, owner, msg, background, request)
 
-    # An EDITED alert is a correction to the trade it already placed, never a
-    # new one — so it deliberately bypasses _execute_signal above and repoints
-    # the resting order instead. Handled per message: one failure must not stop
-    # the rest of the batch, and a bad edit must never fail the listener's POST.
-    for msg in report.edited:
-        try:
-            outcome = discord_edit.apply_price_edit(db, msg)
-            # Recorded on the row, not just logged. "The edit did nothing" and
-            # "the edit was never seen" look identical in an order history and
-            # mean completely different things — and the log is the one place
-            # nobody has when they ask why the price did not move.
-            msg.status_reason = f"Edited alert: {outcome}"[:480]
-            log.info("discord: edited alert %s — %s", msg.discord_message_id, outcome)
-        except Exception as exc:  # noqa: BLE001
-            msg.status_reason = f"Edited alert: handling failed — {exc}"[:480]
-            log.exception("discord: edit handling failed for %s", msg.discord_message_id)
+    owner = db.get(User, src.user_id)
+    _handle_edits(db, owner, report.edited, background, request)
+    _handle_deletions(db, report.deleted, background)
 
     for mid in wrong:
         report.rejected.append({"message_id": mid, "reason": "channel_mismatch"})
