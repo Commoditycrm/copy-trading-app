@@ -186,3 +186,26 @@ def test_nothing_held_from_the_channel_is_refused(monkeypatch):
     discord_sources._close_all_from_channel(None, SimpleNamespace(id=USER), msg, None, None)
     assert msg.status is DiscordMessageStatus.ORDER_FAILED
     assert msg.status_reason == "Stopped out — you hold no SPY calls opened from this channel."
+
+
+# ── "Adding .4" after being stopped out ──────────────────────────────────────
+
+def test_an_add_with_nothing_held_finds_the_channels_latest_contract_to_re_enter(broker, monkeypatch):
+    from datetime import date as _date
+    from app.services import market_hours
+    monkeypatch.setattr(market_hours, "now_et", lambda: SimpleNamespace(date=lambda: EXP))
+    db, clint, other = _db()
+    _bought(db, clint, "767", OptionRight.CALL, "1")       # stopped out: nothing held
+    user = db.get(User, USER)
+    assert ex.latest_channel_contract(db, user, clint.id) is None                 # the old answer
+    got = ex.latest_channel_contract(db, user, clint.id, held_only=False)
+    assert (got["symbol"], got["strike"], got["option_type"]) == ("SPY", "767.0000", "call")
+
+
+def test_an_expired_contract_is_not_re_entered(broker, monkeypatch):
+    from datetime import timedelta
+    from app.services import market_hours
+    monkeypatch.setattr(market_hours, "now_et", lambda: SimpleNamespace(date=lambda: EXP + timedelta(days=1)))
+    db, clint, other = _db()
+    _bought(db, clint, "767", OptionRight.CALL, "1")
+    assert ex.latest_channel_contract(db, db.get(User, USER), clint.id, held_only=False) is None

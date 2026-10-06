@@ -2046,8 +2046,19 @@ def _execute_signal(
             log.exception("discord: add-to-latest lookup failed for alert %s", msg.id)
             return
         if latest is None:
+            # Nothing held — stopped out of it. The author is adding, so they
+            # are still in: re-enter the channel's latest contract as a new
+            # position rather than skip the alert.
+            try:
+                latest = discord_execution.latest_channel_contract(
+                    db, user, msg.source_id, held_only=False)
+            except Exception as exc:  # noqa: BLE001
+                discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
+                log.exception("discord: add-to-latest lookup failed for alert %s", msg.id)
+                return
+        if latest is None:
             discord_execution.mark_failed(
-                msg, "An add with no contract, and you hold nothing this channel opened to add to."
+                msg, "An add with no contract, and this channel has no recent contract to re-enter."
             )
             return
         signal = {**signal, **latest}
@@ -2322,7 +2333,9 @@ def _execute_signal(
         # Normally the order was sized FROM the position, so what we placed is
         # also what was held — but not always (a light position adds its opening
         # size; a dollar cap can cut the add), so the held quantity is carried.
-        if signal.get("double_up"):
+        # …only when there WAS a position. An add into nothing re-entered as a
+        # new position, and its ladder starts from this order like any entry.
+        if signal.get("double_up") and (getattr(resolved, "held_quantity", None) or 0) > 0:
             guards.average_in(
                 db, opened,
                 held_qty=getattr(resolved, "held_quantity", None) or p.quantity,

@@ -445,13 +445,17 @@ def _broker_expiries(adapter: Any, symbol: str, strike: Decimal, want_cp: str,
     } - {None})
 
 
-def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
+def latest_channel_contract(db: Session, user: User, source_id, *, held_only: bool = True) -> dict | None:
     """The contract this CHANNEL most recently bought that is still held.
 
     For "Adding .4": an add that names nothing means the position the channel
     is in. Taken from the channel's own filled/working BUY orders, newest first,
     and only if the broker still reports it held — never a guess across other
     channels' positions.
+
+    ``held_only=False``: when nothing the channel bought is still held — the
+    position was stopped out — the channel's most recent contract that has not
+    expired, so the add can re-enter it as a new position.
     """
     from sqlalchemy import select  # noqa: PLC0415
 
@@ -489,18 +493,28 @@ def latest_channel_contract(db: Session, user: User, source_id) -> dict | None:
         return None
     acct = _broker_account(db, user)
     adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    def _contract(o) -> dict:
+        return {
+            "symbol": o.symbol,
+            "asset_type": "OPTION" if o.option_strike is not None else "STOCK",
+            "strike": str(o.option_strike) if o.option_strike is not None else None,
+            "option_type": o.option_right.value if o.option_right else None,
+            "expiration": o.option_expiry.isoformat() if o.option_expiry else None,
+        }
+
     for o in candidates:
         held = [p for p in _positions(adapter, o.symbol)
                 if p.option_strike == o.option_strike and p.option_right == o.option_right
                 and p.option_expiry == o.option_expiry and (p.quantity or 0) > 0]
         if held:
-            return {
-                "symbol": o.symbol,
-                "asset_type": "OPTION" if o.option_strike is not None else "STOCK",
-                "strike": str(o.option_strike) if o.option_strike is not None else None,
-                "option_type": o.option_right.value if o.option_right else None,
-                "expiration": o.option_expiry.isoformat() if o.option_expiry else None,
-            }
+            return _contract(o)
+    if held_only:
+        return None
+    # Nothing held: the channel's latest contract that can still be bought.
+    today = market_hours.now_et().date()
+    for o in candidates:
+        if o.option_expiry is None or o.option_expiry >= today:
+            return _contract(o)
     return None
 
 
@@ -756,14 +770,11 @@ def _resolve_quantity(
         )
         qty = abs(Decimal(str(held.quantity))) if held is not None else Decimal(0)
         if qty <= 0:
-            # Nothing to average down INTO. Taking the default size here would
-            # open a fresh position at a price the channel is calling a loss —
-            # a trade nobody asked for, off an alert that assumed you were
-            # already in. Refuse by name instead.
-            raise ExecutionRefused(
-                "This is an averaging-down alert, but you hold no position in "
-                "that contract to average into."
-            )
+            # Nothing to average INTO — the position was stopped out, or never
+            # opened here. The author is adding, so they are in it: re-enter
+            # it as a NEW position, sized like any entry (below).
+            resolutions["reentry"] = "nothing held — re-entering as a new position"
+            return _entry_quantity(signal, sizing, resolutions)
         # A position opened LIGHT (light / not heavy / lotto / risky) is one the
         # author sized down on purpose. Doubling it on every average grows it
         # geometrically — 1, 2, 4, 8 — so it adds the opening size again
@@ -777,6 +788,11 @@ def _resolve_quantity(
         resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
         return qty
 
+    return _entry_quantity(signal, sizing, resolutions)
+
+
+def _entry_quantity(signal, sizing, resolutions) -> Decimal:
+    """An ENTRY's size: the trader's Contracts per alert, halved for "light"."""
     # An ENTRY is exactly the trader's "Contracts per alert" (sizing.multiplier).
     # A size the alert states is the AUTHOR's, not yours, and is ignored — so
     # "BTO 3 SPY …" and "BTO SPY …" both buy your setting. Closes returned
