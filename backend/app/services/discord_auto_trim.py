@@ -155,11 +155,18 @@ def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder")
     entry = guard.entry_price
     if entry is None or entry <= 0:
         return False
-    stop = pg._to_tick(Decimal(str(entry)) * (Decimal(1) + pct / Decimal(100)))
+    trailing = discord_ladder.fill_stop_trails(ts)
+    # Fixed: a return from entry (-25 = 25% below). Trailing: a give-back from
+    # the high, which at the fill IS the entry, raised as the price climbs.
+    stop, trail_pct, peak = pg.rung_stop(
+        entry, pg.RungConfig(stop_pct=pct, stop_trail=trailing), None)
+    stop = pg._to_tick(stop)
     if stop is None or stop <= 0:
         return False                      # rounds to $0 on a very cheap contract: not a stop
     guard.stop_price = stop
-    log.info("on-fill stop: %s filled at %s — stop set at %s (%s%%)", guard.symbol, entry, stop, pct)
+    guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+    log.info("on-fill stop: %s filled at %s — stop set at %s (%s%%%s)", guard.symbol, entry, stop, pct,
+             " trailing" if trailing else "")
     return True
 
 

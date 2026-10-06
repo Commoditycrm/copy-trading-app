@@ -159,17 +159,16 @@ def test_second_trim_on_a_cheap_contract_sells_at_market(harness, placed):
     assert guard.trail_qty is None
 
 
-def test_second_trim_on_an_expensive_contract_arms_a_trail_instead(harness, placed):
-    """Nothing is sold today — the slice is parked on a trailing give-back."""
+def test_second_trim_on_an_expensive_contract_now_sells_at_market(harness, placed):
+    """The old "Trailing exit" (trims 2+ of a contract over $0.90 riding a dollar
+    give-back) is gone from settings — trailing is set per trim on the STOP now —
+    so the trim sells at market like any other."""
     db, user, msg, guard, _ = harness(held=2, rung=1, mark="3.00", entry="2.00")
     _run(db, user, msg)
 
-    assert placed == {}                               # no order placed
-    assert guard.trail_qty == Decimal(1)
-    assert guard.trail_amount == Decimal("0.25")
-    assert guard.peak_price == Decimal("3.00")        # anchored at the mark
+    assert placed["payload"].quantity == Decimal(1)
+    assert guard.trail_qty is None
     assert guard.stop_price == Decimal("2.00")        # break-even on the rest
-    assert msg.status is DiscordMessageStatus.PARSED
 
 
 # ── rung 3 ───────────────────────────────────────────────────────────────────
@@ -183,13 +182,12 @@ def test_third_trim_exits_everything_and_retires(harness, placed):
     assert retired != []
 
 
-def test_a_trailing_third_trim_places_nothing_yet(harness, placed):
+def test_an_expensive_third_trim_exits_everything_now(harness, placed):
     db, user, msg, guard, retired = harness(held=3, rung=2, mark="4.00", entry="2.00")
     _run(db, user, msg)
 
-    assert placed == {}
-    assert guard.trail_qty == Decimal(3)
-    assert retired == []                              # still owns the pending exit
+    assert placed["payload"].quantity == Decimal(3)
+    assert guard.trail_qty is None and retired != []
 
 
 # ── failure ──────────────────────────────────────────────────────────────────

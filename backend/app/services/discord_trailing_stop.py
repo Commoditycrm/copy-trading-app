@@ -84,6 +84,9 @@ def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal]
     # contracts twice.
     # A take-profit's linked stop counts too: on the last trim it is the ONLY
     # stop resting, covering everything held.
+    # A trailing stop follows a new high up first; the resting order (if any)
+    # is moved to it by the stop reconciler on its next pass.
+    guards.ratchet_stop(guard, price)
     rests = guard.stop_order_id or getattr(guard, "tp_stop_order_id", None)
     stop = None if rests else guard.stop_price
     if stop is not None and price <= stop:

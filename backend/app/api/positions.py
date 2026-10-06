@@ -2049,6 +2049,7 @@ def set_position_stop(
         db.add(guard)
     previous = guard.stop_price
     guard.stop_price = price
+    guards.clear_stop_trail(guard)        # a stop set by hand stays where it is put
     audit.record(
         db, actor_user_id=user.id, action="positions.stop_set",
         entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
@@ -2121,6 +2122,7 @@ def cancel_position_stops(
             removed.append(f"stop @ {guard.stop_price}")
             discord_stop_orders.release(db, guard, cancel)
             guard.stop_price = None
+            guards.clear_stop_trail(guard)
         if guard.trail_qty is not None:
             removed.append(f"trailing exit on {guard.trail_qty}")
             guards.clear_trail(guard)
@@ -2254,6 +2256,7 @@ def cancel_position_open_orders(
     if guard is not None and guard.stop_order_id in {o.id for o in orders}:
         guard.stop_order_id = None
         guard.stop_price = None
+        guards.clear_stop_trail(guard)
         db.commit()
     return result
 

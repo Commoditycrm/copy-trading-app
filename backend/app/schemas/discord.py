@@ -422,8 +422,10 @@ class DiscordTrimRow(BaseModel):
     profit_gate_pct: str
     # Share of what is STILL HELD that this trim sells.
     qty_pct: str
-    # Where the stop sits after this trim, as a return from entry.
+    # Where the stop sits after this trim, as a return from entry — or, when
+    # ``stop_trail``, the give-back from the high it trails at (15 = 15% below).
     stop_pct: str
+    stop_trail: bool = False
 
 
 class DiscordSettingsOut(BaseModel):
@@ -475,6 +477,8 @@ class DiscordSettingsOut(BaseModel):
     # "On Fill": the stop set the moment the entry fills, as a return from entry
     # (-25 = 25% below). Null = no stop until the first trim.
     fill_stop_pct: str | None = None
+    # The On Fill stop trails: fill_stop_pct is then a give-back from the high.
+    fill_stop_trail: bool = False
 
     # ── chasing an entry that didn't fill ───────────────────────────────────
     # Seconds an unfilled buy rests before its one repriced attempt.
@@ -516,6 +520,8 @@ class DiscordSettingsIn(BaseModel):
     trims: list[DiscordTrimRow] | None = Field(default=None, min_length=1, max_length=10)
     # "On Fill" stop; "" clears it (no stop until the first trim).
     fill_stop_pct: str | None = None
+    # With fill_stop_pct: is it a trailing give-back rather than a fixed level?
+    fill_stop_trail: bool | None = None
     reprice_after_seconds: int | None = Field(default=None, ge=5, le=600)
     reprice_pct: str | None = None
 
