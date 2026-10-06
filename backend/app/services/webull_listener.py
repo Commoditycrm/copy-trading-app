@@ -180,25 +180,19 @@ def _safe_poll_interval(num_accounts: int) -> float:
     return max(_poll_interval(), _DAYORDERS_PER_ACCOUNT_S * max(1, num_accounts))
 
 
-# Orders still live at the broker — worth monitoring at a faster cadence even
-# after hours (they can be cancelled/modified, or fill in a later session).
-_WORKING_STATUSES = (
-    OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
-)
-
-
 def _has_working_orders(trader_user_id: uuid.UUID) -> bool:
-    """True if the trader has any still-working order. Only consulted while the
-    market is CLOSED, to decide between the slow idle cadence and a faster one
-    that keeps monitoring outstanding orders. On any DB error, assume True (the
-    safer, faster side)."""
+    """True if the trader has any still-working order — SUBMITTED / ACCEPTED /
+    PARTIALLY_FILLED, the module's existing ``_WORKING`` set (not a new status
+    list). Only consulted while the market is CLOSED, to choose between the slow
+    idle cadence and a faster one that keeps monitoring outstanding orders. On
+    any DB error, assume True (the safer, faster side)."""
     try:
         from sqlalchemy import select  # noqa: PLC0415
         with SessionLocal() as db:
             row = db.execute(
                 select(Order.id)
                 .where(Order.user_id == trader_user_id,
-                       Order.status.in_(_WORKING_STATUSES))
+                       Order.status.in_(_WORKING))
                 .limit(1)
             ).first()
             return row is not None
@@ -206,22 +200,47 @@ def _has_working_orders(trader_user_id: uuid.UUID) -> bool:
         return True
 
 
-def _effective_poll_interval(num_accounts: int, trader_user_id: uuid.UUID) -> float:
-    """Poll cadence for THIS cycle. Full rate while the market is tradable
-    (regular + extended hours); when closed, back off to the idle interval —
-    or the faster 'active' interval if the trader still has working orders.
-    Never goes below the rate-limit floor (``_safe_poll_interval``)."""
+# Absolute floor for the closed-market cadence, so a bad config value (0,
+# negative, etc.) can never collapse the poll into a tight loop. Also guarded by
+# the max(base, …) rate-limit floor below.
+_MIN_CLOSED_POLL_S = 5.0
+
+
+def _sane_closed_interval(value: float, fallback: float) -> float:
+    """A configured closed-market interval, floored to a safe minimum. Any
+    non-positive / invalid value falls back to ``fallback`` then the floor."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = fallback
+    if v <= 0:
+        v = fallback
+    return max(_MIN_CLOSED_POLL_S, v)
+
+
+def _poll_plan(num_accounts: int, trader_user_id: uuid.UUID) -> tuple[float, str, bool]:
+    """Decide this cycle's poll cadence. Returns (interval, market_session,
+    active_orders). Full rate while the market is tradable (pre-market, regular,
+    after-hours); when CLOSED, back off to the idle interval — or the faster
+    'active' interval if the trader still has working orders. Never below the
+    rate-limit floor (``_safe_poll_interval``)."""
     base = _safe_poll_interval(num_accounts)
-    if market_hours.is_tradable_now():
-        return base
+    session = market_hours.market_session()
+    if session != market_hours.CLOSED:
+        return base, session, False
     from app.config import get_settings  # noqa: PLC0415
     s = get_settings()
-    closed = (
-        float(s.webull_poll_interval_closed_active_seconds)
-        if _has_working_orders(trader_user_id)
-        else float(s.webull_poll_interval_closed_seconds)
+    active = _has_working_orders(trader_user_id)
+    closed = _sane_closed_interval(
+        s.webull_poll_interval_closed_active_seconds if active else s.webull_poll_interval_closed_seconds,
+        20.0 if active else 120.0,
     )
-    return max(base, closed)
+    return max(base, closed), session, active
+
+
+def _effective_poll_interval(num_accounts: int, trader_user_id: uuid.UUID) -> float:
+    """The effective poll interval for this cycle (see ``_poll_plan``)."""
+    return _poll_plan(num_accounts, trader_user_id)[0]
 
 
 # ── credentials ─────────────────────────────────────────────────────────────
@@ -1104,6 +1123,7 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
     interval = _safe_poll_interval(len(account_ids))
     log.info("webull-poll[%s] started; interval=%.1fs (%d account(s), 10-req/30s cap) accounts=%s",
              trader_user_id, interval, len(account_ids), account_ids)
+    _last_cadence_log: tuple[str, float] | None = None  # (session, interval) last logged
 
     while True:
         try:
@@ -1130,7 +1150,17 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             # rate during regular + extended hours, and a backed-off idle rate
             # overnight / weekends (faster if the trader still has working
             # orders). Returns to full rate automatically in pre-market.
-            interval = _effective_poll_interval(len(account_ids), trader_user_id)
+            interval, _session, _active = _poll_plan(len(account_ids), trader_user_id)
+            # Log the cadence only when the session OR the effective interval
+            # changes — not every cycle. Lets you see the open→closed backoff
+            # (and the active-order speed-up) without flooding the log.
+            if _last_cadence_log != (_session, interval):
+                log.info(
+                    "webull-poll[%s] worker=webull_order_poll market_session=%s "
+                    "active_orders=%s poll_interval=%.0fs",
+                    trader_user_id, _session, _active, interval,
+                )
+                _last_cadence_log = (_session, interval)
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
