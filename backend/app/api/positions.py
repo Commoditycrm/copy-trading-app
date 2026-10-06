@@ -210,6 +210,18 @@ def list_positions(
         _attach_ladder_stops(db, user.id, out)
     except Exception:  # noqa: BLE001
         log.warning("positions: could not attach ladder stops", exc_info=True)
+    try:
+        from app.services import position_protections  # noqa: PLC0415
+
+        from app.schemas.position import ProtectionOut  # noqa: PLC0415
+
+        position_protections.attach(db, user.id, out)
+        for p in out:
+            p.protections = [ProtectionOut(**i) for i in p.protections]
+    except Exception:  # noqa: BLE001
+        log.warning("positions: could not attach protections", exc_info=True)
+        for p in out:
+            p.protections = []
     if detail:
         return PositionsPayload(positions=out, unreachable=unreachable, stale=stale)
     return out
