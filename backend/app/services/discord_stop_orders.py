@@ -70,6 +70,33 @@ _TRANSIENT_MARKERS = (
 )
 
 
+# Rejections that mean "these contracts are still held by another resting sell"
+# — not that the market is through the stop. Webull reads a sell for more than
+# is free as OPENING a short and refuses it as a naked call; Alpaca calls it a
+# cash-secured put it can't fund. It happens when a stop or take-profit is
+# replaced and the broker has not finished releasing the old one. QA 2026-10-06:
+# moving SPY 779C's stop from 0.75 to 1.01 was refused this way while the 0.75
+# stop still held all 5, and the refusal was read as "the stop would have
+# fired" — the position was sold at market, below every trim.
+_CONFLICT_MARKERS = (
+    "naked call", "naked put", "net moeny not enough", "net money not enough",
+    "new naked", "cash-secured", "cash secured", "insufficient", "intent mismatch",
+    "position intent", "exceeds", "not enough position", "available quantity",
+)
+
+
+def is_reservation_conflict(msg: str) -> bool:
+    """The broker refused a sell because the contracts are still reserved by
+    another resting order. A wait, never a reason to close the position."""
+    m = str(msg or "").lower().replace("_", " ")
+    return any(k in m for k in _CONFLICT_MARKERS)
+
+
+# A refusal for held-up contracts is retried once the old order has had time
+# to go — not every pass, in case something else is holding them.
+_CONFLICT_RETRY_S = 45
+
+
 def _is_transient(msg: str) -> bool:
     # Underscores normalised so a broker's own code name matches the phrase:
     # Webull says TOO_MANY_REQUESTS, not "too many requests".
@@ -104,7 +131,9 @@ def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> s
         return place_stop(quantity, price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        if close_position is None or _is_transient(msg):
+        if close_position is None or _is_transient(msg) or is_reservation_conflict(msg):
+            # Retried on a later pass. The emulated stop covers the position
+            # meanwhile (discord_trailing_stop.decide: no stop resting).
             raise
         log.warning(
             "discord stop: %s refused a stop at %s (%s) — closing %s instead, "
@@ -209,6 +238,13 @@ def reconcile(
         # 29 of them, in the case that led to this guard. Back off instead and
         # let the cause be fixed.
         refusal = _recent_rejection_reason(db, guard)
+        if refusal is not None and is_reservation_conflict(refusal):
+            # The contracts were still held by the order being replaced. Not a
+            # verdict on the stop: once that order has had time to go, place it.
+            age = _recent_rejection_age_s(db, guard)
+            if age is not None and age < _CONFLICT_RETRY_S:
+                return "waiting (contracts still held by the order being replaced)"
+            refusal = None
         if refusal is not None:
             # But "back off" cannot be the whole answer: we want a stop here,
             # the broker has refused one, and the position is open — so it is
@@ -245,23 +281,21 @@ def reconcile(
     if same_qty and same_price:
         return "in sync"
 
-    # The ladder moved the level, or a fill changed the size. Replace it.
-    # The old stop is cancelled FIRST, so a refusal here leaves the position
-    # barer than a failed first placement would — all the more reason to exit
-    # rather than leave it open with nothing resting.
+    # The ladder moved the level, or a fill changed the size. Replace it — in
+    # two passes. The old stop is cancelled now and the new one placed on the
+    # NEXT pass: a broker releases the contracts a cancelled order held only
+    # once the cancel completes, and a new stop placed in the same instant asks
+    # for contracts that are still taken. Webull refuses that as opening a
+    # naked call (QA 2026-10-06, SPY 779C). Until the next pass the emulated
+    # stop covers the position: with nothing resting, discord_trailing_stop
+    # enforces the level itself.
     cancel_stop(resting.id)
     guard.stop_order_id = None
-    oid = _place_or_close(
-        db, guard, want_qty, want_price, place_stop, close_position
-    )
-    if oid is None:
-        return "closed (stop refused on replace)"
-    guard.stop_order_id = oid
     log.info(
-        "discord stop: %s stop moved to %s x%s (was %s x%s)",
+        "discord stop: %s stop moving to %s x%s (was %s x%s) — placed next pass",
         guard.symbol, want_price, want_qty, resting.stop_price, resting.quantity,
     )
-    return f"replaced -> {want_qty} @ {want_price}"
+    return f"cancelled {resting.quantity} @ {resting.stop_price}; {want_qty} @ {want_price} next pass"
 
 
 # How long to wait after a rejected stop before trying again. Long enough that a
@@ -273,6 +307,30 @@ _REJECT_BACKOFF_S = 900
 def _recently_rejected(db: Session, guard) -> bool:
     """Whether a stop for this contract was rejected in the last backoff window."""
     return _recent_rejection_reason(db, guard) is not None
+
+
+def _recent_rejection_age_s(db: Session, guard) -> float | None:
+    """Seconds since the most recent refused stop for this contract, or None."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    from app.models.order import Order, OrderStatus, OrderType  # noqa: PLC0415
+    from sqlalchemy import select  # noqa: PLC0415
+
+    at = db.execute(
+        select(Order.created_at).where(
+            Order.user_id == guard.user_id,
+            Order.symbol == guard.symbol,
+            Order.option_strike.is_not_distinct_from(guard.option_strike),
+            Order.option_expiry.is_not_distinct_from(guard.option_expiry),
+            Order.order_type == OrderType.STOP,
+            Order.status == OrderStatus.REJECTED,
+        ).order_by(Order.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if at is None:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - at).total_seconds()
 
 
 def _recent_rejection_reason(db: Session, guard) -> str | None:
@@ -410,4 +468,5 @@ def release(db: Session, guard, cancel_stop) -> bool:
     return True
 
 
-__all__ = ["desired_quantity", "reconcile", "release", "release_for_position", "working_exit"]
+__all__ = ["desired_quantity", "reconcile", "release", "release_for_position", "working_exit",
+           "is_reservation_conflict"]
