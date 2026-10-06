@@ -240,6 +240,8 @@ export interface Position {
   /** The Discord exit ladder's stop level on this position — its own order
    *  at the broker, separate from the entry's bracket SL. Null when none. */
   ladder_stop_price?: string | null;
+  /** What protects this position: stops, trailing stops, take-profits. */
+  protections?: Protection[];
   current_price: string | null;
   market_value: string | null;
   unrealized_pnl: string | null;            // Open P&L ($) — broker's own value
@@ -442,3 +444,20 @@ export interface SubscriberSummary {
   broker_count: number;
   realized_pnl_30d: string;
 }
+
+/** One stop / trailing stop / take-profit on a position (GET /api/positions). */
+export type Protection = {
+  kind: "stop" | "trailing_stop" | "take_profit";
+  /** The level now — a trailing stop's current stop. */
+  price: string | null;
+  /** Contracts / shares covered; null = the whole position. */
+  quantity: string | null;
+  /** The broker it rests at ("Webull", "Alpaca"), or "app" when Kopyya watches the price. */
+  where: string;
+  order_id: string | null;
+  source: "ladder" | "order" | "bracket";
+  note: string | null;
+  trail_pct: string | null;
+  trail_amount: string | null;
+  peak: string | null;
+};
