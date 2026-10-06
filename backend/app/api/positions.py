@@ -1095,6 +1095,18 @@ def delete_snapshot_position(
     return {"ok": True, "remaining": len(poss), "snapshot_deleted": False}
 
 
+def _held_for_protection(adapter) -> list:
+    """Positions for the Stop / T.Stop buttons: the shared read (one Webull call
+    serves every caller for a few seconds, and on a 429 the last snapshot) —
+    so arming protection does not fail because the broker is busy answering
+    the Positions page. Only what is held and its cost are taken from it; the
+    price comes from Alpaca (services/live_marks)."""
+    try:
+        return adapter.get_positions(cached_ok=True)
+    except TypeError:                     # brokers without the shared read
+        return adapter.get_positions()
+
+
 @router.post("/channel")
 def assign_position_channel(
     payload: PositionChannelIn,
@@ -1987,7 +1999,7 @@ def set_position_stop(
     acct = db.get(BrokerAccount, broker_account_id)
     if not acct or acct.user_id != user.id:
         raise HTTPException(404, "broker_account_not_found")
-    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    positions = _held_for_protection(adapter_for(acct, decrypt_json(acct.encrypted_credentials)))
     pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
@@ -2014,7 +2026,10 @@ def set_position_stop(
     price = (entry * (Decimal(1) + pnl_pct / Decimal(100))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     if price <= 0:
         raise HTTPException(422, "That level rounds to a $0 stop.")
-    mark = getattr(pos, "current_price", None)
+    # Judged against Alpaca's live quote, not the broker's last mark.
+    from app.services import live_marks  # noqa: PLC0415
+
+    mark = live_marks.position_mark(pos, user.id)
     if mark is not None and Decimal(str(mark)) > 0 and price >= Decimal(str(mark)):
         # A sell stop at or above the market fires at once; Alpaca refuses it.
         raise HTTPException(
@@ -2288,16 +2303,19 @@ def arm_trailing_stop(
 
     creds = decrypt_json(acct.encrypted_credentials)
     adapter = adapter_for(acct, creds)
-    positions = adapter.get_positions()
+    positions = _held_for_protection(adapter)
     target = broker_symbol.upper()
     pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
 
-    raw_price = pos.current_price
-    if raw_price is None or Decimal(str(raw_price)) <= 0:
+    # The trail is anchored on Alpaca's live quote (the broker's mark only if
+    # Alpaca has none), and the poller ratchets it on the same feed.
+    from app.services import live_marks  # noqa: PLC0415
+
+    price = live_marks.position_mark(pos, user.id)
+    if price is None or price <= 0:
         raise HTTPException(422, "no_live_price_to_anchor_trail")
-    price = Decimal(str(raw_price))
     held = abs(Decimal(str(pos.quantity)))
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
 

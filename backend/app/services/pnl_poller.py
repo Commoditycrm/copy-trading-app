@@ -1010,10 +1010,11 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                             # broker, and the stop is sized around it. The fill
                             # price first — the target is measured from it.
                             _g.sync_entry_price(db, guard)
+                            from app.services import live_marks  # noqa: PLC0415
+
                             outcome = _tp.reconcile(
                                 db, guard, held, ts_g,
-                                Decimal(str(pos.current_price)) if pos is not None
-                                and getattr(pos, "current_price", None) else None,
+                                live_marks.position_mark(pos, acct.user_id) if pos is not None else None,
                                 place_limit=_make_limit_placer(db, live_acct, acct, guard),
                                 place_pair=_make_pair_placer(db, live_acct, acct, adapter, guard),
                                 cancel=_canceller,
@@ -1038,7 +1039,8 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                         )
                 db.commit()
 
-            closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close)
+            # The same read as the stops above — not a second one this tick.
+            closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close, positions=positions)
             db.commit()
             if closed:
                 log.info(
