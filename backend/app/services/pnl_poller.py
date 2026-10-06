@@ -134,13 +134,10 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
 }
 
 
-def _interval_for_broker(broker: BrokerName) -> float:
-    """Return the current per-tick interval for ``broker``, reading any
-    runtime override every call. For Alpaca this checks Redis (~0.5ms);
-    for everything else it uses the static map above.
-
-    Called on the hot path (stamping the next-due time after each tick)
-    so an admin change lands on the very next tick without restart."""
+def _base_interval_for_broker(broker: BrokerName) -> float:
+    """The full-cadence per-tick interval for ``broker``, reading any runtime
+    override every call. For Alpaca this checks Redis (~0.5ms); for everything
+    else it uses the static map above."""
     if broker == BrokerName.ALPACA:
         try:
             from app.services.platform_config import (  # noqa: PLC0415
@@ -154,6 +151,22 @@ def _interval_for_broker(broker: BrokerName) -> float:
             )
             return _INTERVAL_BY_BROKER[BrokerName.ALPACA]
     return _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
+
+
+def _interval_for_broker(broker: BrokerName) -> float:
+    """Per-tick interval for ``broker``. Full cadence during regular + extended
+    hours; backed off to the closed floor overnight / weekends, since account
+    P&L (and therefore the daily kill-switch / auto-liquidation / TP-SL the
+    poller enforces) can't change while the market is shut. This cuts CPU and
+    broker REST calls (Alpaca included) off-hours; full cadence resumes
+    automatically in pre-market. Called on the hot path (stamping next-due) so a
+    change lands on the next tick without restart."""
+    base = _base_interval_for_broker(broker)
+    from app.services import market_hours  # noqa: PLC0415
+    if not market_hours.is_tradable_now():
+        from app.config import get_settings  # noqa: PLC0415
+        return max(base, float(get_settings().pnl_poll_interval_closed_seconds))
+    return base
 
 # Per-account monotonic timestamp of the earliest time the account is
 # allowed to be polled again. The outer loop ticks every POLL_INTERVAL_S
