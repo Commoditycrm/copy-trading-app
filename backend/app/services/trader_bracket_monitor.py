@@ -167,24 +167,57 @@ def _sl_breached(pos: BrokerPosition, entry: Order, is_long: bool) -> bool:
     return unrealized_pct <= -sl_pct
 
 
+def _has_live_sl_entry(db: Session, trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> bool:
+    """Is there anything this monitor could act on: a filled option entry with a
+    stop loss, on a contract that has not expired? The same filters as
+    _find_entry_with_sl, minus the contract — checked in the DB so a tick with
+    nothing to watch costs no broker call."""
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+    from sqlalchemy import or_  # noqa: PLC0415
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    return db.execute(
+        select(Order.id).where(
+            Order.user_id == trader_user_id,
+            Order.broker_account_id == broker_account_id,
+            Order.instrument_type == InstrumentType.OPTION,
+            Order.status == OrderStatus.FILLED,
+            Order.is_closing.is_(False),
+            Order.bracket_parent_id.is_(None),
+            Order.stop_loss_price.isnot(None),
+            or_(Order.option_expiry.is_(None), Order.option_expiry >= today),
+        ).limit(1)
+    ).first() is not None
+
+
 def enforce_trader_option_sl(
     db: Session,
     trader_user_id: uuid.UUID,
     broker_account_id: uuid.UUID,
+    *,
+    positions: list | None = None,
 ) -> list[dict]:
     """Per-tick entry-point. Returns a list of triggered closes (one
     dict per closed option position) so the caller can publish events.
-    Empty list = nothing fired this tick."""
+    Empty list = nothing fired this tick.
+
+    ``positions``: a read the caller made this same tick. Webull allows two
+    position reads per two seconds, so the P&L poller's stop pass and this
+    monitor reading back to back used up the window on their own and any
+    other read in it (the Positions page, auto-trim) was refused."""
     acct = db.get(BrokerAccount, broker_account_id)
     if acct is None or acct.user_id != trader_user_id:
         return []
     if acct.connection_status != "connected":
         return []
+    if not _has_live_sl_entry(db, trader_user_id, broker_account_id):
+        return []
 
     try:
         creds = decrypt_json(acct.encrypted_credentials)
         adapter = adapter_for(acct, creds)
-        positions = adapter.get_positions()
+        if positions is None:
+            positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
         log.exception(
             "trader_bracket_monitor: get_positions failed for account %s",
