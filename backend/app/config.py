@@ -328,6 +328,12 @@ class Settings(BaseSettings):
     # Cap on a single intake batch from the listener. The observer flushes in
     # small batches; anything larger is a malformed or hostile payload.
     discord_ingest_max_batch: int = 50
+    # An ENTRY alert that reaches us more than this many seconds after it was
+    # posted is not placed automatically — it waits for the trader's approval
+    # instead. A restarted or reconnecting listener replays everything posted
+    # while it was away (so nothing is lost); buying those at whatever the
+    # price is now is not what anyone asked for. Exits are not held.
+    discord_max_alert_age_s: int = 120
     # How long a message's idempotency marker is held in Redis. Sized to cover a
     # listener restart / reconnect replaying the visible channel backlog, which
     # is the realistic duplicate window. The durable guard is the DB unique

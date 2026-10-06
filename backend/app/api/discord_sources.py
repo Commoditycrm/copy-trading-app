@@ -2715,7 +2715,14 @@ def listener_messages(
     if auto and report.accepted:
         owner = db.get(User, src.user_id)
         if owner is not None:
+            from app.services import discord_freshness  # noqa: PLC0415
+
             for msg in report.stored:
+                # A late entry — the backlog a reconnecting listener replays —
+                # waits for approval instead of buying at today's price.
+                if discord_freshness.hold_if_stale(msg):
+                    log.info("discord: alert %s held — arrived late", msg.discord_message_id)
+                    continue
                 if msg.decision is SignalDecision.APPROVED:
                     _execute_signal(db, owner, msg, background, request)
 

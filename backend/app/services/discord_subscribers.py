@@ -241,6 +241,10 @@ def relay_for_subscriber(db: Session, subscriber: User, parent: DiscordAlertSour
                 msg.status_reason = reason
                 msg.decision = None
                 continue
+        from app.services import discord_freshness  # noqa: PLC0415
+
+        if discord_freshness.hold_if_stale(msg):
+            continue                      # a late entry waits for approval
         if msg.decision is SignalDecision.APPROVED:
             discord_sources._execute_signal(db, subscriber, msg, background, request)
 
