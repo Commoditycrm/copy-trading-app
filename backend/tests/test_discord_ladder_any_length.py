@@ -302,3 +302,26 @@ def test_a_stop_that_rounds_to_zero_is_not_set():
     g = _fill_guard(entry_price=D("0.01"))
     assert discord_auto_trim.apply_fill_stop(_filled(), g, _ts(discord_fill_stop_pct=D("-90"))) is False
     assert g.stop_price is None
+
+
+def test_a_channel_with_an_older_copy_does_not_borrow_the_accounts_new_ladder():
+    """Its own Trims 1-3 must not be topped up with the account's Trims 4+,
+    On Fill stop or Take-profit mode (seen locally 2026-10-06: a mixed ladder)."""
+    account = _ts(discord_trim_count=5, discord_fill_stop_pct=D("-35"), discord_tp_orders=True,
+                  discord_extra_trims=[{"profit_gate_pct": "80", "stop_pct": "20", "qty_pct": "50"},
+                                       {"profit_gate_pct": "120", "stop_pct": "40", "qty_pct": "50"}])
+    older_copy = {"discord_trim_profit_gate_pct": "20", "discord_trim_stop_pct": "-90",
+                  "discord_trim_qty_pct": "50", "discord_auto_trim": True}
+    own = dcs.ChannelSettings(account, older_copy)
+    assert discord_ladder.count(own) == 3
+    assert discord_ladder.rungs(own)[0].stop_pct == D("-90")
+    assert discord_ladder.fill_stop_pct(own) is None
+    assert dcs.exit_mode(own) == "auto"            # its own Auto trim, not the account's Take-profit orders
+
+
+def test_turning_a_channel_onto_its_own_settings_copies_the_whole_ladder():
+    account = _ts(discord_trim_count=4, discord_fill_stop_pct=D("-35"),
+                  discord_extra_trims=[{"profit_gate_pct": "80", "stop_pct": "20", "qty_pct": "100"}])
+    own = dcs.ChannelSettings(account, dcs.snapshot(account))
+    assert discord_ladder.count(own) == 4 and discord_ladder.fill_stop_pct(own) == D("-35")
+    assert discord_ladder.rungs(own)[3].profit_gate_pct == D("80")
