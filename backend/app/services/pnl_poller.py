@@ -540,6 +540,13 @@ def _enforce_one_safe(acct: BrokerAccount) -> None:
 
 
 def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
+    # One coalescing window per account per tick: the sub-enforcers below each
+    # read this account's positions LIVE, and on Webull those near-simultaneous
+    # reads 429. risk_tick shares ONE fresh read across them (a mutating
+    # place_order invalidates it). Each account runs in its own thread/context
+    # (asyncio.to_thread), so ticks never share a snapshot. See risk_tick.py.
+    from app.services import risk_tick  # noqa: PLC0415
+    token = risk_tick.begin()
     try:
         if role == "trader":
             _enforce_one_trader(acct)
@@ -554,6 +561,15 @@ def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
             "pnl_poller: enforce failed for account %s (user %s, role=%s)",
             acct.id, acct.user_id, role,
         )
+    finally:
+        tick = risk_tick.end(token)
+        if tick is not None and (tick.fresh_fetches or tick.reuses):
+            # DEBUG so it never floods prod; proves the coalescing per account.
+            log.debug(
+                "risk_tick: account=%s positions_fresh_fetches=%d "
+                "positions_snapshot_reuses=%d refreshes=%d",
+                acct.id, tick.fresh_fetches, tick.reuses, tick.refreshes,
+            )
 
 
 def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
