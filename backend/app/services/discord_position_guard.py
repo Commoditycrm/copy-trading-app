@@ -72,6 +72,9 @@ class RungConfig:
     profit_gate_pct: Decimal = Decimal("0")
     stop_pct: Decimal = Decimal("0")
     qty_pct: Decimal = Decimal("50")
+    # The stop TRAILS: ``stop_pct`` is then a give-back from the high since this
+    # trim (15 = 15% below the best price), not a return from entry.
+    stop_trail: bool = False
 
 
 @dataclass
@@ -95,6 +98,10 @@ class TrimConfig:
     # in order (services/discord_ladder builds it from the settings). When set
     # it is the ladder; trim1..trim3 above are then not consulted.
     rungs: tuple[RungConfig, ...] | None = None
+    # Trims 2+ on an expensive contract ride a dollar give-back instead of going
+    # to market. Off for the configured ladder (services/discord_ladder), which
+    # trails the STOP per trim instead.
+    trail_exits: bool = True
 
     def ladder(self) -> tuple[RungConfig, ...]:
         return self.rungs if self.rungs else (self.trim1, self.trim2, self.trim3)
@@ -121,6 +128,9 @@ class TrimPlan:
     exit_style: str = NONE
     trail_amount: Decimal | None = None
     new_stop_price: Decimal | None = None
+    # Set with new_stop_price when that stop trails (see apply_stop).
+    stop_trail_pct: Decimal | None = None
+    stop_peak: Decimal | None = None
     retire: bool = False
     note: str = ""
 
@@ -228,10 +238,9 @@ def plan_exit(
     # break-even, so there was no way to say "the 2nd trim moves the stop to
     # +10%". Existing values were negated by migration e4c9d2a6b183, so a
     # ladder that read 25 (25% below) now reads -25 and sits where it always did.
-    stop = (
-        entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100))
-        if entry is not None and entry > 0 else None
-    )
+    # A trailing stop instead starts that give-back below the price now.
+    stop, trail_pct, peak = rung_stop(entry, rung_cfg, mark)
+    trailing = {"stop_trail_pct": trail_pct, "stop_peak": peak}
 
     # A gate of 0 means NO minimum, not "must be at break-even or better".
     # That distinction is the difference between reproducing the old ladder and
@@ -257,7 +266,7 @@ def plan_exit(
             # unprotected position until the next one happens to come.
             return TrimPlan(
                 rung=rung, guard=guard,
-                new_stop_price=_armable_stop(stop, mark),
+                new_stop_price=_armable_stop(stop, mark), **trailing,
                 note=(f"trim {rung}: up {gain_pct.quantize(Decimal('0.01'))}%, "
                       f"under the {gate}% gate — nothing sold"
                       + (f", stop set at {stop.quantize(Decimal('0.0001'))}"
@@ -274,7 +283,7 @@ def plan_exit(
     if leaves_runner and sell <= 0:
         return TrimPlan(
             rung=rung, guard=guard,
-            new_stop_price=_armable_stop(stop, mark),
+            new_stop_price=_armable_stop(stop, mark), **trailing,
             note=(f"trim {rung}: last trim at {rung_cfg.qty_pct.normalize():f}% of {held} "
                   f"rounds down to 0 — {RUNNER_NOTE}"
                   + (f", stop {stop.quantize(Decimal('0.0001'))}" if stop is not None else "")),
@@ -282,7 +291,7 @@ def plan_exit(
 
     # The 1st trim always goes to market. Later rungs ride an expensive contract
     # out on a trailing give-back instead — a cheap one isn't worth trailing.
-    style, amount = _exit_style(entry, cfg) if rung >= 2 else (MARKET, None)
+    style, amount = _exit_style(entry, cfg) if rung >= 2 and cfg.trail_exits else (MARKET, None)
 
     takes_everything = sell >= held
     gain_note = (
@@ -291,12 +300,14 @@ def plan_exit(
     stop_note = (
         "" if takes_everything or stop is None
         else f", stop {stop.quantize(Decimal('0.0001'))}"
+        + (f" trailing {trail_pct.normalize():f}%" if trail_pct is not None else "")
     )
     return TrimPlan(
         rung=rung, guard=guard, sell_qty=sell, exit_style=style,
         trail_amount=amount,
         # Nothing left to protect if this rung takes the whole position.
         new_stop_price=(None if takes_everything else _armable_stop(stop, mark)),
+        **({} if takes_everything else trailing),
         retire=(takes_everything and style == MARKET),
         note=(f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}"
               + (f" — {held - sell} {RUNNER_NOTE}" if leaves_runner and sell < held else "")),
@@ -339,6 +350,77 @@ def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     if stop is None or mark is None:
         return stop
     return stop if stop < mark else None
+
+
+def rung_stop(entry, rung_cfg: RungConfig, mark) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """Where a trim's stop goes: (stop price, trail %, peak).
+
+    A FIXED stop is a return from entry (-25 -> entry x 0.75). A TRAILING one is
+    a give-back from the best price since the trim — it starts that far below
+    the price now (the entry when there is no mark yet) and ratchet_stop() raises
+    it from there. Trail % and peak are None for a fixed stop."""
+    entry = Decimal(str(entry)) if entry is not None else None
+    if not rung_cfg.stop_trail:
+        if entry is None or entry <= 0:
+            return None, None, None
+        return entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100)), None, None
+    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), mark if mark else entry)
+
+
+def trailing_stop(pct: Decimal, peak) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """A trailing stop ``pct`` % below ``peak``: (stop price, pct, peak)."""
+    if peak is None or pct <= 0:
+        return None, None, None
+    peak = Decimal(str(peak))
+    if peak <= 0:
+        return None, None, None
+    return peak * (Decimal(1) - pct / Decimal(100)), pct, peak
+
+
+def apply_stop(guard: DiscordPositionGuard, plan: "TrimPlan") -> None:
+    """Put a plan's stop on the guard — fixed, or trailing with its peak. A plan
+    with no new stop leaves the one already there (fixed or trailing) alone."""
+    if plan.new_stop_price is None:
+        return
+    guard.stop_price = plan.new_stop_price
+    guard.stop_trail_pct = plan.stop_trail_pct
+    guard.stop_peak = plan.stop_peak
+
+
+# How far a trailing stop must be able to rise before it is moved. Each move
+# replaces the order resting at the broker, so following every cent would spend
+# the rate limit on churn; 2% (at least 2 cents) keeps it within a whisker of
+# the true trail.
+_RATCHET_PCT = Decimal("2")
+_RATCHET_MIN = Decimal("0.02")
+
+
+def ratchet_stop(guard: DiscordPositionGuard, price) -> bool:
+    """Raise a trailing stop after a new high. Only ever up — a pullback leaves
+    it where it is, which is what makes it a stop. Returns True when it moved."""
+    pct = getattr(guard, "stop_trail_pct", None)
+    if pct is None or price is None or guard.stop_price is None:
+        return False
+    price = Decimal(str(price))
+    if price <= 0:
+        return False
+    peak = getattr(guard, "stop_peak", None)
+    peak = Decimal(str(peak)) if peak is not None else None
+    if peak is None or price > peak:
+        guard.stop_peak = peak = price
+    want = _to_tick(peak * (Decimal(1) - abs(Decimal(str(pct))) / Decimal(100)))
+    current = Decimal(str(guard.stop_price))
+    step = max(_RATCHET_MIN, current * _RATCHET_PCT / Decimal(100))
+    if want is None or want <= 0 or want < current + step:
+        return False
+    guard.stop_price = want
+    return True
+
+
+def clear_stop_trail(guard: DiscordPositionGuard) -> None:
+    """The stop is no longer the ladder's trailing one (set or removed by hand)."""
+    guard.stop_trail_pct = None
+    guard.stop_peak = None
 
 
 def _exit_style(entry: Decimal | None, cfg: TrimConfig) -> tuple[str, Decimal | None]:
@@ -669,6 +751,7 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 
 __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
-    "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
+    "arm_trail", "armed", "clear_trail", "rung_stop", "trailing_stop", "apply_stop",
+    "ratchet_stop", "clear_stop_trail", "find", "on_buy", "plan_exit",
     "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price",
 ]

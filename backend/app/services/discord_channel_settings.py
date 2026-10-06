@@ -53,6 +53,7 @@ CHANNEL_FIELDS = (
     "discord_trim_count",
     "discord_extra_trims",
     "discord_fill_stop_pct",
+    "discord_stop_trails",
     "discord_trim_price_threshold",
     "discord_trim_trail_amount",
     "discord_reprice_after_seconds",
@@ -70,6 +71,7 @@ _ADDED_LATER: dict[str, Any] = {
     "discord_extra_trims": [],
     "discord_fill_stop_pct": None,
     "discord_tp_orders": False,
+    "discord_stop_trails": None,
 }
 
 

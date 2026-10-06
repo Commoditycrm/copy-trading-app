@@ -236,6 +236,15 @@ class TraderSettings(Base, TimestampMixin):
     # from entry (-25 = 25% below). NULL = no stop until the first trim, which
     # is how the ladder behaved before this existed.
     discord_fill_stop_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
+    # Which stops TRAIL instead of sitting at a fixed level:
+    # {"fill": bool, "trims": [bool, ...]} — the On Fill stop and each trim, in
+    # ladder order. A trailing stop's value is a give-back from the high since
+    # it was set (15 = 15% below the best price), not a return from entry.
+    # Missing/false = a fixed stop, as before this existed. Read through
+    # services/discord_ladder.
+    discord_stop_trails: Mapped[dict | None] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=True,
+    )
 
     # Entry price above which an exit trails instead of going to market.
     discord_trim_price_threshold: Mapped[Decimal] = mapped_column(

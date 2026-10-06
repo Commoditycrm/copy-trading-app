@@ -75,6 +75,8 @@ type DiscordSettings = {
   trims?: TrimRow[];
   /** "On Fill" stop as a return from entry; null = no stop until the first trim. */
   fill_stop_pct?: string | null;
+  /** The On Fill stop trails: fill_stop_pct is then a give-back from the high. */
+  fill_stop_trail?: boolean;
   quantity_multiplier: number;
   max_per_contract: string | null;
   max_per_order: string | null;
@@ -161,8 +163,14 @@ type LadderField = {
 };
 
 
-/** One trim of the exit ladder, as typed. */
-type TrimRow = { profit_gate_pct: string; qty_pct: string; stop_pct: string };
+/** One trim of the exit ladder, as typed. ``stop_trail``: the stop trails — its
+ *  value is a give-back from the high since this trim, not a return from entry.
+ *  ``stop_alt`` is the other mode's value, kept while you flip between them
+ *  (never sent). */
+type TrimRow = {
+  profit_gate_pct: string; qty_pct: string; stop_pct: string;
+  stop_trail?: boolean; stop_alt?: string;
+};
 
 /** The ladder as a table — one ROW per stage, one COLUMN per setting:
  *
@@ -173,14 +181,15 @@ type TrimRow = { profit_gate_pct: string; qty_pct: string; stop_pct: string };
  *  Read across a row for what happens at that stage. On Fill has no target and
  *  no quantity — nothing is sold when the entry fills; it only places the stop.
  */
-const TRIM_COLUMNS: { key: keyof TrimRow; label: string; hint: string; min: string; max?: string }[] = [
+const TRIM_COLUMNS: { key: "profit_gate_pct" | "qty_pct" | "stop_pct"; label: string; hint: string; min: string; max?: string }[] = [
   { key: "profit_gate_pct", label: "Profit target", min: "0",
     hint: "minimum gain over entry before this trim sells (0 = no minimum)" },
   { key: "qty_pct", label: "Trim of rem. qty", min: "0", max: "100",
     hint: "share of what is STILL held, not of the original position" },
-  { key: "stop_pct", label: "Stop", min: "-100",
-    hint: "where the stop sits after this stage, as a return from entry: -25% is 25% below, "
-      + "0% is break-even, +10% locks in profit" },
+  { key: "stop_pct", label: "Stop / trailing stop", min: "-100",
+    hint: "Stop: where the stop sits after this stage, as a return from entry (-25% is 25% below, "
+      + "0% is break-even, +10% locks in profit). Trail: follows the high after this stage and "
+      + "exits on a give-back of that %" },
 ];
 
 const MAX_TRIMS = 10;
@@ -205,33 +214,52 @@ function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
 }
 
 /** The boxes on this page that hold typing until Save. */
-type EditedField = "trims" | "fill" | "trail" | "maxPerContract" | "maxPerOrder";
+type EditedField = "trims" | "fill" | "maxPerContract" | "maxPerOrder";
 
 const sameTrims = (a: TrimRow[], b: TrimRow[]) =>
-  a.length === b.length && a.every((t, i) => TRIM_COLUMNS.every((c) => t[c.key] === b[i][c.key]));
+  a.length === b.length && a.every((t, i) =>
+    TRIM_COLUMNS.every((c) => t[c.key] === b[i][c.key]) && !!t.stop_trail === !!b[i].stop_trail);
 
-/** Not part of the per-trim table: these two describe the trailing exit that
- *  every trim after the first uses on an expensive contract, so they keep
- *  their own row rather than pretending to belong to one trim. */
-const TRAIL_FIELDS: LadderField[] = [
-  { key: "trim_price_threshold", label: "Trail when entry is above", prefix: "$", step: "0.05" },
-  { key: "trim_trail_amount", label: "Trailing give-back", prefix: "$", step: "0.05" },
-];
+/** What a fresh Trail starts at when there's nothing remembered for it. */
+const DEFAULT_TRAIL = "15";
 
-// The two trailing-exit fields, for the dirty check and for building state.
-const LADDER_FIELDS: LadderField[] = TRAIL_FIELDS;
+/** Flip a stop between a fixed level and a trailing give-back, keeping the
+ *  value of the mode you're leaving so flipping back restores it. */
+function flipStop<T extends { stop: string; trail: boolean; alt?: string }>(cur: T, trail: boolean): T {
+  if (cur.trail === trail) return cur;
+  return { ...cur, trail, stop: cur.alt ?? (trail ? DEFAULT_TRAIL : ""), alt: cur.stop };
+}
 
-const LADDER_DEFAULTS: Record<string, string> = {
-  trim_price_threshold: "0.90", trim_trail_amount: "0.25",
-};
-
-/** Trailing-exit values from a settings response, falling back to the defaults. */
-function ladderFrom(s: Partial<DiscordSettings>): Record<string, string> {
-  return Object.fromEntries(
-    LADDER_FIELDS.map((f) => [
-      f.key,
-      (s as Record<string, string | undefined>)[f.key] ?? LADDER_DEFAULTS[f.key],
-    ]),
+/** Stop | Trail, in front of a stop box. */
+function StopModeToggle({ trail, onChange, disabled, label }: {
+  trail: boolean; onChange: (trail: boolean) => void; disabled?: boolean; label: string;
+}) {
+  return (
+    <div role="radiogroup" aria-label={`${label}: stop or trailing stop`}
+         className="flex shrink-0 rounded-lg border overflow-hidden"
+         style={{ borderColor: "var(--border-strong)" }}>
+      {([[false, "Stop"], [true, "Trail"]] as const).map(([value, text]) => (
+        <button
+          key={text}
+          type="button"
+          role="radio"
+          aria-checked={trail === value}
+          disabled={disabled}
+          onClick={() => onChange(value)}
+          title={value
+            ? "Trailing stop: follows the high and exits on a give-back of this %"
+            : "Fixed stop: a return from entry"}
+          className="px-2 text-[11px] focus-ring disabled:opacity-50"
+          style={{
+            height: 30,
+            background: trail === value ? "var(--accent-glow)" : "transparent",
+            color: trail === value ? "var(--accent-2)" : "var(--muted)",
+          }}
+        >
+          {text}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -270,19 +298,21 @@ export default function DiscordPage() {
   // lets Save disable itself when nothing has changed.
   const [savedMaxPerContract, setSavedMaxPerContract] = useState("");
   const [savedMaxPerOrder, setSavedMaxPerOrder] = useState("");
-  const [ladder, setLadder] = useState<Record<string, string>>(LADDER_DEFAULTS);
-  const [savedLadder, setSavedLadder] = useState<Record<string, string>>(ladder);
   // The exit ladder: the On Fill stop, then one row per trim.
   const [trims, setTrims] = useState<TrimRow[]>(DEFAULT_TRIMS);
   const [savedTrims, setSavedTrims] = useState<TrimRow[]>(DEFAULT_TRIMS);
   const [fillStop, setFillStop] = useState("");
   const [savedFillStop, setSavedFillStop] = useState("");
+  // On Fill's Stop | Trail, and the other mode's value while flipping.
+  const [fillTrail, setFillTrail] = useState(false);
+  const [savedFillTrail, setSavedFillTrail] = useState(false);
+  const [fillAlt, setFillAlt] = useState<string | undefined>(undefined);
   // What the server last said for every field you type into, as a ref: the
   // 15s background reload runs a stale closure, so state can't tell it whether
   // a box holds an unsaved edit. It used to overwrite them all — an edited
   // ladder reverted 15s later unless Save had been clicked by then.
   const savedRef = useRef({
-    trims: DEFAULT_TRIMS, fill: "", trail: LADDER_DEFAULTS as Record<string, string>,
+    trims: DEFAULT_TRIMS, fill: "", fillTrail: false,
     maxPerContract: "", maxPerOrder: "",
   });
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
@@ -341,19 +371,17 @@ export default function DiscordPage() {
       const next = {
         trims: trimsFrom(settings),
         fill: settings.fill_stop_pct ?? "",
-        trail: ladderFrom(settings),
+        fillTrail: !!settings.fill_stop_trail,
         maxPerContract: settings.max_per_contract ?? "",
         maxPerOrder: settings.max_per_order ?? "",
       };
       savedRef.current = next;
-      const sameRecord = (a: Record<string, string>, b: Record<string, string>) =>
-        Object.keys(b).every((k) => a[k] === b[k]);
       setTrims((cur) => (forced("trims") || sameTrims(cur, prev.trims) ? next.trims : cur));
       setSavedTrims(next.trims);
       setFillStop((cur) => (forced("fill") || cur === prev.fill ? next.fill : cur));
       setSavedFillStop(next.fill);
-      setLadder((cur) => (forced("trail") || sameRecord(cur, prev.trail) ? next.trail : cur));
-      setSavedLadder(next.trail);
+      setFillTrail((cur) => (forced("fill") || cur === prev.fillTrail ? next.fillTrail : cur));
+      setSavedFillTrail(next.fillTrail);
       setMaxPerContract((cur) => (forced("maxPerContract") || cur === prev.maxPerContract ? next.maxPerContract : cur));
       setSavedMaxPerContract(next.maxPerContract);
       setMaxPerOrder((cur) => (forced("maxPerOrder") || cur === prev.maxPerOrder ? next.maxPerOrder : cur));
@@ -510,10 +538,14 @@ export default function DiscordPage() {
     }
   }
 
-  const ladderDirty = LADDER_FIELDS.some((f) => ladder[f.key] !== savedLadder[f.key])
-    || !sameTrims(trims, savedTrims) || fillStop !== savedFillStop;
+  const ladderDirty = !sameTrims(trims, savedTrims) || fillStop !== savedFillStop
+    || fillTrail !== savedFillTrail;
   /** Everything the exit ladder's Save sends: the whole ladder at once. */
-  const ladderPatch = () => ({ ...ladder, trims, fill_stop_pct: fillStop.trim() });
+  const ladderPatch = () => ({
+    trims: trims.map(({ stop_alt: _alt, ...t }) => ({ ...t, stop_trail: !!t.stop_trail })),
+    fill_stop_pct: fillStop.trim(),
+    fill_stop_trail: fillTrail,
+  });
   const lastTrimLeavesRunner = Number(trims[trims.length - 1]?.qty_pct) < 100;
 
   async function saveSizing(patch: Record<string, unknown>) {
@@ -528,7 +560,6 @@ export default function DiscordPage() {
       const sent: EditedField[] = [];
       if ("trims" in patch) sent.push("trims");
       if ("fill_stop_pct" in patch) sent.push("fill");
-      if ("trim_price_threshold" in patch || "trim_trail_amount" in patch) sent.push("trail");
       if ("max_per_contract" in patch) sent.push("maxPerContract");
       if ("max_per_order" in patch) sent.push("maxPerOrder");
       applySettings(r, sent);
@@ -1662,31 +1693,46 @@ export default function DiscordPage() {
                     </span>
                     <span aria-hidden="true" />
                     <span aria-hidden="true" />
-                    <div className="relative">
-                      <input
-                        id="ladder-fill-stop"
-                        aria-label="Stop, On Fill"
-                        type="number"
-                        min="-99"
-                        max="-1"
-                        step="5"
-                        placeholder="none"
-                        value={fillStop}
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <StopModeToggle
+                        label="On Fill"
+                        trail={fillTrail}
                         disabled={modeBusy}
-                        onChange={(e) => setFillStop(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
-                        title="Stop placed as soon as the entry fills, as a return from entry: -25 is 25% below. Leave empty for no stop until the first trim."
-                        className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
-                        style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 8, paddingRight: 20 }}
+                        onChange={(trail) => {
+                          const next = flipStop({ stop: fillStop, trail: fillTrail, alt: fillAlt }, trail);
+                          setFillTrail(next.trail);
+                          setFillStop(next.stop);
+                          setFillAlt(next.alt);
+                        }}
                       />
-                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
+                      <div className="relative flex-1 min-w-0">
+                        <input
+                          id="ladder-fill-stop"
+                          aria-label={fillTrail ? "Trailing stop, On Fill" : "Stop, On Fill"}
+                          type="number"
+                          min={fillTrail ? "1" : "-99"}
+                          max={fillTrail ? "99" : "-1"}
+                          step="5"
+                          placeholder={fillTrail ? "give-back" : "none"}
+                          value={fillStop}
+                          disabled={modeBusy}
+                          onChange={(e) => setFillStop(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
+                          title={fillTrail
+                            ? "Trailing stop from the fill: 20 exits on a 20% give-back from the best price since the entry filled."
+                            : "Stop placed as soon as the entry fills, as a return from entry: -25 is 25% below. Leave empty for no stop until the first trim."}
+                          className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
+                          style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 8, paddingRight: 20 }}
+                        />
+                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
+                      </div>
                     </div>
                     <span />
 
                     {trims.map((t, i) => (
                       <Fragment key={i}>
                         <span className="text-[11px]" style={{ color: "var(--muted)" }}>Trim {i + 1}</span>
-                        {TRIM_COLUMNS.map((c) => (
+                        {TRIM_COLUMNS.filter((c) => c.key !== "stop_pct").map((c) => (
                           <div key={c.key} className="relative">
                             <input
                               id={`ladder-trim${i + 1}-${c.key}`}
@@ -1715,6 +1761,43 @@ export default function DiscordPage() {
                             <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
                           </div>
                         ))}
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <StopModeToggle
+                            label={`Trim ${i + 1}`}
+                            trail={!!t.stop_trail}
+                            disabled={modeBusy}
+                            onChange={(trail) =>
+                              setTrims((rows) => rows.map((r, j) => {
+                                if (j !== i) return r;
+                                const next = flipStop({ stop: r.stop_pct, trail: !!r.stop_trail, alt: r.stop_alt }, trail);
+                                return { ...r, stop_pct: next.stop, stop_trail: next.trail, stop_alt: next.alt };
+                              }))
+                            }
+                          />
+                          <div className="relative flex-1 min-w-0">
+                            <input
+                              id={`ladder-trim${i + 1}-stop_pct`}
+                              aria-label={`${t.stop_trail ? "Trailing stop" : "Stop"}, Trim ${i + 1}`}
+                              type="number"
+                              min={t.stop_trail ? "1" : "-100"}
+                              max={t.stop_trail ? "99" : undefined}
+                              step="5"
+                              placeholder={t.stop_trail ? "give-back" : undefined}
+                              value={t.stop_pct}
+                              disabled={modeBusy}
+                              onChange={(e) =>
+                                setTrims((rows) => rows.map((r, j) => (j === i ? { ...r, stop_pct: e.target.value } : r)))
+                              }
+                              onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
+                              title={t.stop_trail
+                                ? "Trailing stop: follows the high after this trim and exits on a give-back of this %"
+                                : "Where the stop sits after this trim, as a return from entry"}
+                              className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
+                              style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 8, paddingRight: 20 }}
+                            />
+                            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[13px]" style={{ color: "var(--muted)" }}>%</span>
+                          </div>
+                        </div>
                         {trims.length > 1 ? (
                           <button
                             type="button"
@@ -1748,63 +1831,6 @@ export default function DiscordPage() {
                     </p>
                   </div>
 
-                  {/* The trailing exit is not per-rung: it is the style the 2nd
-                      and 3rd trims use when the contract is expensive enough to
-                      be worth riding. */}
-                  <div className="mt-3">
-                    <span
-                      className="text-[10px] font-medium uppercase tracking-wide"
-                      style={{ color: "var(--text-2)" }}
-                    >
-                      Trailing exit
-                    </span>
-                    <span className="text-[10px] ml-2" style={{ color: "var(--muted)" }}>
-                      every trim after the first
-                    </span>
-                    <div className="grid grid-cols-2 gap-2 mt-1.5">
-                      {TRAIL_FIELDS.map((f) => (
-                        <div key={f.key}>
-                          <label
-                            className="block text-[10px] mb-1"
-                            style={{ color: "var(--muted)" }}
-                            htmlFor={`ladder-${f.key}`}
-                          >
-                            {f.label}
-                          </label>
-                          <div className="relative">
-                            <span
-                              className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
-                              style={{ color: "var(--muted)" }}
-                            >
-                              {f.prefix}
-                            </span>
-                            <input
-                              id={`ladder-${f.key}`}
-                              type="number"
-                              min="0"
-                              step={f.step}
-                              value={ladder[f.key]}
-                              disabled={modeBusy}
-                              onChange={(e) =>
-                                setLadder((l) => ({ ...l, [f.key]: e.target.value }))
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") saveSizing(ladderPatch());
-                              }}
-                              className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
-                              style={{
-                                borderColor: "var(--border)",
-                                color: "var(--text)",
-                                paddingLeft: 22,
-                                paddingRight: 12,
-                              }}
-                            />
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
                   <div className="flex items-center gap-2 mt-3">
                     <button
                       type="button"
@@ -1818,6 +1844,8 @@ export default function DiscordPage() {
                       Trim of rem. qty is a share of what is STILL held, so 50 / 50 / 100 works a
                       position of 4 down as 2, then 1, then 1. A trim only fires above
                       its profit target; its stop applies to whatever is left after it.
+                      Stop is a level from entry; Trail follows the high and exits on a
+                      give-back of that %.
                     </p>
                   </div>
                   </>

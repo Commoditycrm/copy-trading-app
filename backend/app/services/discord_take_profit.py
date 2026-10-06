@@ -212,13 +212,13 @@ def settle(db: Session, guard, ts, cancel, *, in_session: bool = True) -> str | 
         rung = guard.tp_rung or ((guard.sell_count or 0) + 1)
         cfg = discord_ladder.trim_config(ts)
         guard.sell_count = max(guard.sell_count or 0, rung)
-        entry = guard.entry_price
-        stop = None
-        if entry is not None and entry > 0:
-            stop = guards._to_tick(
-                Decimal(str(entry)) * (Decimal(1) + cfg.rung(rung).stop_pct / Decimal(100)))
+        # A trailing stop starts its give-back below the price the trim sold at.
+        stop, trail_pct, peak = guards.rung_stop(
+            guard.entry_price, cfg.rung(rung), tp.filled_avg_price or tp.limit_price)
+        stop = guards._to_tick(stop)
         if stop is not None and stop > 0:
             guard.stop_price = stop           # this trim's stop, on whatever is left
+            guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
         # The broker cancels the linked stop itself; make sure, and keep our row honest.
         if _working(sl):
             try:
