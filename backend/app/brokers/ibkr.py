@@ -1,54 +1,86 @@
-"""Interactive Brokers — direct integration via IBKR's OAuth Web API.
+"""Interactive Brokers — direct integration via IBKR's OAuth 1.0a Web API.
 
-Each user (trader OR subscriber) registers their OWN self-service OAuth
-consumer in their IBKR Client Portal, generates an access token, and pastes
-the four pieces of OAuth material + their IBKR account id into our connect
-form. We sign every API call with their per-user credentials — no shared
-app-level consumer, no IBKR third-party approval required.
+Each user (trader OR subscriber) creates their OWN self-service OAuth consumer
+in IBKR Client Portal (Settings → API → OAuth), which hands them:
 
-Credentials shape (Fernet-encrypted in broker_accounts.encrypted_credentials)::
+* a consumer key,
+* an access token + an access token secret (the secret is RSA-encrypted
+  with the user's public encryption key — only their private key opens it),
+* the two private keys they generated for that consumer: a *signature* key
+  and an *encryption* key,
+* the Diffie-Hellman prime (``dhparam.pem``) they registered.
+
+We store all of that Fernet-encrypted in ``broker_accounts.encrypted_credentials``::
 
     {
-      "consumer_key":         "...",   # OAuth 1.0a consumer key
-      "signing_key":          "...",   # OAuth 1.0a consumer signing key
-      "access_token":         "...",   # per-user access token
-      "access_token_secret":  "...",   # per-user access token secret
-      "account_id":           "U1234567",  # IBKR account number (e.g. U1234567)
-      "paper":                false
+      "consumer_key":           "ABCDEFGHI",
+      "access_token":           "...",
+      "access_token_secret":    "<base64, RSA-encrypted>",
+      "private_signature_key":  "-----BEGIN RSA PRIVATE KEY----- ...",
+      "private_encryption_key": "-----BEGIN RSA PRIVATE KEY----- ...",
+      "dh_prime":               "<hex>  or  -----BEGIN DH PARAMETERS----- ...",
+      "account_id":             "U1234567",
+      "paper":                  false,
+      "realm":                  "limited_poa"      # optional
     }
 
-Why direct OAuth (not the Client Portal Gateway)
-------------------------------------------------
-We do NOT want every subscriber to run IBKR's Java gateway 24/7 on their
-own machine. The OAuth Web API talks to IBKR's hosted endpoints with
-per-user OAuth 1.0a signing — no local process — which is the only
-realistic SaaS shape.
+How IBKR's OAuth actually works (and why requests-oauthlib can't do it)
+----------------------------------------------------------------------
+1. **Live Session Token (LST).** Before anything else we POST to
+   ``/oauth/live_session_token`` with an OAuth header signed RSA-SHA256 by
+   the private signature key, carrying a Diffie-Hellman challenge
+   ``g^a mod p``. The signature base string is prefixed with the hex of the
+   DECRYPTED access token secret. IBKR answers with ``g^b mod p``; the shared
+   secret ``K`` feeds ``HMAC-SHA1(K, decrypted secret)`` which IS the LST.
+   IBKR also returns ``HMAC-SHA1(LST, consumer_key)`` so we can verify we
+   derived the same token. The LST is good for ~24h.
+2. **Signed requests.** Every later call carries a standard OAuth 1.0a
+   header signed HMAC-SHA256 with the LST as the key.
+3. **Brokerage session.** The ``/iserver/*`` endpoints (orders, contract
+   search, account) additionally need a brokerage session, opened with
+   ``POST /iserver/auth/ssodh/init``. It idles out after a few minutes
+   without traffic, so we re-check ``/iserver/auth/status`` once a minute
+   and re-init when it has dropped.
 
-Status / scope
---------------
-* Stocks: place_order / get_order / cancel_order / get_positions / poll loop.
-* Options: placement NOT yet implemented (needs the option-chain / OCC
-  resolution flow). Externally-placed option orders are still detected by
-  the listener and parsed into our Order schema.
-* Untested against live IBKR yet — this file is a first pass against
-  IBKR's documented endpoint shapes. Expect minor adjustments once we
-  exercise a real account:
-    - Some ``/iserver/*`` endpoints may require IBKR's Live Session Token
-      (LST) handshake before responding; if direct signed calls return
-      401, we'll add the DH key exchange.
-    - Order-body field names and the placement confirmation/reply chain
-      have historically varied between API versions — verify against your
-      registered consumer's docs.
+Both the LST and the brokerage-session state live in a process-wide cache
+keyed by consumer key + access token, so the listener's poll loop and the
+copy engine's per-order adapters share one session instead of each
+re-handshaking.
+
+Instruments
+-----------
+IBKR identifies everything by ``conid``. Stocks resolve through
+``/iserver/secdef/search``; options resolve underlying → ``/iserver/secdef/info``
+(month + strike + right) → the row whose ``maturityDate`` matches the expiry.
+Resolved conids are cached per process; contract ids are stable.
+
+Operational notes
+-----------------
+* IBKR activates newly generated self-service OAuth keys during its nightly
+  reset, so a connection attempted the same day the keys were created fails
+  with 401 until the next morning. The connect form says so.
+* ``paper`` is metadata: a paper account (``DU…``) uses the same host and the
+  same OAuth material as the live one.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
-from datetime import datetime, timezone
+import re
+import secrets
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 import requests
-from requests_oauthlib import OAuth1
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from app.brokers.base import (
     BrokerAdapter,
@@ -59,6 +91,7 @@ from app.brokers.base import (
 )
 from app.models.order import (
     InstrumentType,
+    OptionRight,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -68,6 +101,20 @@ log = logging.getLogger(__name__)
 
 
 BASE_URL = "https://api.ibkr.com/v1/api"
+LST_PATH = "/oauth/live_session_token"
+# Self-service (first-party) consumers sign into the "limited_poa" realm;
+# IBKR's shared TESTCONS key uses "test_realm". Overridable per account.
+DEFAULT_REALM = "limited_poa"
+_USER_AGENT = "copy-trader/1.0 (ibkr-oauth1a)"
+_DH_GENERATOR = 2
+# Re-handshake this long before the LST's stated expiry so a token never
+# dies mid-poll.
+_LST_REFRESH_MARGIN_S = 3600
+# How long an "authenticated" answer from /iserver/auth/status is trusted
+# before we ask again. Every signed call keeps the session alive, so this
+# only matters for adapters that go quiet (a subscriber between mirrors).
+_BROKERAGE_STATUS_INTERVAL_S = 60.0
+_HTTP_TIMEOUT_S = 20
 
 # IBKR order status → our enum. IBKR is inconsistent across endpoints
 # (some endpoints return "PreSubmitted", others "PRESUBMITTED", others
@@ -97,6 +144,10 @@ _TYPE_OUT = {
     OrderType.STOP:       "STP",
     OrderType.STOP_LIMIT: "STP_LMT",
 }
+_RIGHT_OUT = {OptionRight.CALL: "C", OptionRight.PUT: "P"}
+
+
+# ── Small helpers ───────────────────────────────────────────────────────────
 
 
 def _attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -122,143 +173,627 @@ def _norm_status(raw: Any) -> str:
     return str(raw or "SUBMITTED").upper().replace(" ", "_")
 
 
-class IBKRAdapter(BrokerAdapter):
-    """OAuth Web API client for ONE user's IBKR account.
+def _fmt_strike(strike: Decimal) -> str:
+    """``Decimal('450.00')`` → ``'450'``, ``Decimal('452.50')`` → ``'452.5'``.
+    IBKR matches strikes textually in ``/secdef/info``."""
+    s = format(strike.normalize(), "f")
+    return s
 
-    - Every HTTP call is signed with OAuth 1.0a (HMAC-SHA256) using the
-      per-user consumer + token. requests-oauthlib does the signing.
-    - IBKR identifies instruments by ``conid`` (an integer contract id),
-      so every order needs a symbol→conid lookup first. Cached per
-      process; restarts re-warm cheaply.
-    """
+
+def build_occ_symbol(symbol: str, expiry: date, strike: Decimal, right: OptionRight) -> str:
+    """OCC 21-char symbol with no inner padding (``AAPL250719C00200000``) — the
+    same form the Alpaca and Webull adapters use for ``broker_symbol``."""
+    cp = "C" if right == OptionRight.CALL else "P"
+    return f"{symbol.upper()}{expiry.strftime('%y%m%d')}{cp}{int(strike * 1000):08d}"
+
+
+_OCC_RE = re.compile(r"^([A-Z.]{1,6})\s*(\d{6})([CP])(\d{8})$")
+# "AAPL 06JUN26 200 C"  — IBKR's compact contractDesc.
+_DESC_COMPACT_RE = re.compile(
+    r"^([A-Z.]{1,6})\s+(\d{2})([A-Z]{3})(\d{2})\s+(\d+(?:\.\d+)?)\s+([CP])(?:ALL|UT)?$"
+)
+# "SPY DEC 19 '25 600 Call" — the TWS-style description seen on some rows.
+_DESC_TWS_RE = re.compile(
+    r"^([A-Z.]{1,6})\s+([A-Z]{3})\s+(\d{1,2})\s+'(\d{2})\s+(\d+(?:\.\d+)?)\s+(C|P|CALL|PUT)$"
+)
+_MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1
+)}
+
+
+def parse_contract_desc(desc: str | None) -> tuple[str, date, Decimal, OptionRight] | None:
+    """Best-effort parse of an IBKR option description into
+    ``(underlying, expiry, strike, right)``. Handles the compact
+    ``AAPL 06JUN26 200 C`` form, the TWS ``SPY DEC 19 '25 600 Call`` form and
+    a (possibly space-padded) OCC symbol. ``None`` when it matches nothing —
+    callers then fall back to the authoritative ``/iserver/contract/{conid}/info``."""
+    if not desc:
+        return None
+    s = " ".join(str(desc).upper().split())
+    m = _OCC_RE.match(s.replace(" ", "")) or _OCC_RE.match(s)
+    if m:
+        root, yymmdd, cp, strike_str = m.groups()
+        try:
+            expiry = date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+        except ValueError:
+            return None
+        return root, expiry, Decimal(strike_str) / 1000, (
+            OptionRight.CALL if cp == "C" else OptionRight.PUT
+        )
+    m = _DESC_COMPACT_RE.match(s)
+    if m:
+        root, dd, mon, yy, strike_str, cp = m.groups()
+        try:
+            expiry = date(2000 + int(yy), _MONTHS[mon], int(dd))
+        except (KeyError, ValueError):
+            return None
+        return root, expiry, Decimal(strike_str), (
+            OptionRight.CALL if cp == "C" else OptionRight.PUT
+        )
+    m = _DESC_TWS_RE.match(s)
+    if m:
+        root, mon, dd, yy, strike_str, cp = m.groups()
+        try:
+            expiry = date(2000 + int(yy), _MONTHS[mon], int(dd))
+        except (KeyError, ValueError):
+            return None
+        return root, expiry, Decimal(strike_str), (
+            OptionRight.CALL if cp.startswith("C") else OptionRight.PUT
+        )
+    return None
+
+
+# ── OAuth primitives ────────────────────────────────────────────────────────
+
+
+def _pct(s: str) -> str:
+    """RFC 3986 percent-encoding as OAuth 1.0a wants it (nothing but
+    unreserved characters survive)."""
+    return quote(str(s), safe="")
+
+
+def _base_string(method: str, url: str, params: dict[str, str]) -> str:
+    """OAuth 1.0a signature base string: ``METHOD&url&k1=v1&k2=v2`` with the
+    parameters sorted and the url + parameter string each percent-encoded.
+    ``params`` must NOT contain ``oauth_signature``."""
+    pairs = sorted((_pct(k), _pct(v)) for k, v in params.items())
+    param_str = "&".join(f"{k}={v}" for k, v in pairs)
+    return f"{method.upper()}&{_pct(url)}&{_pct(param_str)}"
+
+
+def _auth_header(realm: str, params: dict[str, str]) -> str:
+    """``OAuth realm="…", k="v", …`` — values are already percent-encoded
+    where they need to be (the signature), everything else is url-safe."""
+    body = ", ".join(f'{k}="{v}"' for k, v in sorted(params.items()))
+    return f'OAuth realm="{realm}", {body}'
+
+
+def _load_private_key(pem: str, what: str) -> rsa.RSAPrivateKey:
+    """Accept a PEM (PKCS#1 or PKCS#8) pasted with real newlines, with literal
+    ``\\n`` escapes, or as a bare base64 body without the BEGIN/END lines."""
+    text = str(pem or "").strip().replace("\\n", "\n")
+    if "-----BEGIN" not in text:
+        body = "".join(text.split())
+        text = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+    try:
+        key = serialization.load_pem_private_key(text.encode(), password=None)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"IBKR {what} is not a readable PEM private key: {exc}") from exc
+    if not isinstance(key, rsa.RSAPrivateKey):
+        raise RuntimeError(f"IBKR {what} must be an RSA key")
+    return key
+
+
+def _parse_dh_prime(value: str) -> int:
+    """The DH prime either as the hex string IBKR shows, or the
+    ``dhparam.pem`` the user generated (we read ``p`` out of it)."""
+    text = str(value or "").strip().replace("\\n", "\n")
+    if "-----BEGIN" in text:
+        try:
+            params = serialization.load_pem_parameters(text.encode())
+            return int(params.parameter_numbers().p)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(f"IBKR DH parameters PEM is unreadable: {exc}") from exc
+    hex_str = "".join(text.split()).lower()
+    if hex_str.startswith("0x"):
+        hex_str = hex_str[2:]
+    if not hex_str or not re.fullmatch(r"[0-9a-f]+", hex_str):
+        raise RuntimeError("IBKR DH prime must be a hex string or a DH PARAMETERS PEM")
+    p = int(hex_str, 16)
+    if p < (1 << 500):
+        raise RuntimeError("IBKR DH prime is too small to be the registered modulus")
+    return p
+
+
+def _int_to_dh_bytes(k: int) -> bytes:
+    """Big-endian bytes of ``k`` with a leading zero byte when the top bit is
+    set — IBKR derives the LST from Java's two's-complement BigInteger
+    encoding, so we must match it byte for byte."""
+    hex_str = format(k, "x")
+    if len(hex_str) % 2:
+        hex_str = "0" + hex_str
+    raw = bytes.fromhex(hex_str)
+    if raw and raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return raw
+
+
+@dataclass
+class _Session:
+    """Process-wide auth state for ONE (consumer key, access token) pair."""
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    lst: bytes | None = None            # the live session token, base64-decoded
+    lst_expires_at: float = 0.0         # epoch seconds
+    brokerage_checked_at: float = 0.0   # last time /iserver/auth/status was "authenticated"
+    portfolio_primed: bool = False      # /portfolio/accounts called this session
+
+
+_SESSIONS: dict[str, _Session] = {}
+_SESSIONS_LOCK = threading.Lock()
+
+
+def _session_for(consumer_key: str, access_token: str) -> _Session:
+    key = hashlib.sha256(f"{consumer_key}:{access_token}".encode()).hexdigest()
+    with _SESSIONS_LOCK:
+        s = _SESSIONS.get(key)
+        if s is None:
+            s = _SESSIONS[key] = _Session()
+        return s
+
+
+class IBKRAuthError(RuntimeError):
+    """Credentials rejected (401) even after a fresh handshake."""
+
+
+# ── Adapter ─────────────────────────────────────────────────────────────────
+
+
+class IBKRAdapter(BrokerAdapter):
+    """OAuth Web API client for ONE user's IBKR account. See the module
+    docstring for the auth flow."""
 
     name = "ibkr"
+    # IBKR has no native "replace"; the copy engine cancels and re-places.
+    supports_replace = False
+    # A MARKET order outside regular hours just queues until the open;
+    # extended-hours mirrors are re-routed as outsideRTH limits.
+    requires_extended_hours_limit = True
 
-    # Process-wide symbol→conid cache. Contract ids are stable so this is
-    # safe to share across instances within one process.
+    # Process-wide caches. Contract ids are stable so sharing is safe.
     _conid_cache: dict[str, int] = {}
+    _option_detail_cache: dict[int, tuple[str, date, Decimal, OptionRight]] = {}
 
     def __init__(self, credentials: dict[str, Any]):
         super().__init__(credentials)
-        self._consumer_key = credentials["consumer_key"]
-        self._signing_key = credentials["signing_key"]
-        self._access_token = credentials["access_token"]
-        self._access_token_secret = credentials["access_token_secret"]
-        self._account_id = credentials["account_id"]
-        self._paper = bool(credentials.get("paper", False))
-
-    # ── HTTP wrapper ──────────────────────────────────────────────────────
-
-    def _oauth(self) -> OAuth1:
-        return OAuth1(
-            client_key=self._consumer_key,
-            client_secret=self._signing_key,
-            resource_owner_key=self._access_token,
-            resource_owner_secret=self._access_token_secret,
-            signature_method="HMAC-SHA256",
-            signature_type="auth_header",
-        )
-
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        url = f"{BASE_URL}{path}"
-        kwargs.setdefault("timeout", 20)
-        try:
-            r = requests.request(method, url, auth=self._oauth(), **kwargs)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"IBKR network error: {exc}") from exc
-        if r.status_code == 401:
+        if "private_signature_key" not in credentials and "signing_key" in credentials:
             raise RuntimeError(
-                f"IBKR auth rejected (401) — verify the consumer key, "
-                f"signing key, and access token are current. "
+                "This IBKR connection was saved with the old single-signing-key "
+                "form, which IBKR's OAuth never accepted. Disconnect it and "
+                "reconnect with the consumer key, access token + secret, your "
+                "private signature and encryption keys, and the DH prime."
+            )
+        try:
+            self._consumer_key = str(credentials["consumer_key"]).strip()
+            self._access_token = str(credentials["access_token"]).strip()
+            self._access_token_secret = "".join(str(credentials["access_token_secret"]).split())
+            self._account_id = str(credentials["account_id"]).strip().upper()
+            self._sig_key = _load_private_key(
+                credentials["private_signature_key"], "private signature key"
+            )
+            self._enc_key = _load_private_key(
+                credentials["private_encryption_key"], "private encryption key"
+            )
+            self._dh_prime = _parse_dh_prime(credentials["dh_prime"])
+        except KeyError as exc:
+            raise RuntimeError(f"IBKR credentials missing {exc.args[0]!r}") from exc
+        self._paper = bool(credentials.get("paper", False))
+        self._realm = str(credentials.get("realm") or DEFAULT_REALM)
+        self._session = _session_for(self._consumer_key, self._access_token)
+
+    # ── Live Session Token ────────────────────────────────────────────────
+
+    def _decrypted_token_secret(self) -> bytes:
+        try:
+            raw = base64.b64decode(self._access_token_secret)
+            return self._enc_key.decrypt(raw, padding.PKCS1v15())
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "IBKR access token secret could not be decrypted with the private "
+                "encryption key — make sure both come from the same OAuth consumer"
+            ) from exc
+
+    def _lst(self) -> bytes:
+        """The current live session token, handshaking when missing or about
+        to expire. Serialised per session so concurrent callers share one
+        handshake."""
+        s = self._session
+        with s.lock:
+            if s.lst is None or time.time() > s.lst_expires_at - _LST_REFRESH_MARGIN_S:
+                self._handshake()
+            assert s.lst is not None
+            return s.lst
+
+    def _handshake(self) -> None:
+        prepend = self._decrypted_token_secret()
+        a = secrets.randbits(256)
+        challenge = format(pow(_DH_GENERATOR, a, self._dh_prime), "x")
+        url = BASE_URL + LST_PATH
+        params = {
+            "oauth_consumer_key": self._consumer_key,
+            "oauth_nonce": secrets.token_hex(16),
+            "oauth_signature_method": "RSA-SHA256",
+            "oauth_timestamp": str(int(time.time())),
+            "oauth_token": self._access_token,
+            "diffie_hellman_challenge": challenge,
+        }
+        base = prepend.hex() + _base_string("POST", url, params)
+        signature = self._sig_key.sign(base.encode(), padding.PKCS1v15(), hashes.SHA256())
+        params["oauth_signature"] = _pct(base64.b64encode(signature).decode())
+        headers = {
+            "Authorization": _auth_header(self._realm, params),
+            "Accept": "application/json",
+            "User-Agent": _USER_AGENT,
+        }
+        try:
+            r = requests.post(url, headers=headers, timeout=_HTTP_TIMEOUT_S)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"IBKR network error during handshake: {exc}") from exc
+        if r.status_code != 200:
+            raise IBKRAuthError(
+                f"IBKR rejected the live-session-token request (HTTP {r.status_code}). "
+                "Check the consumer key, access token + secret, private keys and DH "
+                "prime all belong to the same OAuth consumer, and note that keys "
+                "created today only activate after IBKR's nightly reset. "
                 f"body={r.text[:300]!r}"
             )
-        if r.status_code >= 400:
-            raise RuntimeError(
-                f"IBKR {method} {path}: HTTP {r.status_code} — {r.text[:400]}"
-            )
-        if not r.text:
-            return {}
         try:
-            return r.json()
+            body = r.json()
+            dh_response = str(body["diffie_hellman_response"])
+            lst_signature = str(body["live_session_token_signature"]).lower()
+            expires_ms = body.get("live_session_token_expiration")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"IBKR handshake returned an unexpected body: {r.text[:300]!r}") from exc
+
+        shared = pow(int(dh_response, 16), a, self._dh_prime)
+        lst = hmac.new(_int_to_dh_bytes(shared), prepend, hashlib.sha1).digest()
+        expected = hmac.new(lst, self._consumer_key.encode(), hashlib.sha1).hexdigest()
+        if not hmac.compare_digest(expected, lst_signature):
+            raise IBKRAuthError(
+                "IBKR live session token failed verification — the DH prime or "
+                "private encryption key doesn't match what the consumer key was "
+                "registered with."
+            )
+        s = self._session
+        s.lst = lst
+        s.lst_expires_at = (
+            float(expires_ms) / 1000.0 if expires_ms else time.time() + 23 * 3600
+        )
+        s.brokerage_checked_at = 0.0
+        s.portfolio_primed = False
+        log.info("ibkr: live session token established for consumer %s…", self._consumer_key[:3])
+
+    def _invalidate_lst(self) -> None:
+        s = self._session
+        with s.lock:
+            s.lst = None
+            s.lst_expires_at = 0.0
+            s.brokerage_checked_at = 0.0
+            s.portfolio_primed = False
+
+    # ── Signed HTTP ───────────────────────────────────────────────────────
+
+    def _http(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+    ) -> tuple[int, Any]:
+        """One signed call. Returns ``(status_code, parsed_body)`` and leaves
+        auth/retry decisions to the caller."""
+        url = BASE_URL + path
+        query = {k: str(v) for k, v in (params or {}).items() if v is not None}
+        oauth = {
+            "oauth_consumer_key": self._consumer_key,
+            "oauth_nonce": secrets.token_hex(16),
+            "oauth_signature_method": "HMAC-SHA256",
+            "oauth_timestamp": str(int(time.time())),
+            "oauth_token": self._access_token,
+        }
+        base = _base_string(method, url, {**query, **oauth})
+        sig = hmac.new(self._lst(), base.encode(), hashlib.sha256).digest()
+        oauth["oauth_signature"] = _pct(base64.b64encode(sig).decode())
+        headers = {
+            "Authorization": _auth_header(self._realm, oauth),
+            "Accept": "application/json",
+            "User-Agent": _USER_AGENT,
+        }
+        try:
+            r = requests.request(
+                method, url, params=query or None, json=json,
+                headers=headers, timeout=_HTTP_TIMEOUT_S,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"IBKR network error: {exc}") from exc
+        if not r.text:
+            return r.status_code, {}
+        try:
+            return r.status_code, r.json()
         except ValueError:
-            return r.text
+            return r.status_code, r.text
+
+    @staticmethod
+    def _says_not_authenticated(body: Any) -> bool:
+        if isinstance(body, dict):
+            err = str(body.get("error") or body.get("message") or "").lower()
+            return "not authenticated" in err or ("session" in err and "expired" in err)
+        if isinstance(body, str):
+            return "not authenticated" in body.lower()
+        return False
+
+    def _ensure_brokerage_session(self, *, force: bool = False) -> None:
+        """Make sure an ``/iserver`` brokerage session is open. Cheap when one
+        was confirmed within the last minute."""
+        s = self._session
+        with s.lock:
+            if not force and time.time() - s.brokerage_checked_at < _BROKERAGE_STATUS_INTERVAL_S:
+                return
+            code, status = self._http("POST", "/iserver/auth/status")
+            if code == 200 and isinstance(status, dict) and status.get("authenticated"):
+                s.brokerage_checked_at = time.time()
+                return
+            code, body = self._http(
+                "POST", "/iserver/auth/ssodh/init", json={"publish": True, "compete": True},
+            )
+            if code == 401:
+                raise IBKRAuthError(f"IBKR brokerage session init rejected (401): {body!r}"[:400])
+            if isinstance(body, dict) and body.get("authenticated"):
+                s.brokerage_checked_at = time.time()
+                return
+            for _ in range(6):
+                time.sleep(1.0)
+                code, status = self._http("POST", "/iserver/auth/status")
+                if code == 200 and isinstance(status, dict) and status.get("authenticated"):
+                    s.brokerage_checked_at = time.time()
+                    return
+            raise RuntimeError(
+                "IBKR brokerage session did not authenticate after ssodh/init. "
+                f"last status={status!r}"[:400]
+            )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+    ) -> Any:
+        """Signed call with the session plumbing: brokerage session for
+        ``/iserver`` and ``/portfolio``, one re-init on "not authenticated",
+        one full re-handshake on 401."""
+        needs_brokerage = path.startswith("/iserver") or path.startswith("/portfolio")
+        if needs_brokerage:
+            self._ensure_brokerage_session()
+        code, body = self._http(method, path, params=params, json=json)
+
+        if code == 401:
+            log.info("ibkr: 401 on %s %s — re-handshaking once", method, path)
+            self._invalidate_lst()
+            if needs_brokerage:
+                self._ensure_brokerage_session(force=True)
+            code, body = self._http(method, path, params=params, json=json)
+            if code == 401:
+                raise IBKRAuthError(
+                    f"IBKR auth rejected (401) on {method} {path} even after a fresh "
+                    f"handshake — the access token may have been revoked. body={body!r}"[:400]
+                )
+        elif needs_brokerage and self._says_not_authenticated(body):
+            log.info("ibkr: brokerage session dropped on %s %s — re-initialising", method, path)
+            self._ensure_brokerage_session(force=True)
+            code, body = self._http(method, path, params=params, json=json)
+
+        if code >= 400:
+            raise RuntimeError(f"IBKR {method} {path}: HTTP {code} — {str(body)[:400]}")
+        if isinstance(body, dict) and body.get("error") and len(body) <= 2:
+            # IBKR reports many failures as 200 + {"error": "..."}.
+            raise RuntimeError(f"IBKR {method} {path}: {body['error']}")
+        return body
+
+    def _portfolio_request(self, method: str, path: str, **kw: Any) -> Any:
+        """``/portfolio/{acct}/*`` endpoints need ``/portfolio/accounts`` to have
+        been called once in the session; do that lazily."""
+        s = self._session
+        if not s.portfolio_primed:
+            self._request("GET", "/portfolio/accounts")
+            s.portfolio_primed = True
+        return self._request(method, path, **kw)
 
     # ── Account info / verify ─────────────────────────────────────────────
 
     def verify_connection(self) -> ConnectionInfo:
-        """Lightweight authenticated call: list the accounts the OAuth
-        token can see. If our stored ``account_id`` isn't among them,
-        surface a clean message so the user can fix the form instead of
-        having every subsequent order fail mysteriously."""
+        """Full handshake + brokerage session + list the accounts the token
+        can see. If our stored ``account_id`` isn't among them, surface a
+        clean message so the user can fix the form instead of having every
+        subsequent order fail mysteriously."""
+        self._lst()
         body = self._request("GET", "/portfolio/accounts")
-        accounts = body if isinstance(body, list) else (body.get("accounts") if isinstance(body, dict) else [])
-        account_ids = {str(_attr(a, "accountId", "id")) for a in (accounts or []) if a}
-        if self._account_id and self._account_id not in account_ids:
+        self._session.portfolio_primed = True
+        accounts = body if isinstance(body, list) else (
+            body.get("accounts") if isinstance(body, dict) else []
+        )
+        account_ids = {
+            str(_attr(a, "accountId", "id") or "").upper()
+            for a in (accounts or []) if a
+        } - {""}
+        if account_ids and self._account_id not in account_ids:
             raise RuntimeError(
                 f"IBKR auth succeeded but account_id '{self._account_id}' "
-                f"isn't in the connected accounts ({sorted(account_ids) or '[]'}). "
+                f"isn't in the connected accounts ({sorted(account_ids)}). "
                 "Re-check the account number on the connect form."
             )
         return ConnectionInfo(
             broker_account_id=self._account_id,
-            # IBKR fractional-share support is symbol-specific and gated
-            # by account permissions. Default off; subscribers can change
-            # their broker_account.supports_fractional manually if they
-            # know their account is enabled.
+            # Fractional-share support is symbol-specific and gated by
+            # account permissions; default off.
             supports_fractional=False,
             extra={"paper": self._paper, "accounts": sorted(account_ids)},
         )
 
-    # ── Contract resolution (symbol → conid) ──────────────────────────────
+    # ── Contract resolution ───────────────────────────────────────────────
 
     def _conid_for(self, symbol: str) -> int:
+        """Stock (also an option's underlying) → conid."""
         sym = symbol.upper().strip()
         if sym in self._conid_cache:
             return self._conid_cache[sym]
-        body = self._request("GET", "/iserver/secdef/search", params={"symbol": sym})
+        body = self._request(
+            "GET", "/iserver/secdef/search", params={"symbol": sym, "secType": "STK"},
+        )
         if not isinstance(body, list) or not body:
             raise RuntimeError(f"IBKR symbol lookup empty for '{sym}'")
-        # Prefer the U.S. stock whose ticker exactly matches; fall back to
-        # the first match if no exact STK hit (rare).
         best = next(
             (h for h in body
-             if (_attr(h, "secType") or "").upper() == "STK"
+             if (_attr(h, "secType") or "STK").upper() == "STK"
              and (_attr(h, "symbol") or "").upper() == sym),
             body[0],
         )
         conid = _attr(best, "conid", "conId")
-        if conid is None:
-            raise RuntimeError(f"IBKR symbol lookup for '{sym}' returned no conid: {best!r}")
         try:
             conid_int = int(conid)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"IBKR conid for '{sym}' is non-numeric: {conid!r}") from exc
+            raise RuntimeError(f"IBKR symbol lookup for '{sym}' returned no usable conid: {best!r}") from exc
         self._conid_cache[sym] = conid_int
         return conid_int
+
+    def _option_conid(
+        self, symbol: str, expiry: date, strike: Decimal, right: OptionRight,
+    ) -> int:
+        """Option contract → conid via ``/iserver/secdef/info`` on the
+        underlying, filtered to the exact expiry."""
+        occ = build_occ_symbol(symbol, expiry, strike, right)
+        if occ in self._conid_cache:
+            return self._conid_cache[occ]
+        underlying = self._conid_for(symbol)
+        month = expiry.strftime("%b%y").upper()          # OCT26
+        want_maturity = expiry.strftime("%Y%m%d")       # 20261017
+        rows = self._request(
+            "GET", "/iserver/secdef/info",
+            params={
+                "conid": underlying,
+                "sectype": "OPT",
+                "month": month,
+                "strike": _fmt_strike(strike),
+                "right": _RIGHT_OUT[right],
+                "exchange": "SMART",
+            },
+        )
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            rows = []
+        match = None
+        for r in rows:
+            if str(_attr(r, "maturityDate", "maturity_date") or "") != want_maturity:
+                continue
+            r_right = str(_attr(r, "right") or _RIGHT_OUT[right]).upper()[:1]
+            if r_right != _RIGHT_OUT[right]:
+                continue
+            r_strike = _to_dec(_attr(r, "strike"))
+            if r_strike is not None and r_strike != strike:
+                continue
+            match = r
+            break
+        if match is None:
+            raise RuntimeError(
+                f"IBKR has no {symbol.upper()} {expiry.isoformat()} "
+                f"{_fmt_strike(strike)}{_RIGHT_OUT[right]} contract "
+                f"({len(rows)} candidate(s) for {month})"
+            )
+        try:
+            conid = int(_attr(match, "conid", "conId"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"IBKR option lookup returned no usable conid: {match!r}") from exc
+        self._conid_cache[occ] = conid
+        self._option_detail_cache[conid] = (symbol.upper(), expiry, strike, right)
+        return conid
+
+    def option_details(self, conid: int | str) -> tuple[str, date, Decimal, OptionRight] | None:
+        """``(underlying, expiry, strike, right)`` for an option conid, from
+        ``/iserver/contract/{conid}/info``. Cached. ``None`` if IBKR's answer
+        can't be read — never raises, so a listener poll survives it."""
+        try:
+            cid = int(conid)
+        except (TypeError, ValueError):
+            return None
+        if cid in self._option_detail_cache:
+            return self._option_detail_cache[cid]
+        try:
+            info = self._request("GET", f"/iserver/contract/{cid}/info")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ibkr: contract info for conid %s failed: %s", cid, exc)
+            return None
+        parsed = parse_contract_desc(_attr(info, "local_symbol", "localSymbol"))
+        if parsed is None:
+            maturity = str(_attr(info, "maturity_date", "maturityDate") or "")
+            strike = _to_dec(_attr(info, "strike"))
+            right_raw = str(_attr(info, "right") or "").upper()[:1]
+            symbol = str(_attr(info, "symbol", "underlying_symbol") or "").upper()
+            if len(maturity) == 8 and strike is not None and right_raw in ("C", "P") and symbol:
+                try:
+                    expiry = date(int(maturity[:4]), int(maturity[4:6]), int(maturity[6:8]))
+                except ValueError:
+                    expiry = None
+                if expiry is not None:
+                    parsed = (
+                        symbol, expiry, strike,
+                        OptionRight.CALL if right_raw == "C" else OptionRight.PUT,
+                    )
+        if parsed is None:
+            log.warning("ibkr: could not read option contract %s: %r", cid, info)
+            return None
+        self._option_detail_cache[cid] = parsed
+        return parsed
 
     # ── Orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
-        if req.instrument_type != InstrumentType.STOCK:
-            raise ValueError(
-                "IBKR adapter: option order placement not yet implemented. "
-                "Externally-placed options ARE detected by the listener; "
-                "placement requires the option-chain resolution flow."
+        if req.order_type not in _TYPE_OUT:
+            raise ValueError(f"IBKR adapter: order type {req.order_type.value} is not supported")
+        if req.take_profit_price is not None or req.stop_loss_price is not None:
+            log.warning(
+                "ibkr: native bracket legs not supported — placing %s %s as a plain "
+                "order; the bracket emulator covers the exits", req.side.value, req.symbol,
             )
-        conid = self._conid_for(req.symbol)
+
+        if req.instrument_type == InstrumentType.OPTION:
+            if req.option_expiry is None or req.option_strike is None or req.option_right is None:
+                raise ValueError("IBKR adapter: option order needs expiry, strike and right")
+            conid = self._option_conid(
+                req.symbol, req.option_expiry, req.option_strike, req.option_right,
+            )
+            sec_type = f"{conid}:OPT"
+        else:
+            conid = self._conid_for(req.symbol)
+            sec_type = f"{conid}:STK"
+
+        qty = req.quantity
         order: dict[str, Any] = {
             "acctId":    self._account_id,
             "conid":     conid,
-            "secType":   "STK",
-            "orderType": _TYPE_OUT.get(req.order_type, "MKT"),
+            "secType":   sec_type,
+            "orderType": _TYPE_OUT[req.order_type],
             "side":      _SIDE_OUT[req.side],
-            "quantity":  float(req.quantity),
+            "quantity":  int(qty) if qty == qty.to_integral_value() else float(qty),
             "tif":       "DAY",
         }
         if req.limit_price is not None:
             order["price"] = float(req.limit_price)
         if req.stop_price is not None:
             order["auxPrice"] = float(req.stop_price)
+        if req.extended_hours and req.instrument_type == InstrumentType.STOCK:
+            order["outsideRTH"] = True
         if req.client_order_id:
             # IBKR caps custom-order-id length; truncate defensively.
             order["cOID"] = str(req.client_order_id)[:32]
@@ -269,17 +804,20 @@ class IBKRAdapter(BrokerAdapter):
             json={"orders": [order]},
         )
         # IBKR returns a list. Each item is either the placed order (with
-        # ``order_id`` + ``order_status``) OR a confirmation prompt with
-        # an ``id`` we must POST to /iserver/reply/{id}. Loop a few times
-        # to clear any "Are you sure?" prompts before giving up.
+        # ``order_id`` + ``order_status``) OR a confirmation prompt with an
+        # ``id`` we must POST to /iserver/reply/{id}. Loop a few times to
+        # clear any "Are you sure?" prompts before giving up.
         for _ in range(5):
+            if isinstance(body, dict):
+                body = [body]
             if not isinstance(body, list) or not body:
                 raise RuntimeError(f"IBKR place_order: unexpected response {body!r}")
             first = body[0]
+            if isinstance(first, dict) and first.get("error"):
+                raise RuntimeError(f"IBKR place_order rejected: {first['error']}")
             order_status = _attr(first, "order_status", "orderStatus", "status")
             broker_order_id = _attr(first, "order_id", "orderId")
-            if order_status is None and _attr(first, "id"):
-                # Confirmation prompt — acknowledge and continue the loop.
+            if broker_order_id is None and _attr(first, "id"):
                 body = self._request(
                     "POST",
                     f"/iserver/reply/{_attr(first, 'id')}",
@@ -299,9 +837,7 @@ class IBKRAdapter(BrokerAdapter):
 
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
         """IBKR has no clean get-by-id; we scan the recent-orders feed
-        (same source the listener uses). Matches WebullAdapter /
-        SnapTradeAdapter pattern — this is called rarely (status checks
-        / cancel cascade)."""
+        (same source the listener uses)."""
         for o in self.list_recent_activities():
             if str(_attr(o, "orderId", "order_id", "id") or "") == str(broker_order_id):
                 return self._order_to_result(o)
@@ -325,29 +861,49 @@ class IBKRAdapter(BrokerAdapter):
         out: list[BrokerPosition] = []
         page = 0
         while True:
-            body = self._request(
+            body = self._portfolio_request(
                 "GET", f"/portfolio/{self._account_id}/positions/{page}"
             )
-            rows = body if isinstance(body, list) else (body.get("positions") if isinstance(body, dict) else [])
+            rows = body if isinstance(body, list) else (
+                body.get("positions") if isinstance(body, dict) else []
+            )
             if not rows:
                 break
             for p in rows:
                 qty = _to_dec(_attr(p, "position", "quantity")) or Decimal(0)
                 if qty == 0:
                     continue
-                symbol_raw = str(_attr(p, "contractDesc", "ticker", "symbol") or "")
+                desc = str(_attr(p, "contractDesc", "ticker", "symbol") or "")
                 sec_type = (_attr(p, "secType", "assetClass") or "").upper()
-                instrument = (
-                    InstrumentType.OPTION if sec_type in ("OPT", "FOP")
-                    else InstrumentType.STOCK
-                )
+                conid = _attr(p, "conid", "conId")
+                if sec_type in ("OPT", "FOP"):
+                    details = self.option_details(conid) if conid is not None else None
+                    if details is None:
+                        details = parse_contract_desc(desc)
+                    if details is not None:
+                        root, expiry, strike, right = details
+                        out.append(BrokerPosition(
+                            broker_symbol=build_occ_symbol(root, expiry, strike, right),
+                            symbol=root,
+                            instrument_type=InstrumentType.OPTION,
+                            quantity=qty,
+                            avg_entry_price=_to_dec(_attr(p, "avgPrice", "avgCost")),
+                            current_price=_to_dec(_attr(p, "mktPrice", "marketPrice")),
+                            market_value=_to_dec(_attr(p, "mktValue", "marketValue")),
+                            unrealized_pnl=_to_dec(_attr(p, "unrealizedPnl")),
+                            cost_basis=None,
+                            option_expiry=expiry,
+                            option_strike=strike,
+                            option_right=right,
+                        ))
+                        continue
+                    log.warning("ibkr: option position %s (%r) unparsed; kept without legs", conid, desc)
                 out.append(BrokerPosition(
-                    broker_symbol=str(_attr(p, "conid", "conId") or symbol_raw),
-                    # contractDesc for options reads like "AAPL 06JUN26 200 C" —
-                    # the first token is the underlying, which is the friendly
-                    # display value. For stocks it's just the ticker.
-                    symbol=symbol_raw.split(" ")[0],
-                    instrument_type=instrument,
+                    broker_symbol=str(conid or desc),
+                    symbol=desc.split(" ")[0].upper(),
+                    instrument_type=(
+                        InstrumentType.OPTION if sec_type in ("OPT", "FOP") else InstrumentType.STOCK
+                    ),
                     quantity=qty,
                     avg_entry_price=_to_dec(_attr(p, "avgCost", "avg_cost", "avgPrice")),
                     current_price=_to_dec(_attr(p, "mktPrice", "marketPrice")),
@@ -356,8 +912,8 @@ class IBKRAdapter(BrokerAdapter):
                     cost_basis=None,
                 ))
             page += 1
-            # IBKR returns pages of 100 per their convention; under-full
-            # means we've hit the end. Cap defensively at 20 pages.
+            # IBKR pages positions 100 at a time; an under-full page is the
+            # last one. Cap defensively.
             if len(rows) < 100 or page > 20:
                 break
         return out
@@ -374,12 +930,11 @@ class IBKRAdapter(BrokerAdapter):
             orders = body
         else:
             orders = []
-        # IBKR can return orders for sibling sub-accounts; scope to ours
-        # so we only see what belongs to this user's connected account.
+        # IBKR can return orders for sibling sub-accounts; scope to ours.
         return [
             o for o in orders
             if not _attr(o, "acctId", "account")
-            or _attr(o, "acctId", "account") == self._account_id
+            or str(_attr(o, "acctId", "account")).upper() == self._account_id
         ]
 
     # ── helpers ───────────────────────────────────────────────────────────
@@ -389,8 +944,7 @@ class IBKRAdapter(BrokerAdapter):
         status_str = _norm_status(_attr(o, "status", "orderStatus"))
         filled = _to_dec(_attr(o, "filledQuantity", "cumQty")) or Decimal(0)
         avg = _to_dec(_attr(o, "avgPrice", "lastPrice"))
-        # IBKR returns timestamps as either ISO strings or epoch ms.
-        ts = _attr(o, "lastExecutionTime", "submittedTime", "time")
+        ts = _attr(o, "lastExecutionTime_r", "lastExecutionTime", "submittedTime", "time")
         submitted_at = self._parse_ts(ts) or datetime.now(timezone.utc)
         return BrokerOrderResult(
             broker_order_id=broker_order_id,
