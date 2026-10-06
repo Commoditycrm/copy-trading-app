@@ -51,27 +51,16 @@ def _key_of_guard(g) -> tuple:
 
 
 def _current_price(pos, user_id=None) -> Decimal | None:
-    """The price this position is being judged at.
+    """The price this position is being judged at: Alpaca's live quote (see
+    services/live_marks), else the broker's own mark.
 
     A hand-pinned price wins when the feature is switched on, which is how the
     ladder gets tested without waiting for the market. It is off by default and
     must stay off in production — see services/price_override.
     """
-    if user_id is not None:
-        from app.services import price_override  # noqa: PLC0415
-        pinned = price_override.apply_to(user_id, pos)
-        if pinned is not None:
-            log.info("discord stops: using pinned price %s for %s", pinned, pos.symbol)
-            return pinned
+    from app.services import live_marks  # noqa: PLC0415
 
-    raw = getattr(pos, "current_price", None)
-    if raw is None:
-        return None
-    try:
-        price = Decimal(str(raw))
-    except Exception:  # noqa: BLE001
-        return None
-    return price if price > 0 else None
+    return live_marks.position_mark(pos, user_id)
 
 
 STOP = "stop"
@@ -117,7 +106,7 @@ def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal]
     return TRAIL, min(qty, held), peak
 
 
-def enforce(db: Session, user_id, adapter, close_position) -> int:
+def enforce(db: Session, user_id, adapter, close_position, positions=None) -> int:
     """Advance every protection this trader has live. Returns how many fired.
 
     ``close_position(position, guard, quantity)`` is injected so this module
@@ -128,12 +117,13 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
     if not rows:
         return 0
 
-    try:
-        positions = adapter.get_positions()
-    except Exception:  # noqa: BLE001
-        # A failed read is not a reason to exit anything. Skip the tick.
-        log.warning("discord stops: position read failed for user=%s", user_id, exc_info=True)
-        return 0
+    if positions is None:            # the caller's read of this tick, when it has one
+        try:
+            positions = adapter.get_positions()
+        except Exception:  # noqa: BLE001
+            # A failed read is not a reason to exit anything. Skip the tick.
+            log.warning("discord stops: position read failed for user=%s", user_id, exc_info=True)
+            return 0
 
     by_contract = {_key_of_position(p): p for p in positions}
     fired = 0
