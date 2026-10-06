@@ -884,7 +884,7 @@ def _pinned(user_id, guard) -> bool:
     return price_override.get_pin(user_id, key) is not None
 
 
-def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
+def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = None) -> None:
     """Advance the stops and trailing exits a Discord trim left behind.
 
     Set by the trim ladder: a stop level under what's still held, and sometimes
@@ -948,6 +948,8 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
 
             try:
                 positions = adapter.get_positions()
+                if seen is not None:
+                    seen["positions"] = positions   # the option-SL monitor reuses it
             except Exception:  # noqa: BLE001
                 positions = None
                 log.warning(
@@ -1077,7 +1079,10 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
         enforce_trader_option_sl,
     )
 
-    _enforce_discord_trailing_stops(acct)
+    # One positions read per tick: the option-SL monitor below reuses the
+    # stop pass's read rather than making a second one milliseconds later.
+    seen: dict = {}
+    _enforce_discord_trailing_stops(acct, seen)
 
     # Discord: for a Discord-enabled trader, periodically pull their latest fills
     # and broadcast any new ones — a path-independent backstop so alerts fire
@@ -1104,7 +1109,7 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
     notifications_to_send: list[dict[str, Any]] = []
 
     with SessionLocal() as db:
-        closures = enforce_trader_option_sl(db, acct.user_id, acct.id)
+        closures = enforce_trader_option_sl(db, acct.user_id, acct.id, positions=seen.get("positions"))
         if not closures:
             return
         for c in closures:
