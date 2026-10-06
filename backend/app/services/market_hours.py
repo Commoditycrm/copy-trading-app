@@ -183,10 +183,12 @@ REGULAR = "regular"
 AFTER_HOURS = "after_hours"
 CLOSED = "closed"
 
-# NYSE half-day schedule: the regular session ends at 13:00 ET and extended
-# hours end at 17:00 ET on early-close days.
+# NYSE half-day schedule: the regular session ends early at 13:00 ET. The
+# post-market window is NOT shortened for polling purposes — it runs to the same
+# POSTMARKET_END (20:00 ET) that in_extended_hours() uses, so the pollers never
+# treat the market as closed while the order-routing logic still considers
+# extended-hours trading active (one shared definition of the extended window).
 EARLY_CLOSE = time(13, 0)
-EARLY_CLOSE_POSTMARKET_END = time(17, 0)
 
 
 def is_early_close_day(d: date) -> bool:
@@ -213,21 +215,21 @@ def regular_close_time(d: date) -> time:
 def market_session(dt_et: datetime | None = None) -> str:
     """Classify the US market session right now: PRE_MARKET / REGULAR /
     AFTER_HOURS / CLOSED. Holiday- and early-close-aware (weekends and full
-    holidays are CLOSED; half-days end REGULAR at 13:00 and AFTER_HOURS at
-    17:00). This is the single source of truth the pollers key their cadence
-    off."""
+    holidays are CLOSED). On a half-day the REGULAR session ends early at 13:00,
+    but AFTER_HOURS still runs to POSTMARKET_END (20:00 ET) — the same boundary
+    in_extended_hours() uses — so polling stays at full cadence for as long as
+    the app considers extended-hours trading possible. This is the single source
+    of truth the pollers key their cadence off."""
     dt = dt_et or now_et()
     if not is_regular_trading_day(dt):          # weekend or full holiday
         return CLOSED
-    early = is_early_close_day(dt.date())
-    close_t = EARLY_CLOSE if early else MARKET_CLOSE
-    post_end = EARLY_CLOSE_POSTMARKET_END if early else POSTMARKET_END
+    close_t = EARLY_CLOSE if is_early_close_day(dt.date()) else MARKET_CLOSE
     t = dt.time()
     if PREMARKET_START <= t < REGULAR_OPEN:
         return PRE_MARKET
     if REGULAR_OPEN <= t < close_t:
         return REGULAR
-    if close_t <= t < post_end:
+    if close_t <= t < POSTMARKET_END:
         return AFTER_HOURS
     return CLOSED
 
