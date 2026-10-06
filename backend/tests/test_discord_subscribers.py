@@ -78,8 +78,11 @@ def _channel(db, owner=TRADER, channel_id="111", label="Sniper"):
 
 
 def _raw(content, mid="9001"):
+    # Posted just now: an alert that arrives late is held for approval
+    # (services/discord_freshness), which is not what these tests are about.
+    from datetime import datetime, timezone
     return {"message_id": mid, "channel_id": "111", "content": content,
-            "timestamp": "2026-09-30T16:13:33Z"}
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 # ── who gets it ──────────────────────────────────────────────────────────────
@@ -242,3 +245,13 @@ def test_a_subscriber_can_only_switch_a_channel_on_or_off():
     with pytest.raises(HTTPException) as e:
         discord_sources.update_source(mirror.id, DiscordSourceUpdateIn(label="Mine"), db, sub)
     assert e.value.status_code == 403
+
+
+def test_a_late_entry_is_held_for_the_subscriber_too():
+    """The backlog a reconnecting listener replays reaches subscribers as well;
+    their late entries wait for approval just like the trader's."""
+    import inspect
+    from app.services import discord_subscribers as subs
+    src = inspect.getsource(subs.relay_for_subscriber)
+    assert "discord_freshness.hold_if_stale(msg)" in src
+    assert src.index("hold_if_stale") < src.index("_execute_signal")
