@@ -17,7 +17,8 @@ What each carries, and what execution fills in:
     ``nearest_expiry``, so execution buys the nearest listed expiry.
   * add    — BUY at the stated price, ``add_to_latest`` + ``double_up``:
     execution resolves the contract from this CHANNEL's latest open position
-    and doubles it (average down), refusing if the channel has nothing open.
+    and doubles it (average down). With nothing open — stopped out — it
+    re-enters the channel's latest contract as a new position.
   * trim   — SELL of the named symbol's position through the exit ladder.
     "add trim" is a trim: a stated gain is an exit call, not a buy.
 

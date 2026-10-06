@@ -877,12 +877,21 @@ def test_an_average_down_is_not_also_halved(monkeypatch):
     assert r.payload.quantity == Decimal("4")
 
 
-def test_an_average_down_with_nothing_held_is_refused(monkeypatch):
-    """Nothing to average INTO. Taking the default size here would open a
-    fresh position at a price the channel is calling a loss."""
+def test_an_average_with_nothing_held_re_enters_as_a_new_position(monkeypatch):
+    """Stopped out of it, and the author adds: they are still in, so this is a
+    new entry — sized like one (Contracts per alert), not refused."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
-    with pytest.raises(ex.ExecutionRefused, match="no position in that contract"):
-        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=3))
+    assert r.is_closing is False and r.payload.side.value == "buy"
+    assert r.payload.quantity == Decimal("3")
+    assert r.held_quantity is None
+    assert "re-entering" in r.resolutions["reentry"]
+
+
+def test_a_light_re_entry_is_halved_like_any_light_entry(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
+    r = ex.resolve(None, _User(), _signal(double_up=True, half_size=True), ex.Sizing(multiplier=4))
+    assert r.payload.quantity == Decimal("2")
 
 
 def test_an_average_down_matches_the_contract_not_just_the_symbol(monkeypatch):
@@ -892,8 +901,9 @@ def test_an_average_down_matches_the_contract_not_just_the_symbol(monkeypatch):
         contracts=[_Contract(100)],
         positions=[_Pos(strike="105", qty="8")],      # MSFT 105C, not 100C
     ))
-    with pytest.raises(ex.ExecutionRefused, match="no position in that contract"):
-        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    assert r.payload.quantity == Decimal("1")        # a fresh entry, not 8 from the 105C
+    assert "reentry" in r.resolutions
 
 
 def test_the_doubling_is_recorded_for_the_audit_trail(monkeypatch):
@@ -938,11 +948,12 @@ def test_an_average_into_an_ordinary_position_still_doubles(monkeypatch):
     assert r.payload.quantity == Decimal("4") and r.held_quantity == Decimal("4")
 
 
-def test_a_light_average_with_nothing_held_is_still_refused(monkeypatch):
+def test_with_nothing_held_the_opening_size_rule_does_not_apply(monkeypatch):
+    """No position, so nothing to add the opening size to: a plain re-entry."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
     monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: Decimal("2"))
-    with pytest.raises(ex.ExecutionRefused):
-        ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=5))
+    assert r.payload.quantity == Decimal("5") and "reentry" in r.resolutions
 
 
 class _LightDB:
