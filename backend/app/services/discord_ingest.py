@@ -86,6 +86,9 @@ class IngestReport:
     # — that would place a second order for one trade. The caller repoints the
     # order the message already placed instead.
     edited: list[Any] = field(default_factory=list)
+    # Rows whose message the author DELETED in Discord. The caller withdraws the
+    # entry it placed (services/discord_repost.apply_delete); nothing is stored.
+    deleted: list[Any] = field(default_factory=list)
     # NOT taken: nothing was stored and the message is gone unless re-observed.
     rejected: list[dict[str, str]] = field(default_factory=list)
     # Stored, but couldn't be pushed onto the pipeline queue. Deliberately NOT
@@ -111,6 +114,7 @@ class IngestReport:
             "accepted": len(self.accepted),
             "duplicates": len(self.duplicates),
             "edited": len(self.edited),
+            "deleted": len(self.deleted),
             "rejected": self.rejected,
             "queue_failed": len(self.queue_failed),
         }
@@ -204,6 +208,23 @@ def _persist(
             pass
         return _apply_edit(db, source, raw, auto_approve=auto_approve)
     return row, False
+
+
+def _deleted_row(db: Session, source: DiscordAlertSource, message_id: str) -> DiscordMessage | None:
+    """The stored row for a message the author deleted — None when we never
+    stored it (history from before the channel was connected) or the deletion
+    was already handled (a reconnect replays what it saw)."""
+    from app.services.discord_repost import DELETED_PREFIX  # noqa: PLC0415
+
+    row = db.execute(
+        select(DiscordMessage).where(
+            DiscordMessage.source_id == source.id,
+            DiscordMessage.discord_message_id == message_id,
+        )
+    ).scalars().first()
+    if row is None or (row.status_reason or "").startswith(DELETED_PREFIX):
+        return None
+    return row
 
 
 def _apply_edit(
@@ -351,6 +372,14 @@ def ingest_batch(
             # No snowflake means no idempotency key, so this message could never
             # be de-duplicated. Reject rather than invent one.
             report.rejected.append({"message_id": "", "reason": "missing_message_id"})
+            continue
+
+        if raw.get("is_delete"):
+            gone = _deleted_row(db, source, message_id)
+            if gone is None:
+                report.duplicates.append(message_id)   # never ours, or already handled
+            else:
+                report.deleted.append(gone)
             continue
 
         row, was_edit = _persist(db, source, raw, auto_approve=auto_approve)

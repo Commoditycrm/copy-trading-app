@@ -173,6 +173,9 @@ class DiscordIncomingMessage(BaseModel):
     # one arrive. Discord edits alerts in place often enough ("filled", "closed"
     # appended to the original post) that the parser will need to know.
     is_edit: bool = False
+    # True when the message was removed from the channel — the author deleted
+    # it. Carries no content; only the id matters.
+    is_delete: bool = False
 
 
 class DiscordMessageBatchIn(BaseModel):
