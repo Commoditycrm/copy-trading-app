@@ -27,7 +27,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.brokers.ibkr import IBKRAdapter
+from app.brokers.ibkr import IBKRAdapter, parse_contract_desc
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import (
@@ -298,7 +298,8 @@ def _poll_once(
             seen[broker_order_id] = status_str
 
             _persist_and_fanout(
-                trader_user_id, broker_account_id, broker_order_id, status_str, o
+                trader_user_id, broker_account_id, broker_order_id, status_str, o,
+                adapter=adapter,
             )
 
 
@@ -328,6 +329,7 @@ def _persist_and_fanout(
     broker_order_id: str,
     status_str: str,
     order_obj: Any,
+    adapter: IBKRAdapter | None = None,
 ) -> None:
     status_enum = _STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
 
@@ -436,7 +438,8 @@ def _persist_and_fanout(
                 return
 
         order = _insert_order_from_ibkr(
-            db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
+            db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum,
+            adapter=adapter,
         )
         order.trader_submitted_at = _as_dt(
             _attr(order_obj, "lastExecutionTime", "submittedTime", "time")
@@ -506,12 +509,14 @@ def _insert_order_from_ibkr(
     broker_order_id: str,
     order_obj: Any,
     status_enum: OrderStatus,
+    adapter: IBKRAdapter | None = None,
 ) -> Order:
     """Translate an IBKR order payload into our Order schema and INSERT.
 
-    Stocks-only for now (matches the adapter's placement scope). Option
-    detection lives in the contract description; once IBKR option
-    placement is implemented we'll parse expiry/strike/right out here."""
+    Options carry expiry/strike/right so the copy engine can place the
+    mirror: resolved from the order's conid via ``adapter.option_details``
+    (authoritative, cached), falling back to parsing IBKR's contract
+    description when the lookup is unavailable."""
     side_raw = str(_attr(order_obj, "side") or "").upper()
     side = _BUY if side_raw == "BUY" else _SELL
 
@@ -528,6 +533,33 @@ def _insert_order_from_ibkr(
     symbol_raw = str(_attr(order_obj, "ticker", "symbol", "contractDesc") or "")
     symbol = symbol_raw.split(" ")[0].upper()
 
+    option_expiry = option_strike = option_right = None
+    if instrument == InstrumentType.OPTION:
+        details = None
+        conid = _attr(order_obj, "conid", "conId")
+        if adapter is not None and conid is not None:
+            details = adapter.option_details(conid)
+        if details is None:
+            desc1 = str(_attr(order_obj, "description1") or "")
+            desc2 = str(_attr(order_obj, "description2") or "")
+            for candidate in (
+                _attr(order_obj, "contractDesc"),
+                f"{desc1} {desc2}".strip(),
+                desc2,
+                _attr(order_obj, "localSymbol", "local_symbol"),
+            ):
+                details = parse_contract_desc(candidate)
+                if details is not None:
+                    break
+        if details is not None:
+            symbol, option_expiry, option_strike, option_right = details
+        else:
+            log.warning(
+                "ibkr-listener[%s] option order %s has no readable contract "
+                "(conid=%s, desc=%r) — recorded without expiry/strike/right",
+                trader_user_id, broker_order_id, conid, symbol_raw,
+            )
+
     qty = _to_dec(_attr(order_obj, "totalSize", "quantity")) or Decimal(0)
     limit_price = _to_dec(_attr(order_obj, "price"))
     stop_price = _to_dec(_attr(order_obj, "auxPrice", "stopPrice"))
@@ -543,13 +575,9 @@ def _insert_order_from_ibkr(
         broker_account_id=broker_account_id,
         instrument_type=instrument,
         symbol=symbol,
-        # Option fields stay None for stocks; option placement is a TODO,
-        # but if a trader places an option on IBKR's app directly we'll
-        # detect it as instrument_type=OPTION with the underlying as
-        # symbol — a follow-up will parse expiry/strike/right.
-        option_expiry=None,
-        option_strike=None,
-        option_right=None,
+        option_expiry=option_expiry,
+        option_strike=option_strike,
+        option_right=option_right,
         side=side,
         order_type=order_type,
         quantity=qty,

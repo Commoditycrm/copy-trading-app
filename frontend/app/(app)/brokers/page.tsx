@@ -315,13 +315,15 @@ export default function BrokersPage() {
   const [stPaper, setStPaper] = useState(false);
 
   // IBKR direct-OAuth form state. Each field maps 1:1 to the backend's
-  // IbkrCredentialsIn schema. Long fields (signing_key, access_token_secret)
-  // use textareas because IBKR keys can run to several hundred characters
+  // IbkrCredentialsIn schema. The PEM keys, the DH prime and the encrypted
+  // access token secret use textareas because they run to many hundreds of characters
   // for RSA-style OAuth configurations.
   const [ibkrLabel, setIbkrLabel] = useState("");
   const [ibkrAccountId, setIbkrAccountId] = useState("");
   const [ibkrConsumerKey, setIbkrConsumerKey] = useState("");
-  const [ibkrSigningKey, setIbkrSigningKey] = useState("");
+  const [ibkrSignatureKey, setIbkrSignatureKey] = useState("");
+  const [ibkrEncryptionKey, setIbkrEncryptionKey] = useState("");
+  const [ibkrDhPrime, setIbkrDhPrime] = useState("");
   const [ibkrAccessToken, setIbkrAccessToken] = useState("");
   const [ibkrAccessTokenSecret, setIbkrAccessTokenSecret] = useState("");
   const [ibkrPaper, setIbkrPaper] = useState(false);
@@ -457,7 +459,8 @@ export default function BrokersPage() {
     setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
-    setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
+    setIbkrSignatureKey(""); setIbkrEncryptionKey(""); setIbkrDhPrime("");
+    setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
     setIbkrPaper(false);
   }
 
@@ -471,12 +474,14 @@ export default function BrokersPage() {
           broker: "ibkr",
           label: ibkrLabel.trim(),
           ibkr: {
-            consumer_key:        ibkrConsumerKey.trim(),
-            signing_key:         ibkrSigningKey.trim(),
-            access_token:        ibkrAccessToken.trim(),
-            access_token_secret: ibkrAccessTokenSecret.trim(),
-            account_id:          ibkrAccountId.trim(),
-            paper:               ibkrPaper,
+            consumer_key:           ibkrConsumerKey.trim(),
+            access_token:           ibkrAccessToken.trim(),
+            access_token_secret:    ibkrAccessTokenSecret.trim(),
+            private_signature_key:  ibkrSignatureKey.trim(),
+            private_encryption_key: ibkrEncryptionKey.trim(),
+            dh_prime:               ibkrDhPrime.trim(),
+            account_id:             ibkrAccountId.trim(),
+            paper:                  ibkrPaper,
           },
         }),
       });
@@ -1114,11 +1119,17 @@ export default function BrokersPage() {
             </div>
             <p className="text-xs" style={{ color: "var(--muted)" }}>
               Direct IBKR integration via their OAuth 1.0a Web API — no
-              aggregator, no local gateway. Generate the four OAuth values
-              in your IBKR Client Portal under{" "}
-              <strong>Settings → API → OAuth</strong> (self-service
-              consumer registration) and paste them here together with
-              your IBKR account number. Mirror latency is typically 2–5s.
+              aggregator, no local gateway. In IBKR Client Portal under{" "}
+              <strong>Settings → API → OAuth</strong>, register a self-service
+              consumer with a signature key, an encryption key and DH
+              parameters you generate, then create an access token. Paste the
+              consumer key, the access token and its encrypted secret, both
+              private keys and the DH prime here with your account number.
+              Mirror latency is typically 2–5s.
+            </p>
+            <p className="text-xs" style={{ color: "var(--muted)" }}>
+              IBKR activates new OAuth keys during its nightly reset, so a
+              consumer created today can only be connected tomorrow.
             </p>
             <form onSubmit={connectIbkr} className="space-y-3">
               <div>
@@ -1157,18 +1168,6 @@ export default function BrokersPage() {
                 />
               </div>
               <div>
-                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Signing key</label>
-                <textarea
-                  className="w-full p-2.5 font-mono text-xs"
-                  rows={3}
-                  placeholder="Paste your consumer signing key (long base64 / PEM)"
-                  aria-label="IBKR signing key"
-                  value={ibkrSigningKey}
-                  onChange={e => setIbkrSigningKey(e.target.value)}
-                  required
-                />
-              </div>
-              <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Access token</label>
                 <input
                   type="text"
@@ -1184,9 +1183,46 @@ export default function BrokersPage() {
                 <textarea
                   className="w-full p-2.5 font-mono text-xs"
                   rows={3}
+                  placeholder="The base64 secret IBKR showed once, encrypted to your encryption key"
                   aria-label="IBKR access token secret"
                   value={ibkrAccessTokenSecret}
                   onChange={e => setIbkrAccessTokenSecret(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Private signature key (PEM)</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={4}
+                  placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+                  aria-label="IBKR private signature key"
+                  value={ibkrSignatureKey}
+                  onChange={e => setIbkrSignatureKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Private encryption key (PEM)</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={4}
+                  placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+                  aria-label="IBKR private encryption key"
+                  value={ibkrEncryptionKey}
+                  onChange={e => setIbkrEncryptionKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>DH prime</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={3}
+                  placeholder="Hex modulus from the OAuth page, or paste the whole dhparam.pem"
+                  aria-label="IBKR DH prime"
+                  value={ibkrDhPrime}
+                  onChange={e => setIbkrDhPrime(e.target.value)}
                   required
                 />
               </div>
@@ -1201,8 +1237,9 @@ export default function BrokersPage() {
                 {busy && <Spinner />}
               </button>
               <p className="text-[10px]" style={{ color: "var(--muted)" }}>
-                We verify the credentials with a live IBKR call before
-                saving. Stored Fernet-encrypted at rest; never logged.
+                We complete IBKR&apos;s live-session handshake and list your
+                accounts before saving. Keys are stored Fernet-encrypted at
+                rest and never logged.
               </p>
             </form>
           </>
