@@ -8,6 +8,20 @@ from pydantic import BaseModel, Field, model_validator
 from app.models.order import InstrumentType, OptionRight, OrderType
 
 
+class ProtectionOut(BaseModel):
+    """One thing protecting a position — see services/position_protections."""
+    kind: str                         # "stop" | "trailing_stop" | "take_profit"
+    price: str | None = None          # the level now (a trailing stop's current stop)
+    quantity: str | None = None       # contracts / shares covered; None = the whole position
+    where: str = "app"                # the broker it rests at ("Webull", "Alpaca"), or "app"
+    order_id: str | None = None       # the resting order, when there is one
+    source: str = "order"             # "ladder" | "order" | "bracket"
+    note: str | None = None           # e.g. "Trim 2", "linked to the take-profit"
+    trail_pct: str | None = None
+    trail_amount: str | None = None
+    peak: str | None = None           # the high a trailing stop is measured from
+
+
 class PositionOut(BaseModel):
     broker_account_id: uuid.UUID
     broker_symbol: str                # canonical broker id (OCC for options, ticker for stocks)
@@ -43,6 +57,9 @@ class PositionOut(BaseModel):
     # That stop is its own order at the broker (not the entry's bracket SL), so
     # the row needs to know about it to offer "Cancel stop" for it.
     ladder_stop_price: Decimal | None = None
+    # Stops, trailing stops and take-profits on this position (Positions page
+    # icons + their details).
+    protections: list[ProtectionOut] = []
 
 
 class UnreachableAccount(BaseModel):

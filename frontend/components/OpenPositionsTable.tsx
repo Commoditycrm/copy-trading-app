@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, Search, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, Search, Shield, Target, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
@@ -19,7 +19,7 @@ import { Spinner } from "@/components/Spinner";
 import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
-import type { BrokerAccount, Order, Position, PositionsPayload, StaleAccount, UnreachableAccount, User } from "@/lib/types";
+import type { BrokerAccount, Order, Position, PositionsPayload, Protection, StaleAccount, UnreachableAccount, User } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
 const POS_KEY = "positions:table";
@@ -219,6 +219,129 @@ function ModeCaret({ mode, labels, onChange, disabled, variant, actions = [] }: 
         </div>
       )}
     </div>
+  );
+}
+
+/** How each kind of protection looks: icon, name, colours. */
+const PROTECTION_STYLE: Record<Protection["kind"] | "none", { Icon: typeof Shield; name: string; fg: string; bg: string }> = {
+  stop: { Icon: Shield, name: "Stop", fg: "var(--warn, #b45309)", bg: "rgba(180,83,9,0.14)" },
+  trailing_stop: { Icon: TrendingUp, name: "Trailing stop", fg: "var(--accent)", bg: "var(--accent-glow)" },
+  take_profit: { Icon: Target, name: "Take-profit", fg: "var(--good)", bg: "var(--good-soft)" },
+  none: { Icon: AlertTriangle, name: "Nothing placed", fg: "var(--bad)", bg: "var(--bad-soft)" },
+};
+const PROTECTION_ORDER: Protection["kind"][] = ["stop", "trailing_stop", "take_profit"];
+
+/** Small round icons beside the symbol: one per kind of protection placed (no
+ *  prices — those are in the row that opens on click), or a red warning when
+ *  nothing protects the position. */
+function ProtectionIcons({ items, open, onToggle }: { items: Protection[]; open: boolean; onToggle: () => void }) {
+  const kinds: (Protection["kind"] | "none")[] = items.length
+    ? PROTECTION_ORDER.filter((k) => items.some((i) => i.kind === k))
+    : ["none"];
+  return (
+    <span className="inline-flex items-center gap-1 ml-1.5">
+      {kinds.map((k) => {
+        const { Icon, name, fg, bg } = PROTECTION_STYLE[k];
+        const label = k === "none" ? "No stop or take-profit" : `${name} placed`;
+        return (
+          <button
+            key={k}
+            type="button"
+            onClick={onToggle}
+            aria-expanded={open}
+            aria-label={`${label} — ${open ? "hide" : "show"} details`}
+            title={label}
+            className="focus-ring inline-flex items-center justify-center rounded-full"
+            style={{ width: 20, height: 20, background: bg, color: fg, boxShadow: open ? `0 0 0 1.5px ${fg}` : "none" }}
+          >
+            <Icon size={12} />
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+/** Opens under a position when one of its protection icons is clicked: each
+ *  stop, trailing stop and take-profit on it, with a Cancel for each. */
+function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSymbol, brokerAccountId, onDone }: {
+  colSpan: number; items: Protection[]; label: string; isOption: boolean; entryOrderId: string | null;
+  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
+}) {
+  const [busy, setBusy] = useState<number | null>(null);
+
+  async function cancel(item: Protection, i: number) {
+    const name = PROTECTION_STYLE[item.kind].name.toLowerCase();
+    const emulatedLadder = !item.order_id && item.source === "ladder";
+    const ask = emulatedLadder
+      ? `Cancel the stops on ${label}? This removes every stop on it, including a trailing stop. The position stays open.`
+      : `Cancel the ${name}${item.price ? ` at ${item.price}` : ""} on ${label}? The position stays open.`;
+    if (!confirm(ask)) return;
+    setBusy(i);
+    try {
+      if (item.order_id) {
+        await api(`/api/trades/${item.order_id}/cancel`, { method: "POST" });
+      } else if (item.source === "bracket" && entryOrderId) {
+        const leg = item.kind === "take_profit" ? "take_profit_price" : "stop_loss_price";
+        await api(`/api/trades/${entryOrderId}/bracket`, { method: "PATCH", body: JSON.stringify({ [leg]: null }) });
+      } else {
+        await api(`/api/positions/${encodeURIComponent(brokerSymbol)}/stops/cancel?broker_account_id=${brokerAccountId}`,
+          { method: "POST" });
+      }
+      notify.success(`${PROTECTION_STYLE[item.kind].name} cancelled`);
+      onDone();
+    } catch (e) { notify.fromError(e, `Could not cancel the ${name}`); }
+    finally { setBusy(null); }
+  }
+
+  const rows = [...items].sort((a, b) => PROTECTION_ORDER.indexOf(a.kind) - PROTECTION_ORDER.indexOf(b.kind));
+  return (
+    <tr style={{ background: "var(--panel-2)" }}>
+      <td colSpan={colSpan} className="px-5 py-2.5">
+        {rows.length === 0 ? (
+          <div className="flex items-center gap-2 text-[12px]" style={{ color: "var(--muted)" }}>
+            <AlertTriangle size={13} style={{ color: "var(--bad)" }} />
+            No stop, trailing stop or take-profit on this position — set one from the arrow in Actions.
+          </div>
+        ) : (
+          <div className="grid gap-x-3 gap-y-1.5 items-center text-[12px]" style={{ gridTemplateColumns: "130px minmax(0,1fr) auto" }}>
+            {rows.map((it, i) => {
+              const { Icon, name, fg } = PROTECTION_STYLE[it.kind];
+              const parts: string[] = [];
+              if (it.note && it.note.startsWith("Trim")) parts.push(it.note);
+              if (it.kind === "trailing_stop" && it.trail_pct) parts.push(`${it.trail_pct}% give-back${it.peak ? ` from high ${it.peak}` : ""}`);
+              else if (it.kind === "trailing_stop" && it.trail_amount) parts.push(`$${it.trail_amount} give-back${it.peak ? ` from high ${it.peak}` : ""}`);
+              const unit = isOption ? "contract" : "share";
+              parts.push(it.quantity ? `${fmtNum(it.quantity, 0)} ${unit}${Number(it.quantity) === 1 ? "" : "s"}` : "whole position");
+              const where = it.where === "app"
+                ? "watched by Kopyya"
+                : `resting at ${it.where}${it.note && !it.note.startsWith("Trim") ? `, ${it.note}` : ""}`;
+              return (
+                <Fragment key={i}>
+                  <span className="inline-flex items-center gap-1.5" style={{ color: "var(--text-2)" }}>
+                    <Icon size={13} style={{ color: fg }} /> {name}
+                  </span>
+                  <span style={{ color: "var(--text)" }}>
+                    {it.kind === "take_profit" ? "target" : "stop"}{" "}
+                    <span className="num font-semibold">{it.price ?? "—"}</span>
+                    {" · "}{parts.join(" · ")}{" · "}
+                    <span style={{ color: "var(--muted)" }}>{where}</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void cancel(it, i)}
+                    disabled={busy !== null}
+                    className="btn-ghost px-2 py-0.5 text-[11px] disabled:opacity-50"
+                  >
+                    {busy === i ? <Spinner /> : "Cancel"}
+                  </button>
+                </Fragment>
+              );
+            })}
+          </div>
+        )}
+      </td>
+    </tr>
   );
 }
 
@@ -678,6 +801,8 @@ export const OpenPositionsTable = forwardRef<
       setCloseLimitPrices((s) => { const n = { ...s }; delete n[key]; return n; });
     // Positions whose stop row (down arrow in Actions) is open.
     const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+    // Which rows have their protections (stops / trailing / take-profits) open.
+    const [protOpen, setProtOpen] = useState<Record<string, boolean>>({});
     // Per row, what each split button does: close the position, or average
     // into it (buy more). Chosen from the ▾ beside the button.
     const [marketMode, setMarketMode] = useState<Record<string, ExitMode>>({});
@@ -1460,6 +1585,11 @@ export const OpenPositionsTable = forwardRef<
                         <span className="inline-flex items-center gap-1.5">
                           <PositionIcon kind={positionKind(p)} />
                           {positionSymbolLabel(p)}
+                          <ProtectionIcons
+                            items={p.protections ?? []}
+                            open={!!protOpen[key]}
+                            onToggle={() => setProtOpen(s => ({ ...s, [key]: !s[key] }))}
+                          />
                         </span>
                       </td>
                     ),
@@ -1658,6 +1788,18 @@ export const OpenPositionsTable = forwardRef<
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
                         {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                       </tr>
+                      {protOpen[key] && (
+                        <ProtectionRow
+                          colSpan={cols.columns.length}
+                          items={p.protections ?? []}
+                          label={positionSymbolLabel(p)}
+                          isOption={p.instrument_type === "option"}
+                          entryOrderId={orderId}
+                          brokerSymbol={p.broker_symbol}
+                          brokerAccountId={p.broker_account_id}
+                          onDone={refresh}
+                        />
+                      )}
                       {expanded[key] && (
                         <PositionStopRow
                           columnIds={cols.columns.map(c => c.id)}
