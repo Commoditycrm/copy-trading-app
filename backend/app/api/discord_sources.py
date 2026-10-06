@@ -2063,6 +2063,21 @@ def _execute_signal(
             return
         signal = {**signal, **latest}
 
+    # The same channel posting the same entry again (a corrected price, a
+    # re-post) is a correction of the trade it already placed, not a second one.
+    try:
+        from app.services import discord_repost  # noqa: PLC0415
+
+        prior = discord_repost.find_recent_entry(db, msg, signal)
+        if prior is not None:
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = discord_repost.absorb(db, msg, *prior, signal)[:480]
+            log.info("discord: alert %s absorbed into %s — %s", msg.id, prior[1].id, msg.status_reason)
+            return
+    except Exception:  # noqa: BLE001
+        # Never let this check stop an alert: it is a guard, not the trade.
+        log.exception("discord: re-post check failed for alert %s", msg.id)
+
     # An entry that never filled — even after the +10% retry — is a bid for a
     # position the trader is already exiting. Left resting it can still fill
     # later, buying into a move whose exit signal has been given, with no rung
