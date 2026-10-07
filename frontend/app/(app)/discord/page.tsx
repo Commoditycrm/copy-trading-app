@@ -221,7 +221,7 @@ const sameTrims = (a: TrimRow[], b: TrimRow[]) =>
     TRIM_COLUMNS.every((c) => t[c.key] === b[i][c.key]) && !!t.stop_trail === !!b[i].stop_trail);
 
 /** What a fresh Trail starts at when there's nothing remembered for it. */
-const DEFAULT_TRAIL = "15";
+const DEFAULT_TRAIL = "10";
 
 /** Flip a stop between a fixed level and a trailing give-back, keeping the
  *  value of the mode you're leaving so flipping back restores it. */
