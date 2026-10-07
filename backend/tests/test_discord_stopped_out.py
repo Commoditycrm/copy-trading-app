@@ -7,7 +7,7 @@ opened by hand or from another channel are left alone.
 import os
 import sys
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -258,3 +258,73 @@ def test_an_expired_contract_is_not_re_entered(broker, monkeypatch):
     db, clint, other = _db()
     _bought(db, clint, "767", OptionRight.CALL, "1")
     assert ex.latest_channel_contract(db, db.get(User, USER), clint.id, held_only=False) is None
+
+
+# ── "Added to TSLA, New avg @0.90 @Mark" (live 2026-10-07: bought TSLA stock) ─
+
+def test_added_to_a_ticker_is_an_option_add_of_the_channels_contract():
+    s = parse_message(ParsedMessage(content="Added to TSLA, New avg @0.90 @Mark",
+                                    posted_at=datetime(2026, 10, 7, 14, 50, tzinfo=timezone.utc))).signals[0]
+    assert s.action.value == "BUY" and s.asset_type.value == "OPTION" and s.symbol == "TSLA"
+    assert s.limit_price == Decimal("0.90") and s.add_to_latest and s.contract_unspecified
+
+
+def test_an_add_naming_the_contract_is_unchanged():
+    s = parse_message(ParsedMessage(content="Adding $MSFT 100c @1.90",
+                                    posted_at=datetime(2026, 10, 7, 14, 50, tzinfo=timezone.utc))).signals[0]
+    assert s.strike == Decimal("100") and not s.add_to_latest
+
+
+def test_the_channels_latest_contract_for_a_ticker_skips_a_stock_buy(broker):
+    db, clint, other = _db()
+    _bought(db, clint, "767", OptionRight.CALL, "1")
+    stock = Order(id=uuid.uuid4(), user_id=USER, instrument_type=InstrumentType.STOCK, symbol="SPY",
+                  side=OrderSide.BUY, order_type=OrderType.MARKET, quantity=Decimal(1),
+                  status=OrderStatus.FILLED)
+    db.add(stock); db.flush()
+    db.add(DiscordMessage(source_id=clint.id, user_id=USER, discord_message_id="9",
+                          discord_channel_id=clint.channel_id, content="x",
+                          status=DiscordMessageStatus.ORDER_CREATED, order_id=stock.id))
+    db.commit()
+    broker.append(_pos("767", OptionRight.CALL))
+    broker.append(SimpleNamespace(option_strike=None, option_right=None, option_expiry=None, quantity=Decimal(1)))
+    got = ex.latest_channel_contract(db, SimpleNamespace(id=USER), clint.id, symbol="SPY")
+    assert got["asset_type"] == "OPTION" and Decimal(got["strike"]) == Decimal("767")
+    assert ex.latest_channel_contract(db, SimpleNamespace(id=USER), clint.id, symbol="QQQ") is None
+
+
+def test_an_add_to_a_named_ticker_trades_the_channels_contract_in_it(monkeypatch):
+    asked = {}
+    latest = {"symbol": "TSLA", "asset_type": "OPTION", "strike": "375", "option_type": "call",
+              "expiration": "2026-10-07"}
+
+    def _latest(db, user, sid, held_only=True, symbol=None):
+        asked.setdefault("symbol", symbol)
+        return latest
+
+    class Stop(Exception):
+        pass
+
+    def _resolve(db, user, signal, sizing):
+        asked["signal"] = signal
+        raise Stop
+
+    monkeypatch.setattr(ex, "latest_channel_contract", _latest)
+    monkeypatch.setattr(ex, "resolve", _resolve)
+    monkeypatch.setattr(ex, "already_executed", lambda m: False)
+    monkeypatch.setattr(ex, "cancel_stale_entries_for_signal", lambda *a: [])
+    monkeypatch.setattr(discord_sources.discord_channel_settings, "effective", lambda *a, **k: None)
+    from app.services import discord_repost
+    monkeypatch.setattr(discord_repost, "find_recent_entry", lambda *a: None)
+    monkeypatch.setattr(discord_repost, "find_switched_entry", lambda *a: None)
+    sig = parse_message(ParsedMessage(content="Added to TSLA, New avg @0.90 @Mark",
+                                      posted_at=datetime(2026, 10, 7, 14, 50, tzinfo=timezone.utc))).signals[0].as_dict()
+    msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), user_id=USER, parsed_signal=sig,
+                          order_id=None, status=DiscordMessageStatus.PARSED, status_reason=None)
+    try:
+        discord_sources._execute_signal(SimpleNamespace(), SimpleNamespace(id=USER), msg, None, None)
+    except Stop:
+        pass
+    assert asked["symbol"] == "TSLA"
+    s = asked["signal"]
+    assert (s["asset_type"], s["strike"], s["option_type"], s["limit_price"]) == ("OPTION", "375", "call", "0.90")

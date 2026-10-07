@@ -445,7 +445,8 @@ def _broker_expiries(adapter: Any, symbol: str, strike: Decimal, want_cp: str,
     } - {None})
 
 
-def latest_channel_contract(db: Session, user: User, source_id, *, held_only: bool = True) -> dict | None:
+def latest_channel_contract(db: Session, user: User, source_id, *, held_only: bool = True,
+                            symbol: str | None = None) -> dict | None:
     """The contract this CHANNEL most recently bought that is still held.
 
     For "Adding .4": an add that names nothing means the position the channel
@@ -467,6 +468,10 @@ def latest_channel_contract(db: Session, user: User, source_id, *, held_only: bo
             DiscordMessage.source_id == source_id,
             Order.user_id == user.id,
             Order.side == OrderSide.BUY,
+            # Contracts only: an add is to the OPTION the channel is in — a stock
+            # buy (such as one misread from an alert) is never what it means.
+            Order.option_strike.isnot(None),
+            *([Order.symbol == symbol.upper()] if symbol else []),
         ).order_by(Order.created_at.desc()).limit(20)
     ).scalars().all()
     # Positions the trader ASSIGNED to a channel by hand (Positions → Channel):
@@ -484,6 +489,7 @@ def latest_channel_contract(db: Session, user: User, source_id, *, held_only: bo
                         option_right=_right(getattr(g.option_right, "value", g.option_right)),
                         option_expiry=g.option_expiry)
         for g in assigned if g.source_id == source_id
+        and (not symbol or (g.symbol or "").upper() == symbol.upper())
     ] + [
         o for o in orders
         if (o.symbol, *guards.contract_key(o.option_strike, o.option_right, o.option_expiry))
