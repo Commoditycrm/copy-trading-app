@@ -194,10 +194,10 @@ def entry(monkeypatch):
     return seen
 
 
-def _run_entry():
+def _run_entry(**signal):
     msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), status=DiscordMessageStatus.PARSED,
                           status_reason=None, order_id=None,
-                          parsed_signal={"action": "BUY", "symbol": "SPY"})
+                          parsed_signal={"action": "BUY", "symbol": "SPY", **signal})
     ds._execute_signal(None, SimpleNamespace(id=USER, role=UserRole.TRADER), msg, None, None)
     return msg
 
@@ -221,4 +221,30 @@ def test_a_limit_channel_is_unchanged(entry, monkeypatch):
     monkeypatch.setattr(dcs, "entry_order_type", lambda db, sid: "limit")
     monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: True)
     _run_entry()
+    assert entry["payload"].order_type is OrderType.LIMIT
+
+
+# ── "@Market" typed at the end of a composer alert ──────────────────────────
+
+@pytest.mark.parametrize("typed, alert, market", [
+    ("SPY 770C 1.38 @Market", "SPY 770C 1.38", True),
+    ("QQQ 759P @here out the gate @market  ", "QQQ 759P @here out the gate", True),
+    ("SPY 770C 1.38", "SPY 770C 1.38", False),
+    ("market is ripping SPY 770C 1.38", "market is ripping SPY 770C 1.38", False),   # only at the end
+])
+def test_a_trailing_at_market_is_taken_off_the_alert(typed, alert, market):
+    assert ds._split_at_market(typed) == (alert, market)
+
+
+def test_at_market_buys_at_market_on_a_limit_channel(entry, monkeypatch):
+    monkeypatch.setattr(dcs, "entry_order_type", lambda db, sid: "limit")
+    monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: True)
+    _run_entry(at_market=True)
+    assert entry["payload"].order_type is OrderType.MARKET and entry["payload"].limit_price is None
+
+
+def test_at_market_keeps_the_limit_outside_the_session(entry, monkeypatch):
+    monkeypatch.setattr(dcs, "entry_order_type", lambda db, sid: "limit")
+    monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: False)
+    _run_entry(at_market=True)
     assert entry["payload"].order_type is OrderType.LIMIT
