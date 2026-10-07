@@ -173,6 +173,76 @@ def in_extended_hours(dt_et: datetime | None = None) -> bool:
     return (PREMARKET_START <= t < REGULAR_OPEN) or (MARKET_CLOSE <= t < POSTMARKET_END)
 
 
+# ── Market session classification (holiday- + early-close-aware) ─────────────
+# One shared source of truth for "is the market open and in which phase",
+# layered on the NYSE calendar above (is_regular_trading_day / is_market_holiday)
+# so there's no second, independent definition of market hours. Background
+# pollers use is_tradable_now()/market_session() to decide their cadence.
+PRE_MARKET = "pre_market"
+REGULAR = "regular"
+AFTER_HOURS = "after_hours"
+CLOSED = "closed"
+
+# NYSE half-day schedule: the regular session ends early at 13:00 ET. The
+# post-market window is NOT shortened for polling purposes — it runs to the same
+# POSTMARKET_END (20:00 ET) that in_extended_hours() uses, so the pollers never
+# treat the market as closed while the order-routing logic still considers
+# extended-hours trading active (one shared definition of the extended window).
+EARLY_CLOSE = time(13, 0)
+
+
+def is_early_close_day(d: date) -> bool:
+    """True on a NYSE half-day — the regular session ends 13:00 ET instead of
+    16:00. These are the day after Thanksgiving (Black Friday), the weekday
+    before Independence Day, and a weekday Christmas Eve. Full holidays are NOT
+    early-close days (is_market_holiday owns those), and neither are weekends."""
+    if d.weekday() >= 5 or is_market_holiday(d):
+        return False
+    y = d.year
+    days = {_nth_weekday(y, 11, 3, 4) + timedelta(days=1)}   # Black Friday
+    if date(y, 7, 4).weekday() < 5:                          # July 3, before a weekday July 4
+        days.add(date(y, 7, 3))
+    days.add(date(y, 12, 24))                                # Christmas Eve (weekday)
+    return d in days
+
+
+def regular_close_time(d: date) -> time:
+    """Official regular-session close for date ``d`` — 13:00 ET on a half day,
+    otherwise 16:00 ET."""
+    return EARLY_CLOSE if is_early_close_day(d) else MARKET_CLOSE
+
+
+def market_session(dt_et: datetime | None = None) -> str:
+    """Classify the US market session right now: PRE_MARKET / REGULAR /
+    AFTER_HOURS / CLOSED. Holiday- and early-close-aware (weekends and full
+    holidays are CLOSED). On a half-day the REGULAR session ends early at 13:00,
+    but AFTER_HOURS still runs to POSTMARKET_END (20:00 ET) — the same boundary
+    in_extended_hours() uses — so polling stays at full cadence for as long as
+    the app considers extended-hours trading possible. This is the single source
+    of truth the pollers key their cadence off."""
+    dt = dt_et or now_et()
+    if not is_regular_trading_day(dt):          # weekend or full holiday
+        return CLOSED
+    close_t = EARLY_CLOSE if is_early_close_day(dt.date()) else MARKET_CLOSE
+    t = dt.time()
+    if PREMARKET_START <= t < REGULAR_OPEN:
+        return PRE_MARKET
+    if REGULAR_OPEN <= t < close_t:
+        return REGULAR
+    if close_t <= t < POSTMARKET_END:
+        return AFTER_HOURS
+    return CLOSED
+
+
+def is_tradable_now(dt_et: datetime | None = None) -> bool:
+    """True whenever a trade could actually happen — pre-market, the regular
+    session, or after-hours on a REAL trading day (not a weekend/holiday, and
+    respecting half-day early closes). Background pollers run at full cadence
+    while this is True and back off when it's False (overnight, weekends,
+    holidays), since prices, positions and account P&L can't move then."""
+    return market_session(dt_et) in (PRE_MARKET, REGULAR, AFTER_HOURS)
+
+
 def is_same_day_expiry(option_expiry: date | None, dt_et: datetime | None = None) -> bool:
     """True when an option expires on today's ET date (0DTE). False for stocks
     (``option_expiry is None``) and for any later-dated contract."""
