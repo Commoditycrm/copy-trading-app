@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.broker_account import BrokerName
 
@@ -58,24 +60,51 @@ class WebullAccountOut(BaseModel):
 
 
 class IbkrCredentialsIn(BaseModel):
-    """Self-service OAuth 1.0a material from IBKR Client Portal
-    (Settings → API → OAuth). ``access_token_secret`` is the base64,
-    RSA-encrypted secret IBKR shows once; the two private keys are the PEMs
-    the user generated for that consumer; ``dh_prime`` is the hex modulus
-    (or the whole ``dhparam.pem``). ``account_id`` is the IBKR account
-    number (``U1234567`` live, ``DU…`` paper). The adapter validates that
-    the keys parse and that the secret decrypts before anything is saved."""
+    """Two ways to reach one IBKR account.
 
-    consumer_key: str = Field(min_length=4, max_length=200)
-    access_token: str = Field(min_length=4, max_length=500)
-    access_token_secret: str = Field(min_length=20, max_length=8000)
-    private_signature_key: str = Field(min_length=100, max_length=16000)
-    private_encryption_key: str = Field(min_length=100, max_length=16000)
-    dh_prime: str = Field(min_length=100, max_length=16000)
+    ``mode="gateway"`` (individual / retail accounts — the only kind IBKR
+    lets most people have): the user runs IBKR's Client Portal Gateway on
+    the backend's machine or a private network host and signs into it in a
+    browser; we only need its origin and the account number.
+
+    ``mode="oauth"`` (institutional accounts): self-service OAuth 1.0a
+    material from IBKR Client Portal. ``access_token_secret`` is the base64,
+    RSA-encrypted secret IBKR shows once; the two private keys are the PEMs
+    the user generated; ``dh_prime`` is the hex modulus (or the whole
+    ``dhparam.pem``).
+
+    ``account_id`` is the IBKR account number (``U…`` live, ``DU…`` paper).
+    The adapter validates everything with a live call before anything is saved."""
+
+    mode: Literal["gateway", "oauth"] = "gateway"
     account_id: str = Field(min_length=2, max_length=40)
     paper: bool = False
+
+    # gateway mode
+    gateway_url: str | None = Field(default=None, max_length=200)
+
+    # oauth mode
+    consumer_key: str | None = Field(default=None, min_length=4, max_length=200)
+    access_token: str | None = Field(default=None, min_length=4, max_length=500)
+    access_token_secret: str | None = Field(default=None, min_length=20, max_length=8000)
+    private_signature_key: str | None = Field(default=None, min_length=100, max_length=16000)
+    private_encryption_key: str | None = Field(default=None, min_length=100, max_length=16000)
+    dh_prime: str | None = Field(default=None, min_length=100, max_length=16000)
     # OAuth realm. Self-service consumers use "limited_poa"; leave unset.
     realm: str | None = Field(default=None, max_length=40)
+
+    @model_validator(mode="after")
+    def _fields_for_mode(self) -> "IbkrCredentialsIn":
+        if self.mode == "oauth":
+            missing = [
+                f for f in (
+                    "consumer_key", "access_token", "access_token_secret",
+                    "private_signature_key", "private_encryption_key", "dh_prime",
+                ) if not getattr(self, f)
+            ]
+            if missing:
+                raise ValueError(f"oauth mode requires: {', '.join(missing)}")
+        return self
 
 
 class StartSnaptradeIn(BaseModel):

@@ -82,6 +82,9 @@ class FakeIBKR:
         self.calls: list[tuple[str, str, dict | None, object]] = []
         self.brokerage_authenticated = False
         self.placed: list[dict] = []
+        self.feed: list[dict] = []
+        self.cancel_503_once = False
+        self.snapshot_calls = 0
         self.search_results = [
             {"conid": 265598, "symbol": "AAPL", "secType": "STK", "description": "NASDAQ"},
         ]
@@ -133,7 +136,8 @@ class FakeIBKR:
         })
 
     # ── signed API calls ─────────────────────────────────────────────────
-    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None, verify=True):
+        assert verify is True, "hosted IBKR must keep TLS verification"
         oauth = _parse_auth_header(headers["Authorization"])
         oauth.pop("realm")
         assert oauth["oauth_signature_method"] == "HMAC-SHA256"
@@ -163,7 +167,26 @@ class FakeIBKR:
         if path == "/iserver/secdef/info":
             return _Resp(200, self.info_results)
         if path == "/iserver/account/orders":
-            return _Resp(200, {"orders": []})
+            return _Resp(200, {"orders": self.feed})
+        if path.startswith(f"/iserver/account/{ACCOUNT_ID}/order/") and method == "DELETE":
+            oid = path.rsplit("/", 1)[1]
+            live = next((o for o in self.feed if str(o.get("orderId")) == oid and o.get("status") in ("Submitted", "PreSubmitted")), None)
+            if live is not None and self.cancel_503_once:
+                # The paper gateway's quirk: cancel performed, 503 returned.
+                self.cancel_503_once = False
+                live["status"] = "Cancelled"
+                return _Resp(503, {"error": "Service Unavailable", "statusCode": 503})
+            if live is not None:
+                live["status"] = "Cancelled"
+                return _Resp(200, [{"msg": "Request was submitted"}])
+            if any(str(o.get("orderId")) == oid for o in self.feed):
+                return _Resp(400, {"error": f"Cancel attempted when order is not in a cancellable state.  Order permId ={oid}"})
+            return _Resp(400, {"error": f"OrderID {oid} doesn't exist"})
+        if path == "/iserver/marketdata/snapshot":
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                return _Resp(200, [{"conid": 265598}])
+            return _Resp(200, [{"conid": 265598, "31": "C331.85", "84": "331.80", "86": "331.90"}])
         if path == f"/iserver/account/{ACCOUNT_ID}/orders":
             self.placed.append(json["orders"][0])
             return _Resp(200, [{"id": "confirm-1", "message": ["Are you sure?"]}])
@@ -253,7 +276,10 @@ def test_wrong_encryption_key_is_rejected_at_handshake(world):
     # problem, not a network one.
     creds, fake = world
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    with pytest.raises(ibkr_mod.IBKRAuthError, match="rejected the live-session-token request"):
+    # Depending on the padding bytes OpenSSL either raises (→ "could not be
+    # decrypted") or hands back random bytes (→ IBKR rejects the signed
+    # handshake). Both are credential errors; both must stay RuntimeErrors.
+    with pytest.raises(RuntimeError, match="rejected the live-session-token request|could not be decrypted"):
         IBKRAdapter({**creds, "private_encryption_key": _pem(other)}).verify_connection()
     assert fake.handshakes == 0
 
@@ -296,7 +322,7 @@ def test_option_order_resolves_conid_and_clears_confirmation(world):
     assert order["secType"] == "700000001:OPT"
     assert order["orderType"] == "LMT" and order["price"] == 3.45
     assert order["quantity"] == 2 and order["side"] == "BUY"
-    assert order["cOID"] == "11111111-2222-3333-4444-555555555555"[:32]
+    assert order["cOID"] == "11111111222233334444555555555555"  # 32-char hex, fits IBKR's cap
     info_call = next(c for c in fake.calls if c[1] == "/iserver/secdef/info")
     assert info_call[2] == {
         "conid": "265598", "sectype": "OPT", "month": "OCT26",
@@ -368,3 +394,163 @@ def test_parse_contract_desc(desc, expected):
 
 def test_build_occ_symbol():
     assert build_occ_symbol("spy", date(2026, 10, 17), Decimal("452.5"), OptionRight.PUT) == "SPY261017P00452500"
+
+
+# ── Gateway mode (Client Portal Gateway on the backend's machine) ───────────
+
+
+class FakeGateway:
+    """A Client Portal Gateway: same endpoints, no OAuth, self-signed TLS."""
+
+    def __init__(self):
+        self.logged_in = True
+        self.authenticated = True
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None, verify=True):
+        assert verify is False, "gateway has a self-signed certificate"
+        assert "Authorization" not in headers, "gateway calls must not be OAuth-signed"
+        assert url.startswith("https://localhost:5000/v1/api")
+        path = url[len("https://localhost:5000/v1/api"):]
+        self.calls.append((method, path))
+        if not self.logged_in:
+            return _Resp(401, {"error": "not authenticated"})
+        if path == "/iserver/auth/status":
+            return _Resp(200, {"authenticated": self.authenticated, "connected": True})
+        if path == "/iserver/auth/ssodh/init":
+            self.authenticated = True
+            return _Resp(200, {"authenticated": True})
+        if path == "/portfolio/accounts":
+            return _Resp(200, [{"accountId": "DU1234567"}])
+        if path == "/iserver/account/orders":
+            return _Resp(200, {"orders": []})
+        return _Resp(404, {"error": f"unrouted {path}"})
+
+
+@pytest.fixture
+def gateway(monkeypatch):
+    fake = FakeGateway()
+    monkeypatch.setattr(ibkr_mod.requests, "request", fake.request)
+    monkeypatch.setattr(ibkr_mod.requests, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no OAuth handshake in gateway mode")))
+    monkeypatch.setattr(ibkr_mod.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(ibkr_mod, "_SESSIONS", {})
+    monkeypatch.setattr(ibkr_mod, "_start_gateway_keepalive", lambda *_: None)
+    return fake
+
+
+GATEWAY_CREDS = {"mode": "gateway", "gateway_url": "https://localhost:5000", "account_id": "DU1234567", "paper": True}
+
+
+def test_gateway_verify_connection(gateway):
+    info = IBKRAdapter(GATEWAY_CREDS).verify_connection()
+    assert info.broker_account_id == "DU1234567"
+    assert info.extra["mode"] == "gateway" and info.extra["paper"] is True
+    assert ("GET", "/portfolio/accounts") in gateway.calls
+
+
+def test_gateway_reinitialises_timed_out_brokerage_session(gateway):
+    gateway.authenticated = False  # idle timeout: connected but not authenticated
+    IBKRAdapter(GATEWAY_CREDS).list_recent_activities()
+    assert ("POST", "/iserver/auth/ssodh/init") in gateway.calls
+
+
+def test_gateway_not_logged_in_is_a_clear_user_message(gateway):
+    gateway.logged_in = False
+    with pytest.raises(ibkr_mod.IBKRAuthError, match="Open https://localhost:5000 in a browser"):
+        IBKRAdapter(GATEWAY_CREDS).verify_connection()
+    # No OAuth re-handshake attempted (the fixture's requests.post would assert).
+
+
+def test_gateway_url_defaults_and_is_inferred_from_gateway_url(gateway):
+    a = IBKRAdapter({"gateway_url": "localhost:5000", "account_id": "du1234567"})
+    assert a._gateway and a._base_url == "https://localhost:5000/v1/api" and a._account_id == "DU1234567"
+
+
+@pytest.mark.parametrize("url", [
+    "https://localhost:5000", "http://127.0.0.1:5000", "https://192.168.1.20:5000",
+    "https://100.101.102.103:5000", "https://my-mac.ts.net:5000", "https://gw.lan",
+])
+def test_gateway_url_private_hosts_allowed(url):
+    assert ibkr_mod.normalize_gateway_url(url).startswith(url.split("://")[0])
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.ibkr.com", "https://8.8.8.8:5000", "https://example.com:5000",
+    "https://localhost:5000/v1/api", "ftp://localhost:5000",
+])
+def test_gateway_url_public_or_malformed_rejected(url):
+    with pytest.raises(RuntimeError):
+        ibkr_mod.normalize_gateway_url(url)
+
+
+
+# ── Listener helpers (pure functions, no DB) ───────────────────────────────
+
+
+def test_listener_reads_order_ref_as_app_order_id():
+    from app.services import ibkr_listener as L
+    import uuid as _uuid
+    oid = _uuid.UUID("9db66cb3-73f1-47f8-85b0-a55d9e2f1234")
+    assert L._app_order_ref_uuid({"order_ref": oid.hex}) == oid          # what the adapter now sends
+    assert L._app_order_ref_uuid({"cOID": str(oid)}) == oid               # older payload shape
+    assert L._app_order_ref_uuid({"order_ref": "9db66cb3-73f1-47f8-85b0-a55d9e2f"}) is None  # truncated dashed → unusable
+    assert L._app_order_ref_uuid({"order_ref": "37065808"}) is None       # IBKR's own ref on external orders
+    assert L._app_order_ref_uuid({}) is None
+
+
+@pytest.mark.parametrize("row,expected", [
+    ({"orderType": "Limit", "price": "320.00"}, OrderType.LIMIT),
+    ({"orderType": "Market"}, OrderType.MARKET),
+    ({"orderType": "Stop Limit"}, OrderType.STOP_LIMIT),
+    ({"orderType": "LMT"}, OrderType.LIMIT),
+    ({"orderType": "Weird", "price": "10"}, OrderType.LIMIT),   # unmapped + priced → never MARKET
+    ({"orderType": "Weird"}, OrderType.MARKET),
+])
+def test_listener_maps_feed_order_types(row, expected):
+    from app.services import ibkr_listener as L
+    assert L._order_type_in(row) == expected
+
+
+
+# ── Cancel semantics + quotes ───────────────────────────────────────────────
+
+
+def test_cancel_of_already_cancelled_order_returns_false(world):
+    creds, fake = world
+    fake.feed = [{"orderId": 777, "ticker": "NIO", "side": "BUY", "status": "Cancelled", "filledQuantity": 0.0}]
+    assert IBKRAdapter(creds).cancel_order("777") is False
+
+
+def test_cancel_of_live_order_returns_true(world):
+    creds, fake = world
+    fake.feed = [{"orderId": 778, "ticker": "NIO", "side": "BUY", "status": "Submitted", "filledQuantity": 0.0}]
+    assert IBKRAdapter(creds).cancel_order("778") is True
+
+
+def test_cancel_of_unknown_order_still_raises(world):
+    creds, _ = world
+    with pytest.raises(RuntimeError, match="doesn't exist"):
+        IBKRAdapter(creds).cancel_order("999")
+
+
+def test_latest_price_falls_back_to_ibkr_snapshot(world, monkeypatch):
+    creds, fake = world
+    from app.services import market_data_stream as mds
+    monkeypatch.setattr(mds, "data_stock_price", lambda s: None)
+    px = IBKRAdapter(creds).get_stock_latest_price("AAPL")
+    assert px == Decimal("331.85")           # "C" close-marker stripped
+    assert fake.snapshot_calls == 2          # primed, then read
+
+
+def test_cancel_acknowledged_with_503_is_settled_by_reading_back(world):
+    creds, fake = world
+    fake.feed = [{"orderId": 779, "ticker": "NIO", "side": "BUY", "status": "Submitted", "filledQuantity": 0.0}]
+    fake.cancel_503_once = True
+    assert IBKRAdapter(creds).cancel_order("779") is True
+    assert fake.feed[0]["status"] == "Cancelled"
+
+
+def test_cancel_of_filled_order_returns_false_on_not_cancellable(world):
+    creds, fake = world
+    fake.feed = [{"orderId": 780, "ticker": "NIO", "side": "BUY", "status": "Filled", "filledQuantity": 1.0, "avgPrice": "3.4"}]
+    assert IBKRAdapter(creds).cancel_order("780") is False

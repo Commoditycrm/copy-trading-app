@@ -120,8 +120,9 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
         case BrokerName.IBKR:
             if not payload.ibkr:
                 raise HTTPException(422, "ibkr credentials required")
-            creds = payload.ibkr.model_dump()
-            # Validate via a live OAuth call before we persist. A bad
+            creds = payload.ibkr.model_dump(exclude_none=True)
+            # Validate via a live call (OAuth handshake, or the local gateway's
+            # login state) before we persist. A bad
             # consumer/token combo would otherwise sit silently and break
             # every subsequent listener poll + order placement.
             try:
