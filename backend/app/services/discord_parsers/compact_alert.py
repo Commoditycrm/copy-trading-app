@@ -127,9 +127,14 @@ _UPDATE_RE = re.compile(
 # (percent_means_exit). Anywhere else this shape is chatter, so the pattern is
 # deliberately strict: the line must be ONLY the ticker and the percentage.
 # Allowing trailing prose would turn "AMD 27% of the float is short" into a sell.
+#
+# The one exception is an exit word — "TSLA -90% Out" (Mark, 2026-10-07,
+# missed). That is the author saying they are OUT, which is unambiguous, so it
+# is allowed — and makes the exit a full close rather than a ladder trim.
 _PCT_BARE_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<sign>[+\-\u2212])?\s*(?P<pct>{_NUM})\s*%\s*$",
+    rf"(?P<sign>[+\-\u2212])?\s*(?P<pct>{_NUM})\s*%\s*"
+    rf"(?:(?P<out>(?:all\s+)?out|closed?|done|exit(?:ed)?|sold|cut|stopped(?:\s+out)?)\b[\s!.]*)?$",
     re.IGNORECASE,
 )
 
@@ -477,6 +482,9 @@ class CompactAlertParser(Parser):
                     limit_price=None,
                     pnl_percent=pct,
                     position_closed=True,
+                    # "TSLA -90% Out": the author is out — sell all of it,
+                    # whatever the ladder's gates would say about a trim.
+                    flatten=bool(m.groupdict().get("out")),
                     source_action="CLOSE",
                     parser=self.name,
                 ),
