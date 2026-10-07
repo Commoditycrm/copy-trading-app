@@ -131,6 +131,9 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     # 0DTE contract that can move a long way in that minute. 15s reads positions
     # four times a minute against a 60/minute allowance.
     BrokerName.WEBULL: 15.0,
+    # IBKR gateway: generous rate budget, but every call shares the user's
+    # single brokerage session with the order poll — 15s is plenty.
+    BrokerName.IBKR: 15.0,
 }
 
 
@@ -252,7 +255,7 @@ def _snapshot_or_last_known(
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
 # is listed here, and (c) the broker has an entry in
 # ``_INTERVAL_BY_BROKER``.
-_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.WEBULL)
+_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.WEBULL, BrokerName.IBKR)
 
 # Concurrency gate for SnapTrade. Even with skip-idle and 60s cadence,
 # if 30+ subscribers all become due in the same tick they would burst

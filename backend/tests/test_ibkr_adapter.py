@@ -85,6 +85,7 @@ class FakeIBKR:
         self.feed: list[dict] = []
         self.cancel_503_once = False
         self.snapshot_calls = 0
+        self.pnl_calls = 0
         self.search_results = [
             {"conid": 265598, "symbol": "AAPL", "secType": "STK", "description": "NASDAQ"},
         ]
@@ -182,6 +183,17 @@ class FakeIBKR:
             if any(str(o.get("orderId")) == oid for o in self.feed):
                 return _Resp(400, {"error": f"Cancel attempted when order is not in a cancellable state.  Order permId ={oid}"})
             return _Resp(400, {"error": f"OrderID {oid} doesn't exist"})
+        if path == f"/portfolio/{ACCOUNT_ID}/summary":
+            return _Resp(200, {
+                "netliquidation": {"amount": 1031939.0625, "currency": "USD", "isNull": False},
+                "totalcashvalue": {"amount": 1031446.875, "currency": "USD", "isNull": False},
+                "buyingpower": {"amount": 4125824.25, "currency": "USD", "isNull": False},
+            })
+        if path == "/iserver/account/pnl/partitioned":
+            self.pnl_calls += 1
+            if self.pnl_calls == 1:
+                return _Resp(200, {"upnl": {}})
+            return _Resp(200, {"upnl": {f"{ACCOUNT_ID}.Core": {"dpl": -12.5, "nl": 1031939.06, "upl": 3.0}}})
         if path == "/iserver/marketdata/snapshot":
             self.snapshot_calls += 1
             if self.snapshot_calls == 1:
@@ -554,3 +566,22 @@ def test_cancel_of_filled_order_returns_false_on_not_cancellable(world):
     creds, fake = world
     fake.feed = [{"orderId": 780, "ticker": "NIO", "side": "BUY", "status": "Filled", "filledQuantity": 1.0, "avgPrice": "3.4"}]
     assert IBKRAdapter(creds).cancel_order("780") is False
+
+
+def test_balance_snapshot_reads_nested_summary(world):
+    creds, _ = world
+    b = IBKRAdapter(creds).get_balance_snapshot()
+    assert b == {
+        "cash": Decimal("1031446.875"), "buying_power": Decimal("4125824.25"),
+        "total_equity": Decimal("1031939.0625"), "currency": "USD",
+    }
+
+
+def test_pnl_snapshot_primes_then_reads(world):
+    creds, fake = world
+    p = IBKRAdapter(creds).get_pnl_snapshot()
+    assert p == {
+        "todays_pl": Decimal("-12.5"), "equity": Decimal("1031939.0625"),   # equity from the summary, not the coarse nl
+        "beginning_day_balance": Decimal("1031951.5625"),
+    }
+    assert fake.pnl_calls == 2
