@@ -357,7 +357,9 @@ const INPUT_GROUP: React.CSSProperties = {
   border: "1px solid var(--border-strong)",
   borderRadius: "var(--r-sm)",
   background: "var(--panel-2)",
-  overflow: "hidden",
+  // NOT overflow: hidden — the Close ▾ menu (close / average) opens out of
+  // this group, and clipping hid it: averaging at a limit was unreachable.
+  // The last control rounds its own right corners instead.
 };
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -564,7 +566,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
                 ? `Start a trailing stop at ${trailStart.toFixed(2)}, ${trailPct}% below the market`
                 : "Enter a trail % first"}
               className="btn-primary px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-              style={{ borderRadius: 0 }}
+              style={{ borderRadius: 0, borderTopRightRadius: "var(--r-sm)", borderBottomRightRadius: "var(--r-sm)" }}
             >
               <span>Trl.Stop</span>
               {busy === "trail" && <Spinner />}
