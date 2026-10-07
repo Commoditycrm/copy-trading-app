@@ -206,14 +206,6 @@ const DEFAULT_TRIMS: TrimRow[] = [
 /** What "Add trim" appends: sell the rest, stop at break-even. */
 const NEW_TRIM: TrimRow = { profit_gate_pct: "0", qty_pct: "100", stop_pct: "0" };
 
-/** A sizing card that isn't in use: greyed and not clickable, with why. */
-function sizingCardStyle(inUse: boolean, minWidth: number): React.CSSProperties {
-  return {
-    background: "var(--panel-2)", border: "1px solid var(--border)", minWidth,
-    opacity: inUse ? 1 : 0.45, pointerEvents: inUse ? undefined : "none",
-  };
-}
-
 /** The ladder from a settings response (older responses carry only the three
  *  per-trim fields). */
 function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
@@ -1444,35 +1436,8 @@ export default function DiscordPage() {
                 question (how much exposure per alert) and reading them together
                 is how you judge whether the pair is sane. */}
             <div className="space-y-3">
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <div className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
-                  Sizing
-                </div>
-                {/* ONE cap at a time, and only with Contracts — Dollars is its own rule. */}
-                <div className="flex items-center gap-2 text-[11px]" style={{ color: "var(--muted)" }}>
-                  <span>Cap</span>
-                  <div role="radiogroup" aria-label="Which cap applies" className="flex rounded-lg border overflow-hidden"
-                       style={{ borderColor: "var(--border-strong)", opacity: sizeModeUi === "dollars" ? 0.45 : 1 }}
-                       title={sizeModeUi === "dollars" ? "Not used while sizing by dollars — the amount is the rule" : "Only one cap applies at a time"}>
-                    {([["none", "None"], ["per_contract", "Max per contract"], ["per_order", "Max per order"]] as const).map(([value, text]) => (
-                      <button
-                        key={value}
-                        type="button"
-                        role="radio"
-                        aria-checked={sizeCap === value}
-                        disabled={modeBusy || sizeModeUi === "dollars"}
-                        onClick={() => { setSizeCap(value); saveSizing({ size_cap: value }); }}
-                        className="px-2.5 py-0.5 disabled:cursor-not-allowed"
-                        style={{
-                          background: sizeCap === value ? "var(--accent-glow)" : "transparent",
-                          color: sizeCap === value ? "var(--accent-2)" : "var(--muted)",
-                        }}
-                      >
-                        {text}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+              <div className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
+                Sizing
               </div>
 
               <div className="flex gap-4 flex-wrap items-stretch">
@@ -1583,111 +1548,95 @@ export default function DiscordPage() {
                   )}
                 </div>
 
-                {/* Max per contract — in use only with Contracts, as the chosen cap */}
-                <div
-                  className="rounded-xl px-4 py-3 flex-1"
-                  aria-disabled={!(sizeModeUi === "contracts" && sizeCap === "per_contract")}
-                  title={sizeModeUi === "dollars" ? "Not used while sizing by dollars"
-                    : sizeCap !== "per_contract" ? "Not in use — choose Max per contract as the cap above" : undefined}
-                  style={sizingCardStyle(sizeModeUi === "contracts" && sizeCap === "per_contract", 300)}
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
-                      Max per contract
-                    </label>
-                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-                      {savedMaxPerContract ? `$${savedMaxPerContract}` : "No limit"}
-                    </span>
-                  </div>
-                  <div className="flex gap-2 mt-2">
-                    <div className="relative flex-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
-                            style={{ color: "var(--muted)" }}>$</span>
-                      <input
-                        type="number"
-                        min="1"
-                        step="50"
-                        placeholder="No limit"
-                        value={maxPerContract}
-                        disabled={modeBusy}
-                        onChange={(e) => setMaxPerContract(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") saveSizing({ max_per_contract: maxPerContract });
-                        }}
-                        className="w-full rounded-lg border pl-7 pr-3 py-1.5 text-sm bg-transparent focus-ring"
-                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                      />
-                    </div>
-                    {/* Explicit save: typing a number shouldn't commit a risk
-                        limit the moment focus moves. */}
-                    <button
-                      type="button"
-                      disabled={modeBusy || maxPerContract === savedMaxPerContract}
-                      onClick={() => saveSizing({ max_per_contract: maxPerContract })}
-                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                {/* The cap — ONE of max per contract / max per order, or none, and
+                    only with Contracts: sizing by Dollars is its own rule. One
+                    card and one amount box, for whichever cap is chosen. */}
+                {(() => {
+                  const dollars = sizeModeUi === "dollars";
+                  const perContract = sizeCap === "per_contract";
+                  const value = perContract ? maxPerContract : maxPerOrder;
+                  const saved = perContract ? savedMaxPerContract : savedMaxPerOrder;
+                  const setValue = perContract ? setMaxPerContract : setMaxPerOrder;
+                  const field = perContract ? "max_per_contract" : "max_per_order";
+                  const save = () => saveSizing({ [field]: value, size_cap: sizeCap });
+                  return (
+                    <div
+                      className="rounded-xl px-4 py-3 flex-1"
+                      title={dollars ? "Not used while sizing by dollars — the amount is the rule" : undefined}
+                      style={{
+                        background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300,
+                        opacity: dollars ? 0.45 : 1, pointerEvents: dollars ? "none" : undefined,
+                      }}
                     >
-                      {modeBusy ? <Spinner /> : "Save"}
-                    </button>
-                  </div>
-                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Skips an entry when one contract&apos;s value (premium × 100) is above this — at the live price for a market entry.
-                    Options only — closes always go through.
-                  </p>
-                </div>
-
-                {/* Max per order — the whole order's value, not one contract's.
-                    Kept as a separate limit rather than folded into the one
-                    above: they answer different questions, and an alert can
-                    pass either and fail the other. */}
-                <div
-                  className="rounded-xl px-4 py-3 flex-1"
-                  aria-disabled={!(sizeModeUi === "contracts" && sizeCap === "per_order")}
-                  title={sizeModeUi === "dollars" ? "Not used while sizing by dollars"
-                    : sizeCap !== "per_order" ? "Not in use — choose Max per order as the cap above" : undefined}
-                  style={sizingCardStyle(sizeModeUi === "contracts" && sizeCap === "per_order", 300)}
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
-                      Max per order
-                    </label>
-                    <span className="text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-                      {savedMaxPerOrder ? `$${savedMaxPerOrder}` : "No limit"}
-                    </span>
-                  </div>
-                  <div className="flex gap-2 mt-2">
-                    <div className="relative flex-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm"
-                            style={{ color: "var(--muted)" }}>$</span>
-                      <input
-                        type="number"
-                        min="1"
-                        step="100"
-                        placeholder="No limit"
-                        value={maxPerOrder}
-                        disabled={modeBusy}
-                        onChange={(e) => setMaxPerOrder(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") saveSizing({ max_per_order: maxPerOrder });
-                        }}
-                        className="w-full rounded-lg border pl-7 pr-3 py-1.5 text-sm bg-transparent focus-ring"
-                        style={{ borderColor: "var(--border)", color: "var(--text)" }}
-                      />
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                          Cap
+                        </label>
+                        <div role="radiogroup" aria-label="Which cap applies" className="flex rounded-lg border overflow-hidden"
+                             style={{ borderColor: "var(--border-strong)" }}>
+                          {([["none", "None"], ["per_contract", "Per contract"], ["per_order", "Per order"]] as const).map(([v, text]) => (
+                            <button
+                              key={v}
+                              type="button"
+                              role="radio"
+                              aria-checked={sizeCap === v}
+                              disabled={modeBusy || dollars}
+                              onClick={() => { setSizeCap(v); saveSizing({ size_cap: v }); }}
+                              className="px-2.5 py-0.5 text-[11px] disabled:opacity-60"
+                              style={{
+                                background: sizeCap === v ? "var(--accent-glow)" : "transparent",
+                                color: sizeCap === v ? "var(--accent-2)" : "var(--muted)",
+                              }}
+                            >
+                              {text}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      {sizeCap === "none" ? (
+                        <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                          No cap: every entry buys your Contracts count, whatever it costs.
+                        </p>
+                      ) : (
+                        <>
+                          <div className="flex gap-2 mt-2">
+                            <div className="relative flex-1">
+                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: "var(--muted)" }}>$</span>
+                              <input
+                                type="number"
+                                min="1"
+                                step="50"
+                                inputMode="decimal"
+                                placeholder={perContract ? "e.g. 300" : "e.g. 1000"}
+                                aria-label={perContract ? "Max per contract" : "Max per order"}
+                                value={value}
+                                disabled={modeBusy || dollars}
+                                onChange={(e) => setValue(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+                                className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
+                                style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 22, paddingRight: 12 }}
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              disabled={modeBusy || dollars || value === saved}
+                              onClick={save}
+                              className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                            >
+                              {modeBusy ? <Spinner /> : "Save"}
+                            </button>
+                          </div>
+                          <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                            {perContract
+                              ? "Skips an entry when one contract (premium × 100) costs more than this — at the live price for a market entry."
+                              : "Cuts an entry to the most contracts that fit under this total (× 100 for options, at the live price for a market entry); skips it if not even one fits."}
+                            {" "}Closes always go through.
+                          </p>
+                        </>
+                      )}
                     </div>
-                    {/* Explicit save, same as the limit above: typing a number
-                        shouldn't commit a risk limit when focus moves. */}
-                    <button
-                      type="button"
-                      disabled={modeBusy || maxPerOrder === savedMaxPerOrder}
-                      onClick={() => saveSizing({ max_per_order: maxPerOrder })}
-                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
-                    >
-                      {modeBusy ? <Spinner /> : "Save"}
-                    </button>
-                  </div>
-                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Cuts an entry to the most contracts that fit under this total (quantity × price, × 100 for options — the live price for a market entry); skips it only if not even one fits. Closes always go through.
-                  </p>
-                </div>
+                  );
+                })()}
               </div>
 
               {/* The exit ladder, below the sizing cards and full width: the
