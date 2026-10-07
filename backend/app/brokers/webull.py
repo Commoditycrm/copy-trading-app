@@ -1021,8 +1021,13 @@ class WebullAdapter(BrokerAdapter):
             extra={"region_id": self.region_id},
         )
 
-    def get_positions(self, *, cached_ok: bool = False) -> list[BrokerPosition]:
+    def get_positions(self, *, cached_ok: bool = False, fresh: bool = False) -> list[BrokerPosition]:
         """Positions for this account.
+
+        ``fresh=True`` (with cached_ok): read live now — no reuse of a recent
+        read — while keeping the serialising lock and, if Webull answers 429,
+        the last snapshot. For the Positions page right after a fill, when a
+        read from moments ago would still show what was just sold.
 
         ``cached_ok=True`` is for DISPLAY paths only. It serialises concurrent
         reads for this account and lets them share one HTTP call, because Webull
@@ -1037,11 +1042,11 @@ class WebullAdapter(BrokerAdapter):
         key = f"{self.app_key}:{self.account_id}"
         with _positions_lock_for(key):
             hit = _positions_cache.get(key)
-            if hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
+            if not fresh and hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
                 return hit[1]
             # Another process read it moments ago: reuse that, no broker call.
             snap = _snapshot_read(self.app_key, self.account_id)
-            if snap is not None and snap[1] and snap[0] <= _SNAPSHOT_FRESH_S:
+            if not fresh and snap is not None and snap[1] and snap[0] <= _SNAPSHOT_FRESH_S:
                 return snap[2]
             # A failure is NOT cached: the next caller retries. It is still
             # serialised by the lock, which is the part that prevents the 429.

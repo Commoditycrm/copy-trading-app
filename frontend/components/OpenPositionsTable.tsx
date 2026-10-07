@@ -890,13 +890,17 @@ export const OpenPositionsTable = forwardRef<
     // broker for the account figure four times per event is what had Webull
     // refusing a sixth of these calls (QA 2026-10-06). The steady live refresh
     // keeps that figure current anyway.
-    const refresh = useCallback(async (withDayPnl: boolean = true) => {
+    /** Returns true when this read came back LIVE: it landed, and no account
+     *  answered from a snapshot or not at all. ``fresh`` asks the server not to
+     *  reuse a read from moments ago — right after a fill, that read would
+     *  still show what was just sold. */
+    const refresh = useCallback(async (withDayPnl: boolean = true, fresh: boolean = false): Promise<boolean> => {
       const seq = ++reqSeq.current;
       try {
         const [payload, ords, dpnl, brokers] = await Promise.all([
           // ?detail=1 returns { positions, unreachable } so a broker that
           // failed to answer is distinguishable from one holding nothing.
-          api<PositionsPayload>("/api/positions?detail=1"),
+          api<PositionsPayload>(`/api/positions?detail=1${fresh ? "&fresh=1" : ""}`),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
           withDayPnl
             ? api<{ day_pnl: number | null }>("/api/positions/day-pnl").catch(() => null)
@@ -904,7 +908,7 @@ export const OpenPositionsTable = forwardRef<
           api<BrokerAccount[]>("/api/brokers").catch(() => [] as BrokerAccount[]),
         ]);
         // A newer refresh already landed — drop this one rather than undo it.
-        if (seq !== reqSeq.current) return;
+        if (seq !== reqSeq.current) return false;
         const pos = payload.positions ?? [];
         const down = payload.unreachable ?? [];
         setPositions(pos);
@@ -928,9 +932,11 @@ export const OpenPositionsTable = forwardRef<
         if (down.length === 0) {
           setSnapshot<PosSnap>(POS_KEY, { positions: pos, orders: ords });
         }
+        return down.length === 0 && (payload.stale ?? []).length === 0;
       } catch (e) {
-        if (seq !== reqSeq.current) return;
+        if (seq !== reqSeq.current) return false;
         notify.fromError(e, "failed to load positions");
+        return false;
       } finally {
         if (seq === reqSeq.current) setLoading(false);
       }
@@ -986,7 +992,7 @@ export const OpenPositionsTable = forwardRef<
       };
     }, [pollMs, refreshLive]);
 
-    useImperativeHandle(ref, () => ({ refresh }), [refresh]);
+    useImperativeHandle(ref, () => ({ refresh: async () => { await refresh(); } }), [refresh]);
 
     // Real-time: any order event for this user (own placement, mirror from a
     // followed trader, cancellation, etc.) is a reason to re-check positions.
@@ -1032,14 +1038,18 @@ export const OpenPositionsTable = forwardRef<
       for (const [i, ms] of SCHEDULE_MS.entries()) {
         ssTimers.current.push(setTimeout(async () => {
           // Only the first refresh of the burst asks for the account Day's
-          // P&L; the later ones are there to catch a fill.
-          await refresh(i === 0);
+          // P&L; the later ones are there to catch a fill. Each asks for a
+          // FRESH read: the shared one can be up to 10s old on Webull and
+          // would still show the position that was just sold.
+          const live = await refresh(i === 0, true);
           // The stagger exists to catch a fill we get no SSE for. Once nothing
           // is working any more there is nothing left to catch, so cancel the
           // rest instead of firing them blind. Each one costs a broker call,
           // and on Webull four of them arriving together is what triggers the
-          // 429 that blanks this table in the first place.
-          if (!workingRef.current) clearTimers();
+          // 429 that blanks this table in the first place. But only after a
+          // LIVE read: one served from a snapshot (rate limited) may still
+          // show the sold position, so the next check stays scheduled.
+          if (live && !workingRef.current) clearTimers();
         }, ms));
       }
     });
