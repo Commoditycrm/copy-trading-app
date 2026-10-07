@@ -111,3 +111,79 @@ def test_closed_interval_never_faster_than_tradable(monkeypatch):
 def test_tradable_base_interval_unchanged():
     # This PR must not change the tradable sweep cadence.
     assert at.POLL_INTERVAL_S == 15
+
+
+# ─────────── bounded backoff sleep: CLOSED cadence kept, fast open transition ───────────
+def _rec_sleep(monkeypatch):
+    naps: list[float] = []
+    monkeypatch.setattr(at.time, "sleep", lambda s: naps.append(s))
+    return naps
+
+
+def test_backoff_closed_keeps_180s_cadence_via_15s_checks(monkeypatch):
+    # CLOSED throughout: the 180s sweep interval is spent as 12 × 15s session
+    # checks — the broker-sweep cadence is NOT turned back into 15s.
+    naps = _rec_sleep(monkeypatch)
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: False)
+    assert at._backoff_sleep(180.0, None) is False
+    assert naps == [15.0] * 12
+    assert sum(naps) == 180.0
+
+
+def test_backoff_resumes_within_15s_when_market_opens(monkeypatch):
+    # Market open during the backoff → resume after one 15s check, not 180s.
+    naps = _rec_sleep(monkeypatch)
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: True)
+    assert at._backoff_sleep(180.0, None) is False
+    assert naps == [15.0]
+    assert sum(naps) <= 15.0
+
+
+def test_backoff_opens_partway_through(monkeypatch):
+    # CLOSED for the first two checks, then PRE_MARKET opens on the third.
+    naps = _rec_sleep(monkeypatch)
+    seq = iter([False, False, True])
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: next(seq))
+    assert at._backoff_sleep(180.0, None) is False
+    assert naps == [15.0, 15.0, 15.0]        # resumes ~45s in, far short of 180s
+    assert sum(naps) <= 45.0
+
+
+def test_backoff_intermediate_wakeups_are_session_checks_only(monkeypatch):
+    # The intermediate wake-ups do ONLY a session check — never a broker read or
+    # tick(). Count the session checks == number of naps; nothing else runs.
+    naps = _rec_sleep(monkeypatch)
+    checks = {"n": 0}
+
+    def _closed(*a, **k):
+        checks["n"] += 1
+        return False
+
+    monkeypatch.setattr(mh, "is_tradable_now", _closed)
+    at._backoff_sleep(180.0, None)
+    assert checks["n"] == 12 and len(naps) == 12   # 12 checks, 0 broker calls
+
+
+def test_backoff_shutdown_returns_before_sleeping(monkeypatch):
+    # Shutdown already requested → stop before sleeping (checked at chunk top).
+    naps = _rec_sleep(monkeypatch)
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: False)
+    assert at._backoff_sleep(180.0, lambda: True) is True
+    assert naps == []
+
+
+def test_backoff_shutdown_midway_wakes_within_one_chunk(monkeypatch):
+    # Shutdown flips True after the first check → noticed within one 15s chunk.
+    naps = _rec_sleep(monkeypatch)
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: False)
+    seq = iter([False, True])
+    assert at._backoff_sleep(180.0, lambda: next(seq)) is True
+    assert len(naps) == 1
+
+
+def test_backoff_tradable_sleeps_one_chunk(monkeypatch):
+    # Tradable cadence (interval == 15) sleeps exactly once, same as before.
+    naps = _rec_sleep(monkeypatch)
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: True)
+    assert at._backoff_sleep(float(at.POLL_INTERVAL_S), None) is False
+    assert naps == [15.0]

@@ -535,6 +535,39 @@ def _interval_and_session() -> "tuple[float, str]":
     return float(POLL_INTERVAL_S), session
 
 
+# How often to surface from a closed-market backoff to re-check the session and
+# the shutdown flag. Decouples the WAKE/check frequency from the broker-sweep
+# frequency: the sweep still fires ~every closed interval (~180s), but a
+# CLOSED->tradable transition (or a shutdown) is noticed within this many
+# seconds instead of up to a full interval late.
+_WAKE_CHECK_S = float(POLL_INTERVAL_S)
+
+
+def _backoff_sleep(interval: float, shutdown_check) -> bool:
+    """Sleep up to ``interval`` between sweeps, waking every ``_WAKE_CHECK_S`` to
+    re-check shutdown and the market session. These intermediate wake-ups are
+    session checks ONLY — they never call tick() or any broker API — so the
+    closed-market broker-sweep cadence is preserved while a CLOSED->tradable
+    transition is picked up within ``_WAKE_CHECK_S``. Returns True if the worker
+    should stop (shutdown requested). Elapsed is summed from the naps, not read
+    from the wall clock, so a system-clock adjustment can't distort the interval.
+    """
+    from app.services import market_hours  # noqa: PLC0415
+    remaining = interval
+    while remaining > 0:
+        if shutdown_check is not None and shutdown_check():
+            return True
+        nap = min(_WAKE_CHECK_S, remaining)
+        time.sleep(nap)
+        remaining -= nap
+        # The market opened during a closed-market backoff — sweep now rather
+        # than finish the long sleep. (A no-op during tradable cadence, where
+        # interval == _WAKE_CHECK_S and remaining is already 0.)
+        if market_hours.is_tradable_now():
+            return False
+    return False
+
+
 def poll_loop(shutdown_check=None) -> None:
     log.info("discord_auto_trim: starting (tradable interval=%ss)", POLL_INTERVAL_S)
     last_cadence: "tuple[str, float] | None" = None
@@ -550,7 +583,8 @@ def poll_loop(shutdown_check=None) -> None:
         if last_cadence != (session, interval):
             log.info("auto_trim market_session=%s interval=%.0fs", session, interval)
             last_cadence = (session, interval)
-        time.sleep(interval)
+        if _backoff_sleep(interval, shutdown_check):
+            return
 
 
 # Count this loop's Webull calls under its own name (services/webull_usage.py).
