@@ -320,6 +320,10 @@ export default function BrokersPage() {
   // for RSA-style OAuth configurations.
   const [ibkrLabel, setIbkrLabel] = useState("");
   const [ibkrAccountId, setIbkrAccountId] = useState("");
+  // "gateway" = IBKR's Client Portal Gateway running on the server's machine
+  // (what individual accounts get); "oauth" = institutional self-service OAuth.
+  const [ibkrMode, setIbkrMode] = useState<"gateway" | "oauth">("gateway");
+  const [ibkrGatewayUrl, setIbkrGatewayUrl] = useState("https://localhost:5000");
   const [ibkrConsumerKey, setIbkrConsumerKey] = useState("");
   const [ibkrSignatureKey, setIbkrSignatureKey] = useState("");
   const [ibkrEncryptionKey, setIbkrEncryptionKey] = useState("");
@@ -459,6 +463,7 @@ export default function BrokersPage() {
     setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
+    setIbkrMode("gateway"); setIbkrGatewayUrl("https://localhost:5000");
     setIbkrSignatureKey(""); setIbkrEncryptionKey(""); setIbkrDhPrime("");
     setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
     setIbkrPaper(false);
@@ -473,7 +478,13 @@ export default function BrokersPage() {
         body: JSON.stringify({
           broker: "ibkr",
           label: ibkrLabel.trim(),
-          ibkr: {
+          ibkr: ibkrMode === "gateway" ? {
+            mode:        "gateway",
+            gateway_url: ibkrGatewayUrl.trim(),
+            account_id:  ibkrAccountId.trim(),
+            paper:       ibkrPaper,
+          } : {
+            mode:                   "oauth",
             consumer_key:           ibkrConsumerKey.trim(),
             access_token:           ibkrAccessToken.trim(),
             access_token_secret:    ibkrAccessTokenSecret.trim(),
@@ -1117,20 +1128,57 @@ export default function BrokersPage() {
               <BrokerAvatar broker="ibkr" size={32} />
               <h2 className="font-semibold">Connect Interactive Brokers</h2>
             </div>
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              Direct IBKR integration via their OAuth 1.0a Web API — no
-              aggregator, no local gateway. In IBKR Client Portal under{" "}
-              <strong>Settings → API → OAuth</strong>, register a self-service
-              consumer with a signature key, an encryption key and DH
-              parameters you generate, then create an access token. Paste the
-              consumer key, the access token and its encrypted secret, both
-              private keys and the DH prime here with your account number.
-              Mirror latency is typically 2–5s.
-            </p>
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              IBKR activates new OAuth keys during its nightly reset, so a
-              consumer created today can only be connected tomorrow.
-            </p>
+            <div className="flex gap-2 text-xs" role="tablist" aria-label="IBKR connection method">
+              {(["gateway", "oauth"] as const).map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={ibkrMode === m}
+                  onClick={() => setIbkrMode(m)}
+                  className="px-3 py-1.5 rounded-md border"
+                  style={{
+                    borderColor: ibkrMode === m ? "var(--accent)" : "var(--border)",
+                    color: ibkrMode === m ? "var(--fg)" : "var(--muted)",
+                    background: ibkrMode === m ? "var(--card)" : "transparent",
+                  }}
+                >
+                  {m === "gateway" ? "Client Portal Gateway (individual accounts)" : "OAuth (institutional accounts)"}
+                </button>
+              ))}
+            </div>
+            {ibkrMode === "gateway" ? (
+              <>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  IBKR gives individual accounts API access only through its
+                  Client Portal Gateway, a small Java app that runs on the same
+                  machine as this server. Start it, open its address in a
+                  browser, sign in with the IBKR username for this account, then
+                  connect here. The login lasts until IBKR&apos;s nightly reset,
+                  so you sign in once each trading day.
+                </p>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  Paper accounts work the same way: sign into the gateway with
+                  your paper username and enter the <strong>DU…</strong> account number.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  Direct OAuth 1.0a access, which IBKR offers to institutional
+                  accounts (advisors, organizations, funds). In IBKR Client
+                  Portal under <strong>Settings → API → OAuth</strong>, register
+                  a self-service consumer with a signature key, an encryption
+                  key and DH parameters you generate, then create an access
+                  token. Paste the consumer key, the access token and its
+                  encrypted secret, both private keys and the DH prime here.
+                </p>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  IBKR activates new OAuth keys during its nightly reset, so a
+                  consumer created today can only be connected tomorrow.
+                </p>
+              </>
+            )}
             <form onSubmit={connectIbkr} className="space-y-3">
               <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
@@ -1149,13 +1197,32 @@ export default function BrokersPage() {
                 <input
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
-                  placeholder="U1234567"
+                  placeholder={ibkrMode === "gateway" ? "DU1234567 or U1234567" : "U1234567"}
                   aria-label="IBKR account ID"
                   value={ibkrAccountId}
                   onChange={e => setIbkrAccountId(e.target.value)}
                   required
                 />
               </div>
+              {ibkrMode === "gateway" && (
+                <div>
+                  <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Gateway address</label>
+                  <input
+                    type="text"
+                    className="w-full p-2.5 font-mono text-sm"
+                    placeholder="https://localhost:5000"
+                    aria-label="IBKR gateway address"
+                    value={ibkrGatewayUrl}
+                    onChange={e => setIbkrGatewayUrl(e.target.value)}
+                    required
+                  />
+                  <p className="text-[10px] mt-1" style={{ color: "var(--muted)" }}>
+                    Where the gateway listens, as seen from this server. Must be
+                    localhost or a private-network address.
+                  </p>
+                </div>
+              )}
+              {ibkrMode === "oauth" && (<>
               <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Consumer key</label>
                 <input
@@ -1226,6 +1293,7 @@ export default function BrokersPage() {
                   required
                 />
               </div>
+              </>)}
               <PaperLiveRadio
                 value={ibkrPaper}
                 onChange={setIbkrPaper}
@@ -1237,9 +1305,9 @@ export default function BrokersPage() {
                 {busy && <Spinner />}
               </button>
               <p className="text-[10px]" style={{ color: "var(--muted)" }}>
-                We complete IBKR&apos;s live-session handshake and list your
-                accounts before saving. Keys are stored Fernet-encrypted at
-                rest and never logged.
+                {ibkrMode === "gateway"
+                  ? "We check the gateway is signed in and list its accounts before saving."
+                  : "We complete IBKR's live-session handshake and list your accounts before saving. Keys are stored Fernet-encrypted at rest and never logged."}
               </p>
             </form>
           </>
