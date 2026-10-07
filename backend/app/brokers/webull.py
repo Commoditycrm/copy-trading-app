@@ -615,6 +615,25 @@ _SNAPSHOT_FRESH_S = 10.0
 _SNAPSHOT_KEEP_S = 300.0
 _SNAPSHOT_KEY = "webull:positions:{}"
 
+# ── cross-process single-flight for DISPLAY positions reads ─────────────────
+# The in-process lock above can't coordinate the worker (risk) and the backend
+# (Positions page) — separate processes. They collide when both read the SAME
+# account LIVE inside Webull's few-second burst window and the second gets 429
+# (observed REGULAR 2026-10-07: a page read 0.3–2s after the worker's read).
+# The worker writes the shared snapshot after every live read, so:
+#   * a "fresh" display read still reuses a snapshot this new (the risk worker
+#     just wrote it) instead of a second Webull call — unless a fill marked it
+#     stale (see _snapshot_mark_stale), in which case it reads live;
+#   * when two processes want a live refresh at once only ONE hits Webull (a
+#     short Redis lock per account) while the others wait briefly and reuse its
+#     snapshot.
+# DISPLAY ONLY (cached_ok=True). The risk path keeps priority and live reads.
+_DISPLAY_FRESH_REUSE_S = 2.5          # a fresh display read reuses a snapshot this recent
+_REFRESH_LOCK_KEY = "webull:positions:refresh:{}"
+_REFRESH_LOCK_TTL_S = 3.0             # max a process holds the refresh slot (self-healing)
+_REFRESH_WAIT_S = 2.5                 # how long a waiter blocks for the in-flight result
+_REFRESH_POLL_S = 0.05
+
 
 class StalePositions(list):
     """Positions served from the shared snapshot because Webull rate-limited
@@ -720,6 +739,54 @@ def _snapshot_mark_stale(app_key, account_id=None) -> None:
 def _is_rate_limit(exc: BaseException) -> bool:
     msg = str(exc)
     return "429" in msg or "TOO_MANY_REQUESTS" in msg.upper()
+
+
+def _coordinated_display_fetch(app_key, account_id, fetch):
+    """Single-flight a DISPLAY live positions read across processes.
+
+    Only one process refreshes Webull for an account at a time (a Redis
+    ``SET NX`` lock); the others wait up to ``_REFRESH_WAIT_S`` and reuse the
+    snapshot the refresher writes, so the Positions page never fires a second
+    Webull call into the worker's (or another tab's) burst window. Returns
+    ``(positions, from_webull)`` — ``from_webull`` is False when the result came
+    from the in-flight refresher's snapshot. Different accounts never block each
+    other (the lock is per account). Degrades to a direct fetch if Redis is
+    unavailable, so display never depends on Redis being up. Webull-only.
+    """
+    lock = None
+    r = None
+    got = False
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+        r = get_sync_redis()
+        lock = _REFRESH_LOCK_KEY.format(_snapshot_id(app_key, account_id))
+        got = bool(r.set(lock, "1", nx=True, ex=int(_REFRESH_LOCK_TTL_S)))
+    except Exception:  # noqa: BLE001 — Redis trouble: just read live ourselves
+        return fetch(), True
+
+    if not got:
+        # Another process is refreshing this account right now. Wait for its
+        # result instead of racing it into a 429.
+        deadline = time.monotonic() + _REFRESH_WAIT_S
+        while time.monotonic() < deadline:
+            time.sleep(_REFRESH_POLL_S)
+            snap = _snapshot_read(app_key, account_id)
+            if snap is not None and snap[1] and snap[0] <= _REFRESH_LOCK_TTL_S:
+                return snap[2], False
+        # The refresher never produced a snapshot within the window (it died, or
+        # 429'd). Fall through and read live ourselves rather than fail.
+
+    try:
+        out = fetch()
+        _snapshot_write(app_key, account_id, out)
+        return out, True
+    finally:
+        if got and r is not None:
+            try:
+                r.delete(lock)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def invalidate_positions_cache(app_key: str | None, account_id: str | None = None) -> None:
@@ -1055,14 +1122,26 @@ class WebullAdapter(BrokerAdapter):
             hit = _positions_cache.get(key)
             if not fresh and hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
                 return hit[1]
-            # Another process read it moments ago: reuse that, no broker call.
+            # Reuse the shared snapshot another process (usually the risk worker)
+            # just wrote, instead of a second Webull call into its burst window.
+            # A normal display read reuses one up to _SNAPSHOT_FRESH_S old; a
+            # "fresh" read (Positions page right after a fill) still reuses a
+            # VERY recent one — the few-second window the cross-process 429s
+            # happen in. A fill marks the snapshot stale (snap[1] False), so a
+            # genuinely post-fill read falls through to a live read regardless.
             snap = _snapshot_read(self.app_key, self.account_id)
-            if not fresh and snap is not None and snap[1] and snap[0] <= _SNAPSHOT_FRESH_S:
+            reuse_window = _DISPLAY_FRESH_REUSE_S if fresh else _SNAPSHOT_FRESH_S
+            if snap is not None and snap[1] and snap[0] <= reuse_window:
                 return snap[2]
-            # A failure is NOT cached: the next caller retries. It is still
-            # serialised by the lock, which is the part that prevents the 429.
+            # Cross-process single-flight: only one process refreshes Webull for
+            # this account at a time; the rest reuse its snapshot. The
+            # in-process lock above serialises THIS process; this coordinates the
+            # worker and the backend. A failure is NOT cached. The risk path
+            # (cached_ok=False, above) is untouched and keeps priority.
             try:
-                out = self._fetch_positions()
+                out, from_webull = _coordinated_display_fetch(
+                    self.app_key, self.account_id, self._fetch_positions,
+                )
             except Exception as exc:
                 # Rate limited: show the last positions, marked with their age,
                 # rather than an empty table.
@@ -1071,8 +1150,8 @@ class WebullAdapter(BrokerAdapter):
                     stale.stale_age_s = snap[0]
                     return stale
                 raise
-            _positions_cache[key] = (time.monotonic(), out)
-            _snapshot_write(self.app_key, self.account_id, out)
+            if from_webull:
+                _positions_cache[key] = (time.monotonic(), out)
             return out
 
     def _fetch_positions(self) -> list[BrokerPosition]:
