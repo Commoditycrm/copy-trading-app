@@ -295,54 +295,53 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
   }
 
   const rows = [...items].sort((a, b) => PROTECTION_ORDER.indexOf(a.kind) - PROTECTION_ORDER.indexOf(b.kind));
+  const unit = isOption ? "contract" : "share";
+  // What is placed, as ONE line beside the rules — each protection a short
+  // chip with its own ×, rather than a row each.
+  const placed = (
+    <div className="flex items-center flex-wrap gap-x-2 gap-y-1" style={{ color: "var(--text-2)" }}>
+      <span className="font-semibold" style={{ color: "var(--text)" }}>Placed:</span>
+      {rows.length === 0 ? (
+        <span className="inline-flex items-center gap-1.5" style={{ color: "var(--muted)" }}>
+          <AlertTriangle size={12} style={{ color: "var(--bad)" }} />
+          nothing — no stop, trailing stop or take-profit; set one with the buttons above
+        </span>
+      ) : rows.map((it, i) => {
+        const { Icon, name, fg } = PROTECTION_STYLE[it.kind];
+        const bits: string[] = [];
+        if (it.note && it.note.startsWith("Trim")) bits.push(it.note.replace("Trim ", "T"));
+        if (it.kind === "trailing_stop" && it.trail_pct) bits.push(`${it.trail_pct}% from ${it.peak ?? "high"}`);
+        else if (it.kind === "trailing_stop" && it.trail_amount) bits.push(`$${it.trail_amount} from ${it.peak ?? "high"}`);
+        bits.push(it.quantity ? `${fmtNum(it.quantity, 0)} ${unit}${Number(it.quantity) === 1 ? "" : "s"}` : "all");
+        bits.push(it.where === "app" ? "watched by Kopyya" : `at ${it.where}`);
+        const tip = `${name}${it.note && !it.note.startsWith("Trim") ? ` — ${it.note}` : ""}`;
+        return (
+          <span key={i} title={tip}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5"
+                style={{ border: "1px solid var(--border)" }}>
+            <Icon size={12} style={{ color: fg }} />
+            <span>{name}</span>
+            <span className="num font-semibold" style={{ color: "var(--text)" }}>{it.price ?? "—"}</span>
+            <span style={{ color: "var(--muted)" }}>· {bits.join(" · ")}</span>
+            <button
+              type="button"
+              onClick={() => void cancel(it, i)}
+              disabled={busy !== null}
+              aria-label={`Cancel the ${name.toLowerCase()}`}
+              title={`Cancel the ${name.toLowerCase()}`}
+              className="ml-0.5 rounded p-0.5 opacity-60 hover:opacity-100 disabled:opacity-30"
+            >
+              {busy === i ? <Spinner /> : <X size={11} />}
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  );
   return (
     <tr style={{ background: "var(--panel-2)" }}>
-      <td colSpan={colSpan} className="px-5 py-2.5">
-        {rows.length === 0 ? (
-          <div className="flex items-center gap-2 text-[12px]" style={{ color: "var(--muted)" }}>
-            <AlertTriangle size={13} style={{ color: "var(--bad)" }} />
-            No stop, trailing stop or take-profit on this position — set one with the buttons above.
-          </div>
-        ) : (
-          <div className="grid gap-x-3 gap-y-1.5 items-center text-[12px]" style={{ gridTemplateColumns: "130px minmax(0,1fr) auto" }}>
-            {rows.map((it, i) => {
-              const { Icon, name, fg } = PROTECTION_STYLE[it.kind];
-              const parts: string[] = [];
-              if (it.note && it.note.startsWith("Trim")) parts.push(it.note);
-              if (it.kind === "trailing_stop" && it.trail_pct) parts.push(`${it.trail_pct}% give-back${it.peak ? ` from high ${it.peak}` : ""}`);
-              else if (it.kind === "trailing_stop" && it.trail_amount) parts.push(`$${it.trail_amount} give-back${it.peak ? ` from high ${it.peak}` : ""}`);
-              const unit = isOption ? "contract" : "share";
-              parts.push(it.quantity ? `${fmtNum(it.quantity, 0)} ${unit}${Number(it.quantity) === 1 ? "" : "s"}` : "whole position");
-              const where = it.where === "app"
-                ? "watched by Kopyya"
-                : `resting at ${it.where}${it.note && !it.note.startsWith("Trim") ? `, ${it.note}` : ""}`;
-              return (
-                <Fragment key={i}>
-                  <span className="inline-flex items-center gap-1.5" style={{ color: "var(--text-2)" }}>
-                    <Icon size={13} style={{ color: fg }} /> {name}
-                  </span>
-                  <span style={{ color: "var(--text)" }}>
-                    {it.kind === "take_profit" ? "target" : "stop"}{" "}
-                    <span className="num font-semibold">{it.price ?? "—"}</span>
-                    {" · "}{parts.join(" · ")}{" · "}
-                    <span style={{ color: "var(--muted)" }}>{where}</span>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void cancel(it, i)}
-                    disabled={busy !== null}
-                    className="btn-ghost px-2 py-0.5 text-[11px] disabled:opacity-50"
-                  >
-                    {busy === i ? <Spinner /> : "Cancel"}
-                  </button>
-                </Fragment>
-              );
-            })}
-          </div>
-        )}
-        <div className="mt-3 pt-2.5" style={{ borderTop: "1px solid var(--border)" }}>
-          <PositionSummary target={summary} />
-        </div>
+      <td colSpan={colSpan} className="px-4 py-2">
+        <PositionSummary target={summary} placed={placed} />
       </td>
     </tr>
   );
