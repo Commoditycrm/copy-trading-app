@@ -342,6 +342,16 @@ def create_app() -> FastAPI:
             except Exception:  # noqa: BLE001
                 log.exception("failed to start webull subscriber reconciler")
 
+        # IBKR subscriber mirror-status reconciler — same shape as the Alpaca
+        # and Webull ones. IBKR subscriber accounts have no listener, so this
+        # is the only thing that moves their mirrors from SUBMITTED to
+        # FILLED / CANCELED. Worker-only.
+        try:
+            from app.services import ibkr_subscriber_reconciler
+            ibkr_subscriber_reconciler.start_ibkr_subscriber_reconciler()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start ibkr subscriber reconciler")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep
@@ -460,6 +470,9 @@ def create_app() -> FastAPI:
                        alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler)
         await _bounded("webull subscriber reconciler",
                        webull_subscriber_reconciler.stop_webull_subscriber_reconciler)
+        from app.services import ibkr_subscriber_reconciler  # noqa: PLC0415
+        await _bounded("ibkr subscriber reconciler",
+                       ibkr_subscriber_reconciler.stop_ibkr_subscriber_reconciler)
         await _bounded("market_data_stream", market_data_stream.stop_market_data_stream)
         await _bounded("webull_market_stream", webull_market_stream.stop_webull_market_stream)
         await _bounded("redis client", close_async_redis)

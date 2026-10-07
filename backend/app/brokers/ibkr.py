@@ -54,6 +54,24 @@ IBKR identifies everything by ``conid``. Stocks resolve through
 (month + strike + right) → the row whose ``maturityDate`` matches the expiry.
 Resolved conids are cached per process; contract ids are stable.
 
+Gateway mode (individual / retail accounts)
+--------------------------------------------
+IBKR only grants OAuth to institutional accounts; retail logins are told to
+use the **Client Portal Gateway**, a local Java app the user runs on their
+own machine and signs into through a browser once a day. The gateway exposes
+the SAME ``/v1/api`` endpoints without any OAuth header, so the adapter has
+a second transport::
+
+    {"mode": "gateway", "gateway_url": "https://localhost:5000",
+     "account_id": "DU1234567", "paper": true}
+
+Rules in gateway mode: no signing; the gateway's self-signed TLS certificate
+is accepted; a 401 or an unauthenticated status means "nobody is logged into
+the gateway", which only the user can fix in their browser; a background
+``/tickle`` keeps the session from idling out between orders. The gateway
+URL must point at the backend's own machine or a private network address —
+this is a single-operator / self-hosted shape, never a public URL.
+
 Operational notes
 -----------------
 * IBKR activates newly generated self-service OAuth keys during its nightly
@@ -67,18 +85,21 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import logging
 import re
 import secrets
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
+import urllib3
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -342,7 +363,71 @@ def _session_for(consumer_key: str, access_token: str) -> _Session:
 
 
 class IBKRAuthError(RuntimeError):
-    """Credentials rejected (401) even after a fresh handshake."""
+    """Credentials rejected (401) even after a fresh handshake — or, in
+    gateway mode, nobody is logged into the Client Portal Gateway."""
+
+
+DEFAULT_GATEWAY_URL = "https://localhost:5000"
+_GATEWAY_TICKLE_INTERVAL_S = 60.0
+_GATEWAY_LOCAL_SUFFIXES = (".localhost", ".local", ".ts.net", ".internal", ".lan")
+
+
+def normalize_gateway_url(raw: str | None) -> str:
+    """Validate a Client Portal Gateway origin. The backend will send
+    requests to it, so it must be this machine or a private network: an SSRF
+    guard, and also simply how the gateway works (IBKR only serves API calls
+    from the machine where the browser login happened)."""
+    text = (raw or DEFAULT_GATEWAY_URL).strip().rstrip("/")
+    if "://" not in text:
+        text = "https://" + text
+    u = urlparse(text)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise RuntimeError(f"IBKR gateway URL is not a valid http(s) origin: {raw!r}")
+    if u.path not in ("", "/") or u.query or u.fragment:
+        raise RuntimeError("IBKR gateway URL must be just the origin, e.g. https://localhost:5000")
+    host = u.hostname.lower()
+    ok = host == "localhost" or host.endswith(_GATEWAY_LOCAL_SUFFIXES)
+    if not ok:
+        try:
+            ip = ipaddress.ip_address(host)
+            ok = ip.is_private or ip.is_loopback or ip.is_link_local or (
+                ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")  # CGNAT / Tailscale
+            )
+        except ValueError:
+            ok = False
+    if not ok:
+        raise RuntimeError(
+            "IBKR gateway URL must be localhost or a private-network address — "
+            "the Client Portal Gateway runs on your own machine"
+        )
+    return f"{u.scheme}://{u.hostname}{':' + str(u.port) if u.port else ''}"
+
+
+_gateway_keepalives: set[str] = set()
+_gateway_keepalive_lock = threading.Lock()
+
+
+def _start_gateway_keepalive(api_base: str) -> None:
+    """One daemon thread per gateway that GETs ``/tickle`` every minute so the
+    brokerage session survives idle stretches (it times out after ~6 min).
+    Failures are logged and retried; the thread lives as long as the process."""
+    with _gateway_keepalive_lock:
+        if api_base in _gateway_keepalives:
+            return
+        _gateway_keepalives.add(api_base)
+
+    def _loop() -> None:
+        while True:
+            time.sleep(_GATEWAY_TICKLE_INTERVAL_S)
+            try:
+                requests.post(
+                    f"{api_base}/tickle", headers={"User-Agent": _USER_AGENT},
+                    timeout=_HTTP_TIMEOUT_S, verify=False,
+                )
+            except requests.RequestException as exc:
+                log.debug("ibkr gateway tickle failed (%s): %s", api_base, exc)
+
+    threading.Thread(target=_loop, name=f"ibkr-gateway-tickle", daemon=True).start()
 
 
 # ── Adapter ─────────────────────────────────────────────────────────────────
@@ -365,6 +450,23 @@ class IBKRAdapter(BrokerAdapter):
 
     def __init__(self, credentials: dict[str, Any]):
         super().__init__(credentials)
+        self._paper = bool(credentials.get("paper", False))
+        mode = str(credentials.get("mode") or ("gateway" if credentials.get("gateway_url") else "oauth"))
+        self._gateway = mode == "gateway"
+        if self._gateway:
+            try:
+                self._account_id = str(credentials["account_id"]).strip().upper()
+            except KeyError as exc:
+                raise RuntimeError("IBKR credentials missing 'account_id'") from exc
+            self._gateway_url = normalize_gateway_url(credentials.get("gateway_url"))
+            self._base_url = self._gateway_url + "/v1/api"
+            self._realm = DEFAULT_REALM
+            self._session = _session_for("gateway", self._base_url)
+            # The gateway ships a self-signed certificate for localhost.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            _start_gateway_keepalive(self._base_url)
+            return
+        self._base_url = BASE_URL
         if "private_signature_key" not in credentials and "signing_key" in credentials:
             raise RuntimeError(
                 "This IBKR connection was saved with the old single-signing-key "
@@ -386,7 +488,6 @@ class IBKRAdapter(BrokerAdapter):
             self._dh_prime = _parse_dh_prime(credentials["dh_prime"])
         except KeyError as exc:
             raise RuntimeError(f"IBKR credentials missing {exc.args[0]!r}") from exc
-        self._paper = bool(credentials.get("paper", False))
         self._realm = str(credentials.get("realm") or DEFAULT_REALM)
         self._session = _session_for(self._consumer_key, self._access_token)
 
@@ -406,6 +507,8 @@ class IBKRAdapter(BrokerAdapter):
         """The current live session token, handshaking when missing or about
         to expire. Serialised per session so concurrent callers share one
         handshake."""
+        if self._gateway:
+            raise RuntimeError("IBKR gateway mode has no live session token")
         s = self._session
         with s.lock:
             if s.lst is None or time.time() > s.lst_expires_at - _LST_REFRESH_MARGIN_S:
@@ -431,7 +534,7 @@ class IBKRAdapter(BrokerAdapter):
         params["oauth_signature"] = _pct(base64.b64encode(signature).decode())
         headers = {
             "Authorization": _auth_header(self._realm, params),
-            "Accept": "application/json",
+            "Accept": "*/*",
             "User-Agent": _USER_AGENT,
         }
         try:
@@ -490,29 +593,29 @@ class IBKRAdapter(BrokerAdapter):
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> tuple[int, Any]:
-        """One signed call. Returns ``(status_code, parsed_body)`` and leaves
-        auth/retry decisions to the caller."""
-        url = BASE_URL + path
+        """One call — OAuth-signed against IBKR's hosted API, or plain against
+        a local Client Portal Gateway. Returns ``(status_code, parsed_body)``
+        and leaves auth/retry decisions to the caller."""
+        url = self._base_url + path
         query = {k: str(v) for k, v in (params or {}).items() if v is not None}
-        oauth = {
-            "oauth_consumer_key": self._consumer_key,
-            "oauth_nonce": secrets.token_hex(16),
-            "oauth_signature_method": "HMAC-SHA256",
-            "oauth_timestamp": str(int(time.time())),
-            "oauth_token": self._access_token,
-        }
-        base = _base_string(method, url, {**query, **oauth})
-        sig = hmac.new(self._lst(), base.encode(), hashlib.sha256).digest()
-        oauth["oauth_signature"] = _pct(base64.b64encode(sig).decode())
-        headers = {
-            "Authorization": _auth_header(self._realm, oauth),
-            "Accept": "application/json",
-            "User-Agent": _USER_AGENT,
-        }
+        headers = {"Accept": "*/*", "User-Agent": _USER_AGENT}
+        if not self._gateway:
+            oauth = {
+                "oauth_consumer_key": self._consumer_key,
+                "oauth_nonce": secrets.token_hex(16),
+                "oauth_signature_method": "HMAC-SHA256",
+                "oauth_timestamp": str(int(time.time())),
+                "oauth_token": self._access_token,
+            }
+            base = _base_string(method, url, {**query, **oauth})
+            sig = hmac.new(self._lst(), base.encode(), hashlib.sha256).digest()
+            oauth["oauth_signature"] = _pct(base64.b64encode(sig).decode())
+            headers["Authorization"] = _auth_header(self._realm, oauth)
         try:
             r = requests.request(
                 method, url, params=query or None, json=json,
                 headers=headers, timeout=_HTTP_TIMEOUT_S,
+                verify=not self._gateway,
             )
         except requests.RequestException as exc:
             raise RuntimeError(f"IBKR network error: {exc}") from exc
@@ -543,10 +646,16 @@ class IBKRAdapter(BrokerAdapter):
             if code == 200 and isinstance(status, dict) and status.get("authenticated"):
                 s.brokerage_checked_at = time.time()
                 return
+            if self._gateway and (
+                code == 401 or not (isinstance(status, dict) and status.get("connected"))
+            ):
+                raise IBKRAuthError(self._gateway_login_message(status))
             code, body = self._http(
                 "POST", "/iserver/auth/ssodh/init", json={"publish": True, "compete": True},
             )
             if code == 401:
+                if self._gateway:
+                    raise IBKRAuthError(self._gateway_login_message(body))
                 raise IBKRAuthError(f"IBKR brokerage session init rejected (401): {body!r}"[:400])
             if isinstance(body, dict) and body.get("authenticated"):
                 s.brokerage_checked_at = time.time()
@@ -557,10 +666,20 @@ class IBKRAdapter(BrokerAdapter):
                 if code == 200 and isinstance(status, dict) and status.get("authenticated"):
                     s.brokerage_checked_at = time.time()
                     return
+            if self._gateway:
+                raise IBKRAuthError(self._gateway_login_message(status))
             raise RuntimeError(
                 "IBKR brokerage session did not authenticate after ssodh/init. "
                 f"last status={status!r}"[:400]
             )
+
+    def _gateway_login_message(self, body: Any = None) -> str:
+        return (
+            f"IBKR Client Portal Gateway at {self._gateway_url} has no logged-in "
+            f"session. Open {self._gateway_url} in a browser on that machine, sign in "
+            "with the IBKR username for this account, then retry. "
+            f"(gateway said: {str(body)[:160]!r})"
+        )
 
     def _request(
         self,
@@ -578,6 +697,10 @@ class IBKRAdapter(BrokerAdapter):
             self._ensure_brokerage_session()
         code, body = self._http(method, path, params=params, json=json)
 
+        if code == 401 and self._gateway:
+            # Only a browser login fixes this; don't spin.
+            self._session.brokerage_checked_at = 0.0
+            raise IBKRAuthError(self._gateway_login_message(body))
         if code == 401:
             log.info("ibkr: 401 on %s %s — re-handshaking once", method, path)
             self._invalidate_lst()
@@ -613,11 +736,13 @@ class IBKRAdapter(BrokerAdapter):
     # ── Account info / verify ─────────────────────────────────────────────
 
     def verify_connection(self) -> ConnectionInfo:
-        """Full handshake + brokerage session + list the accounts the token
-        can see. If our stored ``account_id`` isn't among them, surface a
-        clean message so the user can fix the form instead of having every
-        subsequent order fail mysteriously."""
-        self._lst()
+        """Full handshake (OAuth) or gateway login check, then the brokerage
+        session and the list of accounts this login can see. If our stored
+        ``account_id`` isn't among them, surface a clean message so the user
+        can fix the form instead of having every subsequent order fail
+        mysteriously."""
+        if not self._gateway:
+            self._lst()
         body = self._request("GET", "/portfolio/accounts")
         self._session.portfolio_primed = True
         accounts = body if isinstance(body, list) else (
@@ -638,7 +763,12 @@ class IBKRAdapter(BrokerAdapter):
             # Fractional-share support is symbol-specific and gated by
             # account permissions; default off.
             supports_fractional=False,
-            extra={"paper": self._paper, "accounts": sorted(account_ids)},
+            extra={
+                "paper": self._paper,
+                "accounts": sorted(account_ids),
+                "mode": "gateway" if self._gateway else "oauth",
+                **({"gateway_url": self._gateway_url} if self._gateway else {}),
+            },
         )
 
     # ── Contract resolution ───────────────────────────────────────────────
@@ -795,8 +925,15 @@ class IBKRAdapter(BrokerAdapter):
         if req.extended_hours and req.instrument_type == InstrumentType.STOCK:
             order["outsideRTH"] = True
         if req.client_order_id:
-            # IBKR caps custom-order-id length; truncate defensively.
-            order["cOID"] = str(req.client_order_id)[:32]
+            # IBKR echoes this back as ``order_ref`` on the orders feed, cut to
+            # 32 characters. A dashed UUID is 36, so send the 32-char hex form —
+            # it survives intact and uuid.UUID() parses it on the way back.
+            cid = str(req.client_order_id).strip()
+            try:
+                cid = uuid.UUID(cid).hex
+            except ValueError:
+                cid = cid[:32]
+            order["cOID"] = cid
 
         body = self._request(
             "POST",
@@ -843,17 +980,98 @@ class IBKRAdapter(BrokerAdapter):
                 return self._order_to_result(o)
         raise LookupError(f"IBKR order {broker_order_id} not in recent orders feed")
 
+    _TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
+
     def cancel_order(self, broker_order_id: str) -> bool:
-        """True — a failed cancel raises, so reaching the return means the order
-        was live and is now cancelled. See base.cancel_order."""
+        """True when the order is cancelled at IBKR after this call; False when
+        IBKR had ALREADY finished with it (filled / cancelled earlier); raises
+        only when its state is unknown. See base.cancel_order.
+
+        IBKR's DELETE is not a clean request/response: the paper gateway has
+        answered **503 Service Unavailable while actually performing the
+        cancel** (2026-10-07, twice), and a second attempt then gets "Cancel
+        attempted when order is not in a cancellable state" or "OrderID …
+        doesn't exist". So every failure is settled by reading the order back:
+        the orders feed, not the DELETE's status code, is the truth."""
         try:
             self._request(
                 "DELETE",
                 f"/iserver/account/{self._account_id}/order/{broker_order_id}",
             )
+            return True
         except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            # A 4xx that says the order was already finished with → the DELETE
+            # did nothing; a 5xx / network failure → it may well have done it.
+            already_dead = any(k in msg for k in (
+                "doesn't exist", "does not exist", "not found", "not in a cancellable state",
+            ))
+            status = self._settled_status_after_cancel(broker_order_id)
+            if status == OrderStatus.CANCELED and not already_dead:
+                log.info("ibkr: cancel of %s errored (%s) but the order is cancelled", broker_order_id, exc)
+                return True
+            if status in self._TERMINAL:
+                log.info("ibkr: cancel of %s — already %s at IBKR, nothing to cancel", broker_order_id, status.value)
+                return False
             raise RuntimeError(f"IBKR cancel_order: {exc}") from exc
-        return True
+
+    def _settled_status_after_cancel(self, broker_order_id: str) -> OrderStatus | None:
+        """Read the order back a few times — a cancel acknowledged with a 503 can
+        take a moment to show as Cancelled on the feed."""
+        last: OrderStatus | None = None
+        for attempt in range(4):
+            try:
+                last = self.get_order(broker_order_id).status
+            except Exception:  # noqa: BLE001
+                last = None
+            if last in self._TERMINAL:
+                return last
+            if attempt < 3:
+                time.sleep(0.75)
+        return last
+
+    # ── Quotes ────────────────────────────────────────────────────────────
+
+    def get_stock_latest_price(self, symbol: str) -> Decimal | None:
+        """Last traded price for a stock, or None. The copy engine uses it to
+        price a marketable LIMIT pre/post-market — without it a mirror goes out
+        as a MARKET order, which IBKR cancels on arrival outside regular hours
+        (paper, 2026-10-07: every pre-market mirror came back Cancelled).
+
+        The shared Alpaca data feed is asked first (same price, no IBKR
+        session traffic); IBKR's snapshot is the fallback. The snapshot
+        endpoint needs one priming call before it returns fields."""
+        try:
+            from app.services import market_data_stream as mds  # noqa: PLC0415
+            px = mds.data_stock_price(symbol)
+            if px is not None and px > 0:
+                return px
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            conid = self._conid_for(symbol)
+            params = {"conids": conid, "fields": "31,84,86"}
+            rows = self._request("GET", "/iserver/marketdata/snapshot", params=params)
+            row = rows[0] if isinstance(rows, list) and rows else {}
+            if not _attr(row, "31"):
+                time.sleep(0.5)
+                rows = self._request("GET", "/iserver/marketdata/snapshot", params=params)
+                row = rows[0] if isinstance(rows, list) and rows else {}
+            raw = str(_attr(row, "31") or "").strip()
+            # IBKR prefixes the last price with a marker outside RTH ("C" for a
+            # close, "H" halted); strip anything that isn't part of the number.
+            raw = re.sub(r"[^0-9.]", "", raw)
+            px = Decimal(raw) if raw else None
+            if px is None or px <= 0:
+                for f in ("84", "86"):          # bid / ask as a last resort
+                    alt = _to_dec(re.sub(r"[^0-9.]", "", str(_attr(row, f) or "")))
+                    if alt and alt > 0:
+                        return alt
+                return None
+            return px
+        except Exception as exc:  # noqa: BLE001
+            log.info("ibkr: latest price for %s unavailable: %s", symbol, exc)
+            return None
 
     # ── Positions ─────────────────────────────────────────────────────────
 
