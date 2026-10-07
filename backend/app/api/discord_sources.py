@@ -2563,6 +2563,21 @@ def _close_all_from_channel(
     the alert keeps the first order and a line per contract.
     """
     sig = dict(msg.parsed_signal or {})
+    if sig.get("latest_contract") and not sig.get("symbol"):
+        # "Cutting @here" names nothing: it means the position this channel is
+        # in — the contract it most recently bought that is still held.
+        try:
+            latest = discord_execution.latest_channel_contract(db, user, msg.source_id)
+        except Exception as exc:  # noqa: BLE001
+            discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
+            log.exception("discord: latest-contract lookup failed for alert %s", msg.id)
+            return
+        if latest is None:
+            discord_execution.mark_failed(
+                msg, "A close-out with no ticker, and nothing from this channel is held.")
+            return
+        sig = {**sig, "symbol": latest["symbol"], "option_type": latest.get("option_type"),
+               "strike": latest.get("strike")}
     what = f"{sig.get('symbol')} {(sig.get('option_type') or '').lower() + 's' if sig.get('option_type') else 'options'}"
     # Everything this closes was opened by this channel, so its settings decide:
     # with Manual exits a stop-out is recorded and nothing is sold.
