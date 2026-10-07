@@ -1030,6 +1030,82 @@ class IBKRAdapter(BrokerAdapter):
                 time.sleep(0.75)
         return last
 
+    # ── Balances / P&L ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _summary_amount(summary: Any, key: str) -> Decimal | None:
+        """``/portfolio/{acct}/summary`` nests each figure as
+        ``{"amount": 1031939.06, "currency": "USD", ...}``."""
+        cell = summary.get(key) if isinstance(summary, dict) else None
+        if isinstance(cell, dict):
+            if cell.get("isNull"):
+                return None
+            return _to_dec(cell.get("amount") if cell.get("amount") is not None else cell.get("value"))
+        return _to_dec(cell)
+
+    def get_balance_snapshot(self) -> dict[str, Any]:
+        """Cash / buying power / equity for the Brokers card and connect. Same
+        shape as the Alpaca / SnapTrade / Webull adapters so
+        ``balance_sync.refresh_account_balance`` can consume it."""
+        summary = self._portfolio_request("GET", f"/portfolio/{self._account_id}/summary")
+        if not isinstance(summary, dict) or not summary:
+            raise RuntimeError("IBKR account summary came back empty")
+        equity = self._summary_amount(summary, "netliquidation")
+        cash = self._summary_amount(summary, "totalcashvalue")
+        bp = self._summary_amount(summary, "buyingpower") or self._summary_amount(summary, "availablefunds")
+        ccy = None
+        cell = summary.get("netliquidation")
+        if isinstance(cell, dict):
+            ccy = cell.get("currency")
+        return {
+            "cash": cash,
+            "buying_power": bp,
+            "total_equity": equity,
+            "currency": ccy or "USD",
+        }
+
+    def get_pnl_snapshot(self) -> dict[str, Any] | None:
+        """Equity / day-start / today's P&L for the daily kill switches, from
+        ``/iserver/account/pnl/partitioned`` (``dpl`` = day P&L, ``nl`` = net
+        liquidation). IBKR fills that endpoint lazily: the first call of a
+        session answers ``{"upnl": {}}`` and later calls carry the figures, so
+        we read it twice. None (poller skips) when IBKR has no day figure."""
+        try:
+            row: dict[str, Any] = {}
+            for attempt in range(2):
+                body = self._request("GET", "/iserver/account/pnl/partitioned")
+                upnl = body.get("upnl") if isinstance(body, dict) else None
+                if isinstance(upnl, dict) and upnl:
+                    # Keys look like "DUN603294.Core"; take ours (or the only one).
+                    row = next(
+                        (v for k, v in upnl.items() if str(k).upper().startswith(self._account_id)),
+                        next(iter(upnl.values())),
+                    ) or {}
+                    if row.get("dpl") is not None:
+                        break
+                if attempt == 0:
+                    time.sleep(0.75)
+            todays_pl = _to_dec(row.get("dpl"))
+            # The partitioned feed's ``nl`` is a coarse figure (live paper:
+            # 1030000.0 against a summary net liquidation of 1031939.06), so
+            # take equity from the account summary and keep ``nl`` as a fallback.
+            equity = self._summary_amount(
+                self._portfolio_request("GET", f"/portfolio/{self._account_id}/summary"),
+                "netliquidation",
+            )
+            if equity is None:
+                equity = _to_dec(row.get("nl"))
+            if equity is None or todays_pl is None:
+                return None
+            return {
+                "todays_pl": todays_pl,
+                "equity": equity,
+                "beginning_day_balance": equity - todays_pl,
+            }
+        except Exception:  # noqa: BLE001
+            log.warning("ibkr get_pnl_snapshot failed", exc_info=True)
+            return None
+
     # ── Quotes ────────────────────────────────────────────────────────────
 
     def get_stock_latest_price(self, symbol: str) -> Decimal | None:
