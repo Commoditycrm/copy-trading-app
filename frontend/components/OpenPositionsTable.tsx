@@ -350,6 +350,26 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
 
 /** Stop levels offered on the expanded row, as the position's P&L: -25 puts the
  *  stop 25% below entry, 0 at break-even, +25 locks in a quarter. */
+/** An input and the button that acts on it, drawn as ONE control — a shared
+ *  border, a small label inside — so it can't be mistaken for the plain
+ *  buttons beside it (X.Stops, Stop), which don't use any input. */
+const INPUT_GROUP: React.CSSProperties = {
+  border: "1px solid var(--border-strong)",
+  borderRadius: "var(--r-sm)",
+  background: "var(--panel-2)",
+  overflow: "hidden",
+};
+function GroupLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="px-1.5 inline-flex items-center text-[10px] uppercase tracking-wide"
+          style={{ color: "var(--muted)", borderRight: "1px solid var(--border)" }}>
+      {children}
+    </span>
+  );
+}
+
+/** What Close % starts at on every position. */
+const DEFAULT_CLOSE_PCT = 25;
 const STOP_LEVELS = [-25, -10, 0];
 /** Profit levels, in a green dropdown after the chips: the stop locks that much in. */
 const PROFIT_LEVELS = [25, 35, 50, 60, 70, 80, 100, 120, 150];
@@ -484,6 +504,18 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               return <option key={pct} value={pct}>+{pct}%{px != null ? ` (${px.toFixed(2)})` : ""}</option>;
             })}
           </select>
+          {/* Stop acts on the level picked just left of it — so it sits here,
+              not beside the trail box, which it has nothing to do with. */}
+          <button
+            type="button"
+            disabled={level == null || busy !== null}
+            onClick={setStop}
+            title={level == null ? "Pick a stop level first" : `Set the stop at ${level > 0 ? "+" : ""}${level}% P&L`}
+            className="btn-ghost px-2 py-0.5 text-[11px] inline-flex items-center justify-center gap-1 disabled:opacity-40"
+          >
+            <span>Stop</span>
+            {busy === "set" && <Spinner />}
+          </button>
         </div>
       </td>
     ),
@@ -492,17 +524,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
         <div className="flex gap-2 items-center whitespace-nowrap">
           {/* Same width as the main row's Close at Market, so the input below
               lines up under the Limit field. */}
-          <div className="flex gap-1 justify-between" style={{ width: ACTION_SLOT_W }}>
-            <button
-              type="button"
-              disabled={level == null || busy !== null}
-              onClick={setStop}
-              title={level == null ? "Pick a stop level first" : `Set the stop at ${level > 0 ? "+" : ""}${level}% P&L`}
-              className="btn-ghost px-2 py-1 text-xs inline-flex items-center justify-center gap-1 disabled:opacity-40"
-            >
-              <span>Stop</span>
-              {busy === "set" && <Spinner />}
-            </button>
+          <div className="flex gap-1" style={{ width: ACTION_SLOT_W }}>
             <button
               type="button"
               disabled={busy !== null}
@@ -514,10 +536,13 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               {busy === "stop" && <Spinner />}
             </button>
           </div>
-          <div className="flex items-stretch">
+          <span aria-hidden className="self-stretch" style={{ width: 1, background: "var(--border)" }} />
+          <div className="flex items-stretch" style={INPUT_GROUP}
+               title="Trailing stop: the % and the button that uses it">
+            <GroupLabel>Trail</GroupLabel>
             <input
               type="number" step="0.1" min="0.1" max="100"
-              placeholder="trail %"
+              placeholder="%"
               title={trailStart != null
                 ? `Trailing stop starts at ${trailStart.toFixed(2)} (${trailPct}% below the market) and rises with new highs`
                 : "Trailing stop: % below the market price, rising with new highs"}
@@ -525,16 +550,8 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               value={trailPct}
               onChange={e => setTrailPct(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && trailPct) void armTrail(); }}
-              className="w-20 px-2 py-1 text-xs border"
-              style={{
-                borderColor: "var(--border)",
-                background: "var(--bg)",
-                borderTopLeftRadius: "var(--r-sm)",
-                borderBottomLeftRadius: "var(--r-sm)",
-                borderTopRightRadius: 0,
-                borderBottomRightRadius: 0,
-                borderRight: "none",
-              }}
+              className="w-14 px-2 py-1 text-xs text-right"
+              style={{ border: "none", background: "var(--bg)", borderRadius: 0 }}
             />
             <button
               type="button"
@@ -544,12 +561,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
                 ? `Start a trailing stop at ${trailStart.toFixed(2)}, ${trailPct}% below the market`
                 : "Enter a trail % first"}
               className="btn-primary px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
-              style={{
-                borderTopLeftRadius: 0,
-                borderBottomLeftRadius: 0,
-                borderTopRightRadius: "var(--r-sm)",
-                borderBottomRightRadius: "var(--r-sm)",
-              }}
+              style={{ borderRadius: 0 }}
             >
               <span>Trl.Stop</span>
               {busy === "trail" && <Spinner />}
@@ -843,7 +855,7 @@ export const OpenPositionsTable = forwardRef<
     // into it (buy more). Chosen from the ▾ beside the button.
     const [marketMode, setMarketMode] = useState<Record<string, ExitMode>>({});
     const [limitMode, setLimitMode] = useState<Record<string, ExitMode>>({});
-    // Per-row close size as a percentage of the held quantity. Defaults to 100%.
+    // Per-row close size as a percentage of the held quantity. Defaults to 25%.
     const [closePercents, setClosePercents] = useState<Record<string, number>>({});
     // Filter: default to options since that's the most common workflow here.
     const [filter, setFilter] = useState<"all" | "stock" | "option">("all");
@@ -858,7 +870,9 @@ export const OpenPositionsTable = forwardRef<
       const total = Math.abs(Number(p.quantity));
       if (!Number.isFinite(total) || total <= 0) return null;
       let qty = total * (pct / 100);
-      if (p.instrument_type === "option") qty = Math.floor(qty);
+      // Options round UP to a whole contract, never past what is held: 25% of 1
+      // closes 1, 25% of 6 closes 2. A close that rounded to nothing would do nothing.
+      if (p.instrument_type === "option") qty = Math.min(total, Math.max(1, Math.ceil(qty)));
       else qty = Math.round(qty * 1e6) / 1e6;
       return qty > 0 ? qty : null;
     }
@@ -1040,7 +1054,7 @@ export const OpenPositionsTable = forwardRef<
           return;
         }
       }
-      const pct = closePercents[key] ?? 100;
+      const pct = closePercents[key] ?? DEFAULT_CLOSE_PCT;
       const qty = quantityForPercent(p, pct);
       if (qty == null) {
         notify.warn(`Can't close ${pct}% of this position — would round to zero.`);
@@ -1133,7 +1147,7 @@ export const OpenPositionsTable = forwardRef<
         }
       }
       // Sized off what is held now, like a close: 50% of 10 adds 5.
-      const pct = closePercents[key] ?? 100;
+      const pct = closePercents[key] ?? DEFAULT_CLOSE_PCT;
       const qty = quantityForPercent(p, pct);
       if (qty == null) {
         notify.warn(`Can't average ${pct}% of this position — would round to zero.`);
@@ -1651,7 +1665,7 @@ export const OpenPositionsTable = forwardRef<
                           {[25, 50, 75, 100].map(pct => {
                             const computedQty = quantityForPercent(p, pct);
                             const disabled = computedQty == null;
-                            const selected = (closePercents[key] ?? 100) === pct;
+                            const selected = (closePercents[key] ?? DEFAULT_CLOSE_PCT) === pct;
                             return (
                               <button
                                 key={pct}
@@ -1700,7 +1714,10 @@ export const OpenPositionsTable = forwardRef<
                               actions={[{ label: "Canc.Open Ord", onClick: () => void cancelPositionOpenOrders(p), danger: true }]}
                             />
                           </div>
-                          <div className="flex items-stretch">
+                          <span aria-hidden className="self-stretch" style={{ width: 1, background: "var(--border)" }} />
+                          <div className="flex items-stretch" style={INPUT_GROUP}
+                               title="Limit price and the button that uses it">
+                            <GroupLabel>Limit</GroupLabel>
                             <LimitPriceInput
                               symbol={liveSym}
                               fallback={p.current_price}
@@ -1708,16 +1725,8 @@ export const OpenPositionsTable = forwardRef<
                               value={closeLimitPrices[key]}
                               onChange={v => setCloseLimitPrices(s => ({ ...s, [key]: v }))}
                               onDefault={v => { limitDefaults.current[key] = v; }}
-                              className="w-20 px-2 py-1 text-xs border"
-                              style={{
-                                borderColor: "var(--border)",
-                                background: "var(--bg)",
-                                borderTopLeftRadius: "var(--r-sm)",
-                                borderBottomLeftRadius: "var(--r-sm)",
-                                borderTopRightRadius: 0,
-                                borderBottomRightRadius: 0,
-                                borderRight: "none",
-                              }}
+                              className="w-16 px-2 py-1 text-xs"
+                              style={{ border: "none", background: "var(--bg)", borderRadius: 0 }}
                             />
                             <button
                               disabled={inFlight || !(closeLimitPrices[key] ?? (p.current_price || ""))}

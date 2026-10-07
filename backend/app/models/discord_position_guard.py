@@ -131,13 +131,15 @@ class DiscordPositionGuard(Base, TimestampMixin):
     # Hard stop on whatever is still held, as an absolute price. Set below entry
     # by the first trim and lifted to break-even by the second. Emulated, like
     # everything else here — Alpaca won't hold a resting stop on an option.
-    stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # active_history: the level before a change is loaded even after a commit
+    # expired it, so services/position_events can record "moved from X".
+    stop_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, active_history=True)
 
     # A quantity waiting to leave on a trailing stop rather than at market,
     # which is how the 2nd and 3rd trims exit an expensive contract. NULL means
     # nothing is trailing. ``peak_price`` tracks the best price since it armed
     # and ``trail_amount`` is the dollar give-back that triggers the exit.
-    trail_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    trail_qty: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True, active_history=True)
     trail_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
 
     # Trail as a positive percent (20 = exit on a 20% retrace from the peak).
