@@ -368,6 +368,9 @@ function GroupLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** What the Trail box (Trl.Stop) starts at: 10% below the market. */
+const DEFAULT_TRAIL_PCT = "10";
+
 /** What Close % starts at on every position. */
 const DEFAULT_CLOSE_PCT = 25;
 const STOP_LEVELS = [-25, -10, 0];
@@ -395,7 +398,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
   const bracketStop = !!orderId && hasStop;
   const [level, setLevel] = useState<number | null>(null);
   const [busy, setBusy] = useState<null | "set" | "stop" | "trail">(null);
-  const [trailPct, setTrailPct] = useState("");
+  const [trailPct, setTrailPct] = useState(DEFAULT_TRAIL_PCT);
   const account = `broker_account_id=${brokerAccountId}`;
   const base = `/api/positions/${encodeURIComponent(brokerSymbol)}`;
 
@@ -454,7 +457,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
     try {
       const res = await api<{ mode?: string }>(`${base}/trailing-stop?${account}&trail_percent=${pct}`, { method: "POST" });
       notify.success(`Trailing stop armed ${pct}% below the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
-      setTrailPct("");
+      setTrailPct(DEFAULT_TRAIL_PCT);
       onDone();
     } catch (err) { notify.fromError(err, "Could not arm trailing stop"); }
     finally { setBusy(null); }
