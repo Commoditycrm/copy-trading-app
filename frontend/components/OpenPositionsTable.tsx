@@ -1646,6 +1646,18 @@ export const OpenPositionsTable = forwardRef<
                     symbol: (
                       <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                         <span className="inline-flex items-center gap-1.5">
+                          {/* The same open / close as the arrow beside Close —
+                              one shared state, so both always agree. */}
+                          <button
+                            type="button"
+                            onClick={() => setExpanded(s => ({ ...s, [key]: !s[key] }))}
+                            aria-expanded={!!expanded[key]}
+                            aria-label={expanded[key] ? "Hide stop options" : "Show stop options"}
+                            title={expanded[key] ? "Hide stop options" : "Stops and trailing stop"}
+                            className="btn-ghost px-1 py-0.5 inline-flex items-center"
+                          >
+                            {expanded[key] ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                          </button>
                           {positionSymbolLabel(p)}
                           <ProtectionIcons
                             items={p.protections ?? []}
