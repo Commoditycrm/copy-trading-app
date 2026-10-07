@@ -16,7 +16,7 @@
  */
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { fmtDateTimeMs } from "@/lib/format";
+import { fmtDateTimeMs, fmtSignedUsd } from "@/lib/format";
 
 type Item = {
   type: "order" | "event";
@@ -29,6 +29,8 @@ type Item = {
   remaining: string | null;
   /** Average cost of what is still held after this fill (null when flat). */
   avg_price: string | null;
+  /** Realized P&L of a sell, in dollars (signed); null for buys and events. */
+  pnl: string | null;
   detail: string | null;
 };
 
@@ -77,13 +79,14 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
         </div>
       ) : (
         <div className="grid gap-x-4 gap-y-1 text-[12px] items-center"
-             style={{ gridTemplateColumns: "auto auto auto auto auto auto 1fr" }}>
+             style={{ gridTemplateColumns: "auto auto auto auto auto auto auto 1fr" }}>
           <span style={muted}>Time (ET)</span>
           <span style={muted}>Event</span>
           <span style={muted}>Requested</span>
           <span style={muted}>Filled</span>
           <span className="text-right" style={muted}>Rem.Qty</span>
           <span className="text-right" style={muted} title="Average cost of what is still held">Avg.Price</span>
+          <span className="text-right" style={muted} title="What each sell realized">P/L</span>
           <span />
           {items.map((it, i) => <Row key={i} it={it} />)}
         </div>
@@ -113,6 +116,7 @@ function Row({ it }: { it: Item }) {
         <span />
         <span />
         <span />
+        <span />
       </>
     );
   }
@@ -134,7 +138,20 @@ function Row({ it }: { it: Item }) {
       <span className="num text-right" style={{ color: "var(--text-2)" }}>
         {filled ? (it.avg_price ?? "—") : ""}
       </span>
+      <PnlCell value={it.pnl} />
       <span />
     </>
+  );
+}
+
+/** A sell's realized P&L: green for a gain, red for a loss, blank otherwise. */
+function PnlCell({ value }: { value: string | null }) {
+  const n = value == null ? null : Number(value);
+  if (n == null || !Number.isFinite(n)) return <span />;
+  return (
+    <span className="num text-right font-semibold"
+          style={{ color: n > 0 ? "var(--good)" : n < 0 ? "var(--bad)" : "var(--text-2)" }}>
+      {fmtSignedUsd(n)}
+    </span>
   );
 }

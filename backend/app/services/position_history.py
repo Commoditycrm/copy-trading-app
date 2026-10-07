@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from datetime import datetime, timedelta, timezone
 
-from app.models.order import OptionRight, Order, OrderSide, OrderStatus, OrderType
+from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.position_event import PositionEvent
 
 
@@ -168,6 +168,16 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
         t = _utc(t)
         return t is not None and (start is None or t >= start) and (end is None or t <= end)
 
+    # Each sell's realized P&L as the rest of the app reports it (Closed today,
+    # Order History): a FIFO walk over the user's whole history. Falls back to
+    # the sell against this summary's average cost when it has no figure.
+    try:
+        from app.services.pnl import realized_pnl_by_order  # noqa: PLC0415
+
+        realized = realized_pnl_by_order(db, user_id)
+    except Exception:  # noqa: BLE001
+        realized = {}
+
     items: list[tuple] = []
     buys = sells = 0
     avg = Decimal(0)
@@ -182,6 +192,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
                 continue
         buy = o.side == OrderSide.BUY
         price = Decimal(str(o.filled_avg_price)) if o.filled_avg_price is not None else None
+        pnl = None
         if mine and buy:
             buys += 1
             label = "Entry" if buys == 1 else ("Average" if price is not None and avg and price < avg else "Add")
@@ -189,6 +200,13 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
                 avg = ((avg * held) + price * filled) / (held + filled) if held + filled else price
             held += filled
         elif mine:
+            # What this sell realized: the order's own figure (what Closed today
+            # shows), else the fill against the average cost it sold from.
+            if o.id in realized:
+                pnl = Decimal(str(realized[o.id]))
+            elif price is not None and avg:
+                mult = Decimal(100) if o.instrument_type == InstrumentType.OPTION else Decimal(1)
+                pnl = (price - avg) * filled * mult
             if o.order_type in _STOP_TYPES:
                 label = "Stopped out"
             else:
@@ -212,6 +230,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             # Average cost of what is still held after this fill. A sell
             # doesn't change it; flat has none.
             "avg_price": (_px(avg) if mine and held > 0 and avg else None),
+            # Realized P&L of a sell, in dollars (signed, 2 decimals).
+            "pnl": (f"{pnl.quantize(Decimal('0.01')):f}" if pnl is not None else None),
             "detail": None,
         }))
 
@@ -235,7 +255,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "at": at.isoformat(),
             "label": _EVENT_LABELS.get(e.kind, e.kind),
             "side": None, "requested": None, "filled": None, "status": None, "remaining": None,
-            "avg_price": None,
+            "avg_price": None, "pnl": None,
             "detail": _event_detail(e),
         }))
 
