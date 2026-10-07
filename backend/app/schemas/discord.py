@@ -457,6 +457,10 @@ class DiscordSettingsOut(BaseModel):
     exit_mode: Literal["alerts", "auto", "orders", "manual"] = "alerts"
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
+    # "contracts" (quantity_multiplier per entry) or "dollars" (size_dollars per
+    # entry, as many whole contracts as fit at the price the order pays).
+    size_mode: Literal["contracts", "dollars"] = "contracts"
+    size_dollars: str | None = None
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
     max_per_contract: str | None = None
     # Dollar ceiling on the WHOLE ORDER's value; null = no ceiling. Independent
@@ -510,6 +514,9 @@ class DiscordSettingsIn(BaseModel):
     # are sent.
     exit_mode: Literal["alerts", "auto", "orders", "manual"] | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
+    size_mode: Literal["contracts", "dollars"] | None = None
+    # Dollars per entry; "" clears it.
+    size_dollars: str | None = None
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None

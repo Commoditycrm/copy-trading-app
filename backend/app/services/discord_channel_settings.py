@@ -35,6 +35,8 @@ CHANNEL_FIELDS = (
     "discord_execution_mode",
     "discord_live_trading",
     "discord_quantity_multiplier",
+    "discord_size_mode",
+    "discord_size_dollars",
     "discord_max_per_contract",
     "discord_max_per_order",
     "discord_trail_percent",
@@ -72,6 +74,8 @@ _ADDED_LATER: dict[str, Any] = {
     "discord_fill_stop_pct": None,
     "discord_tp_orders": False,
     "discord_stop_trails": None,
+    "discord_size_mode": "contracts",
+    "discord_size_dollars": None,
 }
 
 

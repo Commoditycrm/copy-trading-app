@@ -386,11 +386,14 @@ def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
     fill = discord_ladder.fill_stop_pct(ts)
     engine = getattr(ts, "discord_exit_engine", None)
     mult = getattr(ts, "discord_quantity_multiplier", None) or 1
+    dollars = getattr(ts, "discord_size_dollars", None)
+    by_dollars = getattr(ts, "discord_size_mode", None) == "dollars" and dollars
     max_c = getattr(ts, "discord_max_per_contract", None)
     max_o = getattr(ts, "discord_max_per_order", None)
     return {
         "channel": channel,
-        "quantity": f"{mult}× the alert's size",
+        "quantity": (f"${_px(dollars)} per entry" if by_dollars
+                     else f"{mult} contract{'s' if mult != 1 else ''} per entry"),
         "max_per_contract": f"${_px(max_c)}" if max_c else None,
         "max_per_order": f"${_px(max_o)}" if max_o else None,
         "exits": "AI trimming" if engine == "ai" else _EXIT_MODES.get(dcs.exit_mode(ts), dcs.exit_mode(ts)),

@@ -91,6 +91,13 @@ class TraderSettings(Base, TimestampMixin):
     discord_quantity_multiplier: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1", nullable=False,
     )
+    # How an ENTRY is sized: "contracts" (exactly discord_quantity_multiplier)
+    # or "dollars" (as many whole contracts as fit in discord_size_dollars at the
+    # price the order will actually pay — the live price for a market entry).
+    discord_size_mode: Mapped[str] = mapped_column(
+        String(10), default="contracts", server_default="contracts", nullable=False,
+    )
+    discord_size_dollars: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
 
     # Ceiling on the dollar value of a single Discord order (quantity x price x
     # 100 for options). Unlike SubscriberSettings.max_per_contract — which is
