@@ -119,3 +119,21 @@ def test_the_app_key_is_not_in_the_redis_key(world):
     ad, calls, r = world
     ad.get_positions()
     assert all("KEY" not in k for k in r)
+
+
+def test_a_fresh_read_after_a_fill_skips_both_caches(world):
+    """The Positions page right after a sell: a read from moments ago would still
+    show what was just sold."""
+    ad, calls, r = world
+    ad.get_positions(cached_ok=True)                     # cached in-process and in Redis
+    assert ad.get_positions(cached_ok=True) == [_pos()] and calls["n"] == 1
+    ad.get_positions(cached_ok=True, fresh=True)
+    assert calls["n"] == 2                               # read live
+
+
+def test_a_fresh_read_that_is_rate_limited_still_shows_the_snapshot(world):
+    ad, calls, r = world
+    ad.get_positions()
+    calls["fail"] = "429 Too Many Requests"
+    got = ad.get_positions(cached_ok=True, fresh=True)
+    assert got == [_pos()] and getattr(got, "stale_age_s", None) is not None
