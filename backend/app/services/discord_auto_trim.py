@@ -504,8 +504,40 @@ def _sweep_trader(db, trader_id, rows) -> None:
             log.exception("auto-trim: failed on %s", guard.symbol)
 
 
+# Absolute floor for the closed-market sweep — a bad config value (0, negative,
+# non-numeric) can never speed the loop up or spin it; it falls back to a slow
+# default and is never faster than the tradable cadence.
+_MIN_CLOSED_INTERVAL_S = float(POLL_INTERVAL_S)
+
+
+def _closed_interval() -> float:
+    """Configured closed-market sweep interval, floored so a bad value can't
+    create a busy loop or run faster than the tradable cadence."""
+    from app.config import get_settings  # noqa: PLC0415
+    try:
+        v = float(get_settings().discord_auto_trim_closed_interval_seconds)
+    except (TypeError, ValueError):
+        v = 180.0
+    if v <= 0:
+        v = 180.0
+    return max(_MIN_CLOSED_INTERVAL_S, v)
+
+
+def _interval_and_session() -> "tuple[float, str]":
+    """This sweep's sleep and the market session. Full 15s cadence while a trim
+    could actually fill (pre-market / regular / after-hours); backed off when
+    CLOSED, since no trim can execute and no new fill needs an on-fill stop.
+    Reuses the shared market_hours classifier — no duplicate time logic here."""
+    from app.services import market_hours  # noqa: PLC0415
+    session = market_hours.market_session()
+    if session == market_hours.CLOSED:
+        return _closed_interval(), session
+    return float(POLL_INTERVAL_S), session
+
+
 def poll_loop(shutdown_check=None) -> None:
-    log.info("discord_auto_trim: starting (interval=%ss)", POLL_INTERVAL_S)
+    log.info("discord_auto_trim: starting (tradable interval=%ss)", POLL_INTERVAL_S)
+    last_cadence: "tuple[str, float] | None" = None
     while True:
         if shutdown_check is not None and shutdown_check():
             return
@@ -513,7 +545,12 @@ def poll_loop(shutdown_check=None) -> None:
             tick()
         except Exception:  # noqa: BLE001
             log.exception("discord_auto_trim: tick failed")
-        time.sleep(POLL_INTERVAL_S)
+        interval, session = _interval_and_session()
+        # Log only when the session or cadence changes — not every sweep.
+        if last_cadence != (session, interval):
+            log.info("auto_trim market_session=%s interval=%.0fs", session, interval)
+            last_cadence = (session, interval)
+        time.sleep(interval)
 
 
 # Count this loop's Webull calls under its own name (services/webull_usage.py).

@@ -168,6 +168,11 @@ class Settings(BaseSettings):
     webull_poll_interval_closed_active_seconds: float = 20.0
     # P&L poller (all brokers, incl. Alpaca REST) floor when the market is CLOSED.
     pnl_poll_interval_closed_seconds: float = 180.0
+    # Discord auto-trim sweep when the market is CLOSED. Auto-trim only takes
+    # profit (fires ladder/AI trims) and sets on-fill stops — no trim can fill
+    # while the market is shut, so it backs off hard. Tradable cadence (15s) is
+    # unchanged; see discord_auto_trim.poll_loop / market_hours.is_tradable_now.
+    discord_auto_trim_closed_interval_seconds: float = 180.0
     # ── Webull token authorisation wait ──────────────────────────────────
     # Webull's SDK creates an access token in PENDING status and then BLOCKS,
     # polling until the account owner authorises it in their Webull app. Its own
