@@ -31,7 +31,7 @@ from app.brokers import adapter_for
 from app.brokers.capabilities import capabilities_for
 from app.brokers.base import BrokerPosition
 from app.database import get_db
-from app.models.broker_account import BrokerAccount
+from app.models.broker_account import BrokerAccount, BrokerName
 from datetime import date, datetime, timezone
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
@@ -96,6 +96,10 @@ def list_positions(
         False,
         description="Return {positions, unreachable} instead of a bare list.",
     ),
+    fresh: bool = Query(
+        False,
+        description="Read live now rather than reuse a read from moments ago (the page asks right after a fill).",
+    ),
 ) -> "list[PositionOut] | PositionsPayload":
     """Return positions across every connected broker account for the caller.
 
@@ -143,7 +147,11 @@ def list_positions(
             # Webull rejects simultaneous position reads with 429, and this
             # endpoint is called up to four times per order event by the
             # positions table alone, plus the calendar independently.
-            held = adapter.get_positions(cached_ok=True)
+            # Right after a fill the page asks for a FRESH read: a shared read
+            # from a few seconds ago would still show what was just sold.
+            held = (adapter.get_positions(cached_ok=True, fresh=True)
+                    if fresh and acct.broker == BrokerName.WEBULL
+                    else adapter.get_positions(cached_ok=True))
             stale_age = getattr(held, "stale_age_s", None)
             if stale_age is not None:
                 # Rate limited: these are the last positions read, not live.
