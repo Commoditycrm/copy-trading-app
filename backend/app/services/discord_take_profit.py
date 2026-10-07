@@ -217,8 +217,13 @@ def settle(db: Session, guard, ts, cancel, *, in_session: bool = True) -> str | 
             guard.entry_price, cfg.rung(rung), tp.filled_avg_price or tp.limit_price)
         stop = guards._to_tick(stop)
         if stop is not None and stop > 0:
-            guard.stop_price = stop           # this trim's stop, on whatever is left
-            guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+            from app.services.position_events import because  # noqa: PLC0415
+
+            with because(f"Trim {rung} take-profit filled — the ladder's stop for what is left"):
+                guard.stop_price = stop           # this trim's stop, on whatever is left
+                guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+                if hasattr(db, "flush"):
+                    db.flush()
         # The broker cancels the linked stop itself; make sure, and keep our row honest.
         if _working(sl):
             try:
@@ -348,11 +353,15 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
         guard.tp_qty = None
         return f"position being closed (stop: {stop_outcome})"
 
+    from app.services.position_events import because  # noqa: PLC0415
+
     try:
-        if want.stop_price is not None:
-            tp_id, sl_id = place_pair(want.quantity, want.price, want.stop_price)
-        else:
-            tp_id, sl_id = place_limit(want.quantity, want.price), None
+        with because(f"take-profit for Trim {want.rung} at {want.price}"
+                     + (f", linked stop {want.stop_price}" if want.stop_price is not None else "")):
+            if want.stop_price is not None:
+                tp_id, sl_id = place_pair(want.quantity, want.price, want.stop_price)
+            else:
+                tp_id, sl_id = place_limit(want.quantity, want.price), None
     except Exception as exc:  # noqa: BLE001
         # Nothing rests, so nothing is earmarked: the ladder stop grows back to
         # the whole position on the next pass.

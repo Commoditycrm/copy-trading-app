@@ -113,6 +113,40 @@ def _requested(o: Order) -> str:
     return f"{qty} stop @ {_s(o.stop_price)}" + (f" limit {_s(o.limit_price)}" if o.limit_price else "")
 
 
+def _order_reasons(db: Session, order_ids: list) -> dict:
+    """Why each order was placed: a recorded reason (services/position_events),
+    else the Discord alert that placed it."""
+    out: dict = {}
+    if not order_ids:
+        return out
+    try:
+        for e in db.execute(select(PositionEvent).where(
+                PositionEvent.kind == "order_note", PositionEvent.order_id.in_(order_ids))).scalars():
+            out.setdefault(e.order_id, e.note)
+    except Exception:  # noqa: BLE001 — a database without the column yet
+        pass
+    try:
+        from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+        from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+
+        rows = db.execute(
+            select(DiscordMessage.order_id, DiscordMessage.content, DiscordAlertSource.label,
+                   DiscordAlertSource.channel_id)
+            .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id)
+            .where(DiscordMessage.order_id.in_(order_ids))
+        ).all()
+        for oid, content, label, channel in rows:
+            if oid in out:
+                continue
+            text = " ".join((content or "").split())
+            text = text if len(text) <= 120 else text[:117] + "…"
+            who = "typed in the Discord popup" if channel == "self" else label
+            out[oid] = f"{who} alert: “{text}”"
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 _EVENT_LABELS = {
     "stop_set": "Stop set",
     "stop_moved": "Stop moved",
@@ -121,6 +155,7 @@ _EVENT_LABELS = {
     "trailing_stop_raised": "Trailing stop raised",
     "trailing_exit_armed": "Trailing exit armed",
     "trailing_exit_cleared": "Trailing exit cleared",
+    "ladder_closed": "Ladder finished",
 }
 
 
@@ -133,8 +168,23 @@ def _event_detail(e: PositionEvent) -> str:
         return f"{_s(e.quantity)} rides a {give} give-back from {_s(e.peak)}" + (f" (exits at {_s(e.price)})" if e.price else "")
     if e.kind == "trailing_exit_cleared":
         return f"{_s(e.quantity)} no longer trailing"
+    if e.kind == "ladder_closed":
+        return ""
     moved = f"{_s(e.old_price)} → {_s(e.price)}" if e.old_price is not None else f"@ {_s(e.price)}"
     return moved + (f" · {trail}" if trail else "")
+
+
+def _fallback_reason(o: Order, filled: bool) -> str | None:
+    """When nothing recorded why: what the order itself says."""
+    if o.order_type in _STOP_TYPES and filled:
+        return "stop order filled at the broker"
+    if o.bracket_leg == "sl":
+        return "the entry's stop-loss"
+    if o.bracket_leg == "tp":
+        return "the entry's take-profit"
+    if o.parent_order_id is not None:
+        return "copied from the trader you follow"
+    return None
 
 
 def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: Decimal | None = None,
@@ -177,6 +227,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
         realized = realized_pnl_by_order(db, user_id)
     except Exception:  # noqa: BLE001
         realized = {}
+
+    reasons = _order_reasons(db, [o.id for o in orders])
 
     items: list[tuple] = []
     buys = sells = 0
@@ -232,6 +284,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "avg_price": (_px(avg) if mine and held > 0 and avg else None),
             # Realized P&L of a sell, in dollars (signed, 2 decimals).
             "pnl": (f"{pnl.quantize(Decimal('0.01')):f}" if pnl is not None else None),
+            # Why it was placed: the alert, auto-trim, a stop, you on Positions …
+            "note": reasons.get(o.id) or _fallback_reason(o, mine),
             "detail": None,
         }))
 
@@ -247,8 +301,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
     except Exception:  # noqa: BLE001 — a database without the table yet
         events = []
     for e in events:
-        if not inside(e.created_at):
-            continue
+        if e.kind == "order_note" or not inside(e.created_at):
+            continue                      # an order's reason is shown on its own line
         at = _utc(e.created_at)
         items.append((at, {
             "type": "event",
@@ -256,6 +310,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "label": _EVENT_LABELS.get(e.kind, e.kind),
             "side": None, "requested": None, "filled": None, "status": None, "remaining": None,
             "avg_price": None, "pnl": None,
+            "note": getattr(e, "note", None),
             "detail": _event_detail(e),
         }))
 
@@ -264,3 +319,84 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
 
 
 __all__ = ["holding", "timeline"]
+
+
+_EXIT_MODES = {
+    "alerts": "on the channel's exit alerts",
+    "auto": "auto-trim (each trim fires at its profit target)",
+    "orders": "take-profit orders resting at the broker",
+    "manual": "manual — nothing sells on its own",
+}
+
+
+def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
+          right: str | None = None, expiry: date | None = None) -> dict | None:
+    """The settings that govern this position: whose they are, how exits work,
+    the ladder and how far along it the position is. None for a position with
+    no Discord ladder (opened by hand, never assigned a channel)."""
+    from sqlalchemy import desc  # noqa: PLC0415
+
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    q = select(DiscordPositionGuard).where(
+        DiscordPositionGuard.user_id == user_id,
+        DiscordPositionGuard.symbol == symbol.upper(),
+    )
+    for col, val in ((DiscordPositionGuard.option_strike, strike),
+                     (DiscordPositionGuard.option_right, right),
+                     (DiscordPositionGuard.option_expiry, expiry)):
+        q = q.where(col.is_(None) if val is None else col == val)
+    # The live one, else the most recent (a closed position's).
+    guard = db.execute(q.order_by(DiscordPositionGuard.closed_at.isnot(None),
+                                  desc(DiscordPositionGuard.created_at)).limit(1)).scalars().first()
+    if guard is None:
+        return None
+
+    source_id = guard.source_id or dcs.source_for_order(db, guard.entry_order_id)
+    src = db.get(DiscordAlertSource, source_id) if source_id else None
+    ts = dcs.for_guard(db, user_id, guard) or db.get(TraderSettings, user_id)
+    if ts is None:
+        return None
+    if src is None:
+        channel = "your account settings (no channel)"
+    elif src.channel_id == "self":
+        channel = "Self (typed in the Discord popup) — your account settings"
+    elif src.use_account_settings:
+        channel = f"{src.label} — following your account settings"
+    else:
+        channel = f"{src.label} — the channel's own settings"
+
+    trails = discord_ladder.stop_trails(ts)
+    done = guard.sell_count or 0
+    ladder = []
+    for i, r in enumerate(discord_ladder.rungs(ts), start=1):
+        stop = (f"trailing {_s(abs(r.stop_pct))}% below the high" if r.stop_pct is not None and trails[i - 1]
+                else f"stop {_s(r.stop_pct)}% from entry")
+        ladder.append({
+            "trim": i,
+            "target": f"+{_s(r.profit_gate_pct)}%" if r.profit_gate_pct else "any price",
+            "sells": f"{_s(r.qty_pct)}% of what is left",
+            "stop": stop,
+            "state": "done" if i <= done else ("next" if i == done + 1 else ""),
+        })
+    fill = discord_ladder.fill_stop_pct(ts)
+    engine = getattr(ts, "discord_exit_engine", None)
+    return {
+        "channel": channel,
+        "exits": "AI trimming decides each exit" if engine == "ai" else _EXIT_MODES.get(dcs.exit_mode(ts), dcs.exit_mode(ts)),
+        "entries": "market" if dcs.entry_order_type(db, source_id) == "market" else "limit",
+        "mode": "live" if getattr(ts, "discord_live_trading", False) else "paper",
+        "on_fill": (None if fill is None else
+                    (f"trailing {_s(abs(fill))}% below the high" if discord_ladder.fill_stop_trails(ts)
+                     else f"stop {_s(fill)}% from entry")),
+        "ladder": ladder,
+        "entry_price": _px(guard.entry_price),
+        "stop_now": _px(guard.stop_price),
+        "trailing_now": (f"{_s(guard.stop_trail_pct)}% below {_px(guard.stop_peak)}"
+                         if getattr(guard, "stop_trail_pct", None) is not None else None),
+        "closed": guard.closed_reason if guard.closed_at is not None else None,
+    }

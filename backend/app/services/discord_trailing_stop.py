@@ -147,7 +147,12 @@ def enforce(db: Session, user_id, adapter, close_position, positions=None) -> in
             guards.retire(db, guard, "position no longer held")
             continue
 
-        decision = decide(guard, price, held)
+        from app.services.position_events import because  # noqa: PLC0415
+
+        with because(f"trailing stop follows a new high of {price}"):
+            decision = decide(guard, price, held)
+            if getattr(guard, "stop_trail_pct", None) is not None and hasattr(db, "flush"):
+                db.flush()                 # record a raise under this reason
         if decision is None:
             continue
         kind, sell, level = decision
@@ -170,7 +175,8 @@ def enforce(db: Session, user_id, adapter, close_position, positions=None) -> in
             log.info("discord stops: %s at %s broke its %s stop — closing %s",
                      guard.symbol, price, level, held)
             try:
-                close_position(pos, guard, held)
+                with because(f"stop {level} hit at {price} — selling all {held}"):
+                    close_position(pos, guard, held)
             except Exception:  # noqa: BLE001
                 # Leave it armed so the next tick tries again — an exit that
                 # failed once must not be forgotten.
@@ -185,7 +191,8 @@ def enforce(db: Session, user_id, adapter, close_position, positions=None) -> in
         log.info("discord stops: %s gave back %s from %s — trailing out %s",
                  guard.symbol, guard.trail_amount, level, sell)
         try:
-            close_position(pos, guard, sell)
+            with because(f"trailing exit: gave back {guard.trail_amount} from the high of {level}"):
+                close_position(pos, guard, sell)
         except Exception:  # noqa: BLE001
             log.exception("discord stops: trailing exit failed for %s", guard.symbol)
             continue

@@ -31,7 +31,22 @@ type Item = {
   avg_price: string | null;
   /** Realized P&L of a sell, in dollars (signed); null for buys and events. */
   pnl: string | null;
+  /** Why it happened: the alert, auto-trim, a stop, you on Positions … */
+  note: string | null;
   detail: string | null;
+};
+
+type Rules = {
+  channel: string;
+  exits: string;
+  entries: string;
+  mode: string;
+  on_fill: string | null;
+  ladder: { trim: number; target: string; sells: string; stop: string; state: string }[];
+  entry_price: string | null;
+  stop_now: string | null;
+  trailing_now: string | null;
+  closed: string | null;
 };
 
 export type SummaryTarget = {
@@ -46,6 +61,7 @@ export type SummaryTarget = {
 
 export function PositionSummary({ target }: { target: SummaryTarget }) {
   const [items, setItems] = useState<Item[] | null>(null);
+  const [rules, setRules] = useState<Rules | null>(null);
   const [error, setError] = useState(false);
 
   const q = new URLSearchParams({ broker_account_id: target.brokerAccountId, symbol: target.symbol });
@@ -57,8 +73,8 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
 
   useEffect(() => {
     let live = true;
-    api<Item[]>(url)
-      .then((rows) => { if (live) setItems(rows); })
+    api<{ rules: Rules | null; items: Item[] }>(url)
+      .then((r) => { if (live) { setItems(r.items); setRules(r.rules); } })
       .catch(() => { if (live) setError(true); });
     return () => { live = false; };
   }, [url]);
@@ -66,6 +82,7 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
   const muted = { color: "var(--muted)" } as const;
   return (
     <div>
+      {rules && <RulesBlock rules={rules} />}
       <div className="text-[10px] font-medium uppercase tracking-wide mb-1.5" style={{ color: "var(--text-2)" }}>
         Position summary
       </div>
@@ -87,7 +104,7 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
           <span className="text-right" style={muted}>Rem.Qty</span>
           <span className="text-right" style={muted} title="Average cost of what is still held">Avg.Price</span>
           <span className="text-right" style={muted} title="What each sell realized">P/L</span>
-          <span />
+          <span style={muted}>Why</span>
           {items.map((it, i) => <Row key={i} it={it} />)}
         </div>
       )}
@@ -116,7 +133,7 @@ function Row({ it }: { it: Item }) {
         <span />
         <span />
         <span />
-        <span />
+        <Why note={it.note} />
       </>
     );
   }
@@ -139,7 +156,7 @@ function Row({ it }: { it: Item }) {
         {filled ? (it.avg_price ?? "—") : ""}
       </span>
       <PnlCell value={it.pnl} />
-      <span />
+      <Why note={it.note} />
     </>
   );
 }
@@ -153,5 +170,68 @@ function PnlCell({ value }: { value: string | null }) {
           style={{ color: n > 0 ? "var(--good)" : n < 0 ? "var(--bad)" : "var(--text-2)" }}>
       {fmtSignedUsd(n)}
     </span>
+  );
+}
+
+/** Why a line happened, muted, in the last column. */
+function Why({ note }: { note: string | null }) {
+  return (
+    <span className="text-[11px] leading-snug min-w-0" style={{ color: "var(--muted)" }} title={note ?? undefined}>
+      {note ?? ""}
+    </span>
+  );
+}
+
+/** The settings that govern this position, above its timeline. */
+function RulesBlock({ rules }: { rules: Rules }) {
+  const muted = { color: "var(--muted)" } as const;
+  const text = { color: "var(--text-2)" } as const;
+  return (
+    <div className="mb-3 pb-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
+      <div className="text-[10px] font-medium uppercase tracking-wide mb-1.5" style={{ color: "var(--text-2)" }}>
+        Rules for this position
+      </div>
+      <div className="text-[12px] leading-relaxed" style={text}>
+        <div><span style={muted}>Settings:</span> {rules.channel}</div>
+        <div>
+          <span style={muted}>Exits:</span> {rules.exits}
+          <span style={muted}> · Entries:</span> {rules.entries}
+          <span style={muted}> · </span>{rules.mode === "live" ? "live" : "paper"}
+        </div>
+        {rules.on_fill && <div><span style={muted}>On Fill:</span> {rules.on_fill}</div>}
+      </div>
+      {rules.ladder.length > 0 && (
+        <div className="grid gap-x-4 gap-y-0.5 text-[12px] mt-1.5 items-center"
+             style={{ gridTemplateColumns: "auto auto auto auto 1fr" }}>
+          {rules.ladder.map((r) => (
+            <RungRow key={r.trim} r={r} />
+          ))}
+        </div>
+      )}
+      <div className="text-[12px] mt-1.5" style={text}>
+        {rules.entry_price && <><span style={muted}>Entry</span> <span className="num">{rules.entry_price}</span></>}
+        {rules.stop_now && <><span style={muted}> · Stop now</span> <span className="num">{rules.stop_now}</span></>}
+        {rules.trailing_now && <span style={muted}> (trailing {rules.trailing_now})</span>}
+        {rules.closed && <span style={muted}> · Ladder finished: {rules.closed}</span>}
+      </div>
+    </div>
+  );
+}
+
+function RungRow({ r }: { r: Rules["ladder"][number] }) {
+  const done = r.state === "done";
+  const next = r.state === "next";
+  return (
+    <>
+      <span className="font-semibold" style={{ color: next ? "var(--accent)" : done ? "var(--muted)" : "var(--text-2)" }}>
+        T{r.trim}
+      </span>
+      <span className="num" style={{ color: done ? "var(--muted)" : "var(--text)" }}>{r.target}</span>
+      <span style={{ color: done ? "var(--muted)" : "var(--text-2)" }}>sells {r.sells}</span>
+      <span style={{ color: done ? "var(--muted)" : "var(--text-2)" }}>then {r.stop}</span>
+      <span className="text-[11px]" style={{ color: next ? "var(--accent)" : "var(--muted)" }}>
+        {done ? "done" : next ? "next" : ""}
+      </span>
+    </>
   );
 }

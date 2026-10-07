@@ -163,7 +163,10 @@ def _exit_instead(db, guard, quantity, close_position) -> str:
             return "exit deferred to the regular session"
     if working_exit(db, guard) is not None:
         return "exit already working"
-    close_position(quantity)
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("the broker refused the stop — exited instead of holding it unprotected"):
+        close_position(quantity)
     return "exit sent"
 
 
@@ -210,8 +213,13 @@ def reconcile(
                 "— treating it as removed by the trader, not re-placing",
                 guard.symbol, guard.stop_price,
             )
-            guard.stop_order_id = None
-            guard.stop_price = None
+            from app.services.position_events import because  # noqa: PLC0415
+
+            with because("cancelled outside the ladder (broker app, Order History or cancel all) — not put back"):
+                guard.stop_order_id = None
+                guard.stop_price = None
+                if hasattr(db, "flush"):
+                    db.flush()
             return "removed by the trader"
         guard.stop_order_id = None
         resting = None
