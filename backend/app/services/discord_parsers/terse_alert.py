@@ -22,6 +22,17 @@ What each carries, and what execution fills in:
   * trim   — SELL of the named symbol's position through the exit ladder.
     "add trim" is a trim: a stated gain is an exit call, not a buy.
 
+Also live (2026-10-06), missed at the time:
+
+    QQQ 759P @here @everyone out the gate high risk     entry: spaced, no price
+
+A SPACED contract is commentary unless the message opens with "In"/"Entry" —
+or pings the channel (@here / @everyone), which is how this author marks a
+call. Pinged, it is an entry; with no price ("out the gate") the price comes
+from the live quote at execution (a marketable limit at the ask). A pinged
+message that reads as an exit (a %, "sold", "trim", "out of" …) is never an
+entry.
+
 The rule throughout is the same as every parser here: refuse rather than
 guess. A message that fits none of the three shapes exactly is ignored.
 """
@@ -59,6 +70,18 @@ _SPACED_ENTRY_RE = re.compile(
     r"(?-i:\$?(?P<sym>[A-Z]{1,5}))\s+(?P<strike>\d{1,5}(?:\.\d+)?)(?P<right>[CcPp])(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# "QQQ 759P" anywhere in the message — an entry only when the channel is pinged.
+_SPACED_ANY_RE = re.compile(
+    r"(?<![A-Za-z0-9$])\$?(?P<sym>[A-Z]{1,5})\s+(?P<strike>\d{1,5}(?:\.\d+)?)(?P<right>[CcPp])(?![A-Za-z0-9])"
+)
+# The author pinging the channel: what marks a call rather than commentary.
+_PING_RE = re.compile(r"@(?:here|everyone)\b", re.IGNORECASE)
+# A pinged message that is about getting OUT, not in: never an entry.
+_EXIT_TALK_RE = re.compile(
+    r"%|\b(?:sold|sell(?:ing)?|clos(?:e|ed|ing)|exit(?:ed|ing)?|trim\w*|cut|stopped|"
+    r"took\s+profits?|profits?\s+taken|out\s+of)\b",
+    re.IGNORECASE,
+)
 # A bare option price: ".55", "0.55", "1.2", "@.63". Not a percentage.
 _PRICE_RE = re.compile(r"(?<![\w.%])@?\s*\$?(?P<price>\d*\.\d+)(?!\s*%)(?![\w.])")
 # "Adding .4" / "add 0.40" at the START — an add that names no contract.
@@ -92,6 +115,13 @@ def _clean(text: str) -> str:
     return " ".join(_EDITED_RE.sub(" ", _MENTION_RE.sub(" ", text or "")).split())
 
 
+def _pinged_entry(message: ParsedMessage, text: str) -> "re.Match | None":
+    """A spaced contract in a message that pings the channel and isn't exit talk."""
+    if not _PING_RE.search(message.content or "") or _EXIT_TALK_RE.search(text):
+        return None
+    return _SPACED_ANY_RE.search(text)
+
+
 class TerseAlertParser(Parser):
     name = "terse_alert"
 
@@ -100,7 +130,7 @@ class TerseAlertParser(Parser):
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
             or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text)
-            or _SPACED_ENTRY_RE.match(text)
+            or _SPACED_ENTRY_RE.match(text) or _pinged_entry(message, text)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -137,15 +167,19 @@ class TerseAlertParser(Parser):
                 parser=self.name,
             ))
 
-        glued = _GLUED_RE.search(text) or _SPACED_ENTRY_RE.match(text)
+        pinged = bool(_PING_RE.search(message.content or "")) and not _EXIT_TALK_RE.search(text)
+        glued = (_GLUED_RE.search(text) or _SPACED_ENTRY_RE.match(text)
+                 or _pinged_entry(message, text))
         if glued:
             rest = text[:glued.start()] + " " + text[glued.end():]
             price_m = _PRICE_RE.search(rest)
-            if not price_m:
-                return ParseResult.ignored("a contract with no price")
-            price = to_decimal(price_m.group("price"))
-            if price is None or price <= 0:
+            price = to_decimal(price_m.group("price")) if price_m else None
+            if price_m and (price is None or price <= 0):
                 return ParseResult.ignored("a contract with no usable price")
+            if price is None and not pinged:
+                return ParseResult.ignored("a contract with no price")
+            # Pinged with no price ("out the gate"): buy now — execution prices
+            # it from the live quote, a limit at the ask.
             return ParseResult.parsed(TradeSignal(
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
@@ -155,6 +189,7 @@ class TerseAlertParser(Parser):
                 quantity=_ENTRY_QTY,
                 order_type=OrderKind.LIMIT,
                 limit_price=price,
+                limit_price_unspecified=price is None,
                 expiry_unspecified=True,
                 nearest_expiry=True,
                 source_action="ENTRY",
