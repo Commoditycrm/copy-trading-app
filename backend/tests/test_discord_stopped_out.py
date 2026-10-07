@@ -53,9 +53,26 @@ def test_a_stop_out_closes_everything_matching(text, right, strike):
     assert (str(s.strike) if s.strike is not None else None) == strike
 
 
-@pytest.mark.parametrize("text", ["Stopped out", "Stopped out of SPY and QQQ calls"])
-def test_a_stop_out_without_one_ticker_is_refused(text):
-    assert parse_message(ParsedMessage(content=text)).status is ParseStatus.INVALID
+def test_a_stop_out_naming_two_tickers_is_refused():
+    assert parse_message(ParsedMessage(content="Stopped out of SPY and QQQ calls")).status is ParseStatus.INVALID
+
+
+@pytest.mark.parametrize("text, action", [
+    ("Stopped out", "STOPPED_OUT"),
+    ("Stopped out @here @Sniper", "STOPPED_OUT"),
+    ("Cutting @here @Sniper 10% loss", "CUTTING"),        # live 2026-10-07, missed
+])
+def test_a_close_out_naming_no_ticker_closes_the_channels_position(text, action):
+    r = parse_message(ParsedMessage(content=text))
+    assert r.status is ParseStatus.PARSED
+    s = r.signals[0]
+    assert s.action.value == "SELL" and s.symbol is None and s.source_action == action
+    assert s.close_all_matching and s.latest_contract and s.flatten
+
+
+def test_cutting_a_named_ticker_closes_that_ticker():
+    s = parse_message(ParsedMessage(content="Cutting IWM @here 10% loss")).signals[0]
+    assert s.symbol == "IWM" and s.close_all_matching and not s.latest_contract and s.source_action == "CUTTING"
 
 
 # ── which contracts: this channel's, still held ─────────────────────────────
@@ -186,6 +203,38 @@ def test_nothing_held_from_the_channel_is_refused(monkeypatch):
     discord_sources._close_all_from_channel(None, SimpleNamespace(id=USER), msg, None, None)
     assert msg.status is DiscordMessageStatus.ORDER_FAILED
     assert msg.status_reason == "Stopped out — you hold no SPY calls opened from this channel."
+
+
+def test_cutting_with_no_ticker_closes_the_contract_the_channel_is_in(monkeypatch):
+    latest = {"symbol": "IWM", "strike": "282", "option_type": "put", "expiration": "2026-10-07"}
+    monkeypatch.setattr(ex, "latest_channel_contract", lambda db, user, sid: latest)
+    asked = {}
+
+    def _held(db, user, sid, symbol, option_type=None, strike=None):
+        asked.update(symbol=symbol, option_type=option_type, strike=strike)
+        return [latest]
+
+    monkeypatch.setattr(ex, "channel_held_contracts", _held)
+    monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    seen = []
+    monkeypatch.setattr(discord_sources, "_execute_signal",
+                        lambda db, user, msg, bg, req: seen.append(dict(msg.parsed_signal)))
+    sig = parse_message(ParsedMessage(content="Cutting @here @Sniper 10% loss")).signals[0].as_dict()
+    msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), parsed_signal=sig,
+                          order_id=None, status=None, status_reason=None)
+    discord_sources._close_all_from_channel(None, SimpleNamespace(id=USER), msg, None, None)
+    assert asked["symbol"] == "IWM" and asked["option_type"] == "put"
+    assert [(s["symbol"], s["strike"], s["flatten"]) for s in seen] == [("IWM", "282", True)]
+
+
+def test_cutting_with_nothing_held_from_the_channel_is_refused(monkeypatch):
+    monkeypatch.setattr(ex, "latest_channel_contract", lambda db, user, sid: None)
+    monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    sig = parse_message(ParsedMessage(content="Cutting @here 10% loss")).signals[0].as_dict()
+    msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), parsed_signal=sig,
+                          order_id=None, status=None, status_reason=None)
+    discord_sources._close_all_from_channel(None, SimpleNamespace(id=USER), msg, None, None)
+    assert msg.status is DiscordMessageStatus.ORDER_FAILED and "nothing from this channel is held" in msg.status_reason
 
 
 # ── "Adding .4" after being stopped out ──────────────────────────────────────

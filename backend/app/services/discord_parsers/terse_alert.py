@@ -94,6 +94,9 @@ _TRIM_RE = re.compile(r"\btrim(?:med|ming|s)?\b", re.IGNORECASE)
 # out SPY": the author is fully out — close everything matching from this
 # channel. The ticker must be written as one (capitals or $).
 _STOPPED_RE = re.compile(r"\bstopped\s+out\b", re.IGNORECASE)
+# "Cutting @here @Sniper 10% loss" / "cut IWM": the author is out of the trade —
+# a full close, like a stop-out. The % is the result, not an instruction.
+_CUT_RE = re.compile(r"\bcut(?:ting|s)?\b", re.IGNORECASE)
 _STOP_TICKER_RE = re.compile(r"(?<![A-Za-z0-9])\$?(?P<sym>[A-Z]{1,5})(?![A-Za-z0-9])")
 _RIGHT_WORD_RE = re.compile(r"\b(?P<right>calls?|puts?)\b", re.IGNORECASE)
 _AVG_DOWN_RE = re.compile(
@@ -129,7 +132,7 @@ class TerseAlertParser(Parser):
         text = _clean(message.content)
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
-            or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text)
+            or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text) or _CUT_RE.search(text)
             or _SPACED_ENTRY_RE.match(text) or _pinged_entry(message, text)
         )
 
@@ -140,6 +143,8 @@ class TerseAlertParser(Parser):
         # else the sentence says.
         if _STOPPED_RE.search(text):
             return self._stopped_out(text)
+        if _CUT_RE.search(text):
+            return self._stopped_out(text, source_action="CUTTING")
 
         if _TRIM_RE.search(text):
             return self._trim(text)
@@ -198,18 +203,37 @@ class TerseAlertParser(Parser):
 
         return ParseResult.ignored("not a terse alert")
 
-    def _stopped_out(self, text: str) -> ParseResult:
-        """The author was stopped out: close every matching position this
-        channel opened, at market. Execution finds them; none held = refused."""
+    def _stopped_out(self, text: str, source_action: str = "STOPPED_OUT") -> ParseResult:
+        """The author is out — stopped out, or cutting the trade: close every
+        matching position this channel opened, at market. Execution finds them;
+        none held = refused. Naming no ticker means the position the channel is
+        in (``latest_contract``), as "Adding .4" does."""
         glued = _GLUED_RE.search(text)
         tickers = {m.group("sym") for m in _STOP_TICKER_RE.finditer(text)
                    if m.group("sym") not in _NOT_TICKERS}
         if glued:
             tickers = {glued.group("sym")}
-        if len(tickers) != 1:
+        if len(tickers) > 1:
             return ParseResult.invalid(
-                "a stop-out that doesn't name exactly one ticker — nothing to close"
+                "a close-out that names more than one ticker — no way to tell which to close"
             )
+        if not tickers:
+            return ParseResult.parsed(TradeSignal(
+                action=SignalAction.SELL,
+                asset_type=AssetType.OPTION,
+                symbol=None,
+                quantity=None,              # everything held
+                order_type=OrderKind.MARKET,
+                limit_price_unspecified=True,
+                position_closed=True,
+                flatten=True,
+                close_all_matching=True,
+                latest_contract=True,       # the position this channel is in
+                expiry_unspecified=True,
+                contract_unspecified=True,
+                source_action=source_action,
+                parser=self.name,
+            ))
         right_m = _RIGHT_WORD_RE.search(text)
         right = (glued.group("right") if glued else
                  (right_m.group("right")[0].upper() if right_m else None))
@@ -228,7 +252,7 @@ class TerseAlertParser(Parser):
             close_all_matching=True,
             expiry_unspecified=True,
             contract_unspecified=True,
-            source_action="STOPPED_OUT",
+            source_action=source_action,
             parser=self.name,
         ))
 

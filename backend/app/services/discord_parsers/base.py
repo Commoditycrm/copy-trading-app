@@ -134,6 +134,9 @@ class TradeSignal:
     # symbol (and call/put, when named) that this channel opened and is still
     # held — at market, in full. Several contracts are expected, not refused.
     close_all_matching: bool = False
+    # With close_all_matching and no symbol ("Cutting @here", "Stopped out"):
+    # the contract is the one this channel is in — its latest buy still held.
+    latest_contract: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -182,6 +185,7 @@ class TradeSignal:
             "add_to_latest": self.add_to_latest,
             "nearest_expiry": self.nearest_expiry,
             "close_all_matching": self.close_all_matching,
+            "latest_contract": self.latest_contract,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,
