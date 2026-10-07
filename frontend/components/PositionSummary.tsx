@@ -38,6 +38,9 @@ type Item = {
 
 type Rules = {
   channel: string;
+  quantity: string;
+  max_per_contract: string | null;
+  max_per_order: string | null;
   exits: string;
   entries: string;
   mode: string;
@@ -182,56 +185,58 @@ function Why({ note }: { note: string | null }) {
   );
 }
 
-/** The settings that govern this position, above its timeline. */
+/** The settings that govern this position, above its timeline: one line for
+ *  entries, one for exits (the whole ladder, T1 T2 T3 …, inline). */
 function RulesBlock({ rules }: { rules: Rules }) {
   const muted = { color: "var(--muted)" } as const;
   const text = { color: "var(--text-2)" } as const;
+  const sep = <span style={muted}> · </span>;
+  const entry: string[] = [
+    rules.channel,
+    rules.entries,
+    rules.quantity,
+    ...(rules.max_per_contract ? [`max ${rules.max_per_contract}/contract`] : []),
+    ...(rules.max_per_order ? [`max ${rules.max_per_order}/order`] : []),
+    rules.mode,
+  ];
   return (
-    <div className="mb-3 pb-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
-      <div className="text-[10px] font-medium uppercase tracking-wide mb-1.5" style={{ color: "var(--text-2)" }}>
-        Rules for this position
+    <div className="mb-3 pb-2.5 text-[12px] leading-relaxed" style={{ borderBottom: "1px solid var(--border)", ...text }}>
+      <div>
+        <span className="font-semibold" style={{ color: "var(--text)" }}>Entry Settings:</span>{" "}
+        {entry.map((e, i) => <span key={i}>{i > 0 && sep}{e}</span>)}
       </div>
-      <div className="text-[12px] leading-relaxed" style={text}>
-        <div><span style={muted}>Settings:</span> {rules.channel}</div>
-        <div>
-          <span style={muted}>Exits:</span> {rules.exits}
-          <span style={muted}> · Entries:</span> {rules.entries}
-          <span style={muted}> · </span>{rules.mode === "live" ? "live" : "paper"}
-        </div>
-        {rules.on_fill && <div><span style={muted}>On Fill:</span> {rules.on_fill}</div>}
+      <div>
+        <span className="font-semibold" style={{ color: "var(--text)" }}>Exit Settings:</span>{" "}
+        {rules.exits}
+        {rules.on_fill && <>{sep}<span>On Fill: {rules.on_fill}</span></>}
+        {rules.ladder.map((r) => {
+          const done = r.state === "done";
+          const next = r.state === "next";
+          return (
+            <span key={r.trim}>
+              {sep}
+              <span
+                title={done ? "done" : next ? "next" : undefined}
+                style={{
+                  color: done ? "var(--muted)" : next ? "var(--accent)" : "var(--text-2)",
+                  textDecoration: done ? "line-through" : undefined,
+                  fontWeight: next ? 600 : undefined,
+                }}
+              >
+                T{r.trim}: {r.target}, {r.sells}, {r.stop}
+              </span>
+            </span>
+          );
+        })}
       </div>
-      {rules.ladder.length > 0 && (
-        <div className="grid gap-x-4 gap-y-0.5 text-[12px] mt-1.5 items-center"
-             style={{ gridTemplateColumns: "auto auto auto auto 1fr" }}>
-          {rules.ladder.map((r) => (
-            <RungRow key={r.trim} r={r} />
-          ))}
+      {(rules.entry_price || rules.stop_now || rules.closed) && (
+        <div style={muted}>
+          {rules.entry_price && <>Entry <span className="num" style={text}>{rules.entry_price}</span></>}
+          {rules.stop_now && <> · Stop now <span className="num" style={text}>{rules.stop_now}</span></>}
+          {rules.trailing_now && <> (trailing {rules.trailing_now})</>}
+          {rules.closed && <> · Ladder finished: {rules.closed}</>}
         </div>
       )}
-      <div className="text-[12px] mt-1.5" style={text}>
-        {rules.entry_price && <><span style={muted}>Entry</span> <span className="num">{rules.entry_price}</span></>}
-        {rules.stop_now && <><span style={muted}> · Stop now</span> <span className="num">{rules.stop_now}</span></>}
-        {rules.trailing_now && <span style={muted}> (trailing {rules.trailing_now})</span>}
-        {rules.closed && <span style={muted}> · Ladder finished: {rules.closed}</span>}
-      </div>
     </div>
-  );
-}
-
-function RungRow({ r }: { r: Rules["ladder"][number] }) {
-  const done = r.state === "done";
-  const next = r.state === "next";
-  return (
-    <>
-      <span className="font-semibold" style={{ color: next ? "var(--accent)" : done ? "var(--muted)" : "var(--text-2)" }}>
-        T{r.trim}
-      </span>
-      <span className="num" style={{ color: done ? "var(--muted)" : "var(--text)" }}>{r.target}</span>
-      <span style={{ color: done ? "var(--muted)" : "var(--text-2)" }}>sells {r.sells}</span>
-      <span style={{ color: done ? "var(--muted)" : "var(--text-2)" }}>then {r.stop}</span>
-      <span className="text-[11px]" style={{ color: next ? "var(--accent)" : "var(--muted)" }}>
-        {done ? "done" : next ? "next" : ""}
-      </span>
-    </>
   );
 }

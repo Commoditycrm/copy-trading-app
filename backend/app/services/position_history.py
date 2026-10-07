@@ -322,9 +322,9 @@ __all__ = ["holding", "timeline"]
 
 
 _EXIT_MODES = {
-    "alerts": "on the channel's exit alerts",
-    "auto": "auto-trim (each trim fires at its profit target)",
-    "orders": "take-profit orders resting at the broker",
+    "alerts": "on exit alerts",
+    "auto": "auto-trim",
+    "orders": "take-profit orders",
     "manual": "manual — nothing sells on its own",
 }
 
@@ -362,37 +362,43 @@ def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
     if ts is None:
         return None
     if src is None:
-        channel = "your account settings (no channel)"
+        channel = "account"
     elif src.channel_id == "self":
-        channel = "Self (typed in the Discord popup) — your account settings"
+        channel = "Self"
     elif src.use_account_settings:
-        channel = f"{src.label} — following your account settings"
+        channel = f"{src.label}, account settings"
     else:
-        channel = f"{src.label} — the channel's own settings"
+        channel = src.label
 
     trails = discord_ladder.stop_trails(ts)
     done = guard.sell_count or 0
     ladder = []
     for i, r in enumerate(discord_ladder.rungs(ts), start=1):
-        stop = (f"trailing {_s(abs(r.stop_pct))}% below the high" if r.stop_pct is not None and trails[i - 1]
-                else f"stop {_s(r.stop_pct)}% from entry")
+        stop = (f"trail {_s(abs(r.stop_pct))}%" if r.stop_pct is not None and trails[i - 1]
+                else f"stop {_s(r.stop_pct)}%")
         ladder.append({
             "trim": i,
-            "target": f"+{_s(r.profit_gate_pct)}%" if r.profit_gate_pct else "any price",
-            "sells": f"{_s(r.qty_pct)}% of what is left",
+            "target": f"+{_s(r.profit_gate_pct)}%" if r.profit_gate_pct else "any",
+            "sells": f"sell {_s(r.qty_pct)}%",
             "stop": stop,
             "state": "done" if i <= done else ("next" if i == done + 1 else ""),
         })
     fill = discord_ladder.fill_stop_pct(ts)
     engine = getattr(ts, "discord_exit_engine", None)
+    mult = getattr(ts, "discord_quantity_multiplier", None) or 1
+    max_c = getattr(ts, "discord_max_per_contract", None)
+    max_o = getattr(ts, "discord_max_per_order", None)
     return {
         "channel": channel,
-        "exits": "AI trimming decides each exit" if engine == "ai" else _EXIT_MODES.get(dcs.exit_mode(ts), dcs.exit_mode(ts)),
+        "quantity": f"{mult}× the alert's size",
+        "max_per_contract": f"${_px(max_c)}" if max_c else None,
+        "max_per_order": f"${_px(max_o)}" if max_o else None,
+        "exits": "AI trimming" if engine == "ai" else _EXIT_MODES.get(dcs.exit_mode(ts), dcs.exit_mode(ts)),
         "entries": "market" if dcs.entry_order_type(db, source_id) == "market" else "limit",
         "mode": "live" if getattr(ts, "discord_live_trading", False) else "paper",
         "on_fill": (None if fill is None else
-                    (f"trailing {_s(abs(fill))}% below the high" if discord_ladder.fill_stop_trails(ts)
-                     else f"stop {_s(fill)}% from entry")),
+                    (f"trail {_s(abs(fill))}%" if discord_ladder.fill_stop_trails(ts)
+                     else f"stop {_s(fill)}%")),
         "ladder": ladder,
         "entry_price": _px(guard.entry_price),
         "stop_now": _px(guard.stop_price),
