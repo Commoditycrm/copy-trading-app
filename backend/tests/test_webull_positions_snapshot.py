@@ -131,9 +131,13 @@ def test_a_fresh_read_after_a_fill_skips_both_caches(world):
     assert calls["n"] == 2                               # read live
 
 
-def test_a_fresh_read_that_is_rate_limited_still_shows_the_snapshot(world):
+def test_a_fresh_read_reuses_the_recent_snapshot_instead_of_racing_a_429(world):
     ad, calls, r = world
-    ad.get_positions()
-    calls["fail"] = "429 Too Many Requests"
+    ad.get_positions()                         # risk worker writes a ~0s snapshot
+    calls["fail"] = "429 Too Many Requests"    # Webull would 429 a second read now
     got = ad.get_positions(cached_ok=True, fresh=True)
-    assert got == [_pos()] and getattr(got, "stale_age_s", None) is not None
+    # A fresh display read reuses the worker's very recent snapshot rather than
+    # racing it into Webull — so the page shows the positions with NO live read
+    # (hence no 429, no stale marker). The 429 stale-fallback for an OLDER
+    # snapshot is covered in test_webull_cross_container_coordination.py.
+    assert got == [_pos()]
