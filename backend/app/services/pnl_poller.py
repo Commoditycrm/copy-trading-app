@@ -134,28 +134,13 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
 }
 
 
-# Floor for the market-closed P&L cadence, so a bad config value (0/negative/
-# invalid) can never tighten the poll — also guarded by max(base, …) below.
-_MIN_PNL_CLOSED_S = 30.0
+def _interval_for_broker(broker: BrokerName) -> float:
+    """Return the current per-tick interval for ``broker``, reading any
+    runtime override every call. For Alpaca this checks Redis (~0.5ms);
+    for everything else it uses the static map above.
 
-
-def _closed_pnl_interval() -> float:
-    """Configured closed-market P&L interval (``pnl_poll_interval_closed_seconds``),
-    floored to a safe minimum. Invalid/non-positive values fall back to 180s."""
-    from app.config import get_settings  # noqa: PLC0415
-    try:
-        v = float(get_settings().pnl_poll_interval_closed_seconds)
-    except (TypeError, ValueError):
-        v = 180.0
-    if v <= 0:
-        v = 180.0
-    return max(_MIN_PNL_CLOSED_S, v)
-
-
-def _base_interval_for_broker(broker: BrokerName) -> float:
-    """The full-cadence per-tick interval for ``broker``, reading any runtime
-    override every call. For Alpaca this checks Redis (~0.5ms); for everything
-    else it uses the static map above."""
+    Called on the hot path (stamping the next-due time after each tick)
+    so an admin change lands on the very next tick without restart."""
     if broker == BrokerName.ALPACA:
         try:
             from app.services.platform_config import (  # noqa: PLC0415
@@ -169,21 +154,6 @@ def _base_interval_for_broker(broker: BrokerName) -> float:
             )
             return _INTERVAL_BY_BROKER[BrokerName.ALPACA]
     return _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
-
-
-def _interval_for_broker(broker: BrokerName) -> float:
-    """Per-tick interval for ``broker``. Full cadence during regular + extended
-    hours; backed off to the closed floor overnight / weekends, since account
-    P&L (and therefore the daily kill-switch / auto-liquidation / TP-SL the
-    poller enforces) can't change while the market is shut. This cuts CPU and
-    broker REST calls (Alpaca included) off-hours; full cadence resumes
-    automatically in pre-market. Called on the hot path (stamping next-due) so a
-    change lands on the next tick without restart."""
-    base = _base_interval_for_broker(broker)
-    from app.services import market_hours  # noqa: PLC0415
-    if not market_hours.is_tradable_now():
-        return max(base, _closed_pnl_interval())
-    return base
 
 # Per-account monotonic timestamp of the earliest time the account is
 # allowed to be polled again. The outer loop ticks every POLL_INTERVAL_S
@@ -304,27 +274,6 @@ async def stop() -> None:
     _task = None
 
 
-_last_session_log: str | None = None
-
-
-def _maybe_log_session() -> None:
-    """Log once when the market session changes (e.g. after-hours → closed),
-    with the resulting P&L cadence — never every tick."""
-    global _last_session_log
-    from app.services import market_hours  # noqa: PLC0415
-    session = market_hours.market_session()
-    if session == _last_session_log:
-        return
-    _last_session_log = session
-    log.info(
-        "pnl_poller: worker=pnl_poller market_session=%s tradable=%s "
-        "alpaca_interval=%.0fs webull_interval=%.0fs",
-        session, session != market_hours.CLOSED,
-        _interval_for_broker(BrokerName.ALPACA),
-        _interval_for_broker(BrokerName.WEBULL),
-    )
-
-
 async def _run() -> None:
     """Outer loop ticks every POLL_INTERVAL_S. On each tick:
 
@@ -338,7 +287,6 @@ async def _run() -> None:
     """
     while True:
         try:
-            _maybe_log_session()
             accts = await asyncio.to_thread(_load_active_accounts)
             now = time.monotonic()
             due = [a for a in accts if _next_due_at.get(a.id, 0.0) <= now]
@@ -540,13 +488,6 @@ def _enforce_one_safe(acct: BrokerAccount) -> None:
 
 
 def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
-    # One coalescing window per account per tick: the sub-enforcers below each
-    # read this account's positions LIVE, and on Webull those near-simultaneous
-    # reads 429. risk_tick shares ONE fresh read across them (a mutating
-    # place_order invalidates it). Each account runs in its own thread/context
-    # (asyncio.to_thread), so ticks never share a snapshot. See risk_tick.py.
-    from app.services import risk_tick  # noqa: PLC0415
-    token = risk_tick.begin()
     try:
         if role == "trader":
             _enforce_one_trader(acct)
@@ -561,15 +502,6 @@ def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
             "pnl_poller: enforce failed for account %s (user %s, role=%s)",
             acct.id, acct.user_id, role,
         )
-    finally:
-        tick = risk_tick.end(token)
-        if tick is not None and (tick.fresh_fetches or tick.reuses):
-            # DEBUG so it never floods prod; proves the coalescing per account.
-            log.debug(
-                "risk_tick: account=%s positions_fresh_fetches=%d "
-                "positions_snapshot_reuses=%d refreshes=%d",
-                acct.id, tick.fresh_fetches, tick.reuses, tick.refreshes,
-            )
 
 
 def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:

@@ -504,73 +504,8 @@ def _sweep_trader(db, trader_id, rows) -> None:
             log.exception("auto-trim: failed on %s", guard.symbol)
 
 
-# Absolute floor for the closed-market sweep — a bad config value (0, negative,
-# non-numeric) can never speed the loop up or spin it; it falls back to a slow
-# default and is never faster than the tradable cadence.
-_MIN_CLOSED_INTERVAL_S = float(POLL_INTERVAL_S)
-
-
-def _closed_interval() -> float:
-    """Configured closed-market sweep interval, floored so a bad value can't
-    create a busy loop or run faster than the tradable cadence."""
-    from app.config import get_settings  # noqa: PLC0415
-    try:
-        v = float(get_settings().discord_auto_trim_closed_interval_seconds)
-    except (TypeError, ValueError):
-        v = 180.0
-    if v <= 0:
-        v = 180.0
-    return max(_MIN_CLOSED_INTERVAL_S, v)
-
-
-def _interval_and_session() -> "tuple[float, str]":
-    """This sweep's sleep and the market session. Full 15s cadence while a trim
-    could actually fill (pre-market / regular / after-hours); backed off when
-    CLOSED, since no trim can execute and no new fill needs an on-fill stop.
-    Reuses the shared market_hours classifier — no duplicate time logic here."""
-    from app.services import market_hours  # noqa: PLC0415
-    session = market_hours.market_session()
-    if session == market_hours.CLOSED:
-        return _closed_interval(), session
-    return float(POLL_INTERVAL_S), session
-
-
-# How often to surface from a closed-market backoff to re-check the session and
-# the shutdown flag. Decouples the WAKE/check frequency from the broker-sweep
-# frequency: the sweep still fires ~every closed interval (~180s), but a
-# CLOSED->tradable transition (or a shutdown) is noticed within this many
-# seconds instead of up to a full interval late.
-_WAKE_CHECK_S = float(POLL_INTERVAL_S)
-
-
-def _backoff_sleep(interval: float, shutdown_check) -> bool:
-    """Sleep up to ``interval`` between sweeps, waking every ``_WAKE_CHECK_S`` to
-    re-check shutdown and the market session. These intermediate wake-ups are
-    session checks ONLY — they never call tick() or any broker API — so the
-    closed-market broker-sweep cadence is preserved while a CLOSED->tradable
-    transition is picked up within ``_WAKE_CHECK_S``. Returns True if the worker
-    should stop (shutdown requested). Elapsed is summed from the naps, not read
-    from the wall clock, so a system-clock adjustment can't distort the interval.
-    """
-    from app.services import market_hours  # noqa: PLC0415
-    remaining = interval
-    while remaining > 0:
-        if shutdown_check is not None and shutdown_check():
-            return True
-        nap = min(_WAKE_CHECK_S, remaining)
-        time.sleep(nap)
-        remaining -= nap
-        # The market opened during a closed-market backoff — sweep now rather
-        # than finish the long sleep. (A no-op during tradable cadence, where
-        # interval == _WAKE_CHECK_S and remaining is already 0.)
-        if market_hours.is_tradable_now():
-            return False
-    return False
-
-
 def poll_loop(shutdown_check=None) -> None:
-    log.info("discord_auto_trim: starting (tradable interval=%ss)", POLL_INTERVAL_S)
-    last_cadence: "tuple[str, float] | None" = None
+    log.info("discord_auto_trim: starting (interval=%ss)", POLL_INTERVAL_S)
     while True:
         if shutdown_check is not None and shutdown_check():
             return
@@ -578,13 +513,7 @@ def poll_loop(shutdown_check=None) -> None:
             tick()
         except Exception:  # noqa: BLE001
             log.exception("discord_auto_trim: tick failed")
-        interval, session = _interval_and_session()
-        # Log only when the session or cadence changes — not every sweep.
-        if last_cadence != (session, interval):
-            log.info("auto_trim market_session=%s interval=%.0fs", session, interval)
-            last_cadence = (session, interval)
-        if _backoff_sleep(interval, shutdown_check):
-            return
+        time.sleep(POLL_INTERVAL_S)
 
 
 # Count this loop's Webull calls under its own name (services/webull_usage.py).

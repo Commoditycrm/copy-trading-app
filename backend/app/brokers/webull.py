@@ -1036,20 +1036,9 @@ class WebullAdapter(BrokerAdapter):
         must leave it False and read live.
         """
         if not cached_ok:
-            # Risk-tick coalescing: inside one pnl_poller enforcement tick the
-            # several sub-enforcers each read this account's positions LIVE
-            # within ~0.2s, and Webull 429s the 3rd. Share ONE fresh read across
-            # the read-only sub-enforcers of the tick (a place_order invalidates
-            # it, so a decision never reuses a pre-mutation snapshot). No-op
-            # outside a tick — see services/risk_tick.py.
-            from app.services import risk_tick  # noqa: PLC0415
-
-            def _live() -> list[BrokerPosition]:
-                out = self._fetch_positions()
-                _snapshot_write(self.app_key, self.account_id, out)
-                return out
-
-            return risk_tick.get_or_fetch(f"{self.app_key}:{self.account_id}", _live)
+            out = self._fetch_positions()
+            _snapshot_write(self.app_key, self.account_id, out)
+            return out
         key = f"{self.app_key}:{self.account_id}"
         with _positions_lock_for(key):
             hit = _positions_cache.get(key)
@@ -1250,12 +1239,6 @@ class WebullAdapter(BrokerAdapter):
                 self.account_id, [self._build_stock_order(req, coid)]
             )
         self._assert_place_accepted(resp, coid)
-        # A placement leads to a fill that changes holdings — drop any coalesced
-        # same-tick positions snapshot so a later sub-enforcer re-reads LIVE
-        # rather than deciding off a pre-placement view (see risk_tick). Resting
-        # replace/cancel/exit-pair don't change holdings, so they don't.
-        from app.services import risk_tick  # noqa: PLC0415
-        risk_tick.invalidate(f"{self.app_key}:{self.account_id}")
         # The place response returns only {client_order_id, order_id} — no fill
         # yet. Report SUBMITTED; the subscriber reconciler polls get_order for
         # the fill (exactly like the SnapTrade subscriber path).
