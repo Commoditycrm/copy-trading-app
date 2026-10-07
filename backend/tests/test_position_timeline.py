@@ -105,6 +105,8 @@ def test_orders_asked_vs_filled_with_labels_and_rem_qty(db):
         ("T1", "3 @ 2.4 limit", "3 @ 2.42", "3"),
         ("T2", "1 @ market", "1 @ 2.5", "2"),
     ]
+    # 4 @ 2.00 then 2 @ 1.70 averages 1.90; selling doesn't move it
+    assert [r["avg_price"] for r in rows] == ["2.00", "1.90", "1.90", "1.90"]
 
 
 def test_a_stop_out_a_resting_trim_and_a_refused_one(db):
@@ -118,7 +120,7 @@ def test_a_stop_out_a_resting_trim_and_a_refused_one(db):
     rows = _timeline(db, through_order_id=out.id)
     assert [(r["label"], r["status"]) for r in rows] == [
         ("Entry", "filled"), ("Sell order", "submitted"), ("Sell order", "rejected"), ("Stopped out", "filled")]
-    assert rows[-1]["remaining"] == "0"
+    assert rows[-1]["remaining"] == "0" and rows[-1]["avg_price"] is None    # flat
 
 
 def test_stop_events_are_merged_in_time_order(db):
