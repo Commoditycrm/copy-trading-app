@@ -1,22 +1,27 @@
 "use client";
 
 /**
- * Position summary: everything that happened to one holding, oldest first —
+ * Position summary: the rules that govern a holding, what is placed on it, and
+ * everything that happened to it, oldest first —
  *
- *     Entry     4 @ 2.05 limit   filled 4 @ 2.00    Rem.Qty 4
- *     Stop set  @ 1.50
- *     T1        3 @ 2.40 limit   filled 3 @ 2.42    Rem.Qty 1
- *     Trailing stop raised  1.50 → 1.80 · 15% below high 2.12
+ *     Entry Settings: Mark · market · 4× the alert's size · live
+ *     Exit Settings:  take-profit orders · T1: +20%, sell 50%, stop -25% · …
+ *     Placed:         TP 0.50 · T1 · 4 · Webull  ×
  *
- * Orders show what was asked for (qty, market / limit price) and what filled;
- * the stop's own history (set, moved, trailing raised, removed) sits between
- * them in time. Shown in the panel under an open position, and under a sold
- * one in Closed today (``throughOrderId`` = the sell, for the holding it
- * closed). Reads GET /api/positions/history — our own records, no broker call.
+ *     11:58:04  Entry    4 @ market      4 @ 0.41   4   0.41    Mark alert: "…"
+ *     11:58:50  Average  4 @ 0.38 limit  4 @ 0.38   8   0.395   averaged by you
+ *
+ * Orders show what was asked for and what filled; the stop's own history sits
+ * between them in time; "Why" says what caused each line. Shown in the panel
+ * under an open position (with ``placed``), and under a sold one in Closed
+ * today (``throughOrderId`` = the sell, for the holding it closed). Reads
+ * GET /api/positions/history — our own records, no broker call — and reads it
+ * again whenever an order event arrives, so a trim or sell shows at once.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { fmtDateTimeMs, fmtSignedUsd } from "@/lib/format";
+import { useEventStream } from "@/lib/sse";
 
 type Item = {
   type: "order" | "event";
@@ -62,7 +67,14 @@ export type SummaryTarget = {
   throughOrderId?: string;
 };
 
-export function PositionSummary({ target }: { target: SummaryTarget }) {
+/** Order events that can change a holding's history. */
+const REFRESH_ON = new Set([
+  "order.placed", "order.updated", "order.cancelled", "order.copy_submitted", "position.auto_closed",
+]);
+/** After an event: once quickly, once more to catch the fill the event announced. */
+const REFRESH_AFTER_MS = [1_200, 6_000];
+
+export function PositionSummary({ target, placed }: { target: SummaryTarget; placed?: React.ReactNode }) {
   const [items, setItems] = useState<Item[] | null>(null);
   const [rules, setRules] = useState<Rules | null>(null);
   const [error, setError] = useState(false);
@@ -74,33 +86,57 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
   if (target.throughOrderId) q.set("through_order_id", target.throughOrderId);
   const url = `/api/positions/history?${q.toString()}`;
 
-  useEffect(() => {
-    let live = true;
+  const mounted = useRef(true);
+  const haveData = useRef(false);
+  const load = useCallback(() => {
     api<{ rules: Rules | null; items: Item[] }>(url)
-      .then((r) => { if (live) { setItems(r.items); setRules(r.rules); } })
-      .catch(() => { if (live) setError(true); });
-    return () => { live = false; };
+      .then((r) => {
+        if (!mounted.current) return;
+        haveData.current = true;
+        setItems(r.items);
+        setRules(r.rules);
+        setError(false);
+      })
+      // A failed refresh keeps what is shown; only a first load that fails says so.
+      .catch(() => { if (mounted.current && !haveData.current) setError(true); });
   }, [url]);
+
+  useEffect(() => {
+    mounted.current = true;
+    load();
+    return () => { mounted.current = false; };
+  }, [load]);
+
+  // A trim, a sell, a stop order: re-read as soon as the app hears of it.
+  const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEventStream((evt) => {
+    if (!REFRESH_ON.has(evt.type)) return;
+    for (const t of timers.current) clearTimeout(t);
+    timers.current = REFRESH_AFTER_MS.map((ms) => setTimeout(load, ms));
+  });
+  useEffect(() => () => { for (const t of timers.current) clearTimeout(t); }, []);
 
   const muted = { color: "var(--muted)" } as const;
   return (
-    <div>
-      {rules && <RulesBlock rules={rules} />}
-      <div className="text-[10px] font-medium uppercase tracking-wide mb-1.5" style={{ color: "var(--text-2)" }}>
-        Position summary
-      </div>
+    <div className="text-[12px]">
+      {(rules || placed) && (
+        <div className="mb-1.5 pb-1.5 leading-relaxed" style={{ borderBottom: "1px solid var(--border)" }}>
+          {rules && <RulesLines rules={rules} />}
+          {placed}
+        </div>
+      )}
       {error ? (
-        <div className="text-[12px]" style={muted}>Couldn&apos;t load this position&apos;s history.</div>
+        <div style={muted}>Couldn&apos;t load this position&apos;s history.</div>
       ) : items === null ? (
-        <div className="text-[12px]" style={muted}>Loading…</div>
+        <div style={muted}>Loading…</div>
       ) : items.length === 0 ? (
-        <div className="text-[12px]" style={muted}>
+        <div style={muted}>
           Nothing placed through Kopyya for this position — it may have been opened in the broker&apos;s own app.
         </div>
       ) : (
-        <div className="grid gap-x-4 gap-y-1 text-[12px] items-center"
-             style={{ gridTemplateColumns: "auto auto auto auto auto auto auto 1fr" }}>
-          <span style={muted}>Time (ET)</span>
+        <div className="grid gap-x-3 gap-y-0.5 items-center"
+             style={{ gridTemplateColumns: "auto auto auto auto auto auto auto minmax(0,1fr)" }}>
+          <span style={muted} title="Eastern time">Time</span>
           <span style={muted}>Event</span>
           <span style={muted}>Requested</span>
           <span style={muted}>Filled</span>
@@ -115,6 +151,18 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
   );
 }
 
+/** "11:58:04" today, "10/6 11:58" on an earlier day — ET either way. */
+function shortTime(iso: string): string {
+  const d = new Date(iso);
+  const day = (x: Date) => x.toLocaleDateString("en-US", { timeZone: "America/New_York" });
+  if (day(d) === day(new Date())) {
+    return d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
+  }
+  const md = d.toLocaleDateString("en-US", { timeZone: "America/New_York", month: "numeric", day: "numeric" });
+  const hm = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false, hour: "2-digit", minute: "2-digit" });
+  return `${md} ${hm}`;
+}
+
 /** How an order that has not filled reads in the Filled column. */
 const UNFILLED: Record<string, string> = {
   pending: "waiting", submitted: "resting", accepted: "resting",
@@ -123,8 +171,9 @@ const UNFILLED: Record<string, string> = {
 
 function Row({ it }: { it: Item }) {
   const time = (
-    <span className="num whitespace-nowrap" style={{ color: "var(--muted)" }}>
-      {it.at ? fmtDateTimeMs(it.at, "America/New_York") : "—"}
+    <span className="num whitespace-nowrap" style={{ color: "var(--muted)" }}
+          title={it.at ? fmtDateTimeMs(it.at, "America/New_York") : undefined}>
+      {it.at ? shortTime(it.at) : "—"}
     </span>
   );
   if (it.type === "event") {
@@ -179,17 +228,16 @@ function PnlCell({ value }: { value: string | null }) {
 /** Why a line happened, muted, in the last column. */
 function Why({ note }: { note: string | null }) {
   return (
-    <span className="text-[11px] leading-snug min-w-0" style={{ color: "var(--muted)" }} title={note ?? undefined}>
+    <span className="text-[11px] leading-snug min-w-0 truncate" style={{ color: "var(--muted)" }} title={note ?? undefined}>
       {note ?? ""}
     </span>
   );
 }
 
-/** The settings that govern this position, above its timeline: one line for
- *  entries, one for exits (the whole ladder, T1 T2 T3 …, inline). */
-function RulesBlock({ rules }: { rules: Rules }) {
+/** The settings that govern this position: one line for entries, one for
+ *  exits (the whole ladder, T1 T2 T3 …, inline, then where it stands now). */
+function RulesLines({ rules }: { rules: Rules }) {
   const muted = { color: "var(--muted)" } as const;
-  const text = { color: "var(--text-2)" } as const;
   const sep = <span style={muted}> · </span>;
   const entry: string[] = [
     rules.channel,
@@ -199,8 +247,13 @@ function RulesBlock({ rules }: { rules: Rules }) {
     ...(rules.max_per_order ? [`max ${rules.max_per_order}/order`] : []),
     rules.mode,
   ];
+  const now: string[] = [
+    ...(rules.entry_price ? [`entry ${rules.entry_price}`] : []),
+    ...(rules.stop_now ? [`stop ${rules.stop_now}${rules.trailing_now ? ` (trailing ${rules.trailing_now})` : ""}`] : []),
+    ...(rules.closed ? [`ladder finished: ${rules.closed}`] : []),
+  ];
   return (
-    <div className="mb-3 pb-2.5 text-[12px] leading-relaxed" style={{ borderBottom: "1px solid var(--border)", ...text }}>
+    <div style={{ color: "var(--text-2)" }}>
       <div>
         <span className="font-semibold" style={{ color: "var(--text)" }}>Entry Settings:</span>{" "}
         {entry.map((e, i) => <span key={i}>{i > 0 && sep}{e}</span>)}
@@ -228,15 +281,8 @@ function RulesBlock({ rules }: { rules: Rules }) {
             </span>
           );
         })}
+        {now.length > 0 && <span style={muted}>{"  ·  now: "}{now.join(", ")}</span>}
       </div>
-      {(rules.entry_price || rules.stop_now || rules.closed) && (
-        <div style={muted}>
-          {rules.entry_price && <>Entry <span className="num" style={text}>{rules.entry_price}</span></>}
-          {rules.stop_now && <> · Stop now <span className="num" style={text}>{rules.stop_now}</span></>}
-          {rules.trailing_now && <> (trailing {rules.trailing_now})</>}
-          {rules.closed && <> · Ladder finished: {rules.closed}</>}
-        </div>
-      )}
     </div>
   );
 }
