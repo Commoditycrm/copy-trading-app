@@ -1,4 +1,10 @@
-"""A position's fills in order — the Positions page's "position summary".
+"""A position's history — the Positions page's "position summary".
+
+``timeline()`` is what the page shows: every order of the holding (what was
+asked for — qty, market / limit price — and what filled), labelled Entry,
+Average, Add, T1, T2 …, Stopped out; merged in time order with the stop's own
+history (set, moved, trailing raised, removed — services/position_events).
+``holding()`` underneath is the fills alone:
 
     Buy  10 @ 5.20   Rem.Qty 10
     Sell  5 @ 5.79   Rem.Qty  5
@@ -22,7 +28,10 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.order import OptionRight, Order, OrderSide
+from datetime import datetime, timedelta, timezone
+
+from app.models.order import OptionRight, Order, OrderSide, OrderStatus, OrderType
+from app.models.position_event import PositionEvent
 
 
 def _when(o: Order):
@@ -71,4 +80,151 @@ def holding(db: Session, user_id, broker_account_id, symbol: str, *, strike: Dec
     return holdings[-1]
 
 
-__all__ = ["holding"]
+_STOP_TYPES = (OrderType.STOP, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP)
+_UNFILLED_SHOWN = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
+                   OrderStatus.PARTIALLY_FILLED, OrderStatus.REJECTED)
+
+
+def _utc(t):
+    if t is not None and t.tzinfo is None:
+        return t.replace(tzinfo=timezone.utc)
+    return t
+
+
+def _requested(o: Order) -> str:
+    qty = _s(o.quantity)
+    if o.order_type == OrderType.MARKET:
+        return f"{qty} @ market"
+    if o.order_type == OrderType.LIMIT:
+        return f"{qty} @ {_s(o.limit_price)} limit"
+    if o.order_type == OrderType.TRAILING_STOP:
+        trail = f"{_s(o.trail_percent)}%" if getattr(o, "trail_percent", None) else f"${_s(getattr(o, 'trail_price', None))}"
+        return f"{qty} trailing {trail}"
+    return f"{qty} stop @ {_s(o.stop_price)}" + (f" limit {_s(o.limit_price)}" if o.limit_price else "")
+
+
+_EVENT_LABELS = {
+    "stop_set": "Stop set",
+    "stop_moved": "Stop moved",
+    "stop_removed": "Stop removed",
+    "trailing_stop_set": "Trailing stop set",
+    "trailing_stop_raised": "Trailing stop raised",
+    "trailing_exit_armed": "Trailing exit armed",
+    "trailing_exit_cleared": "Trailing exit cleared",
+}
+
+
+def _event_detail(e: PositionEvent) -> str:
+    trail = f"{_s(e.trail_pct)}% below high {_s(e.peak)}" if e.trail_pct is not None and e.peak is not None else None
+    if e.kind == "stop_removed":
+        return f"was {_s(e.old_price)}"
+    if e.kind == "trailing_exit_armed":
+        give = f"${_s(e.trail_amount)}" if e.trail_amount is not None else f"{_s(e.trail_pct)}%"
+        return f"{_s(e.quantity)} rides a {give} give-back from {_s(e.peak)}" + (f" (exits at {_s(e.price)})" if e.price else "")
+    if e.kind == "trailing_exit_cleared":
+        return f"{_s(e.quantity)} no longer trailing"
+    moved = f"{_s(e.old_price)} → {_s(e.price)}" if e.old_price is not None else f"@ {_s(e.price)}"
+    return moved + (f" · {trail}" if trail else "")
+
+
+def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: Decimal | None = None,
+             right: str | None = None, expiry: date | None = None,
+             through_order_id: uuid.UUID | None = None) -> list[dict]:
+    """Everything that happened to one holding, oldest first (see module doc)."""
+    fills = holding(db, user_id, broker_account_id, symbol, strike=strike, right=right,
+                    expiry=expiry, through_order_id=through_order_id)
+    if not fills:
+        return []
+    remaining = {f["order_id"]: f["remaining"] for f in fills}
+
+    right_enum = OptionRight(right) if right else None
+    q = select(Order).where(
+        Order.user_id == user_id,
+        Order.broker_account_id == broker_account_id,
+        Order.symbol == symbol.upper(),
+    )
+    for col, val in ((Order.option_strike, strike), (Order.option_right, right_enum), (Order.option_expiry, expiry)):
+        q = q.where(col.is_(None) if val is None else col == val)
+    orders = list(db.execute(q).scalars())
+    in_holding = [o for o in orders if str(o.id) in remaining]
+    start = min(_utc(o.created_at) for o in in_holding if o.created_at) if any(o.created_at for o in in_holding) else None
+    closed = fills[-1]["remaining"] == "0"
+    end = None                            # open: up to now
+    if closed:
+        last = max((_utc(_when(o)) for o in in_holding if _when(o)), default=None)
+        end = last + timedelta(minutes=2) if last else None
+
+    def inside(t) -> bool:
+        t = _utc(t)
+        return t is not None and (start is None or t >= start) and (end is None or t <= end)
+
+    items: list[tuple] = []
+    buys = sells = 0
+    avg = Decimal(0)
+    held = Decimal(0)
+    for o in sorted(orders, key=lambda o: (_utc(_when(o)) or datetime.min.replace(tzinfo=timezone.utc))):
+        filled = Decimal(str(o.filled_quantity or 0))
+        mine = str(o.id) in remaining
+        if not mine:
+            if filled > 0 or o.status not in _UNFILLED_SHOWN or o.order_type in _STOP_TYPES:
+                continue                  # another holding's fill, a replaced order, a resting stop
+            if not inside(o.created_at):
+                continue
+        buy = o.side == OrderSide.BUY
+        price = Decimal(str(o.filled_avg_price)) if o.filled_avg_price is not None else None
+        if mine and buy:
+            buys += 1
+            label = "Entry" if buys == 1 else ("Average" if price is not None and avg and price < avg else "Add")
+            if price is not None:
+                avg = ((avg * held) + price * filled) / (held + filled) if held + filled else price
+            held += filled
+        elif mine:
+            if o.order_type in _STOP_TYPES:
+                label = "Stopped out"
+            else:
+                sells += 1
+                label = f"T{sells}"
+            held -= filled
+        else:
+            label = "Buy order" if buy else "Sell order"
+        at = _when(o) if mine else o.created_at
+        items.append((_utc(at), {
+            "type": "order",
+            "at": _utc(at).isoformat() if at else None,
+            "label": label,
+            "side": "buy" if buy else "sell",
+            "requested": _requested(o),
+            "filled": f"{_s(filled)} @ {_s(price)}" if mine else None,
+            "status": o.status.value,
+            "remaining": remaining.get(str(o.id)),
+            "detail": None,
+        }))
+
+    ev_q = select(PositionEvent).where(
+        PositionEvent.user_id == user_id,
+        PositionEvent.symbol == symbol.upper(),
+    )
+    for col, val in ((PositionEvent.option_strike, strike), (PositionEvent.option_right, right),
+                     (PositionEvent.option_expiry, expiry)):
+        ev_q = ev_q.where(col.is_(None) if val is None else col == val)
+    try:
+        events = list(db.execute(ev_q).scalars())
+    except Exception:  # noqa: BLE001 — a database without the table yet
+        events = []
+    for e in events:
+        if not inside(e.created_at):
+            continue
+        at = _utc(e.created_at)
+        items.append((at, {
+            "type": "event",
+            "at": at.isoformat(),
+            "label": _EVENT_LABELS.get(e.kind, e.kind),
+            "side": None, "requested": None, "filled": None, "status": None, "remaining": None,
+            "detail": _event_detail(e),
+        }))
+
+    items.sort(key=lambda it: (it[0] or datetime.min.replace(tzinfo=timezone.utc)))
+    return [i for _, i in items]
+
+
+__all__ = ["holding", "timeline"]

@@ -12,6 +12,7 @@ from app.models.discord_position_guard import DiscordPositionGuard
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
 from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.notification import Notification
+from app.models.position_event import PositionEvent
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.sell_all_snapshot import SellAllSnapshot
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
@@ -42,6 +43,7 @@ __all__ = [
     "OrderSide",
     "OrderStatus",
     "OrderType",
+    "PositionEvent",
     "RetryInterval",
     "SellAllSnapshot",
     "SubscriberSettings",

@@ -135,6 +135,12 @@ def create_app() -> FastAPI:
 
     webull_usage.install()
 
+    # Keep a history of every position's stop for the Position summary
+    # (services/position_events.py).
+    from app.services import position_events
+
+    position_events.install()
+
     @app.middleware("http")
     async def _tag_webull_caller(request, call_next):  # noqa: ANN001, ANN202
         token = webull_usage.set_request_caller(request.method, request.url.path)
