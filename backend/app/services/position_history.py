@@ -91,6 +91,16 @@ def _utc(t):
     return t
 
 
+def _px(v: Decimal | None) -> str | None:
+    """A price for display: at least 2 decimals, at most 4 (2 -> "2.00",
+    2.0333.. -> "2.0333")."""
+    if v is None:
+        return None
+    q = f"{Decimal(v).quantize(Decimal('0.0001')):f}".rstrip("0")
+    whole, _, frac = q.partition(".")
+    return f"{whole}.{frac.ljust(2, '0')}"
+
+
 def _requested(o: Order) -> str:
     qty = _s(o.quantity)
     if o.order_type == OrderType.MARKET:
@@ -185,6 +195,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
                 sells += 1
                 label = f"T{sells}"
             held -= filled
+            if held <= 0:
+                avg = Decimal(0)           # flat: nothing left to have a cost
         else:
             label = "Buy order" if buy else "Sell order"
         at = _when(o) if mine else o.created_at
@@ -197,6 +209,9 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "filled": f"{_s(filled)} @ {_s(price)}" if mine else None,
             "status": o.status.value,
             "remaining": remaining.get(str(o.id)),
+            # Average cost of what is still held after this fill. A sell
+            # doesn't change it; flat has none.
+            "avg_price": (_px(avg) if mine and held > 0 and avg else None),
             "detail": None,
         }))
 
@@ -220,6 +235,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "at": at.isoformat(),
             "label": _EVENT_LABELS.get(e.kind, e.kind),
             "side": None, "requested": None, "filled": None, "status": None, "remaining": None,
+            "avg_price": None,
             "detail": _event_detail(e),
         }))
 

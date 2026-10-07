@@ -27,6 +27,8 @@ type Item = {
   filled: string | null;
   status: string | null;
   remaining: string | null;
+  /** Average cost of what is still held after this fill (null when flat). */
+  avg_price: string | null;
   detail: string | null;
 };
 
@@ -75,12 +77,13 @@ export function PositionSummary({ target }: { target: SummaryTarget }) {
         </div>
       ) : (
         <div className="grid gap-x-4 gap-y-1 text-[12px] items-center"
-             style={{ gridTemplateColumns: "auto auto auto auto auto 1fr" }}>
+             style={{ gridTemplateColumns: "auto auto auto auto auto auto 1fr" }}>
           <span style={muted}>Time (ET)</span>
           <span style={muted}>Event</span>
           <span style={muted}>Requested</span>
           <span style={muted}>Filled</span>
           <span className="text-right" style={muted}>Rem.Qty</span>
+          <span className="text-right" style={muted} title="Average cost of what is still held">Avg.Price</span>
           <span />
           {items.map((it, i) => <Row key={i} it={it} />)}
         </div>
@@ -109,6 +112,7 @@ function Row({ it }: { it: Item }) {
         <span className="num" style={{ gridColumn: "span 2", color: "var(--text-2)" }}>{it.detail}</span>
         <span />
         <span />
+        <span />
       </>
     );
   }
@@ -127,6 +131,9 @@ function Row({ it }: { it: Item }) {
         {filled ? it.filled : (UNFILLED[it.status ?? ""] ?? it.status)}
       </span>
       <span className="num text-right font-semibold" style={{ color: "var(--text)" }}>{it.remaining ?? ""}</span>
+      <span className="num text-right" style={{ color: "var(--text-2)" }}>
+        {filled ? (it.avg_price ?? "—") : ""}
+      </span>
       <span />
     </>
   );
