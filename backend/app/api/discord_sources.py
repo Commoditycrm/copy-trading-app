@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -1991,6 +1992,17 @@ class _InlineTasks(BackgroundTasks):
             _run_coroutine_inline(result)
 
 
+# "@Market" typed at the end of a composer alert: place the entry at market.
+_AT_MARKET_RE = re.compile(r"\s*@market\s*$", re.IGNORECASE)
+
+
+def _split_at_market(content: str) -> tuple[str, bool]:
+    """(the alert without a trailing "@Market", whether it had one)."""
+    text = (content or "").strip()
+    stripped = _AT_MARKET_RE.sub("", text)
+    return stripped, stripped != text
+
+
 def submit_self_alert_text(
     db: Session,
     user: User,
@@ -2017,6 +2029,10 @@ def submit_self_alert_text(
     """
     src = _get_owned(db, user, source_id) if source_id is not None else _self_source(db, user)
     typed_into_channel = src.channel_id != _SELF_CHANNEL_ID
+    # "... @Market" asks for this one alert's entry at market, whatever the
+    # channel's own entry setting. Taken off before parsing (it is not part of
+    # the alert) and carried on the parsed signal to execution.
+    content, at_market = _split_at_market(content)
     # A typed alert is not the channel's watcher reporting in: it must not look
     # like a heartbeat (the disconnect watchdog reads these) or move the
     # channel's own "latest message" markers.
@@ -2035,6 +2051,11 @@ def submit_self_alert_text(
 
     auto = approve or _auto_approve(db, user.id, src.id if typed_into_channel else None)
     report = discord_ingest.ingest_batch(db, src, [raw], auto_approve=auto)
+    if at_market:
+        for m in report.stored:
+            if m.parsed_signal:
+                m.parsed_signal = {**m.parsed_signal, "at_market": True}
+                m.parsed_signals = [{**sig, "at_market": True} for sig in (m.parsed_signals or [m.parsed_signal])]
     if typed_into_channel:
         src.last_heartbeat_at, src.last_message_at, src.last_seen_message_id = watcher_state
     if not report.stored:
@@ -2356,15 +2377,20 @@ def _execute_signal(
     # the reference: the dollar caps were checked against it in resolve(), and
     # it is the ladder's provisional entry until the fill replaces it.
     entry_ref_price = p.limit_price
+    # Asked for by the alert itself ("... @Market" in the composer), or by the
+    # channel's entry setting.
+    asked_market = bool((msg.parsed_signal or {}).get("at_market"))
     if (not resolved.is_closing
-            and discord_channel_settings.entry_order_type(db, getattr(msg, "source_id", None)) == "market"):
+            and (asked_market
+                 or discord_channel_settings.entry_order_type(db, getattr(msg, "source_id", None)) == "market")):
         from app.services import market_hours  # noqa: PLC0415
 
         if market_hours.in_regular_session():
             resolved.payload = p = p.model_copy(
                 update={"order_type": OrderType.MARKET, "limit_price": None}
             )
-            detail += (" · " if detail else "") + "at market (channel setting)"
+            detail += (" · " if detail else "") + (
+                "at market (@Market)" if asked_market else "at market (channel setting)")
         else:
             # Market orders don't trade outside the regular session; a market
             # entry there would just sit until the open. Keep the alert's limit.

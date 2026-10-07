@@ -194,3 +194,25 @@ def test_typed_alerts_are_recognised_whatever_channel_they_were_typed_as():
     assert ds._is_self_alert(None, typed) is True
     from_discord = SimpleNamespace(author_id="112233445566778899", user_id=uid, source_id=None)
     assert ds._is_self_alert(None, from_discord) is False
+
+
+def test_at_market_is_taken_off_before_parsing_and_marked_on_the_signal(monkeypatch):
+    """"... @Market" is an instruction, not part of the alert: the parser sees
+    the alert alone, and execution sees at_market on its signal."""
+    seen = {}
+    src = SimpleNamespace(id=uuid.uuid4(), channel_id="self", last_heartbeat_at=None,
+                          last_message_at=None, last_seen_message_id=None)
+    stored = SimpleNamespace(parsed_signal={"action": "BUY", "symbol": "SPY"}, parsed_signals=None,
+                             decision=None)
+
+    def _ingest(db, source, batch, auto_approve):
+        seen["content"] = batch[0]["content"]
+        return SimpleNamespace(stored=[stored])
+
+    monkeypatch.setattr(ds, "_self_source", lambda db, user: src)
+    monkeypatch.setattr(ds, "_auto_approve", lambda *a, **k: False)
+    monkeypatch.setattr(ds.discord_ingest, "ingest_batch", _ingest)
+    db = SimpleNamespace(commit=lambda: None, refresh=lambda m: None)
+    ds.submit_self_alert_text(db, SimpleNamespace(id=uuid.uuid4(), email="t@x.com"), "SPY 770C 1.38 @Market")
+    assert seen["content"] == "SPY 770C 1.38"
+    assert stored.parsed_signal["at_market"] is True and stored.parsed_signals[0]["at_market"] is True
