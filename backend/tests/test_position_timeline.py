@@ -159,3 +159,76 @@ def test_a_sell_shows_the_realized_pnl_the_rest_of_the_app_reports(db, monkeypat
     loss = _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="1.60")
     monkeypatch.setattr(pnl, "realized_pnl_by_order", lambda db_, uid: {loss.id: D("-41.25")})
     assert _timeline(db)[-1]["pnl"] == "-41.25"
+
+
+# ── why: every event and order carries the reason it happened ───────────────
+
+def test_a_stop_change_carries_the_reason_it_was_made_under(db):
+    g = _guard(db)
+    with position_events.because("removed by you (X.Stops)"):
+        g.stop_price = D("1.50"); db.commit()
+    e = db.query(PositionEvent).one()
+    assert e.kind == "stop_set" and e.note == "removed by you (X.Stops)"
+
+
+def test_an_order_placed_under_a_reason_shows_it_on_its_line(db):
+    _order(db, OrderSide.BUY, OrderType.LIMIT, 2, 0, price="2.00", limit="2.00")
+    with position_events.because("auto-trim: up 35.0% — Trim 1"):
+        sell = _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="2.70")
+    note = db.query(PositionEvent).filter_by(kind="order_note").one()
+    assert note.order_id == sell.id
+    rows = _timeline(db)
+    assert rows[-1]["label"] == "T1" and rows[-1]["note"] == "auto-trim: up 35.0% — Trim 1"
+    assert all(r["type"] == "order" for r in rows)          # the note isn't a row of its own
+
+
+def test_an_outer_reason_is_kept_when_asked(db):
+    with position_events.because("auto-trim: up 35.0% — Trim 1"):
+        with position_events.because("Self alert: “✂️ SPY 781c”", keep_outer=True):
+            assert position_events.current_reason() == "auto-trim: up 35.0% — Trim 1"
+        with position_events.because("stop 1.50 hit"):
+            assert position_events.current_reason() == "stop 1.50 hit"
+
+
+def test_a_filled_stop_order_explains_itself_with_no_recorded_reason(db):
+    _order(db, OrderSide.BUY, OrderType.LIMIT, 2, 0, price="2.00", limit="2.00")
+    out = _order(db, OrderSide.SELL, OrderType.STOP, 2, 9, price="1.48", stop="1.50")
+    rows = _timeline(db, through_order_id=out.id)
+    assert rows[-1]["note"] == "stop order filled at the broker"
+
+
+def test_the_ladder_finishing_is_an_event(db):
+    _order(db, OrderSide.BUY, OrderType.LIMIT, 2, 0, price="2.00", limit="2.00")
+    g = _guard(db)
+    g.closed_at, g.closed_reason = datetime.now(timezone.utc), "position no longer held"
+    db.commit()
+    e = db.query(PositionEvent).filter_by(kind="ladder_closed").one()
+    assert e.note == "position no longer held"
+
+
+# ── the rules that apply ────────────────────────────────────────────────────
+
+def test_the_rules_name_the_ladder_and_how_far_along_it_is(db, monkeypatch):
+    from types import SimpleNamespace
+    from app.services import discord_channel_settings as dcs
+
+    g = _guard(db)
+    g.sell_count, g.stop_price = 1, D("2.00"); db.commit()
+    ts = SimpleNamespace(discord_trim_count=2, discord_extra_trims=[], discord_stop_trails={"trims": [False, True]},
+                         discord_trim_profit_gate_pct=D(33), discord_trim_stop_pct=D(-25), discord_trim_qty_pct=D(50),
+                         discord_trim2_profit_gate_pct=D(50), discord_trim2_stop_pct=D(15), discord_trim2_qty_pct=D(100),
+                         discord_fill_stop_pct=D(-25), discord_manual_exit=False, discord_tp_orders=False,
+                         discord_auto_trim=True, discord_live_trading=False, discord_exit_engine="ladder")
+    monkeypatch.setattr(dcs, "for_guard", lambda db_, uid, guard: ts)
+    monkeypatch.setattr(dcs, "source_for_order", lambda db_, oid: None)
+    r = position_history.rules(db, USER, "SPY", strike=D(781), right="call", expiry=EXP)
+    assert r["exits"].startswith("auto-trim") and r["mode"] == "paper" and r["on_fill"] == "stop -25% from entry"
+    assert [(x["trim"], x["target"], x["sells"], x["stop"], x["state"]) for x in r["ladder"]] == [
+        (1, "+33%", "50% of what is left", "stop -25% from entry", "done"),
+        (2, "+50%", "100% of what is left", "trailing 15% below the high", "next"),
+    ]
+    assert r["stop_now"] == "2.00"
+
+
+def test_no_ladder_means_no_rules(db):
+    assert position_history.rules(db, USER, "SPY", strike=D(781), right="call", expiry=EXP) is None

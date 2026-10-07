@@ -85,6 +85,8 @@ class _MinimalRequestShim:
         else:
             self.client = None
 
+from app.services.position_events import tagged as _tagged  # noqa: E402
+
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
@@ -732,16 +734,23 @@ def position_history(
     through_order_id: uuid.UUID | None = Query(None, description="A closing order: return the holding it belongs to"),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
-) -> list[dict]:
+) -> dict:
     """The position summary: everything that happened to this holding, oldest
     first — its orders (requested and filled, Rem.Qty after each fill) and its
     stop's history. Our own records only — no broker call."""
     from app.services import position_history as _ph  # noqa: PLC0415
 
-    return _ph.timeline(
+    items = _ph.timeline(
         db, user.id, broker_account_id, symbol, strike=option_strike, right=option_right,
         expiry=option_expiry, through_order_id=through_order_id,
     )
+    try:
+        rules = _ph.rules(db, user.id, symbol, strike=option_strike, right=option_right,
+                          expiry=option_expiry)
+    except Exception:  # noqa: BLE001 — the rules are context; the history is the point
+        log.warning("positions: could not read the rules for %s", symbol, exc_info=True)
+        rules = None
+    return {"rules": rules, "items": items}
 
 
 def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
@@ -1866,6 +1875,7 @@ def _cancel_working_orders_for_position(
 
 
 @router.post("/{broker_symbol}/close", response_model=OrderOut)
+@_tagged("closed by you on Positions")
 def close_position(
     broker_symbol: str,
     payload: ClosePositionIn,
@@ -2016,6 +2026,7 @@ def close_position(
 
 
 @router.post("/{broker_symbol}/stop")
+@_tagged("set by you on Positions")
 def set_position_stop(
     broker_symbol: str,
     request: Request,
@@ -2124,6 +2135,7 @@ def _resting_stop_orders(db: Session, user_id, pos) -> list:
 
 
 @router.post("/{broker_symbol}/stops/cancel")
+@_tagged("removed by you (X.Stops)")
 def cancel_position_stops(
     broker_symbol: str,
     request: Request,
@@ -2189,6 +2201,7 @@ def cancel_position_stops(
 
 
 @router.post("/{broker_symbol}/average", response_model=OrderOut)
+@_tagged("averaged by you on Positions")
 def average_position(
     broker_symbol: str,
     payload: AveragePositionIn,
@@ -2259,6 +2272,7 @@ def average_position(
 
 
 @router.post("/{broker_symbol}/cancel-open")
+@_tagged("cancelled by you (Canc.Open Ord)")
 def cancel_position_open_orders(
     broker_symbol: str,
     request: Request,
@@ -2322,6 +2336,7 @@ def _position_open_orders(db: Session, user_id, acct_id, pos, statuses) -> list:
 
 
 @router.post("/{broker_symbol}/trailing-stop")
+@_tagged("armed by you on Positions (Trl.Stop)")
 def arm_trailing_stop(
     broker_symbol: str,
     request: Request,

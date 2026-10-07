@@ -2126,6 +2126,37 @@ def submit_self_alert(
     )
 
 
+def _alert_reason(db: Session, msg) -> str:
+    """How the position summary explains what an alert did: the channel and
+    what it said ("Mark: “TSLA -90% Out”"), or that it was typed by hand."""
+    label = "Discord"
+    try:
+        src = db.get(DiscordAlertSource, msg.source_id) if getattr(msg, "source_id", None) else None
+        if src is not None:
+            label = "typed in the Discord popup" if src.channel_id == _SELF_CHANNEL_ID else src.label
+    except Exception:  # noqa: BLE001 — a label is never worth failing an alert for
+        pass
+    text = " ".join(str(getattr(msg, "content", "") or "").split())
+    text = text if len(text) <= 120 else text[:117] + "…"
+    return f"{label} alert: “{text}”" if text else f"{label} alert"
+
+
+def _with_alert_reason(fn):
+    """Everything an alert does — its order, the stop it moves — is recorded in
+    the position summary as caused by that alert. An outer reason (auto-trim,
+    which submits its own alert) is kept."""
+    import functools  # noqa: PLC0415
+
+    @functools.wraps(fn)
+    def _w(db, user, msg, background, request):
+        from app.services import position_events  # noqa: PLC0415
+
+        with position_events.because(_alert_reason(db, msg), keep_outer=True):
+            return fn(db, user, msg, background, request)
+    return _w
+
+
+@_with_alert_reason
 def _execute_signal(
     db: Session,
     user: User,

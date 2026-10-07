@@ -38,6 +38,8 @@ from app.services.pnl import (
     alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_order,
 )
 
+from app.services.position_events import tagged as _tagged  # noqa: E402
+
 router = APIRouter(prefix="/api", tags=["trades"])
 
 # Date-range filters (from/to) are interpreted as MARKET days (ET, DST-aware) so
@@ -1358,6 +1360,7 @@ def _place_trader_order(
 
 
 @router.post("/trades", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+@_tagged("placed by you (Trade panel)", keep_outer=True)
 def place_trade(
     payload: PlaceOrderIn,
     request: Request,

@@ -163,8 +163,13 @@ def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder")
     stop = pg._to_tick(stop)
     if stop is None or stop <= 0:
         return False                      # rounds to $0 on a very cheap contract: not a stop
-    guard.stop_price = stop
-    guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("On Fill stop — set when the entry filled"):
+        guard.stop_price = stop
+        guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+        if hasattr(db, "flush"):
+            db.flush()
     log.info("on-fill stop: %s filled at %s — stop set at %s (%s%%%s)", guard.symbol, entry, stop, pct,
              " trailing" if trailing else "")
     return True
@@ -467,7 +472,10 @@ def _sweep_trader(db, trader_id, rows) -> None:
                 "auto-trim: %s reached %.2f%% — firing trim %s via %r",
                 guard.symbol, gain_pct(guard.entry_price, mark), rung, text,
             )
-            msg = submit_self_alert_text(db, user, text, approve=True)
+            from app.services.position_events import because  # noqa: PLC0415
+
+            with because(f"auto-trim: up {gain_pct(guard.entry_price, mark):.1f}% — Trim {rung}"):
+                msg = submit_self_alert_text(db, user, text, approve=True)
 
             # If the rung sold nothing and armed nothing, give it back.
             #

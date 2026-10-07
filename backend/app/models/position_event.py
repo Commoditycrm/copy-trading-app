@@ -33,7 +33,8 @@ class PositionEvent(Base):
     option_right: Mapped[str | None] = mapped_column(String(4), nullable=True)
     option_expiry: Mapped[date | None] = mapped_column(Date, nullable=True)
     # stop_set | stop_moved | stop_removed | trailing_stop_set | trailing_stop_raised
-    # | trailing_exit_armed | trailing_exit_cleared
+    # | trailing_exit_armed | trailing_exit_cleared | ladder_closed
+    # | order_note (why an order was placed — joined to the order by order_id)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)       # the level now
     old_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)   # the level before
@@ -41,4 +42,8 @@ class PositionEvent(Base):
     trail_pct: Mapped[Decimal | None] = mapped_column(Numeric(9, 4), nullable=True)
     trail_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     peak: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # Why: "by you on Positions", "Mark's alert: …", "auto-trim at +35%" …
+    note: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # The order this note explains (kind order_note), when there is one.
+    order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
