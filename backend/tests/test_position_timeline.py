@@ -107,6 +107,8 @@ def test_orders_asked_vs_filled_with_labels_and_rem_qty(db):
     ]
     # 4 @ 2.00 then 2 @ 1.70 averages 1.90; selling doesn't move it
     assert [r["avg_price"] for r in rows] == ["2.00", "1.90", "1.90", "1.90"]
+    # sells realize against the 1.90 average: 3 x 0.52 x 100, 1 x 0.60 x 100; buys realize nothing
+    assert [r["pnl"] for r in rows] == [None, None, "156.00", "60.00"]
 
 
 def test_a_stop_out_a_resting_trim_and_a_refused_one(db):
@@ -146,3 +148,14 @@ def test_an_earlier_holding_s_events_stay_with_it(db):
     _order(db, OrderSide.BUY, OrderType.MARKET, 3, 30, price="2.00")
     assert [r["label"] for r in _timeline(db)] == ["Entry"]
     assert [r["label"] for r in _timeline(db, through_order_id=first_close.id)] == ["Entry", "Stop set", "T1"]
+
+
+def test_a_sell_shows_the_realized_pnl_the_rest_of_the_app_reports(db, monkeypatch):
+    """Closed today and Order History use pnl.realized_pnl_by_order (FIFO); the
+    summary shows the same figure rather than its own."""
+    from app.services import pnl
+
+    _order(db, OrderSide.BUY, OrderType.MARKET, 2, 0, price="2.00")
+    loss = _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="1.60")
+    monkeypatch.setattr(pnl, "realized_pnl_by_order", lambda db_, uid: {loss.id: D("-41.25")})
+    assert _timeline(db)[-1]["pnl"] == "-41.25"
