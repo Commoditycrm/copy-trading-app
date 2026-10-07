@@ -2543,12 +2543,20 @@ def _execute_signal(
         # …only when there WAS a position. An add into nothing re-entered as a
         # new position, and its ladder starts from this order like any entry.
         if signal.get("double_up") and (getattr(resolved, "held_quantity", None) or 0) > 0:
+            before = opened.entry_price
             guards.average_in(
                 db, opened,
                 held_qty=getattr(resolved, "held_quantity", None) or p.quantity,
                 added_qty=p.quantity,
                 added_price=entry_ref_price,
             )
+            # …and the ladder's stop with it (a hand-set or trailing stop stays).
+            try:
+                origin_ts = discord_channel_settings.for_guard(db, user.id, opened) or ts_for_sizing
+                if origin_ts is not None:
+                    guards.reprice_ladder_stop(opened, before, opened.entry_price, origin_ts)
+            except Exception:  # noqa: BLE001
+                log.exception("discord: could not move the ladder stop after averaging %s", opened.symbol)
 
     # A trim leaves a REMAINDER, and that remainder is unprotected until the
     # stop reconciler next runs — up to the account's whole poll interval (10s

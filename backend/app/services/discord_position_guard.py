@@ -488,44 +488,123 @@ def contract_key(strike, right, expiry) -> tuple:
     return (strike, getattr(right, "value", right) or None, expiry)
 
 
-def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
-    """Adopt the opening order's ACTUAL fill price. Returns True if it moved.
+def _holding_average(db: Session, guard: DiscordPositionGuard) -> Decimal | None:
+    """The average cost of this holding: every BUY of the contract that filled
+    since the guard opened (the entry and each average), weighted by quantity.
+    None when nothing has filled, or the orders can't be read."""
+    from app.models.order import Order, OrderSide  # noqa: PLC0415
+
+    try:
+        q = select(Order).where(
+            Order.user_id == guard.user_id,
+            Order.symbol == (guard.symbol or "").upper(),
+            Order.side == OrderSide.BUY,
+            Order.is_closing.is_(False),
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+        right = getattr(guard.option_right, "value", guard.option_right)
+        for col, val in ((Order.option_strike, guard.option_strike),
+                         (Order.option_right, OptionRight(right) if right else None),
+                         (Order.option_expiry, guard.option_expiry)):
+            q = q.where(col.is_(None) if val is None else col == val)
+        opened = getattr(guard, "created_at", None)
+        if opened is not None:
+            q = q.where(Order.created_at >= opened)
+        orders = list(db.execute(q).scalars())
+    except Exception:  # noqa: BLE001 — a database that can't answer: no average
+        return None
+    qty = sum((Decimal(str(o.filled_quantity)) for o in orders), Decimal(0))
+    if qty <= 0:
+        return None
+    cost = sum((Decimal(str(o.filled_quantity)) * Decimal(str(o.filled_avg_price)) for o in orders), Decimal(0))
+    return (cost / qty).quantize(Decimal("0.0001"))
+
+
+def sync_entry_price(db: Session, guard: DiscordPositionGuard, ts=None) -> bool:
+    """Adopt what the position ACTUALLY cost. Returns True if it moved.
 
     ``entry_price`` is seeded at placement with the limit we bid, because that
-    is the only reference that exists before the order fills. For a plain limit
-    buy the fill can only be at or better than that, so the seed was pessimistic
-    but safe.
+    is the only reference that exists before the order fills, and an average
+    re-weights it at placement the same way (average_in). Both are corrected
+    here from the fills: the average cost of every buy of this holding — the
+    entry and each average — weighted by quantity.
 
-    The +10% entry reprice broke that: it moves the limit ABOVE the alert's
-    price and can fill there, so the seeded value is a price the trader never
-    paid. Left uncorrected the whole ladder shifts -- the -25% stop sits further
-    below the real cost than asked, the profit gate opens early, and the
-    "break-even" stop on rung 2 is set BELOW the fill, which books a loss.
+    (It used to adopt only the OPENING order's fill. That undid every average:
+    averaging 4 @ 0.41 with 4 @ 0.38 re-weighted the entry to 0.395, and the
+    next pass put it back to 0.41 — targets and stops kept measuring from a
+    price no longer paid.)
 
-    Only ever adopts the opening order's own fill, so a later add cannot
-    re-average the reference out from under a stop already protecting the
-    position.
+    When it moves and ``ts`` (the settings that govern the position) is given,
+    the ladder's stop moves with it — see reprice_ladder_stop.
     """
     from app.models.order import Order, OrderStatus  # noqa: PLC0415
 
-    if guard.entry_order_id is None:
+    filled = _holding_average(db, guard)
+    if filled is None:
+        # Fall back to the opening order's own fill.
+        if guard.entry_order_id is None:
+            return False
+        order = db.get(Order, guard.entry_order_id)
+        if order is None or order.status not in (
+            OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
+        ):
+            return False
+        if order.filled_avg_price is None or Decimal(str(order.filled_avg_price)) <= 0:
+            return False
+        filled = Decimal(str(order.filled_avg_price))
+    if filled <= 0:
         return False
-    order = db.get(Order, guard.entry_order_id)
-    if order is None or order.status not in (
-        OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
-    ):
-        return False
-    filled = order.filled_avg_price
-    if filled is None or Decimal(str(filled)) <= 0:
-        return False
-    filled = Decimal(str(filled))
     if guard.entry_price is not None and Decimal(str(guard.entry_price)) == filled:
         return False
-    log.info(
-        "discord guard: %s entry %s -> %s (actual fill)",
-        guard.symbol, guard.entry_price, filled,
-    )
+    old = guard.entry_price
+    log.info("discord guard: %s entry %s -> %s (actual cost)", guard.symbol, old, filled)
     guard.entry_price = filled
+    if ts is not None:
+        reprice_ladder_stop(guard, old, filled, ts)
+    return True
+
+
+def reprice_ladder_stop(guard: DiscordPositionGuard, old_entry, new_entry, ts) -> bool:
+    """After the entry moved (an average filled), move the LADDER's stop with it.
+
+    The stop the ladder set is a return from entry — the On Fill stop before any
+    trim, else the stop of the last trim — so it is recomputed from the new
+    average. Only when the stop sits exactly where the ladder put it: a stop set
+    by hand is the trader's, and a trailing stop measures from its high, not
+    from entry, so neither is touched. Returns True when it moved.
+    """
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    if (old_entry is None or new_entry is None or guard.stop_price is None
+            or getattr(guard, "stop_trail_pct", None) is not None):
+        return False
+    old_entry, new_entry = Decimal(str(old_entry)), Decimal(str(new_entry))
+    rung = guard.sell_count or 0
+    if rung == 0:
+        if discord_ladder.fill_stop_trails(ts):
+            return False
+        pct = discord_ladder.fill_stop_pct(ts)
+    else:
+        cfg = discord_ladder.trim_config(ts).rung(rung)
+        if cfg.stop_trail:
+            return False
+        pct = cfg.stop_pct
+    if pct is None:
+        return False
+    pct = Decimal(str(pct))
+    was = _to_tick(old_entry * (Decimal(1) + pct / Decimal(100)))
+    if was is None or Decimal(str(guard.stop_price)) != was:
+        return False                      # not the ladder's level: set by hand
+    now = _to_tick(new_entry * (Decimal(1) + pct / Decimal(100)))
+    if now is None or now <= 0 or now == was:
+        return False
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because(f"averaged — the ladder's stop recalculated from the new average {_to_tick(new_entry)}"):
+        guard.stop_price = now
+    log.info("discord guard: %s averaged %s -> %s; ladder stop %s -> %s",
+             guard.symbol, old_entry, new_entry, was, now)
     return True
 
 

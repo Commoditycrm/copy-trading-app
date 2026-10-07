@@ -295,7 +295,7 @@ def test_the_entry_is_synced_before_the_gate_is_measured():
     import inspect
 
     src = inspect.getsource(at._sweep_trader)
-    sync_at = src.index("pg.sync_entry_price(db, guard)")
+    sync_at = src.index("pg.sync_entry_price(db, guard, guard_ts.get(guard.id, ts))")
     measure_at = src.index("rung = due_rung(guard_ts.get(guard.id, ts), guard, mark)")
     assert sync_at < measure_at, "the entry must be synced BEFORE the gate is read"
 

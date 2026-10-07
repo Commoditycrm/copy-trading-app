@@ -448,7 +448,7 @@ def _sweep_trader(db, trader_id, rows) -> None:
             # Idempotent (returns False when unchanged) and the exit
             # path still syncs too, so nothing else changes behaviour —
             # the reference is simply correct sooner.
-            if pg.sync_entry_price(db, guard):
+            if pg.sync_entry_price(db, guard, guard_ts.get(guard.id, ts)):
                 db.commit()
 
             # Take-profit orders, on a broker that links them to a stop: this
