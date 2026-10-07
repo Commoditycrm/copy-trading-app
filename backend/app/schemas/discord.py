@@ -461,6 +461,8 @@ class DiscordSettingsOut(BaseModel):
     # entry, as many whole contracts as fit at the price the order pays).
     size_mode: Literal["contracts", "dollars"] = "contracts"
     size_dollars: str | None = None
+    # With contracts: the ONE cap that applies — or none. Ignored with dollars.
+    size_cap: Literal["none", "per_contract", "per_order"] = "none"
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
     max_per_contract: str | None = None
     # Dollar ceiling on the WHOLE ORDER's value; null = no ceiling. Independent
@@ -517,6 +519,7 @@ class DiscordSettingsIn(BaseModel):
     size_mode: Literal["contracts", "dollars"] | None = None
     # Dollars per entry; "" clears it.
     size_dollars: str | None = None
+    size_cap: Literal["none", "per_contract", "per_order"] | None = None
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None

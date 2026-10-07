@@ -1081,6 +1081,7 @@ def _settings_out(ts) -> DiscordSettingsOut:
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         size_mode=(getattr(ts, "discord_size_mode", None) or "contracts") if ts else "contracts",
         size_dollars=_plain(getattr(ts, "discord_size_dollars", None)) if ts else None,
+        size_cap=discord_channel_settings.active_sizing(ts)["cap"] if ts else "none",
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
@@ -1133,6 +1134,8 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
         if payload.size_mode == "dollars" and not getattr(ts, "discord_size_dollars", None):
             raise HTTPException(400, "Set the dollars per entry first")
         ts.discord_size_mode = payload.size_mode
+    if payload.size_cap is not None:
+        ts.discord_size_cap = payload.size_cap
     if payload.max_per_contract is not None:
         raw = payload.max_per_contract.strip()
         if not raw:
@@ -2221,12 +2224,14 @@ def _execute_signal(
         )
     except Exception:  # noqa: BLE001
         goes_at_market = False
+    # ONE way to size: dollars alone, or contracts with at most one cap.
+    rules = discord_channel_settings.active_sizing(ts_for_sizing)
     sizing = discord_execution.Sizing(
-        multiplier=(ts_for_sizing.discord_quantity_multiplier if ts_for_sizing else 1) or 1,
-        max_per_contract=(ts_for_sizing.discord_max_per_contract if ts_for_sizing else None),
-        max_per_order=(ts_for_sizing.discord_max_per_order if ts_for_sizing else None),
-        mode=(getattr(ts_for_sizing, "discord_size_mode", None) or "contracts") if ts_for_sizing else "contracts",
-        dollars=(getattr(ts_for_sizing, "discord_size_dollars", None) if ts_for_sizing else None),
+        multiplier=rules["contracts"] or 1,
+        max_per_contract=rules["max_per_contract"],
+        max_per_order=rules["max_per_order"],
+        mode=rules["mode"],
+        dollars=rules["dollars"],
         at_market=goes_at_market,
     )
 

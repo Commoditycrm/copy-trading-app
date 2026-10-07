@@ -43,3 +43,43 @@ def test_back_to_contracts_keeps_the_amount_for_later():
     ts = _patch(_ts(), size_dollars="500", size_mode="dollars")
     ts = _patch(ts, size_mode="contracts")
     assert ts.discord_size_mode == "contracts" and ts.discord_size_dollars == D("500.00")
+
+
+# ── one way to size ─────────────────────────────────────────────────────────
+
+from app.services.discord_channel_settings import active_sizing  # noqa: E402
+
+
+def _s(**kw):
+    base = dict(discord_quantity_multiplier=4, discord_size_mode="contracts", discord_size_dollars=None,
+                discord_max_per_contract=None, discord_max_per_order=None, discord_size_cap=None)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_dollars_switch_everything_else_off():
+    r = active_sizing(_s(discord_size_mode="dollars", discord_size_dollars=D(500),
+                         discord_max_per_contract=D(300), discord_max_per_order=D(1000)))
+    assert r == {"mode": "dollars", "contracts": None, "dollars": D(500),
+                 "max_per_contract": None, "max_per_order": None, "cap": "none"}
+
+
+@pytest.mark.parametrize("cap, per_contract, per_order", [
+    ("per_contract", D(300), None),
+    ("per_order", None, D(1000)),
+    ("none", None, None),
+])
+def test_contracts_take_only_the_chosen_cap(cap, per_contract, per_order):
+    r = active_sizing(_s(discord_max_per_contract=D(300), discord_max_per_order=D(1000), discord_size_cap=cap))
+    assert (r["contracts"], r["max_per_contract"], r["max_per_order"]) == (4, per_contract, per_order)
+
+
+@pytest.mark.parametrize("pc, po, cap", [(D(300), D(1000), "per_contract"), (None, D(1000), "per_order"),
+                                         (None, None, "none")])
+def test_never_chosen_takes_the_cap_that_has_a_value(pc, po, cap):
+    assert active_sizing(_s(discord_max_per_contract=pc, discord_max_per_order=po))["cap"] == cap
+
+
+def test_choosing_a_cap_is_saved():
+    ts = _patch(_ts(), size_cap="per_order")
+    assert ts.discord_size_cap == "per_order" and _settings_out(ts).size_cap == "per_order"
