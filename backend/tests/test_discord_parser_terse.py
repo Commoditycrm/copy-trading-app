@@ -268,3 +268,43 @@ def test_a_spaced_contract_without_a_leading_entry_word_is_not_an_entry(text):
 
 def test_an_entry_with_no_price_is_refused():
     assert parse_message(ParsedMessage(content="In SPY 763P")).status is ParseStatus.IGNORED
+
+
+# ── a pinged, spaced, price-less call (missed live 2026-10-06) ──────────────
+
+def test_a_pinged_spaced_contract_with_no_price_is_an_entry_priced_at_execution():
+    s = _sig("QQQ 759P @here @everyone out the gate high risk")
+    assert (s.action, s.symbol, s.strike, s.option_type) == (SignalAction.BUY, "QQQ", Decimal("759"), OptionType.PUT)
+    assert s.limit_price is None and s.limit_price_unspecified is True
+    assert s.nearest_expiry is True and s.quantity == Decimal(1)
+
+
+def test_a_pinged_glued_contract_with_no_price_is_an_entry_too():
+    s = _sig("QQQ759P @here")
+    assert s.symbol == "QQQ" and s.limit_price_unspecified is True
+
+
+@pytest.mark.parametrize("text", [
+    "QQQ 759P looking juicy",           # not pinged: commentary
+    "SPY 763P hit 1.50",                # not pinged
+    "QQQ 759P @here up 40%",            # pinged, but a gain report
+    "QQQ 759P @here trimmed",           # pinged, but an exit
+    "QQQ 759P @everyone out of the rest",
+])
+def test_these_are_never_a_buy(text):
+    r = parse_message(ParsedMessage(content=text, posted_at=TS))
+    assert not any(s.action is SignalAction.BUY for s in (r.signals or []))
+
+
+def test_execution_buys_a_price_less_entry_at_the_live_ask():
+    sig = {"action": "BUY", "limit_price": None, "limit_price_unspecified": True}
+    adapter = SimpleNamespace()
+    resolutions = {}
+    original = ex._quote
+    ex._quote = lambda *a, **k: (Decimal("0.40"), Decimal("0.44"))
+    try:
+        price = ex._resolve_limit_price(sig, adapter, "QQQ", Decimal(759), OptionRight.PUT,
+                                        date(2026, 10, 6), ex.OrderSide.BUY, resolutions)
+    finally:
+        ex._quote = original
+    assert price == Decimal("0.44") and "live quote" in resolutions["limit_price"]
