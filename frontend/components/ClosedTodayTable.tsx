@@ -15,8 +15,8 @@
  * Collapsible: the header (count + realized total) stays; the choice is
  * remembered in this browser.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, History } from "lucide-react";
 import { api } from "@/lib/api";
 import { fmtNum, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
@@ -24,6 +24,7 @@ import { useEventStream } from "@/lib/sse";
 import { getSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import type { Order, Position, User } from "@/lib/types";
 import { positionSymbolLabel } from "@/components/OpenPositionsTable";
+import { PositionSummary } from "@/components/PositionSummary";
 
 const ET = "America/New_York";
 const COLLAPSED_KEY = "positions.closedToday.collapsed";
@@ -89,6 +90,8 @@ export function ClosedTodayTable() {
   const [reQty, setReQty] = useState<Record<string, string>>({});
   const [rePrice, setRePrice] = useState<Record<string, string>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Rows whose position summary is open (the icon beside the symbol).
+  const [summaryOpen, setSummaryOpen] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     try {
@@ -205,10 +208,30 @@ export function ClosedTodayTable() {
                 const label = positionSymbolLabel(o as unknown as Position);
                 const blocked = reEnterBlock(o);
                 const isOption = o.instrument_type === "option";
+                const open = !!summaryOpen[o.id];
                 return (
-                  <tr key={o.id} style={{ borderTop: "1px solid var(--border)" }}>
+                  <Fragment key={o.id}>
+                  <tr style={{ borderTop: "1px solid var(--border)" }}>
                     {showChannel && <td className={td}>{o.discord_channel || "—"}</td>}
-                    <td className={`${td} whitespace-nowrap font-medium`} style={{ color: "var(--text)" }}>{label}</td>
+                    <td className={`${td} whitespace-nowrap font-medium`} style={{ color: "var(--text)" }}>
+                      <span className="inline-flex items-center gap-1.5">
+                        {label}
+                        {o.broker_account_id && <button
+                          type="button"
+                          onClick={() => setSummaryOpen((m) => ({ ...m, [o.id]: !m[o.id] }))}
+                          aria-expanded={open}
+                          aria-label={`${open ? "Hide" : "Show"} the position summary for ${label}`}
+                          title="Position summary — every buy and sell, with Rem.Qty"
+                          className="focus-ring inline-flex items-center justify-center rounded-full"
+                          style={{
+                            width: 20, height: 20, background: "var(--panel-2)", color: "var(--text-2)",
+                            boxShadow: open ? "0 0 0 1.5px var(--text-2)" : "none",
+                          }}
+                        >
+                          <History size={12} />
+                        </button>}
+                      </span>
+                    </td>
                     <td className={`${td} num text-right`}>{fmtNum(o.filled_quantity, 0)}</td>
                     <td className={`${td} capitalize`}>{String(o.order_type).replace(/_/g, " ")}</td>
                     <td className={`${td} num text-right`}>{o.filled_avg_price ? fmtNum(o.filled_avg_price, 2) : "—"}</td>
@@ -249,6 +272,21 @@ export function ClosedTodayTable() {
                       </div>
                     </td>
                   </tr>
+                  {open && o.broker_account_id && (
+                    <tr style={{ background: "var(--panel-2)" }}>
+                      <td colSpan={showChannel ? 7 : 6} className="px-4 py-2.5">
+                        <PositionSummary target={{
+                          brokerAccountId: o.broker_account_id,
+                          symbol: o.symbol,
+                          optionStrike: o.option_strike,
+                          optionRight: o.option_right,
+                          optionExpiry: o.option_expiry,
+                          throughOrderId: o.id,
+                        }} />
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
             </tbody>

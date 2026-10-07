@@ -16,9 +16,9 @@ import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useT
 import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { DiscordAlertComposer } from "@/components/DiscordAlertComposer";
 import { Spinner } from "@/components/Spinner";
-import { PositionIcon, positionKind } from "@/components/PositionIcon";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
+import { PositionSummary, type SummaryTarget } from "@/components/PositionSummary";
 import type { BrokerAccount, Order, Position, PositionsPayload, Protection, StaleAccount, UnreachableAccount, User } from "@/lib/types";
 
 type PosSnap = { positions: Position[]; orders: Order[] };
@@ -264,9 +264,9 @@ function ProtectionIcons({ items, open, onToggle }: { items: Protection[]; open:
 
 /** Opens under a position when one of its protection icons is clicked: each
  *  stop, trailing stop and take-profit on it, with a Cancel for each. */
-function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSymbol, brokerAccountId, onDone }: {
+function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSymbol, brokerAccountId, summary, onDone }: {
   colSpan: number; items: Protection[]; label: string; isOption: boolean; entryOrderId: string | null;
-  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
+  brokerSymbol: string; brokerAccountId: string; summary: SummaryTarget; onDone: () => void;
 }) {
   const [busy, setBusy] = useState<number | null>(null);
 
@@ -301,7 +301,7 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
         {rows.length === 0 ? (
           <div className="flex items-center gap-2 text-[12px]" style={{ color: "var(--muted)" }}>
             <AlertTriangle size={13} style={{ color: "var(--bad)" }} />
-            No stop, trailing stop or take-profit on this position — set one from the arrow in Actions.
+            No stop, trailing stop or take-profit on this position — set one with the buttons above.
           </div>
         ) : (
           <div className="grid gap-x-3 gap-y-1.5 items-center text-[12px]" style={{ gridTemplateColumns: "130px minmax(0,1fr) auto" }}>
@@ -340,6 +340,9 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
             })}
           </div>
         )}
+        <div className="mt-3 pt-2.5" style={{ borderTop: "1px solid var(--border)" }}>
+          <PositionSummary target={summary} />
+        </div>
       </td>
     </tr>
   );
@@ -347,7 +350,11 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
 
 /** Stop levels offered on the expanded row, as the position's P&L: -25 puts the
  *  stop 25% below entry, 0 at break-even, +25 locks in a quarter. */
-const STOP_LEVELS = [-25, -10, 0, 25];
+const STOP_LEVELS = [-25, -10, 0];
+/** Profit levels, in a green dropdown after the chips: the stop locks that much in. */
+const PROFIT_LEVELS = [25, 35, 50, 60, 70, 80, 100, 120, 150];
+/** A stop level's colour: red below entry, neutral at break-even, green in profit. */
+const levelColor = (pct: number) => (pct < 0 ? "var(--bad)" : pct > 0 ? "var(--good)" : "var(--text-2)");
 
 /** Width of the first control in both action rows (Close at Market above,
  *  Stop + X.Stops below), so the inputs after it line up in one column. */
@@ -358,10 +365,10 @@ const ACTION_SLOT_W = 116;
  *  level; Actions holds Stop (set it), X.Stops (cancel them), and the trailing % with
  *  T.Stop. Every other column renders empty so the two cells sit exactly
  *  under their counterparts in the user's own column order. */
-function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, label, brokerSymbol, brokerAccountId, onDone }: {
+function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, label, brokerSymbol, brokerAccountId, marketPrice, onDone }: {
   columnIds: string[]; orderId: string | null; hasStop: boolean; ladderStop: string | null;
   entryPrice: number | null; label: string;
-  brokerSymbol: string; brokerAccountId: string; onDone: () => void;
+  brokerSymbol: string; brokerAccountId: string; marketPrice: number | null; onDone: () => void;
 }) {
   // The entry's bracket SL is cleared through the bracket endpoint; everything
   // else (ladder stop, trailing exit, resting stop orders) through stops/cancel.
@@ -374,6 +381,10 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
 
   const levelPrice = (pct: number) =>
     entryPrice != null ? Math.floor(entryPrice * (1 + pct / 100) * 100) / 100 : null;
+  // Where a trailing stop would start: that % under today's price.
+  const trailNum = parseFloat(trailPct);
+  const trailStart = marketPrice != null && trailNum > 0 && trailNum < 100
+    ? Math.floor(marketPrice * (1 - trailNum / 100) * 100) / 100 : null;
 
   async function setStop() {
     if (level == null) return;
@@ -446,13 +457,33 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
                 style={{
                   border: `1px solid ${selected ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
                   background: selected ? "var(--nav-active-bg)" : "transparent",
-                  color: selected ? "var(--accent)" : "var(--text-2)",
+                  color: levelColor(pct),
+                  fontWeight: selected ? 600 : undefined,
                 }}
               >
                 {pct}%
               </button>
             );
           })}
+          {/* Profit levels: one green dropdown rather than a chip each. */}
+          <select
+            aria-label={`Stop at a profit level for ${label}`}
+            value={level != null && level > 0 ? String(level) : ""}
+            onChange={e => setLevel(e.target.value ? Number(e.target.value) : null)}
+            title="Stop that locks in a profit: the % P&L from entry it sits at"
+            className="px-1 py-0.5 text-[10px] rounded"
+            style={{
+              border: `1px solid ${level != null && level > 0 ? "var(--good)" : "rgba(34,160,90,0.45)"}`,
+              background: level != null && level > 0 ? "var(--good-soft)" : "transparent",
+              color: "var(--good)",
+            }}
+          >
+            <option value="">+ profit</option>
+            {PROFIT_LEVELS.map(pct => {
+              const px = levelPrice(pct);
+              return <option key={pct} value={pct}>+{pct}%{px != null ? ` (${px.toFixed(2)})` : ""}</option>;
+            })}
+          </select>
         </div>
       </td>
     ),
@@ -486,7 +517,10 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
           <div className="flex items-stretch">
             <input
               type="number" step="0.1" min="0.1" max="100"
-              placeholder="-% mkt"
+              placeholder="trail %"
+              title={trailStart != null
+                ? `Trailing stop starts at ${trailStart.toFixed(2)} (${trailPct}% below the market) and rises with new highs`
+                : "Trailing stop: % below the market price, rising with new highs"}
               aria-label={`Trailing stop percent below market for ${label}`}
               value={trailPct}
               onChange={e => setTrailPct(e.target.value)}
@@ -506,7 +540,10 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               type="button"
               disabled={busy !== null || !trailPct}
               onClick={armTrail}
-              className="btn-danger px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
+              title={trailStart != null
+                ? `Start a trailing stop at ${trailStart.toFixed(2)}, ${trailPct}% below the market`
+                : "Enter a trail % first"}
+              className="btn-primary px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
               style={{
                 borderTopLeftRadius: 0,
                 borderBottomLeftRadius: 0,
@@ -514,7 +551,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
                 borderBottomRightRadius: "var(--r-sm)",
               }}
             >
-              <span>T.Stop</span>
+              <span>Trl.Stop</span>
               {busy === "trail" && <Spinner />}
             </button>
           </div>
@@ -801,8 +838,7 @@ export const OpenPositionsTable = forwardRef<
       setCloseLimitPrices((s) => { const n = { ...s }; delete n[key]; return n; });
     // Positions whose stop row (down arrow in Actions) is open.
     const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-    // Which rows have their protections (stops / trailing / take-profits) open.
-    const [protOpen, setProtOpen] = useState<Record<string, boolean>>({});
+
     // Per row, what each split button does: close the position, or average
     // into it (buy more). Chosen from the ▾ beside the button.
     const [marketMode, setMarketMode] = useState<Record<string, ExitMode>>({});
@@ -1583,12 +1619,11 @@ export const OpenPositionsTable = forwardRef<
                     symbol: (
                       <td className="px-5 py-3.5 whitespace-nowrap font-medium" style={{ color: "var(--text)" }}>
                         <span className="inline-flex items-center gap-1.5">
-                          <PositionIcon kind={positionKind(p)} />
                           {positionSymbolLabel(p)}
                           <ProtectionIcons
                             items={p.protections ?? []}
-                            open={!!protOpen[key]}
-                            onToggle={() => setProtOpen(s => ({ ...s, [key]: !s[key] }))}
+                            open={!!expanded[key]}
+                            onToggle={() => setExpanded(s => ({ ...s, [key]: !s[key] }))}
                           />
                         </span>
                       </td>
@@ -1788,18 +1823,6 @@ export const OpenPositionsTable = forwardRef<
                       <tr className="border-t transition-colors hover:bg-[var(--panel-2)]" style={{ borderColor: "var(--border)" }}>
                         {cols.columns.map((c) => <Fragment key={c.id}>{cell[c.id] ?? null}</Fragment>)}
                       </tr>
-                      {protOpen[key] && (
-                        <ProtectionRow
-                          colSpan={cols.columns.length}
-                          items={p.protections ?? []}
-                          label={positionSymbolLabel(p)}
-                          isOption={p.instrument_type === "option"}
-                          entryOrderId={orderId}
-                          brokerSymbol={p.broker_symbol}
-                          brokerAccountId={p.broker_account_id}
-                          onDone={refresh}
-                        />
-                      )}
                       {expanded[key] && (
                         <PositionStopRow
                           columnIds={cols.columns.map(c => c.id)}
@@ -1810,6 +1833,26 @@ export const OpenPositionsTable = forwardRef<
                           label={p.symbol.toUpperCase()}
                           brokerSymbol={p.broker_symbol}
                           brokerAccountId={p.broker_account_id}
+                          marketPrice={p.current_price != null ? Number(p.current_price) : null}
+                          onDone={refresh}
+                        />
+                      )}
+                      {expanded[key] && (
+                        <ProtectionRow
+                          colSpan={cols.columns.length}
+                          items={p.protections ?? []}
+                          label={positionSymbolLabel(p)}
+                          isOption={p.instrument_type === "option"}
+                          entryOrderId={orderId}
+                          brokerSymbol={p.broker_symbol}
+                          brokerAccountId={p.broker_account_id}
+                          summary={{
+                            brokerAccountId: p.broker_account_id,
+                            symbol: p.symbol,
+                            optionStrike: p.option_strike,
+                            optionRight: p.option_right,
+                            optionExpiry: p.option_expiry,
+                          }}
                           onDone={refresh}
                         />
                       )}

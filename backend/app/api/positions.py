@@ -714,6 +714,27 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             p.discord_channel = name
 
 
+@router.get("/history")
+def position_history(
+    broker_account_id: uuid.UUID = Query(...),
+    symbol: str = Query(..., min_length=1, max_length=32),
+    option_strike: Decimal | None = Query(None),
+    option_right: str | None = Query(None, pattern=r"^(call|put)$"),
+    option_expiry: date | None = Query(None),
+    through_order_id: uuid.UUID | None = Query(None, description="A closing order: return the holding it belongs to"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[dict]:
+    """The position summary: each fill of this holding, oldest first, with the
+    remaining quantity after it. Our own orders only — no broker call."""
+    from app.services import position_history as _ph  # noqa: PLC0415
+
+    return _ph.holding(
+        db, user.id, broker_account_id, symbol, strike=option_strike, right=option_right,
+        expiry=option_expiry, through_order_id=through_order_id,
+    )
+
+
 def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
     """Set .ladder_stop_price from each held contract's live Discord guard.
 

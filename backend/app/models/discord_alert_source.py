@@ -73,6 +73,12 @@ class DiscordAlertSource(Base, TimestampMixin):
 
     # Trader on/off for THIS source. The listener only opens enabled sources.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Switched off by "Pause ALL channels" (not by hand), so "Resume ALL
+    # channels" turns back on exactly these and leaves a channel the trader had
+    # already turned off, off. Cleared whenever the switch is set by hand.
+    paused_by_pause_all: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
 
     # Set on a SUBSCRIBER's copy of a trader's channel (see
     # services/discord_subscribers.py): the trader channel it mirrors. The copy
