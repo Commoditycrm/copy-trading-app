@@ -37,6 +37,7 @@ CHANNEL_FIELDS = (
     "discord_quantity_multiplier",
     "discord_size_mode",
     "discord_size_dollars",
+    "discord_size_cap",
     "discord_max_per_contract",
     "discord_max_per_order",
     "discord_trail_percent",
@@ -76,6 +77,7 @@ _ADDED_LATER: dict[str, Any] = {
     "discord_stop_trails": None,
     "discord_size_mode": "contracts",
     "discord_size_dollars": None,
+    "discord_size_cap": None,
 }
 
 
@@ -170,6 +172,36 @@ def for_guard(db: Session, user_id: uuid.UUID, guard) -> Any | None:
     if source_id is None:
         return None
     return effective(db, user_id, source_id)
+
+
+def active_sizing(ts: Any) -> dict:
+    """The sizing rules that apply under these settings — ONE way to size:
+
+    * dollars:   the amount per entry, and nothing else (no contract count, no cap);
+    * contracts: the count per entry, plus at most ONE cap — max per contract OR
+                 max per order, never both.
+    """
+    if ts is None:
+        return {"mode": "contracts", "contracts": 1, "dollars": None,
+                "max_per_contract": None, "max_per_order": None, "cap": "none"}
+    dollars = getattr(ts, "discord_size_dollars", None)
+    if getattr(ts, "discord_size_mode", None) == "dollars" and dollars:
+        return {"mode": "dollars", "contracts": None, "dollars": dollars,
+                "max_per_contract": None, "max_per_order": None, "cap": "none"}
+    per_contract = getattr(ts, "discord_max_per_contract", None)
+    per_order = getattr(ts, "discord_max_per_order", None)
+    cap = getattr(ts, "discord_size_cap", None)
+    if cap not in ("per_contract", "per_order", "none"):
+        # Never chosen (set before caps were exclusive): the one with a value.
+        cap = "per_contract" if per_contract else ("per_order" if per_order else "none")
+    return {
+        "mode": "contracts",
+        "contracts": int(getattr(ts, "discord_quantity_multiplier", None) or 1),
+        "dollars": None,
+        "max_per_contract": per_contract if cap == "per_contract" else None,
+        "max_per_order": per_order if cap == "per_order" else None,
+        "cap": cap,
+    }
 
 
 def exits_manual(ts: Any) -> bool:

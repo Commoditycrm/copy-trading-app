@@ -385,11 +385,12 @@ def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
         })
     fill = discord_ladder.fill_stop_pct(ts)
     engine = getattr(ts, "discord_exit_engine", None)
-    mult = getattr(ts, "discord_quantity_multiplier", None) or 1
-    dollars = getattr(ts, "discord_size_dollars", None)
-    by_dollars = getattr(ts, "discord_size_mode", None) == "dollars" and dollars
-    max_c = getattr(ts, "discord_max_per_contract", None)
-    max_o = getattr(ts, "discord_max_per_order", None)
+    sizing = dcs.active_sizing(ts)
+    mult = sizing["contracts"] or 1
+    dollars = sizing["dollars"]
+    by_dollars = sizing["mode"] == "dollars"
+    max_c = sizing["max_per_contract"]
+    max_o = sizing["max_per_order"]
     return {
         "channel": channel,
         "quantity": (f"${_px(dollars)} per entry" if by_dollars

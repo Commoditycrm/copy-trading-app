@@ -81,6 +81,8 @@ type DiscordSettings = {
   /** "contracts" (quantity_multiplier per entry) or "dollars" (size_dollars per entry). */
   size_mode?: "contracts" | "dollars";
   size_dollars?: string | null;
+  /** With contracts: the ONE cap that applies. Ignored with dollars. */
+  size_cap?: "none" | "per_contract" | "per_order";
   max_per_contract: string | null;
   max_per_order: string | null;
   trail_percent: string;
@@ -204,6 +206,14 @@ const DEFAULT_TRIMS: TrimRow[] = [
 /** What "Add trim" appends: sell the rest, stop at break-even. */
 const NEW_TRIM: TrimRow = { profit_gate_pct: "0", qty_pct: "100", stop_pct: "0" };
 
+/** A sizing card that isn't in use: greyed and not clickable, with why. */
+function sizingCardStyle(inUse: boolean, minWidth: number): React.CSSProperties {
+  return {
+    background: "var(--panel-2)", border: "1px solid var(--border)", minWidth,
+    opacity: inUse ? 1 : 0.45, pointerEvents: inUse ? undefined : "none",
+  };
+}
+
 /** The ladder from a settings response (older responses carry only the three
  *  per-trim fields). */
 function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
@@ -301,6 +311,7 @@ export default function DiscordPage() {
   const [sizeMode, setSizeMode] = useState<"contracts" | "dollars">("contracts");
   const [sizeModeUi, setSizeModeUi] = useState<"contracts" | "dollars">("contracts");
   const [sizeDollars, setSizeDollars] = useState("");
+  const [sizeCap, setSizeCap] = useState<"none" | "per_contract" | "per_order">("none");
   const [savedSizeDollars, setSavedSizeDollars] = useState("");
   const [maxPerOrder, setMaxPerOrder] = useState("");
   // What the server currently holds, as distinct from what's in the box —
@@ -397,6 +408,7 @@ export default function DiscordPage() {
       setSavedSizeDollars(next.sizeDollars);
       setSizeMode(settings.size_mode ?? "contracts");
       setSizeModeUi(settings.size_mode ?? "contracts");
+      setSizeCap(settings.size_cap ?? "none");
       setSavedMaxPerContract(next.maxPerContract);
       setMaxPerOrder((cur) => (forced("maxPerOrder") || cur === prev.maxPerOrder ? next.maxPerOrder : cur));
       setSavedMaxPerOrder(next.maxPerOrder);
@@ -1432,9 +1444,35 @@ export default function DiscordPage() {
                 question (how much exposure per alert) and reading them together
                 is how you judge whether the pair is sane. */}
             <div className="space-y-3">
-              <div className="text-[11px] font-semibold uppercase tracking-wide"
-                   style={{ color: "var(--muted)" }}>
-                Sizing
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
+                  Sizing
+                </div>
+                {/* ONE cap at a time, and only with Contracts — Dollars is its own rule. */}
+                <div className="flex items-center gap-2 text-[11px]" style={{ color: "var(--muted)" }}>
+                  <span>Cap</span>
+                  <div role="radiogroup" aria-label="Which cap applies" className="flex rounded-lg border overflow-hidden"
+                       style={{ borderColor: "var(--border-strong)", opacity: sizeModeUi === "dollars" ? 0.45 : 1 }}
+                       title={sizeModeUi === "dollars" ? "Not used while sizing by dollars — the amount is the rule" : "Only one cap applies at a time"}>
+                    {([["none", "None"], ["per_contract", "Max per contract"], ["per_order", "Max per order"]] as const).map(([value, text]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        role="radio"
+                        aria-checked={sizeCap === value}
+                        disabled={modeBusy || sizeModeUi === "dollars"}
+                        onClick={() => { setSizeCap(value); saveSizing({ size_cap: value }); }}
+                        className="px-2.5 py-0.5 disabled:cursor-not-allowed"
+                        style={{
+                          background: sizeCap === value ? "var(--accent-glow)" : "transparent",
+                          color: sizeCap === value ? "var(--accent-2)" : "var(--muted)",
+                        }}
+                      >
+                        {text}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
 
               <div className="flex gap-4 flex-wrap items-stretch">
@@ -1545,10 +1583,13 @@ export default function DiscordPage() {
                   )}
                 </div>
 
-                {/* Max per contract */}
+                {/* Max per contract — in use only with Contracts, as the chosen cap */}
                 <div
                   className="rounded-xl px-4 py-3 flex-1"
-                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
+                  aria-disabled={!(sizeModeUi === "contracts" && sizeCap === "per_contract")}
+                  title={sizeModeUi === "dollars" ? "Not used while sizing by dollars"
+                    : sizeCap !== "per_contract" ? "Not in use — choose Max per contract as the cap above" : undefined}
+                  style={sizingCardStyle(sizeModeUi === "contracts" && sizeCap === "per_contract", 300)}
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
@@ -1600,7 +1641,10 @@ export default function DiscordPage() {
                     pass either and fail the other. */}
                 <div
                   className="rounded-xl px-4 py-3 flex-1"
-                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300 }}
+                  aria-disabled={!(sizeModeUi === "contracts" && sizeCap === "per_order")}
+                  title={sizeModeUi === "dollars" ? "Not used while sizing by dollars"
+                    : sizeCap !== "per_order" ? "Not in use — choose Max per order as the cap above" : undefined}
+                  style={sizingCardStyle(sizeModeUi === "contracts" && sizeCap === "per_order", 300)}
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>

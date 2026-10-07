@@ -98,6 +98,10 @@ class TraderSettings(Base, TimestampMixin):
         String(10), default="contracts", server_default="contracts", nullable=False,
     )
     discord_size_dollars: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Which ONE cap applies when sizing by contracts: "per_contract",
+    # "per_order" or "none". NULL (never chosen) = whichever has a value, Max per
+    # contract first. Sizing by dollars uses no cap — the amount is the rule.
+    discord_size_cap: Mapped[str | None] = mapped_column(String(12), nullable=True)
 
     # Ceiling on the dollar value of a single Discord order (quantity x price x
     # 100 for options). Unlike SubscriberSettings.max_per_contract — which is
