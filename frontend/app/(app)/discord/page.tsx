@@ -78,6 +78,9 @@ type DiscordSettings = {
   /** The On Fill stop trails: fill_stop_pct is then a give-back from the high. */
   fill_stop_trail?: boolean;
   quantity_multiplier: number;
+  /** "contracts" (quantity_multiplier per entry) or "dollars" (size_dollars per entry). */
+  size_mode?: "contracts" | "dollars";
+  size_dollars?: string | null;
   max_per_contract: string | null;
   max_per_order: string | null;
   trail_percent: string;
@@ -214,7 +217,7 @@ function trimsFrom(s: Partial<DiscordSettings>): TrimRow[] {
 }
 
 /** The boxes on this page that hold typing until Save. */
-type EditedField = "trims" | "fill" | "maxPerContract" | "maxPerOrder";
+type EditedField = "trims" | "fill" | "maxPerContract" | "maxPerOrder" | "sizeDollars";
 
 const sameTrims = (a: TrimRow[], b: TrimRow[]) =>
   a.length === b.length && a.every((t, i) =>
@@ -293,6 +296,12 @@ export default function DiscordPage() {
   const [exitEngine, setExitEngine] = useState<"ladder" | "ai">("ladder");
   const [qtyMultiplier, setQtyMultiplier] = useState(1);
   const [maxPerContract, setMaxPerContract] = useState("");
+  // Sizing by contracts or by dollars. The toggle shows the choice before it's
+  // saved (Dollars needs an amount first); sizeMode is what the server holds.
+  const [sizeMode, setSizeMode] = useState<"contracts" | "dollars">("contracts");
+  const [sizeModeUi, setSizeModeUi] = useState<"contracts" | "dollars">("contracts");
+  const [sizeDollars, setSizeDollars] = useState("");
+  const [savedSizeDollars, setSavedSizeDollars] = useState("");
   const [maxPerOrder, setMaxPerOrder] = useState("");
   // What the server currently holds, as distinct from what's in the box —
   // lets Save disable itself when nothing has changed.
@@ -313,7 +322,7 @@ export default function DiscordPage() {
   // ladder reverted 15s later unless Save had been clicked by then.
   const savedRef = useRef({
     trims: DEFAULT_TRIMS, fill: "", fillTrail: false,
-    maxPerContract: "", maxPerOrder: "",
+    maxPerContract: "", maxPerOrder: "", sizeDollars: "",
   });
   const [pairFor, setPairFor] = useState<DiscordSource | null>(null);
   // Which settings the Alert handling card edits: null = the account's, else a
@@ -373,6 +382,7 @@ export default function DiscordPage() {
         fill: settings.fill_stop_pct ?? "",
         fillTrail: !!settings.fill_stop_trail,
         maxPerContract: settings.max_per_contract ?? "",
+        sizeDollars: settings.size_dollars ?? "",
         maxPerOrder: settings.max_per_order ?? "",
       };
       savedRef.current = next;
@@ -383,6 +393,10 @@ export default function DiscordPage() {
       setFillTrail((cur) => (forced("fill") || cur === prev.fillTrail ? next.fillTrail : cur));
       setSavedFillTrail(next.fillTrail);
       setMaxPerContract((cur) => (forced("maxPerContract") || cur === prev.maxPerContract ? next.maxPerContract : cur));
+      setSizeDollars((cur) => (forced("sizeDollars") || cur === prev.sizeDollars ? next.sizeDollars : cur));
+      setSavedSizeDollars(next.sizeDollars);
+      setSizeMode(settings.size_mode ?? "contracts");
+      setSizeModeUi(settings.size_mode ?? "contracts");
       setSavedMaxPerContract(next.maxPerContract);
       setMaxPerOrder((cur) => (forced("maxPerOrder") || cur === prev.maxPerOrder ? next.maxPerOrder : cur));
       setSavedMaxPerOrder(next.maxPerOrder);
@@ -561,6 +575,7 @@ export default function DiscordPage() {
       if ("trims" in patch) sent.push("trims");
       if ("fill_stop_pct" in patch) sent.push("fill");
       if ("max_per_contract" in patch) sent.push("maxPerContract");
+      if ("size_dollars" in patch) sent.push("sizeDollars");
       if ("max_per_order" in patch) sent.push("maxPerOrder");
       applySettings(r, sent);
       notify.success("Saved");
@@ -1423,44 +1438,111 @@ export default function DiscordPage() {
               </div>
 
               <div className="flex gap-4 flex-wrap items-stretch">
-                {/* Contracts per alert */}
+                {/* Size each entry: by contracts, or by dollars */}
                 <div
                   className="rounded-xl px-4 py-3 flex-1"
                   style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 330 }}
                 >
-                  <div className="flex items-baseline justify-between gap-2">
+                  <div className="flex items-center justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
-                      Contracts per alert
+                      Size each entry by
                     </label>
-                    <span className="text-[11px] tabular-nums" style={{ color: "var(--accent-2)" }}>
-                      {qtyMultiplier} {qtyMultiplier === 1 ? "contract" : "contracts"}
-                    </span>
-                  </div>
-                  <div className="flex gap-1 mt-2 flex-wrap">
-                    {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => {
-                      const active = qtyMultiplier === n;
-                      return (
+                    <div role="radiogroup" aria-label="Size each entry by" className="flex rounded-lg border overflow-hidden"
+                         style={{ borderColor: "var(--border-strong)" }}>
+                      {([["contracts", "Contracts"], ["dollars", "Dollars"]] as const).map(([value, text]) => (
                         <button
-                          key={n}
+                          key={value}
                           type="button"
+                          role="radio"
+                          aria-checked={sizeModeUi === value}
                           disabled={modeBusy}
-                          onClick={() => saveSizing({ quantity_multiplier: n })}
-                          className="text-[11px] font-semibold rounded-lg transition-colors disabled:opacity-60"
+                          onClick={() => {
+                            setSizeModeUi(value);
+                            // Contracts can switch at once; Dollars waits for an amount.
+                            if (value === "contracts" && sizeMode !== "contracts") saveSizing({ size_mode: "contracts" });
+                            if (value === "dollars" && sizeMode !== "dollars" && savedSizeDollars) saveSizing({ size_mode: "dollars" });
+                          }}
+                          className="px-2.5 py-0.5 text-[11px] disabled:opacity-60"
                           style={{
-                            width: 28, height: 28,
-                            background: active ? "var(--accent-glow)" : "transparent",
-                            border: `1px solid ${active ? "rgba(44,147,197,0.5)" : "var(--border)"}`,
-                            color: active ? "var(--accent-2)" : "var(--muted)",
+                            background: sizeModeUi === value ? "var(--accent-glow)" : "transparent",
+                            color: sizeModeUi === value ? "var(--accent-2)" : "var(--muted)",
                           }}
                         >
-                          {n}
+                          {text}
                         </button>
-                      );
-                    })}
+                      ))}
+                    </div>
                   </div>
-                  <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Every entry buys exactly this many, whatever size the alert says. A close always sells the position you hold.
-                  </p>
+
+                  {sizeModeUi === "contracts" ? (
+                    <>
+                      <div className="flex gap-1 mt-2 flex-wrap items-center">
+                        {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => {
+                          const active = qtyMultiplier === n;
+                          return (
+                            <button
+                              key={n}
+                              type="button"
+                              disabled={modeBusy}
+                              onClick={() => saveSizing({ quantity_multiplier: n })}
+                              className="text-[11px] font-semibold rounded-lg transition-colors disabled:opacity-60"
+                              style={{
+                                width: 28, height: 28,
+                                background: active ? "var(--accent-glow)" : "transparent",
+                                border: `1px solid ${active ? "rgba(44,147,197,0.5)" : "var(--border)"}`,
+                                color: active ? "var(--accent-2)" : "var(--muted)",
+                              }}
+                            >
+                              {n}
+                            </button>
+                          );
+                        })}
+                        <span className="text-[11px] ml-1 tabular-nums" style={{ color: "var(--accent-2)" }}>
+                          {qtyMultiplier} {qtyMultiplier === 1 ? "contract" : "contracts"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                        Every entry buys exactly this many, whatever size the alert says. A close always sells the position you hold.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex gap-2 mt-2">
+                        <div className="relative flex-1">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: "var(--muted)" }}>$</span>
+                          <input
+                            type="number"
+                            min="1"
+                            step="50"
+                            inputMode="decimal"
+                            placeholder="500"
+                            aria-label="Dollars per entry"
+                            value={sizeDollars}
+                            disabled={modeBusy}
+                            onChange={(e) => setSizeDollars(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && sizeDollars.trim()) saveSizing({ size_dollars: sizeDollars, size_mode: "dollars" });
+                            }}
+                            className="w-full rounded-lg border py-1.5 text-sm bg-transparent focus-ring"
+                            style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 22, paddingRight: 12 }}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          disabled={modeBusy || !sizeDollars.trim() || (sizeDollars === savedSizeDollars && sizeMode === "dollars")}
+                          onClick={() => saveSizing({ size_dollars: sizeDollars, size_mode: "dollars" })}
+                          className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                        >
+                          Save
+                        </button>
+                      </div>
+                      <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
+                        Each entry buys as many whole contracts as fit in this amount, at the price it will pay — the live
+                        price for a market entry. Light alerts spend half; if one contract costs more, the entry is skipped.
+                        Averaging down still doubles what you hold. A close always sells the position you hold.
+                      </p>
+                    </>
+                  )}
                 </div>
 
                 {/* Max per contract */}
@@ -1507,7 +1589,7 @@ export default function DiscordPage() {
                     </button>
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Skips an entry when one contract&apos;s value (premium × 100) is above this.
+                    Skips an entry when one contract&apos;s value (premium × 100) is above this — at the live price for a market entry.
                     Options only — closes always go through.
                   </p>
                 </div>
@@ -1559,7 +1641,7 @@ export default function DiscordPage() {
                     </button>
                   </div>
                   <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
-                    Cuts an entry to the most contracts that fit under this total (quantity × price, × 100 for options); skips it only if not even one fits. Closes always go through.
+                    Cuts an entry to the most contracts that fit under this total (quantity × price, × 100 for options — the live price for a market entry); skips it only if not even one fits. Closes always go through.
                   </p>
                 </div>
               </div>

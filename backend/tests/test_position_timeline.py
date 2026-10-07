@@ -228,7 +228,7 @@ def test_the_rules_name_the_ladder_and_how_far_along_it_is(db, monkeypatch):
         (1, "+33%", "sell 50%", "stop -25%", "done"),
         (2, "+50%", "sell 100%", "trail 15%", "next"),
     ]
-    assert r["channel"] == "account" and r["quantity"] == "1× the alert's size"
+    assert r["channel"] == "account" and r["quantity"] == "1 contract per entry"
     assert r["stop_now"] == "2.00"
 
 

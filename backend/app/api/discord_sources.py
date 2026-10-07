@@ -440,7 +440,11 @@ def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOu
     account = db.get(TraderSettings, user.id)
     n = int(getattr(eff, "discord_quantity_multiplier", None) or 1)
     kind = "Market" if discord_channel_settings.entry_order_type(db, src_id) == "market" else "Limit"
-    entry = f"{kind} · {n} contract{'s' if n != 1 else ''}"
+    dollars = getattr(eff, "discord_size_dollars", None)
+    if getattr(eff, "discord_size_mode", None) == "dollars" and dollars:
+        entry = f"{kind} · ${Decimal(str(dollars)).normalize():f}"
+    else:
+        entry = f"{kind} · {n} contract{'s' if n != 1 else ''}"
     if not getattr(eff, "discord_live_trading", False):
         entry += " · Test"
     if (getattr(eff, "discord_execution_mode", None) or "manual").lower() != "auto":
@@ -1075,6 +1079,8 @@ def _settings_out(ts) -> DiscordSettingsOut:
         auto_trim=bool(ts and getattr(ts, "discord_auto_trim", False)),
         exit_mode=discord_channel_settings.exit_mode(ts),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
+        size_mode=(getattr(ts, "discord_size_mode", None) or "contracts") if ts else "contracts",
+        size_dollars=_plain(getattr(ts, "discord_size_dollars", None)) if ts else None,
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
@@ -1111,6 +1117,22 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
         ts.discord_execution_mode = payload.execution_mode
     if payload.quantity_multiplier is not None:
         ts.discord_quantity_multiplier = payload.quantity_multiplier
+    if "size_dollars" in payload.model_fields_set:
+        raw = (payload.size_dollars or "").strip().lstrip("$").replace(",", "")
+        if raw == "":
+            ts.discord_size_dollars = None
+        else:
+            try:
+                amount = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, "Dollars per entry is not a number")
+            if not amount.is_finite() or amount < 1 or amount > 1_000_000:
+                raise HTTPException(400, "Dollars per entry must be between $1 and $1,000,000")
+            ts.discord_size_dollars = amount.quantize(Decimal("0.01"))
+    if payload.size_mode is not None:
+        if payload.size_mode == "dollars" and not getattr(ts, "discord_size_dollars", None):
+            raise HTTPException(400, "Set the dollars per entry first")
+        ts.discord_size_mode = payload.size_mode
     if payload.max_per_contract is not None:
         raw = payload.max_per_contract.strip()
         if not raw:
@@ -2187,10 +2209,25 @@ def _execute_signal(
     # The alert's channel decides an ENTRY: its own settings, or the account's
     # while it follows them. An exit switches to the opening channel's below.
     ts_for_sizing = discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None))
+    # Will this entry go at MARKET? Then it is sized and capped against the
+    # live price, not the alert's (a market order pays the market).
+    try:
+        from app.services import market_hours as _mh  # noqa: PLC0415
+
+        goes_at_market = bool(
+            ((msg.parsed_signal or {}).get("at_market")
+             or discord_channel_settings.entry_order_type(db, getattr(msg, "source_id", None)) == "market")
+            and _mh.in_regular_session()
+        )
+    except Exception:  # noqa: BLE001
+        goes_at_market = False
     sizing = discord_execution.Sizing(
         multiplier=(ts_for_sizing.discord_quantity_multiplier if ts_for_sizing else 1) or 1,
         max_per_contract=(ts_for_sizing.discord_max_per_contract if ts_for_sizing else None),
         max_per_order=(ts_for_sizing.discord_max_per_order if ts_for_sizing else None),
+        mode=(getattr(ts_for_sizing, "discord_size_mode", None) or "contracts") if ts_for_sizing else "contracts",
+        dollars=(getattr(ts_for_sizing, "discord_size_dollars", None) if ts_for_sizing else None),
+        at_market=goes_at_market,
     )
 
     signal = msg.parsed_signal or {}

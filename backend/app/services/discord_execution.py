@@ -57,6 +57,15 @@ class Sizing:
     multiplier: int = 1
     max_per_contract: Decimal | None = None
     max_per_order: Decimal | None = None
+    # "contracts": an entry buys exactly ``multiplier``. "dollars": as many whole
+    # contracts as fit in ``dollars`` at the price the order will pay.
+    mode: str = "contracts"
+    dollars: Decimal | None = None
+    # The entry will go to the broker at MARKET (a Market channel, or @Market,
+    # in the regular session). Then the live price — not the alert's — is what
+    # it will pay, so that is what the dollar amount and both caps are checked
+    # against.
+    at_market: bool = False
 
 
 @dataclass
@@ -235,16 +244,31 @@ def resolve(
             )
             mark_price = pinned
 
-    # The dollar cap needs the price, so it's applied once both are known.
+    # The dollar rules need the price, so they're applied once both are known.
     if not is_closing:
+        # The price the order will actually pay: its limit — or, for an entry
+        # that goes at MARKET, the live price. Sizing and caps measured against
+        # the alert's price would let a market order spend more than allowed.
+        price = limit_price
+        if sizing.at_market:
+            live = _market_price(adapter, symbol, strike, right, expiry, is_option)
+            if live is not None:
+                price = live
+                resolutions["sizing_price"] = f"{live} (the market price — the order goes at market)"
+        # Size by dollars: a fresh entry only. An average-down doubles what is
+        # held — a statement about your own position, sized from it.
+        averaging = bool(signal.get("double_up")) and (held_quantity or 0) > 0
+        if sizing.mode == "dollars" and sizing.dollars and not averaging:
+            quantity = _dollar_quantity(sizing, price, is_option, bool(signal.get("half_size")),
+                                        resolutions)
         # Independent ceilings, checked in their own right: one is about what a
         # contract costs, the other about what the order costs. An order can
         # pass either and fail the other, and neither reads the other's value.
         quantity = _apply_max_per_contract(
-            quantity, limit_price, is_option, sizing, resolutions
+            quantity, price, is_option, sizing, resolutions
         )
         quantity = _apply_max_per_order(
-            quantity, limit_price, is_option, sizing, resolutions
+            quantity, price, is_option, sizing, resolutions
         )
 
     payload = PlaceOrderIn(
@@ -795,6 +819,44 @@ def _resolve_quantity(
         return qty
 
     return _entry_quantity(signal, sizing, resolutions)
+
+
+def _market_price(adapter, symbol, strike, right, expiry, is_option) -> Decimal | None:
+    """What a market BUY of this pays now: the ask, else the live mark."""
+    quote = _quote(adapter, symbol, strike, right, expiry) if is_option else None
+    if quote and quote[1] and quote[1] > 0:
+        return Decimal(str(quote[1])).quantize(Decimal("0.01"))
+    try:
+        from app.services import live_marks  # noqa: PLC0415
+
+        mark = live_marks.contract_mark(symbol, strike, right, expiry)
+    except Exception:  # noqa: BLE001
+        mark = None
+    return Decimal(str(mark)).quantize(Decimal("0.01")) if mark and mark > 0 else None
+
+
+def _dollar_quantity(sizing, price, is_option, half, resolutions) -> Decimal:
+    """An entry sized by dollars: whole contracts (shares) that fit in the amount.
+
+    "light" halves the amount. When not even one fits, the entry is skipped —
+    buying one anyway would spend more than the amount the trader set."""
+    budget = Decimal(str(sizing.dollars))
+    if half:
+        budget = budget / Decimal(2)
+    if price is None or price <= 0:
+        raise ExecutionRefused("Sizing by dollars needs a price, and none is known for this entry.")
+    unit = Decimal(str(price)) * (Decimal(100) if is_option else Decimal(1))
+    qty = (budget / unit).to_integral_value(rounding=ROUND_FLOOR)
+    what = "contract" if is_option else "share"
+    if qty < 1:
+        raise ExecutionRefused(
+            f"One {what} costs ${unit:.2f}{' at market' if sizing.at_market else ''}, "
+            f"above your ${budget:.2f} per entry{' (half, light)' if half else ''}."
+        )
+    resolutions["quantity"] = (
+        f"{qty} (${budget:.2f} per entry{' — half, light' if half else ''} ÷ ${unit:.2f} a {what})"
+    )
+    return qty
 
 
 def _entry_quantity(signal, sizing, resolutions) -> Decimal:
