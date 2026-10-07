@@ -218,15 +218,17 @@ def test_the_rules_name_the_ladder_and_how_far_along_it_is(db, monkeypatch):
                          discord_trim_profit_gate_pct=D(33), discord_trim_stop_pct=D(-25), discord_trim_qty_pct=D(50),
                          discord_trim2_profit_gate_pct=D(50), discord_trim2_stop_pct=D(15), discord_trim2_qty_pct=D(100),
                          discord_fill_stop_pct=D(-25), discord_manual_exit=False, discord_tp_orders=False,
-                         discord_auto_trim=True, discord_live_trading=False, discord_exit_engine="ladder")
+                         discord_auto_trim=True, discord_live_trading=False, discord_exit_engine="ladder",
+                         discord_quantity_multiplier=1, discord_max_per_contract=None, discord_max_per_order=None)
     monkeypatch.setattr(dcs, "for_guard", lambda db_, uid, guard: ts)
     monkeypatch.setattr(dcs, "source_for_order", lambda db_, oid: None)
     r = position_history.rules(db, USER, "SPY", strike=D(781), right="call", expiry=EXP)
-    assert r["exits"].startswith("auto-trim") and r["mode"] == "paper" and r["on_fill"] == "stop -25% from entry"
+    assert r["exits"] == "auto-trim" and r["mode"] == "paper" and r["on_fill"] == "stop -25%"
     assert [(x["trim"], x["target"], x["sells"], x["stop"], x["state"]) for x in r["ladder"]] == [
-        (1, "+33%", "50% of what is left", "stop -25% from entry", "done"),
-        (2, "+50%", "100% of what is left", "trailing 15% below the high", "next"),
+        (1, "+33%", "sell 50%", "stop -25%", "done"),
+        (2, "+50%", "sell 100%", "trail 15%", "next"),
     ]
+    assert r["channel"] == "account" and r["quantity"] == "1× the alert's size"
     assert r["stop_now"] == "2.00"
 
 
