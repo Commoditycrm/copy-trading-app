@@ -725,11 +725,12 @@ def position_history(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> list[dict]:
-    """The position summary: each fill of this holding, oldest first, with the
-    remaining quantity after it. Our own orders only — no broker call."""
+    """The position summary: everything that happened to this holding, oldest
+    first — its orders (requested and filled, Rem.Qty after each fill) and its
+    stop's history. Our own records only — no broker call."""
     from app.services import position_history as _ph  # noqa: PLC0415
 
-    return _ph.holding(
+    return _ph.timeline(
         db, user.id, broker_account_id, symbol, strike=option_strike, right=option_right,
         expiry=option_expiry, through_order_id=through_order_id,
     )
