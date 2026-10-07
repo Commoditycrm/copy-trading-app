@@ -82,6 +82,18 @@ class DiscordSessionInfo(BaseModel):
     age_days: int | None = None
 
 
+class PauseAllIn(BaseModel):
+    """Pause (true) or resume (false) every channel at once."""
+    paused: bool
+
+
+class PauseAllOut(BaseModel):
+    # True while channels that "Pause ALL channels" switched off are still off.
+    paused: bool
+    # How many channels it switched off (pause) or back on (resume) just now.
+    changed: int = 0
+
+
 class DiscordSourceOut(BaseModel):
     """Public view of a source. NEVER includes the Discord session itself."""
 

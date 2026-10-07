@@ -88,6 +88,8 @@ from app.schemas.discord import (
     ChannelSettingsOut,
     DiscordSelfAlertIn,
     DiscordSelfAlertOut,
+    PauseAllIn,
+    PauseAllOut,
 )
 from app.services import (
     discord_execution,
@@ -357,6 +359,75 @@ def list_sources(
         .order_by(DiscordAlertSource.created_at.desc())
     ).scalars()
     return [_with_pills(db, user, r.id, _to_out(r)) for r in rows]
+
+
+def _pausable(db: Session, user: User) -> list[DiscordAlertSource]:
+    """Every channel "Pause ALL channels" acts on: the trader's own, or a
+    subscriber's copies of the trader's. Never the Self channel — that is where
+    the trader replays an alert by hand."""
+    if user.role != UserRole.TRADER:
+        discord_subscribers.sync_mirrors(db, user)
+    return list(db.execute(
+        select(DiscordAlertSource).where(
+            DiscordAlertSource.user_id == user.id,
+            DiscordAlertSource.channel_id != _SELF_CHANNEL_ID,
+        )
+    ).scalars())
+
+
+def _connect_status(src: DiscordAlertSource) -> str:
+    """What an enabled channel shows until the listener reports in."""
+    return "connecting" if (src.account and src.account.encrypted_session) else "needs_login"
+
+
+@router.get("/pause-all", response_model=PauseAllOut)
+def pause_all_state(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> PauseAllOut:
+    """Is "Pause ALL channels" in effect?"""
+    rows = _pausable(db, user)
+    db.commit()
+    return PauseAllOut(paused=any(r.paused_by_pause_all for r in rows))
+
+
+@router.post("/pause-all", response_model=PauseAllOut)
+def pause_all(
+    payload: PauseAllIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_discord_member),
+) -> PauseAllOut:
+    """Pause: turn off every channel that is on, remembering which. Resume: turn
+    those back on — a channel that was already off before the pause stays off.
+    Open positions and their exits are not touched."""
+    from app.services import audit  # noqa: PLC0415
+    from app.api.deps import client_ip  # noqa: PLC0415
+
+    changed = 0
+    for src in _pausable(db, user):
+        if payload.paused and src.is_enabled:
+            src.is_enabled = False
+            src.paused_by_pause_all = True
+            if src.parent_source_id is None:
+                src.status = "disconnected"
+            changed += 1
+        elif not payload.paused and src.paused_by_pause_all:
+            src.is_enabled = True
+            src.paused_by_pause_all = False
+            if src.parent_source_id is None:
+                src.status = _connect_status(src)
+            changed += 1
+    audit.record(
+        db, actor_user_id=user.id,
+        action="discord.channels_paused" if payload.paused else "discord.channels_resumed",
+        entity_type="user", entity_id=user.id, metadata={"channels": changed},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    log.info("discord: %s %d channel(s) for user %s",
+             "paused" if payload.paused else "resumed", changed, user.id)
+    return PauseAllOut(paused=payload.paused and changed > 0, changed=changed)
 
 
 def _with_pills(db: Session, user: User, src_id: uuid.UUID, out: DiscordSourceOut) -> DiscordSourceOut:
@@ -1565,6 +1636,7 @@ def update_source(
             raise HTTPException(403, "Only the on/off switch can be changed on a trader's channel.")
         if payload.is_enabled is not None:
             src.is_enabled = payload.is_enabled
+            src.paused_by_pause_all = False      # set by hand now
         db.commit()
         parent = (db.get(DiscordAlertSource, src.parent_source_id)
                   if src.parent_source_id else None)
@@ -1618,6 +1690,8 @@ def update_source(
         # Ignore junk rather than reject: an out-of-range day would otherwise
         # make the whole window unsatisfiable and silently stop alerts.
         src.schedule_days = sorted({d for d in payload.schedule_days if 0 <= d <= 6})
+    if payload.is_enabled is not None:
+        src.paused_by_pause_all = False          # set by hand now
     if payload.is_enabled is not None and payload.is_enabled != src.is_enabled:
         src.is_enabled = payload.is_enabled
         # Reflect the intent immediately so the UI doesn't show a stale

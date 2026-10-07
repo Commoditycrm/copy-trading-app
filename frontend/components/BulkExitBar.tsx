@@ -48,7 +48,7 @@ const EXIT_DEFS: Record<ExitKey, ExitDef> = {
     iconPath: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9",
   },
   my_orders: {
-    label: "Cancel My Orders",
+    label: "Cancel ALL Open Orders",
     title: "Cancel all your open orders?",
     message:
       "Cancels every still-working order in YOUR connected brokers (Pending / Submitted / Accepted / Partially Filled). Subscribers' orders are not affected. This cannot be undone.",
@@ -150,6 +150,37 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
   // exit. null = not yet known (keep enabled until we know it's 0).
   const [posCount, setPosCount] = useState<number | null>(null);
   const noPositions = posCount === 0;
+  // "Pause ALL channels": true while the channels it switched off are still off.
+  const [channelsPaused, setChannelsPaused] = useState<boolean | null>(null);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const hasDiscord = !!user?.discord_available;
+
+  useEffect(() => {
+    if (!hasDiscord) return;
+    api<{ paused: boolean }>("/api/discord-sources/pause-all")
+      .then((r) => setChannelsPaused(r.paused))
+      .catch(() => setChannelsPaused(false));
+  }, [hasDiscord]);
+
+  async function togglePauseAll() {
+    const pause = !channelsPaused;
+    if (!confirm(pause
+      ? "Pause ALL channels? Every Discord channel that is on is turned off, so no new alerts are traded. Open positions and their exits are not touched."
+      : "Resume ALL channels? The channels Pause turned off are turned back on.")) return;
+    setPauseBusy(true);
+    try {
+      const r = await api<{ paused: boolean; changed: number }>("/api/discord-sources/pause-all", {
+        method: "POST", body: JSON.stringify({ paused: pause }),
+      });
+      setChannelsPaused(r.paused);
+      if (pause) notify[r.changed ? "success" : "info"](r.changed ? `Paused ${r.changed} channel${r.changed === 1 ? "" : "s"}` : "No channels were on");
+      else notify.success(`Resumed ${r.changed} channel${r.changed === 1 ? "" : "s"}`);
+    } catch (e) {
+      notify.fromError(e, pause ? "Could not pause the channels" : "Could not resume the channels");
+    } finally {
+      setPauseBusy(false);
+    }
+  }
 
   async function loadPositions() {
     try {
@@ -428,6 +459,30 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
       {hasSellAll && renderButton("my_positions")}
       {hasSellAll && !noPositions && reentryPill}
       {renderButton("my_orders")}
+      {hasDiscord && (
+        <button
+          type="button"
+          onClick={() => void togglePauseAll()}
+          disabled={pauseBusy || channelsPaused === null}
+          title={channelsPaused
+            ? "Turn back on the channels Pause ALL channels turned off"
+            : "Turn off every Discord channel — no new alerts are traded until you resume"}
+          className="shrink-0 whitespace-nowrap inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50"
+          style={{
+            background: channelsPaused ? "var(--good-soft)" : "rgba(180,83,9,0.14)",
+            border: `1px solid ${channelsPaused ? "var(--good)" : "rgba(180,83,9,0.45)"}`,
+            color: channelsPaused ? "var(--good)" : "var(--warn, #b45309)",
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            {channelsPaused
+              ? <path d="M6 4l14 8-14 8z" />
+              : <><path d="M8 4v16" /><path d="M16 4v16" /></>}
+          </svg>
+          <span>{channelsPaused ? "Resume ALL channels" : "Pause ALL channels"}</span>
+        </button>
+      )}
     </>
   );
   const subscriberButtons = actsForSubscribers && (
