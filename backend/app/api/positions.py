@@ -2265,8 +2265,19 @@ def average_position(
     added_price = limit if limit is not None else getattr(pos, "current_price", None)
     if (guard is not None and guard.entry_price is not None and added_price is not None
             and Decimal(str(added_price)) < guard.entry_price):
+        before = guard.entry_price
         guards.average_in(db, guard, held_qty=held, added_qty=payload.quantity,
                           added_price=Decimal(str(added_price)))
+        # The ladder's stop follows the new average (a hand-set stop doesn't).
+        try:
+            from app.models.settings import TraderSettings  # noqa: PLC0415
+            from app.services import discord_channel_settings as _dcs  # noqa: PLC0415
+
+            ts = _dcs.for_guard(db, user.id, guard) or db.get(TraderSettings, user.id)
+            if ts is not None:
+                guards.reprice_ladder_stop(guard, before, guard.entry_price, ts)
+        except Exception:  # noqa: BLE001 — the average is placed; the stop catches up on fill
+            log.warning("positions: could not move the ladder stop after averaging", exc_info=True)
     db.commit()
     return order
 

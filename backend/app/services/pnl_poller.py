@@ -1074,12 +1074,16 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                             )
 
                         ts_g = _settings_for(guard)
+                        # An average that filled moves the entry — and the
+                        # ladder's stop with it — before anything is measured.
+                        if _ladder_engine and pos is not None:
+                            _g.sync_entry_price(db, guard, ts_g)
                         if (_ladder_engine and guard.option_strike is not None
                                 and _tp.active(ts_g, adapter)):
                             # Take-profit orders: the next trim rests at the
                             # broker, and the stop is sized around it. The fill
                             # price first — the target is measured from it.
-                            _g.sync_entry_price(db, guard)
+                            _g.sync_entry_price(db, guard, ts_g)
                             from app.services import live_marks  # noqa: PLC0415
 
                             outcome = _tp.reconcile(
