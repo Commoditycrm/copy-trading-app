@@ -2003,6 +2003,24 @@ def _split_at_market(content: str) -> tuple[str, bool]:
     return stripped, stripped != text
 
 
+def _price_far_from_market(p) -> Decimal | None:
+    """The live price, when the order's stated limit is nowhere near it (under
+    half, or over double) — the alert's price is then not this instrument's.
+    None when it is close, or no live price is to be had."""
+    if p.limit_price is None or p.limit_price <= 0:
+        return None
+    try:
+        from app.services import live_marks  # noqa: PLC0415
+
+        live = live_marks.contract_mark(p.symbol, p.option_strike, p.option_right, p.option_expiry)
+    except Exception:  # noqa: BLE001
+        return None
+    if live is None or live <= 0:
+        return None
+    limit = Decimal(str(p.limit_price))
+    return live if (limit < live / 2 or limit > live * 2) else None
+
+
 def submit_self_alert_text(
     db: Session,
     user: User,
@@ -2148,10 +2166,12 @@ def _execute_signal(
 
     # "Adding .4" names no contract: it means the position THIS channel is in.
     # Fill the contract from the channel's own latest still-held buy; with
-    # nothing held from this channel there is nothing to add to.
-    if signal.get("add_to_latest") and not signal.get("symbol"):
+    # nothing held from this channel there is nothing to add to. "Added to TSLA"
+    # names the ticker only: the same, among this channel's TSLA contracts.
+    if signal.get("add_to_latest") and not (signal.get("strike") and signal.get("option_type")):
+        named = signal.get("symbol") or None
         try:
-            latest = discord_execution.latest_channel_contract(db, user, msg.source_id)
+            latest = discord_execution.latest_channel_contract(db, user, msg.source_id, symbol=named)
         except Exception as exc:  # noqa: BLE001
             discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
             log.exception("discord: add-to-latest lookup failed for alert %s", msg.id)
@@ -2162,17 +2182,22 @@ def _execute_signal(
             # position rather than skip the alert.
             try:
                 latest = discord_execution.latest_channel_contract(
-                    db, user, msg.source_id, held_only=False)
+                    db, user, msg.source_id, held_only=False, symbol=named)
             except Exception as exc:  # noqa: BLE001
                 discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
                 log.exception("discord: add-to-latest lookup failed for alert %s", msg.id)
                 return
-        if latest is None:
+        if latest is None and named:
+            # Nothing from this channel in that ticker: resolve() fills the
+            # contract from the option position held, as for any add.
+            pass
+        elif latest is None:
             discord_execution.mark_failed(
                 msg, "An add with no contract, and this channel has no recent contract to re-enter."
             )
             return
-        signal = {**signal, **latest}
+        else:
+            signal = {**signal, **latest}
 
     # The same channel posting the same entry again (a corrected price, a
     # re-post) is a correction of the trade it already placed, not a second one.
@@ -2385,7 +2410,15 @@ def _execute_signal(
                  or discord_channel_settings.entry_order_type(db, getattr(msg, "source_id", None)) == "market")):
         from app.services import market_hours  # noqa: PLC0415
 
-        if market_hours.in_regular_session():
+        far = _price_far_from_market(p)
+        if far is not None:
+            # The alert's price is nowhere near this instrument's: it was read
+            # as the wrong thing (Mark's "Added to TSLA, New avg @0.90" became a
+            # TSLA STOCK buy, and at market it filled as shares). Keep the
+            # limit — it will not fill — rather than buy at whatever the market is.
+            detail += (" · " if detail else "") + (
+                f"kept as a limit — the alert's {p.limit_price} is far from the market {far}")
+        elif market_hours.in_regular_session():
             resolved.payload = p = p.model_copy(
                 update={"order_type": OrderType.MARKET, "limit_price": None}
             )

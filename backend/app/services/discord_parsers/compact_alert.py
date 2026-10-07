@@ -204,7 +204,10 @@ def _strip_average_down(line: str) -> tuple[str, bool]:
 # Requires an explicit contract or a "$" ticker so prose like "leave room to add
 # in case they want a bit more of a bounce" isn't read as an order.
 _ADD_RE = re.compile(
-    rf"^\s*(?:ADD|ADDING)\s+"
+    # "Add" / "Adding" / "Added", with or without "to": "Added to TSLA, New avg
+    # @0.90" (Mark, 2026-10-07) — read as a STOCK buy by the free-text parser
+    # when this didn't match, and filled as TSLA shares.
+    rf"^\s*(?:ADD|ADDING|ADDED)\s+(?:TO\s+|ON\s+|MORE\s+)?"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
     rf"\s*(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
@@ -390,6 +393,12 @@ class CompactAlertParser(Parser):
             return None, err
 
         price = to_decimal(m.group("price"))
+        if price is None and m.group("trailing"):
+            # "Added to TSLA, New avg @0.90": the price is written later, after
+            # an "@" — only an "@" price, never any number in the prose.
+            at = re.search(rf"@\s*\$?(?P<p>{_NUM})\b", m.group("trailing"))
+            price = to_decimal(at.group("p")) if at else None
+        unnamed = strike is None or right is None
         return (
             TradeSignal(
                 action=SignalAction.BUY,
@@ -401,7 +410,10 @@ class CompactAlertParser(Parser):
                 expiry_unspecified=unspecified,
                 # No strike/right stated ⇒ the contract itself has to come from
                 # the open position.
-                contract_unspecified=strike is None or right is None,
+                contract_unspecified=unnamed,
+                # Naming only the ticker means the contract this channel is in
+                # (its previous entry) — never the stock.
+                add_to_latest=unnamed,
                 quantity=DEFAULT_QUANTITY,
                 order_type=OrderKind.LIMIT,
                 limit_price_unspecified=price is None,
@@ -576,9 +588,14 @@ def _is_entry(m: re.Match, average_down: bool = False) -> bool:
 
 
 def _is_add(m: re.Match) -> bool:
-    """Guard against prose. An add needs either a "$" ticker or an explicit
-    contract — "leave room to add in case they want a bounce" has neither."""
-    return bool(m.group("dsymbol") or (m.group("strike") and m.group("right")))
+    """Guard against prose. An add needs a "$" ticker, an explicit contract, or
+    a ticker written as one (capitals) with an "@" price — "Added to TSLA, New
+    avg @0.90". "leave room to add in case they want a bounce" has none of them."""
+    if m.group("dsymbol") or (m.group("strike") and m.group("right")):
+        return True
+    sym = m.group("symbol") or ""
+    at_price = m.group("price") or re.search(rf"@\s*\$?{_NUM}\b", m.group("trailing") or "")
+    return sym.isupper() and bool(at_price)
 
 
 def _has_marker(line: str) -> bool:

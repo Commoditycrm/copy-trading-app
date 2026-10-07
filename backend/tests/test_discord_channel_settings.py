@@ -248,3 +248,21 @@ def test_at_market_keeps_the_limit_outside_the_session(entry, monkeypatch):
     monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: False)
     _run_entry(at_market=True)
     assert entry["payload"].order_type is OrderType.LIMIT
+
+
+def test_a_market_entry_whose_price_is_not_the_instruments_stays_a_limit(entry, monkeypatch):
+    """Mark's "Added to TSLA, New avg @0.90" was read as TSLA STOCK; on a Market
+    channel it bought shares. A 0.90 "price" on a ~400 stock is not its price."""
+    monkeypatch.setattr(dcs, "entry_order_type", lambda db, sid: "market")
+    monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: True)
+    monkeypatch.setattr("app.services.live_marks.contract_mark", lambda *a, **k: Decimal("0.30"))
+    _run_entry()                                   # the alert says 1.38; the market is 0.30
+    assert entry["payload"].order_type is OrderType.LIMIT and entry["payload"].limit_price == Decimal("1.38")
+
+
+def test_a_market_entry_near_the_live_price_goes_to_market(entry, monkeypatch):
+    monkeypatch.setattr(dcs, "entry_order_type", lambda db, sid: "market")
+    monkeypatch.setattr("app.services.market_hours.in_regular_session", lambda *a, **k: True)
+    monkeypatch.setattr("app.services.live_marks.contract_mark", lambda *a, **k: Decimal("1.30"))
+    _run_entry()
+    assert entry["payload"].order_type is OrderType.MARKET
