@@ -1206,11 +1206,22 @@ def assign_position_channel(
 
     if guard is None:
         guard = guards.on_buy(db, user.id, *args, entry_price=payload.entry_price)
+    was_self = guards.is_manual(db, guard)
     guard.source_id = src.id
+    cancelled = 0
+    if choice == "self":
+        # Self = managed by you: the ladder's and the channel's orders go, and
+        # nothing is placed or sold on its own from here.
+        cancelled = guards.hand_to_trader(db, user, guard, discord_sources._cancel_stop_order(db, user))
+    elif was_self:
+        guard.tp_off = False            # back on a channel: its ladder takes over again
     db.commit()
     log.info("positions: %s assigned %s to channel %s", user.id, payload.symbol, src.id)
     name = (src.label or "").strip() or (src.channel_name or "").strip() or None
-    return {"channel": str(src.id), "discord_channel": name}
+    out = {"channel": str(src.id), "discord_channel": name}
+    if choice == "self":
+        out["cancelled"] = cancelled          # the ladder's orders the hand-over cancelled
+    return out
 
 
 @router.post("/re-enter")

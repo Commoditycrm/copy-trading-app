@@ -35,7 +35,7 @@ class _DB:
 
 @pytest.fixture
 def wired(monkeypatch):
-    state = SimpleNamespace(guard=None, created=[])
+    state = SimpleNamespace(guard=None, created=[], handed=[])
     monkeypatch.setattr(ds, "require_discord_member", lambda **kw: kw["user"])
     monkeypatch.setattr(ds, "_self_source", lambda db, user: SELF)
     monkeypatch.setattr(guards, "find", lambda *a, **k: state.guard)
@@ -46,6 +46,8 @@ def wired(monkeypatch):
         return state.guard
 
     monkeypatch.setattr(guards, "on_buy", _on_buy)
+    # The hand-over to Self is tested on its own (test_self_hands_over.py).
+    monkeypatch.setattr(guards, "hand_to_trader", lambda *a, **k: state.handed.append(1) or 0)
     return state
 
 
@@ -70,6 +72,7 @@ def test_a_hand_opened_position_gets_a_ladder_from_its_cost(wired):
     assert wired.created == [("SPY", Decimal("764"), OptionRight.CALL,
                               _body("self").option_expiry, Decimal("1.02"))]
     assert wired.guard.source_id == SELF.id and out["discord_channel"] == "Self"
+    assert wired.handed == [1] and out["cancelled"] == 0     # handed to the trader
 
 
 def test_auto_goes_back_to_the_opening_channel(wired):

@@ -990,7 +990,8 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                 g for g in _guards.live(db, acct.user_id)
                 if g.option_strike is not None
                 and (g.tp_order_id is not None or g.tp_stop_order_id is not None
-                     or (_tp_possible and _tp.enabled(_settings_for(g))))
+                     or (_tp_possible and _tp.enabled(_settings_for(g))
+                         and not _guards.is_manual(db, g)))       # Self: no take-profit
             ]
             if not _tp_waiting and not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
                 return  # nothing armed for this trader
@@ -1079,9 +1080,13 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                         ts_g = _settings_for(guard)
                         # An average that filled moves the entry — and the
                         # ladder's stop with it — before anything is measured.
+                        # Assigned to Self: the trader manages it. Only a stop
+                        # they set themselves is kept resting; the ladder does
+                        # nothing else (no take-profit, no re-pricing).
+                        manual = _g.is_manual(db, guard)
                         if _ladder_engine and pos is not None:
-                            _g.sync_entry_price(db, guard, ts_g)
-                        if (_ladder_engine and guard.option_strike is not None
+                            _g.sync_entry_price(db, guard, None if manual else ts_g)
+                        if (_ladder_engine and not manual and guard.option_strike is not None
                                 and _tp.active(ts_g, adapter)):
                             # Take-profit orders: the next trim rests at the
                             # broker, and the stop is sized around it. The fill

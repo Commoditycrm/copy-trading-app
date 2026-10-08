@@ -2399,6 +2399,20 @@ def _execute_signal(
                 "symbol": p.symbol, "rung": 0, "reason": "take-profit orders manage the trims",
             })
             return
+        # Assigned to Self: the trader manages it. A channel's exit alert —
+        # trim or close — is recorded and does nothing; their own alerts (the
+        # popup) still go through.
+        if guard is not None and guards.is_manual(db, guard) and not _is_self_alert(db, msg):
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                f"{p.symbol} is assigned to Self — you manage it, so this exit alert was not acted on."
+            )
+            log.info("discord: exit alert %s for %s skipped — assigned to Self", msg.id, p.symbol)
+            events.publish(user.id, {
+                "type": "discord.trim_skipped", "message_id": str(msg.id),
+                "symbol": p.symbol, "rung": 0, "reason": "assigned to Self — managed by you",
+            })
+            return
         if guard is None:
             # A position the ladder never saw open — opened by hand, or before
             # this feature. Start it on rung one against the broker's own cost

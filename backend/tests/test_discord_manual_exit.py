@@ -210,3 +210,22 @@ def test_your_own_trim_still_goes_through_under_take_profit_orders(exit_alert):
     db, user, msg, guard, _ = setup(_settings(discord_tp_orders=True), source=SimpleNamespace(channel_id="self"))
     ds._execute_signal(db, user, msg, background=None, request=None)
     assert placed["payload"].quantity == Decimal(2)
+
+
+# ── assigned to Self: managed by the trader ─────────────────────────────────
+
+def test_a_channel_exit_alert_does_nothing_to_a_self_position(exit_alert, monkeypatch):
+    setup, placed = exit_alert
+    db, user, msg, guard, _ = setup(_settings(), source=SimpleNamespace(channel_id="123"))
+    monkeypatch.setattr(ds.guards, "is_manual", lambda db_, g: True)
+    ds._execute_signal(db, user, msg, background=None, request=None)
+    assert placed == {} and "assigned to Self" in msg.status_reason
+    assert (guard.sell_count, guard.stop_price) == (0, None)
+
+
+def test_your_own_exit_still_closes_a_self_position(exit_alert, monkeypatch):
+    setup, placed = exit_alert
+    db, user, msg, guard, _ = setup(_settings(), source=SimpleNamespace(channel_id="self"))
+    monkeypatch.setattr(ds.guards, "is_manual", lambda db_, g: True)
+    ds._execute_signal(db, user, msg, background=None, request=None)
+    assert placed["payload"].quantity == Decimal(2)
