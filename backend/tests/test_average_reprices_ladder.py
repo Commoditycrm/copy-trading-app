@@ -119,3 +119,15 @@ def test_a_buy_from_an_earlier_holding_is_not_averaged_in(db):
     g = _guard(db, entry)
     guards.sync_entry_price(db, g)
     assert g.entry_price == D("0.41")
+
+
+def test_the_entry_order_placed_just_before_the_guard_still_counts(db):
+    """QA 2026-10-08: 6 @ 1.00 then 2 @ 0.91 read as 0.91 — the guard is created
+    a moment AFTER its entry order, and the entry was left out of the average."""
+    entry = _buy(db, 6, "1.00", 0)
+    g = _guard(db, entry)
+    g.created_at = entry.created_at + timedelta(seconds=1)       # created after the order
+    db.commit()
+    _buy(db, 2, "0.91", 4)
+    guards.sync_entry_price(db, g)
+    assert g.entry_price == D("0.9775")

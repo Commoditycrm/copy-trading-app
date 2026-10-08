@@ -2177,7 +2177,16 @@ def _with_alert_reason(fn):
         from app.services import position_events  # noqa: PLC0415
 
         with position_events.because(_alert_reason(db, msg), keep_outer=True):
-            return fn(db, user, msg, background, request)
+            result = fn(db, user, msg, background, request)
+            # Save what the alert changed WHILE its reason is still set: the
+            # caller commits later, after this block — and a stop it moved was
+            # then recorded with no "Why".
+            if hasattr(db, "flush"):
+                try:
+                    db.flush()
+                except Exception:  # noqa: BLE001 — the caller's commit reports it
+                    log.debug("discord: flush after alert %s failed", getattr(msg, "id", None), exc_info=True)
+            return result
     return _w
 
 
