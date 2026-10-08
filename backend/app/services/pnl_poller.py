@@ -867,6 +867,28 @@ def _bid_for(adapter, pos) -> "Decimal | None":
         return None
 
 
+def exit_freeing_reservations(db, trader, live_acct, adapter, pos, quantity):
+    """Exit at market — after freeing the contracts resting orders reserve.
+
+    The ladder's stop and a resting take-profit (with its linked stop) each
+    hold contracts at the broker, and a sell of the same contracts on top of
+    them is refused: QA 2026-10-08, SPY 775P — a trailing stop armed after T1
+    fired three times and Webull rejected every market sell, because T2's
+    take-profit pair and the 0.76 stop were holding the 5 contracts. The manual
+    close always released them first (release_for_position); the poller's
+    exits — a trailing exit, an emulated stop, a refused stop's fallback — now
+    do the same. The next pass puts back whatever should still rest.
+    """
+    from app.services import discord_stop_orders  # noqa: PLC0415
+
+    try:
+        discord_stop_orders.release_for_position(db, trader, pos)
+    except Exception:  # noqa: BLE001 — try the exit anyway; a refusal is reported
+        log.warning("pnl_poller: could not release resting orders before exiting %s",
+                    getattr(pos, "symbol", "?"), exc_info=True)
+    return place_exit(db, trader, live_acct, adapter, pos, quantity)
+
+
 def place_exit(db, trader, live_acct, adapter, pos, quantity, *, partial: bool = False):
     """Sell ``quantity`` of a held position so that it fills. Returns the Order.
 
@@ -1009,7 +1031,7 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                 """
                 from app.models.user import User  # noqa: PLC0415
 
-                place_exit(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
+                exit_freeing_reservations(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
 
             # Keep a REAL stop order resting at the broker for each protected
             # position. Reconciled every tick rather than placed once, so it
