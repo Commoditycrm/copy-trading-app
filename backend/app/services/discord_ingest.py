@@ -457,7 +457,9 @@ def record_status(
     the status so ``GET /api/discord-sources`` and the SSE pill can't disagree.
     Caller commits.
     """
-    source.status = status
+    # A channel the trader turned off can still be read for its subscribers;
+    # it keeps reading as off ("disconnected") to the trader, not "connected".
+    source.status = status if getattr(source, "is_enabled", True) else "disconnected"
     source.last_error = (error or None) if status == "error" else None
     if source.last_error:
         source.last_error = source.last_error[:480]

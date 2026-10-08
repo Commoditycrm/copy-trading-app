@@ -2928,12 +2928,25 @@ def listener_assignments(db: Session = Depends(get_db)) -> list[DiscordAssignmen
     so the trader is told to re-authorise instead of the listener retrying a
     credential that can never work.
     """
+    # A channel the trader turned OFF is still read while any subscriber has
+    # their copy of it ON: subscribers get alerts only by relay from this
+    # channel being read (QA 2026-10-08 — Mark's channel off, so a subscriber
+    # with it on got nothing). The trader's own side then records and does not
+    # trade (listener_messages).
+    from sqlalchemy import exists, or_  # noqa: PLC0415
+    from sqlalchemy.orm import aliased  # noqa: PLC0415
+
+    mirror = aliased(DiscordAlertSource)
+    subscribers_on = exists().where(
+        mirror.parent_source_id == DiscordAlertSource.id,
+        mirror.is_enabled.is_(True),
+    )
     rows = list(
         db.execute(
             select(DiscordAlertSource)
             .join(DiscordAccount, DiscordAccount.id == DiscordAlertSource.account_id)
             .where(
-                DiscordAlertSource.is_enabled.is_(True),
+                or_(DiscordAlertSource.is_enabled.is_(True), subscribers_on),
                 DiscordAccount.encrypted_session.is_not(None),
             )
         ).scalars()
@@ -3084,6 +3097,20 @@ def listener_messages(
         discord_subscribers.relay_batch(db, src, batch)
     except Exception:  # noqa: BLE001 — never stall the trader's own feed
         log.exception("discord: subscriber relay failed for source %s", src.id)
+    if not src.is_enabled:
+        # Turned off by the trader, read only for the subscribers relayed above.
+        # Recorded for the trader — never traded, edited or cancelled for them.
+        report = discord_ingest.ingest_batch(db, src, batch, auto_approve=False)
+        for msg in report.stored:
+            if msg.status is not DiscordMessageStatus.IGNORED:
+                msg.status = DiscordMessageStatus.IGNORED
+                msg.decision = None
+                msg.status_reason = "Channel off — not traded for you (still sent to your subscribers)."
+        for mid in wrong:
+            report.rejected.append({"message_id": mid, "reason": "channel_mismatch"})
+        db.commit()
+        return DiscordIngestOut(**report.as_dict())
+
     auto = _auto_approve(db, src.user_id, src.id)
     report = discord_ingest.ingest_batch(db, src, batch, auto_approve=auto)
 
