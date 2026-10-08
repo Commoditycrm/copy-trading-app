@@ -184,3 +184,29 @@ def test_a_stop_out_closes_nothing_under_manual_exits(monkeypatch):
     ds._close_all_from_channel(None, SimpleNamespace(id=uuid.uuid4()), msg, None, None)
     assert msg.status is DiscordMessageStatus.PARSED and msg.order_id is None
     assert "manual" in msg.status_reason.lower() and "SPY calls" in msg.status_reason
+
+
+# ── take-profit orders: the channel's trims are ignored ─────────────────────
+
+def test_a_trim_alert_is_ignored_when_trims_are_take_profit_orders(exit_alert):
+    setup, placed = exit_alert
+    db, user, msg, guard, _ = setup(_settings(discord_tp_orders=True), source=SimpleNamespace(channel_id="123"))
+    ds._execute_signal(db, user, msg, background=None, request=None)
+    assert placed == {}
+    assert msg.status is DiscordMessageStatus.PARSED and "take-profit orders" in msg.status_reason
+    assert (guard.sell_count, guard.stop_price) == (0, None)        # no rung used, no stop moved
+
+
+def test_a_full_exit_still_closes_under_take_profit_orders(exit_alert):
+    setup, placed = exit_alert
+    db, user, msg, guard, _ = setup(_settings(discord_tp_orders=True), source=SimpleNamespace(channel_id="123"))
+    msg.parsed_signal = {"action": "SELL", "symbol": "MSFT", "flatten": True}   # "TSLA -90% Out"
+    ds._execute_signal(db, user, msg, background=None, request=None)
+    assert placed["payload"].quantity == Decimal(4)
+
+
+def test_your_own_trim_still_goes_through_under_take_profit_orders(exit_alert):
+    setup, placed = exit_alert
+    db, user, msg, guard, _ = setup(_settings(discord_tp_orders=True), source=SimpleNamespace(channel_id="self"))
+    ds._execute_signal(db, user, msg, background=None, request=None)
+    assert placed["payload"].quantity == Decimal(2)

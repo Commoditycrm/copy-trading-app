@@ -2381,6 +2381,24 @@ def _execute_signal(
                 "symbol": p.symbol, "rung": 0, "reason": "exits are manual for this channel",
             })
             return
+        # Take-profit orders: the trims rest at the broker at each trim's
+        # target, so the channel's own TRIM alerts are ignored — nothing sold,
+        # no rung used, no stop moved. A full exit ("Out", "Stopped out",
+        # "Cutting") still closes: the trader is out, not trimming. Your own
+        # alerts (the popup, auto-trim) go through, as with Manual exits.
+        if (discord_channel_settings.exit_mode(exit_ts) == "orders"
+                and not signal.get("flatten") and not _is_self_alert(db, msg)):
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                "Trim alert ignored — take-profit orders manage the trims for this channel "
+                "(each trim rests at the broker at its target)."
+            )
+            log.info("discord: trim alert %s for %s ignored — take-profit orders", msg.id, p.symbol)
+            events.publish(user.id, {
+                "type": "discord.trim_skipped", "message_id": str(msg.id),
+                "symbol": p.symbol, "rung": 0, "reason": "take-profit orders manage the trims",
+            })
+            return
         if guard is None:
             # A position the ladder never saw open — opened by hand, or before
             # this feature. Start it on rung one against the broker's own cost
