@@ -1415,7 +1415,7 @@ def re_enter_trade(
     if acct is None:
         raise HTTPException(409, "broker_not_connected")
 
-    return _place_trader_order(
+    order = _place_trader_order(
         db, user,
         PlaceOrderIn(
             instrument_type=src.instrument_type,
@@ -1430,6 +1430,41 @@ def re_enter_trade(
         ),
         acct.id, background, request,
     )
+    _restart_ladder_on_reentry(db, user, order, acct.id)
+    return order
+
+
+def _restart_ladder_on_reentry(db: Session, user: User, order: Order, account_id) -> None:
+    """A re-entry starts the position's exit ladder over (T1, entry and stop
+    recalculated) — see discord_position_guard.restart_ladder. Best-effort: the
+    order is placed; a ladder that doesn't restart is logged, not raised."""
+    if not getattr(order, "symbol", None) or getattr(order, "id", None) is None:
+        return
+    try:
+        from app.models.settings import TraderSettings  # noqa: PLC0415
+        from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+        from app.services import position_history  # noqa: PLC0415
+
+        right = getattr(order.option_right, "value", order.option_right)
+        fills = position_history.holding(
+            db, user.id, account_id, order.symbol, strike=order.option_strike,
+            right=right, expiry=order.option_expiry,
+        )
+        held = Decimal(fills[-1]["remaining"]) if fills else Decimal(0)
+        live = guards.find(db, user.id, order.symbol, order.option_strike, order.option_right,
+                           order.option_expiry)
+        ts = (dcs.for_guard(db, user.id, live) if live is not None else None) or db.get(TraderSettings, user.id)
+        guards.restart_ladder(
+            db, user.id, order.symbol, order.option_strike, order.option_right, order.option_expiry,
+            entry_order_id=order.id, entry_price=order.limit_price, added_qty=order.quantity,
+            held_qty=held, ts=ts,
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        if hasattr(db, "rollback"):
+            db.rollback()
+        logging.getLogger(__name__).exception("re-enter: could not restart the ladder for %s", order.symbol)
 
 
 @router.post("/trades/{order_id}/cancel", response_model=OrderOut)

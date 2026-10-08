@@ -1410,6 +1410,11 @@ def re_enter_from_snapshot(
                 db, user, payload, acct.id, background, request,
                 skip_fanout=True, resolve_wash_trade=False,
             )
+            if side == OrderSide.BUY:
+                # Back in after Sell-All: the ladder starts over, as for any re-entry.
+                from app.api.trades import _restart_ladder_on_reentry  # noqa: PLC0415
+
+                _restart_ladder_on_reentry(db, user, order, acct.id)
             # Tag the row so trail_down_monitor re-prices it. The order itself is
             # a plain limit at the broker.
             if use_trail_down:
