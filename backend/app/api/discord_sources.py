@@ -2592,6 +2592,14 @@ def _execute_signal(
             if existing is not None:
                 guards.retire(db, existing, "closed by exit alert")
     else:
+        if resolved.resolutions.get("reentry"):
+            # "Adding" after a stop-out re-enters as a NEW position: its ladder
+            # starts over (a spent one could still be live until it retires).
+            guards.restart_ladder(
+                db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
+                entry_order_id=order.id, entry_price=entry_ref_price, added_qty=p.quantity,
+                held_qty=Decimal(0),
+            )
         opened = guards.on_buy(
             db, user.id, p.symbol, p.option_strike, p.option_right, p.option_expiry,
             # Provisional: the limit we bid is the only reference that exists at

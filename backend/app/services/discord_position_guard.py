@@ -489,45 +489,134 @@ def contract_key(strike, right, expiry) -> tuple:
 
 
 def _holding_average(db: Session, guard: DiscordPositionGuard) -> Decimal | None:
-    """The average cost of this holding: every BUY of the contract that filled
-    since the guard opened (the entry and each average), weighted by quantity.
-    None when nothing has filled, or the orders can't be read."""
+    """The average cost of what is held now: the buys since the position was
+    last FLAT (the entry, each average, a re-entry), weighted by quantity —
+    sells don't change an average cost. None when nothing has filled, or the
+    orders can't be read.
+
+    "Since last flat" rather than "since the guard opened": the guard is created
+    a moment after its entry order (so that bound once dropped the entry itself),
+    and a re-entry after a partial trim is part of the same holding."""
     from app.models.order import Order, OrderSide  # noqa: PLC0415
 
     try:
         q = select(Order).where(
             Order.user_id == guard.user_id,
             Order.symbol == (guard.symbol or "").upper(),
-            Order.side == OrderSide.BUY,
-            Order.is_closing.is_(False),
             Order.filled_quantity > 0,
-            Order.filled_avg_price.isnot(None),
         )
         right = getattr(guard.option_right, "value", guard.option_right)
         for col, val in ((Order.option_strike, guard.option_strike),
                          (Order.option_right, OptionRight(right) if right else None),
                          (Order.option_expiry, guard.option_expiry)):
             q = q.where(col.is_(None) if val is None else col == val)
-        # Since the holding opened — which is the ENTRY order's placement, a
-        # moment BEFORE the guard is created (on_buy runs after the order is
-        # placed). Bounding by the guard alone dropped the entry itself, so an
-        # average of 6 @ 1.00 + 2 @ 0.91 read as 0.91 (QA 2026-10-08).
-        opened = getattr(guard, "created_at", None)
-        if guard.entry_order_id is not None:
-            entry = db.get(Order, guard.entry_order_id)
-            if entry is not None and entry.created_at is not None and (
-                    opened is None or entry.created_at < opened):
-                opened = entry.created_at
-        if opened is not None:
-            q = q.where(Order.created_at >= opened)
         orders = list(db.execute(q).scalars())
     except Exception:  # noqa: BLE001 — a database that can't answer: no average
         return None
-    qty = sum((Decimal(str(o.filled_quantity)) for o in orders), Decimal(0))
-    if qty <= 0:
+
+    def _when(o):
+        t = o.broker_filled_at or o.closed_at or o.created_at
+        if t is not None and t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t or datetime.min.replace(tzinfo=timezone.utc)
+
+    held = cost = Decimal(0)
+    for o in sorted(orders, key=_when):
+        qty = Decimal(str(o.filled_quantity))
+        if o.side == OrderSide.BUY and not o.is_closing and o.filled_avg_price is not None:
+            cost += qty * Decimal(str(o.filled_avg_price))
+            held += qty
+        elif o.side == OrderSide.SELL:
+            if held > 0:
+                cost -= cost * min(qty, held) / held     # sold at the average cost
+            held = max(held - qty, Decimal(0))
+            if held == 0:
+                cost = Decimal(0)                        # flat: a new holding starts
+    if held <= 0:
         return None
-    cost = sum((Decimal(str(o.filled_quantity)) * Decimal(str(o.filled_avg_price)) for o in orders), Decimal(0))
-    return (cost / qty).quantize(Decimal("0.0001"))
+    return (cost / held).quantize(Decimal("0.0001"))
+
+
+def restart_ladder(db: Session, user_id, symbol: str, strike, right, expiry, *,
+                   entry_order_id, entry_price: Decimal | None, added_qty: Decimal | None = None,
+                   held_qty: Decimal | None = None, ts=None) -> DiscordPositionGuard | None:
+    """A RE-ENTRY starts the ladder over: back to T1, nothing trailing, the
+    take-profit for T1 next, and the entry recalculated.
+
+    * Nothing held (re-entering after a full exit): a fresh ladder — the live
+      one reset, or a NEW one when the old has finished, on the same channel
+      the position came from, so that channel's rules apply. The On Fill stop
+      is placed when the re-entry fills, as for any entry.
+    * Some still held (re-entering what a trim sold): the same ladder reset,
+      the entry re-weighted with the re-entry, and the On Fill stop recomputed
+      from it straight away, so what is held stays protected.
+    """
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    guard = find(db, user_id, symbol, strike, right, expiry)
+    still_held = (held_qty or Decimal(0)) > 0
+    if guard is None:
+        # The last ladder this contract had (finished): the channel it was on.
+        prev = db.execute(
+            select(DiscordPositionGuard).where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.symbol == symbol.upper(),
+                DiscordPositionGuard.option_strike == strike,
+                DiscordPositionGuard.option_right == (getattr(right, "value", right) or None),
+                DiscordPositionGuard.option_expiry == expiry,
+            ).order_by(DiscordPositionGuard.created_at.desc()).limit(1)
+        ).scalars().first()
+        if prev is None:
+            return None                         # never on a ladder: nothing to restart
+        source_id = None
+        if prev is not None:
+            source_id = prev.source_id
+            if source_id is None and prev.entry_order_id is not None:
+                from app.services.discord_channel_settings import source_for_order  # noqa: PLC0415
+
+                source_id = source_for_order(db, prev.entry_order_id)
+        guard = DiscordPositionGuard(
+            user_id=user_id, symbol=symbol.upper(), option_strike=strike,
+            option_right=(getattr(right, "value", right) or None), option_expiry=expiry,
+            sell_count=0, entry_price=entry_price, entry_order_id=entry_order_id,
+            source_id=source_id,
+        )
+        db.add(guard)
+        db.flush()
+        log.info("discord guard: re-entry opened a fresh ladder for %s %s", symbol, strike)
+        return guard
+
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("re-entered — the ladder starts over at T1"):
+        guard.sell_count = 0
+        guard.entry_order_id = entry_order_id
+        guard.tp_off = False
+        guard.tp_backoff_until = None
+        clear_trail(guard)
+        clear_stop_trail(guard)
+        if still_held and entry_price is not None and added_qty:
+            sync_entry_price(db, guard)        # what is held, at what it really cost
+            average_in(db, guard, held_qty=held_qty, added_qty=added_qty, added_price=entry_price)
+            fill = discord_ladder.fill_stop_pct(ts) if ts is not None else None
+            if fill is not None and guard.entry_price:
+                stop, trail_pct, peak = rung_stop(
+                    guard.entry_price,
+                    RungConfig(stop_pct=fill, stop_trail=discord_ladder.fill_stop_trails(ts)), None)
+                stop = _to_tick(stop)
+                if stop is not None and stop > 0:
+                    guard.stop_price = stop
+                    guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+            guard.fill_stop_done = True        # set here, not again when it fills
+        else:
+            # Nothing held: as a new position — its On Fill stop when it fills.
+            guard.entry_price = entry_price if entry_price is not None else guard.entry_price
+            guard.stop_price = None
+            guard.fill_stop_done = False
+        if hasattr(db, "flush"):
+            db.flush()
+    log.info("discord guard: re-entry restarted the ladder for %s %s", symbol, strike)
+    return guard
 
 
 def sync_entry_price(db: Session, guard: DiscordPositionGuard, ts=None) -> bool:
@@ -841,5 +930,5 @@ __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "rung_stop", "trailing_stop", "apply_stop",
     "ratchet_stop", "clear_stop_trail", "find", "on_buy", "plan_exit",
-    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price",
+    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
 ]
