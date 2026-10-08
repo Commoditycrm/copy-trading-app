@@ -152,8 +152,9 @@ export function DiscordAlertComposer({ onSent }: { onSent?: () => unknown }) {
               Paste an alert the system missed. It is read by the same parser as
               a live channel and follows your Discord settings — so in manual
               mode it waits for your approval rather than placing.
-              End it with <span className="font-mono" style={{ color: "var(--text-2)" }}>@Market</span> to
-              buy at market instead of a limit (regular session only).
+              Add <span className="font-mono" style={{ color: "var(--text-2)" }}>@Market</span> (or
+              &quot;out the gate&quot;) to buy at market instead of a limit (regular session only);
+              &quot;light&quot;, &quot;risky&quot; or &quot;high risk&quot; buys half size.
             </p>
 
             <label className="flex items-center gap-2 text-xs" style={{ color: "var(--text-2)" }}>

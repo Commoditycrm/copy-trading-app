@@ -50,10 +50,19 @@ log = logging.getLogger(__name__)
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
 # Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
 # "small(er) size" and "half size". And "lotto" / "lottos" — a long-shot
-# entry — and "risky", so half the size too.
+# entry — and "risky" / "high risk", so half the size too.
 _HALF_SIZE_RE = re.compile(
     r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b"
-    r"|\blottos?\b|\brisky\b",
+    r"|\blottos?\b|\brisky\b|\bhigh[\s-]+risk\b",
+    re.IGNORECASE,
+)
+
+# The author asking to be filled at MARKET: "@market" / "@ market" anywhere in
+# the alert, or "out the gate" (buy now, at whatever it is). Execution then
+# places the entry at market in the regular session, sized and capped at the
+# live price — the same as a Market channel or "@Market" typed in the popup.
+_AT_MARKET_RE = re.compile(
+    r"@\s*market\b|\bout\s+(?:of\s+)?the\s+gate\b",
     re.IGNORECASE,
 )
 
@@ -114,6 +123,7 @@ def parse_message(message: ParsedMessage, *, parser_key: str | None = None) -> P
                 first_ignored = result
             continue
         _mark_half_size(message, result)
+        _mark_at_market(message, result)
         return result
 
     if first_ignored is not None:
@@ -133,6 +143,16 @@ def _mark_half_size(message: ParsedMessage, result: ParseResult) -> None:
     for signal in result.signals or []:
         if signal.action is SignalAction.BUY:
             signal.half_size = True
+
+
+def _mark_at_market(message: ParsedMessage, result: ParseResult) -> None:
+    """Flag BUY signals the author asked to fill at market. Entries only: an
+    exit already goes at market."""
+    if not _AT_MARKET_RE.search(message.text or ""):
+        return
+    for signal in result.signals or []:
+        if signal.action is SignalAction.BUY:
+            signal.at_market = True
 
 
 __all__ = [

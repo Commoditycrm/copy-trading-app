@@ -111,6 +111,8 @@ class TradeSignal:
     # Acted on in discord_execution._resolve_quantity: the entry is taken at
     # HALF the size it otherwise would be.
     half_size: bool = False
+    # Fill this entry at MARKET ("@market", "out the gate"): see parse_message.
+    at_market: bool = False
     # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
     # held, so the position doubles. Distinct from half_size, which scales the
     # alert's own size; this one IGNORES it and sizes purely from the position,
@@ -180,6 +182,7 @@ class TradeSignal:
             ),
             "position_closed": self.position_closed,
             "half_size": self.half_size,
+            "at_market": self.at_market,
             "double_up": self.double_up,
             "flatten": self.flatten,
             "add_to_latest": self.add_to_latest,
