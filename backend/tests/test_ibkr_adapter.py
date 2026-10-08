@@ -585,3 +585,22 @@ def test_pnl_snapshot_primes_then_reads(world):
         "beginning_day_balance": Decimal("1031951.5625"),
     }
     assert fake.pnl_calls == 2
+
+
+def test_gateway_url_accepts_compose_service_name_resolving_privately(monkeypatch):
+    monkeypatch.setattr(ibkr_mod.socket, "getaddrinfo", lambda h, *_a, **_k: [(None, None, None, None, ("172.18.0.5", 0))])
+    assert ibkr_mod.normalize_gateway_url("https://ibkr-gw-1:5000") == "https://ibkr-gw-1:5000"
+
+
+def test_gateway_url_rejects_name_resolving_publicly(monkeypatch):
+    monkeypatch.setattr(ibkr_mod.socket, "getaddrinfo", lambda h, *_a, **_k: [(None, None, None, None, ("93.184.216.34", 0))])
+    with pytest.raises(RuntimeError, match="private-network"):
+        ibkr_mod.normalize_gateway_url("https://gateway.example.com:5000")
+
+
+def test_gateway_url_rejects_unresolvable_name(monkeypatch):
+    def boom(*_a, **_k):
+        raise ibkr_mod.socket.gaierror("nope")
+    monkeypatch.setattr(ibkr_mod.socket, "getaddrinfo", boom)
+    with pytest.raises(RuntimeError, match="private-network"):
+        ibkr_mod.normalize_gateway_url("https://no-such-host:5000")
