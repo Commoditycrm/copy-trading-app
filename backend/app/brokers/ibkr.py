@@ -89,6 +89,7 @@ import ipaddress
 import logging
 import re
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -388,19 +389,35 @@ def normalize_gateway_url(raw: str | None) -> str:
     host = u.hostname.lower()
     ok = host == "localhost" or host.endswith(_GATEWAY_LOCAL_SUFFIXES)
     if not ok:
-        try:
-            ip = ipaddress.ip_address(host)
-            ok = ip.is_private or ip.is_loopback or ip.is_link_local or (
-                ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")  # CGNAT / Tailscale
-            )
-        except ValueError:
-            ok = False
+        ok = _is_private_host(host)
     if not ok:
         raise RuntimeError(
             "IBKR gateway URL must be localhost or a private-network address — "
             "the Client Portal Gateway runs on your own machine"
         )
     return f"{u.scheme}://{u.hostname}{':' + str(u.port) if u.port else ''}"
+
+
+def _is_private_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return ip.is_private or ip.is_loopback or ip.is_link_local or (
+        ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")  # CGNAT / Tailscale
+    )
+
+
+def _is_private_host(host: str) -> bool:
+    """An IP literal on a private range, or a name (a compose service such as
+    ``ibkr-gw-1``) that resolves ONLY to private addresses. Resolution failing
+    counts as not private."""
+    try:
+        return _is_private_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    addrs = {ipaddress.ip_address(i[4][0]) for i in infos}
+    return bool(addrs) and all(_is_private_ip(a) for a in addrs)
 
 
 _gateway_keepalives: set[str] = set()
