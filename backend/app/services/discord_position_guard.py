@@ -508,7 +508,16 @@ def _holding_average(db: Session, guard: DiscordPositionGuard) -> Decimal | None
                          (Order.option_right, OptionRight(right) if right else None),
                          (Order.option_expiry, guard.option_expiry)):
             q = q.where(col.is_(None) if val is None else col == val)
+        # Since the holding opened — which is the ENTRY order's placement, a
+        # moment BEFORE the guard is created (on_buy runs after the order is
+        # placed). Bounding by the guard alone dropped the entry itself, so an
+        # average of 6 @ 1.00 + 2 @ 0.91 read as 0.91 (QA 2026-10-08).
         opened = getattr(guard, "created_at", None)
+        if guard.entry_order_id is not None:
+            entry = db.get(Order, guard.entry_order_id)
+            if entry is not None and entry.created_at is not None and (
+                    opened is None or entry.created_at < opened):
+                opened = entry.created_at
         if opened is not None:
             q = q.where(Order.created_at >= opened)
         orders = list(db.execute(q).scalars())

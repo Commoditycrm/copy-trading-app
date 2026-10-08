@@ -2,6 +2,7 @@
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -234,3 +235,21 @@ def test_the_rules_name_the_ladder_and_how_far_along_it_is(db, monkeypatch):
 
 def test_no_ladder_means_no_rules(db):
     assert position_history.rules(db, USER, "SPY", strike=D(781), right="call", expiry=EXP) is None
+
+
+def test_an_alert_s_stop_change_is_saved_with_its_reason(db, monkeypatch):
+    """The listener commits after _execute_signal returns; the stop the alert
+    moved must already be recorded under the alert's reason by then."""
+    import app.api.discord_sources as ds
+
+    g = _guard(db)
+
+    def _body(db_, user, msg, bg, req):
+        g.stop_price = D("0.75")                   # what an under-target exit alert does
+
+    wrapped = ds._with_alert_reason(_body)
+    monkeypatch.setattr(ds, "_alert_reason", lambda db_, msg: "Clint alert: “✂️ SPY 776c +10%”")
+    wrapped(db, None, SimpleNamespace(id=uuid.uuid4()), None, None)
+    db.commit()
+    e = db.query(PositionEvent).filter_by(kind="stop_set").one()
+    assert e.note == "Clint alert: “✂️ SPY 776c +10%”"
