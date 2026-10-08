@@ -1124,14 +1124,16 @@ export const OpenPositionsTable = forwardRef<
         : value === "auto" ? null
         : channels.find((c) => c.id === value)?.label ?? "that channel";
       const what = positionSymbolLabel(p);
-      const ask = name
-        ? `Assign ${what} to ${name}? ${name}'s exit settings will manage this position from now on.`
-        : `Reset ${what} to the channel that opened it?`;
+      const ask = value === "self"
+        ? `Assign ${what} to Self? You'll manage it by hand: its stop, take-profit and any order a channel placed for it are CANCELLED, and nothing is placed or sold on its own. Stops you set yourself still work.`
+        : name
+          ? `Assign ${what} to ${name}? ${name}'s exit settings will manage this position from now on.`
+          : `Reset ${what} to the channel that opened it?`;
       if (!confirm(ask)) return;
       setChannelBusy(key);
       try {
         const isOption = p.instrument_type === "option";
-        await api("/api/positions/channel", {
+        const res = await api<{ cancelled?: number }>("/api/positions/channel", {
           method: "POST",
           body: JSON.stringify({
             symbol: p.symbol,
@@ -1142,7 +1144,11 @@ export const OpenPositionsTable = forwardRef<
             entry_price: Number(p.avg_entry_price) > 0 ? p.avg_entry_price : null,
           }),
         });
-        notify.success(name ? `${what} assigned to ${name}` : `${what} reset to its opening channel`);
+        notify.success(
+          value === "self"
+            ? `${what} is yours to manage${res?.cancelled ? ` — ${res.cancelled} order${res.cancelled === 1 ? "" : "s"} cancelled` : ""}`
+            : name ? `${what} assigned to ${name}` : `${what} reset to its opening channel`,
+        );
         refresh();
       } catch (e) {
         notify.fromError(e, "Could not change the channel");

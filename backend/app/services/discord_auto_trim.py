@@ -135,6 +135,9 @@ def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder")
 
     if guard.fill_stop_done or guard.closed_at is not None:
         return False
+    if pg.is_manual(db, guard):
+        guard.fill_stop_done = True       # assigned to Self: no stop of the ladder's
+        return False
     if guard.entry_order_id is None:
         guard.fill_stop_done = True
         return False
@@ -429,6 +432,8 @@ def _sweep_trader(db, trader_id, rows) -> None:
             # Loaded before the lock was taken — another sweep may have fired a
             # rung or closed the guard since. Judge the committed state.
             db.refresh(guard)
+            if pg.is_manual(db, guard):
+                continue                  # assigned to Self: the trader manages it
             if guard.closed_at is not None:
                 continue
 

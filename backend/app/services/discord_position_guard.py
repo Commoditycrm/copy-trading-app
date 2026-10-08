@@ -537,6 +537,68 @@ def _holding_average(db: Session, guard: DiscordPositionGuard) -> Decimal | None
     return (cost / held).quantize(Decimal("0.0001"))
 
 
+def is_manual(db: Session, guard) -> bool:
+    """Is this position assigned to Self — managed by the trader by hand? Then
+    the ladder does nothing on its own: no take-profit, no auto-trim, no On Fill
+    stop, no re-pricing, and channel exit alerts don't act on it. Stops the
+    trader sets themselves (Positions → Stop / Trl.Stop) still rest and fire."""
+    source_id = getattr(guard, "source_id", None)
+    if source_id is None:
+        return False
+    try:
+        from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+
+        src = db.get(DiscordAlertSource, source_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return src is not None and getattr(src, "channel_id", None) == "self"
+
+
+def hand_to_trader(db: Session, user, guard, cancel) -> int:
+    """Assigned to Self: cancel every order the ladder or a channel placed for
+    this position, and clear what the ladder was holding — the stop, a trailing
+    stop or exit, the take-profit. Orders the trader placed by hand are theirs
+    and are left. Returns how many orders were cancelled."""
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+    from app.services import discord_stop_orders, discord_take_profit  # noqa: PLC0415
+    from app.services.position_events import because  # noqa: PLC0415
+
+    working = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+    cancelled = 0
+    with because("assigned to Self — managed by you; the ladder's orders were cancelled"):
+        for oid in (guard.tp_order_id, guard.tp_stop_order_id, guard.stop_order_id):
+            o = db.get(Order, oid) if oid else None
+            if o is not None and o.status in working:
+                cancelled += 1
+        discord_take_profit.release(db, guard, cancel)
+        discord_stop_orders.release(db, guard, cancel)
+        # Orders a channel's ALERTS placed for this contract and still working
+        # (a resting trim, an add): the channel no longer manages it.
+        right = getattr(guard.option_right, "value", guard.option_right)
+        q = (select(Order).join(DiscordMessage, DiscordMessage.order_id == Order.id)
+             .where(Order.user_id == guard.user_id, Order.symbol == (guard.symbol or "").upper(),
+                    Order.status.in_(working)))
+        for col, val in ((Order.option_strike, guard.option_strike),
+                         (Order.option_right, OptionRight(right) if right else None),
+                         (Order.option_expiry, guard.option_expiry)):
+            q = q.where(col.is_(None) if val is None else col == val)
+        for o in db.execute(q).scalars():
+            try:
+                cancel(o.id)
+                cancelled += 1
+            except Exception:  # noqa: BLE001
+                log.warning("discord guard: could not cancel %s on hand-over", o.id, exc_info=True)
+        guard.stop_price = None
+        clear_stop_trail(guard)
+        clear_trail(guard)
+        guard.tp_off = True
+        guard.fill_stop_done = True
+        db.flush()
+    log.info("discord guard: %s handed to the trader (Self) — %d order(s) cancelled", guard.symbol, cancelled)
+    return cancelled
+
+
 def restart_ladder(db: Session, user_id, symbol: str, strike, right, expiry, *,
                    entry_order_id, entry_price: Decimal | None, added_qty: Decimal | None = None,
                    held_qty: Decimal | None = None, ts=None) -> DiscordPositionGuard | None:

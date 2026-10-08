@@ -341,6 +341,7 @@ def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
     from app.models.settings import TraderSettings  # noqa: PLC0415
     from app.services import discord_channel_settings as dcs  # noqa: PLC0415
     from app.services import discord_ladder  # noqa: PLC0415
+    from app.services import discord_position_guard as guards_mod  # noqa: PLC0415
 
     q = select(DiscordPositionGuard).where(
         DiscordPositionGuard.user_id == user_id,
@@ -391,6 +392,16 @@ def rules(db: Session, user_id, symbol: str, *, strike: Decimal | None = None,
     by_dollars = sizing["mode"] == "dollars"
     max_c = sizing["max_per_contract"]
     max_o = sizing["max_per_order"]
+    if guards_mod.is_manual(db, guard):
+        # Self: the trader manages it — no exit rules apply on their own.
+        return {
+            "channel": channel, "quantity": "—", "max_per_contract": None, "max_per_order": None,
+            "exits": "managed by you (Self) — nothing is placed or sold on its own",
+            "entries": "—", "mode": "live" if getattr(ts, "discord_live_trading", False) else "paper",
+            "on_fill": None, "ladder": [], "entry_price": _px(guard.entry_price),
+            "stop_now": _px(guard.stop_price), "trailing_now": None,
+            "closed": guard.closed_reason if guard.closed_at is not None else None,
+        }
     return {
         "channel": channel,
         "quantity": (f"${_px(dollars)} per entry" if by_dollars
