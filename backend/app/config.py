@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     # in the existing SnapTrade/Alpaca/IBKR paths changes. Turn on only in
     # environments where a trader has connected a direct Webull account.
     webull_direct_enabled: bool = False
+    # Kopyya-hosted IBKR gateways: how many gateway containers the compose stack
+    # runs (ibkr-gw-1 … ibkr-gw-N, profile "ibkr"). 0 = hosted mode off; the
+    # IBKR connect form then offers only "gateway on your machine" / OAuth.
+    ibkr_gateway_pool_size: int = 0
+    # Where slot N is reachable from the backend. {slot} is substituted.
+    ibkr_gateway_url_template: str = "https://ibkr-gw-{slot}:5000"
     # Shadow mode: when true, the Webull listener DETECTS + logs the
     # trader's orders but does NOT fan out to subscribers. Lets us verify
     # parity against the SnapTrade feed before trusting it with real

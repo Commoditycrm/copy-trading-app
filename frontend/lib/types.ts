@@ -110,6 +110,10 @@ export interface BrokerAccount {
   // Broker-chosen steady refresh interval (seconds) for this account's Day P&L
   // surfaces. The UI reads this instead of hardcoding per-broker intervals.
   day_pnl_refresh_interval_s?: number;
+
+  // Kopyya-hosted IBKR gateway slot. Set only for IBKR accounts we host the
+  // gateway for; the card then shows "Sign in to IBKR".
+  ibkr_gateway_slot?: number | null;
 }
 
 
