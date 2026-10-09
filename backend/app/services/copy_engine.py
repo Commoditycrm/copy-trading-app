@@ -241,6 +241,29 @@ def exceeds_order_cap(total: "Decimal | None", cap: "Decimal | None") -> bool:
     return total > Decimal(str(cap))
 
 
+def trim_to_contract_cap(
+    unit_price: "Decimal | None", quantity: "Decimal | int | None", cap: "Decimal | None",
+) -> "Decimal | None":
+    """Trim an OPTION mirror to the most whole contracts whose total value
+    (premium x 100 x qty) fits the max_per_contract budget.
+
+    Returns the trimmed quantity — unchanged when it already fits or can't be
+    priced, and Decimal(0) when not even one contract fits (the caller skips).
+    The cap is a dollar budget on the option order, not a per-single-contract
+    filter; shared by the copy engine and the Discord ceiling so the formula has
+    one home.
+    """
+    if quantity is None:
+        return None
+    qty = Decimal(str(quantity))
+    if cap is None or unit_price is None or qty <= 0:
+        return qty
+    per_contract = Decimal(str(unit_price)) * Decimal(100)
+    if per_contract <= 0 or per_contract * qty <= Decimal(str(cap)):
+        return qty
+    return (Decimal(str(cap)) / per_contract).to_integral_value(rounding=ROUND_DOWN)
+
+
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
     # WHOLE UNITS ONLY (copy trades are never fractional, even on brokers that
     # support it). Round the scaled size UP (ceil) to a whole unit — so
@@ -2799,40 +2822,60 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 continue
 
             # ── Max per-contract value gate (OPTION opens only) ──────────────
-            # Skip an OPENING option mirror when a single contract's value
-            # (premium × 100) exceeds the subscriber's max_per_contract ceiling.
-            # A CLOSE always passes (they must be able to exit); stocks have no
-            # per-contract concept, so this is options-only. Priced off _gate_px
-            # (trader's premium, or a live option quote when a market order is
-            # fanned out before its fill records a price); only when NEITHER is
-            # available does it fall back to allow. Read the cap from the FRESH
-            # DB map (see _fresh_caps above), never the cached subscriber, so a
-            # just-set cap can't be missed.
+            # TRIM an OPENING option mirror to the most whole contracts whose
+            # TOTAL value (premium × 100 × qty) fits the subscriber's
+            # max_per_contract budget, instead of skipping it. Skip only when not
+            # even one contract fits. A CLOSE always passes (they must be able to
+            # exit); stocks have no per-contract concept, so this is options-only.
+            # Priced off _gate_px (trader's premium, or a live option quote when a
+            # market order is fanned out before its fill records a price); only
+            # when NEITHER is available does it fall back to allow. Read the cap
+            # from the FRESH DB map (see _fresh_caps above), never the cached
+            # subscriber. Trimming the entry qty here is enough to size the
+            # brackets too: a native Alpaca bracket rides this entry order, and an
+            # emulated option/ST/WB bracket spawns off the subscriber's own
+            # (trimmed) fill.
             _mpc = _fresh_caps.get(sub.user_id)
             if (
                 not is_closing_effective
                 and _mpc is not None
+                and _gate_px is not None
                 and trader_order.instrument_type == InstrumentType.OPTION
             ):
-                _px = _gate_px  # trader premium, or a live quote for a pre-fill market option
-                if _px is not None and Decimal(_px) * Decimal(100) > Decimal(_mpc):
+                _fit = trim_to_contract_cap(_gate_px, scaled, _mpc)
+                if _fit is not None and _fit < scaled:
+                    _per_contract = Decimal(_gate_px) * Decimal(100)
+                    if _fit < 1:
+                        audit.record(
+                            db, actor_user_id=sub.user_id,
+                            action="copy.skipped_max_per_contract",
+                            entity_type="order", entity_id=trader_order.id,
+                            metadata={
+                                "symbol": trade_symbol,
+                                "per_contract": str(_per_contract),
+                                "max_per_contract": str(_mpc),
+                            },
+                        )
+                        results.append(FanoutResult(
+                            subscriber_user_id=sub.user_id,
+                            broker_account_id=acct.id,
+                            order_id=None,
+                            status="skipped_max_per_contract",
+                        ))
+                        continue
                     audit.record(
                         db, actor_user_id=sub.user_id,
-                        action="copy.skipped_max_per_contract",
+                        action="copy.trimmed_max_per_contract",
                         entity_type="order", entity_id=trader_order.id,
                         metadata={
                             "symbol": trade_symbol,
-                            "per_contract": str(Decimal(_px) * Decimal(100)),
+                            "per_contract": str(_per_contract),
                             "max_per_contract": str(_mpc),
+                            "from_qty": str(scaled),
+                            "to_qty": str(_fit),
                         },
                     )
-                    results.append(FanoutResult(
-                        subscriber_user_id=sub.user_id,
-                        broker_account_id=acct.id,
-                        order_id=None,
-                        status="skipped_max_per_contract",
-                    ))
-                    continue
+                    scaled = _fit
 
             # ── Max per-ORDER value gate (opens only, stocks included) ───────
             # Skip an OPENING mirror whose WHOLE value is above the subscriber's
