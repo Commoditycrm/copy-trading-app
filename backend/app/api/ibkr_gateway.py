@@ -108,9 +108,14 @@ def gateway_verify(
                      "Disconnect and reconnect with the account number you want.",
             )
     elif visible and wanted not in visible:
+        # Either the wrong account number, or the gateway is still holding a
+        # PREVIOUS login's session (seen on QA after a paper → live switch).
+        # Clear it so the next "Sign in to IBKR" starts from a clean gateway.
+        hosted.logout(slot)
         raise HTTPException(
-            400, f"Account {wanted} isn't one this IBKR login can see ({', '.join(visible)}). "
-                 "Disconnect and reconnect with the right account number.",
+            409, f"The IBKR login on this gateway sees {', '.join(visible)}, not {wanted}. "
+                 "The session has been cleared — click Sign in to IBKR and sign in with the "
+                 f"IBKR username that owns {wanted}.",
         )
     creds["account_id"] = wanted
 
