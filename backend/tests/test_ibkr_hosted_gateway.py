@@ -53,6 +53,7 @@ def test_is_rewritable():
     assert H.is_rewritable("text/html; charset=utf-8")
     assert H.is_rewritable("application/javascript")
     assert not H.is_rewritable("image/png")
+    assert not H.is_rewritable("application/json")   # two-factor exchange passes through untouched
     assert not H.is_rewritable(None)
 
 

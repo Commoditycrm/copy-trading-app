@@ -3482,7 +3482,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # status == "error" is a FINAL rejection; retries are notified separately
     # only once all attempts are exhausted (retry_scheduler), so no double-send.
     if any(r.status == "error" for r in results):
-        from app.services.notifications import create_notification  # noqa: PLC0415
+        from app.services.notifications import (  # noqa: PLC0415
+            create_notification,
+            instrument_label,
+        )
         _side = trader_order.side.value.upper()
         for r in results:
             if r.status != "error":
@@ -3504,13 +3507,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     user_id=r.subscriber_user_id,
                     type="copy.rejected",
                     message=(
-                        f"Your copy of the {_side} {trader_order.symbol} order was "
+                        f"Your copy of the {_side} "
+                        f"{instrument_label(trader_order)} order was "
                         f"rejected: {reason}"
                     ),
                     metadata={
                         "parent_order_id": str(trader_order.id),
                         "order_id": str(r.order_id),
                         "symbol": trader_order.symbol,
+                        "instrument": instrument_label(trader_order),
                         "side": _side,
                         "reason": reason,
                         "trader_id": str(trader_order.user_id),
