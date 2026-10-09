@@ -65,8 +65,17 @@ _LOCK_TTL_S = 120
 _LOCK_WAIT_S = 10
 
 
+def _manual(ts) -> bool:
+    """Exits are the trader's own under these settings — nothing auto-fires."""
+    return bool(ts is not None and getattr(ts, "discord_manual_exit", False))
+
+
 def _enabled(ts) -> bool:
-    return bool(ts is not None and getattr(ts, "discord_auto_trim", False))
+    """Should rungs fire off the price for these settings? Auto trim — and
+    Take-profit orders too, which runs as auto-trim on a broker that cannot
+    link a take-profit to a stop (the sweep skips it where the broker can)."""
+    on = getattr(ts, "discord_auto_trim", False) or getattr(ts, "discord_tp_orders", False)
+    return bool(ts is not None and on) and not _manual(ts)
 
 
 def _engine(ts) -> str:
@@ -75,17 +84,20 @@ def _engine(ts) -> str:
 
 
 def _gate_for(ts, rung: int) -> Decimal:
-    """This rung's Min Profit to Trim, as configured. 0 means "no minimum"."""
-    field = {
-        1: "discord_trim_profit_gate_pct",
-        2: "discord_trim2_profit_gate_pct",
-        3: "discord_trim3_profit_gate_pct",
-    }.get(rung, "discord_trim3_profit_gate_pct")
-    raw = getattr(ts, field, None)
+    """This rung's Profit target, as configured. 0 means "no minimum"."""
+    from app.services import discord_ladder  # noqa: PLC0415
+
     try:
-        return Decimal(str(raw)) if raw is not None else Decimal(0)
+        ladder = discord_ladder.rungs(ts)
+        return ladder[rung - 1].profit_gate_pct if 1 <= rung <= len(ladder) else Decimal(0)
     except Exception:  # noqa: BLE001
         return Decimal(0)
+
+
+def _trim_count(ts) -> int:
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    return discord_ladder.count(ts)
 
 
 def gain_pct(entry: Decimal | None, mark: Decimal | None) -> Decimal | None:
@@ -103,14 +115,77 @@ def gain_pct(entry: Decimal | None, mark: Decimal | None) -> Decimal | None:
     return (mark - entry) / entry * Decimal(100)
 
 
+def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder") -> bool:
+    """The "On Fill" stop: once the entry has filled, put the stop at the
+    configured return from entry. Returns True when a stop level was set — the
+    stop reconciler then rests a real order there on its next pass.
+
+    One-shot per holding (``fill_stop_done``): decided the first time the entry
+    is seen filled, and never revisited. So a stop the trader later cancels by
+    hand stays cancelled, and switching a setting does not reach back and put a
+    stop on a position that has been open for hours.
+
+    Nothing is set when exits are Manual or AI trimming runs them, when no On
+    Fill stop is configured, or when the holding has no opening order of ours to
+    wait on (adopted from the broker, or assigned to a channel by hand).
+    """
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+    from app.services import discord_ladder  # noqa: PLC0415
+    from app.services import discord_position_guard as pg  # noqa: PLC0415
+
+    if guard.fill_stop_done or guard.closed_at is not None:
+        return False
+    if pg.is_manual(db, guard):
+        guard.fill_stop_done = True       # assigned to Self: no stop of the ladder's
+        return False
+    if guard.entry_order_id is None:
+        guard.fill_stop_done = True
+        return False
+    order = db.get(Order, guard.entry_order_id)
+    if order is None:
+        guard.fill_stop_done = True
+        return False
+    if order.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        return False                      # still working (or never filled): nothing to protect yet
+
+    guard.fill_stop_done = True
+    pct = discord_ladder.fill_stop_pct(ts)
+    if pct is None or engine != "ladder" or _manual(ts):
+        return False
+    if (guard.sell_count or 0) > 0 or guard.stop_price is not None:
+        return False                      # a trim, or the trader, already set one
+    pg.sync_entry_price(db, guard)        # the FILL, not the limit we bid
+    entry = guard.entry_price
+    if entry is None or entry <= 0:
+        return False
+    trailing = discord_ladder.fill_stop_trails(ts)
+    # Fixed: a return from entry (-25 = 25% below). Trailing: a give-back from
+    # the high, which at the fill IS the entry, raised as the price climbs.
+    stop, trail_pct, peak = pg.rung_stop(
+        entry, pg.RungConfig(stop_pct=pct, stop_trail=trailing), None)
+    stop = pg._to_tick(stop)
+    if stop is None or stop <= 0:
+        return False                      # rounds to $0 on a very cheap contract: not a stop
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("On Fill stop — set when the entry filled"):
+        guard.stop_price = stop
+        guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+        if hasattr(db, "flush"):
+            db.flush()
+    log.info("on-fill stop: %s filled at %s — stop set at %s (%s%%%s)", guard.symbol, entry, stop, pct,
+             " trailing" if trailing else "")
+    return True
+
+
 def due_rung(ts, guard: DiscordPositionGuard, mark: Decimal | None) -> int | None:
     """The rung to fire now, or None. Pure — no DB, no broker."""
     if not _enabled(ts):
         return None
     rung = (guard.sell_count or 0) + 1
-    if rung > 3:
-        # The ladder has three steps. Past the third there is nothing left to
-        # automate: the final rung exits what remains.
+    if rung > _trim_count(ts):
+        # Past the last trim there is nothing left to automate: the final rung
+        # exits what remains, or leaves a runner for the trader to manage.
         return None
     gate = _gate_for(ts, rung)
     if gate <= 0:
@@ -192,12 +267,11 @@ def _mark_for(positions, guard, user_id=None) -> Decimal | None:
         # Test-only pins from Simulated Prices must exercise the automatic
         # trim ladder too, not just stop/trailing enforcement. Pins are scoped
         # by trader and contract and are disabled outside a test-enabled env.
-        if user_id is not None:
-            from app.services import price_override  # noqa: PLC0415
-            pinned = price_override.apply_to(user_id, p)
-            if pinned is not None:
-                return pinned
-        return _dec(getattr(p, "current_price", None))
+        # The position says it is held; the PRICE is Alpaca's live quote (a pin
+        # first, the broker's mark last) — see services/live_marks.
+        from app.services import live_marks  # noqa: PLC0415
+
+        return live_marks.position_mark(p, user_id)
     return None
 
 
@@ -283,8 +357,27 @@ def _sweep_trader(db, trader_id, rows) -> None:
     ts = db.get(TraderSettings, trader_id)
     # The AI engine runs whether or not ladder auto-trim is on; with it selected
     # the ladder's rungs are never auto-fired, so two engines can't both sell.
+    # The engine is account-wide; the LADDER (gates, auto-trim on/off) is per
+    # position — the settings of the channel that opened it.
     engine = _engine(ts)
-    if engine == "ladder" and not _enabled(ts):
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+
+    guard_ts = {g.id: (dcs.for_guard(db, trader_id, g) or ts) for g in rows}
+    # On Fill stops first, and before the early return below: they apply with
+    # Auto trim off too, and need no broker read.
+    try:
+        touched = False
+        for g in rows:
+            if not g.fill_stop_done:
+                apply_fill_stop(db, g, guard_ts.get(g.id, ts), engine)
+                touched = True
+        if touched:
+            db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.exception("on-fill stop: sweep failed for user %s", trader_id)
+    # Nothing has auto-trim on: skip before the broker read (rate limits).
+    if engine == "ladder" and not any(_enabled(t) for t in guard_ts.values()):
         return
     user = db.get(User, trader_id)
     if user is None:
@@ -307,7 +400,13 @@ def _sweep_trader(db, trader_id, rows) -> None:
     # against that list. Reading them per-guard made N broker calls per
     # sweep and blew Webull's 10-req/30s limit (429 storm on prod).
     try:
-        positions = adapter.get_positions()
+        # A TRIGGER check, not an order: a trim it fires re-reads live positions
+        # before placing anything. So it may share a read another loop made
+        # seconds ago (Webull's limits — see webull.py, shared snapshot).
+        try:
+            positions = adapter.get_positions(cached_ok=True)
+        except TypeError:                 # brokers without the cached read
+            positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
         log.warning("auto-trim: could not read positions for user %s", trader_id, exc_info=True)
         return
@@ -318,7 +417,9 @@ def _sweep_trader(db, trader_id, rows) -> None:
         live = []
         for guard in rows:
             db.refresh(guard)
-            if guard.closed_at is None:
+            # A position whose channel has Manual exits is the trader's to
+            # close — the model is never asked about it.
+            if guard.closed_at is None and not _manual(guard_ts.get(guard.id, ts)):
                 live.append(guard)
         ai_trim.sweep(
             db, user, ts, acct, adapter, live, positions,
@@ -331,6 +432,8 @@ def _sweep_trader(db, trader_id, rows) -> None:
             # Loaded before the lock was taken — another sweep may have fired a
             # rung or closed the guard since. Judge the committed state.
             db.refresh(guard)
+            if pg.is_manual(db, guard):
+                continue                  # assigned to Self: the trader manages it
             if guard.closed_at is not None:
                 continue
 
@@ -350,11 +453,19 @@ def _sweep_trader(db, trader_id, rows) -> None:
             # Idempotent (returns False when unchanged) and the exit
             # path still syncs too, so nothing else changes behaviour —
             # the reference is simply correct sooner.
-            if pg.sync_entry_price(db, guard):
+            if pg.sync_entry_price(db, guard, guard_ts.get(guard.id, ts)):
                 db.commit()
 
+            # Take-profit orders, on a broker that links them to a stop: this
+            # trim is resting at the broker (discord_take_profit) and fills
+            # there. Firing it here as well would sell the same contracts twice.
+            from app.services import discord_take_profit  # noqa: PLC0415
+
+            if discord_take_profit.active(guard_ts.get(guard.id, ts), adapter):
+                continue
+
             mark = _mark_for(positions, guard, trader_id)
-            rung = due_rung(ts, guard, mark)
+            rung = due_rung(guard_ts.get(guard.id, ts), guard, mark)
             if rung is None:
                 continue
 
@@ -366,7 +477,10 @@ def _sweep_trader(db, trader_id, rows) -> None:
                 "auto-trim: %s reached %.2f%% — firing trim %s via %r",
                 guard.symbol, gain_pct(guard.entry_price, mark), rung, text,
             )
-            msg = submit_self_alert_text(db, user, text, approve=True)
+            from app.services.position_events import because  # noqa: PLC0415
+
+            with because(f"auto-trim: up {gain_pct(guard.entry_price, mark):.1f}% — Trim {rung}"):
+                msg = submit_self_alert_text(db, user, text, approve=True)
 
             # If the rung sold nothing and armed nothing, give it back.
             #
@@ -387,6 +501,10 @@ def _sweep_trader(db, trader_id, rows) -> None:
             did_something = (
                 (msg is not None and msg.order_id is not None)
                 or guard.trail_qty != before_trail
+                # The LAST trim rounded down to nothing and left a runner. That
+                # is the rung doing its job — hand it back and it would fire
+                # again on every sweep for as long as the price holds.
+                or (msg is not None and pg.RUNNER_NOTE in (msg.status_reason or ""))
             )
             if not did_something and (guard.sell_count or 0) > before_rung:
                 log.info(
@@ -399,8 +517,73 @@ def _sweep_trader(db, trader_id, rows) -> None:
             log.exception("auto-trim: failed on %s", guard.symbol)
 
 
+# Absolute floor for the closed-market sweep — a bad config value (0, negative,
+# non-numeric) can never speed the loop up or spin it; it falls back to a slow
+# default and is never faster than the tradable cadence.
+_MIN_CLOSED_INTERVAL_S = float(POLL_INTERVAL_S)
+
+
+def _closed_interval() -> float:
+    """Configured closed-market sweep interval, floored so a bad value can't
+    create a busy loop or run faster than the tradable cadence."""
+    from app.config import get_settings  # noqa: PLC0415
+    try:
+        v = float(get_settings().discord_auto_trim_closed_interval_seconds)
+    except (TypeError, ValueError):
+        v = 180.0
+    if v <= 0:
+        v = 180.0
+    return max(_MIN_CLOSED_INTERVAL_S, v)
+
+
+def _interval_and_session() -> "tuple[float, str]":
+    """This sweep's sleep and the market session. Full 15s cadence while a trim
+    could actually fill (pre-market / regular / after-hours); backed off when
+    CLOSED, since no trim can execute and no new fill needs an on-fill stop.
+    Reuses the shared market_hours classifier — no duplicate time logic here."""
+    from app.services import market_hours  # noqa: PLC0415
+    session = market_hours.market_session()
+    if session == market_hours.CLOSED:
+        return _closed_interval(), session
+    return float(POLL_INTERVAL_S), session
+
+
+# How often to surface from a closed-market backoff to re-check the session and
+# the shutdown flag. Decouples the WAKE/check frequency from the broker-sweep
+# frequency: the sweep still fires ~every closed interval (~180s), but a
+# CLOSED->tradable transition (or a shutdown) is noticed within this many
+# seconds instead of up to a full interval late.
+_WAKE_CHECK_S = float(POLL_INTERVAL_S)
+
+
+def _backoff_sleep(interval: float, shutdown_check) -> bool:
+    """Sleep up to ``interval`` between sweeps, waking every ``_WAKE_CHECK_S`` to
+    re-check shutdown and the market session. These intermediate wake-ups are
+    session checks ONLY — they never call tick() or any broker API — so the
+    closed-market broker-sweep cadence is preserved while a CLOSED->tradable
+    transition is picked up within ``_WAKE_CHECK_S``. Returns True if the worker
+    should stop (shutdown requested). Elapsed is summed from the naps, not read
+    from the wall clock, so a system-clock adjustment can't distort the interval.
+    """
+    from app.services import market_hours  # noqa: PLC0415
+    remaining = interval
+    while remaining > 0:
+        if shutdown_check is not None and shutdown_check():
+            return True
+        nap = min(_WAKE_CHECK_S, remaining)
+        time.sleep(nap)
+        remaining -= nap
+        # The market opened during a closed-market backoff — sweep now rather
+        # than finish the long sleep. (A no-op during tradable cadence, where
+        # interval == _WAKE_CHECK_S and remaining is already 0.)
+        if market_hours.is_tradable_now():
+            return False
+    return False
+
+
 def poll_loop(shutdown_check=None) -> None:
-    log.info("discord_auto_trim: starting (interval=%ss)", POLL_INTERVAL_S)
+    log.info("discord_auto_trim: starting (tradable interval=%ss)", POLL_INTERVAL_S)
+    last_cadence: "tuple[str, float] | None" = None
     while True:
         if shutdown_check is not None and shutdown_check():
             return
@@ -408,4 +591,16 @@ def poll_loop(shutdown_check=None) -> None:
             tick()
         except Exception:  # noqa: BLE001
             log.exception("discord_auto_trim: tick failed")
-        time.sleep(POLL_INTERVAL_S)
+        interval, session = _interval_and_session()
+        # Log only when the session or cadence changes — not every sweep.
+        if last_cadence != (session, interval):
+            log.info("auto_trim market_session=%s interval=%.0fs", session, interval)
+            last_cadence = (session, interval)
+        if _backoff_sleep(interval, shutdown_check):
+            return
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+tick = webull_usage.tagged("Auto-trim")(tick)

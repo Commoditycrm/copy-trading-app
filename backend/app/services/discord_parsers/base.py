@@ -111,6 +111,8 @@ class TradeSignal:
     # Acted on in discord_execution._resolve_quantity: the entry is taken at
     # HALF the size it otherwise would be.
     half_size: bool = False
+    # Fill this entry at MARKET ("@market", "out the gate"): see parse_message.
+    at_market: bool = False
     # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
     # held, so the position doubles. Distinct from half_size, which scales the
     # alert's own size; this one IGNORES it and sizes purely from the position,
@@ -130,6 +132,13 @@ class TradeSignal:
     # Opt-in per parser: execution buys the NEAREST listed expiry when set, and
     # refuses (as before) when not.
     nearest_expiry: bool = False
+    # "Stopped out of rest of SPY calls": close EVERY contract matching the
+    # symbol (and call/put, when named) that this channel opened and is still
+    # held — at market, in full. Several contracts are expected, not refused.
+    close_all_matching: bool = False
+    # With close_all_matching and no symbol ("Cutting @here", "Stopped out"):
+    # the contract is the one this channel is in — its latest buy still held.
+    latest_contract: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -173,10 +182,13 @@ class TradeSignal:
             ),
             "position_closed": self.position_closed,
             "half_size": self.half_size,
+            "at_market": self.at_market,
             "double_up": self.double_up,
             "flatten": self.flatten,
             "add_to_latest": self.add_to_latest,
             "nearest_expiry": self.nearest_expiry,
+            "close_all_matching": self.close_all_matching,
+            "latest_contract": self.latest_contract,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,

@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     # in the existing SnapTrade/Alpaca/IBKR paths changes. Turn on only in
     # environments where a trader has connected a direct Webull account.
     webull_direct_enabled: bool = False
+    # Kopyya-hosted IBKR gateways: how many gateway containers the compose stack
+    # runs (ibkr-gw-1 … ibkr-gw-N, profile "ibkr"). 0 = hosted mode off; the
+    # IBKR connect form then offers only "gateway on your machine" / OAuth.
+    ibkr_gateway_pool_size: int = 0
+    # Where slot N is reachable from the backend. {slot} is substituted.
+    ibkr_gateway_url_template: str = "https://ibkr-gw-{slot}:5000"
     # Shadow mode: when true, the Webull listener DETECTS + logs the
     # trader's orders but does NOT fan out to subscribers. Lets us verify
     # parity against the SnapTrade feed before trusting it with real
@@ -151,7 +157,28 @@ class Settings(BaseSettings):
     # account count (≈3.3s × accounts) — see webull_listener._safe_poll_interval.
     # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
     # 4s also works (7.5 / 30s). Don't go below 3.5s.
-    webull_poll_interval_seconds: float = 5.0
+    # 15s, not 5s: the live events stream detects orders first; this poll is the
+    # backstop, and at 5s it was the largest share of a Webull key's request
+    # budget (every account under the key, every 5s).
+    webull_poll_interval_seconds: float = 15.0
+    # ── Market-closed polling slowdown ───────────────────────────────────
+    # Outside tradable hours (weekends + weekday <04:00 / ≥20:00 ET) prices,
+    # positions and account P&L can't move, so the data pollers back off to cut
+    # CPU + broker API calls. They return to full cadence automatically in
+    # pre-market (04:00 ET). Copy-trading/risk behaviour during tradable hours
+    # is unchanged. See market_hours.is_tradable_now.
+    #
+    # Webull order poll when the market is CLOSED. The faster "active" value is
+    # used when the trader still has working/pending orders worth monitoring.
+    webull_poll_interval_closed_seconds: float = 120.0
+    webull_poll_interval_closed_active_seconds: float = 20.0
+    # P&L poller (all brokers, incl. Alpaca REST) floor when the market is CLOSED.
+    pnl_poll_interval_closed_seconds: float = 180.0
+    # Discord auto-trim sweep when the market is CLOSED. Auto-trim only takes
+    # profit (fires ladder/AI trims) and sets on-fill stops — no trim can fill
+    # while the market is shut, so it backs off hard. Tradable cadence (15s) is
+    # unchanged; see discord_auto_trim.poll_loop / market_hours.is_tradable_now.
+    discord_auto_trim_closed_interval_seconds: float = 180.0
     # ── Webull token authorisation wait ──────────────────────────────────
     # Webull's SDK creates an access token in PENDING status and then BLOCKS,
     # polling until the account owner authorises it in their Webull app. Its own
@@ -325,6 +352,16 @@ class Settings(BaseSettings):
     # Cap on a single intake batch from the listener. The observer flushes in
     # small batches; anything larger is a malformed or hostile payload.
     discord_ingest_max_batch: int = 50
+    # An ENTRY alert that reaches us more than this many seconds after it was
+    # posted is not placed automatically — it waits for the trader's approval
+    # instead. A restarted or reconnecting listener replays everything posted
+    # while it was away (so nothing is lost); buying those at whatever the
+    # price is now is not what anyone asked for. Exits are not held.
+    discord_max_alert_age_s: int = 120
+    # A channel posting the SAME entry again within this many seconds — a
+    # corrected price, a re-post after deleting the first — is a correction,
+    # not a second trade (services/discord_repost).
+    discord_repost_window_s: int = 180
     # How long a message's idempotency marker is held in Redis. Sized to cover a
     # listener restart / reconnect replaying the visible channel backlog, which
     # is the realistic duplicate window. The durable guard is the DB unique

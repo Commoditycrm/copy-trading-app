@@ -18,18 +18,50 @@ import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.models.notification import Notification
+from app.models.order import InstrumentType
 from app.models.user import User
 from app.services import events
 
 log = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
+
+
+def instrument_label(order: Any) -> str:
+    """``SPY`` for a stock; ``SPY C $770 25 Sep 26`` for an option.
+
+    A rejection that only says "SPY" leaves the reader guessing which contract
+    of several open ones the broker turned down. This names it.
+
+    Deliberately matches the frontend's ``positionSymbolLabel`` so the notice
+    reads the same as the row the user will go looking for in Positions or
+    Trades. It is NOT ``trades._instrument_label``: that one feeds the Excel
+    export and has to keep an ISO date so the column sorts.
+    """
+    sym = (getattr(order, "symbol", None) or "\u2014").upper()
+    if getattr(order, "instrument_type", None) != InstrumentType.OPTION:
+        return sym
+    parts = [sym]
+    right = getattr(getattr(order, "option_right", None), "value", None)
+    if right:
+        parts.append(str(right)[:1].upper())
+    strike = getattr(order, "option_strike", None)
+    if strike is not None:
+        # normalize() drops trailing zeros (4.50 -> 4.5) but renders whole
+        # numbers in scientific notation, so :f is required (770.00 -> 770).
+        parts.append(f"${Decimal(str(strike)).normalize():f}")
+    expiry = getattr(order, "option_expiry", None)
+    if expiry is not None:
+        parts.append(f"{expiry.day} {expiry:%b} {expiry:%y}")
+    return " ".join(parts)
+
 
 # Notification type → in-app path appended to the SMS body (NOT the in-app
 # message, which stays clean) so a tapped text drops the user on the right
@@ -39,6 +71,7 @@ _SMS_DEEP_LINK = {
     "order.rejected": "/trades",
     "copy.auto_liquidated": "/positions",
     "broker.disconnected": "/broker",
+    "discord.disconnected": "/discord",
 }
 
 # Notification type → the User column that gates its SMS.
@@ -56,6 +89,9 @@ _SMS_PREF_EXACT = {
     "copy.rejected": "sms_on_trade_rejected",
     "trader.order_rejected": "sms_on_trade_rejected",
     "broker.disconnected": "sms_on_broker_connection",
+    # Same category and wording style as the broker disconnect: losing the
+    # Discord connection stops copying exactly the way losing a broker does.
+    "discord.disconnected": "sms_on_broker_connection",
 }
 
 # These types are built with f-strings (e.g. f"copy.auto_paused_{reason}"), so

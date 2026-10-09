@@ -30,6 +30,22 @@
  *   RECONNECT (lastSeenMessageId known) — emit exactly the backlog newer than
  *     it, so alerts posted while the listener was down aren't lost. Overlap is
  *     harmless: the backend de-duplicates on (source_id, message_id).
+ *
+ * DELETIONS
+ * ---------
+ * A deleted message's node is removed from the list — but so are nodes Discord
+ * merely stops rendering (it virtualises the scroller, trimming the oldest from
+ * the top) and every node on a re-render or channel switch. A removal is only
+ * reported as a deletion when it looks like nothing else:
+ *
+ *   - exactly one message node removed in that mutation, and no more than a
+ *     couple across the whole callback (a re-render removes dozens);
+ *   - a message still sits above it (trimming always takes the topmost);
+ *   - after a short wait, the id has not been rendered again and the message
+ *     above it is still there (a re-render puts both back or takes both away).
+ *
+ * Reported with `is_delete: true` and no content; the backend withdraws the
+ * entry it placed if that never filled.
  */
 (config) => {
   const { channelId, lastSeenMessageId, flushMs } = config;
@@ -61,6 +77,10 @@
 
   const pending = new Map();
   let flushTimer = null;
+
+  // See DELETIONS above.
+  const DELETE_CONFIRM_MS = 1500;
+  const MAX_REMOVALS_PER_CALLBACK = 2;
 
   function remember(id) {
     emitted.add(id);
@@ -288,6 +308,51 @@
     queue(msg);
   }
 
+  function isMessageNode(n) {
+    return !!(n && n.nodeType === 1 && n.id && n.id.startsWith(MESSAGE_ID_PREFIX));
+  }
+
+  function messageIdOf(li) {
+    const parts = (li.id || "").slice(MESSAGE_ID_PREFIX.length).split("-");
+    const id = parts[parts.length - 1];
+    return /^\d+$/.test(id) ? id : null;
+  }
+
+  /* The nearest message node above a removed one, skipping date dividers and
+   * the like. None means it was the topmost — what virtualisation trims. */
+  function messageAbove(node) {
+    for (let n = node, hops = 0; n && hops < 6; n = n.previousSibling, hops++) {
+      if (isMessageNode(n)) return n;
+    }
+    return null;
+  }
+
+  function considerRemoval(li, above) {
+    const id = messageIdOf(li);
+    if (!id || !contentSeen.has(id) || !above) return;
+    const domId = li.id;
+    const aboveId = above.id;
+    setTimeout(() => {
+      if (document.getElementById(domId)) return;     // rendered again: not deleted
+      if (!document.getElementById(aboveId)) return;  // the list itself went away
+      if (!contentSeen.has(id)) return;               // already reported
+      contentSeen.delete(id);
+      queue({
+        message_id: id,
+        channel_id: channelId,
+        server_id: (location.pathname.match(/\/channels\/(\d+)\//) || [])[1] || null,
+        author: null,
+        author_id: null,
+        content: "",
+        timestamp: null,
+        attachments: [],
+        embeds: [],
+        is_edit: false,
+        is_delete: true,
+      });
+    }, DELETE_CONFIRM_MS);
+  }
+
   function scanSubtree(node, opts) {
     if (node.nodeType !== 1) return;
     if (node.id && node.id.startsWith(MESSAGE_ID_PREFIX)) {
@@ -301,6 +366,18 @@
   }
 
   const observer = new MutationObserver((mutations) => {
+    const removals = [];
+    for (const m of mutations) {
+      const gone = [];
+      m.removedNodes.forEach((n) => {
+        if (isMessageNode(n)) gone.push(n);
+      });
+      if (gone.length === 1) removals.push([gone[0], messageAbove(m.previousSibling)]);
+      else if (gone.length > 1) removals.push(null);   // a range: never a single delete
+    }
+    if (removals.length && removals.length <= MAX_REMOVALS_PER_CALLBACK && removals.every(Boolean)) {
+      removals.forEach(([li, above]) => considerRemoval(li, above));
+    }
     for (const m of mutations) {
       m.addedNodes.forEach((n) => scanSubtree(n, { fromBacklog: false }));
       // An edit changes text inside an existing node rather than adding one.

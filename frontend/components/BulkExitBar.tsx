@@ -13,6 +13,7 @@
  *    `onActionComplete` hook (typically a table-refresh) and forget.
  */
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import Link from "next/link";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
@@ -47,7 +48,7 @@ const EXIT_DEFS: Record<ExitKey, ExitDef> = {
     iconPath: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9",
   },
   my_orders: {
-    label: "Cancel My Orders",
+    label: "Cancel ALL Open Orders",
     title: "Cancel all your open orders?",
     message:
       "Cancels every still-working order in YOUR connected brokers (Pending / Submitted / Accepted / Partially Filled). Subscribers' orders are not affected. This cannot be undone.",
@@ -90,10 +91,25 @@ interface Props {
   /** Called after a bulk action completes successfully — typically a
    *  `tableRef.current?.refresh()` so the positions list re-renders. */
   onActionComplete?: () => void;
+  /** Render just the buttons, with no card and no "Bulk Exit" heading, to sit
+   *  in a toolbar (the Positions page puts them beside the All / Options /
+   *  Stocks pills). The "Re-Enter Last Exit" strip, when there is one, then
+   *  renders into the element with id BULK_REENTER_SLOT_ID. */
+  inline?: boolean;
 }
 
-export function BulkExitBar({ onActionComplete }: Props) {
+/** Where the inline variant puts its "Re-Enter Last Exit" strip. */
+export const BULK_REENTER_SLOT_ID = "bulk-reenter-slot";
+
+export function BulkExitBar({ onActionComplete, inline }: Props) {
   const [user, setUser] = useState<User | null>(null);
+  // Inline only: the host page's slot for the "Re-Enter Last Exit" strip. Found
+  // after mount — the slot is the page's, and may not be in the DOM on the
+  // first render.
+  const [reenterSlot, setReenterSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (inline) setReenterSlot(document.getElementById(BULK_REENTER_SLOT_ID));
+  }, [inline]);
   const [pending, setPending] = useState<ExitKey | null>(null);
   const [busy, setBusy] = useState(false);
   // Optional trailing-stop trail (%) for "Exit My Positions". Empty = market
@@ -134,6 +150,37 @@ export function BulkExitBar({ onActionComplete }: Props) {
   // exit. null = not yet known (keep enabled until we know it's 0).
   const [posCount, setPosCount] = useState<number | null>(null);
   const noPositions = posCount === 0;
+  // "Pause ALL channels": true while the channels it switched off are still off.
+  const [channelsPaused, setChannelsPaused] = useState<boolean | null>(null);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const hasDiscord = !!user?.discord_available;
+
+  useEffect(() => {
+    if (!hasDiscord) return;
+    api<{ paused: boolean }>("/api/discord-sources/pause-all")
+      .then((r) => setChannelsPaused(r.paused))
+      .catch(() => setChannelsPaused(false));
+  }, [hasDiscord]);
+
+  async function togglePauseAll() {
+    const pause = !channelsPaused;
+    if (!confirm(pause
+      ? "Pause ALL channels? Every Discord channel that is on is turned off, so no new alerts are traded. Open positions and their exits are not touched."
+      : "Resume ALL channels? The channels Pause turned off are turned back on.")) return;
+    setPauseBusy(true);
+    try {
+      const r = await api<{ paused: boolean; changed: number }>("/api/discord-sources/pause-all", {
+        method: "POST", body: JSON.stringify({ paused: pause }),
+      });
+      setChannelsPaused(r.paused);
+      if (pause) notify[r.changed ? "success" : "info"](r.changed ? `Paused ${r.changed} channel${r.changed === 1 ? "" : "s"}` : "No channels were on");
+      else notify.success(`Resumed ${r.changed} channel${r.changed === 1 ? "" : "s"}`);
+    } catch (e) {
+      notify.fromError(e, pause ? "Could not pause the channels" : "Could not resume the channels");
+    } finally {
+      setPauseBusy(false);
+    }
+  }
 
   async function loadPositions() {
     try {
@@ -402,42 +449,50 @@ export function BulkExitBar({ onActionComplete }: Props) {
     </div>
   );
 
-  return (
+  // Who gets which buttons: everyone can cancel their own orders; Exit My
+  // Positions (and its Exit-as / Re-enter controls) needs Sell-All access; the
+  // two subscriber buttons are for traders whose subscribers copy them — not
+  // Discord traders, whose subscribers trade on their own.
+  const myButtons = (
     <>
-      <div
-        className="rounded-xl px-3 py-2.5 flex flex-col gap-2.5"
-        style={cardStyle}
-      >
-        {/* Label — top-left, on its own line. */}
-        <div className="flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--bad)" }} />
-          <span
-            className="text-[10px] uppercase tracking-[0.2em] font-semibold"
-            style={{ color: "var(--text-2)" }}
-          >
-            Bulk Exit
-          </span>
-        </div>
-        {/* One line below the label — your actions hug the left, the subscriber
-            actions hug the right, so the row fills the width with no trailing gap.
-            Scrolls horizontally only if the panel is very narrow. */}
-        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
-          <div className="flex items-center gap-2 shrink-0">
-            {hasSellAll && !noPositions && exitModePill}
-            {hasSellAll && renderButton("my_positions")}
-            {hasSellAll && !noPositions && reentryPill}
-            {renderButton("my_orders")}
-          </div>
-          {actsForSubscribers && (
-            <div className="flex items-center gap-2 shrink-0">
-              {renderButton("subs_positions")}
-              {renderButton("subs_orders")}
-            </div>
-          )}
-        </div>
-      </div>
+      {hasSellAll && !noPositions && exitModePill}
+      {hasSellAll && renderButton("my_positions")}
+      {hasSellAll && !noPositions && reentryPill}
+      {renderButton("my_orders")}
+      {hasDiscord && (
+        <button
+          type="button"
+          onClick={() => void togglePauseAll()}
+          disabled={pauseBusy || channelsPaused === null}
+          title={channelsPaused
+            ? "Turn back on the channels Pause ALL channels turned off"
+            : "Turn off every Discord channel — no new alerts are traded until you resume"}
+          className="shrink-0 whitespace-nowrap inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-50"
+          style={{
+            background: channelsPaused ? "var(--good-soft)" : "rgba(180,83,9,0.14)",
+            border: `1px solid ${channelsPaused ? "var(--good)" : "rgba(180,83,9,0.45)"}`,
+            color: channelsPaused ? "var(--good)" : "var(--warn, #b45309)",
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            {channelsPaused
+              ? <path d="M6 4l14 8-14 8z" />
+              : <><path d="M8 4v16" /><path d="M16 4v16" /></>}
+          </svg>
+          <span>{channelsPaused ? "Resume ALL channels" : "Pause ALL channels"}</span>
+        </button>
+      )}
+    </>
+  );
+  const subscriberButtons = actsForSubscribers && (
+    <>
+      {renderButton("subs_positions")}
+      {renderButton("subs_orders")}
+    </>
+  );
 
-      {hasSellAll && snapshot && snapshot.summary.total > 0 && (
+  const reenterStrip = hasSellAll && snapshot && snapshot.summary.total > 0 && (
         <div
           className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
           style={cardStyle}
@@ -508,8 +563,9 @@ export function BulkExitBar({ onActionComplete }: Props) {
             </button>
           </div>
         </div>
-      )}
+      );
 
+  const modal = (
       <ConfirmModal
         open={pending !== null}
         title={pending ? EXIT_DEFS[pending].title : ""}
@@ -526,6 +582,51 @@ export function BulkExitBar({ onActionComplete }: Props) {
         onConfirm={confirmRun}
         onCancel={() => { if (!busy) setPending(null); }}
       />
+  );
+
+  if (inline) {
+    // No card, no heading: the buttons sit in the host's toolbar. The strip
+    // goes to its slot above the table, when the page provides one.
+    return (
+      <>
+        {myButtons}
+        {subscriberButtons}
+        {reenterStrip && reenterSlot ? createPortal(reenterStrip, reenterSlot) : null}
+        {modal}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div
+        className="rounded-xl px-3 py-2.5 flex flex-col gap-2.5"
+        style={cardStyle}
+      >
+        {/* Label — top-left, on its own line. */}
+        <div className="flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--bad)" }} />
+          <span
+            className="text-[10px] uppercase tracking-[0.2em] font-semibold"
+            style={{ color: "var(--text-2)" }}
+          >
+            Bulk Exit
+          </span>
+        </div>
+        {/* One line below the label — your actions hug the left, the subscriber
+            actions hug the right, so the row fills the width with no trailing gap.
+            Scrolls horizontally only if the panel is very narrow. */}
+        <div className="flex items-center gap-2 flex-nowrap overflow-x-auto justify-between">
+          <div className="flex items-center gap-2 shrink-0">{myButtons}</div>
+          {subscriberButtons && (
+            <div className="flex items-center gap-2 shrink-0">{subscriberButtons}</div>
+          )}
+        </div>
+      </div>
+
+      {reenterStrip}
+
+      {modal}
     </>
   );
 }

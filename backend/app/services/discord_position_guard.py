@@ -32,7 +32,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from sqlalchemy import or_ as sa_or, select
 from sqlalchemy.orm import Session
@@ -72,6 +72,9 @@ class RungConfig:
     profit_gate_pct: Decimal = Decimal("0")
     stop_pct: Decimal = Decimal("0")
     qty_pct: Decimal = Decimal("50")
+    # The stop TRAILS: ``stop_pct`` is then a give-back from the high since this
+    # trim (15 = 15% below the best price), not a return from entry.
+    stop_trail: bool = False
 
 
 @dataclass
@@ -91,11 +94,28 @@ class TrimConfig:
     trim3: RungConfig = RungConfig(Decimal("0"), Decimal("0"), Decimal("100"))
     price_threshold: Decimal = Decimal("0.90")  # above this, exits trail
     trail_amount: Decimal = Decimal("0.25")     # dollar give-back that triggers
+    # The whole ladder, when it is not the classic three: any number of trims,
+    # in order (services/discord_ladder builds it from the settings). When set
+    # it is the ladder; trim1..trim3 above are then not consulted.
+    rungs: tuple[RungConfig, ...] | None = None
+    # Trims 2+ on an expensive contract ride a dollar give-back instead of going
+    # to market. Off for the configured ladder (services/discord_ladder), which
+    # trails the STOP per trim instead.
+    trail_exits: bool = True
+
+    def ladder(self) -> tuple[RungConfig, ...]:
+        return self.rungs if self.rungs else (self.trim1, self.trim2, self.trim3)
+
+    @property
+    def count(self) -> int:
+        """How many trims the ladder has."""
+        return len(self.ladder())
 
     def rung(self, n: int) -> RungConfig:
-        """This rung's settings. Rungs past the third reuse the third's — the
-        ladder has three steps and anything beyond is a repeat of the last."""
-        return {1: self.trim1, 2: self.trim2}.get(n, self.trim3)
+        """This rung's settings. Rungs past the last reuse the last one's — an
+        exit alert that arrives after the ladder is spent repeats its final step."""
+        seq = self.ladder()
+        return seq[n - 1] if 1 <= n <= len(seq) else seq[-1]
 
 
 @dataclass
@@ -108,6 +128,9 @@ class TrimPlan:
     exit_style: str = NONE
     trail_amount: Decimal | None = None
     new_stop_price: Decimal | None = None
+    # Set with new_stop_price when that stop trails (see apply_stop).
+    stop_trail_pct: Decimal | None = None
+    stop_peak: Decimal | None = None
     retire: bool = False
     note: str = ""
 
@@ -139,6 +162,40 @@ def _slice(held: Decimal, pct: Decimal | None) -> Decimal:
         return Decimal(0)
     want = (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_CEILING)
     return want if want < held else held
+
+
+# In a plan's note when the last trim rounded down to nothing: the rung is spent
+# on purpose (auto-trim must not hand it back and fire it again every sweep).
+RUNNER_NOTE = "runner left"
+
+
+def _slice_down(held: Decimal, pct: Decimal | None) -> Decimal:
+    """``pct`` percent of what is still held, rounded DOWN to a whole contract.
+
+    The LAST trim's rule when it is not 100%: whatever the percentage does not
+    cleanly take stays on as a runner. Every earlier trim rounds UP (see _slice)
+    so it can never be a no-op; the last one is where the trader has said they
+    want something left, so it never takes more than asked — 50% of 3 sells 1
+    and leaves 2, and 50% of 1 sells nothing and leaves the 1.
+    """
+    if held <= 0:
+        return Decimal(0)
+    pct = Decimal(str(pct if pct is not None else 50))
+    if pct <= 0:
+        return Decimal(0)
+    return (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_FLOOR)
+
+
+def rung_quantity(cfg: "TrimConfig", rung: int, held: Decimal) -> tuple[Decimal, bool]:
+    """How many contracts this trim sells out of ``held``, and whether it is a
+    last trim that leaves a runner. One rule for a trim fired by an alert, by
+    auto-trim, and for a take-profit order resting at the broker — the three
+    must agree on the size or the ladder walks differently depending on how a
+    trim happened to fire."""
+    rung_cfg = cfg.rung(rung)
+    leaves_runner = rung >= cfg.count and Decimal(str(rung_cfg.qty_pct)) < Decimal(100)
+    sell = _slice_down(held, rung_cfg.qty_pct) if leaves_runner else _slice(held, rung_cfg.qty_pct)
+    return sell, leaves_runner
 
 
 def plan_exit(
@@ -181,10 +238,9 @@ def plan_exit(
     # break-even, so there was no way to say "the 2nd trim moves the stop to
     # +10%". Existing values were negated by migration e4c9d2a6b183, so a
     # ladder that read 25 (25% below) now reads -25 and sits where it always did.
-    stop = (
-        entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100))
-        if entry is not None and entry > 0 else None
-    )
+    # A trailing stop instead starts that give-back below the price now.
+    stop, trail_pct, peak = rung_stop(entry, rung_cfg, mark)
+    trailing = {"stop_trail_pct": trail_pct, "stop_peak": peak}
 
     # A gate of 0 means NO minimum, not "must be at break-even or better".
     # That distinction is the difference between reproducing the old ladder and
@@ -210,7 +266,7 @@ def plan_exit(
             # unprotected position until the next one happens to come.
             return TrimPlan(
                 rung=rung, guard=guard,
-                new_stop_price=_armable_stop(stop, mark),
+                new_stop_price=_armable_stop(stop, mark), **trailing,
                 note=(f"trim {rung}: up {gain_pct.quantize(Decimal('0.01'))}%, "
                       f"under the {gate}% gate — nothing sold"
                       + (f", stop set at {stop.quantize(Decimal('0.0001'))}"
@@ -220,11 +276,22 @@ def plan_exit(
     # How much leaves: this rung's configured share of what is still held.
     # The defaults (50 / 50 / 100) reproduce the ladder exactly as it behaved
     # before the size was configurable.
-    sell = _slice(held, rung_cfg.qty_pct)
+    #
+    # The LAST trim, when it is not 100%, rounds DOWN and leaves the balance as
+    # a runner, still protected by this trim's stop.
+    sell, leaves_runner = rung_quantity(cfg, rung, held)
+    if leaves_runner and sell <= 0:
+        return TrimPlan(
+            rung=rung, guard=guard,
+            new_stop_price=_armable_stop(stop, mark), **trailing,
+            note=(f"trim {rung}: last trim at {rung_cfg.qty_pct.normalize():f}% of {held} "
+                  f"rounds down to 0 — {RUNNER_NOTE}"
+                  + (f", stop {stop.quantize(Decimal('0.0001'))}" if stop is not None else "")),
+        )
 
     # The 1st trim always goes to market. Later rungs ride an expensive contract
     # out on a trailing give-back instead — a cheap one isn't worth trailing.
-    style, amount = _exit_style(entry, cfg) if rung >= 2 else (MARKET, None)
+    style, amount = _exit_style(entry, cfg) if rung >= 2 and cfg.trail_exits else (MARKET, None)
 
     takes_everything = sell >= held
     gain_note = (
@@ -233,14 +300,17 @@ def plan_exit(
     stop_note = (
         "" if takes_everything or stop is None
         else f", stop {stop.quantize(Decimal('0.0001'))}"
+        + (f" trailing {trail_pct.normalize():f}%" if trail_pct is not None else "")
     )
     return TrimPlan(
         rung=rung, guard=guard, sell_qty=sell, exit_style=style,
         trail_amount=amount,
         # Nothing left to protect if this rung takes the whole position.
         new_stop_price=(None if takes_everything else _armable_stop(stop, mark)),
+        **({} if takes_everything else trailing),
         retire=(takes_everything and style == MARKET),
-        note=f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}",
+        note=(f"trim {rung}: {gain_note}sold {sell} of {held}{stop_note}"
+              + (f" — {held - sell} {RUNNER_NOTE}" if leaves_runner and sell < held else "")),
     )
 
 
@@ -280,6 +350,77 @@ def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     if stop is None or mark is None:
         return stop
     return stop if stop < mark else None
+
+
+def rung_stop(entry, rung_cfg: RungConfig, mark) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """Where a trim's stop goes: (stop price, trail %, peak).
+
+    A FIXED stop is a return from entry (-25 -> entry x 0.75). A TRAILING one is
+    a give-back from the best price since the trim — it starts that far below
+    the price now (the entry when there is no mark yet) and ratchet_stop() raises
+    it from there. Trail % and peak are None for a fixed stop."""
+    entry = Decimal(str(entry)) if entry is not None else None
+    if not rung_cfg.stop_trail:
+        if entry is None or entry <= 0:
+            return None, None, None
+        return entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100)), None, None
+    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), mark if mark else entry)
+
+
+def trailing_stop(pct: Decimal, peak) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """A trailing stop ``pct`` % below ``peak``: (stop price, pct, peak)."""
+    if peak is None or pct <= 0:
+        return None, None, None
+    peak = Decimal(str(peak))
+    if peak <= 0:
+        return None, None, None
+    return peak * (Decimal(1) - pct / Decimal(100)), pct, peak
+
+
+def apply_stop(guard: DiscordPositionGuard, plan: "TrimPlan") -> None:
+    """Put a plan's stop on the guard — fixed, or trailing with its peak. A plan
+    with no new stop leaves the one already there (fixed or trailing) alone."""
+    if plan.new_stop_price is None:
+        return
+    guard.stop_price = plan.new_stop_price
+    guard.stop_trail_pct = plan.stop_trail_pct
+    guard.stop_peak = plan.stop_peak
+
+
+# How far a trailing stop must be able to rise before it is moved. Each move
+# replaces the order resting at the broker, so following every cent would spend
+# the rate limit on churn; 2% (at least 2 cents) keeps it within a whisker of
+# the true trail.
+_RATCHET_PCT = Decimal("2")
+_RATCHET_MIN = Decimal("0.02")
+
+
+def ratchet_stop(guard: DiscordPositionGuard, price) -> bool:
+    """Raise a trailing stop after a new high. Only ever up — a pullback leaves
+    it where it is, which is what makes it a stop. Returns True when it moved."""
+    pct = getattr(guard, "stop_trail_pct", None)
+    if pct is None or price is None or guard.stop_price is None:
+        return False
+    price = Decimal(str(price))
+    if price <= 0:
+        return False
+    peak = getattr(guard, "stop_peak", None)
+    peak = Decimal(str(peak)) if peak is not None else None
+    if peak is None or price > peak:
+        guard.stop_peak = peak = price
+    want = _to_tick(peak * (Decimal(1) - abs(Decimal(str(pct))) / Decimal(100)))
+    current = Decimal(str(guard.stop_price))
+    step = max(_RATCHET_MIN, current * _RATCHET_PCT / Decimal(100))
+    if want is None or want <= 0 or want < current + step:
+        return False
+    guard.stop_price = want
+    return True
+
+
+def clear_stop_trail(guard: DiscordPositionGuard) -> None:
+    """The stop is no longer the ladder's trailing one (set or removed by hand)."""
+    guard.stop_trail_pct = None
+    guard.stop_peak = None
 
 
 def _exit_style(entry: Decimal | None, cfg: TrimConfig) -> tuple[str, Decimal | None]:
@@ -328,44 +469,302 @@ def find(db: Session, user_id: uuid.UUID, symbol: str, strike, right, expiry):
     ).scalars().first()
 
 
-def sync_entry_price(db: Session, guard: DiscordPositionGuard) -> bool:
-    """Adopt the opening order's ACTUAL fill price. Returns True if it moved.
+def assigned(db: Session, user_id: uuid.UUID, symbol: str | None = None) -> list[DiscordPositionGuard]:
+    """Live guards the trader assigned to a channel by hand (``source_id`` set),
+    newest first — optionally only one symbol's."""
+    q = select(DiscordPositionGuard).where(
+        DiscordPositionGuard.user_id == user_id,
+        DiscordPositionGuard.closed_at.is_(None),
+        DiscordPositionGuard.source_id.isnot(None),
+    )
+    if symbol:
+        q = q.where(DiscordPositionGuard.symbol == symbol.upper())
+    return list(db.execute(q.order_by(DiscordPositionGuard.created_at.desc())).scalars())
+
+
+def contract_key(strike, right, expiry) -> tuple:
+    """(strike, right, expiry) with the right as its plain value — a guard
+    stores "call"/"put", a broker position carries the enum."""
+    return (strike, getattr(right, "value", right) or None, expiry)
+
+
+def _holding_average(db: Session, guard: DiscordPositionGuard) -> Decimal | None:
+    """The average cost of what is held now: the buys since the position was
+    last FLAT (the entry, each average, a re-entry), weighted by quantity —
+    sells don't change an average cost. None when nothing has filled, or the
+    orders can't be read.
+
+    "Since last flat" rather than "since the guard opened": the guard is created
+    a moment after its entry order (so that bound once dropped the entry itself),
+    and a re-entry after a partial trim is part of the same holding."""
+    from app.models.order import Order, OrderSide  # noqa: PLC0415
+
+    try:
+        q = select(Order).where(
+            Order.user_id == guard.user_id,
+            Order.symbol == (guard.symbol or "").upper(),
+            Order.filled_quantity > 0,
+        )
+        right = getattr(guard.option_right, "value", guard.option_right)
+        for col, val in ((Order.option_strike, guard.option_strike),
+                         (Order.option_right, OptionRight(right) if right else None),
+                         (Order.option_expiry, guard.option_expiry)):
+            q = q.where(col.is_(None) if val is None else col == val)
+        orders = list(db.execute(q).scalars())
+    except Exception:  # noqa: BLE001 — a database that can't answer: no average
+        return None
+
+    def _when(o):
+        t = o.broker_filled_at or o.closed_at or o.created_at
+        if t is not None and t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t or datetime.min.replace(tzinfo=timezone.utc)
+
+    held = cost = Decimal(0)
+    for o in sorted(orders, key=_when):
+        qty = Decimal(str(o.filled_quantity))
+        if o.side == OrderSide.BUY and not o.is_closing and o.filled_avg_price is not None:
+            cost += qty * Decimal(str(o.filled_avg_price))
+            held += qty
+        elif o.side == OrderSide.SELL:
+            if held > 0:
+                cost -= cost * min(qty, held) / held     # sold at the average cost
+            held = max(held - qty, Decimal(0))
+            if held == 0:
+                cost = Decimal(0)                        # flat: a new holding starts
+    if held <= 0:
+        return None
+    return (cost / held).quantize(Decimal("0.0001"))
+
+
+def is_manual(db: Session, guard) -> bool:
+    """Is this position assigned to Self — managed by the trader by hand? Then
+    the ladder does nothing on its own: no take-profit, no auto-trim, no On Fill
+    stop, no re-pricing, and channel exit alerts don't act on it. Stops the
+    trader sets themselves (Positions → Stop / Trl.Stop) still rest and fire."""
+    source_id = getattr(guard, "source_id", None)
+    if source_id is None:
+        return False
+    try:
+        from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+
+        src = db.get(DiscordAlertSource, source_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return src is not None and getattr(src, "channel_id", None) == "self"
+
+
+def hand_to_trader(db: Session, user, guard, cancel) -> int:
+    """Assigned to Self: cancel every order the ladder or a channel placed for
+    this position, and clear what the ladder was holding — the stop, a trailing
+    stop or exit, the take-profit. Orders the trader placed by hand are theirs
+    and are left. Returns how many orders were cancelled."""
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
+    from app.services import discord_stop_orders, discord_take_profit  # noqa: PLC0415
+    from app.services.position_events import because  # noqa: PLC0415
+
+    working = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+    cancelled = 0
+    with because("assigned to Self — managed by you; the ladder's orders were cancelled"):
+        for oid in (guard.tp_order_id, guard.tp_stop_order_id, guard.stop_order_id):
+            o = db.get(Order, oid) if oid else None
+            if o is not None and o.status in working:
+                cancelled += 1
+        discord_take_profit.release(db, guard, cancel)
+        discord_stop_orders.release(db, guard, cancel)
+        # Orders a channel's ALERTS placed for this contract and still working
+        # (a resting trim, an add): the channel no longer manages it.
+        right = getattr(guard.option_right, "value", guard.option_right)
+        q = (select(Order).join(DiscordMessage, DiscordMessage.order_id == Order.id)
+             .where(Order.user_id == guard.user_id, Order.symbol == (guard.symbol or "").upper(),
+                    Order.status.in_(working)))
+        for col, val in ((Order.option_strike, guard.option_strike),
+                         (Order.option_right, OptionRight(right) if right else None),
+                         (Order.option_expiry, guard.option_expiry)):
+            q = q.where(col.is_(None) if val is None else col == val)
+        for o in db.execute(q).scalars():
+            try:
+                cancel(o.id)
+                cancelled += 1
+            except Exception:  # noqa: BLE001
+                log.warning("discord guard: could not cancel %s on hand-over", o.id, exc_info=True)
+        guard.stop_price = None
+        clear_stop_trail(guard)
+        clear_trail(guard)
+        guard.tp_off = True
+        guard.fill_stop_done = True
+        db.flush()
+    log.info("discord guard: %s handed to the trader (Self) — %d order(s) cancelled", guard.symbol, cancelled)
+    return cancelled
+
+
+def restart_ladder(db: Session, user_id, symbol: str, strike, right, expiry, *,
+                   entry_order_id, entry_price: Decimal | None, added_qty: Decimal | None = None,
+                   held_qty: Decimal | None = None, ts=None) -> DiscordPositionGuard | None:
+    """A RE-ENTRY starts the ladder over: back to T1, nothing trailing, the
+    take-profit for T1 next, and the entry recalculated.
+
+    * Nothing held (re-entering after a full exit): a fresh ladder — the live
+      one reset, or a NEW one when the old has finished, on the same channel
+      the position came from, so that channel's rules apply. The On Fill stop
+      is placed when the re-entry fills, as for any entry.
+    * Some still held (re-entering what a trim sold): the same ladder reset,
+      the entry re-weighted with the re-entry, and the On Fill stop recomputed
+      from it straight away, so what is held stays protected.
+    """
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    guard = find(db, user_id, symbol, strike, right, expiry)
+    still_held = (held_qty or Decimal(0)) > 0
+    if guard is None:
+        # The last ladder this contract had (finished): the channel it was on.
+        prev = db.execute(
+            select(DiscordPositionGuard).where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.symbol == symbol.upper(),
+                DiscordPositionGuard.option_strike == strike,
+                DiscordPositionGuard.option_right == (getattr(right, "value", right) or None),
+                DiscordPositionGuard.option_expiry == expiry,
+            ).order_by(DiscordPositionGuard.created_at.desc()).limit(1)
+        ).scalars().first()
+        if prev is None:
+            return None                         # never on a ladder: nothing to restart
+        source_id = None
+        if prev is not None:
+            source_id = prev.source_id
+            if source_id is None and prev.entry_order_id is not None:
+                from app.services.discord_channel_settings import source_for_order  # noqa: PLC0415
+
+                source_id = source_for_order(db, prev.entry_order_id)
+        guard = DiscordPositionGuard(
+            user_id=user_id, symbol=symbol.upper(), option_strike=strike,
+            option_right=(getattr(right, "value", right) or None), option_expiry=expiry,
+            sell_count=0, entry_price=entry_price, entry_order_id=entry_order_id,
+            source_id=source_id,
+        )
+        db.add(guard)
+        db.flush()
+        log.info("discord guard: re-entry opened a fresh ladder for %s %s", symbol, strike)
+        return guard
+
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("re-entered — the ladder starts over at T1"):
+        guard.sell_count = 0
+        guard.entry_order_id = entry_order_id
+        guard.tp_off = False
+        guard.tp_backoff_until = None
+        clear_trail(guard)
+        clear_stop_trail(guard)
+        if still_held and entry_price is not None and added_qty:
+            sync_entry_price(db, guard)        # what is held, at what it really cost
+            average_in(db, guard, held_qty=held_qty, added_qty=added_qty, added_price=entry_price)
+            fill = discord_ladder.fill_stop_pct(ts) if ts is not None else None
+            if fill is not None and guard.entry_price:
+                stop, trail_pct, peak = rung_stop(
+                    guard.entry_price,
+                    RungConfig(stop_pct=fill, stop_trail=discord_ladder.fill_stop_trails(ts)), None)
+                stop = _to_tick(stop)
+                if stop is not None and stop > 0:
+                    guard.stop_price = stop
+                    guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+            guard.fill_stop_done = True        # set here, not again when it fills
+        else:
+            # Nothing held: as a new position — its On Fill stop when it fills.
+            guard.entry_price = entry_price if entry_price is not None else guard.entry_price
+            guard.stop_price = None
+            guard.fill_stop_done = False
+        if hasattr(db, "flush"):
+            db.flush()
+    log.info("discord guard: re-entry restarted the ladder for %s %s", symbol, strike)
+    return guard
+
+
+def sync_entry_price(db: Session, guard: DiscordPositionGuard, ts=None) -> bool:
+    """Adopt what the position ACTUALLY cost. Returns True if it moved.
 
     ``entry_price`` is seeded at placement with the limit we bid, because that
-    is the only reference that exists before the order fills. For a plain limit
-    buy the fill can only be at or better than that, so the seed was pessimistic
-    but safe.
+    is the only reference that exists before the order fills, and an average
+    re-weights it at placement the same way (average_in). Both are corrected
+    here from the fills: the average cost of every buy of this holding — the
+    entry and each average — weighted by quantity.
 
-    The +10% entry reprice broke that: it moves the limit ABOVE the alert's
-    price and can fill there, so the seeded value is a price the trader never
-    paid. Left uncorrected the whole ladder shifts -- the -25% stop sits further
-    below the real cost than asked, the profit gate opens early, and the
-    "break-even" stop on rung 2 is set BELOW the fill, which books a loss.
+    (It used to adopt only the OPENING order's fill. That undid every average:
+    averaging 4 @ 0.41 with 4 @ 0.38 re-weighted the entry to 0.395, and the
+    next pass put it back to 0.41 — targets and stops kept measuring from a
+    price no longer paid.)
 
-    Only ever adopts the opening order's own fill, so a later add cannot
-    re-average the reference out from under a stop already protecting the
-    position.
+    When it moves and ``ts`` (the settings that govern the position) is given,
+    the ladder's stop moves with it — see reprice_ladder_stop.
     """
     from app.models.order import Order, OrderStatus  # noqa: PLC0415
 
-    if guard.entry_order_id is None:
+    filled = _holding_average(db, guard)
+    if filled is None:
+        # Fall back to the opening order's own fill.
+        if guard.entry_order_id is None:
+            return False
+        order = db.get(Order, guard.entry_order_id)
+        if order is None or order.status not in (
+            OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
+        ):
+            return False
+        if order.filled_avg_price is None or Decimal(str(order.filled_avg_price)) <= 0:
+            return False
+        filled = Decimal(str(order.filled_avg_price))
+    if filled <= 0:
         return False
-    order = db.get(Order, guard.entry_order_id)
-    if order is None or order.status not in (
-        OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
-    ):
-        return False
-    filled = order.filled_avg_price
-    if filled is None or Decimal(str(filled)) <= 0:
-        return False
-    filled = Decimal(str(filled))
     if guard.entry_price is not None and Decimal(str(guard.entry_price)) == filled:
         return False
-    log.info(
-        "discord guard: %s entry %s -> %s (actual fill)",
-        guard.symbol, guard.entry_price, filled,
-    )
+    old = guard.entry_price
+    log.info("discord guard: %s entry %s -> %s (actual cost)", guard.symbol, old, filled)
     guard.entry_price = filled
+    if ts is not None:
+        reprice_ladder_stop(guard, old, filled, ts)
+    return True
+
+
+def reprice_ladder_stop(guard: DiscordPositionGuard, old_entry, new_entry, ts) -> bool:
+    """After the entry moved (an average filled), move the LADDER's stop with it.
+
+    The stop the ladder set is a return from entry — the On Fill stop before any
+    trim, else the stop of the last trim — so it is recomputed from the new
+    average. Only when the stop sits exactly where the ladder put it: a stop set
+    by hand is the trader's, and a trailing stop measures from its high, not
+    from entry, so neither is touched. Returns True when it moved.
+    """
+    from app.services import discord_ladder  # noqa: PLC0415
+
+    if (old_entry is None or new_entry is None or guard.stop_price is None
+            or getattr(guard, "stop_trail_pct", None) is not None):
+        return False
+    old_entry, new_entry = Decimal(str(old_entry)), Decimal(str(new_entry))
+    rung = guard.sell_count or 0
+    if rung == 0:
+        if discord_ladder.fill_stop_trails(ts):
+            return False
+        pct = discord_ladder.fill_stop_pct(ts)
+    else:
+        cfg = discord_ladder.trim_config(ts).rung(rung)
+        if cfg.stop_trail:
+            return False
+        pct = cfg.stop_pct
+    if pct is None:
+        return False
+    pct = Decimal(str(pct))
+    was = _to_tick(old_entry * (Decimal(1) + pct / Decimal(100)))
+    if was is None or Decimal(str(guard.stop_price)) != was:
+        return False                      # not the ladder's level: set by hand
+    now = _to_tick(new_entry * (Decimal(1) + pct / Decimal(100)))
+    if now is None or now <= 0 or now == was:
+        return False
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because(f"averaged — the ladder's stop recalculated from the new average {_to_tick(new_entry)}"):
+        guard.stop_price = now
+    log.info("discord guard: %s averaged %s -> %s; ladder stop %s -> %s",
+             guard.symbol, old_entry, new_entry, was, now)
     return True
 
 
@@ -459,6 +858,7 @@ def on_buy(
             )
             guard.entry_price = entry_price
             guard.entry_order_id = entry_order_id
+            guard.fill_stop_done = False      # a new holding: its On Fill stop is still to come
         elif guard.entry_order_id is None and entry_order_id is not None:
             guard.entry_order_id = entry_order_id
         return guard
@@ -557,6 +957,18 @@ def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
     guard.closed_reason = reason[:120]
 
 
+def live(db: Session, user_id: uuid.UUID) -> list[DiscordPositionGuard]:
+    """Every live guard of one trader, armed or not."""
+    return list(
+        db.execute(
+            select(DiscordPositionGuard).where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.closed_at.is_(None),
+            )
+        ).scalars()
+    )
+
+
 def armed(db: Session) -> list[DiscordPositionGuard]:
     """Every live guard with something to enforce — a stop level, a trailing
     exit, or both."""
@@ -578,6 +990,7 @@ def armed(db: Session) -> list[DiscordPositionGuard]:
 
 __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
-    "arm_trail", "armed", "clear_trail", "find", "on_buy", "plan_exit",
-    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price",
+    "arm_trail", "armed", "clear_trail", "rung_stop", "trailing_stop", "apply_stop",
+    "ratchet_stop", "clear_stop_trail", "find", "on_buy", "plan_exit",
+    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
 ]

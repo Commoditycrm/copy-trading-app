@@ -276,6 +276,14 @@ export default function BrokersPage() {
   // Whether the server has direct-Webull connect enabled. Hides the Webull
   // picker option when off (connect would 400). Fetched in load().
   const [webullEnabled, setWebullEnabled] = useState(false);
+  // Kopyya-hosted IBKR gateways available on this server (IBKR_GATEWAY_POOL_SIZE > 0).
+  const [ibkrHosted, setIbkrHosted] = useState(false);
+  // Per hosted-IBKR account: is its gateway signed in right now? Polled.
+  const [ibkrSignedIn, setIbkrSignedIn] = useState<Record<string, boolean | null>>({});
+  const [ibkrSigning, setIbkrSigning] = useState<string | null>(null);
+  // Accounts whose verify failed for the CURRENT sign-in: don't retry every
+  // poll (it toasted every 5s on QA); retry once the gateway signs out and in again.
+  const ibkrVerifyFailed = useRef<Set<string>>(new Set());
 
   // Alpaca form state
   const [label, setLabel] = useState("");
@@ -315,13 +323,21 @@ export default function BrokersPage() {
   const [stPaper, setStPaper] = useState(false);
 
   // IBKR direct-OAuth form state. Each field maps 1:1 to the backend's
-  // IbkrCredentialsIn schema. Long fields (signing_key, access_token_secret)
-  // use textareas because IBKR keys can run to several hundred characters
+  // IbkrCredentialsIn schema. The PEM keys, the DH prime and the encrypted
+  // access token secret use textareas because they run to many hundreds of characters
   // for RSA-style OAuth configurations.
   const [ibkrLabel, setIbkrLabel] = useState("");
   const [ibkrAccountId, setIbkrAccountId] = useState("");
+  // "gateway" = IBKR's Client Portal Gateway running on the server's machine
+  // (what individual accounts get); "oauth" = institutional self-service OAuth.
+  // "hosted" = Kopyya runs the gateway on the server and the owner signs in
+  // from the card (default when the server has a pool).
+  const [ibkrMode, setIbkrMode] = useState<"hosted" | "gateway" | "oauth">("gateway");
+  const [ibkrGatewayUrl, setIbkrGatewayUrl] = useState("https://localhost:5000");
   const [ibkrConsumerKey, setIbkrConsumerKey] = useState("");
-  const [ibkrSigningKey, setIbkrSigningKey] = useState("");
+  const [ibkrSignatureKey, setIbkrSignatureKey] = useState("");
+  const [ibkrEncryptionKey, setIbkrEncryptionKey] = useState("");
+  const [ibkrDhPrime, setIbkrDhPrime] = useState("");
   const [ibkrAccessToken, setIbkrAccessToken] = useState("");
   const [ibkrAccessTokenSecret, setIbkrAccessTokenSecret] = useState("");
   const [ibkrPaper, setIbkrPaper] = useState(false);
@@ -355,8 +371,12 @@ export default function BrokersPage() {
       // immediately instead of looking stuck until refresh.
       emitBrokerChanged();
       // Feature flags (best-effort — a failure just leaves Webull hidden).
-      api<{ webull_direct_enabled: boolean }>("/api/brokers/features")
-        .then(f => setWebullEnabled(!!f.webull_direct_enabled))
+      api<{ webull_direct_enabled: boolean; ibkr_hosted_enabled?: boolean }>("/api/brokers/features")
+        .then(f => {
+          setWebullEnabled(!!f.webull_direct_enabled);
+          setIbkrHosted(!!f.ibkr_hosted_enabled);
+          if (f.ibkr_hosted_enabled) setIbkrMode("hosted");
+        })
         .catch(() => {});
       // Pull live balances immediately on entry, so opening (or being
       // redirected to) the page shows fresh numbers right away instead of the
@@ -457,7 +477,9 @@ export default function BrokersPage() {
     setWebullAccounts(null); setWebullManualId(false);
     setStLabel(""); setStBrokerSlug(""); setStPaper(false);
     setIbkrLabel(""); setIbkrAccountId(""); setIbkrConsumerKey("");
-    setIbkrSigningKey(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
+    setIbkrMode("gateway"); setIbkrGatewayUrl("https://localhost:5000");
+    setIbkrSignatureKey(""); setIbkrEncryptionKey(""); setIbkrDhPrime("");
+    setIbkrAccessToken(""); setIbkrAccessTokenSecret("");
     setIbkrPaper(false);
   }
 
@@ -470,19 +492,31 @@ export default function BrokersPage() {
         body: JSON.stringify({
           broker: "ibkr",
           label: ibkrLabel.trim(),
-          ibkr: {
-            consumer_key:        ibkrConsumerKey.trim(),
-            signing_key:         ibkrSigningKey.trim(),
-            access_token:        ibkrAccessToken.trim(),
-            access_token_secret: ibkrAccessTokenSecret.trim(),
-            account_id:          ibkrAccountId.trim(),
-            paper:               ibkrPaper,
+          ibkr: ibkrMode === "hosted" ? {
+            mode:        "hosted",
+            account_id:  ibkrAccountId.trim() || undefined,
+            paper:       ibkrPaper,
+          } : ibkrMode === "gateway" ? {
+            mode:        "gateway",
+            gateway_url: ibkrGatewayUrl.trim(),
+            account_id:  ibkrAccountId.trim(),
+            paper:       ibkrPaper,
+          } : {
+            mode:                   "oauth",
+            consumer_key:           ibkrConsumerKey.trim(),
+            access_token:           ibkrAccessToken.trim(),
+            access_token_secret:    ibkrAccessTokenSecret.trim(),
+            private_signature_key:  ibkrSignatureKey.trim(),
+            private_encryption_key: ibkrEncryptionKey.trim(),
+            dh_prime:               ibkrDhPrime.trim(),
+            account_id:             ibkrAccountId.trim(),
+            paper:                  ibkrPaper,
           },
         }),
       });
       await load();
       resetConnectForms();
-      notify.success("IBKR connected");
+      notify.success(ibkrMode === "hosted" ? "Gateway reserved — click Sign in to IBKR on the card to finish" : "IBKR connected");
     } catch (e) {
       notify.fromError(e, "IBKR connect failed");
     } finally {
@@ -603,6 +637,57 @@ export default function BrokersPage() {
   // spinner alone so the UI doesn't flicker every half-minute. A failed
   // auto-poll is intentionally quiet — the card already surfaces last_error
   // and a stale "Updated …" timestamp.
+  // Hosted IBKR: open the gateway's login page (served through our backend)
+  // in a new tab. The status poll below notices the sign-in and, for a
+  // pending account, completes the connection.
+  async function signInToIbkr(id: string) {
+    setIbkrSigning(id);
+    try {
+      const r = await api<{ url: string }>(`/api/brokers/${id}/ibkr-gateway/login-url`, { method: "POST" });
+      const w = window.open(r.url, "_blank", "noopener");
+      if (!w) notify.warn("Your browser blocked the IBKR sign-in window — allow pop-ups for this site and try again.");
+    } catch (e) {
+      notify.fromError(e, "Could not open the IBKR sign-in page");
+    } finally {
+      setIbkrSigning(null);
+    }
+  }
+
+  // Poll each hosted IBKR account's sign-in state: every 5s while something is
+  // pending or signed out (the owner is likely mid sign-in), every 30s otherwise.
+  useEffect(() => {
+    const hosted = accounts.filter(a => a.broker === "ibkr" && a.ibkr_gateway_slot != null);
+    if (hosted.length === 0) return;
+    let stopped = false;
+    const tick = async () => {
+      for (const a of hosted) {
+        try {
+          const st = await api<{ signed_in: boolean; connection_status: string }>(`/api/brokers/${a.id}/ibkr-gateway/status`);
+          if (stopped) return;
+          setIbkrSignedIn(cur => ({ ...cur, [a.id]: st.signed_in }));
+          if (!st.signed_in) ibkrVerifyFailed.current.delete(a.id);
+          if (st.signed_in && a.connection_status === "pending" && !ibkrVerifyFailed.current.has(a.id)) {
+            try {
+              await api(`/api/brokers/${a.id}/ibkr-gateway/verify`, { method: "POST" });
+              notify.success("IBKR connected");
+              await load();
+            } catch (e) {
+              ibkrVerifyFailed.current.add(a.id);
+              notify.fromError(e, "IBKR sign-in seen, but the account could not be verified");
+            }
+          }
+        } catch {
+          if (!stopped) setIbkrSignedIn(cur => ({ ...cur, [a.id]: false }));
+        }
+      }
+    };
+    void tick();
+    const needsFast = hosted.some(a => a.connection_status === "pending" || ibkrSignedIn[a.id] === false);
+    const t = setInterval(tick, needsFast ? 5000 : 30000);
+    return () => { stopped = true; clearInterval(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accounts.map(a => `${a.id}:${a.connection_status}:${a.ibkr_gateway_slot ?? ""}`).join(","), Object.values(ibkrSignedIn).some(v => v === false)]);
+
   async function refreshBalance(id: string, opts?: { silent?: boolean }) {
     const silent = opts?.silent ?? false;
     if (!silent) setRefreshing(p => ({ ...p, [id]: true }));
@@ -757,6 +842,33 @@ export default function BrokersPage() {
                   {a.last_error && (
                     <div className="text-xs mt-2" style={{ color: "var(--bad)" }}>{a.last_error}</div>
                   )}
+                  {a.broker === "ibkr" && a.ibkr_gateway_slot != null && (
+                    <div className="flex items-center gap-2 mt-2 flex-wrap">
+                      <span
+                        className="text-xs"
+                        style={{ color: ibkrSignedIn[a.id] ? "var(--good)" : "var(--muted)" }}
+                      >
+                        {ibkrSignedIn[a.id] == null
+                          ? "Checking IBKR sign-in…"
+                          : ibkrSignedIn[a.id]
+                          ? "IBKR session signed in"
+                          : a.connection_status === "pending"
+                          ? "Sign in to IBKR to finish connecting"
+                          : "IBKR session signed out — sign in to resume"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void signInToIbkr(a.id)}
+                        disabled={ibkrSigning === a.id}
+                        className={`${ibkrSignedIn[a.id] ? "btn-ghost" : "btn-primary"} px-3 py-1 text-xs font-medium disabled:opacity-40`}
+                        title={ibkrSignedIn[a.id]
+                          ? "Already signed in. IBKR ends the session at midnight New York time; sign in again each trading morning."
+                          : "Opens IBKR's login page for your hosted gateway"}
+                      >
+                        {ibkrSigning === a.id ? "Opening…" : ibkrSignedIn[a.id] ? "Sign in again" : "Sign in to IBKR"}
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -771,7 +883,7 @@ export default function BrokersPage() {
                   >
                     {switching === a.id ? "Deactivating…" : "Deactivate"}
                   </button>
-                ) : (
+                ) : a.ibkr_gateway_slot != null && a.connection_status === "pending" ? null : (
                   <button
                     onClick={() => void setActive(a, true)}
                     disabled={switching !== null}
@@ -1112,14 +1224,72 @@ export default function BrokersPage() {
               <BrokerAvatar broker="ibkr" size={32} />
               <h2 className="font-semibold">Connect Interactive Brokers</h2>
             </div>
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              Direct IBKR integration via their OAuth 1.0a Web API — no
-              aggregator, no local gateway. Generate the four OAuth values
-              in your IBKR Client Portal under{" "}
-              <strong>Settings → API → OAuth</strong> (self-service
-              consumer registration) and paste them here together with
-              your IBKR account number. Mirror latency is typically 2–5s.
-            </p>
+            <div className="flex gap-2 text-xs" role="tablist" aria-label="IBKR connection method">
+              {(ibkrHosted ? (["hosted", "gateway", "oauth"] as const) : (["gateway", "oauth"] as const)).map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  role="tab"
+                  aria-selected={ibkrMode === m}
+                  onClick={() => setIbkrMode(m)}
+                  className="px-3 py-1.5 rounded-md border"
+                  style={{
+                    borderColor: ibkrMode === m ? "var(--accent)" : "var(--border)",
+                    color: ibkrMode === m ? "var(--fg)" : "var(--muted)",
+                    background: ibkrMode === m ? "var(--card)" : "transparent",
+                  }}
+                >
+                  {m === "hosted" ? "Kopyya-hosted (recommended)" : m === "gateway" ? "Gateway on your own machine" : "OAuth (institutional accounts)"}
+                </button>
+              ))}
+            </div>
+            {ibkrMode === "hosted" ? (
+              <>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  Nothing to install. Kopyya runs an IBKR gateway for you on its
+                  server. After you connect, a <strong>Sign in to IBKR</strong>{" "}
+                  button appears on your IBKR card: click it, enter your IBKR
+                  username and password on IBKR&apos;s own page, and you&apos;re live.
+                  Your password goes straight to IBKR; Kopyya never sees it.
+                </p>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  IBKR ends every session at midnight New York time, so you click
+                  Sign in to IBKR once each trading morning. The account must be
+                  on the IBKR Pro plan.
+                </p>
+              </>
+            ) : ibkrMode === "gateway" ? (
+              <>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  IBKR gives individual accounts API access only through its
+                  Client Portal Gateway, a small Java app that runs on the same
+                  machine as this server. Start it, open its address in a
+                  browser, sign in with the IBKR username for this account, then
+                  connect here. The login lasts until IBKR&apos;s nightly reset,
+                  so you sign in once each trading day.
+                </p>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  Paper accounts work the same way: sign into the gateway with
+                  your paper username and enter the <strong>DU…</strong> account number.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  Direct OAuth 1.0a access, which IBKR offers to institutional
+                  accounts (advisors, organizations, funds). In IBKR Client
+                  Portal under <strong>Settings → API → OAuth</strong>, register
+                  a self-service consumer with a signature key, an encryption
+                  key and DH parameters you generate, then create an access
+                  token. Paste the consumer key, the access token and its
+                  encrypted secret, both private keys and the DH prime here.
+                </p>
+                <p className="text-xs" style={{ color: "var(--muted)" }}>
+                  IBKR activates new OAuth keys during its nightly reset, so a
+                  consumer created today can only be connected tomorrow.
+                </p>
+              </>
+            )}
             <form onSubmit={connectIbkr} className="space-y-3">
               <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label</label>
@@ -1138,13 +1308,37 @@ export default function BrokersPage() {
                 <input
                   type="text"
                   className="w-full p-2.5 font-mono text-sm"
-                  placeholder="U1234567"
+                  placeholder={ibkrMode === "oauth" ? "U1234567" : "DU1234567 or U1234567"}
                   aria-label="IBKR account ID"
                   value={ibkrAccountId}
                   onChange={e => setIbkrAccountId(e.target.value)}
-                  required
+                  required={ibkrMode !== "hosted"}
                 />
+                {ibkrMode === "hosted" && (
+                  <p className="text-[10px] mt-1" style={{ color: "var(--muted)" }}>
+                    Optional if your IBKR login has just one account — it is picked up after you sign in.
+                  </p>
+                )}
               </div>
+              {ibkrMode === "gateway" && (
+                <div>
+                  <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Gateway address</label>
+                  <input
+                    type="text"
+                    className="w-full p-2.5 font-mono text-sm"
+                    placeholder="https://localhost:5000"
+                    aria-label="IBKR gateway address"
+                    value={ibkrGatewayUrl}
+                    onChange={e => setIbkrGatewayUrl(e.target.value)}
+                    required
+                  />
+                  <p className="text-[10px] mt-1" style={{ color: "var(--muted)" }}>
+                    Where the gateway listens, as seen from this server. Must be
+                    localhost or a private-network address.
+                  </p>
+                </div>
+              )}
+              {ibkrMode === "oauth" && (<>
               <div>
                 <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Consumer key</label>
                 <input
@@ -1153,18 +1347,6 @@ export default function BrokersPage() {
                   aria-label="IBKR consumer key"
                   value={ibkrConsumerKey}
                   onChange={e => setIbkrConsumerKey(e.target.value)}
-                  required
-                />
-              </div>
-              <div>
-                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Signing key</label>
-                <textarea
-                  className="w-full p-2.5 font-mono text-xs"
-                  rows={3}
-                  placeholder="Paste your consumer signing key (long base64 / PEM)"
-                  aria-label="IBKR signing key"
-                  value={ibkrSigningKey}
-                  onChange={e => setIbkrSigningKey(e.target.value)}
                   required
                 />
               </div>
@@ -1184,12 +1366,50 @@ export default function BrokersPage() {
                 <textarea
                   className="w-full p-2.5 font-mono text-xs"
                   rows={3}
+                  placeholder="The base64 secret IBKR showed once, encrypted to your encryption key"
                   aria-label="IBKR access token secret"
                   value={ibkrAccessTokenSecret}
                   onChange={e => setIbkrAccessTokenSecret(e.target.value)}
                   required
                 />
               </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Private signature key (PEM)</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={4}
+                  placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+                  aria-label="IBKR private signature key"
+                  value={ibkrSignatureKey}
+                  onChange={e => setIbkrSignatureKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Private encryption key (PEM)</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={4}
+                  placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+                  aria-label="IBKR private encryption key"
+                  value={ibkrEncryptionKey}
+                  onChange={e => setIbkrEncryptionKey(e.target.value)}
+                  required
+                />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>DH prime</label>
+                <textarea
+                  className="w-full p-2.5 font-mono text-xs"
+                  rows={3}
+                  placeholder="Hex modulus from the OAuth page, or paste the whole dhparam.pem"
+                  aria-label="IBKR DH prime"
+                  value={ibkrDhPrime}
+                  onChange={e => setIbkrDhPrime(e.target.value)}
+                  required
+                />
+              </div>
+              </>)}
               <PaperLiveRadio
                 value={ibkrPaper}
                 onChange={setIbkrPaper}
@@ -1201,8 +1421,11 @@ export default function BrokersPage() {
                 {busy && <Spinner />}
               </button>
               <p className="text-[10px]" style={{ color: "var(--muted)" }}>
-                We verify the credentials with a live IBKR call before
-                saving. Stored Fernet-encrypted at rest; never logged.
+                {ibkrMode === "hosted"
+                  ? "A gateway is reserved for you now; the connection goes live after you sign in from the card."
+                  : ibkrMode === "gateway"
+                  ? "We check the gateway is signed in and list its accounts before saving."
+                  : "We complete IBKR's live-session handshake and list your accounts before saving. Keys are stored Fernet-encrypted at rest and never logged."}
               </p>
             </form>
           </>

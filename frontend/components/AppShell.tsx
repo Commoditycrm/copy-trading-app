@@ -9,6 +9,7 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { HEADER_STATS_SLOT_ID } from "@/lib/headerSlot";
 import { CopyDiscordPromptModal } from "@/components/CopyDiscordPromptModal";
 import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
@@ -416,8 +417,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           router.replace("/admin");
           return;
         }
+        // The footer copy switch renders only once this state has loaded. A
+        // failed first fetch (backend mid-reload, a transient 5xx) used to hide
+        // the switch until a full page reload, so retry a few times before
+        // giving up.
+        const withRetry = <T,>(load: () => Promise<T>, apply: (v: T) => void, attempts = 4) => {
+          const go = (n: number) => load().then(apply).catch(() => {
+            if (n > 1) setTimeout(() => go(n - 1), 2500);
+          });
+          go(attempts);
+        };
         if (u.role === "trader") {
-          api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+          withRetry(() => api<BulkCopyState>("/api/subscribers/copy-state"), setBulkCopy);
           api<TraderSettings>("/api/settings/trader")
             .then((t) => setTraderDiscord({
               enabled: !!t.discord_alerts_enabled,
@@ -425,7 +436,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             }))
             .catch(() => {});
         } else {
-          api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
+          withRetry(() => api<SubscriberSettings>("/api/settings/subscriber"), setSubCopy);
         }
         // Hydrate bell badge for both roles. Today only subscribers
         // receive notifications (copy.retry_failed) but the table is
@@ -460,10 +471,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // 5xx) shouldn't leave the switch stale. Re-fetch the true copy state whenever
   // the tab regains focus, so returning to a background tab corrects it.
   useEffect(() => {
-    if (user?.role !== "trader") return;
+    if (!user || user.role === "admin") return;
     const refetch = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState !== "visible") return;
+      if (user.role === "trader") {
         api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+      } else {
+        api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
       }
     };
     window.addEventListener("focus", refetch);
@@ -798,6 +812,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="hidden sm:block">
               <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
             </div>
+            {/* A page's headline figures (the Positions page puts its Day's P&L,
+                Unrealized P&L, Market value and Account value here). Empty elsewhere. */}
+            <div id={HEADER_STATS_SLOT_ID} className="hidden xl:flex items-center ml-1 min-w-0" />
           </div>
           {/* Right: theme toggle + bell + who's signed in + role chip. */}
           <div className="flex items-center gap-2 sm:gap-3">

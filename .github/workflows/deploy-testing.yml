@@ -13,7 +13,9 @@ jobs:
   deploy:
     name: Build + migrate + restart QA on Lightsail
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Above the SSH step's own command_timeout below, so the step's clearer
+    # error is the one that fires.
+    timeout-minutes: 45
 
     steps:
       - name: Sanity check secrets are configured
@@ -37,11 +39,25 @@ jobs:
           username: ${{ secrets.TEST_DEPLOY_USER }}
           key: ${{ secrets.TEST_DEPLOY_SSH_KEY }}
           script_stop: true
+          # The action's default is 10m. The frontend build alone has taken
+          # longer than that on this box when it is short of memory
+          # (2026-10-02: compiled in 81s, then 2.4min, then 17.2min across
+          # three deploys the same afternoon), and a deploy killed mid-build
+          # never reaches migrate / restart — QA silently stays on old code.
+          command_timeout: 40m
           script: |
             set -euo pipefail
 
             PROJECT_DIR="$HOME/copy-trading-app"
             cd "$PROJECT_DIR"
+
+            # The QA-only discord-listener lives behind `profiles: [discord]`.
+            # Export the profile for every compose command so `up -d
+            # --remove-orphans` keeps it running instead of stopping it as an
+            # orphan each deploy (that's what took the Discord channels down).
+            # ibkr = the hosted IBKR gateway containers (ibkr-gw-N). Same reason:
+            # without the profile exported, `--remove-orphans` would stop them.
+            export COMPOSE_PROFILES=discord,ibkr
 
             echo "── git pull qa-branch ───────────────────────────────────"
             git fetch --prune origin qa-branch
@@ -52,7 +68,19 @@ jobs:
             # Build worker too — it shares ./backend but is a separate image;
             # omitting it leaves the worker on stale code after a deploy while
             # the DB migrates forward (schema/code drift, e.g. missing columns).
-            docker compose build backend worker frontend
+            # discord-listener is built explicitly so its image is fresh too.
+            #
+            # ONE image at a time. Built together they compete for the box's
+            # memory with each other and with the running app; the frontend
+            # (next build) is the heavy one, and under that pressure it went
+            # from 81s to 17 minutes. Sequential costs a little wall-clock when
+            # the box is healthy and avoids the stall when it is not.
+            # ibkr-gw-1 builds the ONE gateway image every ibkr-gw-N shares
+            # (same `image:` tag in docker-compose.yml), so it is built once.
+            for svc in backend worker discord-listener ibkr-gw-1 frontend; do
+              echo "── build $svc"
+              docker compose build "$svc"
+            done
 
             echo "── alembic upgrade head ─────────────────────────────────"
             docker compose run --rm backend alembic upgrade head
