@@ -256,5 +256,7 @@ _IBKR_SSO_BASE_EXPR_PROXIED = (
 
 
 def is_rewritable(content_type: str | None) -> bool:
+    """Only documents that carry URLs the browser will follow. JSON (the
+    SRP/two-factor exchange) is passed through untouched."""
     ct = (content_type or "").lower()
-    return any(t in ct for t in ("text/html", "javascript", "text/css", "application/json"))
+    return any(t in ct for t in ("text/html", "javascript", "text/css"))

@@ -824,18 +824,20 @@ async def _run_rejection_notify_in_background(
 
         trader_label = trader.display_name or trader.email or "Trader"
         symbol = order.symbol or "—"
+        instrument = notif_svc.instrument_label(order)
         side = order.side.value.upper() if order.side else "?"
         qty = str(order.quantity) if order.quantity is not None else "?"
         reason = (order.reject_reason or "broker rejected").strip()
         # Keep the message concise — the notifications bell has limited
         # real estate. Detail goes in metadata for the deep-dive view.
         message = (
-            f"{trader_label} tried to {side} {qty} {symbol} — rejected by broker"
+            f"{trader_label} tried to {side} {qty} {instrument} — rejected by broker"
         )
         metadata = {
             "trader_id": str(trader.id),
             "trader_order_id": str(order.id),
             "symbol": symbol,
+            "instrument": instrument,
             "side": order.side.value if order.side else None,
             "order_type": order.order_type.value if order.order_type else None,
             "quantity": qty,
@@ -1294,12 +1296,14 @@ def _place_trader_order(
                     user_id=trader.id,
                     type="order.rejected",
                     message=(
-                        f"Your {order.side.value.upper()} {order.symbol} order was "
+                        f"Your {order.side.value.upper()} "
+                        f"{notif_svc.instrument_label(order)} order was "
                         f"rejected: {str(exc)[:180]}"
                     ),
                     metadata={
                         "order_id": str(order.id),
                         "symbol": order.symbol,
+                        "instrument": notif_svc.instrument_label(order),
                         "side": order.side.value,
                         "reason": str(exc)[:300],
                     },
