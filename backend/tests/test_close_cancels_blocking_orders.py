@@ -296,6 +296,61 @@ def test_a_stock_close_never_cancels_an_option_on_the_same_ticker():
     assert ad2.cancelled == ["NIO-OPT"]
 
 
+# ── 8. broker-agnostic: Alpaca and Webull shapes both match ────────────────
+#
+# The two brokers describe the SAME option completely differently:
+#
+#   Alpaca  broker_symbol = "NIO260918C00003500"   (OCC)
+#   Webull  broker_symbol = "81I49KQ..."           (opaque position id)
+#
+# If the cancel matched on broker_symbol it would work for one and silently
+# cancel nothing for the other — a close that then hits the same broker
+# rejection with no sign of why. It matches on the NORMALISED contract
+# instead (instrument_type + root symbol + expiry + strike + right), which
+# both adapters produce: Alpaca parses the OCC (_parse_occ -> display_symbol),
+# Webull resolves the terms (_option_terms -> root). Every order-creation path
+# stores that same root in Order.symbol.
+
+def _pos_with_broker_symbol(broker_symbol: str):
+    """Same contract, as each broker would describe it."""
+    return BrokerPosition(
+        broker_symbol=broker_symbol, symbol="NIO",
+        instrument_type=InstrumentType.OPTION, quantity=Decimal("2"),
+        avg_entry_price=Decimal("0.17"), current_price=Decimal("0.20"),
+        market_value=None, unrealized_pnl=None,
+        option_expiry=_EXP, option_strike=Decimal("3.5"),
+        option_right=OptionRight.CALL,
+    )
+
+
+@pytest.mark.parametrize("broker_symbol,label", [
+    ("NIO260918C00003500", "alpaca-style OCC"),
+    ("81I49KQDDG92KOQ9TS9HN5AV9", "webull-style position id"),
+])
+def test_same_contract_matches_whatever_the_broker_calls_it(broker_symbol, label):
+    db = _db(); acct = _acct(db)
+    stop = _order(db, acct, boid="STOP-1")       # stored with root symbol "NIO"
+    user = db.get(User, _USER)
+    ad = _Adapter()
+    got = mod._cancel_working_orders_for_position(
+        db, user, acct, ad, _pos_with_broker_symbol(broker_symbol)
+    )
+    assert got == [stop.id], f"{label}: contract match must not depend on broker_symbol"
+    assert ad.cancelled == ["STOP-1"]
+
+
+def test_alpaca_style_raise_on_uncancellable_is_tolerated():
+    """Alpaca RAISES when an order isn't cancellable (already filled); Webull
+    returns a bool. The helper must survive either without dropping the close
+    — a filled order is not a reason to refuse someone an exit."""
+    db = _db(); acct = _acct(db)
+    _order(db, acct, boid="ALREADY-FILLED")
+    good = _order(db, acct, boid="STILL-WORKING")
+    user = db.get(User, _USER)
+    ad = _Adapter(fail_on=("ALREADY-FILLED",))
+    assert mod._cancel_working_orders_for_position(db, user, acct, ad, _pos()) == [good.id]
+
+
 def test_close_places_the_order_after_cancelling():
     """Wiring check: close_position clears the contract BEFORE it builds the
     close, so the broker sees a free position."""
