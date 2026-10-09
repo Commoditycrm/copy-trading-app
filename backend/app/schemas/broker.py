@@ -76,8 +76,10 @@ class IbkrCredentialsIn(BaseModel):
     ``account_id`` is the IBKR account number (``U…`` live, ``DU…`` paper).
     The adapter validates everything with a live call before anything is saved."""
 
-    mode: Literal["gateway", "oauth"] = "gateway"
-    account_id: str = Field(min_length=2, max_length=40)
+    # "hosted": Kopyya runs the gateway (see services/ibkr_hosted_gateway);
+    # the account number may be left blank and adopted after the first sign-in.
+    mode: Literal["hosted", "gateway", "oauth"] = "hosted"
+    account_id: str | None = Field(default=None, max_length=40)
     paper: bool = False
 
     # gateway mode
@@ -95,6 +97,10 @@ class IbkrCredentialsIn(BaseModel):
 
     @model_validator(mode="after")
     def _fields_for_mode(self) -> "IbkrCredentialsIn":
+        if self.account_id is not None:
+            self.account_id = self.account_id.strip().upper() or None
+        if self.mode != "hosted" and not self.account_id:
+            raise ValueError("account_id is required")
         if self.mode == "oauth":
             missing = [
                 f for f in (
@@ -158,6 +164,8 @@ class BrokerAccountOut(BaseModel):
     connection_status: str
     last_error: str | None
     created_at: datetime
+    # Set for Kopyya-hosted IBKR gateways — the card shows "Sign in to IBKR".
+    ibkr_gateway_slot: int | None = None
 
     cash: Decimal | None = None
     buying_power: Decimal | None = None

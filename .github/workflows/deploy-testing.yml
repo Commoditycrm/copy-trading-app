@@ -55,7 +55,9 @@ jobs:
             # Export the profile for every compose command so `up -d
             # --remove-orphans` keeps it running instead of stopping it as an
             # orphan each deploy (that's what took the Discord channels down).
-            export COMPOSE_PROFILES=discord
+            # ibkr = the hosted IBKR gateway containers (ibkr-gw-N). Same reason:
+            # without the profile exported, `--remove-orphans` would stop them.
+            export COMPOSE_PROFILES=discord,ibkr
 
             echo "── git pull qa-branch ───────────────────────────────────"
             git fetch --prune origin qa-branch
@@ -73,7 +75,9 @@ jobs:
             # (next build) is the heavy one, and under that pressure it went
             # from 81s to 17 minutes. Sequential costs a little wall-clock when
             # the box is healthy and avoids the stall when it is not.
-            for svc in backend worker discord-listener frontend; do
+            # ibkr-gw-1 builds the ONE gateway image every ibkr-gw-N shares
+            # (same `image:` tag in docker-compose.yml), so it is built once.
+            for svc in backend worker discord-listener ibkr-gw-1 frontend; do
               echo "── build $svc"
               docker compose build "$svc"
             done

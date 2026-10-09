@@ -152,6 +152,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_api.router)
     app.include_router(auth.router)
     app.include_router(brokers.router)
+    from app.api import ibkr_gateway as ibkr_gateway_api  # noqa: PLC0415
+    app.include_router(ibkr_gateway_api.router)
     app.include_router(discord_sources.router)
     app.include_router(trades.router)
     app.include_router(settings.router)

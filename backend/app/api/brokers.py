@@ -922,6 +922,9 @@ def connect(
     # write path; mirror fills sync via services.webull_subscriber_reconciler).
     # The webull_direct_enabled server flag still gates it for everyone inside
     # _credentials_for below, so this stays fully inert with the flag off.
+    if payload.broker == BrokerName.IBKR and payload.ibkr is not None and payload.ibkr.mode == "hosted":
+        return _connect_hosted_ibkr(payload, request, db, user)
+
     creds = _credentials_for(payload, user.id)
 
     # Build an unsaved row so we can run verify_connection() against it.
@@ -1044,6 +1047,73 @@ def connect(
     return acct
 
 
+def _connect_hosted_ibkr(
+    payload: ConnectBrokerIn, request: Request, db: Session, user: User,
+) -> BrokerAccount:
+    """Hosted IBKR: reserve a gateway slot and save the account PENDING. The
+    owner then signs in through the card's button and /ibkr-gateway/verify
+    activates it. Nothing is verified here because nobody is signed in yet."""
+    from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+    if not hosted.enabled():
+        raise HTTPException(400, "Hosted IBKR gateways are not enabled on this server.")
+    assert payload.ibkr is not None
+    _lock_user_brokers(db, user.id)
+    # One hosted IBKR row per user: reconnecting reuses the slot they hold.
+    existing = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.broker == BrokerName.IBKR,
+            BrokerAccount.ibkr_gateway_slot.is_not(None),
+        )
+    ).scalars().first()
+    try:
+        slot = existing.ibkr_gateway_slot if existing is not None else hosted.assign_slot(db)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    creds = {
+        "mode": "gateway",
+        "hosted": True,
+        "gateway_url": hosted.gateway_url(slot),
+        "account_id": payload.ibkr.account_id or "",
+        "paper": bool(payload.ibkr.paper),
+    }
+    # Never inherit a session: clear whatever the gateway holds.
+    hosted.logout(slot)
+    if existing is not None:
+        acct = existing
+        acct.label = payload.label
+        acct.is_paper = creds["paper"]
+        acct.encrypted_credentials = encrypt_json(creds)
+        acct.connection_status = "pending"
+        acct.last_error = None
+        acct.broker_account_number = payload.ibkr.account_id or None
+    else:
+        acct = BrokerAccount(
+            user_id=user.id,
+            broker=BrokerName.IBKR,
+            label=payload.label,
+            is_paper=creds["paper"],
+            supports_fractional=False,
+            encrypted_credentials=encrypt_json(creds),
+            connection_status="pending",
+            broker_account_number=payload.ibkr.account_id or None,
+            ibkr_gateway_slot=slot,
+        )
+        db.add(acct)
+    db.flush()
+    audit.record(
+        db, actor_user_id=user.id, action="broker.ibkr_gateway_assigned",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"slot": slot, "label": payload.label, "is_paper": acct.is_paper},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
+    acct.notice = "Gateway reserved. Click \"Sign in to IBKR\" on the card to finish connecting."
+    return acct
+
+
 @router.get("/webull-usage")
 def webull_usage_summary(
     minutes: int = Query(5, ge=1, le=60),
@@ -1077,7 +1147,11 @@ def broker_features(user: User = Depends(current_user)) -> dict:
     """Client-facing broker feature flags for the Brokers page. Lets the picker
     hide the direct-Webull option when the server has it disabled (connect would
     otherwise 400)."""
-    return {"webull_direct_enabled": bool(get_settings().webull_direct_enabled)}
+    from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+    return {
+        "webull_direct_enabled": bool(get_settings().webull_direct_enabled),
+        "ibkr_hosted_enabled": hosted.enabled(),
+    }
 
 
 # A balance older than this is refreshed inline when the account list is read,
@@ -1337,6 +1411,11 @@ def delete_broker(
     # Only the ACTIVE account has a listener. Deleting an inactive one must not
     # stop the listener that is servicing the active broker.
     was_active_trader = user.role == UserRole.TRADER and acct.connection_status == "connected"
+    if acct.ibkr_gateway_slot is not None:
+        # Hosted IBKR: end the gateway's session so the slot's next tenant can
+        # never inherit it. The row's deletion frees the slot.
+        from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+        hosted.logout(acct.ibkr_gateway_slot)
     db.delete(acct)
     db.commit()
     cache.invalidate_broker_accounts(user.id)

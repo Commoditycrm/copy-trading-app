@@ -476,6 +476,7 @@ class IBKRAdapter(BrokerAdapter):
             except KeyError as exc:
                 raise RuntimeError("IBKR credentials missing 'account_id'") from exc
             self._gateway_url = normalize_gateway_url(credentials.get("gateway_url"))
+            self._hosted = bool(credentials.get("hosted"))
             self._base_url = self._gateway_url + "/v1/api"
             self._realm = DEFAULT_REALM
             self._session = _session_for("gateway", self._base_url)
@@ -691,6 +692,12 @@ class IBKRAdapter(BrokerAdapter):
             )
 
     def _gateway_login_message(self, body: Any = None) -> str:
+        if getattr(self, "_hosted", False):
+            return (
+                "Your IBKR session isn't signed in. Open Kopyya → Broker and click "
+                "\"Sign in to IBKR\" on your IBKR card, then retry. (IBKR ends every "
+                "session at midnight New York time.)"
+            )
         return (
             f"IBKR Client Portal Gateway at {self._gateway_url} has no logged-in "
             f"session. Open {self._gateway_url} in a browser on that machine, sign in "
