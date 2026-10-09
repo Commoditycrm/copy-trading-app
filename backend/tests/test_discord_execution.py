@@ -368,20 +368,20 @@ def test_a_multiplier_of_one_is_the_default(monkeypatch):
     assert ex.resolve(None, _User(), _signal()).payload.quantity == Decimal("1")
 
 
-def test_an_affordable_contract_is_not_resized(monkeypatch):
-    """The limit is a judgement on contract PRICE, not a budget to spend down —
-    so an affordable contract goes through at full size."""
+def test_an_over_budget_option_is_trimmed_to_fit(monkeypatch):
+    """max_per_contract is a budget: 5 contracts at $190 is $950, over the $500
+    cap, so it's trimmed to the 2 that fit rather than taken at full size."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="5"),      # $1.90 x 100 = $190 each
         ex.Sizing(multiplier=5, max_per_contract=Decimal("500")),
     )
-    assert r.payload.quantity == Decimal("5")
+    assert r.payload.quantity == Decimal("2")       # floor(500 / 190)
 
 
-def test_an_expensive_contract_skips_the_entry(monkeypatch):
-    """$9.00 x 100 = $900, above a $500 ceiling. Matches
-    SubscriberSettings.max_per_contract: skip the entry, don't trim it."""
+def test_a_single_contract_over_the_budget_is_skipped(monkeypatch):
+    """$9.00 x 100 = $900 — one contract already exceeds the $500 budget, so not
+    even one fits and the entry is skipped rather than trimmed."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     with pytest.raises(ex.ExecutionRefused, match="max per contract"):
         ex.resolve(
@@ -390,15 +390,15 @@ def test_an_expensive_contract_skips_the_entry(monkeypatch):
         )
 
 
-def test_the_ceiling_is_per_contract_not_per_order(monkeypatch):
-    """10 contracts at $190 each is $1,900 of order value, but each CONTRACT is
-    under the $500 ceiling — so it goes through untouched."""
+def test_max_per_contract_trims_a_large_quantity_to_budget(monkeypatch):
+    """10 contracts at $190 is $1,900 of order value — the cap is a budget now,
+    so it trims to the 2 contracts that fit the $500 ceiling."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="1"),
         ex.Sizing(multiplier=10, max_per_contract=Decimal("500")),
     )
-    assert r.payload.quantity == Decimal("10")
+    assert r.payload.quantity == Decimal("2")
 
 
 def test_no_ceiling_means_no_limit(monkeypatch):
@@ -709,17 +709,17 @@ def test_no_order_ceiling_means_no_check(monkeypatch):
     assert r.payload.quantity == Decimal("50")
 
 
-# ── the two ceilings are independent ─────────────────────────────────────────
+# ── the two ceilings are independent budgets; the tighter one binds ──────────
 
-def test_a_cheap_contract_can_still_be_too_big_an_order(monkeypatch):
-    """The case the per-contract cap cannot express: each contract is $190,
-    well under a $500 per-contract ceiling, but ten of them is a $1,900 order."""
+def test_both_budgets_trim_and_the_tighter_one_wins(monkeypatch):
+    """Both caps are dollar budgets now. On a $1,900 order, max_per_contract $500
+    is tighter than max_per_order $1,000, so the $500 budget binds first."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="10"),
         ex.Sizing(multiplier=10, max_per_contract=Decimal("500"), max_per_order=Decimal("1000")),
     )
-    assert r.payload.quantity == Decimal("5")          # $1,900 cut to $950
+    assert r.payload.quantity == Decimal("2")          # floor(500 / 190)
 
 
 def test_a_small_order_of_an_expensive_contract_still_fails_per_contract(monkeypatch):

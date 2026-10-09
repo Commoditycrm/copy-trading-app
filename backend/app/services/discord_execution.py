@@ -887,16 +887,12 @@ def _entry_quantity(signal, sizing, resolutions) -> Decimal:
 
 
 def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) -> Decimal:
-    """Skip an entry whose contract costs more than the trader's ceiling.
+    """Fit an OPTION entry under the trader's max-per-contract budget.
 
-    Mirrors SubscriberSettings.max_per_contract exactly: the test is on a SINGLE
-    contract's value (premium x 100), and failing it skips the entry outright
-    rather than trimming quantity to fit.
-
-    Skipping rather than trimming is the deliberate part. A limit like this says
-    "contracts this expensive aren't for me" — a size judgement, not a budget to
-    spend down. Trimming would quietly take the trade anyway at a size the
-    trader never chose.
+    Mirrors SubscriberSettings.max_per_contract: the cap is a dollar budget on
+    the option order, and an entry over it is TRIMMED to the most whole contracts
+    that fit (floor(cap / (premium x 100))) rather than skipped. Only when not
+    even one contract fits is it skipped.
 
     Options only, and never applied to a close: you must always be able to exit
     a position you already hold.
@@ -904,14 +900,27 @@ def _apply_max_per_contract(qty, limit_price, is_option, sizing, resolutions) ->
     cap = sizing.max_per_contract
     if cap is None or cap <= 0 or not is_option or limit_price is None or limit_price <= 0:
         return qty
+    if qty is None or qty <= 0:
+        return qty
 
+    # One home for the trim formula, shared with the copy engine.
+    from app.services.copy_engine import trim_to_contract_cap  # noqa: PLC0415
+
+    qty = Decimal(str(qty))
+    fit = trim_to_contract_cap(limit_price, qty, cap)
+    if fit is None or fit >= qty:
+        return qty
     per_contract = limit_price * Decimal(100)
-    if per_contract > cap:
+    if fit < 1:
         raise ExecutionRefused(
             f"A single contract is worth ${per_contract:.2f}, above your "
             f"${cap:.2f} max per contract."
         )
-    return qty
+    resolutions["quantity"] = (
+        f"{fit} (cut from {qty} to stay within your ${cap:.2f} max per contract — "
+        f"${per_contract * fit:.2f})"
+    )
+    return fit
 
 
 def cancel_unfilled_entries(
