@@ -168,10 +168,36 @@ def resolve(
         is_closing and is_option and not market_hours.in_regular_session()
     )
     limit_price = None
+    # An entry the alert gave no price for. In the regular session it simply
+    # goes at MARKET: the alert is still a clear instruction to buy, and the
+    # alternative was refusing a trade the author meant to send.
+    entry_at_market = False
     if not is_closing:
         limit_price = _resolve_limit_price(
-            signal, adapter, symbol, strike, right, expiry, side, resolutions
+            signal, adapter, symbol, strike, right, expiry, side, resolutions,
+            allow_market=True,
         )
+        if limit_price is None:
+            if market_hours.in_regular_session():
+                entry_at_market = True
+                resolutions["limit_price"] = "none stated — going at market"
+            else:
+                # Outside the session a market option order is rejected
+                # outright ("options market orders are only allowed during
+                # market hours"), so price a marketable limit THROUGH the book
+                # instead — the mirror of what a close does off-session.
+                live = _market_price(adapter, symbol, strike, right, expiry, is_option)
+                if live is None or live <= 0:
+                    raise ExecutionRefused(
+                        "The alert states no price, and outside the regular session a "
+                        "market entry can't be placed and there's no live price to set "
+                        "a limit from."
+                    )
+                limit_price = (live * Decimal("1.10")).quantize(Decimal("0.01"))
+                resolutions["limit_price"] = (
+                    f"{limit_price} (marketable limit from a {live} mark — "
+                    "outside the regular session)"
+                )
     elif exit_off_session:
         # What the contract is worth right now. The broker's own mark on the
         # held position is the most reliable source — Alpaca exposes no option
@@ -250,7 +276,7 @@ def resolve(
         # that goes at MARKET, the live price. Sizing and caps measured against
         # the alert's price would let a market order spend more than allowed.
         price = limit_price
-        if sizing.at_market:
+        if sizing.at_market or entry_at_market:
             live = _market_price(adapter, symbol, strike, right, expiry, is_option)
             if live is not None:
                 price = live
@@ -261,6 +287,18 @@ def resolve(
         if sizing.mode == "dollars" and sizing.dollars and not averaging:
             quantity = _dollar_quantity(sizing, price, is_option, bool(signal.get("half_size")),
                                         resolutions)
+        # A market entry with no price anywhere cannot be measured against the
+        # trader's dollar limits, and silently ignoring a limit is worse than
+        # not placing the trade — that is the one thing the caps exist to stop.
+        if price is None and (
+            sizing.max_per_contract or sizing.max_per_order
+            or (sizing.mode == "dollars" and sizing.dollars)
+        ):
+            raise ExecutionRefused(
+                "The alert states no price and no live price is available, so your "
+                "dollar limits can't be checked against this entry."
+            )
+
         # Independent ceilings, checked in their own right: one is about what a
         # contract costs, the other about what the order costs. An order can
         # pass either and fail the other, and neither reads the other's value.
@@ -279,7 +317,9 @@ def resolve(
         # get out, not get out at a price — and an unfilled exit is worse than
         # a slightly worse fill.
         order_type=(
-            OrderType.LIMIT if (not is_closing or exit_off_session) else OrderType.MARKET
+            OrderType.MARKET
+            if (is_closing and not exit_off_session) or entry_at_market
+            else OrderType.LIMIT
         ),
         quantity=quantity,
         limit_price=limit_price,
@@ -1081,12 +1121,22 @@ def _apply_max_per_order(qty, limit_price, is_option, sizing, resolutions) -> De
     return fit
 
 
-def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side, resolutions):
+def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side,
+                        resolutions, allow_market: bool = False):
     """The limit price: the alert's, or derived from the live quote.
 
-    Orders are always LIMIT, so a price is mandatory. When the alert doesn't
-    state one (every close, and some entries) it has to come from the market —
-    never from a guess.
+    ``allow_market`` returns None instead of refusing when no price can be
+    found, leaving the caller to place the order at market. Entries pass it;
+    a CLOSE does not, because a close that cannot be priced still has the held
+    position's own mark to fall back on and must never become an unpriced
+    guess.
+
+    Why an entry needs the escape hatch: some channels put the price as a bare
+    trailing token ("AMD 610p @here @Sniper .55"), and when the author drops it
+    the alert is still a perfectly good instruction to buy. Refusing meant the
+    trade was simply missed — and the channel's own "entry order type: market"
+    setting could not help, because it is read AFTER this function has already
+    raised.
     """
     stated = _dec(signal.get("limit_price"))
     if stated is not None and stated > 0:
@@ -1094,6 +1144,8 @@ def _resolve_limit_price(signal, adapter, symbol, strike, right, expiry, side, r
 
     quote = _quote(adapter, symbol, strike, right, expiry)
     if quote is None:
+        if allow_market:
+            return None
         raise ExecutionRefused(
             "The alert states no price and no live quote is available for that contract."
         )
