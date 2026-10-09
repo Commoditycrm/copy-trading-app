@@ -281,6 +281,9 @@ export default function BrokersPage() {
   // Per hosted-IBKR account: is its gateway signed in right now? Polled.
   const [ibkrSignedIn, setIbkrSignedIn] = useState<Record<string, boolean | null>>({});
   const [ibkrSigning, setIbkrSigning] = useState<string | null>(null);
+  // Accounts whose verify failed for the CURRENT sign-in: don't retry every
+  // poll (it toasted every 5s on QA); retry once the gateway signs out and in again.
+  const ibkrVerifyFailed = useRef<Set<string>>(new Set());
 
   // Alpaca form state
   const [label, setLabel] = useState("");
@@ -662,12 +665,14 @@ export default function BrokersPage() {
           const st = await api<{ signed_in: boolean; connection_status: string }>(`/api/brokers/${a.id}/ibkr-gateway/status`);
           if (stopped) return;
           setIbkrSignedIn(cur => ({ ...cur, [a.id]: st.signed_in }));
-          if (st.signed_in && a.connection_status === "pending") {
+          if (!st.signed_in) ibkrVerifyFailed.current.delete(a.id);
+          if (st.signed_in && a.connection_status === "pending" && !ibkrVerifyFailed.current.has(a.id)) {
             try {
               await api(`/api/brokers/${a.id}/ibkr-gateway/verify`, { method: "POST" });
               notify.success("IBKR connected");
               await load();
             } catch (e) {
+              ibkrVerifyFailed.current.add(a.id);
               notify.fromError(e, "IBKR sign-in seen, but the account could not be verified");
             }
           }

@@ -93,14 +93,26 @@ def assign_slot(db: Session) -> int:
 
 
 def logout(slot: int) -> bool:
-    """End whatever IBKR session the gateway holds. Best-effort; used when a
-    slot is released or reassigned so no session outlives its owner."""
-    try:
-        r = requests.post(f"{gateway_url(slot)}/logout", data=b"", verify=False, timeout=_HTTP_TIMEOUT_S)
-        return r.status_code < 400
-    except requests.RequestException as exc:
-        log.info("ibkr hosted gateway %s: logout failed (%s)", slot, exc)
-        return False
+    """End whatever IBKR session the gateway holds, and confirm it is gone.
+    Used when a slot is released or reassigned so no session outlives its
+    owner. Returns True when the gateway reports no authenticated session
+    afterwards.
+
+    The API call is ``POST /v1/api/logout``. The bare ``/logout`` the first
+    version used only bounces the SSO web page (302) and left the brokerage
+    session alive — on QA (2026-10-09) a subscriber who disconnected a paper
+    account and reconnected for live found the paper session still signed in."""
+    base = gateway_url(slot)
+    for path in ("/v1/api/logout", "/logout"):
+        try:
+            requests.post(f"{base}{path}", data=b"", verify=False, timeout=_HTTP_TIMEOUT_S, allow_redirects=False)
+        except requests.RequestException as exc:
+            log.info("ibkr hosted gateway %s: %s failed (%s)", slot, path, exc)
+    st = auth_status(slot)
+    gone = not st["authenticated"]
+    if not gone and st["reachable"]:
+        log.warning("ibkr hosted gateway %s: session still authenticated after logout", slot)
+    return gone
 
 
 def auth_status(slot: int) -> dict[str, Any]:
