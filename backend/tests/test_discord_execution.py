@@ -219,11 +219,90 @@ def test_a_close_carries_no_limit_price_at_all(monkeypatch):
     assert r.payload.limit_price is None
 
 
-def test_no_price_and_no_quote_is_refused(monkeypatch):
-    """Inventing a limit would be guessing the level to trade at."""
+# ── an entry the alert gave no price for ────────────────────────────────────
+#
+# Some channels put the price as a bare trailing token ("AMD 610p @here
+# @Sniper .55"). When the author drops it the alert is still a clear
+# instruction to buy, and refusing meant the trade was simply missed — live
+# 2026-10-09. The channel's own "entry order type: market" setting could not
+# help either, because it is read AFTER the price is resolved.
+
+def _session(monkeypatch, open_now: bool):
+    monkeypatch.setattr(ex.market_hours, "in_regular_session", lambda: open_now)
+
+
+def test_an_entry_with_no_price_goes_at_market(monkeypatch):
     _wire(monkeypatch, _Adapter(quote=None))
-    with pytest.raises(ex.ExecutionRefused, match="no live quote"):
+    _session(monkeypatch, True)
+    r = ex.resolve(None, _User(), _signal(limit_price=None))
+    assert r.payload.order_type.value == "market"
+    assert r.payload.limit_price is None
+    assert r.payload.side.value == "buy"
+
+
+def test_a_stated_price_still_wins(monkeypatch):
+    """Pins that the market path is the fallback, not the new default."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    _session(monkeypatch, True)
+    r = ex.resolve(None, _User(), _signal(limit_price="1.90"))
+    assert r.payload.order_type.value == "limit"
+    assert r.payload.limit_price == Decimal("1.90")
+
+
+def test_outside_the_session_it_is_a_marketable_limit(monkeypatch):
+    """A market option order outside regular hours is rejected outright, so
+    price one through the book instead."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    _session(monkeypatch, False)
+    monkeypatch.setattr(ex, "_market_price", lambda *a, **k: Decimal("2.00"))
+    r = ex.resolve(None, _User(), _signal(limit_price=None))
+    assert r.payload.order_type.value == "limit"
+    assert r.payload.limit_price == Decimal("2.20")      # 2.00 x 1.10, through the ask
+
+
+def test_outside_the_session_with_no_mark_is_refused(monkeypatch):
+    """Nothing to price from, and market is unavailable — placing anything
+    here would be a guess."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    _session(monkeypatch, False)
+    monkeypatch.setattr(ex, "_market_price", lambda *a, **k: None)
+    with pytest.raises(ex.ExecutionRefused, match="no live price"):
         ex.resolve(None, _User(), _signal(limit_price=None))
+
+
+@pytest.mark.parametrize("sizing_kw", [
+    {"max_per_contract": Decimal(500)},
+    {"max_per_order": Decimal(1000)},
+])
+def test_a_dollar_limit_is_never_silently_skipped(monkeypatch, sizing_kw):
+    """The one thing the caps exist to stop. With no price anywhere there is
+    nothing to measure against, and ignoring a limit the trader set is worse
+    than not placing the trade."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    _session(monkeypatch, True)
+    monkeypatch.setattr(ex, "_market_price", lambda *a, **k: None)
+    with pytest.raises(ex.ExecutionRefused, match="dollar limits can't be checked"):
+        ex.resolve(None, _User(), _signal(limit_price=None), ex.Sizing(**sizing_kw))
+
+
+def test_a_cap_is_still_applied_off_the_live_price(monkeypatch):
+    """With a live price available the caps work normally, even though the
+    alert stated nothing."""
+    _wire(monkeypatch, _Adapter(quote=None))
+    _session(monkeypatch, True)
+    monkeypatch.setattr(ex, "_market_price", lambda *a, **k: Decimal("9.00"))
+    with pytest.raises(ex.ExecutionRefused, match="max per contract"):
+        ex.resolve(None, _User(), _signal(limit_price=None),
+                   ex.Sizing(max_per_contract=Decimal(500)))
+
+
+def test_a_close_with_no_price_is_still_refused(monkeypatch):
+    """Only ENTRIES get the market fallback. A close has the held position's
+    own mark to price from and must never become an unpriced guess."""
+    _wire(monkeypatch, _Adapter(positions=[_Pos()], quote=None))
+    _session(monkeypatch, True)
+    r = ex.resolve(None, _User(), _signal(action="SELL", limit_price=None))
+    assert r.is_closing and r.payload.limit_price is None
 
 
 # ── broker plumbing ──────────────────────────────────────────────────────────
