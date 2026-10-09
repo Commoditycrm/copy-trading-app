@@ -308,3 +308,69 @@ def test_execution_buys_a_price_less_entry_at_the_live_ask():
     finally:
         ex._quote = original
     assert price == Decimal("0.44") and "live quote" in resolutions["limit_price"]
+
+
+# ── a mid-paragraph "Adding .50" ────────────────────────────────────────────
+# Live 2026-10-09: the instruction sat inside a paragraph of commentary, so the
+# anchored _ADD_RE never saw it and the alert produced no trade at all. What
+# separates it from musing is the stated result — "new avg .73" is only written
+# after an add that really happened.
+
+REAL_ALERT = (
+    "AAPL is being very stupid QQQ breaking Lows and somehow after a basic gap "
+    "down on bad news bulls are buying the dip on AAPL sadly @everyone @Sniper  "
+    "I do believe we were just early . Adding .50 here new avg .73 if you want "
+    "I truly don’t think this PA on AAPL makes sense rn"
+)
+
+
+def test_the_live_alert_adds_to_the_aapl_contract():
+    s = _sig(REAL_ALERT)
+    assert s.action is SignalAction.BUY
+    assert s.limit_price == Decimal("0.50")   # the add price, not the new average
+    assert s.double_up is True
+    # QQQ is named too, but only as market colour — the add's own sentence
+    # names AAPL, which is the position being averaged.
+    assert s.symbol == "AAPL"
+
+
+def test_the_new_average_is_never_mistaken_for_the_add_price():
+    assert _sig(REAL_ALERT).limit_price != Decimal("0.73")
+
+
+def test_a_message_initial_add_still_names_no_symbol():
+    # Unchanged behaviour: the contract comes from add_to_latest.
+    s = _sig("Adding .50 here new avg .73")
+    assert s.symbol is None and s.add_to_latest is True and s.limit_price == Decimal("0.50")
+
+
+@pytest.mark.parametrize("text,symbol", [
+    ("TSLA looks done here. Adding .40 new avg .61", "TSLA"),
+    ("Adding .50 here new avg .73, down 30%", None),   # a percent is not an exit
+])
+def test_a_corroborated_mid_sentence_add_fires(text, symbol):
+    s = _sig(text)
+    assert s is not None and s.double_up is True and s.symbol == symbol
+
+
+@pytest.mark.parametrize("text", [
+    "I might add .50, new avg would be .73",        # hedged: an average that WOULD be
+    "not adding .50 here, new avg stays .73",       # negated
+    "I do believe we were early . Adding .50 here",  # no stated average to corroborate
+    "I might be adding .50 later if it keeps dropping",
+    "leave room to add in case they want a bit more of a bounce",
+    "sold half. new avg .73 after adding .50",      # an exit, not an add
+])
+def test_chatter_about_adding_never_buys(text):
+    # These are IGNORED, not PARSED, so _sig's status assert does not apply —
+    # check directly that nothing would be bought.
+    r = parse_message(ParsedMessage(content=text, posted_at=TS))
+    assert not any(sig.action is SignalAction.BUY for sig in (r.signals or [])), \
+        f"{text!r} must not place an order"
+
+
+def test_price_action_is_not_read_as_a_ticker():
+    # "this PA on AAPL" previously counted as two tickers, leaving the add
+    # unable to name the position it was averaging.
+    from app.services.discord_parsers.terse_alert import _tickers_in
+    assert _tickers_in("I truly don't think this PA on AAPL makes sense") == ["AAPL"]

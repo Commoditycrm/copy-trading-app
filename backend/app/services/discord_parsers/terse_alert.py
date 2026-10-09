@@ -109,7 +109,104 @@ _PCT_RE = re.compile(r"(?P<sign>[+\-−])?\s*(?P<pct>\d+(?:\.\d+)?)\s*%")
 # A bare ticker in a trim ("... AMZN 25%"): an all-caps word of 2-5 letters.
 _TICKER_RE = re.compile(r"(?<![A-Za-z0-9$])\$?(?P<sym>[A-Z]{2,5})(?![A-Za-z0-9])")
 # All-caps words that are not tickers in these messages.
-_NOT_TICKERS = {"ALL", "OUT", "BTO", "STC", "ATH", "EOD", "DTE", "ITM", "OTM", "ATM", "LOL", "OMG", "PT"}
+_NOT_TICKERS = {
+    "ALL", "OUT", "BTO", "STC", "ATH", "EOD", "DTE", "ITM", "OTM", "ATM", "LOL", "OMG", "PT",
+    # Chatter that is spelled like a ticker. "PA" (price action) is the one
+    # that actually bit: "this PA on AAPL" read as two tickers, so an add
+    # could not be pinned to a symbol.
+    "PA", "HOD", "LOD", "IMO", "NFA", "FYI", "TBH", "IDK", "EOW",
+}
+
+# ── a mid-sentence "Adding .50" ─────────────────────────────────────────────
+# _ADD_RE above is anchored to the START of the message on purpose: the word
+# "add" is far too common in commentary to be an order on its own. But house
+# style buries the real instruction inside a paragraph:
+#
+#   "... I do believe we were just early . Adding .50 here new avg .73 ..."
+#
+# What makes that an order and "I might be adding .50 later" chatter is the
+# stated RESULT: an author only writes "new avg" after an add that actually
+# happened. So a mid-sentence add is accepted ONLY with that corroboration.
+_NEW_AVG_RE = re.compile(
+    r"\bnew\s+(?:avg|average)\b|\bavg\s+(?:is\s+)?now\b", re.IGNORECASE,
+)
+_ADD_ANYWHERE_RE = re.compile(
+    r"\badd(?:ing|ed)?\s+@?\s*\$?(?P<price>\d*\.\d+|\d+(?:\.\d+)?)(?![\w.%])",
+    re.IGNORECASE,
+)
+# Hedges BEFORE the add, in its own sentence: "I might add .50, new avg would
+# be .73" states a hypothetical average, not a filled one.
+_HYPOTHETICAL_RE = re.compile(
+    r"\b(?:not|never|might|may|maybe|could|would|should|if|unless|"
+    r"thinking|think|considering|consider|plan|planning|wait|waiting|"
+    r"gonna|don'?t|didn'?t|won'?t|wouldn'?t|can'?t)\b",
+    re.IGNORECASE,
+)
+# A sentence end, but never the dot inside a price: ".50" is followed by a
+# digit, and "0.48" is preceded by one.
+_SENT_END_RE = re.compile(r"(?<!\d)[.!?](?=\s)")
+# Sell talk that is not already handled by the trim / stop-out / cut branches.
+# "%" is deliberately NOT here: "Adding .50 here new avg .73, down 30%" is an
+# add, and _EXIT_TALK_RE would have refused it for the percent sign alone.
+_ADD_EXIT_TALK_RE = re.compile(
+    r"\b(?:sold|sell(?:ing)?|clos(?:e|ed|ing)|exit(?:ed|ing)?)\b", re.IGNORECASE,
+)
+
+
+def _sentence_around(text: str, pos: int) -> tuple[str, str]:
+    """``(before, sentence)`` for the sentence containing ``pos`` — ``before``
+    is that sentence's text up to ``pos``, used for the hedge check."""
+    start = 0
+    end = len(text)
+    for m in _SENT_END_RE.finditer(text):
+        if m.end() <= pos:
+            start = m.end()
+        else:
+            end = m.start()
+            break
+    return text[start:pos], text[start:end]
+
+
+def _tickers_in(fragment: str) -> list[str]:
+    """Distinct ticker-shaped words, in order, minus known chatter."""
+    out: list[str] = []
+    for m in _TICKER_RE.finditer(fragment):
+        sym = m.group("sym").upper()
+        if sym not in _NOT_TICKERS and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _mid_add(text: str) -> tuple[Decimal | None, str | None] | None:
+    """``(price, symbol)`` for a corroborated mid-sentence add, else None.
+
+    ``symbol`` may be None — that is not a failure. It means the message named
+    several tickers and none could be pinned, so the contract is left to
+    ``add_to_latest`` (this channel's own open position), exactly as a
+    message-initial "Adding .50" has always behaved.
+    """
+    if not _NEW_AVG_RE.search(text) or _GLUED_RE.search(text):
+        return None
+    if _ADD_EXIT_TALK_RE.search(text):
+        return None
+    m = _ADD_ANYWHERE_RE.search(text)
+    if m is None:
+        return None
+    before, sentence = _sentence_around(text, m.start())
+    if _HYPOTHETICAL_RE.search(before):
+        return None
+    price = to_decimal(m.group("price"))
+    if price is None or price <= 0:
+        return None
+    # One ticker in the message is unambiguous. Several ("AAPL ... QQQ ...")
+    # fall back to the add's OWN sentence, which is where an author names the
+    # position they are adding to; still ambiguous ⇒ leave it to add_to_latest.
+    syms = _tickers_in(text)
+    if len(syms) == 1:
+        return price, syms[0]
+    near = _tickers_in(sentence)
+    return price, (near[0] if len(near) == 1 else None)
+
 
 _ENTRY_QTY = Decimal(1)
 
@@ -134,6 +231,27 @@ class TerseAlertParser(Parser):
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
             or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text) or _CUT_RE.search(text)
             or _SPACED_ENTRY_RE.match(text) or _pinged_entry(message, text)
+            or _mid_add(text) is not None
+        )
+
+    def _add(self, price: Decimal, symbol: str | None) -> TradeSignal:
+        """An add: buy as much again as is held, at ``price``.
+
+        ``symbol`` None means "the position this channel is in" — the contract
+        is filled in at execution from the channel's latest holding.
+        """
+        return TradeSignal(
+            action=SignalAction.BUY,
+            asset_type=AssetType.OPTION,
+            symbol=symbol,
+            quantity=None,              # sized from the position (double_up)
+            order_type=OrderKind.LIMIT,
+            limit_price=price,
+            double_up=True,
+            add_to_latest=True,
+            contract_unspecified=True,
+            source_action="ADDING",
+            parser=self.name,
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -158,19 +276,13 @@ class TerseAlertParser(Parser):
             price = to_decimal(add.group("price"))
             if price is None or price <= 0:
                 return ParseResult.ignored("an add with no usable price")
-            return ParseResult.parsed(TradeSignal(
-                action=SignalAction.BUY,
-                asset_type=AssetType.OPTION,
-                symbol=None,
-                quantity=None,              # sized from the position (double_up)
-                order_type=OrderKind.LIMIT,
-                limit_price=price,
-                double_up=True,
-                add_to_latest=True,
-                contract_unspecified=True,
-                source_action="ADDING",
-                parser=self.name,
-            ))
+            return ParseResult.parsed(self._add(price, None))
+
+        # "... we were just early . Adding .50 here new avg .73 ..." — the
+        # instruction is mid-paragraph, so the anchored _ADD_RE never saw it.
+        mid = _mid_add(text)
+        if mid is not None:
+            return ParseResult.parsed(self._add(*mid))
 
         pinged = bool(_PING_RE.search(message.content or "")) and not _EXIT_TALK_RE.search(text)
         glued = (_GLUED_RE.search(text) or _SPACED_ENTRY_RE.match(text)
