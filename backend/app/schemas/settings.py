@@ -2,8 +2,9 @@ import enum
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SubscriberSettingsOut(BaseModel):
@@ -40,6 +41,10 @@ class SubscriberSettingsOut(BaseModel):
     max_per_contract: Decimal | None = None
     # Enforced the same way, on the mirror's TOTAL value, and on stocks too.
     max_per_order: Decimal | None = None
+    # How opening mirrors are sized: "multiplier" (default) or "dollar_target".
+    sizing_mode: str = "multiplier"
+    # Dollar budget per copied trade, used only in dollar_target mode.
+    risk_per_trade_usd: Decimal | None = None
     # Per-position TP/SL percentages applied to every open position.
     # pnl_poller closes the offending position at market when the
     # unrealized P&L breaches the configured threshold. Independent of
@@ -162,6 +167,27 @@ class MaxPerOrderIn(BaseModel):
     ceiling", exactly as for MaxPerContractIn."""
 
     max_per_order: Decimal | None = Field(default=None, gt=0)
+
+
+class SubscriberSizingIn(BaseModel):
+    """Opening-mirror sizing mode for a subscriber.
+
+    ``sizing_mode`` is "multiplier" (legacy: scale the trader's qty by the
+    subscriber multiplier) or "dollar_target" (size each fresh opening entry to
+    ``risk_per_trade_usd``, independent of the trader's size). In dollar_target
+    mode ``risk_per_trade_usd`` must be a positive dollar budget; it is ignored
+    in multiplier mode. A dollar_target with no budget falls back to multiplier
+    sizing, so the budget is required when selecting that mode.
+    """
+
+    sizing_mode: Literal["multiplier", "dollar_target"] = "multiplier"
+    risk_per_trade_usd: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _budget_required_for_dollar_target(self) -> "SubscriberSizingIn":
+        if self.sizing_mode == "dollar_target" and self.risk_per_trade_usd is None:
+            raise ValueError("risk_per_trade_usd is required for dollar_target sizing")
+        return self
 
 
 class MaxAccountPctIn(BaseModel):

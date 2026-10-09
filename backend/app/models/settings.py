@@ -366,6 +366,28 @@ class SubscriberSettings(Base, TimestampMixin):
         Numeric(5, 2), nullable=True,
     )
 
+    # ── How an OPENING mirror is sized ──────────────────────────────────────
+    # "multiplier" (default) — the legacy behaviour: scale the trader's quantity
+    #                          by the subscriber's multiplier (0.25x–10x).
+    # "dollar_target"        — size each FRESH opening entry to a fixed dollar
+    #                          budget instead, independent of the trader's size:
+    #                          qty = floor(risk_per_trade_usd / cost-of-one-unit).
+    #                          Lets a small follower track a large-size trader at
+    #                          a capped risk the 0.25x multiplier floor can't reach
+    #                          (e.g. $500/trade behind a $5,000/trade trader).
+    # Applies to OPENS only; adds to an already-held position and closes still use
+    # the position's locked multiplier so exits can never be stranded. Closes are
+    # never resized. A trade whose single unit already costs more than the budget
+    # floors to 0 and is skipped (skipped_zero_qty), same as any zero-qty mirror.
+    sizing_mode: Mapped[str] = mapped_column(
+        String(16), default="multiplier", server_default="multiplier", nullable=False,
+    )
+    # Dollar budget per copied trade, used only when sizing_mode == "dollar_target".
+    # NULL falls back to multiplier sizing (the mode is inert without a budget).
+    risk_per_trade_usd: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 2), nullable=True,
+    )
+
     # Account-equity floor that triggers FULL LIQUIDATION + copy disable.
     # ABSOLUTE ACCOUNT-VALUE TARGET (not daily, not P&L-based). When the
     # pnl_poller observes broker-reported equity (total account value) >= this

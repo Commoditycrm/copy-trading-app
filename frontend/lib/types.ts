@@ -370,6 +370,11 @@ export interface SubscriberSettings {
    *  Enforced in the copy engine, and unlike max_per_contract it applies to
    *  stock mirrors too. Independent of it. */
   max_per_order: string | null;
+  /** How opening mirrors are sized: "multiplier" (scale by the multiplier) or
+   *  "dollar_target" (size each fresh opening entry to risk_per_trade_usd). */
+  sizing_mode: "multiplier" | "dollar_target";
+  /** Dollar budget per copied trade, used only in dollar_target mode. */
+  risk_per_trade_usd: string | null;
   /** Percent of today's beginning-day account balance (0–100). When
    *  today's filled trade NOTIONAL (USD) crosses
    *  -(beginning_day_balance * pct/100), pnl_poller auto-pauses copy. */

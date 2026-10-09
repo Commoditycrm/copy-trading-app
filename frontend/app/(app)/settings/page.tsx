@@ -173,6 +173,9 @@ export default function SettingsPage() {
   const [maxOrderInput, setMaxOrderInput] = useState("");
   const [maxContractBusy, setMaxContractBusy] = useState(false);
   const [maxOrderBusy, setMaxOrderBusy] = useState(false);
+  const [sizingMode, setSizingMode] = useState<"multiplier" | "dollar_target">("multiplier");
+  const [riskPerTradeInput, setRiskPerTradeInput] = useState("");
+  const [sizingBusy, setSizingBusy] = useState(false);
   // Max-account-pct-per-day is enforced server-side by pnl_poller.
   // `equity` comes in on every pnl.tick event so the panel can render
   // the dynamic dollar threshold (equity × pct/100). Null until the
@@ -266,6 +269,8 @@ export default function SettingsPage() {
         syncLimitInputs(s);
         setMaxContractInput(s.max_per_contract ?? "");
         setMaxOrderInput(s.max_per_order ?? "");
+        setSizingMode(s.sizing_mode === "dollar_target" ? "dollar_target" : "multiplier");
+        setRiskPerTradeInput(s.risk_per_trade_usd ?? "");
         setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setPosTpInput(s.position_tp_pct ?? "");
         setPosSlInput(s.position_sl_pct ?? "");
@@ -615,6 +620,36 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update max per order");
     } finally {
       setMaxOrderBusy(false);
+    }
+  }
+  async function saveSizing(mode: "multiplier" | "dollar_target") {
+    setSizingBusy(true);
+    try {
+      const trimmed = riskPerTradeInput.trim();
+      if (mode === "dollar_target" && !(parseFloat(trimmed) > 0)) {
+        notify.warn("Enter a dollar budget greater than 0 for dollar-target sizing.");
+        setSizingBusy(false);
+        return;
+      }
+      const body = {
+        sizing_mode: mode,
+        risk_per_trade_usd: mode === "dollar_target" ? trimmed : null,
+      };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/sizing", {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      setSub(s);
+      setSizingMode(s.sizing_mode === "dollar_target" ? "dollar_target" : "multiplier");
+      setRiskPerTradeInput(s.risk_per_trade_usd ?? "");
+      notify.success(
+        s.sizing_mode === "dollar_target"
+          ? `Sizing: $${s.risk_per_trade_usd} per trade`
+          : "Sizing: multiplier",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update sizing");
+    } finally {
+      setSizingBusy(false);
     }
   }
 
@@ -1388,6 +1423,51 @@ export default function SettingsPage() {
                 thresholdUsdDisplay="—"
                 headroomDisplay="—"
               />
+              {/* ── Copy sizing mode: multiplier vs dollar-target ───────────
+                  Lets a small follower track a large-size trader at a capped
+                  per-trade risk the 0.25× multiplier floor cannot reach. */}
+              <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border, #273341)" }}>
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 2 }}>Copy sizing</div>
+                <div style={{ fontSize: 12.5, color: "var(--muted, #8aa0b2)", marginBottom: 10 }}>
+                  How each <b>opening</b> trade is sized. Closes are unaffected.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <select
+                    value={sizingMode}
+                    onChange={(e) => setSizingMode(e.target.value === "dollar_target" ? "dollar_target" : "multiplier")}
+                    style={{ padding: "7px 10px", borderRadius: 8, background: "var(--card, #0e151c)", color: "var(--text, #e8edf1)", border: "1px solid var(--border, #273341)" }}
+                  >
+                    <option value="multiplier">Multiplier (×0.25–×10)</option>
+                    <option value="dollar_target">Dollar target ($ per trade)</option>
+                  </select>
+                  {sizingMode === "dollar_target" && (
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted, #8aa0b2)" }}>$</span>
+                      <input
+                        type="number" min="0" step="50" placeholder="500"
+                        value={riskPerTradeInput}
+                        onChange={(e) => setRiskPerTradeInput(e.target.value)}
+                        style={{ width: 110, padding: "7px 10px", borderRadius: 8, background: "var(--card, #0e151c)", color: "var(--text, #e8edf1)", border: "1px solid var(--border, #273341)", textAlign: "right" }}
+                      />
+                      <span style={{ fontSize: 12, color: "var(--muted, #8aa0b2)" }}>per trade</span>
+                    </span>
+                  )}
+                  <button
+                    onClick={() => saveSizing(sizingMode)}
+                    disabled={sizingBusy}
+                    style={{ padding: "7px 14px", borderRadius: 8, fontWeight: 600, border: "none", cursor: "pointer", background: "#2dd4bf", color: "#04211d", opacity: sizingBusy ? 0.6 : 1 }}
+                  >
+                    {sizingBusy ? "Saving…" : "Save"}
+                  </button>
+                </div>
+                {sizingMode === "dollar_target" && (
+                  <div style={{ fontSize: 11.5, color: "var(--muted, #8aa0b2)", marginTop: 8, lineHeight: 1.5 }}>
+                    Each new entry is sized to cost at most this much (floored to whole contracts). A trade whose single
+                    contract already costs more than the budget is skipped. Adds to a position you already hold, and all
+                    closes, keep the position&apos;s original multiplier.
+                  </div>
+                )}
+              </div>
             </div>
           </Card>
 

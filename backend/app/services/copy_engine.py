@@ -241,6 +241,29 @@ def exceeds_order_cap(total: "Decimal | None", cap: "Decimal | None") -> bool:
     return total > Decimal(str(cap))
 
 
+def dollar_target_quantity(
+    unit_price: "Decimal | None", budget: "Decimal | None", is_option: bool,
+) -> "Decimal | None":
+    """Whole units that fit a dollar budget, or None when it cannot be priced.
+
+    ``qty = floor(budget / cost-of-one-unit)``, where one unit costs
+    ``mirror_order_value(unit_price, 1, is_option)`` (premium x 100 for an
+    option, the share price for a stock) — the SAME cost definition the
+    per-order cap uses, so the budget means exactly what the caps mean.
+
+    Floors DOWN, so a copy never exceeds the budget; a single unit already over
+    budget yields 0 and the caller skips it. Returns None when the trade cannot
+    be priced — the caller treats that as "skip", never as a free trade and
+    never as a fall-back to the (possibly much larger) multiplier size.
+    """
+    if budget is None:
+        return None
+    per_unit = mirror_order_value(unit_price, 1, is_option)
+    if per_unit is None or per_unit <= 0:
+        return None
+    return (Decimal(str(budget)) / per_unit).to_integral_value(rounding=ROUND_DOWN)
+
+
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
     # WHOLE UNITS ONLY (copy trades are never fractional, even on brokers that
     # support it). Round the scaled size UP (ceil) to a whole unit — so
@@ -2785,6 +2808,35 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )
+
+            # ── Dollar-target sizing (opt-in) ────────────────────────────────
+            # A subscriber in "dollar_target" mode sizes each FRESH opening entry
+            # to a fixed $ budget instead of the multiplier — letting a small
+            # follower track a large trader at a capped per-trade risk the 0.25x
+            # multiplier floor can't reach (e.g. $500 behind a $5,000 trader).
+            #
+            # Only FRESH entries are re-sized (locked_mult is None, i.e. nothing
+            # held/forming on this contract); adds to a held position and all
+            # CLOSES keep the position's locked multiplier so exits are never
+            # stranded. The effective multiplier (qty / trader qty) is stored as
+            # the mirror's copy_multiplier via ``scale_mult`` below, so a later
+            # add or close on this position stays proportional through the normal
+            # lock path. If the trade can't be priced we SKIP (scaled=0) rather
+            # than fall back to the multiplier, which could massively overshoot
+            # the dollar budget on a fresh entry.
+            if (
+                locked_mult is None
+                and not is_closing_effective
+                and getattr(sub, "sizing_mode", "multiplier") == "dollar_target"
+                and sub.risk_per_trade_usd
+            ):
+                _dt = dollar_target_quantity(
+                    _gate_px, sub.risk_per_trade_usd,
+                    trader_order.instrument_type == InstrumentType.OPTION,
+                )
+                scaled = _dt if _dt is not None else Decimal(0)
+                if _dt and trader_order.quantity and trader_order.quantity > 0:
+                    scale_mult = Decimal(_dt) / Decimal(str(trader_order.quantity))
 
             # Close-only (paused) subscriber: admit ONLY genuine closes. An
             # entry (is_closing_effective False) is dropped here so a paused

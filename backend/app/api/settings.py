@@ -27,6 +27,7 @@ from app.schemas.settings import (
     RetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
+    SubscriberSizingIn,
     SubscriberToggleIn,
     SymbolFilterIn,
     TraderSettingsOut,
@@ -101,6 +102,8 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         eod_autoclose_minutes=s.eod_autoclose_minutes,
         unfilled_timeout_enabled=s.unfilled_timeout_enabled,
         unfilled_timeout_seconds=s.unfilled_timeout_seconds,
+        sizing_mode=getattr(s, "sizing_mode", "multiplier") or "multiplier",
+        risk_per_trade_usd=s.risk_per_trade_usd,
     )
 
 
@@ -345,6 +348,52 @@ def set_max_per_order(
     db.commit()
     db.refresh(s)
     # Bust the fanout cache so the copy engine picks up the new ceiling on the
+    # very next trade instead of after the cache TTL.
+    if s.following_trader_id:
+        cache.invalidate_subscribers_for_trader(s.following_trader_id)
+    return _to_out(db, s)
+
+
+@router.patch("/subscriber/sizing", response_model=SubscriberSettingsOut)
+def set_sizing(
+    payload: SubscriberSizingIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """How opening mirrors are sized. "multiplier" (default) scales the trader's
+    quantity by the subscriber multiplier; "dollar_target" sizes each FRESH
+    opening entry to ``risk_per_trade_usd`` instead — letting a small follower
+    track a large-size trader at a capped per-trade risk the 0.25x multiplier
+    floor cannot reach. Closes and adds to a held position are unaffected (they
+    keep the position's locked multiplier). Enforced in the copy engine."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old_mode, old_budget = s.sizing_mode, s.risk_per_trade_usd
+    s.sizing_mode = payload.sizing_mode
+    # Keep the budget when it is relevant; clear it in multiplier mode so a stale
+    # value can never resurface if the mode is flipped back on without re-entry.
+    s.risk_per_trade_usd = (
+        payload.risk_per_trade_usd if payload.sizing_mode == "dollar_target" else None
+    )
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.sizing_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old_mode": old_mode,
+            "new_mode": s.sizing_mode,
+            "old_budget": str(old_budget) if old_budget is not None else None,
+            "new_budget": str(s.risk_per_trade_usd) if s.risk_per_trade_usd is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    # Bust the fanout cache so the copy engine picks up the new sizing on the
     # very next trade instead of after the cache TTL.
     if s.following_trader_id:
         cache.invalidate_subscribers_for_trader(s.following_trader_id)
