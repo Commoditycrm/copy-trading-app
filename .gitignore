@@ -60,3 +60,6 @@ backend/did.bin
 # .venv, SDK logs, and (critically) plaintext app_key/app_secret + auth tokens
 # used for manual testing. Never commit: it carries live broker credentials.
 webull_sandbox_test/
+
+# EC2 staging proxy config carries the basic-auth hash
+deploy/ec2/Caddyfile.staging

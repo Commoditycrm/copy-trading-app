@@ -1,0 +1,15 @@
+# Copy to deploy/ec2/Caddyfile.staging (git-ignored). Basic auth covers pages
+# only: /api uses Authorization: Bearer, which basic auth would clobber.
+# Hash: docker run --rm caddy:2 caddy hash-password --plaintext '<password>'
+kopyya.<eip-with-dashes>.sslip.io {
+    encode gzip
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+    handle {
+        basic_auth {
+            kopyya <bcrypt-hash>
+        }
+        reverse_proxy frontend:3000
+    }
+}

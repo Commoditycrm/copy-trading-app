@@ -1,0 +1,3 @@
+# settings come from compose env_file; never bake secrets into the image
+.env
+.env.*

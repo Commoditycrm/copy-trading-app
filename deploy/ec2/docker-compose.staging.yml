@@ -1,0 +1,46 @@
+# Staging overlay: run the EC2 stack next to the live Lightsail prod without
+# touching brokers. The app network has no route out; only these fixed IPs get
+# egress, and ct-staging-egress-block.service narrows it further:
+#   caddy   172.30.250.10  internet (Let's Encrypt)
+#   backend 172.30.250.20  Alpaca paper API only
+#   worker  172.30.250.30  Alpaca paper API only
+#
+# The worker stays behind the `cutover` profile so a plain `docker compose up -d`
+# never starts a second set of listeners against prod's brokers (dedupe is
+# per-database advisory locks; nothing is shared across hosts). Start it with
+# `--profile cutover` only while backend/.env has a staging-only encryption key.
+#
+# discord-listener is already gated by its own `discord` profile; keep
+# COMPOSE_PROFILES unset until cutover. Drop this file from COMPOSE_FILE at
+# cutover, after the Lightsail worker is verified stopped.
+
+networks:
+  default:
+    internal: true
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.250.0/24
+
+services:
+  caddy:
+    networks:
+      default: {}
+      edge:
+        ipv4_address: 172.30.250.10
+    volumes:
+      - ./deploy/ec2/Caddyfile.staging:/etc/caddy/Caddyfile:ro
+  backend:
+    networks:
+      default: {}
+      edge:
+        ipv4_address: 172.30.250.20
+  worker:
+    profiles: ["cutover"]
+    # reuse the backend build; building needs egress, which staging doesn't have
+    image: copy-trading-app-backend:latest
+    pull_policy: never
+    networks:
+      default: {}
+      edge:
+        ipv4_address: 172.30.250.30

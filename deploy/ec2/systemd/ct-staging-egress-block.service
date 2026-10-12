@@ -1,0 +1,23 @@
+[Unit]
+Description=Staging: block container egress (caddy may reach internet for TLS; backend only Alpaca PAPER API)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 2 -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 3 -s 172.30.250.10/32 -j RETURN
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 4 -s 172.30.250.20/32 -d 35.194.67.18/32 -p tcp --dport 443 -j RETURN
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 5 -s 172.30.250.30/32 -d 35.194.67.18/32 -p tcp --dport 443 -j RETURN
+ExecStart=/usr/sbin/iptables -I DOCKER-USER 6 -s 172.16.0.0/12 -j DROP
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -s 172.16.0.0/12 -j DROP
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -s 172.30.250.30/32 -d 35.194.67.18/32 -p tcp --dport 443 -j RETURN
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -s 172.30.250.20/32 -d 35.194.67.18/32 -p tcp --dport 443 -j RETURN
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -s 172.30.250.10/32 -j RETURN
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
+ExecStop=/usr/sbin/iptables -D DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+[Install]
+WantedBy=multi-user.target

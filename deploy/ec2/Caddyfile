@@ -1,0 +1,11 @@
+# SITE_ADDRESS comes from the root .env: "kopyya.com, www.kopyya.com" on prod,
+# "test.kopyya.com" on QA.
+{$SITE_ADDRESS} {
+    encode gzip
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+    handle {
+        reverse_proxy frontend:3000
+    }
+}
