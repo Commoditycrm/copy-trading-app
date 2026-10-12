@@ -337,9 +337,14 @@ def refresh(body: RefreshIn, db: Session = Depends(get_db)) -> TokenPair:
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> User:
+    from app.api import deps  # noqa: PLC0415
     from app.services import discord_subscribers  # noqa: PLC0415
 
     user.discord_available = discord_subscribers.has_discord(db, user)
+    # Serialisation only — deliberately NOT `sell_all_access`, which is a real
+    # column: assigning to it here would mark the row dirty and could persist a
+    # grant the admin never made.
+    user.sell_all_available = deps.sell_all_allowed(db, user)
     return user
 
 
@@ -401,9 +406,14 @@ def update_me(
             cache_svc.invalidate_subscribers_for_trader(user.id)
         except Exception:  # noqa: BLE001
             pass
+    from app.api import deps  # noqa: PLC0415
     from app.services import discord_subscribers  # noqa: PLC0415
 
     user.discord_available = discord_subscribers.has_discord(db, user)
+    # Serialisation only — deliberately NOT `sell_all_access`, which is a real
+    # column: assigning to it here would mark the row dirty and could persist a
+    # grant the admin never made.
+    user.sell_all_available = deps.sell_all_allowed(db, user)
     return user
 
 

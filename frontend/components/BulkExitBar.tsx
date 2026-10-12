@@ -340,7 +340,7 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
   // Sell-All suite (Exit My Positions + trailing stop + snapshot/re-entry) is
   // admin-allow-listed per trader. Without access, hide the Exit-My-Positions
   // chip, its trail/re-entry inputs, and the Re-Enter card (the API 403s too).
-  const hasSellAll = !!user?.sell_all_access;
+  const hasSellAll = !!user?.sell_all_available;
 
   const renderButton = (key: ExitKey) => {
     const def = EXIT_DEFS[key];
