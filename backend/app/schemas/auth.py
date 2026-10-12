@@ -222,5 +222,11 @@ class UserOut(BaseModel):
     # subscriber following one (they trade the trader's channels on their own
     # settings). Derived on /me; the frontend gates Discord UI on it.
     discord_available: bool = False
+    # Whether this user gets the Sell-All / Snapshot / Re-entry suite: the admin
+    # allow-list above, OR a subscriber of a Discord trader (who must be able to
+    # exit positions the trader cannot act on). Derived on /me — the stored
+    # `sell_all_access` flag stays the admin's own record, so the admin toggle
+    # keeps showing what the admin set rather than the effective answer.
+    sell_all_available: bool = False
 
     model_config = {"from_attributes": True}

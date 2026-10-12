@@ -21,7 +21,13 @@ export interface User {
   is_active: boolean;
   /** Admin-controlled access to the Sell-All / Snapshot / Re-entry suite.
    *  Trader-only; off unless an admin allow-lists the user. */
+  /** What the ADMIN set. Use sell_all_available to decide what to show. */
   sell_all_access: boolean;
+  /** Effective access to the Sell-All / Snapshot / Re-entry suite: the admin
+   *  flag, OR a subscriber of a Discord trader — they trade the trader's
+   *  channels on their own settings and the trader cannot exit their
+   *  positions, so exiting is theirs to do. Derived by /me. */
+  sell_all_available?: boolean;
   /** Admin-controlled access to the inbound Discord alert-copying feature.
    *  Trader-only; off unless an admin allow-lists the user. Gates both the
    *  Discord nav entry and the /discord route. */

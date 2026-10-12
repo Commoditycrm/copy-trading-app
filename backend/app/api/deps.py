@@ -49,15 +49,43 @@ def require_trader(user: User = Depends(current_user)) -> User:
     return user
 
 
-def require_sell_all_access(user: User = Depends(current_user)) -> User:
-    """Gate the Sell-All / Snapshot / Re-entry suite: admin-allow-listed
-    (users.sell_all_access), for a TRADER or a SUBSCRIBER. Admins toggle it per
-    user (Admin -> Traders for traders, Admin -> Users for subscribers). The
-    subscriber-TARGETING bulk actions (close/cancel across subscribers) stay
-    trader-only via `require_trader` on those endpoints."""
+def sell_all_allowed(db: Session, user: User) -> bool:
+    """Who gets the Sell-All / Snapshot / Re-entry suite.
+
+    Two ways in, and ONE definition of them so the API gate and the /me payload
+    the UI hides buttons on can never disagree:
+
+      * the admin allow-list (``users.sell_all_access``), toggled per user in
+        Admin -> Traders / Admin -> Users; or
+      * being a subscriber of a Discord-enabled trader. Those subscribers trade
+        the trader's channels on their OWN settings, and the trader cannot act
+        on their positions (the subscriber-targeting bulk actions refuse, and
+        the bar hides them) — so exiting has to be theirs to do, without an
+        admin step.
+
+    Never grants to an admin or any other role: the suite acts on the caller's
+    own broker positions, which those do not have.
+    """
+    if user.role not in (UserRole.TRADER, UserRole.SUBSCRIBER):
+        return False
+    if getattr(user, "sell_all_access", False):
+        return True
+    from app.services import discord_subscribers  # noqa: PLC0415
+
+    return discord_subscribers.followed_discord_trader(db, user) is not None
+
+
+def require_sell_all_access(
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> User:
+    """Gate the Sell-All / Snapshot / Re-entry suite — see sell_all_allowed.
+
+    The subscriber-TARGETING bulk actions (close/cancel across subscribers)
+    stay trader-only via `require_trader` on those endpoints.
+    """
     if user.role not in (UserRole.TRADER, UserRole.SUBSCRIBER):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="trader_or_subscriber_only")
-    if not getattr(user, "sell_all_access", False):
+    if not sell_all_allowed(db, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="sell_all_access_required")
     return user
 

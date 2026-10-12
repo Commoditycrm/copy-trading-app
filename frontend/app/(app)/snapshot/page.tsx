@@ -659,7 +659,7 @@ export default function SnapshotPage() {
 
   const checkAccess = useCallback(() => {
     api<User>("/api/auth/me")
-      .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_access))
+      .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_available))
       .catch(() => setAccess(false));
   }, []);
   useEffect(() => { checkAccess(); }, [checkAccess]);
