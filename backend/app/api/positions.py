@@ -2049,7 +2049,7 @@ def set_position_stop(
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
     pnl_pct: Decimal = Query(..., ge=-99, le=1000, description="P&L level for the stop: -25 is 25% below entry, 0 break-even, +25 locks in 25%."),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> dict:
     """Put the position's stop at a P&L level measured from its average price.
 
@@ -2058,6 +2058,12 @@ def set_position_stop(
     then keeps a real STOP order resting at that level — one mechanism for
     every stop on the row, so a ladder stop and a second bracket stop never end
     up competing for the same contracts.
+    Open to the position's OWNER, trader or subscriber. What protects this is
+    the account check below — an account the caller does not own answers 404 —
+    not the role, since the endpoint can never reach another user's position.
+    It was trader-only, which left a subscriber able to arm a TRAILING stop on
+    a row but unable to set a plain one on that same row. Bulk actions that
+    target OTHER people's accounts stay trader-only.
     """
     from decimal import ROUND_DOWN  # noqa: PLC0415
 
@@ -2157,7 +2163,7 @@ def cancel_position_stops(
     request: Request,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> dict:
     """Remove every stop on one position, and keep them removed.
 
@@ -2170,6 +2176,12 @@ def cancel_position_stops(
 
     A bracket's SL leg is not touched here: the row clears that through the
     bracket endpoint, which keeps the entry's bracket state consistent.
+    Open to the position's OWNER, trader or subscriber. What protects this is
+    the account check below — an account the caller does not own answers 404 —
+    not the role, since the endpoint can never reach another user's position.
+    It was trader-only, which left a subscriber able to arm a TRAILING stop on
+    a row but unable to set a plain one on that same row. Bulk actions that
+    target OTHER people's accounts stay trader-only.
     """
     from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
     from app.services import audit, discord_stop_orders  # noqa: PLC0415
