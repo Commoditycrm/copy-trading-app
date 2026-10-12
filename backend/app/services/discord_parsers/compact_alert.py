@@ -587,15 +587,36 @@ def _is_entry(m: re.Match, average_down: bool = False) -> bool:
     return not re.match(rf"^[+\-−]\s*(?:{_NUM})\s*%", trailing)
 
 
+# Capitalised words that follow "add to" without being a position.
+_NOT_ADD_TARGETS = {"WATCHLIST", "LIST", "CART", "NOTES", "CHAT", "ALL", "IT", "THIS", "THAT"}
+
+
 def _is_add(m: re.Match) -> bool:
     """Guard against prose. An add needs a "$" ticker, an explicit contract, or
-    a ticker written as one (capitals) with an "@" price — "Added to TSLA, New
-    avg @0.90". "leave room to add in case they want a bounce" has none of them."""
+    a ticker written as one (capitals) — "Added to TSLA, New avg @0.90".
+    "leave room to add in case they want a bounce" has none of them.
+
+    A bare ticker with NO price is accepted when nothing follows it: mentions
+    are stripped before this runs, so Mark's "Added to SPY @Mark" arrives as
+    "Added to SPY" with empty trailing, while musing ("Adding to SPY soon
+    because I think it bounces") still carries its prose and is refused. The
+    price is then left to execution, which fills it from the live quote or
+    goes at market — the same path a price-less entry takes.
+    """
     if m.group("dsymbol") or (m.group("strike") and m.group("right")):
         return True
     sym = m.group("symbol") or ""
+    if not sym.isupper():
+        return False
     at_price = m.group("price") or re.search(rf"@\s*\$?{_NUM}\b", m.group("trailing") or "")
-    return sym.isupper() and bool(at_price)
+    if at_price:
+        return True
+    # No price: demand a ticker-shaped word and a clean end of line.
+    return (
+        len(sym) <= 5
+        and sym not in _NOT_ADD_TARGETS
+        and not (m.group("trailing") or "").strip()
+    )
 
 
 def _has_marker(line: str) -> bool:

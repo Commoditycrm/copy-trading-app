@@ -328,3 +328,54 @@ def test_an_add_to_a_named_ticker_trades_the_channels_contract_in_it(monkeypatch
     assert asked["symbol"] == "TSLA"
     s = asked["signal"]
     assert (s["asset_type"], s["strike"], s["option_type"], s["limit_price"]) == ("OPTION", "375", "call", "0.90")
+
+
+# ── "Added to SPY @Mark" (live 2026-10-12: no trade at all) ──────────────────
+# The price-bearing form above already worked. This one names the ticker and
+# nothing else — @Mark is a mention, not a price — and was refused outright by
+# _is_add, so an add into an open SPY position never happened.
+
+TS_ADD = datetime(2026, 10, 12, 14, 50, tzinfo=timezone.utc)
+
+
+def _add_sig(body):
+    r = parse_message(ParsedMessage(content=body, posted_at=TS_ADD))
+    return r.signals[0] if r.signals else None
+
+
+@pytest.mark.parametrize("body", [
+    "Added to SPY @Mark",
+    "Added to SPY",
+    "Added to SPY @here @Mark",
+])
+def test_a_bare_ticker_add_with_no_price_is_an_add(body):
+    s = _add_sig(body)
+    assert s is not None, f"{body!r} produced no signal"
+    assert s.action.value == "BUY" and s.asset_type.value == "OPTION"
+    assert s.symbol == "SPY" and s.add_to_latest and s.contract_unspecified
+    # No price stated: execution prices it (live quote, else market).
+    assert s.limit_price is None and s.limit_price_unspecified is True
+
+
+def test_the_priced_add_is_unchanged():
+    s = _add_sig("Added to TSLA, New avg @0.90 @Mark")
+    assert s.symbol == "TSLA" and s.limit_price == Decimal("0.90")
+
+
+def test_a_dollar_ticker_add_still_works():
+    s = _add_sig("Added to $SPY @Mark")
+    assert s.symbol == "SPY" and s.limit_price is None
+
+
+@pytest.mark.parametrize("body", [
+    "Adding to SPY soon because I think it bounces",   # musing: prose follows
+    "Added to SPY tomorrow maybe",
+    "ADD TO WATCHLIST",                                # not a position (too long)
+    "ADD TO CART",                                     # short, but not a ticker
+    "Added to POSITIONS",                              # long word, not a ticker
+    "add to the list when it dips",
+    "leave room to add in case they want a bit more of a bounce",
+])
+def test_talk_about_adding_is_still_not_an_order(body):
+    s = _add_sig(body)
+    assert s is None or s.action.value != "BUY", f"{body!r} must not place an order"
