@@ -1028,10 +1028,31 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
 
                 ``quantity`` is what this protection covers: the whole position
                 for a stop-out, or just the earmarked slice for a trailing exit.
+
+                Resting orders are released first (they hold the contracts),
+                then the sell goes out, and then — once the sell is CONFIRMED
+                filled — this account is made due so the stop on whatever is
+                left goes back on the next wake instead of the next full
+                interval. A trailing exit that sells part of a position used to
+                leave the remainder unprotected for the rest of the interval.
+
+                Confirmed, never assumed: poking the reconciler while the sell
+                is still working would size the stop to the whole position and
+                reserve the very contracts the sell is taking.
                 """
                 from app.models.user import User  # noqa: PLC0415
+                from app.services import exit_confirm  # noqa: PLC0415
 
-                exit_freeing_reservations(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
+                sold = exit_freeing_reservations(
+                    db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
+                try:
+                    if exit_confirm.confirm_filled(db, live_acct.id, sold):
+                        poll_now(live_acct.id)
+                except Exception:  # noqa: BLE001
+                    # The stop still goes out on the next tick; this only ever
+                    # makes it sooner, so a failure must not fail the exit.
+                    log.warning("pnl_poller: could not expedite the stop after exiting %s",
+                                getattr(pos, "symbol", "?"), exc_info=True)
 
             # Keep a REAL stop order resting at the broker for each protected
             # position. Reconciled every tick rather than placed once, so it

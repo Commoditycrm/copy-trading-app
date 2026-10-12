@@ -2660,8 +2660,14 @@ def _execute_signal(
     # sell — the reservation problem the release-then-replace order exists for.
     # Unfilled simply falls through to the normal tick, exactly as today.
     from app.models.order import OrderStatus  # noqa: PLC0415 — local elsewhere too
+    from app.services import exit_confirm  # noqa: PLC0415
 
-    if is_trim and order.status is OrderStatus.FILLED:
+    # …and "filled" is CONFIRMED, not assumed. A market exit is usually filled
+    # by the time placement returns, but when it is not, the row still reads
+    # SUBMITTED and the old condition fell through — so the stop on what is
+    # left waited for the next poll tick even though the sell had gone through
+    # moments later. exit_confirm re-reads it at the broker, twice.
+    if is_trim and exit_confirm.confirm_filled(db, resolved.broker_account_id, order):
         try:
             from app.services.pnl_poller import poll_now  # noqa: PLC0415
 

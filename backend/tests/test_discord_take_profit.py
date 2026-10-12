@@ -449,3 +449,53 @@ def test_a_take_profit_refused_for_held_contracts_is_retried_soon():
     book.place_limit = _naked_call
     out, _ = _run(book, g, 4)
     assert out == "refused — backing off" and g.tp_backoff_until == NOW + tp.CONFLICT_BACKOFF
+
+
+# ── the stop is being resized: the take-profit waits a pass ─────────────────
+# Live 2026-10-13: entry filled 5 @ 1.08, the On Fill stop took all 5, and the
+# Trim 1 take-profit for 3 was REJECTED 32 seconds later. The ladder stop had
+# just been cancelled to resize around the take-profit, and a broker frees a
+# cancelled order's contracts only once the cancel completes — so the sell for
+# 3 asked for contracts the old stop still held.
+
+RESIZING = "cancelled 5 @ 0.21; 2 @ 0.21 next pass"
+
+
+def test_the_take_profit_is_not_placed_while_the_stop_is_being_resized():
+    book, g = _Book(), _guard(stop_price=D("0.21"))
+    out, earmark = _run(book, g, 5, stop=RESIZING)
+    assert book.calls == [], "the take-profit went out while the stop still held the contracts"
+    assert "waits a pass" in out
+
+
+def test_the_slice_stays_earmarked_so_the_new_stop_is_sized_around_it():
+    """The stop going out next pass must already leave room for this trim."""
+    book, g = _Book(), _guard(stop_price=D("0.21"))
+    _out, earmark = _run(book, g, 5, stop=RESIZING)
+    assert earmark == D(3) and g.tp_qty == D(3)
+
+
+def test_waiting_is_not_treated_as_a_refusal():
+    """Nothing was refused, so there is no backoff to serve — the take-profit
+    goes out on the very next pass."""
+    book, g = _Book(), _guard(stop_price=D("0.21"))
+    _run(book, g, 5, stop=RESIZING)
+    assert g.tp_backoff_until is None
+    assert (g.tp_order_id, g.tp_stop_order_id, g.tp_rung) == (None, None, None)
+
+
+def test_the_next_pass_places_it_once_the_stop_has_settled():
+    book, g = _Book(), _guard(stop_price=D("0.21"))
+    _run(book, g, 5, stop=RESIZING)          # pass 1: waits
+    out, _ = _run(book, g, 5, stop="in sync")  # pass 2: the stop is resting again
+    assert book.calls == [("pair", D(3), D("1.20"), D("0.21"))]
+    assert "placed trim 1" in out and g.tp_order_id is not None
+
+
+@pytest.mark.parametrize("stop_outcome", [
+    "in sync", "idle", "placed 5 @ 0.21", "removed by the trader",
+])
+def test_other_stop_outcomes_still_place_the_take_profit(stop_outcome):
+    book, g = _Book(), _guard(stop_price=D("0.21"))
+    _run(book, g, 5, stop=stop_outcome)
+    assert book.calls, f"{stop_outcome!r} wrongly blocked the take-profit"

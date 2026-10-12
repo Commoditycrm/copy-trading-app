@@ -353,6 +353,24 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
         guard.tp_qty = None
         return f"position being closed (stop: {stop_outcome})"
 
+    # The ladder stop was just CANCELLED so it could be resized around this
+    # take-profit, and its replacement goes out next pass. Those contracts are
+    # not free yet — a broker releases them only once the cancel completes — so
+    # a take-profit placed now asks for contracts the old stop still holds and
+    # is refused as opening a naked position. Live 2026-10-13: an entry filled
+    # 5 @ 1.08, the On Fill stop took all 5, and the Trim 1 take-profit for 3
+    # was refused 32 seconds later.
+    #
+    # Wait one pass, exactly as the take-profit's own replace does above. The
+    # earmark (tp_qty) stays, so the stop that goes out next pass is already
+    # sized around this take-profit and the two never ask for the same
+    # contracts. No backoff: nothing was refused.
+    from app.services import discord_stop_orders as _stops  # noqa: PLC0415
+
+    if _stops.is_replacing(stop_outcome):
+        return (f"{settled}; " if settled else "") + (
+            "take-profit waits a pass — the stop is being resized around it")
+
     from app.services.position_events import because  # noqa: PLC0415
 
     try:
