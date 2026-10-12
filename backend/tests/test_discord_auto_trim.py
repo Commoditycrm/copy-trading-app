@@ -385,7 +385,13 @@ def test_a_filled_trim_makes_the_account_due_now():
     # ONLY once filled: reconcile sizes the stop from what the BROKER reports,
     # so poking it mid-settlement would size the stop to the whole position and
     # block the very sell that just went out.
-    assert "if is_trim and order.status is OrderStatus.FILLED:" in src
+    #
+    # And "filled" is confirmed at the broker rather than read off a row that
+    # can still say SUBMITTED for a sell that has already gone through — a
+    # market exit filled a moment after placement used to fall through here and
+    # leave the remainder unprotected until the next tick.
+    assert "exit_confirm.confirm_filled(db, resolved.broker_account_id, order)" in src
+    assert "if is_trim and " in src
 
 
 def test_poll_now_only_clears_that_account():

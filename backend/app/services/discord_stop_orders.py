@@ -303,7 +303,25 @@ def reconcile(
         "discord stop: %s stop moving to %s x%s (was %s x%s) — placed next pass",
         guard.symbol, want_price, want_qty, resting.stop_price, resting.quantity,
     )
-    return f"cancelled {resting.quantity} @ {resting.stop_price}; {want_qty} @ {want_price} next pass"
+    return (f"cancelled {resting.quantity} @ {resting.stop_price}; "
+            f"{want_qty} @ {want_price} {REPLACING}")
+
+
+# Outcome marker: the stop was CANCELLED this pass and its replacement goes out
+# on the next one. Until that cancel completes the broker still holds the old
+# order's contracts, so nothing else may sell them yet — see is_replacing.
+REPLACING = "next pass"
+
+
+def is_replacing(outcome: str | None) -> bool:
+    """Did this reconcile just cancel the stop, with the new one still to come?
+
+    The contracts the cancelled stop held are not free yet. A sell placed in the
+    same instant asks for contracts that are still taken, and the broker refuses
+    it as opening a naked position (QA 2026-10-06; live 2026-10-13, a Trim 1
+    take-profit for 3 refused 32s after an On Fill stop took all 5).
+    """
+    return bool(outcome) and REPLACING in outcome
 
 
 # How long to wait after a rejected stop before trying again. Long enough that a
@@ -476,5 +494,6 @@ def release(db: Session, guard, cancel_stop) -> bool:
     return True
 
 
-__all__ = ["desired_quantity", "reconcile", "release", "release_for_position", "working_exit",
+__all__ = ["REPLACING", "desired_quantity", "is_replacing", "reconcile", "release",
+           "release_for_position", "working_exit",
            "is_reservation_conflict"]

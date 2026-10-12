@@ -36,4 +36,7 @@ def test_the_poller_s_exits_go_through_it():
     import inspect
 
     src = inspect.getsource(pnl_poller._enforce_discord_trailing_stops)
-    assert "exit_freeing_reservations(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)" in src
+    # The CALL, not its argument layout — this is about the poller's exits
+    # going through the releasing path, not about how the line wraps.
+    assert "exit_freeing_reservations(" in src
+    assert "live_acct, adapter, pos, quantity)" in src
