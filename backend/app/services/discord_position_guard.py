@@ -352,19 +352,38 @@ def _armable_stop(stop: Decimal | None, mark: Decimal | None) -> Decimal | None:
     return stop if stop < mark else None
 
 
-def rung_stop(entry, rung_cfg: RungConfig, mark) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+def rung_stop(entry, rung_cfg: RungConfig, mark,
+              *, anchor_to_entry: bool = False) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
     """Where a trim's stop goes: (stop price, trail %, peak).
 
-    A FIXED stop is a return from entry (-25 -> entry x 0.75). A TRAILING one is
-    a give-back from the best price since the trim — it starts that far below
-    the price now (the entry when there is no mark yet) and ratchet_stop() raises
-    it from there. Trail % and peak are None for a fixed stop."""
+    The two kinds measure from DIFFERENT things, and conflating them is how a
+    trailing stop ends up in the wrong place:
+
+      * a FIXED stop is a return from the cost basis (-25 -> entry x 0.75);
+      * a TRAILING stop is a give-back from the best price seen, so it starts
+        that far below the price NOW and ratchet_stop() raises it from there.
+
+    ``anchor_to_entry`` is for the one case where the entry IS the best price
+    seen: the On Fill stop, set the moment the entry fills. There the position
+    has not moved yet, so entry and market are the same number.
+
+    It is OFF by default, because everywhere else they are not. A trim fires
+    after the position has run — measuring its trail from the entry would put
+    the stop a give-back below the COST rather than below the high, which on a
+    position up 200% is far under the market and gives back nearly all of the
+    gain. Without a usable mark there is no honest anchor, so no trailing stop
+    is proposed and whatever stop already protects the position stays
+    (apply_stop leaves a None alone). The next pass that has a mark sets it.
+
+    Trail % and peak are None for a fixed stop.
+    """
     entry = Decimal(str(entry)) if entry is not None else None
     if not rung_cfg.stop_trail:
         if entry is None or entry <= 0:
             return None, None, None
         return entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100)), None, None
-    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), mark if mark else entry)
+    peak = mark if mark else (entry if anchor_to_entry else None)
+    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), peak)
 
 
 def trailing_stop(pct: Decimal, peak) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
@@ -664,7 +683,10 @@ def restart_ladder(db: Session, user_id, symbol: str, strike, right, expiry, *,
             if fill is not None and guard.entry_price:
                 stop, trail_pct, peak = rung_stop(
                     guard.entry_price,
-                    RungConfig(stop_pct=fill, stop_trail=discord_ladder.fill_stop_trails(ts)), None)
+                    RungConfig(stop_pct=fill, stop_trail=discord_ladder.fill_stop_trails(ts)), None,
+                    # The On Fill stop: the position has not moved, so the entry
+                    # is the high a trail gives back from.
+                    anchor_to_entry=True)
                 stop = _to_tick(stop)
                 if stop is not None and stop > 0:
                     guard.stop_price = stop

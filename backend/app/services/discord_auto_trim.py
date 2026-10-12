@@ -162,7 +162,10 @@ def apply_fill_stop(db, guard: DiscordPositionGuard, ts, engine: str = "ladder")
     # Fixed: a return from entry (-25 = 25% below). Trailing: a give-back from
     # the high, which at the fill IS the entry, raised as the price climbs.
     stop, trail_pct, peak = pg.rung_stop(
-        entry, pg.RungConfig(stop_pct=pct, stop_trail=trailing), None)
+        entry, pg.RungConfig(stop_pct=pct, stop_trail=trailing), None,
+        # At the fill the entry IS the high, so it is the anchor a trail gives
+        # back from. Everywhere else a trail needs the market price.
+        anchor_to_entry=True)
     stop = pg._to_tick(stop)
     if stop is None or stop <= 0:
         return False                      # rounds to $0 on a very cheap contract: not a stop
