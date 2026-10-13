@@ -93,7 +93,9 @@ _NON_TERMINAL_STATUSES = (
 )
 
 
-def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
+def _refresh_open_orders(
+    db: Session, acct: BrokerAccount, adapter: Any, changed_out: "list[Order] | None" = None,
+) -> int:
     """Poll the broker's order endpoint for every non-terminal order on this
     account. Alpaca's order resource updates instantly on fill, while the
     activities feed can lag minutes. This keeps Order History fresh without
@@ -216,6 +218,8 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
                 dead_entries.append(order)
         if changed:
             refreshed += 1
+            if changed_out is not None:
+                changed_out.append(order)
 
     for order in newly_closed:
         try:
