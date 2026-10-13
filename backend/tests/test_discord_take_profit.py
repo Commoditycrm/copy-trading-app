@@ -499,3 +499,57 @@ def test_other_stop_outcomes_still_place_the_take_profit(stop_outcome):
     book, g = _Book(), _guard(stop_price=D("0.21"))
     _run(book, g, 5, stop=stop_outcome)
     assert book.calls, f"{stop_outcome!r} wrongly blocked the take-profit"
+
+
+# ── a take-profit that fills in the instant it is replaced ───────────────────
+# QA 2026-10-13, QQQ 743P: Trim 1 rested 6 of 12 @ 0.92 and filled. Before our
+# record caught up, the smaller position no longer matched the plan, so the
+# ladder released (cancelled) the take-profit — which the broker refused as
+# already filled — and the row was marked CANCELED anyway. Trim 1 was never
+# credited and sold 3 more of what was left: 9 of 12 instead of 6.
+
+class _RaceBook(_Book):
+    """The broker filled ``racing`` before our cancel reached it. The canceller
+    records that as a fill (exit_confirm.cancel_and_record)."""
+
+    def __init__(self):
+        super().__init__()
+        self.racing = None
+
+    def cancel(self, oid):
+        self.calls.append(("cancel", oid))
+        if oid == self.racing:
+            self.fill(oid, "1.20")
+        else:
+            self.orders[oid].status = OrderStatus.CANCELED
+
+
+def test_a_take_profit_that_filled_during_its_release_is_credited():
+    book, g = _RaceBook(), _guard(stop_price=D("0.75"))
+    _run(book, g, 4)                                               # T1: 2 @ 1.20, linked stop 0.75
+    book.racing = g.tp_order_id
+    out, _ = _run(book, g, 2)                                      # it filled; we hear of it on release
+    assert g.sell_count == 1, "Trim 1 happened and must be counted"
+    assert "trim 1 filled" in out
+    assert g.tp_order_id is None and g.tp_rung is None
+    pairs = [c for c in book.calls if c[0] == "pair"]
+    assert len(pairs) == 1, "nothing new in the pass that found the fill — the linked stop is still going"
+
+
+def test_after_the_credited_fill_the_next_trim_is_trim_two_not_trim_one_again():
+    book, g = _RaceBook(), _guard(stop_price=D("0.75"))
+    _run(book, g, 4)
+    book.racing = g.tp_order_id
+    _run(book, g, 2)
+    _run(book, g, 2)
+    last = [c for c in book.calls if c[0] == "pair"][-1]
+    assert last[1:3] == (D(1), D("1.40")), f"expected Trim 2 (1 @ 1.40), got {last}"
+
+
+def test_release_keeps_a_filled_take_profit_for_settle_to_credit():
+    book, g = _RaceBook(), _guard(stop_price=D("0.75"))
+    _run(book, g, 4)
+    book.racing = g.tp_order_id
+    assert tp.release(book, g, book.cancel) is True
+    assert g.tp_order_id is not None, "a filled take-profit must not be forgotten"
+    assert tp.settle(book, g, _ts(), book.cancel) == "trim 1 filled" and g.sell_count == 1

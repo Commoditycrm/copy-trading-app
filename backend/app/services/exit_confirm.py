@@ -90,6 +90,85 @@ def record_fill_details(order: Any, result: Any) -> None:
         order.closed_at = at or datetime.now(timezone.utc)
 
 
+def cancel_and_record(adapter: Any, order: Any) -> None:
+    """Cancel one of our resting orders and record what ACTUALLY happened to it.
+
+    The ladder's cancels used to mark the row CANCELED whatever the broker said.
+    But a cancel that reaches an order which has just FILLED is refused as
+    "already terminal" (cancel_order returns False), and marking that row
+    cancelled hides a real sell: the ladder never credits the trim and places it
+    again on what is left. QA 2026-10-13, QQQ 743P: Trim 1's take-profit filled
+    6 @ 0.92 in the second the ladder replaced it, was recorded as cancelled, and
+    Trim 1 then sold 3 more — 9 of 12 instead of 6.
+
+    So: an accepted cancel is CANCELED. Anything else — refused as already
+    terminal, or an error — asks the broker once and records its answer (a fill
+    with its price and time). Only when the broker cannot be read does it fall
+    back to CANCELED, as before.
+    """
+    from app.models.order import OrderStatus  # noqa: PLC0415
+
+    if not getattr(order, "broker_order_id", None):
+        order.status = OrderStatus.CANCELED
+        return
+    try:
+        accepted = adapter.cancel_order(order.broker_order_id)
+    except Exception:  # noqa: BLE001
+        log.warning("cancel: broker cancel failed for %s", getattr(order, "id", "?"), exc_info=True)
+        accepted = None
+    if accepted is True:
+        order.status = OrderStatus.CANCELED
+        return
+    record_cancel_outcome(adapter, order, refused=accepted is False)
+
+
+_AS_CANCELLED = object()
+
+
+def record_cancel_outcome(adapter: Any, order: Any, *, refused: bool,
+                          fallback: Any = _AS_CANCELLED) -> None:
+    """After a cancel the broker did NOT accept: read the order once and record
+    what really happened to it.
+
+    ``refused``: the broker answered "already terminal" (True), as opposed to the
+    cancel call failing (False) — a partly filled order it calls terminal had
+    the rest cancelled; one whose cancel errored may still be working.
+    ``fallback``: the status when the broker cannot be read — CANCELED by default
+    (the ladder's behaviour before), or None to leave the row as it is.
+    """
+    from app.models.order import OrderStatus  # noqa: PLC0415
+
+    if fallback is _AS_CANCELLED:
+        fallback = OrderStatus.CANCELED
+    try:
+        result = adapter.get_order(str(order.broker_order_id))
+    except Exception:  # noqa: BLE001
+        log.warning("cancel: could not read %s after the cancel", getattr(order, "id", "?"),
+                    exc_info=True)
+        result = None
+    status = getattr(result, "status", None)
+    if status is None:
+        if fallback is not None:
+            order.status = fallback
+        return
+    got = _filled_quantity(result)
+    if got > 0:
+        order.filled_quantity = got
+    if status == OrderStatus.FILLED:
+        order.status = OrderStatus.FILLED
+        record_fill_details(order, result)
+        log.info("cancel: %s had already filled (%s @ %s) — recorded as a fill, not a cancel",
+                 getattr(order, "id", "?"), order.filled_quantity, order.filled_avg_price)
+        return
+    if status == OrderStatus.PARTIALLY_FILLED and refused:
+        # Terminal at the broker with part traded: the rest was cancelled, and
+        # what traded keeps its quantity and price.
+        order.status = OrderStatus.CANCELED
+        record_fill_details(order, result)
+        return
+    order.status = status
+
+
 def confirm_filled(
     db: Session,
     broker_account_id: uuid.UUID | None,
