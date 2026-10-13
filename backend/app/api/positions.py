@@ -22,7 +22,8 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import client_ip, current_user, require_sell_all_access, require_trader
+from app.api.deps import (client_ip, current_user, require_sell_all_access,
+                          require_snapshot_access, require_trader)
 from app.api.trades import _place_trader_order
 from collections.abc import Callable
 from decimal import Decimal
@@ -1011,7 +1012,7 @@ def latest_sell_all_snapshot(
         description="Load a SPECIFIC snapshot from the history. Omit for the current (active/newest) one.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """One Sell-All snapshot with each position's live re-entry status
     (filled / working / pending / expired) + current price and a summary count.
@@ -1038,7 +1039,7 @@ def latest_sell_all_snapshot(
 @router.get("/snapshots/today")
 def today_sell_all_snapshots(
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Every snapshot taken TODAY (ET), newest first, each fully priced like the
     `latest` endpoint. The Snapshot page shows these stacked so a fresh Exit
@@ -1063,7 +1064,7 @@ def today_sell_all_snapshots(
 @router.get("/snapshots")
 def list_sell_all_snapshots(
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """History of the user's Sell-All snapshots, newest first: id, when it was
     taken, position count, and a status breakdown. Cheap — counts come from the
@@ -1108,7 +1109,7 @@ def list_sell_all_snapshots(
 def delete_sell_all_snapshot(
     snapshot_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Delete one snapshot from the history. Only removes the re-entry record —
     it never touches any orders that were already placed."""
@@ -1125,7 +1126,7 @@ def delete_snapshot_position(
     snapshot_id: uuid.UUID,
     index: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Remove ONE order (by 0-based index) from a snapshot's re-entry list. If it
     was the last one, the whole snapshot is deleted. Only touches the re-entry
@@ -1258,7 +1259,7 @@ def re_enter_from_snapshot(
         description="'Trail down': rest a BUY LIMIT this % below the live price, then re-price it lower as the stock falls (ratchets DOWN only). Stock only; managed by trail_down_monitor. Wins over discount_percent/limit_price.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Re-open the positions from a Sell-All snapshot, FILL-AWARE: only items not
     already back (or with a resting order) get a new buy. Long positions re-buy,

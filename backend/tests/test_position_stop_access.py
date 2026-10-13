@@ -79,3 +79,32 @@ def test_a_foreign_broker_account_is_refused(monkeypatch):
             pnl_pct=Decimal("-25"), db=db, user=user,
         )
     assert e.value.status_code == 404
+
+
+# ── the snapshot suite is a narrower gate than exiting ──────────────────────
+
+SNAPSHOT_ROUTES = [
+    ("/api/positions/snapshots", "GET"),
+    ("/api/positions/snapshots/latest", "GET"),
+    ("/api/positions/snapshots/today", "GET"),
+    ("/api/positions/snapshots/{snapshot_id}", "DELETE"),
+    ("/api/positions/snapshots/{snapshot_id}/positions/{index}", "DELETE"),
+    ("/api/positions/re-enter", "POST"),
+]
+
+
+@pytest.mark.parametrize("path,method", SNAPSHOT_ROUTES)
+def test_snapshot_routes_need_the_admin_allow_list(path, method):
+    from app.api.deps import require_sell_all_access, require_snapshot_access
+    deps = _deps(path, method)
+    assert require_snapshot_access in deps, f"{path} is not on the snapshot gate"
+    assert require_sell_all_access not in deps, (
+        f"{path} would be reachable by a Discord trader's subscribers")
+
+
+def test_exiting_your_own_positions_keeps_the_wider_gate():
+    """Close-all is the half a Discord trader's subscribers must keep: the
+    trader cannot exit their positions for them."""
+    from app.api.deps import require_sell_all_access, require_snapshot_access
+    deps = _deps("/api/positions/close-all")
+    assert require_sell_all_access in deps and require_snapshot_access not in deps
