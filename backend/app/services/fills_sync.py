@@ -93,6 +93,66 @@ _NON_TERMINAL_STATUSES = (
 )
 
 
+# How far back repair_unrecorded_fills looks. A fill older than this is left
+# alone: the repair is for the gap a confirmation left today, not an archive scan.
+_REPAIR_WINDOW = timedelta(hours=24)
+# At most this many broker reads per call, so a backlog cannot eat a
+# rate-limited broker's budget (direct Webull: ~10 requests / 30s).
+_REPAIR_MAX_READS = 3
+# An order the broker still cannot report as filled after this long is stamped
+# closed and left alone.
+_REPAIR_GIVE_UP = timedelta(hours=1)
+
+
+def repair_unrecorded_fills(db: Session, acct: BrokerAccount, adapter: Any) -> int:
+    """Fill in the price and time of orders we marked FILLED without them.
+
+    A sell confirmed by exit_confirm used to be recorded FILLED with no price and
+    no close time, and an order the sweep above never re-reads (it is terminal)
+    stayed that way: Closed today, which picks a day's sells by fill/close time,
+    and realized P&L both left it out. Each such order is read from the broker
+    once — the close time is stamped whether or not a price comes back, so it is
+    never read again.
+    """
+    from app.services.exit_confirm import record_fill_details  # noqa: PLC0415
+
+    rows = list(db.execute(
+        select(Order).where(
+            Order.broker_account_id == acct.id,
+            Order.status == OrderStatus.FILLED,
+            Order.closed_at.is_(None),
+            Order.broker_order_id.isnot(None),
+            Order.created_at >= datetime.now(timezone.utc) - _REPAIR_WINDOW,
+        ).order_by(Order.created_at).limit(_REPAIR_MAX_READS)
+    ).scalars())
+    repaired = 0
+    now = datetime.now(timezone.utc)
+    for order in rows:
+        try:
+            res = adapter.get_order(order.broker_order_id)
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: repair read of %s failed", order.id, exc_info=True)
+            res = None
+        if getattr(res, "status", None) != OrderStatus.FILLED:
+            # Unreadable, or the broker no longer says filled. Retried on later
+            # ticks for a while (a read can fail on a rate limit), then given up
+            # so one order the broker cannot find does not spend every tick.
+            created = order.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created is not None and now - created > _REPAIR_GIVE_UP:
+                order.closed_at = now
+                repaired += 1
+            continue
+        record_fill_details(order, res)
+        repaired += 1
+        log.info("fills_sync: recorded the fill of %s %s (price %s)",
+                 order.symbol, order.id, order.filled_avg_price)
+    if repaired:
+        db.flush()
+    return repaired
+
+
 def _refresh_open_orders(
     db: Session, acct: BrokerAccount, adapter: Any, changed_out: "list[Order] | None" = None,
 ) -> int:

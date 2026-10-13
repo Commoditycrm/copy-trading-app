@@ -1032,6 +1032,20 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                 return
             adapter = adapter_for(live_acct, decrypt_json(live_acct.encrypted_credentials))
 
+            # A sell this ladder confirmed but never got a price or close time
+            # for: fill them in, or it is missing from Closed today and the
+            # day's P&L. Nothing else re-reads it — a Discord subscriber's
+            # Webull account has no order listener.
+            try:
+                from app.services import fills_sync as _fills  # noqa: PLC0415
+
+                if _fills.repair_unrecorded_fills(db, live_acct, adapter):
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                log.warning("discord stop: fill repair failed for user=%s",
+                            acct.user_id, exc_info=True)
+
             def _close(pos, guard, quantity) -> None:
                 """Exit at market — a stop that fires has to fill.
 

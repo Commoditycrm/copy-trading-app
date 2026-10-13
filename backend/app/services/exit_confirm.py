@@ -71,6 +71,25 @@ def _is_filled(result: Any) -> bool:
     return str(status or "").lower() in _FILLED_STATES
 
 
+def record_fill_details(order: Any, result: Any) -> None:
+    """Copy a filled broker order's price and execution time onto our row, and
+    stamp the close time. Fills only what is missing — never overwrites."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    px = getattr(result, "filled_avg_price", None)
+    if px is not None and getattr(order, "filled_avg_price", None) is None:
+        try:
+            if Decimal(str(px)) > 0:
+                order.filled_avg_price = Decimal(str(px))
+        except Exception:  # noqa: BLE001
+            pass
+    at = getattr(result, "filled_at", None)
+    if at is not None and getattr(order, "broker_filled_at", None) is None:
+        order.broker_filled_at = at
+    if getattr(order, "closed_at", None) is None:
+        order.closed_at = at or datetime.now(timezone.utc)
+
+
 def confirm_filled(
     db: Session,
     broker_account_id: uuid.UUID | None,
@@ -127,6 +146,12 @@ def confirm_filled(
         if got > 0:
             order.filled_quantity = got
         order.status = OrderStatus.FILLED
+        # …and the price and time, from the same read. Without them the sell
+        # was FILLED with no price and no close time: Closed today (which picks
+        # a day's sells by fill/close time) and realized P&L both left it out,
+        # and on a Discord subscriber's Webull account nothing else ever came
+        # back to fill them in (QA 2026-10-13, SPY 776P stop-out).
+        record_fill_details(order, result)
         try:
             db.flush()
         except Exception:  # noqa: BLE001
