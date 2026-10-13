@@ -49,11 +49,16 @@ def gateway_status(
 ) -> dict[str, Any]:
     acct = _hosted_account(db, account_id, user)
     st = hosted.auth_status(acct.ibkr_gateway_slot)
+    restricted = (not st["authenticated"]) and hosted.is_restricted(acct.ibkr_gateway_slot)
+    if st["authenticated"]:
+        hosted.clear_restricted(acct.ibkr_gateway_slot)
     return {
         "slot": acct.ibkr_gateway_slot,
         "signed_in": st["authenticated"],
         "reachable": st["reachable"],
         "connection_status": acct.connection_status,
+        "restricted": restricted,
+        "message": hosted.RESTRICTED_MESSAGE if restricted else None,
     }
 
 
@@ -230,6 +235,26 @@ async def gateway_proxy(slot: int, path: str, request: Request) -> Response:
         raise HTTPException(502, f"Your hosted gateway didn't answer: {exc}") from exc
 
     rewrite = hosted.is_rewritable(r.headers.get("content-type"))
+    # Diagnostic trail for the sign-in flow: every /sso step's status, the
+    # redirect it issues and the cookies it sets (values redacted). Live
+    # accounts with two-factor completed the flow on QA yet left the gateway
+    # with no session (2026-10-12); this shows where the two paths diverge.
+    if path.startswith("sso/") and not path.startswith("sso/lib/"):
+        set_cookies = [c.split("=", 1)[0] + "=<redacted>; " + c.split(";", 1)[1].strip() if ";" in c else c.split("=", 1)[0]
+                       for c in r.headers.get_list("set-cookie")]
+        log.info(
+            "ibkr-gateway slot %s: %s /%s -> %s location=%s set-cookie=%s content-type=%s len=%s",
+            slot, request.method, path, r.status_code, r.headers.get("location"),
+            set_cookies, r.headers.get("content-type"), len(r.content),
+        )
+        if path.endswith("Dispatcher"):
+            snippet = r.content[:600].decode("utf-8", errors="replace").replace("\n", " ")
+            log.info("ibkr-gateway slot %s: Dispatcher body starts: %r", slot, snippet)
+            if "/restricted" in str(r.headers.get("location") or ""):
+                await run_in_threadpool(hosted.mark_restricted, slot)
+            else:
+                await run_in_threadpool(hosted.clear_restricted, slot)
+
     out_headers: list[tuple[str, str]] = []
     for k, v in r.headers.multi_items():
         lk = k.lower()
