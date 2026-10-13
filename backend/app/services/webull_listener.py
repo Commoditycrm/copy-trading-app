@@ -62,6 +62,8 @@ logging.getLogger("webull.core.http.initializer.client_initializer").setLevel(lo
 # ── module state (same shape as the other listeners) ────────────────────────
 _main_loop: asyncio.AbstractEventLoop | None = None
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
+# (eventType, subscribeType) combinations already reported — one INFO each.
+_seen_event_shapes: set[tuple[str, str]] = set()
 # The live stoppable gRPC client per trader — do_subscribe() blocks in a thread
 # and an asyncio cancel can't interrupt that thread, so we keep the client to
 # call request_stop() (closes the channel + breaks the retry loop).
@@ -315,18 +317,32 @@ def _build_stoppable_client(creds: dict[str, Any]):
                     pass
 
         def _build_request(self, app_key, app_secret, accounts):  # noqa: D401 — override
-            # Webull Support (ticket, 2026-08): the ONLY supported subscribeType
-            # is 1. The bundled SDK hardcodes 7 (with a now-stale "1 2 4 allowed"
-            # comment); the gRPC endpoint rejects that, so NO trade events ever
-            # arrive. Rebuild the request with subscribeType=1 — everything else
-            # mirrors the SDK's _build_request (sign → metadata), minus its debug
-            # prints. Ref: developer.webull.com/apis/docs/reference/custom/subscribe-trade-events
+            # subscribeType is a BITMASK, not an enum (Webull Support, ticket
+            # 2026-10, Kobe):
+            #
+            #     1 (0b001)  order events — EQUITIES ONLY
+            #     2 (0b010)  position events
+            #     4 (0b100)  option / PnL events
+            #
+            # so 7 = 1|2|4 = everything, which is the SDK's own default and what
+            # we must send. An earlier reply from the same vendor said 1 was the
+            # only supported value; we believed it, forced 1 here, and the
+            # gateway then filtered out every OPTION event at the source. The
+            # stream authenticated, echoed back "subscribeType: 1", sent Pings
+            # forever and delivered nothing, because this account trades options.
+            # 193 orders over 48h produced zero frames. Do not "simplify" this
+            # back to 1: on an options book that is indistinguishable from the
+            # push scope being switched off.
+            #
+            # The override itself now only exists to drop the SDK's debug prints;
+            # the subscribeType it builds matches the SDK default.
+            # Ref: developer.webull.com/apis/docs/reference/custom/subscribe-trade-events
             import time as _time  # noqa: PLC0415
             import webull.trade.events.events_pb2 as _pb  # noqa: PLC0415
             from webull.core.auth.algorithm import sha_hmac256_new  # noqa: PLC0415
             from webull.trade.events.signature_composer import calc_signature  # noqa: PLC0415
             request = _pb.SubscribeRequest(
-                subscribeType=1,
+                subscribeType=_SUBSCRIBE_ALL,
                 timestamp=int(_time.time() * 1000),  # millis
                 accounts=accounts,
             )
@@ -359,6 +375,15 @@ def _build_stoppable_client(creds: dict[str, Any]):
     host = WEBULL_PAPER_EVENTS_HOST if creds.get("paper") else None
     return _StoppableTradeEvents(creds["app_key"], creds["app_secret"],
                                  creds.get("region_id", "us"), host)
+
+
+# subscribeType bitmask on the gRPC event stream (Webull Support, 2026-10).
+# ORDER events for OPTIONS arrive under 4, not 1 — 1 is equities only — so an
+# options book subscribed with 1 alone receives nothing at all.
+_SUB_ORDERS_EQUITY = 1
+_SUB_POSITIONS = 2
+_SUB_OPTIONS_PNL = 4
+_SUBSCRIBE_ALL = _SUB_ORDERS_EQUITY | _SUB_POSITIONS | _SUB_OPTIONS_PNL   # 7
 
 
 # ── order mapping + option resolution (Stage 3 live path) ───────────────────
@@ -1221,10 +1246,24 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
 def _on_order_event(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID, generation: int,
     creds: dict[str, Any], payload: dict,
+    event_type: Any = None, subscribe_type: Any = None,
 ) -> None:
     """Runs in the gRPC callback thread. Shadow mode (default): log detection
     only — no DB writes, no fanout. Live mode: persist the trader order +
     fanout via ``_persist_and_fanout``."""
+    # We subscribe with the full bitmask (orders | positions | options/PnL), so
+    # three different frame shapes arrive here. Report each NEW combination once
+    # at INFO: we have never seen the position / PnL payloads, and guessing at
+    # their fields in code we cannot test is how the last round of this went.
+    _shape = (str(event_type), str(subscribe_type))
+    if _shape not in _seen_event_shapes:
+        _seen_event_shapes.add(_shape)
+        log.info(
+            "webull-listener[%s] first frame of eventType=%s subscribeType=%s; "
+            "keys=%s",
+            trader_user_id, event_type, subscribe_type,
+            sorted(payload)[:20] if isinstance(payload, dict) else type(payload).__name__,
+        )
     if log.isEnabledFor(logging.DEBUG) and isinstance(payload, dict):
         log.debug(
             "webull-listener[%s] event %s %s status=%s boid=%s",
@@ -1235,6 +1274,13 @@ def _on_order_event(
     if _generation.get(trader_user_id) != generation:
         return
     if not isinstance(payload, dict):
+        return
+
+    # Only ORDER frames drive the order path. A position or PnL frame carries no
+    # order_id, and the rest of this function — status mapping, fanout, dedup by
+    # broker_order_id — is meaningless without one. Dropping them here keeps
+    # them out of the shadow log too, so that log stays a record of ORDERS.
+    if not str(payload.get("order_id") or "").strip():
         return
 
     if _shadow():
@@ -1452,10 +1498,15 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 backoff = min(_BACKOFF_MAX, backoff * 2)
                 continue
 
+            # Keep eventType / subscribeType: with the full bitmask we now
+            # receive POSITION and OPTION/PnL frames alongside order frames, and
+            # the order path must be able to tell them apart rather than try to
+            # read every frame as an order.
             client.on_events_message = (
                 lambda et, st, payload, raw, _tid=trader_user_id,
                 _aid=broker_account_id, _gen=generation, _creds=creds:
-                _on_order_event(_tid, _aid, _gen, _creds, payload)
+                _on_order_event(_tid, _aid, _gen, _creds, payload,
+                                event_type=et, subscribe_type=st)
             )
             # Log SDK frames at the level the SDK assigns them: Pings are DEBUG
             # (hidden under the default INFO config, so no flood), while subscribe
