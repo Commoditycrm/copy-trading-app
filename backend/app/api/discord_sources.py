@@ -195,21 +195,23 @@ def _cancel_stop_order(db: Session, user: User):
         from app.models.order import Order, OrderStatus  # noqa: PLC0415
         from app.services.crypto import decrypt_json  # noqa: PLC0415
 
+        from app.services.exit_confirm import cancel_and_record  # noqa: PLC0415
+
         order = db.get(Order, order_id)
         if order is None:
             return
-        if order.broker_order_id:
-            acct = db.get(BrokerAccount, order.broker_account_id)
-            if acct is not None:
-                try:
-                    adapter_for(acct, decrypt_json(acct.encrypted_credentials)).cancel_order(
-                        order.broker_order_id
-                    )
-                except Exception:  # noqa: BLE001
-                    log.warning(
-                        "discord: stop cancel failed for order %s", order_id, exc_info=True
-                    )
-        order.status = OrderStatus.CANCELED
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_order_id else None
+        if acct is None:
+            order.status = OrderStatus.CANCELED
+            return
+        try:
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        except Exception:  # noqa: BLE001
+            log.warning("discord: no adapter to cancel order %s", order_id, exc_info=True)
+            order.status = OrderStatus.CANCELED
+            return
+        # A fill that beat the cancel is recorded as a fill (cancel_and_record).
+        cancel_and_record(adapter, order)
 
     return _cancel
 

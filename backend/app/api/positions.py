@@ -1885,7 +1885,7 @@ def _cancel_working_orders_for_position(
     touched: list[Order] = []
     for o in rows:
         try:
-            adapter.cancel_order(o.broker_order_id)
+            accepted = adapter.cancel_order(o.broker_order_id)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "close: could not cancel %s order %s (broker_order=%s) blocking the "
@@ -1894,6 +1894,19 @@ def _cancel_working_orders_for_position(
                 str(exc)[:200],
             )
             continue
+        if accepted is False:
+            # Already terminal at the broker — often FILLED: a take-profit or
+            # stop that traded as Close was pressed. Record that sale rather
+            # than call it cancelled, or it vanishes from the position's history
+            # and Closed today (exit_confirm.record_cancel_outcome). It still
+            # counts as a change, so the close re-reads what is left.
+            from app.services.exit_confirm import record_cancel_outcome  # noqa: PLC0415
+
+            record_cancel_outcome(adapter, o, refused=True)
+            if o.status == OrderStatus.FILLED:
+                cancelled.append(o.id)
+                touched.append(o)
+                continue
         o.status = OrderStatus.CANCELED
         o.closed_at = now
         o.reject_reason = (
@@ -1907,7 +1920,8 @@ def _cancel_working_orders_for_position(
         db.commit()
         for o in touched:
             db.refresh(o)
-            events.publish(user.id, copy_engine._order_event("order.cancelled", o))  # noqa: SLF001
+            kind = "order.updated" if o.status == OrderStatus.FILLED else "order.cancelled"
+            events.publish(user.id, copy_engine._order_event(kind, o))  # noqa: SLF001
         log.info(
             "close: cancelled %d working order(s) on %s before closing",
             len(cancelled), pos.broker_symbol,

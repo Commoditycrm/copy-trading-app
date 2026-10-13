@@ -836,23 +836,17 @@ def _make_pair_placer(db, live_acct, acct, adapter, guard):
 
 
 def _make_stop_canceller(db, adapter):
-    """Cancel a resting stop by our order id, and mark the row cancelled."""
+    """Cancel a resting ladder order by our order id, and record what the broker
+    says happened to it — a fill that beat the cancel is a fill, not a cancel
+    (see exit_confirm.cancel_and_record)."""
     def _cancel(order_id):
-        from app.models.order import Order, OrderStatus  # noqa: PLC0415
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services.exit_confirm import cancel_and_record  # noqa: PLC0415
 
         order = db.get(Order, order_id)
         if order is None:
             return
-        if order.broker_order_id:
-            try:
-                adapter.cancel_order(order.broker_order_id)
-            except Exception:  # noqa: BLE001
-                # Already gone at the broker is the usual reason, and it means
-                # the same thing we wanted: nothing is resting any more.
-                log.warning(
-                    "discord stop: broker cancel failed for %s", order_id, exc_info=True
-                )
-        order.status = OrderStatus.CANCELED
+        cancel_and_record(adapter, order)
     return _cancel
 
 
@@ -1174,7 +1168,14 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = Non
                             # The mode was switched off (or never on) with an
                             # order still resting: take it down, then the stop.
                             if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
-                                _tp.release(db, guard, _canceller)
+                                # A fill first: credit a trim that happened
+                                # rather than leave its ids behind.
+                                _tp.settle(db, guard, ts_g, _canceller,
+                                           in_session=_mh.in_regular_session())
+                            if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+                                if _tp.release(db, guard, _canceller):
+                                    _tp.settle(db, guard, ts_g, _canceller,
+                                               in_session=_mh.in_regular_session())
                             guard.tp_qty = None
                             _reconcile_stop()
                         # Reconcile first so a resting stop is CANCELLED on

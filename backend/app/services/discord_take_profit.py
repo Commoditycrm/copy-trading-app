@@ -177,7 +177,7 @@ def release(db: Session, guard, cancel) -> bool:
     """Cancel the resting take-profit (and its linked stop) so the contracts are
     free — before a trim, a close or a stop-out places its own exit. Not a
     trader's cancel: the next pass puts back whatever should rest."""
-    from app.models.order import Order  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
 
     done = False
     for oid in (guard.tp_order_id, guard.tp_stop_order_id):
@@ -189,6 +189,16 @@ def release(db: Session, guard, cancel) -> bool:
                 done = True
             except Exception:  # noqa: BLE001
                 log.warning("take-profit: could not release %s", guard.symbol, exc_info=True)
+    # The cancel can find that an order had already FILLED (the canceller
+    # records that — exit_confirm.cancel_and_record). Then the trim happened:
+    # keep the ids so settle() credits it — the rung, the stop for what is left —
+    # instead of forgetting it and selling the same trim again.
+    for oid in (guard.tp_order_id, guard.tp_stop_order_id):
+        o = db.get(Order, oid) if oid else None
+        if o is not None and o.status == OrderStatus.FILLED:
+            log.info("take-profit: %s's order filled before it could be released — "
+                     "crediting the trim", guard.symbol)
+            return True
     _clear(guard)
     if done:
         log.info("take-profit: released %s's resting orders to make room for an exit", guard.symbol)
@@ -325,6 +335,14 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     released = False
     if not in_sync(db, guard, want):
         released = release(db, guard, cancel)
+        if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+            # The release found the take-profit (or its linked stop) already
+            # filled — usually WHY it was out of sync: the fill shrank the
+            # position, so the plan no longer matched. Credit it now and plan the
+            # next trim from what is left. The linked leg's cancel is still
+            # completing, so the next order waits a pass (released stays True).
+            settled = settle(db, guard, ts, cancel, in_session=in_session) or settled
+            want = plan(guard, held, ts, mark)
     resting = guard.tp_order_id is not None
 
     # Nothing new goes out while the market is closed (a DAY order would only
