@@ -280,6 +280,9 @@ export default function BrokersPage() {
   const [ibkrHosted, setIbkrHosted] = useState(false);
   // Per hosted-IBKR account: is its gateway signed in right now? Polled.
   const [ibkrSignedIn, setIbkrSignedIn] = useState<Record<string, boolean | null>>({});
+  // Per hosted account: IBKR's instruction when a sign-in ended restricted
+  // (new-location email verification), shown under the status line.
+  const [ibkrNotice, setIbkrNotice] = useState<Record<string, string | null>>({});
   const [ibkrSigning, setIbkrSigning] = useState<string | null>(null);
   // Accounts whose verify failed for the CURRENT sign-in: don't retry every
   // poll (it toasted every 5s on QA); retry once the gateway signs out and in again.
@@ -662,9 +665,10 @@ export default function BrokersPage() {
     const tick = async () => {
       for (const a of hosted) {
         try {
-          const st = await api<{ signed_in: boolean; connection_status: string }>(`/api/brokers/${a.id}/ibkr-gateway/status`);
+          const st = await api<{ signed_in: boolean; connection_status: string; restricted?: boolean; message?: string | null }>(`/api/brokers/${a.id}/ibkr-gateway/status`);
           if (stopped) return;
           setIbkrSignedIn(cur => ({ ...cur, [a.id]: st.signed_in }));
+          setIbkrNotice(cur => ({ ...cur, [a.id]: st.restricted ? (st.message ?? null) : null }));
           if (!st.signed_in) ibkrVerifyFailed.current.delete(a.id);
           if (st.signed_in && a.connection_status === "pending" && !ibkrVerifyFailed.current.has(a.id)) {
             try {
@@ -867,6 +871,9 @@ export default function BrokersPage() {
                       >
                         {ibkrSigning === a.id ? "Opening…" : ibkrSignedIn[a.id] ? "Sign in again" : "Sign in to IBKR"}
                       </button>
+                      {ibkrNotice[a.id] && (
+                        <div className="w-full text-xs mt-1" style={{ color: "var(--warn, #d9a441)" }}>{ibkrNotice[a.id]}</div>
+                      )}
                     </div>
                   )}
                 </div>
