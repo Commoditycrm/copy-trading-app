@@ -1788,9 +1788,11 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
     limit (the ``trader_filled`` gate in _place_mirror_with_conflict_resolve), so
     a trader CANCEL just cancels the mirror instead of stranding a phantom fill.
     The flip side is this: when the trader's working order instead FILLS, we force
-    any mirror whose limit hasn't filled to market — cancel the resting order,
-    then place an immediate fill for the UNFILLED remainder (cancel-old +
-    place-new, the same shape as a modify).
+    any CLOSE mirror whose limit hasn't filled to market — cancel the resting
+    order, then place an immediate fill for the UNFILLED remainder (cancel-old +
+    place-new, the same shape as a modify). ENTRY mirrors are left resting at
+    their limit (see the note in the loop); the trader's fill only syncs their
+    status.
 
     NO-OP in the common cases — an order detected AT fill was already forced to
     market in fanout, and a mirror whose limit already filled is left alone. Only
@@ -1871,6 +1873,27 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 if remaining <= 0:
                     synced_any = True
                     continue
+            # ENTRIES are left resting (product decision, 2026-10-13). A
+            # subscriber whose entry limit hasn't reached keeps that limit
+            # working at its price; it is NOT swept into a cancel + marketable
+            # re-place. On brokers with no in-place modify (IBKR, SnapTrade) the
+            # sweep showed as a cancelled order plus a new one for every
+            # immediately-filled trader limit, and the re-place could fill
+            # worse than the limit the trader set. CLOSES are still forced below:
+            # a subscriber must never be left holding what the trader exited.
+            if not ch.is_closing:
+                audit.record(
+                    db, actor_user_id=ch.user_id,
+                    action="order.mirror_left_resting",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={
+                        "parent_order_id": str(trader_order_id),
+                        "broker_order_id": ch.broker_order_id,
+                        "limit_price": str(ch.limit_price) if ch.limit_price is not None else None,
+                    },
+                )
+                synced_any = True
+                continue
             new_id = uuid.uuid4()
             # Immediate fill for the unfilled remainder — MARKET for a stock,
             # marketable-LIMIT for an option (via _to_immediate_close, which

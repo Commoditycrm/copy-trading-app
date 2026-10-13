@@ -35,6 +35,7 @@ from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order, OrderStatus
 from app.models.user import User, UserRole
+from app.services import copy_engine, events
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -155,9 +156,19 @@ def reconcile_once() -> int:
                 if acct is None or acct.connection_status != "connected":
                     continue
                 adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
-                _refresh_open_orders(db, acct, adapter)
+                changed: list[Order] = []
+                _refresh_open_orders(db, acct, adapter, changed_out=changed)
                 db.commit()
                 done += 1
+                # Tell the owner's open pages: the Trades page updates rows from
+                # these events, so a mirror that filled or was cancelled at IBKR
+                # moves without a manual refresh (QA 2026-10-13: it didn't).
+                for o in changed:
+                    try:
+                        db.refresh(o)
+                        events.publish(o.user_id, copy_engine._order_event("order.placed", o))  # noqa: SLF001
+                    except Exception:  # noqa: BLE001
+                        log.exception("ibkr subscriber reconcile: publish failed for order %s", o.id)
         except Exception:  # noqa: BLE001
             log.exception("ibkr subscriber reconcile: account %s failed", acct_id)
     return done
