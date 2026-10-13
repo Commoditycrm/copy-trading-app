@@ -101,3 +101,50 @@ def test_granting_access_never_writes_the_admins_flag(db):
     db.commit()
     db.refresh(sub)
     assert sub.sell_all_access is False, "the stored admin flag was modified"
+
+
+# ── exiting vs snapshots ────────────────────────────────────────────────────
+# Live QA 2026-10-13: a subscriber had the Snapshot nav entry while the Discord
+# trader they follow did not. Exiting your own positions and restoring a
+# snapshot are different powers — the Discord grant reaches only the first.
+
+from app.api.deps import require_snapshot_access  # noqa: E402
+from app.api.deps import require_sell_all_access  # noqa: E402
+
+
+def _snapshot_allowed(db, user) -> bool:
+    from fastapi import HTTPException
+    try:
+        require_snapshot_access(user=user, db=db)
+        return True
+    except HTTPException:
+        return False
+
+
+def test_a_discord_subscriber_can_exit_but_not_reach_snapshots(db):
+    trader = _user(db, UserRole.TRADER, discord=True)
+    sub = _user(db, UserRole.SUBSCRIBER)
+    _follows(db, sub, trader)
+    assert sell_all_allowed(db, sub) is True, "they must still be able to exit"
+    assert _snapshot_allowed(db, sub) is False, "snapshots are admin-granted"
+
+
+def test_a_subscriber_never_outranks_the_trader_they_follow(db):
+    """The symptom that found this: the subscriber saw Snapshot, the trader
+    did not."""
+    trader = _user(db, UserRole.TRADER, discord=True)   # no admin flag
+    sub = _user(db, UserRole.SUBSCRIBER)
+    _follows(db, sub, trader)
+    assert _snapshot_allowed(db, trader) is False
+    assert _snapshot_allowed(db, sub) is False
+
+
+def test_the_admin_flag_still_opens_snapshots(db):
+    assert _snapshot_allowed(db, _user(db, UserRole.SUBSCRIBER, sell_all=True)) is True
+    assert _snapshot_allowed(db, _user(db, UserRole.TRADER, sell_all=True)) is True
+
+
+def test_an_admin_reaches_neither(db):
+    admin = _user(db, UserRole.ADMIN, sell_all=True)
+    assert _snapshot_allowed(db, admin) is False
+    assert sell_all_allowed(db, admin) is False

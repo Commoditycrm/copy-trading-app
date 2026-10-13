@@ -602,7 +602,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // The Snapshot page is part of the admin-gated Sell-All suite — hide its nav
   // entry unless the trader is allow-listed.
   const nav = (user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER)
-    .filter((item) => item.href !== "/snapshot" || !!user.sell_all_available)
+    .filter((item) => item.href !== "/snapshot" || !!user.sell_all_access)
     .filter((item) => !item.href.startsWith("/discord") || !!user.discord_available)
     // Testing-only screen for the Discord ladder — same gate, and hidden
     // entirely unless a trader is allow-listed for Discord.

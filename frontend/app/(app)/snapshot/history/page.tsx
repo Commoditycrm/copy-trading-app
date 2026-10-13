@@ -44,7 +44,7 @@ export default function SnapshotHistoryPage() {
 
   useEffect(() => {
     api<User>("/api/auth/me")
-      .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_available))
+      .then((u) => setAccess((u.role === "trader" || u.role === "subscriber") && !!u.sell_all_access))
       .catch(() => setAccess(false));
   }, []);
   useEffect(() => { load(); }, [load]);

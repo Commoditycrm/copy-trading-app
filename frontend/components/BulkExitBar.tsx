@@ -341,6 +341,11 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
   // admin-allow-listed per trader. Without access, hide the Exit-My-Positions
   // chip, its trail/re-entry inputs, and the Re-Enter card (the API 403s too).
   const hasSellAll = !!user?.sell_all_available;
+  // Re-entry restores a SNAPSHOT, which is the admin-allow-listed half. A
+  // Discord trader's subscribers get the exit controls because the trader
+  // cannot exit their positions for them; that reasoning does not reach
+  // snapshots, and letting it would put them ahead of the trader they follow.
+  const hasSnapshot = !!user?.sell_all_access;
 
   const renderButton = (key: ExitKey) => {
     const def = EXIT_DEFS[key];
@@ -457,7 +462,7 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
     <>
       {hasSellAll && !noPositions && exitModePill}
       {hasSellAll && renderButton("my_positions")}
-      {hasSellAll && !noPositions && reentryPill}
+      {hasSnapshot && !noPositions && reentryPill}
       {renderButton("my_orders")}
       {hasDiscord && (
         <button
@@ -492,7 +497,7 @@ export function BulkExitBar({ onActionComplete, inline }: Props) {
     </>
   );
 
-  const reenterStrip = hasSellAll && snapshot && snapshot.summary.total > 0 && (
+  const reenterStrip = hasSnapshot && snapshot && snapshot.summary.total > 0 && (
         <div
           className="rounded-xl px-3 py-2.5 flex items-center justify-between gap-3 flex-wrap mt-2"
           style={cardStyle}

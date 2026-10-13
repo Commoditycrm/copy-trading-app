@@ -75,6 +75,26 @@ def sell_all_allowed(db: Session, user: User) -> bool:
     return discord_subscribers.followed_discord_trader(db, user) is not None
 
 
+def require_snapshot_access(
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> User:
+    """Gate the SNAPSHOT half of the suite: the snapshot page, its history and
+    re-entry. The admin allow-list only — deliberately NOT sell_all_allowed.
+
+    Exiting your own positions and restoring a snapshot are different powers.
+    A Discord trader's subscribers are granted the first because the trader
+    cannot exit their positions for them; that reasoning does not extend to
+    snapshots, and letting it would put a subscriber AHEAD of the trader they
+    follow — live on QA 2026-10-13, a subscriber had the Snapshot nav entry
+    while the Discord trader they follow did not.
+    """
+    if user.role not in (UserRole.TRADER, UserRole.SUBSCRIBER):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="trader_or_subscriber_only")
+    if not getattr(user, "sell_all_access", False):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="sell_all_access_required")
+    return user
+
+
 def require_sell_all_access(
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> User:
