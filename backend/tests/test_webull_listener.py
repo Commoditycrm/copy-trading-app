@@ -409,3 +409,53 @@ def test_non_order_frames_do_not_enter_the_order_path():
         wl._persist_and_fanout = saved
         wl._shadow = saved_shadow
         wl._generation.pop(tid, None)
+
+
+def test_stream_and_poll_frames_are_distinguishable_in_the_log():
+    """A poller frame was once read as proof the gRPC stream had come back.
+
+    The two reach _on_order_event identically — the only difference is that the
+    stream passes eventType/subscribeType and the poller calls positionally,
+    leaving both None. The log has to say which, or "is the stream working?"
+    stays unanswerable from the logs.
+    """
+    import logging
+    import uuid as _uuid
+    from app.services import webull_listener as wl
+
+    wl._seen_event_shapes.clear()
+    saved_persist, saved_shadow = wl._persist_and_fanout, wl._shadow
+    wl._persist_and_fanout = lambda *a, **k: None
+    wl._shadow = lambda: False
+    tid, aid = _uuid.uuid4(), _uuid.uuid4()
+    wl._generation[tid] = 1
+    records: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, r): records.append(r.getMessage())
+
+    h = _Cap()
+    wl.log.addHandler(h)
+    wl.log.setLevel(logging.INFO)
+    try:
+        order = {"order_id": "WB1", "symbol": "QQQ", "side": "BUY",
+                 "order_status": "FILLED", "filled_qty": "5", "filled_price": "0.52"}
+        # From the REST poller: called positionally, no event metadata.
+        wl._on_order_event(tid, aid, 1, {}, order)
+        # From the gRPC stream.
+        wl._on_order_event(tid, aid, 1, {}, order,
+                           event_type=1024, subscribe_type=1)
+    finally:
+        wl.log.removeHandler(h)
+        wl._persist_and_fanout, wl._shadow = saved_persist, saved_shadow
+        wl._generation.pop(tid, None)
+
+    joined = "\n".join(records)
+    assert "first poll frame" in joined, "a poller frame must be labelled poll"
+    assert "first stream frame" in joined, "a stream frame must be labelled stream"
+    # And every stream frame gets its own line, not just the first of its shape.
+    stream_lines = [r for r in records if "STREAM" in r]
+    assert len(stream_lines) == 1, "the stream frame logs once, per frame"
+    assert "QQQ" in stream_lines[0] and "WB1" in stream_lines[0]
+    assert not any("STREAM" in r and "poll" in r for r in records), \
+        "a poller frame must never be reported as a stream frame"
