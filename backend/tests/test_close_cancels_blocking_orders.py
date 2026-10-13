@@ -232,7 +232,7 @@ def test_position_is_re_read_after_cancelling():
     reread_at = src.index("if cancelled:")
     assert cancel_at < reread_at < place_at, \
         "re-read must sit between the cancel and the placement"
-    assert src.count("adapter.get_positions()") == 2, \
+    assert src.count("_read_positions_for_close(adapter)") == 2, \
         "one read up front, one after cancelling"
 
 
