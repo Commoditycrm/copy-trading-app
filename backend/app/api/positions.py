@@ -1810,6 +1810,32 @@ _RESERVING_STATUSES = (
 # exact moment the close needs it.
 _CANCEL_SETTLE_S = 0.6
 
+# Spacing between a close's two positions reads. Webull's positions endpoint
+# allows 2 calls per 2 s per account (it objects to bursts, not volume), and the
+# P&L poller and Positions page share that budget.
+_POSITIONS_READ_GAP_S = 1.2
+# How long to wait before the one retry of a throttled positions read.
+_RATE_LIMIT_WAIT_S = 2.0
+
+
+def _read_positions_for_close(adapter: Any) -> list:
+    """The account's live positions for a close, retried once if throttled.
+
+    A 429 is refused before anything happens, so retrying after the window has
+    passed is safe — and failing the close the user asked for over one
+    throttled READ was the worse outcome.
+    """
+    from app.services.order_retry import is_rate_limit_error  # noqa: PLC0415
+
+    try:
+        return adapter.get_positions()
+    except Exception as exc:  # noqa: BLE001
+        if not is_rate_limit_error(exc):
+            raise
+        log.info("close: positions read throttled, retrying in %.1fs", _RATE_LIMIT_WAIT_S)
+        time.sleep(_RATE_LIMIT_WAIT_S)
+        return adapter.get_positions()
+
 
 def _cancel_working_orders_for_position(
     db: Session, user: User, acct: BrokerAccount, adapter: Any, pos: BrokerPosition,
@@ -1920,7 +1946,8 @@ def close_position(
 
     creds = decrypt_json(acct.encrypted_credentials)
     adapter = adapter_for(acct, creds)
-    positions = adapter.get_positions()
+    positions = _read_positions_for_close(adapter)
+    first_read_at = time.monotonic()
 
     target = broker_symbol.upper()
     pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
@@ -1937,15 +1964,28 @@ def close_position(
     # read it as removed by the trader and forget the level — leaving whatever
     # the close doesn't sell without a stop. Released here, the reconciler
     # re-places a stop sized to the remainder once the close has settled.
+    released = False
     if pos.quantity > 0:
         from app.services import discord_stop_orders  # noqa: PLC0415
 
-        discord_stop_orders.release_for_position(db, user, pos)
+        released = bool(discord_stop_orders.release_for_position(db, user, pos))
         db.commit()
 
     # Anything still resting on this contract reserves the position at the
     # broker, so the close would be refused. Clear it first — see the helper.
     cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+
+    # The ladder's own stop / take-profit cancelled above count as cancels too.
+    # They were not counted, so when they were the ONLY resting orders the close
+    # skipped both the settle pause and the re-read below and went straight to
+    # the broker while the contracts were still reserved. Webull refused it, and
+    # the conflict handling then re-read positions and retried the place three
+    # times inside two seconds — the 429s on Positions-page closes (QA
+    # 2026-10-13). The helper pauses after its own cancels; this covers the case
+    # it had none.
+    if released and not cancelled:
+        time.sleep(_CANCEL_SETTLE_S)
+    cancelled = cancelled or released
 
     # RE-READ after cancelling. An order we just cancelled may have FILLED in
     # the moments before the cancel reached the broker — a resting stop is
@@ -1954,7 +1994,13 @@ def close_position(
     # becomes a SHORT. Only pay for the extra read when we actually cancelled
     # something; the common case (nothing resting) is unchanged.
     if cancelled:
-        positions = adapter.get_positions()
+        # Webull allows two positions reads per two seconds per account, and the
+        # P&L poller and the Positions page read the same endpoint. Keep this
+        # one clear of the first read rather than land the burst's third call.
+        wait = _POSITIONS_READ_GAP_S - (time.monotonic() - first_read_at)
+        if wait > 0:
+            time.sleep(wait)
+        positions = _read_positions_for_close(adapter)
         pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
         if pos is None or pos.quantity == 0:
             # The resting order closed it for us. Nothing left to sell, and
