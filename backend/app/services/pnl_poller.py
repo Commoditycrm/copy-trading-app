@@ -386,22 +386,45 @@ def _load_active_accounts() -> list[BrokerAccount]:
 
 
 def _has_discord_ladder_work(db, user_id) -> bool:
-    """A live Discord guard with a stop level or an armed trail — the same
-    selection the trader gate below uses."""
+    """A live Discord guard this poller has something to do for: a stop level,
+    an armed trail, a resting take-profit, or an option holding whose entry has
+    filled.
+
+    The last one matters: a filled entry with nothing set yet is exactly the
+    holding that still needs its first protection — the entry price adopted
+    from the fill, then its On Fill stop and first take-profit. Gating on a stop
+    alone skipped it, so a market entry (no price to seed the ladder with) on a
+    Discord subscriber who has no other risk policy was never protected at all
+    (QA 2026-10-13, SPY 776P "out the gate": the trader got a stop and T1, the
+    subscriber got nothing).
+    """
+    from sqlalchemy import exists as _exists  # noqa: PLC0415
     from sqlalchemy import or_ as _or  # noqa: PLC0415
     from sqlalchemy import select as _select  # noqa: PLC0415
 
     from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
 
-    return db.execute(
-        _select(DiscordPositionGuard.id).where(
-            DiscordPositionGuard.user_id == user_id,
-            DiscordPositionGuard.closed_at.is_(None),
+    G = DiscordPositionGuard
+    live = (G.user_id == user_id, G.closed_at.is_(None))
+    if db.execute(
+        _select(G.id).where(
+            *live,
             _or(
-                DiscordPositionGuard.stop_price.isnot(None),
-                DiscordPositionGuard.trail_qty.isnot(None),
+                G.stop_price.isnot(None),
+                G.trail_qty.isnot(None),
+                G.tp_order_id.isnot(None),
+                G.tp_stop_order_id.isnot(None),
             ),
         ).limit(1)
+    ).scalar_one_or_none() is not None:
+        return True
+    entry_filled = _exists().where(
+        Order.id == G.entry_order_id,
+        Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+    )
+    return db.execute(
+        _select(G.id).where(*live, G.option_strike.isnot(None), entry_filled).limit(1)
     ).scalar_one_or_none() is not None
 
 
@@ -482,12 +505,9 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
             # trader-side work. Without this the gate would skip the account and
             # the trail would never be enforced.
             if not has_setup:
-                from app.models.discord_position_guard import (  # noqa: PLC0415
-                    DiscordPositionGuard,
-                )
-
-                # Must match what discord_position_guard.armed() selects, or the
-                # account is skipped before the work is ever reached.
+                # The same selection the subscriber gate uses, a superset of
+                # what discord_position_guard.armed() selects — or the account
+                # is skipped before the work is ever reached.
                 #
                 # armed_at is set ONLY when a TRAILING exit is armed. A guard
                 # protected by a plain stop level has it NULL — which is every
@@ -495,18 +515,7 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                 # trims exit at market. Gating on armed_at therefore skipped
                 # exactly the positions that had a stop to place, and their
                 # guards were never retired when the position closed either.
-                from sqlalchemy import or_ as _or  # noqa: PLC0415
-
-                has_setup = db.execute(
-                    _select(DiscordPositionGuard.id).where(
-                        DiscordPositionGuard.user_id == user_id,
-                        DiscordPositionGuard.closed_at.is_(None),
-                        _or(
-                            DiscordPositionGuard.stop_price.isnot(None),
-                            DiscordPositionGuard.trail_qty.isnot(None),
-                        ),
-                    ).limit(1)
-                ).scalar_one_or_none() is not None
+                has_setup = _has_discord_ladder_work(db, user_id)
             # Also tick if Discord trade-alerts are on — the trader tick sweeps
             # newly-filled orders to the webhook (see _enforce_one_trader), a
             # periodic backstop to the real-time listener + page-sync emits.

@@ -235,9 +235,12 @@ def _exit_alert_text(guard: DiscordPositionGuard) -> str:
 def _live_guards(db, user_id=None):
     from sqlalchemy import select  # noqa: PLC0415
 
+    # No entry price is still a live guard: a MARKET entry has no price to seed
+    # it with until the fill, and its On Fill stop is what adopts that fill
+    # (apply_fill_stop -> sync_entry_price). Excluding it here meant the On Fill
+    # stop never ran for it. The rungs below skip it until it has a price.
     statement = select(DiscordPositionGuard).where(
         DiscordPositionGuard.closed_at.is_(None),
-        DiscordPositionGuard.entry_price.is_not(None),
         # Options only: the alert text this builds names a contract, and
         # the ladder has never run on anything else.
         DiscordPositionGuard.option_strike.is_not(None),
@@ -379,6 +382,11 @@ def _sweep_trader(db, trader_id, rows) -> None:
     except Exception:  # noqa: BLE001
         db.rollback()
         log.exception("on-fill stop: sweep failed for user %s", trader_id)
+    # Rungs measure from the entry: a holding with no price yet waits.
+    rows = [g for g in rows if g.entry_price is not None]
+    if not rows:
+        return
+    guard_ts = {g.id: guard_ts[g.id] for g in rows}
     # Nothing has auto-trim on: skip before the broker read (rate limits).
     if engine == "ladder" and not any(_enabled(t) for t in guard_ts.values()):
         return
