@@ -32,7 +32,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -239,6 +239,24 @@ def exceeds_order_cap(total: "Decimal | None", cap: "Decimal | None") -> bool:
     if cap is None or total is None:
         return False
     return total > Decimal(str(cap))
+
+
+def fit_to_order_cap(
+    quantity: "Decimal | int", unit_price: "Decimal | None", is_option: bool,
+    cap: "Decimal | None",
+) -> Decimal:
+    """The largest whole quantity, up to ``quantity``, that fits under ``cap``.
+
+    An over-cap mirror is cut down rather than skipped, so the subscriber still
+    takes the trade at the size they can afford. Returns ``quantity`` untouched
+    when there is no cap or no price to measure against, and 0 when not even one
+    contract (share) fits — the caller skips that one.
+    """
+    qty = Decimal(str(quantity))
+    if not exceeds_order_cap(mirror_order_value(unit_price, qty, is_option), cap):
+        return qty
+    unit = Decimal(str(unit_price)) * (Decimal(100) if is_option else Decimal(1))
+    return min(qty, (Decimal(str(cap)) / unit).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -632,14 +650,14 @@ def _marketable_option_limit(
 
 
 def _live_option_premium(db: Any, trader: Any, trader_order: Order) -> "Decimal | None":
-    """Best-effort LIVE per-contract option premium for the max-per-contract gate,
-    used only when the trader's OWN price isn't recorded yet — a MARKET option
-    order fanned out in the ~ms window before its fill commits, so
-    ``filled_avg_price`` is None and there's no ``limit_price``. Without a price
-    the cap fails OPEN and lets over-cap options through (QA 2026-08: a $145/contract
-    AAPL market option slipped a $100 cap). Priced off the TRADER's Alpaca account
-    (the adapter that exposes option quotes). Returns None for a non-Alpaca trader
-    or when no quote is available — the gate then keeps its prior fail-open."""
+    """Best-effort LIVE per-contract option premium for the max-per-contract and
+    max-per-order gates, checked once per fanout for a MARKET option (see
+    _entry_gate_price). Before it, a market option fanned out in the ~ms window
+    before its fill committed had no price and the cap failed OPEN (QA 2026-08: a
+    $145/contract AAPL market option slipped a $100 cap). Priced off the TRADER's
+    Alpaca account (the adapter that exposes option quotes). Returns None for a
+    non-Alpaca trader or when no quote is available — the caller then falls back
+    to the live mark."""
     if not (trader_order.option_expiry and trader_order.option_strike and trader_order.option_right):
         return None
     acct = db.execute(
@@ -669,6 +687,35 @@ def _live_option_premium(db: Any, trader: Any, trader_order: Order) -> "Decimal 
     # Per-contract COST: a BUY pays the ask, a SELL receives the bid; fall back to
     # whichever side is quoted so a one-sided book still yields a price.
     return (ask or bid) if trader_order.side == OrderSide.BUY else (bid or ask)
+
+
+def _entry_gate_price(db: Any, trader: Any, trader_order: Order) -> "Decimal | None":
+    """The unit price the max-per-contract / max-per-order gates measure a mirror at.
+
+    A LIMIT pays at most its limit. A MARKET order pays the market, so it is
+    checked live, once per fanout: an option's ask from the trader's Alpaca
+    account, else the live mark from the market-data stream (also how a stock is
+    priced); the trader's own fill only when no live price is available.
+    """
+    if trader_order.order_type != OrderType.MARKET and trader_order.limit_price:
+        return Decimal(str(trader_order.limit_price))
+    px = None
+    if trader_order.instrument_type == InstrumentType.OPTION:
+        px = _live_option_premium(db, trader, trader_order)
+    if not px or px <= 0:
+        try:
+            from app.services import live_marks  # noqa: PLC0415
+
+            px = live_marks.contract_mark(
+                trader_order.symbol, trader_order.option_strike,
+                trader_order.option_right, trader_order.option_expiry,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("order caps: live price failed for %s", trader_order.symbol)
+            px = None
+    if px and px > 0:
+        return Decimal(str(px))
+    return trader_order.filled_avg_price or trader_order.limit_price
 
 
 def _option_market_no_quote(msg: str) -> bool:
@@ -2556,9 +2603,14 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # the cap OPEN and let over-cap options through (QA 2026-08) — fall back to a
     # live option quote. Computed ONCE here (the contract's premium is the same
     # for every subscriber), and only when some subscriber actually has a cap.
-    _gate_px: "Decimal | None" = trader_order.filled_avg_price or trader_order.limit_price
-    if _gate_px is None and (_fresh_caps or _fresh_order_caps):
-        _gate_px = _live_option_premium(db, trader, trader_order)
+    #
+    # A MARKET mirror is priced at the MARKET: one live check here, before any
+    # subscriber buys, because that is what their order will pay — the trader's
+    # fill can be stale by the time the mirror goes in. A LIMIT is priced at its
+    # limit (the most it can pay).
+    _gate_px: "Decimal | None" = None
+    if _fresh_caps or _fresh_order_caps:
+        _gate_px = _entry_gate_price(db, trader, trader_order)
 
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
@@ -2858,23 +2910,25 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     continue
 
             # ── Max per-ORDER value gate (opens only, stocks included) ───────
-            # Skip an OPENING mirror whose WHOLE value is above the subscriber's
-            # max_per_order. Distinct from the per-contract gate above and
-            # checked in its own right: that one asks what a contract costs,
-            # this one what the order costs, and a mirror can pass either and
-            # fail the other — a cheap contract scaled up by the multiplier is
-            # exactly the case a per-contract cap cannot see.
+            # FIT an OPENING mirror under the subscriber's max_per_order: an
+            # order whose WHOLE value is above it is cut to the most contracts
+            # (shares) that fit, priced at _gate_px (the market for a market
+            # order). Skipped only when not even one fits. Distinct from the
+            # per-contract gate above and checked in its own right: that one
+            # asks what a contract costs, this one what the order costs, and a
+            # mirror can pass either and fail the other — a cheap contract
+            # scaled up by the multiplier is exactly the case a per-contract cap
+            # cannot see.
             #
             # Sized off `scaled`, the quantity actually being mirrored, so the
             # multiplier counts toward it. A CLOSE always passes: they must be
             # able to exit whatever it is now worth.
             _mpo = _fresh_order_caps.get(sub.user_id)
             if not is_closing_effective:
-                _total = mirror_order_value(
-                    _gate_px, scaled,
-                    trader_order.instrument_type == InstrumentType.OPTION,
-                )
-                if exceeds_order_cap(_total, _mpo):
+                _is_opt = trader_order.instrument_type == InstrumentType.OPTION
+                _total = mirror_order_value(_gate_px, scaled, _is_opt)
+                _fit = fit_to_order_cap(scaled, _gate_px, _is_opt, _mpo)
+                if _fit < 1:
                     audit.record(
                         db, actor_user_id=sub.user_id,
                         action="copy.skipped_max_per_order",
@@ -2883,6 +2937,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                             "symbol": trade_symbol,
                             "order_value": str(_total),
                             "quantity": str(scaled),
+                            "unit_price": str(_gate_px),
                             "max_per_order": str(_mpo),
                         },
                     )
@@ -2893,6 +2948,30 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                         status="skipped_max_per_order",
                     ))
                     continue
+                if _fit < scaled:
+                    audit.record(
+                        db, actor_user_id=sub.user_id,
+                        action="copy.fitted_max_per_order",
+                        entity_type="order", entity_id=trader_order.id,
+                        metadata={
+                            "symbol": trade_symbol,
+                            "requested_qty": str(scaled),
+                            "quantity": str(_fit),
+                            "unit_price": str(_gate_px),
+                            "order_value": str(mirror_order_value(_gate_px, _fit, _is_opt)),
+                            "max_per_order": str(_mpo),
+                        },
+                    )
+                    # A fresh entry cut down locks the position at the size it
+                    # actually got (fit ÷ the trader's quantity), so the trader's
+                    # later trims scale against it and a half-trim sells half,
+                    # not everything. Rounded UP so the lock is never zero. An
+                    # add keeps the position's existing lock.
+                    if locked_mult is None and trader_order.quantity:
+                        scale_mult = (_fit / Decimal(str(trader_order.quantity))).quantize(
+                            Decimal("0.0001"), rounding=ROUND_UP,
+                        )
+                    scaled = _fit
 
             # Defense-in-depth: never mirror a CLOSE larger than the subscriber
             # actually holds. Clamp to the raw held position (not minus reserved):

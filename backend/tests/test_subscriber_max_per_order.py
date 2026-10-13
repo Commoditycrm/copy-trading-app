@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.models.settings import SubscriberSettings
 from app.schemas.settings import MaxPerOrderIn, SubscriberSettingsOut
 from app.services import cache, copy_engine
-from app.services.copy_engine import exceeds_order_cap, mirror_order_value
+from app.services.copy_engine import exceeds_order_cap, fit_to_order_cap, mirror_order_value
 from app.services.discord_execution import order_value
 
 
@@ -96,6 +96,88 @@ def test_a_zero_quantity_is_not_priced():
     assert mirror_order_value(Decimal("1.90"), 0, True) is None
 
 
+# ── an over-cap entry is cut to fit, not skipped ─────────────────────────────
+
+def test_an_over_cap_option_entry_is_cut_to_what_fits():
+    """6 x $1.90 = $1,140 against $1,000: five contracts ($950) fit."""
+    assert fit_to_order_cap(6, Decimal("1.90"), True, Decimal(1000)) == 5
+
+
+def test_an_over_cap_stock_entry_is_cut_to_what_fits():
+    """100 shares at $5 = $500 against $400: 80 shares."""
+    assert fit_to_order_cap(100, Decimal("5.00"), False, Decimal(400)) == 80
+
+
+def test_an_entry_under_the_cap_keeps_its_size():
+    assert fit_to_order_cap(4, Decimal("1.90"), True, Decimal(1000)) == 4
+
+
+def test_an_entry_exactly_on_the_cap_keeps_its_size():
+    assert fit_to_order_cap(5, Decimal("1.90"), True, Decimal("950")) == 5
+
+
+def test_nothing_fits_when_one_contract_is_over_the_cap():
+    """$1,200 a contract against $1,000: zero, which the fanout skips."""
+    assert fit_to_order_cap(3, Decimal("12.00"), True, Decimal(1000)) == 0
+
+
+def test_no_cap_or_no_price_leaves_the_size_alone():
+    assert fit_to_order_cap(10, Decimal("1.90"), True, None) == 10
+    assert fit_to_order_cap(10, None, True, Decimal(100)) == 10
+
+
+def test_the_fanout_fits_rather_than_skips():
+    src = inspect.getsource(copy_engine.fanout_async)
+    gate = src[src.index("Max per-ORDER value gate"):]
+    assert "fit_to_order_cap(" in gate
+    assert "copy.fitted_max_per_order" in gate
+    # A cut-down fresh entry locks the position at the size it got, so the
+    # trader's partial trims scale against what the subscriber holds.
+    assert "scale_mult = (_fit /" in gate
+
+
+# ── a market order is priced at the market, once ─────────────────────────────
+
+class _Order:
+    def __init__(self, order_type, limit=None, fill=None, option=True):
+        from app.models.order import InstrumentType, OrderType
+        self.order_type = OrderType(order_type)
+        self.limit_price = limit
+        self.filled_avg_price = fill
+        self.instrument_type = InstrumentType.OPTION if option else InstrumentType.STOCK
+        self.symbol = "SPY"
+        self.option_strike = Decimal(600) if option else None
+        self.option_right = None
+        self.option_expiry = None
+
+
+def test_a_limit_order_is_priced_at_its_limit(monkeypatch):
+    monkeypatch.setattr(copy_engine, "_live_option_premium", lambda *a: Decimal("9.99"))
+    px = copy_engine._entry_gate_price(None, None, _Order("limit", limit=Decimal("1.50")))
+    assert px == Decimal("1.50")
+
+
+def test_a_market_option_is_priced_at_the_live_ask_not_the_fill(monkeypatch):
+    monkeypatch.setattr(copy_engine, "_live_option_premium", lambda *a: Decimal("2.10"))
+    px = copy_engine._entry_gate_price(None, None, _Order("market", fill=Decimal("1.50")))
+    assert px == Decimal("2.10")
+
+
+def test_a_market_stock_is_priced_at_the_live_mark(monkeypatch):
+    from app.services import live_marks
+    monkeypatch.setattr(live_marks, "contract_mark", lambda *a, **k: Decimal("101.25"))
+    px = copy_engine._entry_gate_price(None, None, _Order("market", option=False))
+    assert px == Decimal("101.25")
+
+
+def test_with_no_live_price_the_trader_fill_is_used(monkeypatch):
+    from app.services import live_marks
+    monkeypatch.setattr(copy_engine, "_live_option_premium", lambda *a: None)
+    monkeypatch.setattr(live_marks, "contract_mark", lambda *a, **k: None)
+    px = copy_engine._entry_gate_price(None, None, _Order("market", fill=Decimal("1.50")))
+    assert px == Decimal("1.50")
+
+
 # ── it is actually wired into the fanout ─────────────────────────────────────
 
 def test_the_fanout_gates_on_the_order_cap():
@@ -116,7 +198,7 @@ def test_a_close_is_never_gated():
     """Subscribers must always be able to exit, whatever it is now worth."""
     src = inspect.getsource(copy_engine.fanout_async)
     gate = src[src.index("Max per-ORDER value gate"):]
-    assert "not is_closing_effective" in gate[:900]
+    assert "if not is_closing_effective" in gate[:1500]
 
 
 # ── plumbing ─────────────────────────────────────────────────────────────────
