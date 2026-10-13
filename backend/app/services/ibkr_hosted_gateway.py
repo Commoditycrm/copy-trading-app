@@ -156,6 +156,48 @@ def accounts(slot: int) -> list[str]:
     return out
 
 
+# ── Restricted sign-ins ─────────────────────────────────────────────────────
+#
+# A live username signing in from a location IBKR hasn't seen answers the
+# final /sso/Dispatcher step with "Client login succeeds" AND a redirect to
+# /restricted/ — IBKR wants an emailed verification token entered first
+# (Client Portal shows that page; the gateway can't). The gateway then holds
+# NO session, so the card would just sit on "not signed in". The proxy notes
+# the redirect here and the status endpoint tells the owner what to do.
+
+_RESTRICTED_KEY = "ibkr_gw_restricted:{slot}"
+_RESTRICTED_TTL_S = 2 * 3600
+RESTRICTED_MESSAGE = (
+    "IBKR needs you to verify this login first. Open IBKR Client Portal in a browser, "
+    "sign in with the same username, enter the verification token IBKR emails you, "
+    "then log out of Client Portal and click Sign in to IBKR here again."
+)
+
+
+def mark_restricted(slot: int) -> None:
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+        get_sync_redis().setex(_RESTRICTED_KEY.format(slot=slot), _RESTRICTED_TTL_S, "1")
+    except Exception:  # noqa: BLE001
+        log.warning("ibkr hosted gateway %s: could not record restricted sign-in", slot, exc_info=True)
+
+
+def clear_restricted(slot: int) -> None:
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+        get_sync_redis().delete(_RESTRICTED_KEY.format(slot=slot))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def is_restricted(slot: int) -> bool:
+    try:
+        from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+        return get_sync_redis().get(_RESTRICTED_KEY.format(slot=slot)) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ── Login-page tokens ───────────────────────────────────────────────────────
 
 
