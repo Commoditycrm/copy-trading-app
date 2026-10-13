@@ -1255,14 +1255,35 @@ def _on_order_event(
     # three different frame shapes arrive here. Report each NEW combination once
     # at INFO: we have never seen the position / PnL payloads, and guessing at
     # their fields in code we cannot test is how the last round of this went.
+    # Where did this frame come from? The gRPC stream passes eventType /
+    # subscribeType; the REST poller calls us positionally and leaves both None.
+    # Without this the two are indistinguishable in the log — which cost an
+    # afternoon: a poller frame was read as proof the stream had come back.
+    _via = "poll" if event_type is None else "stream"
+
     _shape = (str(event_type), str(subscribe_type))
     if _shape not in _seen_event_shapes:
         _seen_event_shapes.add(_shape)
         log.info(
-            "webull-listener[%s] first frame of eventType=%s subscribeType=%s; "
+            "webull-listener[%s] first %s frame eventType=%s subscribeType=%s; "
             "keys=%s",
-            trader_user_id, event_type, subscribe_type,
+            trader_user_id, _via, event_type, subscribe_type,
             sorted(payload)[:20] if isinstance(payload, dict) else type(payload).__name__,
+        )
+
+    # One line per STREAM frame. The shape log above fires once per
+    # (eventType, subscribeType) and then goes quiet forever, which answers
+    # "what shapes exist" but not "is it still flowing" — the question actually
+    # asked every time anyone checks on this. Volume is an order event or two a
+    # minute even on a busy account, so INFO is affordable. The poller is NOT
+    # logged here: it already announces itself elsewhere and would double every
+    # line.
+    if _via == "stream" and isinstance(payload, dict):
+        log.info(
+            "webull-listener[%s] STREAM %s %s %s filled=%s@%s boid=%s",
+            trader_user_id, payload.get("symbol"), payload.get("side"),
+            payload.get("order_status"), payload.get("filled_qty"),
+            payload.get("filled_price"), payload.get("order_id"),
         )
     if log.isEnabledFor(logging.DEBUG) and isinstance(payload, dict):
         log.debug(
