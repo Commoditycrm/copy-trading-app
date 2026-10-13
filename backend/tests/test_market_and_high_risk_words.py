@@ -51,3 +51,40 @@ def test_a_plain_entry_is_neither():
 def test_an_exit_is_never_flagged():
     r = parse_message(ParsedMessage(content="TSLA -90% Out @market", posted_at=AT))
     assert r.signals[0].action is SignalAction.SELL and r.signals[0].at_market is False
+
+
+# ── "Leave room to add" ─────────────────────────────────────────────────────
+# The author is deliberately entering UNDER their full size so there is room to
+# average in later. Live 2026-10-13: "$SPY 779 PUT 0DTE @0.98, Leave room to
+# add! @Clint" filled at full size, which leaves no room for the add it
+# announces.
+
+@pytest.mark.parametrize("text", [
+    "$SPY 779 PUT 0DTE @0.98,Leave room to add! @Clint",   # the live alert
+    "$SPY 779 PUT 0DTE @0.98 leave room to add",
+    "$SPY 779 PUT 0DTE @0.98 leaving room to add",
+    "$SPY 779 PUT 0DTE @0.98 leave some room to add",
+    "$SPY 779 PUT 0DTE @0.98 leaving a little room",
+])
+def test_leaving_room_to_add_is_a_half_size_entry(text):
+    assert _entry(text).half_size is True
+
+
+def test_an_entry_that_says_nothing_is_still_full_size():
+    assert _entry("$SPY 779 PUT 0DTE @0.98").half_size is False
+
+
+def test_an_exit_is_never_halved_by_the_phrase():
+    """Exits size from the position held, never from the alert — halving one
+    would strand part of a position."""
+    r = parse_message(ParsedMessage(content="✂️ $SPY 779p +40% leaving room",
+                                    posted_at=AT))
+    assert all(s.half_size is False for s in (r.signals or []))
+
+
+def test_the_phrase_alone_is_not_an_order():
+    """It only ever flags a signal that already parsed. "leave room to add in
+    case they want a bit more of a bounce" is commentary."""
+    r = parse_message(ParsedMessage(
+        content="leave room to add in case they want a bit more of a bounce", posted_at=AT))
+    assert not any(s.action is SignalAction.BUY for s in (r.signals or []))
