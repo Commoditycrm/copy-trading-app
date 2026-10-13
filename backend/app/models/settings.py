@@ -416,7 +416,9 @@ class SubscriberSettings(Base, TimestampMixin):
     # contract can still be a large order once the multiplier has scaled it, so
     # ten contracts at $50 passes a $500 per-contract cap and is a $500 order.
     # Also enforced in fanout_async, and unlike max_per_contract it applies to
-    # STOCK mirrors too — an order's value is an order's value. NULL = no cap.
+    # STOCK mirrors too — an order's value is an order's value. An over-cap
+    # entry is cut to the most contracts (shares) that fit, priced at the live
+    # market for a market order; skipped only when not even one fits. NULL = no cap.
     max_per_order: Mapped[Decimal | None] = mapped_column(
         Numeric(20, 2), nullable=True,
     )

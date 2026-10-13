@@ -1375,7 +1375,7 @@ export default function SettingsPage() {
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per order"
-                subtitle={"Skips copying an entry when the whole order's value (quantity × price, × 100 for options) is above this amount. Applies to stocks as well as options — closing trades always go through."}
+                subtitle={"Keeps each copied entry's value (quantity × price, × 100 for options) under this amount: a larger entry is cut to what fits, priced at the market for a market order, and skipped only if not even one fits. Applies to stocks as well as options — closing trades always go through."}
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"
