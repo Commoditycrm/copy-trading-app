@@ -8,17 +8,21 @@ Observed in the channel:
     $MSFT @ 21.10 | 24% TRIMMING          trim
     $CRWV @ 1.29 | 20%                    trim — no word, the shape says it
     $IBIT @ 1.68 | 10% FREE MONEY         trim
+    $WMT @ 0.71 | 40%                     trim
+    $WMT UP 100% AT 1.02                  trim — word order varies
 
-Two shapes, both always with a "$" ticker and an "@" price:
+Two shapes, both always opening with a "$" ticker:
 
-  * entry — ticker, strike, CALL/PUT, expiry, price. A BUY of one lot at the
-    stated limit, the same as a compact-alert entry.
-  * trim  — ticker, price, a percentage, then optional words. The percentage
-    is the trade's RESULT (17.00 -> 21.10 is +24%), never a fraction to sell.
-    No strike, right or expiry is written, so the contract is resolved from
-    the one open position in that symbol at execution — exactly as a terse
-    "... AMZN 25%" trim is — and the exit ladder decides the size. "OUT",
-    "CLOSED", "STOPPED" … after the percentage make it a full close instead.
+  * entry — ticker, strike, CALL/PUT, expiry, "@" price. A BUY of one lot at
+    the stated limit, the same as a compact-alert entry.
+  * trim  — ticker, NO contract, and a percentage anywhere on the line; the
+    price ("@ x" / "AT x") and any words are optional. The percentage alone
+    makes it a trim — "TRIMMING" is not needed — and is the trade's RESULT
+    (17.00 -> 21.10 is +24%), never a fraction to sell. The contract is
+    resolved at execution from what is held in that ticker: this channel's own
+    latest contract first (``channel_contract_first``), else the one open
+    position in it. The exit ladder decides the size. "OUT", "CLOSED",
+    "STOPPED" … on the line make it a full close instead.
 
 Why its own parser rather than another pattern in compact_alert: without it,
 the other parsers read this channel WRONG, not just partially. "$MSFT @ 21.10 |
@@ -26,7 +30,8 @@ the other parsers read this channel WRONG, not just partially. "$MSFT @ 21.10 |
 two trims with no action word were ignored; "@ @ 0.51" lost its price and
 would have bid off the live quote.
 
-Scoped to the channel by name (``ParsedMessage.channel``): on every other
+Scoped to the channel by name (``ParsedMessage.channel`` — the channel name,
+the trader's label and the server name, any of which may say "dragon"): on every other
 channel this parser never matches, so nothing that already parses changes.
 A Dragon message in neither shape is IGNORED here and falls through to the
 other parsers, as it did before.
@@ -71,15 +76,21 @@ _ENTRY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# $MSFT @ 21.10 | 24% TRIMMING
-_TRIM_RE = re.compile(
-    rf"^\s*{_SYMBOL}\s*"
-    rf"{_AT}\$?(?P<price>{_NUM})\s*"
-    rf"[|¦]?\s*"
-    rf"(?P<sign>[+\-−])?\s*(?P<pct>{_NUM})\s*%"
-    rf"(?P<note>.*)$",
-    re.IGNORECASE,
-)
+# A trim is any line that opens with a "$" ticker, names NO contract, and
+# states a percentage — whatever the word order:
+#
+#   $MSFT @ 21.10 | 24% TRIMMING
+#   $WMT @ 0.71 | 40%
+#   $WMT UP 100% AT 1.02
+#
+# The percentage alone makes it a trim; "TRIMMING" is not required.
+_TRIM_LINE_RE = re.compile(rf"^\s*{_SYMBOL}(?![A-Za-z0-9])(?P<rest>.*)$", re.IGNORECASE)
+_CONTRACT_RE = re.compile(rf"(?:^|\s)\$?(?:{_NUM})\s*(?:CALLS?|PUTS?|C|P)\b", re.IGNORECASE)
+_PCT_RE = re.compile(rf"(?P<sign>[+\-−])?\s*(?P<pct>{_NUM})\s*%")
+# "@ 21.10", "@ @ 0.71", "AT 1.02".
+_TRIM_PRICE_RE = re.compile(rf"(?:(?:@\s*)+|\bAT\s+)\$?(?P<price>{_NUM})(?![\d.%])", re.IGNORECASE)
+# "$WMT DOWN 30% AT 0.40": a loss, written as a word rather than a sign.
+_DOWN_RE = re.compile(r"\bdown\b", re.IGNORECASE)
 
 # Words after a trim's percentage that mean the author is OUT, not trimming.
 _OUT_RE = re.compile(
@@ -112,6 +123,14 @@ def _is_entry(m: re.Match) -> bool:
     return not re.match(rf"^\s*[+\-−]\s*(?:{_NUM})\s*%", m.group("trailing") or "")
 
 
+def _trim_match(line: str) -> re.Match | None:
+    """The ticker line of a trim, or None. ``rest`` holds everything after it."""
+    m = _TRIM_LINE_RE.match(line)
+    if m is None or _CONTRACT_RE.search(m.group("rest")) or not _PCT_RE.search(m.group("rest")):
+        return None
+    return m
+
+
 class DragonAlertParser(Parser):
     name = "dragon_alert"
 
@@ -119,7 +138,7 @@ class DragonAlertParser(Parser):
         if not is_dragon_channel(message):
             return False
         return any(
-            _TRIM_RE.match(ln) or ((m := _ENTRY_RE.match(ln)) and _is_entry(m))
+            _trim_match(ln) or ((m := _ENTRY_RE.match(ln)) and _is_entry(m))
             for ln in _lines(message)
         )
 
@@ -133,7 +152,7 @@ class DragonAlertParser(Parser):
                 sig, err = self._entry(m, message)
                 (signals.append(sig) if sig else errors.append(err))
                 continue
-            m = _TRIM_RE.match(line)
+            m = _trim_match(line)
             if m:
                 sig, err = self._trim(m)
                 (signals.append(sig) if sig else errors.append(err))
@@ -175,12 +194,15 @@ class DragonAlertParser(Parser):
         )
 
     def _trim(self, m: re.Match):
-        price = to_decimal(m.group("price"))
-        pct = to_decimal(m.group("pct"))
-        if pct is not None and m.group("sign") in ("-", "−"):
+        rest = m.group("rest")
+        pct_m = _PCT_RE.search(rest)
+        pct = to_decimal(pct_m.group("pct"))
+        if pct is not None and (pct_m.group("sign") in ("-", "−")
+                                or _DOWN_RE.search(rest[:pct_m.start()])):
             pct = -pct
-        note = " ".join((m.group("note") or "").split())
-        out = bool(_OUT_RE.search(note))
+        price_m = _TRIM_PRICE_RE.search(rest)
+        price = to_decimal(price_m.group("price")) if price_m else None
+        out = bool(_OUT_RE.search(rest))
 
         return (
             TradeSignal(
@@ -190,10 +212,12 @@ class DragonAlertParser(Parser):
                 option_type=None,
                 strike=None,
                 expiration=None,
-                # Only the ticker is written — the contract comes from the one
-                # open position in it, never a guess.
+                # Only the ticker is written — the contract comes from what is
+                # held in it: this channel's own latest contract first, else the
+                # one open position in that ticker. Never a guess.
                 expiry_unspecified=True,
                 contract_unspecified=True,
+                channel_contract_first=True,
                 quantity=None,              # sized from the position held
                 # Exits go to market — see compact_alert. The stated price is
                 # kept for display.

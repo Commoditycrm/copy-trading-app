@@ -42,7 +42,7 @@ def main() -> None:
         rows = list(db.execute(select(DiscordMessage)).scalars())
         # Channel name + label per source, for channel-scoped parsers (Dragon).
         channels = {
-            src.id: " ".join(v for v in (src.channel_name, src.label) if v)
+            src.id: " ".join(v for v in (src.channel_name, src.label, src.guild_name) if v)
             for src in db.execute(select(DiscordAlertSource)).scalars()
         }
         for row in rows:
