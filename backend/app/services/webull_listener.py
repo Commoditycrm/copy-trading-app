@@ -614,7 +614,7 @@ def _is_option_payload(payload: dict) -> bool:
 
 def _persist_and_fanout(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID,
-    creds: dict[str, Any], payload: dict,
+    creds: dict[str, Any], payload: dict, via: str = "poll",
 ) -> None:
     """Live path (shadow OFF only): persist the trader's Webull order and hand
     NEW ones to the fanout — mirrors snaptrade_listener._persist_and_fanout
@@ -681,6 +681,16 @@ def _persist_and_fanout(
                     trader_user_id, existing.id, existing.broker_order_id, client_oid,
                 )
                 existing.broker_order_id = client_oid
+            # Which path is actually doing the work. Stamped on every event,
+            # not only the first, so the column reflects what is carrying the
+            # load NOW rather than whatever happened to arrive first.
+            existing.detected_via = via
+            # The broker's own fill time. The stream carries filled_time and we
+            # were dropping it on the floor, so trader fill latency could not be
+            # measured at all — closed_at is OUR clock, not Webull's.
+            _bft = _parse_wb_time(payload.get("filled_time"))
+            if _bft is not None and existing.broker_filled_at is None:
+                existing.broker_filled_at = _bft
             was_working = existing.status in _WORKING
             # Did THIS event flip the order to FILLED? Used to fire the Discord
             # alert exactly once on the fill transition (not on later quiescent
@@ -858,6 +868,8 @@ def _persist_and_fanout(
             limit_price=_dec(payload.get("limit_price")),
             stop_price=_dec(payload.get("stop_price")),
             is_closing=False,   # fanout detects close per-subscriber from held qty
+            detected_via=via,
+            broker_filled_at=_parse_wb_time(payload.get("filled_time")),
             status=status_enum,
             filled_quantity=_dec(payload.get("filled_qty")) or Decimal(0),
             filled_avg_price=_dec(payload.get("filled_price")),
@@ -1327,7 +1339,7 @@ def _on_order_event(
 
     # Live mode — persist + fanout. Isolated so a bad event can't kill the stream.
     try:
-        _persist_and_fanout(trader_user_id, broker_account_id, creds, payload)
+        _persist_and_fanout(trader_user_id, broker_account_id, creds, payload, via=_via)
     except Exception:  # noqa: BLE001
         log.exception(
             "webull-listener[%s] live persist/fanout failed for order %s",

@@ -143,6 +143,11 @@ class OrderOut(BaseModel):
     # the column existed — clients must fall back to closed_at and mark it
     # approximate rather than presenting it as the broker's time.
     broker_filled_at: datetime | None = None
+    # "stream" = the broker's realtime push told us about this order; "poll" =
+    # our REST sweep did. NULL where neither path records it. Diagnostic: it is
+    # how you tell a realtime feed that is genuinely carrying the load from one
+    # that is merely connected.
+    detected_via: str | None = None
     closed_at: datetime | None
     reject_reason: str | None
     created_at: datetime
