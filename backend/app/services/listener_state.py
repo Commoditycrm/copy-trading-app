@@ -78,6 +78,8 @@ def clear_disconnect_debounce(trader_user_id: uuid.UUID) -> None:
 
 # "connecting" | "connected" | "reconnecting" | "disconnected" |
 # "credentials_invalid" | "mfa_required" | "in_use_elsewhere"  (webull-only)
+# | "silent"  (webull-only: subscribed, but the stream stopped delivering orders
+#              and the REST poller is carrying them — see webull_listener's watchdog)
 ListenerState = str
 
 

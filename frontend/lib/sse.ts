@@ -53,7 +53,10 @@ export interface NotificationEventPayload {
 export interface ListenerStatus {
   state: "connecting" | "connected" | "reconnecting" | "disconnected" | "credentials_invalid" | "no_trader" | "no_broker"
     // Webull: the app key's one live stream is held by another environment/app.
-    | "in_use_elsewhere";
+    | "in_use_elsewhere"
+    // Webull: subscribed, but the stream stopped delivering orders; the REST
+    // poller is carrying them (a few seconds slower) until it recovers.
+    | "silent";
   last_event_at: string | null;
   state_changed_at: string | null;
   last_error: string | null;
