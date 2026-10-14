@@ -209,3 +209,35 @@ def test_fifteen_days_of_alerts():
         "CRWV": (Decimal("96"), date(2026, 10, 9)),
         "MSFT": (Decimal("550"), date(2026, 11, 13)),
     }
+
+
+# ── typed into the Discord popup (the Self channel) ─────────────────────────
+
+def _self(text):
+    return parse_message(ParsedMessage(content=text, posted_at=TS, self_channel=True))
+
+
+@pytest.mark.parametrize("text, sym", [
+    # Live: "You hold no position in that contract to close." — read as a sell
+    # of MSFT SHARES while the account held MSFT 550C 11/13.
+    ("$MSFT @ 21.10 | 24% TRIMMING", "MSFT"),
+    ("$WMT @ 0.71 | 40%", "WMT"),
+    ("$WMT UP 100% AT 1.02", "WMT"),
+])
+def test_a_dragon_trim_typed_on_self_trims_the_option(text, sym):
+    s = _self(text).signal
+    assert s.parser == "dragon_alert"
+    assert (s.action, s.asset_type, s.symbol) == (SignalAction.SELL, AssetType.OPTION, sym)
+    assert s.contract_unspecified and s.channel_contract_first
+
+
+@pytest.mark.parametrize("text, parser", [
+    # Entries typed on Self are read as they always were.
+    ("$MSFT 550 CALL 11/13 @ 17.00", "compact_alert"),
+    # Scissors exits and auto-trim's own alerts name a contract: not Dragon's.
+    ("✂️ $SPY 769c +361%", "compact_alert"),
+    ("✂️ $NVDA 230C 09/28", "compact_alert"),
+])
+def test_everything_else_on_self_reads_as_before(text, parser):
+    r = _self(text)
+    assert r.status is ParseStatus.PARSED and r.signal.parser == parser
