@@ -875,13 +875,13 @@ def test_a_single_contract_stays_one(monkeypatch):
     assert r.payload.quantity == Decimal("1")
 
 
-def test_an_odd_size_rounds_down(monkeypatch):
-    """5 -> 2, not 3. "Light" asks for less risk, so the rounding goes that way."""
+def test_an_odd_size_rounds_up(monkeypatch):
+    """5 -> 3, not 2: every contract count rounds UP (the trader's rule, 2026-10-14)."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)]))
     r = ex.resolve(
         None, _User(), _signal(quantity="5", half_size=True), ex.Sizing(multiplier=5),
     )
-    assert r.payload.quantity == Decimal("2")
+    assert r.payload.quantity == Decimal("3")
 
 
 def test_the_reason_is_recorded_for_the_audit_trail(monkeypatch):

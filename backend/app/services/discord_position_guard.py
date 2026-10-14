@@ -169,23 +169,6 @@ def _slice(held: Decimal, pct: Decimal | None) -> Decimal:
 RUNNER_NOTE = "runner left"
 
 
-def _slice_down(held: Decimal, pct: Decimal | None) -> Decimal:
-    """``pct`` percent of what is still held, rounded DOWN to a whole contract.
-
-    The LAST trim's rule when it is not 100%: whatever the percentage does not
-    cleanly take stays on as a runner. Every earlier trim rounds UP (see _slice)
-    so it can never be a no-op; the last one is where the trader has said they
-    want something left, so it never takes more than asked — 50% of 3 sells 1
-    and leaves 2, and 50% of 1 sells nothing and leaves the 1.
-    """
-    if held <= 0:
-        return Decimal(0)
-    pct = Decimal(str(pct if pct is not None else 50))
-    if pct <= 0:
-        return Decimal(0)
-    return (held * pct / Decimal(100)).to_integral_value(rounding=ROUND_FLOOR)
-
-
 def rung_quantity(cfg: "TrimConfig", rung: int, held: Decimal) -> tuple[Decimal, bool]:
     """How many contracts this trim sells out of ``held``, and whether it is a
     last trim that leaves a runner. One rule for a trim fired by an alert, by
@@ -194,7 +177,11 @@ def rung_quantity(cfg: "TrimConfig", rung: int, held: Decimal) -> tuple[Decimal,
     trim happened to fire."""
     rung_cfg = cfg.rung(rung)
     leaves_runner = rung >= cfg.count and Decimal(str(rung_cfg.qty_pct)) < Decimal(100)
-    sell = _slice_down(held, rung_cfg.qty_pct) if leaves_runner else _slice(held, rung_cfg.qty_pct)
+    # Every trim rounds UP, the last one included (the trader's rule, 2026-10-14:
+    # "round up always"). The last trim used to round DOWN to leave a runner, so
+    # "sell 70%" of 4 sold 2; it now sells 3 (70% of 4 is 2.8), and a last trim
+    # of 50% of 1 sells the 1 rather than nothing.
+    sell = _slice(held, rung_cfg.qty_pct)
     return sell, leaves_runner
 
 
@@ -277,15 +264,15 @@ def plan_exit(
     # The defaults (50 / 50 / 100) reproduce the ladder exactly as it behaved
     # before the size was configurable.
     #
-    # The LAST trim, when it is not 100%, rounds DOWN and leaves the balance as
-    # a runner, still protected by this trim's stop.
+    # Every trim rounds UP (see rung_quantity). A LAST trim under 100% leaves
+    # whatever it does not take as a runner, still protected by this trim's stop.
     sell, leaves_runner = rung_quantity(cfg, rung, held)
     if leaves_runner and sell <= 0:
         return TrimPlan(
             rung=rung, guard=guard,
             new_stop_price=_armable_stop(stop, mark), **trailing,
             note=(f"trim {rung}: last trim at {rung_cfg.qty_pct.normalize():f}% of {held} "
-                  f"rounds down to 0 — {RUNNER_NOTE}"
+                  f"rounds to 0 — {RUNNER_NOTE}"
                   + (f", stop {stop.quantize(Decimal('0.0001'))}" if stop is not None else "")),
         )
 

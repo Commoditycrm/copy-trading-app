@@ -27,7 +27,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from types import SimpleNamespace
 from typing import Any
 
@@ -911,9 +911,9 @@ def _entry_quantity(signal, sizing, resolutions) -> Decimal:
             if stated is not None and stated > 0 and stated != scaled else None)
 
     # The author called this one "light" / "not heavy": take half of your size,
-    # rounded down — never below one contract.
+    # rounded UP (the trader's rule, 2026-10-14: "round up always") — so 3 is 2.
     if signal.get("half_size"):
-        halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_FLOOR)
+        halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_CEILING)
         # Never round down to nothing. You cannot buy half a contract, and
         # dropping the trade entirely is not what "smaller" asks for — so a
         # single contract stays a single contract.
