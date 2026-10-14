@@ -1115,3 +1115,52 @@ def test_an_average_down_is_sized_from_the_position_not_dollars(monkeypatch):
     r = ex.resolve(None, _User(), _signal(double_up=True),
                    ex.Sizing(mode="dollars", dollars=Decimal("200")))
     assert r.payload.quantity == Decimal("3")
+
+
+# ── a rate-limited positions read is retried, not refused ─────────────────────
+
+class _ThrottledAdapter:
+    """get_positions answers 429 ``fails`` times, then succeeds."""
+
+    def __init__(self, fails, exc=None):
+        self.fails, self.calls = fails, 0
+        self.exc = exc or RuntimeError(
+            "HTTP Status: 429, Code: TOO_MANY_REQUESTS, Msg: Too many requests")
+
+    def get_positions(self):
+        self.calls += 1
+        if self.calls <= self.fails:
+            raise self.exc
+        from types import SimpleNamespace
+        return [SimpleNamespace(symbol="SPY"), SimpleNamespace(symbol="QQQ")]
+
+
+def test_positions_retries_a_429_then_reads_live(monkeypatch):
+    """Two alerts back to back on Webull (QA, 2026-10-14): the second read 429'd
+    and the order was refused. It now waits and reads again."""
+    sleeps = []
+    monkeypatch.setattr(ex.time, "sleep", sleeps.append)
+    a = _ThrottledAdapter(fails=2)
+    got = ex._positions(a, "SPY")
+    assert [p.symbol for p in got] == ["SPY"]
+    assert a.calls == 3
+    assert sleeps == list(ex._POSITIONS_RETRY_DELAYS_S)
+
+
+def test_positions_still_refuses_when_throttled_throughout(monkeypatch):
+    monkeypatch.setattr(ex.time, "sleep", lambda s: None)
+    a = _ThrottledAdapter(fails=99)
+    with pytest.raises(ex.ExecutionRefused, match="Couldn't read your positions"):
+        ex._positions(a, "SPY")
+    assert a.calls == len(ex._POSITIONS_RETRY_DELAYS_S) + 1
+
+
+def test_positions_does_not_retry_other_errors(monkeypatch):
+    """Only a rate limit is worth waiting out; an auth or network error refuses
+    at once (and is never read as 'no position')."""
+    sleeps = []
+    monkeypatch.setattr(ex.time, "sleep", sleeps.append)
+    a = _ThrottledAdapter(fails=1, exc=RuntimeError("HTTP Status: 401, Code: UNAUTHORIZED"))
+    with pytest.raises(ex.ExecutionRefused):
+        ex._positions(a, "SPY")
+    assert a.calls == 1 and sleeps == []

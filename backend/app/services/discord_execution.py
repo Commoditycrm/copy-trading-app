@@ -24,6 +24,7 @@ placed, which is what makes the rest of the platform work on it unchanged.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -396,13 +397,34 @@ def _broker_account(db: Session, user: User) -> BrokerAccount:
     return accounts[0]
 
 
+# Webull answers 429 when two position reads for one account land within a few
+# seconds of each other — it objects to the overlap, not the volume (see
+# brokers/webull.py, _POSITIONS_TTL_S). Two alerts placed back to back, or one
+# landing while the Positions page or the P&L poller is reading, hit exactly
+# that (QA, 2026-10-14). A short wait and a fresh read gets through.
+_POSITIONS_RETRY_DELAYS_S = (0.5, 1.0)
+
+
+def _rate_limited(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "429" in msg or "TOO_MANY_REQUESTS" in msg.upper()
+
+
 def _positions(adapter: Any, symbol: str) -> list:
     """Held positions in this symbol. A broker hiccup must not be read as
-    'no position' — that would turn a close into an opening short."""
-    try:
-        return [p for p in adapter.get_positions() if (p.symbol or "").upper() == symbol]
-    except Exception as exc:  # noqa: BLE001
-        raise ExecutionRefused(f"Couldn't read your positions from the broker: {exc}") from exc
+    'no position' — that would turn a close into an opening short. A rate
+    limit is retried (still a live read each time); anything else refuses."""
+    for delay in (*_POSITIONS_RETRY_DELAYS_S, None):
+        try:
+            return [p for p in adapter.get_positions() if (p.symbol or "").upper() == symbol]
+        except Exception as exc:  # noqa: BLE001
+            if delay is None or not _rate_limited(exc):
+                raise ExecutionRefused(
+                    f"Couldn't read your positions from the broker: {exc}"
+                ) from exc
+            log.info("discord: positions read rate limited; retrying in %.1fs", delay)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _with_nearest_expiry(adapter: Any, symbol: str, signal: dict, positions: list,
