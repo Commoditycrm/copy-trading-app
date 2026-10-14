@@ -49,21 +49,29 @@ def test_persist_stamps_via_and_the_broker_fill_time():
     assert "broker_filled_at" in src
 
 
-def test_first_writer_wins_so_the_poller_cannot_mask_the_stream():
-    """The column records who got there FIRST, and is never overwritten.
+def test_the_fill_transition_is_what_gets_stamped():
+    """The question is who told us an order FILLED — nothing else.
 
-    Stamping on every event measured the opposite of what it appeared to: the
-    REST poller re-reads every order within 5s, so even when the stream arrived
-    first at ~1s the poller overwrote "stream" with "poll" moments later. Every
-    order came back "poll" and the stream looked dead when it may not have been.
+    Two earlier attempts measured something else entirely:
+
+      * stamping on EVERY event -> the 5s poller re-reads each order and
+        overwrote the stream moments later, so everything read "poll";
+      * stamping only the FIRST event -> the label was set at SUBMIT, again by
+        the poller, so a fill pushed over the stream could never change it and
+        fills read "poll" while fill frames were demonstrably arriving (prod:
+        3 FILLED frames in an hour, 0 orders tagged stream).
+
+    So the fill transition must always (re)stamp, while anything else only
+    fills a blank.
     """
     import inspect
     from app.services import webull_listener as wl
     src = inspect.getsource(wl._persist_and_fanout)
-    assert "if existing.detected_via is None:" in src, \
-        "must not overwrite — the later poll is not a detection"
-    # and the unconditional form must be gone
-    assert "\n            existing.detected_via = via" not in src
+    assert "if became_filled or existing.detected_via is None:" in src, \
+        "a fill must re-stamp; everything else only fills a blank"
+    # The stamp has to come AFTER became_filled exists, or it reads a stale name.
+    assert src.index("became_filled = (") < src.index(
+        "if became_filled or existing.detected_via is None:")
 
 
 def test_poll_is_the_default_so_an_untagged_caller_never_claims_stream():
