@@ -175,20 +175,28 @@ def test_a_trim_before_the_last_still_rounds_up():
     assert plan.sell_qty == D(1)
 
 
-def test_the_last_trim_under_100_rounds_down_and_leaves_runners():
+def test_the_last_trim_under_100_rounds_up_and_leaves_the_rest_as_runners():
+    """Every trim rounds UP, the last one included (the trader's rule, 2026-10-14)."""
     cfg = _cfg((20, 50, -25), (40, 50, 0))                               # last trim is 50%
     plan = guards.plan_exit(_guard(rung=1), D(3), D("1.50"), cfg)
-    assert plan.sell_qty == D(1)                                         # 1.5 rounds DOWN
-    assert plan.retire is False and plan.new_stop_price == D("1.00")     # 2 runners, stop at break-even
+    assert plan.sell_qty == D(2)                                         # 1.5 rounds UP
+    assert plan.retire is False and plan.new_stop_price == D("1.00")     # 1 runner, stop at break-even
     assert guards.RUNNER_NOTE in plan.note
 
 
-def test_a_last_trim_that_rounds_down_to_nothing_sells_nothing():
+def test_seventy_percent_of_four_is_three():
+    """QA 2026-10-14, SPY 773P: a last trim of 70% of 4 sold 2; it sells 3."""
+    cfg = _cfg((30, 70, -25),)
+    plan = guards.plan_exit(_guard(rung=0), D(4), D("1.40"), cfg)
+    assert plan.sell_qty == D(3)
+
+
+def test_a_last_trim_of_half_of_one_contract_sells_it():
+    """50% of 1 rounds UP to the 1 — it no longer sells nothing."""
     cfg = _cfg((20, 50, -25), (40, 50, 0))
     g = _guard(rung=1)
-    plan = guards.plan_exit(g, D(1), D("1.50"), cfg)                     # 50% of 1
-    assert plan.sell_qty == 0 and plan.retire is False
-    assert guards.RUNNER_NOTE in plan.note and plan.new_stop_price == D("1.00")
+    plan = guards.plan_exit(g, D(1), D("1.50"), cfg)
+    assert plan.sell_qty == D(1)
     assert g.sell_count == 2                                             # the rung is spent
 
 

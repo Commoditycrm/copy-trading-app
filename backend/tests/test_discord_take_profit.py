@@ -114,7 +114,6 @@ def test_the_target_rounds_up_to_the_cent():
     (_guard(), D(0), _ts(), D("1.05")),                                              # entry not filled yet
     (_guard(entry_price=None), D(4), _ts(), D("1.05")),
     (_guard(stop_price=D("0.75")), D(4), _ts(), D("0.70")),                          # through the stop already
-    (_guard(sell_count=1), D(1), _ts(discord_trim_count=2), D("1.30")),              # last trim 50% of 1: rounds to 0
 ])
 def test_nothing_rests_when(guard, held, ts, mark):
     assert tp.plan(guard, held, ts, mark) is None
@@ -553,3 +552,9 @@ def test_release_keeps_a_filled_take_profit_for_settle_to_credit():
     assert tp.release(book, g, book.cancel) is True
     assert g.tp_order_id is not None, "a filled take-profit must not be forgotten"
     assert tp.settle(book, g, _ts(), book.cancel) == "trim 1 filled" and g.sell_count == 1
+
+
+def test_a_last_trim_of_half_of_one_contract_rests_for_the_one():
+    """Every trim rounds UP (2026-10-14): 50% of 1 is the 1, not nothing."""
+    p = tp.plan(_guard(sell_count=1), D(1), _ts(discord_trim_count=2), D("1.30"))
+    assert p is not None and (p.rung, p.quantity) == (2, D(1))
