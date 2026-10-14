@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import select
 
 from app.database import SessionLocal
+from app.models.discord_alert_source import DiscordAlertSource
 from app.models.discord_message import DiscordMessage, DiscordMessageStatus
 from app.services.discord_parsers import ParsedMessage, ParseStatus, parse_message
 
@@ -39,6 +40,11 @@ def main() -> None:
     changed = 0
     with SessionLocal() as db:
         rows = list(db.execute(select(DiscordMessage)).scalars())
+        # Channel name + label per source, for channel-scoped parsers (Dragon).
+        channels = {
+            src.id: " ".join(v for v in (src.channel_name, src.label) if v)
+            for src in db.execute(select(DiscordAlertSource)).scalars()
+        }
         for row in rows:
             # Never re-parse a message that already produced an order: its
             # reading is what the order was placed on, and rewriting it would
@@ -54,6 +60,7 @@ def main() -> None:
                     embeds=list(row.embeds or []),
                     author=row.author,
                     posted_at=row.posted_at,
+                    channel=channels.get(row.source_id),
                 )
             )
             new_status = _STATUS[result.status]

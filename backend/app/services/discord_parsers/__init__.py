@@ -2,6 +2,7 @@
 
     Parser
      ├── AlertCardParser    structured ENTERING/TRIMMING/CLOSING embeds
+     ├── DragonAlertParser  the Dragon channel only ("$MSFT @ 21.10 | 24% TRIMMING")
      ├── CompactAlertParser terse one-liners ("$TSLA 375 CALL 0DTE @0.95",
      │                      "✂️ $SPY 769c +361%") — no action word
      └── GenericTextParser  free-text ("BUY AAPL 250C SEP18 @ 2.15")
@@ -25,6 +26,7 @@ import re
 
 from .alert_card import AlertCardParser
 from .compact_alert import CompactAlertParser
+from .dragon_alert import DragonAlertParser
 from .base import (
     AssetType,
     OptionType,
@@ -79,6 +81,10 @@ def _is_half_size(text: str) -> bool:
 
 # Most specific first.
 PARSERS: list[Parser] = [
+    # The Dragon channel only (matched by channel name) — first, so its trims
+    # aren't read as stock sells by the free-text parser. Never matches on any
+    # other channel.
+    DragonAlertParser(),
     AlertCardParser(),
     # Before the free-text parser: "$TSLA 375 CALL 0DTE @0.95" has no action
     # word, so the generic parser would ignore it entirely.
