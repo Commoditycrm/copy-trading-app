@@ -30,6 +30,10 @@ the other parsers read this channel WRONG, not just partially. "$MSFT @ 21.10 |
 two trims with no action word were ignored; "@ @ 0.51" lost its price and
 would have bid off the live quote.
 
+The trims are also read on the Self channel (``ParsedMessage.self_channel``)
+— an alert typed into the Discord popup — where "$MSFT @ 21.10 | 24% TRIMMING"
+otherwise reads as a sell of MSFT SHARES and fails against the option held.
+
 Scoped to the channel by name (``ParsedMessage.channel`` — the channel name,
 the trader's label and the server name, any of which may say "dragon"): on every other
 channel this parser never matches, so nothing that already parses changes.
@@ -135,19 +139,23 @@ class DragonAlertParser(Parser):
     name = "dragon_alert"
 
     def matches(self, message: ParsedMessage) -> bool:
-        if not is_dragon_channel(message):
+        dragon = is_dragon_channel(message)
+        if not (dragon or message.self_channel):
             return False
         return any(
-            _trim_match(ln) or ((m := _ENTRY_RE.match(ln)) and _is_entry(m))
+            _trim_match(ln) or (dragon and (m := _ENTRY_RE.match(ln)) and _is_entry(m))
             for ln in _lines(message)
         )
 
     def parse(self, message: ParsedMessage) -> ParseResult:
         signals: list[TradeSignal] = []
         errors: list[str] = []
+        # On the Self channel (the popup) only the trims are Dragon's: a typed
+        # entry is still read by the parsers that always read it.
+        dragon = is_dragon_channel(message)
 
         for line in _lines(message):
-            m = _ENTRY_RE.match(line)
+            m = _ENTRY_RE.match(line) if dragon else None
             if m and _is_entry(m):
                 sig, err = self._entry(m, message)
                 (signals.append(sig) if sig else errors.append(err))

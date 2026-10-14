@@ -272,6 +272,9 @@ class ParsedMessage:
     # The source channel's name and label, for parsers scoped to one channel
     # (dragon_alert). None when unknown — such parsers then never match.
     channel: str | None = None
+    # Typed by the trader into the Discord popup (the Self channel). Dragon's
+    # ticker-only trims ("$MSFT @ 21.10 | 24% TRIMMING") are read here too.
+    self_channel: bool = False
 
     @property
     def text(self) -> str:

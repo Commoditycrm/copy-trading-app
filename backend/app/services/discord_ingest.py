@@ -194,6 +194,7 @@ def _persist(
         auto_approve=auto_approve,
         percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
         channel=_channel_of(source),
+        self_channel=_is_self(source),
     )
     try:
         with db.begin_nested():
@@ -276,10 +277,19 @@ def _apply_edit(
         auto_approve=auto_approve,
         percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
         channel=_channel_of(source),
+        self_channel=_is_self(source),
     )
     if had_order:
         existing.status = was
     return existing, True
+
+
+# The Self channel: alerts the trader types into the Discord popup.
+_SELF_CHANNEL_ID = "self"
+
+
+def _is_self(source: DiscordAlertSource) -> bool:
+    return getattr(source, "channel_id", None) == _SELF_CHANNEL_ID
 
 
 def _channel_of(source: DiscordAlertSource) -> str:
@@ -295,7 +305,7 @@ def _channel_of(source: DiscordAlertSource) -> str:
 
 def _apply_parse(
     row: DiscordMessage, *, auto_approve: bool, percent_means_exit: bool = False,
-    channel: str | None = None,
+    channel: str | None = None, self_channel: bool = False,
 ) -> None:
     """Read the message, record what it says, and set its decision state.
 
@@ -317,6 +327,7 @@ def _apply_parse(
                 # This channel's house style — see DiscordAlertSource.
                 percent_means_exit=percent_means_exit,
                 channel=channel,
+                self_channel=self_channel,
             )
         )
     except Exception:  # noqa: BLE001

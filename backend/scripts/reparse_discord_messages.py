@@ -41,6 +41,10 @@ def main() -> None:
     with SessionLocal() as db:
         rows = list(db.execute(select(DiscordMessage)).scalars())
         # Channel name + label per source, for channel-scoped parsers (Dragon).
+        self_ids = {
+            src.id for src in db.execute(select(DiscordAlertSource)).scalars()
+            if src.channel_id == "self"
+        }
         channels = {
             src.id: " ".join(v for v in (src.channel_name, src.label, src.guild_name) if v)
             for src in db.execute(select(DiscordAlertSource)).scalars()
@@ -61,6 +65,7 @@ def main() -> None:
                     author=row.author,
                     posted_at=row.posted_at,
                     channel=channels.get(row.source_id),
+                    self_channel=row.source_id in self_ids,
                 )
             )
             new_status = _STATUS[result.status]
