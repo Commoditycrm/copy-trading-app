@@ -1292,17 +1292,19 @@ def _on_order_event(
             sorted(payload)[:20] if isinstance(payload, dict) else type(payload).__name__,
         )
 
-    # One line per STREAM frame. The shape log above fires once per
-    # (eventType, subscribeType) and then goes quiet forever, which answers
-    # "what shapes exist" but not "is it still flowing" — the question actually
-    # asked every time anyone checks on this. Volume is an order event or two a
-    # minute even on a busy account, so INFO is affordable. The poller is NOT
-    # logged here: it already announces itself elsewhere and would double every
-    # line.
-    if _via == "stream" and isinstance(payload, dict):
+    # One line per order frame, tagged with its source. The shape log above
+    # fires once per (eventType, subscribeType) then goes quiet — it answers
+    # "what shapes exist", not "which path saw this order, and is it flowing".
+    # The poller reaches here only on a new/changed order (its seen-map skips
+    # unchanged ones), so this is one line per detection/transition, not per
+    # cycle — INFO is affordable. Logging POLL too (the old code logged STREAM
+    # only) makes a placement the stream never delivered visible in the log,
+    # the same split the durable detected_via field records. STREAM stays the
+    # leading token so existing greps keep matching.
+    if isinstance(payload, dict):
         log.info(
-            "webull-listener[%s] STREAM %s %s %s filled=%s@%s boid=%s",
-            trader_user_id, payload.get("symbol"), payload.get("side"),
+            "webull-listener[%s] %s %s %s %s filled=%s@%s boid=%s",
+            trader_user_id, _via.upper(), payload.get("symbol"), payload.get("side"),
             payload.get("order_status"), payload.get("filled_qty"),
             payload.get("filled_price"), payload.get("order_id"),
         )
