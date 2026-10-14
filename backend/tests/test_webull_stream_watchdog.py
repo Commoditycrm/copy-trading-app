@@ -244,3 +244,29 @@ def test_watchdog_stop_reconnects_quietly(monkeypatch, caplog):
 
     assert ("reconnecting", None) in states
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_dashed_uuid_client_ids_are_not_misses(tid, states):
+    """Webull pushes nothing for an order whose client_order_id is a dashed UUID
+    (QA, 2026-10-14), so those orders must not flag a healthy stream silent."""
+    client = wl._clients[tid] = _FakeClient()
+    for i, coid in enumerate([
+        "27b9681d-184e-496c-a1b8-774d5f6224fa",
+        "b66ad85d-2c71-436c-a23a-f42644fd0448",
+        "a588fb2d-221c-45c6-a55f-4ee4af17e9b4",
+        "397c93f4-8443-448a-8f24-ac162e4d2381",
+    ]):
+        wl._watchdog_poll_change(tid, f"o{i}", "WORKING", "CANCELLED", now=0.0,
+                                 client_order_id=coid)
+    wl._watchdog_tick(tid, now=60.0)
+    assert client.stops == 0
+    assert all(s != wl.STREAM_SILENT for s, _ in states)
+
+
+def test_32_hex_client_ids_still_count(tid):
+    client = wl._clients[tid] = _FakeClient()
+    for i in range(wl._WD_MISSES):
+        wl._watchdog_poll_change(tid, f"o{i}", "WORKING", "CANCELLED", now=0.0,
+                                 client_order_id=f"{i:032x}")
+    wl._watchdog_tick(tid, now=60.0)
+    assert client.stops == 1
