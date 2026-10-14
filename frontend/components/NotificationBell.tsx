@@ -127,7 +127,10 @@ export function NotificationBell({
   }
 
   return (
-    <div className="relative" ref={wrapRef}>
+    // Below sm the wrapper is `static` so the dropdown positions against the
+    // header (which is `relative`) and can span its full width; from sm up it
+    // is `relative` again and the panel hangs off the bell as before.
+    <div className="static sm:relative" ref={wrapRef}>
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -168,9 +171,13 @@ export function NotificationBell({
       {open && (
         <div
           aria-label="Notifications"
-          className="absolute right-0 mt-2 rounded-2xl overflow-hidden z-50 animate-fade-in"
+          // Phones: full header width, directly under the header (left-0 /
+          // right-0 / top-full against the header, see the wrapper note). A
+          // 360px panel anchored to the bell's right edge would otherwise run
+          // ~90px off the left of a 375px screen. From sm up: bell-anchored,
+          // capped at 360px / viewport minus a gutter.
+          className="absolute left-0 right-0 top-full sm:left-auto sm:top-auto sm:w-[min(360px,calc(100vw-24px))] mt-2 rounded-2xl overflow-hidden z-50 animate-fade-in"
           style={{
-            width: "min(360px, calc(100vw - 24px))",
             background: "var(--panel)",
             border: "1px solid var(--border)",
             boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
