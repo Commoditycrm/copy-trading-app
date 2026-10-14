@@ -844,19 +844,6 @@ def _persist_and_fanout(
                     trader_user_id, existing.id, existing.broker_order_id, client_oid,
                 )
                 existing.broker_order_id = client_oid
-            # Which path got here FIRST — the only question worth asking.
-            #
-            # This used to stamp on every event, which measured the opposite of
-            # what it looks like: the REST poller re-reads every order within
-            # 5s, so even when the stream arrives first at ~1s the poller
-            # overwrites "stream" with "poll" moments later. Every order came
-            # back "poll" and the stream looked dead when it may not have been.
-            #
-            # First writer wins, so the column records who actually won the
-            # race. Never overwritten afterwards: a later poll confirming what
-            # the stream already told us is not the poller detecting anything.
-            if existing.detected_via is None:
-                existing.detected_via = via
             # The broker's own fill time. The stream carries filled_time and we
             # were dropping it on the floor, so trader fill latency could not be
             # measured at all — closed_at is OUR clock, not Webull's.
@@ -871,6 +858,22 @@ def _persist_and_fanout(
                 existing.status != OrderStatus.FILLED
                 and status_enum == OrderStatus.FILLED
             )
+
+            # Which path detected this order — and for a FILL specifically, the
+            # only transition whose latency matters.
+            #
+            # Two earlier attempts measured the wrong thing. Stamping on EVERY
+            # event meant the 5s poller overwrote the stream moments later and
+            # everything read "poll". Stamping only the FIRST event meant the
+            # label was set at SUBMIT — again by the poller — so a fill pushed
+            # over the stream could never change it, and fills read "poll" even
+            # while fill frames were demonstrably arriving.
+            #
+            # So: the fill transition always (re)stamps, because "who told us it
+            # filled" is the question; anything else stamps only to fill a blank,
+            # so a cancelled or still-working order still reports something.
+            if became_filled or existing.detected_via is None:
+                existing.detected_via = via
 
             # ── Trader MODIFY: still-working terms changed → propagate as a
             # cancel-replace onto the mirrors (only when the event carries the
