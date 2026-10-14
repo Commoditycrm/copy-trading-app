@@ -1253,12 +1253,15 @@ export default function DiscordPage() {
               className="rounded-xl px-4 py-3 flex items-center gap-x-5 gap-y-2.5 flex-wrap"
               style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
             >
-              <label className="flex items-center gap-2 text-[12px]" style={{ color: "var(--text-2)" }}>
-                Settings for
+              {/* Phones: the label takes the full row and the select shrinks
+                  to it (its longest option is wider than a 375px screen).
+                  From sm up the label is content-sized as before. */}
+              <label className="flex items-center gap-2 text-[12px] w-full sm:w-auto" style={{ color: "var(--text-2)" }}>
+                <span className="shrink-0">Settings for</span>
                 <select
                   value={scope ?? ""}
                   onChange={(e) => void changeScope(e.target.value || null)}
-                  className="rounded-md border px-2 py-1 text-[12px] bg-transparent focus-ring"
+                  className="rounded-md border px-2 py-1 text-[12px] bg-transparent focus-ring min-w-0 flex-1 sm:flex-none"
                   style={{ borderColor: "var(--border)", color: "var(--text)" }}
                 >
                   <option value="">Account (every channel that follows it)</option>
@@ -1443,8 +1446,8 @@ export default function DiscordPage() {
               <div className="flex gap-4 flex-wrap items-stretch">
                 {/* Size each entry: by contracts, or by dollars */}
                 <div
-                  className="rounded-xl px-4 py-3 flex-1"
-                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 330 }}
+                  className="rounded-xl px-4 py-3 flex-1 basis-full sm:basis-0 min-w-0 sm:min-w-[330px]"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <label className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
@@ -1561,10 +1564,10 @@ export default function DiscordPage() {
                   const save = () => saveSizing({ [field]: value, size_cap: sizeCap });
                   return (
                     <div
-                      className="rounded-xl px-4 py-3 flex-1"
+                      className="rounded-xl px-4 py-3 flex-1 basis-full sm:basis-0 min-w-0 sm:min-w-[300px]"
                       title={dollars ? "Not used while sizing by dollars — the amount is the rule" : undefined}
                       style={{
-                        background: "var(--panel-2)", border: "1px solid var(--border)", minWidth: 300,
+                        background: "var(--panel-2)", border: "1px solid var(--border)",
                         opacity: dollars ? 0.45 : 1, pointerEvents: dollars ? "none" : undefined,
                       }}
                     >
@@ -1738,12 +1741,15 @@ export default function DiscordPage() {
                   {/* One ROW per stage, one COLUMN per setting — read across a
                       row for what happens at that stage.
 
-                      No overflow wrapper: "overflow-x-auto" makes an element a
-                      scroll container in BOTH axes, and .focus-ring draws its
-                      outline 2px OUTSIDE the input, so the ring was clipped on
-                      every cell. The columns are minmax(0,1fr) and shrink on
-                      their own, so nothing needed to scroll. */}
-                  <div className="mt-3 grid gap-x-2 gap-y-2 items-center"
+                      From sm up there is no scroll wrapper: the columns are
+                      minmax(0,1fr) and shrink on their own. Below sm the grid
+                      keeps a readable minimum width and scrolls sideways —
+                      "overflow-x-auto" makes an element a scroll container in
+                      BOTH axes and .focus-ring draws its outline 2px OUTSIDE
+                      the input, so the wrapper carries 1 spacing of padding
+                      (cancelled by a negative margin) to give the ring room. */}
+                  <div className="overflow-x-auto sm:overflow-visible -mx-1 px-1 -my-1 py-1 mt-2">
+                  <div className="grid gap-x-2 gap-y-2 items-center min-w-[540px] sm:min-w-0"
                        style={{ gridTemplateColumns: "64px repeat(3, minmax(0, 1fr)) 22px" }}>
                     {/* Header: the settings. */}
                     <span />
@@ -1889,6 +1895,7 @@ export default function DiscordPage() {
                       </Fragment>
                     ))}
                   </div>
+                  </div>
 
                   <div className="mt-2 flex items-center gap-3 flex-wrap">
                     <button
@@ -1906,12 +1913,12 @@ export default function DiscordPage() {
                     </p>
                   </div>
 
-                  <div className="flex items-center gap-2 mt-3">
+                  <div className="flex flex-col items-start sm:flex-row sm:items-center gap-2 mt-3">
                     <button
                       type="button"
                       disabled={modeBusy || !ladderDirty}
                       onClick={() => saveSizing(ladderPatch())}
-                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40"
+                      className="btn-primary px-3.5 py-1.5 text-[12px] disabled:opacity-40 shrink-0"
                     >
                       {modeBusy ? <Spinner /> : "Save"}
                     </button>

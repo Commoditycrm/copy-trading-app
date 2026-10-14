@@ -1066,9 +1066,12 @@ export default function SettingsPage() {
                     </p>
                   </div>
 
-                  {/* Picker + save */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <div className="w-[5.5rem]">
+                  {/* Picker + save. On phones the badge + hint already eat the
+                      row, so this group takes a full line of its own (w-full)
+                      with the picker stretching to fill it; from sm up it sits
+                      inline on the right as before. */}
+                  <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                    <div className="flex-1 sm:flex-none sm:w-[5.5rem]">
                       <SelectInput
                         value={multInput}
                         onChange={setMultInput}
