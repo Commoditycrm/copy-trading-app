@@ -247,6 +247,28 @@ async def gateway_proxy(slot: int, path: str, request: Request) -> Response:
             slot, request.method, path, r.status_code, r.headers.get("location"),
             set_cookies, r.headers.get("content-type"), len(r.content),
         )
+        if path.endswith("Authenticator") and "json" in str(r.headers.get("content-type") or "") and len(r.content) < 2000:
+            # IBKR's reason for a refused step. Only the status/error fields are
+            # logged — never the SRP values or anything from the credential
+            # exchange. (QA 2026-10-14: correct credentials, Client Portal login
+            # fine, gateway login refused — the code here says why.)
+            try:
+                import json as _json  # noqa: PLC0415
+                body = _json.loads(r.content.decode("utf-8", errors="replace"))
+                # Everything except the SRP / key material (long hex blobs):
+                # IBKR's status flags are short values like {"M2":"null",
+                # "reached_max_login":false} or an error string.
+                secret = {"B", "S", "M2", "RSAPUB", "N", "SALT", "TOKEN", "PASSWORD", "KEY", "PUBKEY", "M1", "A"}
+                keep = {}
+                for k, v in (body.items() if isinstance(body, dict) else []):
+                    sv = str(v)
+                    if str(k).upper() in secret or (len(sv) > 24 and all(c in "0123456789abcdefABCDEF" for c in sv)):
+                        keep[k] = f"<{len(sv)} chars>"
+                    else:
+                        keep[k] = sv[:120]
+                log.info("ibkr-gateway slot %s: Authenticator reply fields=%s", slot, keep)
+            except Exception:  # noqa: BLE001
+                pass
         if path.endswith("Dispatcher"):
             snippet = r.content[:600].decode("utf-8", errors="replace").replace("\n", " ")
             log.info("ibkr-gateway slot %s: Dispatcher body starts: %r", slot, snippet)
