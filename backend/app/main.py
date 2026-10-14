@@ -423,6 +423,17 @@ def create_app() -> FastAPI:
                 daemon=True,
             ).start()
 
+            # Trailing stops: raise the resting stop within a second or two of a
+            # new high, on Alpaca's live price, instead of on the P&L poller's
+            # 15s pass. Inert without a trailing stop on a live position.
+            from app.services import trail_ratchet
+            threading.Thread(
+                target=trail_ratchet.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="trail-ratchet",
+                daemon=True,
+            ).start()
+
             from app.services import discord_edit
             threading.Thread(
                 target=discord_edit.poll_loop,

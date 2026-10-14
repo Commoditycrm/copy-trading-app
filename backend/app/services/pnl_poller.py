@@ -981,6 +981,20 @@ def _pinned(user_id, guard) -> bool:
 
 
 def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = None) -> None:
+    """The Discord ladder pass for one account, holding the user's ladder lock.
+
+    The one-second trailing-stop loop (services/trail_ratchet) raises the same
+    guards' stops between these passes. Without the shared lock this pass could
+    load a guard, the loop raise its stop, and this pass then write its stale,
+    LOWER level back over it.
+    """
+    from app.services import trail_ratchet  # noqa: PLC0415
+
+    with trail_ratchet.user_lock(acct.user_id):
+        _enforce_discord_ladder(acct, seen)
+
+
+def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> None:
     """Advance the stops and trailing exits a Discord trim left behind.
 
     Set by the trim ladder: a stop level under what's still held, and sometimes

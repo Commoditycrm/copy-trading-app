@@ -35,7 +35,7 @@ def test_a_failed_release_still_tries_the_exit(monkeypatch):
 def test_the_poller_s_exits_go_through_it():
     import inspect
 
-    src = inspect.getsource(pnl_poller._enforce_discord_trailing_stops)
+    src = inspect.getsource(pnl_poller._enforce_discord_ladder)
     # The CALL, not its argument layout — this is about the poller's exits
     # going through the releasing path, not about how the line wraps.
     assert "exit_freeing_reservations(" in src

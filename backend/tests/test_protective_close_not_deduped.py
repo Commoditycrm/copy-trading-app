@@ -20,7 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.api.trades import _place_trader_order
-from app.services.pnl_poller import _enforce_discord_trailing_stops, place_exit
+from app.services.pnl_poller import _enforce_discord_ladder, place_exit
 
 
 def test_the_placement_path_can_be_told_to_skip_dedup():
@@ -38,7 +38,7 @@ def test_the_dedup_lookup_is_actually_gated_on_the_flag():
 
 def test_the_protective_close_opts_out():
     """The one caller that cannot tolerate being silently skipped."""
-    src = inspect.getsource(_enforce_discord_trailing_stops)
+    src = inspect.getsource(_enforce_discord_ladder)
     # Through exit_freeing_reservations, which frees resting orders and then
     # calls place_exit — the close itself, shared with AI trimming.
     assert "exit_freeing_reservations(" in src[src.index("def _close("):]

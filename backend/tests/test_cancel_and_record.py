@@ -142,7 +142,7 @@ def test_both_role_branches_run_the_same_ladder_pass():
     subscriber = inspect.getsource(pnl_poller._enforce_one_inner)
     assert "_enforce_discord_trailing_stops(" in trader
     assert "_enforce_discord_trailing_stops(" in subscriber
-    sweep = inspect.getsource(pnl_poller._enforce_discord_trailing_stops)
+    sweep = inspect.getsource(pnl_poller._enforce_discord_ladder)
     assert "_make_stop_canceller(" in sweep
 
 
