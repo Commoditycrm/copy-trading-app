@@ -2449,9 +2449,10 @@ def arm_trailing_stop(
     """Arm a trailing stop on one position, measured off the CURRENT market price.
 
     Stocks on trailing-capable brokers get a NATIVE trailing-stop order. Options
-    (which brokers reject for trailing stops) get an EMULATED trail — a guard the
-    P&L poller advances against the live mark and MARKET-closes when the price
-    retraces ``trail_percent`` % from its peak (same engine as Discord trims)."""
+    (which brokers reject for trailing stops) get a real STOP resting at the
+    broker for every contract held, ``trail_percent`` % below the market, which
+    the P&L poller raises as the price makes new highs. It takes over the exit
+    from the ladder's take-profit — see below."""
     from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
     from app.services import discord_position_guard as guards  # noqa: PLC0415
 
@@ -2497,9 +2498,25 @@ def arm_trailing_stop(
         db.commit()
         return {"mode": "native", "order_id": str(order.id), "trail_percent": str(trail_percent)}
 
-    # Emulated trail (options): arm/refresh a guard the P&L poller enforces. The
-    # dollar give-back is trail_percent % of the current mark; the peak seeds at
-    # the current price and ratchets up from there.
+    # Options (no broker takes a trailing-stop order on them): a real STOP that
+    # rests at the broker for EVERYTHING held, trail_percent below the market,
+    # raised by the P&L poller as the price makes new highs (ratchet_stop) — the
+    # ladder's own trailing stop, reconciled by discord_stop_orders.
+    #
+    # It used to arm an app-watched slice instead: checked once per poll (15s on
+    # Webull) and sold at market only after cancelling whatever rested on the
+    # contracts. Worse, it sat ALONGSIDE the ladder: the take-profit pair kept
+    # its contracts and its own fixed linked stop, and the old stop level stayed.
+    # QA 2026-10-14, SPY 773P: 2 held, a 5% trail armed at 1.375 (exit 1.3063),
+    # the take-profit still holding 1 of the 2 — sold at 1.21, 23s later.
+    #
+    # Now the trailing stop TAKES OVER the exit: the take-profit (and its linked
+    # stop) is released and stays off for this holding, the slice trail is
+    # cleared, and the one stop covers every contract. Mutually exclusive with
+    # the Stop button, which clears the trail when it sets a fixed level.
+    if reverse_side != OrderSide.SELL:
+        # The stop reconciler places SELL stops; a short needs a BUY stop.
+        raise HTTPException(422, "Trailing stops from this row are for long positions only.")
     guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
     if guard is None:
         guard = DiscordPositionGuard(
@@ -2509,9 +2526,26 @@ def arm_trailing_stop(
             option_right=(pos.option_right.value if pos.option_right else None),
             option_expiry=pos.option_expiry,
             entry_price=getattr(pos, "avg_entry_price", None),
+            sell_count=0,
         )
         db.add(guard)
+    stop = guards._to_tick(price * (Decimal(1) - trail_percent / Decimal(100)))
+    if stop is None or stop <= 0:
+        raise HTTPException(422, "That trail rounds to a $0 stop.")
+
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.services import discord_take_profit  # noqa: PLC0415
+
+    if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+        discord_take_profit.release(db, guard, _cancel_stop_order(db, user))
+    guard.tp_off = True
+    guards.clear_trail(guard)
     guard.trail_percent = trail_percent
-    guards.arm_trail(guard, held, (price * trail_percent / Decimal(100)), price)
+    guard.stop_price = stop
+    guard.stop_trail_pct = trail_percent
+    guard.stop_peak = price
     db.commit()
-    return {"mode": "emulated", "trail_percent": str(trail_percent), "peak": str(price)}
+    log.info("positions: trailing stop on %s — %s%% below %s, stop %s, all %s held",
+             pos.broker_symbol, trail_percent, price, stop, held)
+    return {"mode": "broker_stop", "trail_percent": str(trail_percent), "peak": str(price),
+            "stop_price": str(stop), "quantity": str(held)}
