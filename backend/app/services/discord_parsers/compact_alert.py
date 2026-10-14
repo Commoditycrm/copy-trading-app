@@ -55,6 +55,27 @@ DEFAULT_QUANTITY = Decimal(1)
 # variation selector, and both appear in the wild.
 _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 
+# "SPX 7750c 10/16pm @14.2": an index expiry can carry its settlement. On a
+# monthly expiration (the third Friday) SPX lists TWO contracts at the same
+# strike: the AM-settled monthly under SPX and the PM-settled weekly under SPXW.
+# "pm" picks the weekly. Without the suffix in these patterns the line failed to
+# match and a real alert was dropped as chatter (Rafael, QA 2026-10-14 15:11 ET);
+# "10/16 pm @14.2" matched but lost its price. Reading the date and ignoring the
+# "pm" would be worse: orders go out under the root the alert names, so it would
+# buy the monthly.
+_SETTLE = r"(?:\s*(?P<settle>[AP]M)\b)?"
+_PM_SETTLED_ROOT = {"SPX": "SPXW", "NDX": "NDXP", "RUT": "RUTW"}
+
+
+def _root(m: re.Match) -> str:
+    """The trading root for a matched line: its ticker, moved to the PM-settled
+    root when the expiry said "pm"."""
+    sym = m.group("symbol").upper()
+    if (m.groupdict().get("settle") or "").upper() == "PM":
+        return _PM_SETTLED_ROOT.get(sym, sym)
+    return sym
+
+
 # $TSLA 375 CALL 0DTE @0.95   /   $AAPL 330 CALL 09/04 @1.00
 #   AAPL $350 CALL 09/02        (no price — a market entry)
 #
@@ -67,7 +88,7 @@ _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -87,7 +108,7 @@ _ENTRY_RE = re.compile(
 # tried first, so the two cannot disagree about a line.
 _ENTRY_EXP_FIRST_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+"
+    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE}\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -99,7 +120,7 @@ _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -210,7 +231,7 @@ _ADD_RE = re.compile(
     rf"^\s*(?:ADD|ADDING|ADDED)\s+(?:TO\s+|ON\s+|MORE\s+)?"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
-    rf"\s*(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"\s*(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -358,7 +379,7 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=expiry,
@@ -403,7 +424,8 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
-                symbol=symbol.upper(),
+                symbol=(_PM_SETTLED_ROOT.get(symbol.upper(), symbol.upper())
+                        if (m.group("settle") or "").upper() == "PM" else symbol.upper()),
                 option_type=right,
                 strike=strike,
                 expiration=expiry,
@@ -443,7 +465,7 @@ class CompactAlertParser(Parser):
                 # These channels trade options; the position lookup settles it
                 # either way, and nothing acts on this field before then.
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=None,
                 strike=None,
                 expiration=None,
@@ -483,7 +505,7 @@ class CompactAlertParser(Parser):
                 TradeSignal(
                     action=SignalAction.SELL,
                     asset_type=AssetType.OPTION,
-                    symbol=m.group("symbol").upper(),
+                    symbol=_root(m),
                     option_type=None,
                     strike=None,
                     expiration=None,
@@ -513,7 +535,7 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.SELL,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=None,
@@ -551,7 +573,7 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.SELL,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=expiry,
