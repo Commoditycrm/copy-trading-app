@@ -1761,6 +1761,13 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             try:
                 # Blocks until the stream ends (stopped, or a non-retryable error).
                 await asyncio.to_thread(client.do_subscribe, account_ids)
+            except Exception:
+                # We closed the channel ourselves (the silence watchdog's
+                # resubscribe); the SDK surfaces that as "Channel closed!".
+                # That is a clean stop, not an error to log and show.
+                stop = getattr(client, "_stop_event", None)
+                if stop is None or not stop.is_set():
+                    raise
             finally:
                 _clients.pop(trader_user_id, None)
 
