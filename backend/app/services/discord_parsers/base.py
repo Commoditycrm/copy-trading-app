@@ -263,6 +263,9 @@ class ParsedMessage:
     # Reading a P&L update as an exit would fire three sells for one position,
     # so this is opt-in per source rather than a global guess.
     percent_means_exit: bool = False
+    # The source channel's name and label, for parsers scoped to one channel
+    # (dragon_alert). None when unknown — such parsers then never match.
+    channel: str | None = None
 
     @property
     def text(self) -> str:

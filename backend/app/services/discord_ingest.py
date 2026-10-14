@@ -193,6 +193,7 @@ def _persist(
         row,
         auto_approve=auto_approve,
         percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
+        channel=_channel_of(source),
     )
     try:
         with db.begin_nested():
@@ -274,14 +275,25 @@ def _apply_edit(
         existing,
         auto_approve=auto_approve,
         percent_means_exit=bool(getattr(source, "percent_means_exit", False)),
+        channel=_channel_of(source),
     )
     if had_order:
         existing.status = was
     return existing, True
 
 
+def _channel_of(source: DiscordAlertSource) -> str:
+    """The channel's name and label, for parsers scoped to one channel. Both,
+    because the name is only backfilled once the listener has the channel open,
+    and a subscriber's copy carries the trader's of each."""
+    return " ".join(
+        v for v in (getattr(source, "channel_name", None), getattr(source, "label", None)) if v
+    )
+
+
 def _apply_parse(
-    row: DiscordMessage, *, auto_approve: bool, percent_means_exit: bool = False
+    row: DiscordMessage, *, auto_approve: bool, percent_means_exit: bool = False,
+    channel: str | None = None,
 ) -> None:
     """Read the message, record what it says, and set its decision state.
 
@@ -302,6 +314,7 @@ def _apply_parse(
                 posted_at=row.posted_at,
                 # This channel's house style — see DiscordAlertSource.
                 percent_means_exit=percent_means_exit,
+                channel=channel,
             )
         )
     except Exception:  # noqa: BLE001
