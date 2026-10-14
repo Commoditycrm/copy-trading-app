@@ -31,6 +31,7 @@ import logging
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -100,7 +101,169 @@ _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
 
 get_status = listener_state.get_status
-_set_state = listener_state.set_state
+
+
+def _set_state(trader_user_id: uuid.UUID, state: str, *, error: str | None = None) -> None:
+    """listener_state.set_state, except that a stream the watchdog has caught
+    being silent stays "silent" when a (re)subscribe reports "connected". A
+    fresh subscription is not proof the stream works — that is exactly what QA
+    saw after the 11:41 redeploy (2026-10-14) — so only a real stream frame
+    (_watchdog_stream_frame) clears it."""
+    with _wd_lock:
+        silent_reason = _stream_silent.get(trader_user_id)
+    if state == "connected" and silent_reason is not None:
+        state, error = STREAM_SILENT, silent_reason
+    listener_state.set_state(trader_user_id, state, error=error)
+
+
+# ── stream silence watchdog ──────────────────────────────────────────────────
+# do_subscribe() only returns on a drop or an error, so a stream that is
+# connected but delivers nothing is never recycled on its own. On QA,
+# 2026-10-14, the stream went quiet at 11:10 ET and stayed "connected" while
+# every order arrived via the poller ~10s late. The poller is our witness: when
+# it sees a fill or cancel that the stream has not delivered, that is a miss.
+# Enough misses in a row and we drop the subscription so _run_listener builds a
+# fresh one. Any stream frame proves the stream is alive and resets everything.
+STREAM_SILENT = "silent"
+_STREAM_SILENT_MESSAGE = (
+    "Webull's event stream is connected but has stopped delivering orders; "
+    "orders are arriving by polling (~5-10s slower). Missed {misses} "
+    "order update(s) in a row."
+)
+# Seconds the stream gets, after the poller sees a change, to deliver it too.
+_WD_GRACE_S = 10.0
+# Misses in a row (no stream frame in between) that force a resubscribe.
+_WD_MISSES = 3
+# ...or this many misses once the stream has been quiet for _WD_WINDOW_S.
+_WD_WINDOW_MISSES = 2
+_WD_WINDOW_S = 900.0
+# Never resubscribe more often than this, however many misses pile up.
+_WD_RESUBSCRIBE_GAP_S = 300.0
+# Per-order timestamps older than this are pruned (day orders; bounded memory).
+_WD_PRUNE_S = 3600.0
+# Statuses Webull is known to PUSH on the stream. It does not push the initial
+# new-order ack (see test_webull_stream_poll_logging.py), so a resting order
+# the poller sees first is NOT a miss — counting it would flag healthy streams.
+_WD_STREAMED = (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED, OrderStatus.CANCELED)
+
+
+@dataclass
+class _Watchdog:
+    since: float                                   # watchdog started (silence reference before any frame)
+    last_frame_at: float | None = None             # last real stream ORDER frame
+    stream_at: dict[str, float] = field(default_factory=dict)   # oid → last stream frame
+    poll_at: dict[str, float] = field(default_factory=dict)     # oid → last poll change
+    pending: dict[str, float] = field(default_factory=dict)     # oid → deadline for the stream
+    misses: int = 0
+    last_resubscribe_at: float | None = None
+
+
+# Stream frames arrive on the gRPC thread, poll changes on the loop: one lock.
+_wd_lock = threading.Lock()
+_watchdogs: dict[uuid.UUID, _Watchdog] = {}
+# trader → last_error to show while the stream is known silent. Sticky across a
+# resubscribe; cleared only by a stream frame or stop_listener.
+_stream_silent: dict[uuid.UUID, str] = {}
+
+
+def _wd(trader_user_id: uuid.UUID, now: float) -> _Watchdog:
+    w = _watchdogs.get(trader_user_id)
+    if w is None:
+        w = _watchdogs[trader_user_id] = _Watchdog(since=now)
+    return w
+
+
+def _watchdog_stream_frame(trader_user_id: uuid.UUID, order_id: str,
+                           now: float | None = None) -> None:
+    """A real stream ORDER frame arrived: the stream is alive."""
+    now = time.monotonic() if now is None else now
+    with _wd_lock:
+        w = _wd(trader_user_id, now)
+        w.last_frame_at = now
+        w.stream_at[order_id] = now
+        w.pending.clear()
+        w.misses = 0
+        was_silent = _stream_silent.pop(trader_user_id, None) is not None
+    if was_silent:
+        log.info("webull-listener[%s] stream delivering again; clearing silent", trader_user_id)
+        _set_state(trader_user_id, "connected")
+
+
+def _watchdog_poll_change(trader_user_id: uuid.UUID, order_id: str,
+                          prev_status: str | None, new_status: str | None,
+                          now: float | None = None) -> None:
+    """The poller is about to act on a change to ``order_id``. If it is a status
+    the stream should have pushed and the stream has not delivered this order
+    since the poller last saw it change, give the stream _WD_GRACE_S to catch up
+    before calling it a miss (see _watchdog_tick)."""
+    now = time.monotonic() if now is None else now
+    new = _map_status(new_status)
+    changed = prev_status is None or _map_status(prev_status) != new
+    with _wd_lock:
+        w = _wd(trader_user_id, now)
+        prev_poll = w.poll_at.get(order_id)
+        w.poll_at[order_id] = now
+        if not changed or new not in _WD_STREAMED:
+            return
+        streamed = w.stream_at.get(order_id)
+        if streamed is not None and (prev_poll is None or streamed >= prev_poll):
+            return  # the stream already delivered it
+        w.pending.setdefault(order_id, now + _WD_GRACE_S)
+
+
+def _watchdog_tick(trader_user_id: uuid.UUID, now: float | None = None) -> None:
+    """Expire overdue pendings into misses and, past the threshold, mark the
+    stream silent and force a resubscribe (rate-limited). Runs once per poll
+    cycle, on the loop."""
+    now = time.monotonic() if now is None else now
+    with _wd_lock:
+        w = _watchdogs.get(trader_user_id)
+        if w is None:
+            return
+        for oid, deadline in list(w.pending.items()):
+            if deadline <= now:
+                del w.pending[oid]
+                w.misses += 1
+        cutoff = now - _WD_PRUNE_S
+        for m in (w.stream_at, w.poll_at):
+            for oid in [k for k, t in m.items() if t < cutoff]:
+                del m[oid]
+        misses = w.misses
+        quiet_s = now - (w.last_frame_at if w.last_frame_at is not None else w.since)
+        trip = misses >= _WD_MISSES or (misses >= _WD_WINDOW_MISSES and quiet_s >= _WD_WINDOW_S)
+        live = _clients.get(trader_user_id)
+        if not trip or live is None:
+            # No live client = _run_listener is already reconnecting (or the key
+            # is in use elsewhere); leave the state to it.
+            return
+        reason = _STREAM_SILENT_MESSAGE.format(misses=misses)
+        announce = _stream_silent.get(trader_user_id) != reason
+        _stream_silent[trader_user_id] = reason
+        can_resubscribe = (w.last_resubscribe_at is None
+                           or now - w.last_resubscribe_at >= _WD_RESUBSCRIBE_GAP_S)
+        client = live if can_resubscribe else None
+        if client is not None:
+            w.last_resubscribe_at = now
+            w.misses = 0   # the next run of misses is judged against the new subscription
+    if announce:
+        _set_state(trader_user_id, STREAM_SILENT, error=reason)
+    if client is None:
+        return
+    log.warning(
+        "webull-listener[%s] stream connected but silent: %d order update(s) in a row "
+        "arrived by poll only (no stream frame for %.0fs); forcing a resubscribe",
+        trader_user_id, misses, quiet_s,
+    )
+    try:
+        client.request_stop()   # do_subscribe returns → _run_listener reconnects
+    except Exception:  # noqa: BLE001
+        log.exception("webull-listener[%s] resubscribe request_stop failed", trader_user_id)
+
+
+def _watchdog_clear(trader_user_id: uuid.UUID) -> None:
+    with _wd_lock:
+        _watchdogs.pop(trader_user_id, None)
+        _stream_silent.pop(trader_user_id, None)
 
 # Webull allows ONE live events subscription per app key. A second one — the
 # same key active in another environment (QA and local, QA and prod) or another
@@ -1218,7 +1381,10 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             # HISTORY (never to be replayed) and which are live work we should
             # keep tracking. Everything not baselined falls through to the normal
             # per-order handling below on this very cycle.
-            if trader_user_id not in _poll_baseline:
+            # Catch-up orders on this cycle predate the stream, so the silence
+            # watchdog does not judge it.
+            first_cycle = trader_user_id not in _poll_baseline
+            if first_cycle:
                 _baseline, _pre = await asyncio.to_thread(
                     _build_poll_baseline, trader_user_id, orders,
                 )
@@ -1242,14 +1408,23 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 if payload is None:
                     continue
                 fp = _order_fingerprint(payload)
-                if seen.get(oid) == fp:
+                prev_fp = seen.get(oid)
+                if prev_fp == fp:
                     continue  # nothing mutable changed since we last acted on it
                 seen[oid] = fp
+                # Only while a stream is up: a gap during reconnect is not a miss.
+                if not first_cycle and trader_user_id in _clients:
+                    _watchdog_poll_change(
+                        trader_user_id, oid,
+                        prev_fp.split("|", 1)[0] if prev_fp is not None else None,
+                        payload.get("order_status"),
+                    )
                 # Run off the loop — persist/fanout does blocking DB I/O.
                 await asyncio.to_thread(
                     _on_order_event, trader_user_id, broker_account_id,
                     generation, creds, payload,
                 )
+            _watchdog_tick(trader_user_id)
             # No trailing sleep here — the per-account gaps above already paced
             # the full cycle (N × gap = interval).
             continue
@@ -1326,6 +1501,12 @@ def _on_order_event(
     # them out of the shadow log too, so that log stays a record of ORDERS.
     if not str(payload.get("order_id") or "").strip():
         return
+
+    # A real stream ORDER frame: the only thing that proves the stream is
+    # delivering. Pings never reach here; poll frames must not count.
+    if _via == "stream":
+        listener_state.bump_last_event(trader_user_id)
+        _watchdog_stream_frame(trader_user_id, str(payload.get("order_id")).strip())
 
     if _shadow():
         # Detection-only: log the event + end-to-end latency, nothing else.
@@ -1503,6 +1684,7 @@ def stop_listener(trader_user_id: uuid.UUID) -> None:
         ptask.cancel()
     _poll_baseline.pop(trader_user_id, None)
     _poll_status.pop(trader_user_id, None)
+    _watchdog_clear(trader_user_id)
     _set_state(trader_user_id, "disconnected")
 
 
