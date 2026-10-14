@@ -145,6 +145,17 @@ _WD_PRUNE_S = 3600.0
 # new-order ack (see test_webull_stream_poll_logging.py), so a resting order
 # the poller sees first is NOT a miss — counting it would flag healthy streams.
 _WD_STREAMED = (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED, OrderStatus.CANCELED)
+# Nor does it push ANY event for an order whose client_order_id is a dashed,
+# 36-char UUID. Some Webull-app orders get one (others get 32 hex, as our own
+# OpenAPI orders do). Seen live on QA, 2026-10-14: since 12:11 ET 0 of ~15 such
+# events streamed while every 32-hex order streamed within a second. Counting
+# them flagged a healthy stream "silent" and resubscribed it for nothing.
+_UNSTREAMED_CLIENT_ID_LEN = 36
+
+
+def _webull_streams(client_order_id: Any) -> bool:
+    coid = str(client_order_id or "").strip()
+    return not (len(coid) == _UNSTREAMED_CLIENT_ID_LEN and coid.count("-") == 4)
 
 
 @dataclass
@@ -191,7 +202,7 @@ def _watchdog_stream_frame(trader_user_id: uuid.UUID, order_id: str,
 
 def _watchdog_poll_change(trader_user_id: uuid.UUID, order_id: str,
                           prev_status: str | None, new_status: str | None,
-                          now: float | None = None) -> None:
+                          now: float | None = None, client_order_id: Any = None) -> None:
     """The poller is about to act on a change to ``order_id``. If it is a status
     the stream should have pushed and the stream has not delivered this order
     since the poller last saw it change, give the stream _WD_GRACE_S to catch up
@@ -203,7 +214,7 @@ def _watchdog_poll_change(trader_user_id: uuid.UUID, order_id: str,
         w = _wd(trader_user_id, now)
         prev_poll = w.poll_at.get(order_id)
         w.poll_at[order_id] = now
-        if not changed or new not in _WD_STREAMED:
+        if not changed or new not in _WD_STREAMED or not _webull_streams(client_order_id):
             return
         streamed = w.stream_at.get(order_id)
         if streamed is not None and (prev_poll is None or streamed >= prev_poll):
@@ -1421,6 +1432,7 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                         trader_user_id, oid,
                         prev_fp.split("|", 1)[0] if prev_fp is not None else None,
                         payload.get("order_status"),
+                        client_order_id=payload.get("client_order_id"),
                     )
                 # Run off the loop — persist/fanout does blocking DB I/O.
                 await asyncio.to_thread(
