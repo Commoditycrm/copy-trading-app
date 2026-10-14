@@ -202,3 +202,45 @@ def test_stop_listener_clears_the_watchdog(tid, monkeypatch, states):
     assert tid not in wl._watchdogs and tid not in wl._stream_silent
     wl._set_state(tid, "connected")
     assert states[-1][0] == "connected"
+
+
+def test_watchdog_stop_reconnects_quietly(monkeypatch, caplog):
+    """Closing the channel ourselves makes the SDK raise "Channel closed!". That
+    is the resubscribe working, not a failure: no ERROR traceback, and no raw
+    gRPC text shown as last_error (seen on QA, 2026-10-14 13:04 ET)."""
+    import asyncio
+    import logging
+    import threading
+
+    t, aid = uuid.uuid4(), uuid.uuid4()
+    monkeypatch.setattr(wl, "_load_creds", lambda _aid: {"app_key": "K", "account_id": "A1"})
+
+    class _Client:
+        def __init__(self):
+            self._stop_event = threading.Event()
+
+        def do_subscribe(self, ids):
+            self._stop_event.set()   # what request_stop() does
+            raise RuntimeError('status = StatusCode.CANCELLED\n\tdetails = "Channel closed!"')
+
+    monkeypatch.setattr(wl, "_build_stoppable_client", lambda creds: _Client())
+    monkeypatch.setattr(wl, "_all_account_ids", lambda creds: ["A1"])
+    monkeypatch.setattr(listener_state, "_mirror_to_redis", lambda *a, **k: None)
+    monkeypatch.setattr(listener_state, "_broadcast_state_changed", lambda *a, **k: None)
+    states = []
+    real_set = listener_state.set_state
+    monkeypatch.setattr(listener_state, "set_state",
+                        lambda tid, s, *, error=None: (states.append((s, error)),
+                                                       real_set(tid, s, error=error)))
+
+    async def _sleep(_s):
+        raise asyncio.CancelledError   # stop after the first reconnect
+
+    monkeypatch.setattr(wl.asyncio, "sleep", _sleep)
+    with caplog.at_level(logging.INFO, logger=wl.log.name):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(wl._run_listener(t, aid))
+    listener_state._status.pop(t, None)
+
+    assert ("reconnecting", None) in states
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
