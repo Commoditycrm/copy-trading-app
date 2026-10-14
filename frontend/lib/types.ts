@@ -183,6 +183,12 @@ export interface Order {
    *  before the column existed — fall back to closed_at and mark it
    *  approximate rather than showing it as the broker's own time. */
   broker_filled_at?: string | null;
+  /** Which path told us about this order: "stream" (the broker's realtime
+   *  push) or "poll" (our REST sweep). NULL where neither records it, and on
+   *  every row written before the column existed. It is how you tell a
+   *  realtime feed that is carrying the load from one that is merely
+   *  connected — they look identical in every other field. */
+  detected_via?: string | null;
   closed_at: string | null;
   reject_reason: string | null;
   created_at: string;
