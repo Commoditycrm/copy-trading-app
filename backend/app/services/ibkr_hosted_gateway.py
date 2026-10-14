@@ -156,6 +156,32 @@ def accounts(slot: int) -> list[str]:
     return out
 
 
+def session_facts(slot: int) -> dict[str, Any]:
+    """What IBKR says about the gateway's SSO session right now, minus
+    identifying fields. Read straight after a restricted sign-in, while the
+    session still exists for a moment, it carries the flags that explain the
+    restriction (pending applicant, anomalous login, missing trading access…).
+    Empty when there is no session."""
+    out: dict[str, Any] = {}
+    try:
+        r = requests.get(f"{gateway_url(slot)}/v1/api/sso/validate", verify=False, timeout=_HTTP_TIMEOUT_S)
+        out["validate_http"] = r.status_code
+        if r.status_code == 200:
+            body = r.json()
+            skip = {"USER_NAME", "PAPER_USER_NAME", "CREDENTIAL", "IP", "USER_ID", "UNIQUE_LOGIN_ID", "HARDWARE_INFO", "EMAIL"}
+            out.update({k: (v if not isinstance(v, (dict, list)) else str(v)[:300]) for k, v in body.items() if k.upper() not in skip})
+    except (requests.RequestException, ValueError) as exc:
+        out["validate_error"] = str(exc)[:120]
+    try:
+        r = requests.post(f"{gateway_url(slot)}/v1/api/iserver/auth/status", data=b"", verify=False, timeout=_HTTP_TIMEOUT_S)
+        out["auth_status_http"] = r.status_code
+        if r.status_code == 200:
+            out["auth_status"] = {k: v for k, v in r.json().items() if k in ("authenticated", "connected", "competing", "message", "fail", "MAC")}
+    except (requests.RequestException, ValueError) as exc:
+        out["auth_status_error"] = str(exc)[:120]
+    return out
+
+
 # ── Restricted sign-ins ─────────────────────────────────────────────────────
 #
 # A live username signing in from a location IBKR hasn't seen answers the

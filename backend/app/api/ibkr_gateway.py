@@ -274,6 +274,9 @@ async def gateway_proxy(slot: int, path: str, request: Request) -> Response:
             log.info("ibkr-gateway slot %s: Dispatcher body starts: %r", slot, snippet)
             if "/restricted" in str(r.headers.get("location") or ""):
                 await run_in_threadpool(hosted.mark_restricted, slot)
+                # Why? Ask the gateway while the SSO session still exists.
+                facts = await run_in_threadpool(hosted.session_facts, slot)
+                log.warning("ibkr-gateway slot %s: RESTRICTED sign-in; session facts=%s", slot, facts)
             else:
                 await run_in_threadpool(hosted.clear_restricted, slot)
 
