@@ -457,7 +457,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
     setBusy("trail");
     try {
       const res = await api<{ mode?: string }>(`${base}/trailing-stop?${account}&trail_percent=${pct}`, { method: "POST" });
-      notify.success(`Trailing stop armed ${pct}% below the market${res.mode === "emulated" ? " (app-monitored)" : ""}`);
+      notify.success(`Trailing stop armed ${pct}% below the market${res.mode === "broker_stop" ? " — rests at the broker and moves up with the price" : ""}`);
       setTrailPct(DEFAULT_TRAIL_PCT);
       onDone();
     } catch (err) { notify.fromError(err, "Could not arm trailing stop"); }
