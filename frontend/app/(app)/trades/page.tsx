@@ -1358,37 +1358,25 @@ export default function TradesPage() {
                           style={{
                             background: st.bg, color: st.color, borderColor: "transparent",
                             // Only hint at a tooltip when there is one to show.
-                            ...(o.reject_reason
+                            ...(o.reject_reason || o.detected_via
                               ? { cursor: "help", textDecoration: "underline dotted", textUnderlineOffset: 3 }
                               : null),
                           }}
-                          title={o.reject_reason || undefined}
+                          title={[
+                            o.reject_reason || null,
+                            // How we learned about this order. A realtime feed
+                            // that is connected but losing the race to the
+                            // poller looks identical in every other column, so
+                            // this is the only place the two are told apart.
+                            o.detected_via === "stream"
+                              ? "Detected by the broker's realtime push"
+                              : o.detected_via === "poll"
+                              ? "Detected by our REST poll, not the realtime feed"
+                              : null,
+                          ].filter(Boolean).join("\n\n") || undefined}
                         >
                           {statusLabel}{o.parent_order_id ? " · copy" : ""}
                         </span>
-                        {/* How we learned about this order. A realtime feed
-                            that is connected but discarding events looks
-                            exactly like one carrying the whole load in every
-                            other column — this is the only place the two are
-                            distinguishable. Absent on rows where no path
-                            records it, so it never adds noise. */}
-                        {o.detected_via && (
-                          <span
-                            className="chip uppercase tracking-wider ml-1.5"
-                            title={o.detected_via === "stream"
-                              ? "Detected by the broker's realtime push"
-                              : "Detected by our REST poll, not the realtime feed"}
-                            style={{
-                              background: "transparent",
-                              borderColor: "var(--border)",
-                              color: o.detected_via === "stream"
-                                ? "var(--good)" : "var(--muted)",
-                              fontSize: 10,
-                            }}
-                          >
-                            {o.detected_via}
-                          </span>
-                        )}
                       </td>
                       ),
                       order_type: (
