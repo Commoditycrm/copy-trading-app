@@ -144,3 +144,68 @@ def test_a_contract_with_a_pnl_update_is_not_an_entry():
     r = _parse("$MSFT 550 CALL 11/13 @ 17.00 +24%")
     assert not (r.status is ParseStatus.PARSED and r.signal.parser == "dragon_alert"
                 and r.signal.action is SignalAction.BUY)
+
+
+# ── the trader's alerts, as posted ──────────────────────────────────────────
+
+# Fifteen days of the Dragon channel, in order. Every entry must buy its
+# contract and every trim must resolve to the contract that entry opened.
+_HISTORY = """\
+$AAPL 325 CALL 9/2 @ 1.42
+$AAPL @ 1.83 | 28%
+$AAPL 40%
+$NKE 40 CALL 10/16 @ 2.09
+$AAPL @ 2.40 | 70%
+$AAPL @ 3.40 | 140%
+$PBR 21 CALL 9/11 @ 0.23
+$PBR @ 0.29 | 26%
+$PBR @ 0.32 | 40%
+$PBR @ 0.46 | 100%
+$PBR @ 0.66 | 200%
+$WMT 108 CALL 9/11 @ 0.92
+$WMT @ 1.10 | 20%
+$WMT @ 1.21 | 31%
+$WMT @ 1.40 | 52%
+$WMT @ 1.83 | 100%
+$IBIT 49 CALL 10/16 @ 1.52
+$IBIT @ 1.68 | 10%
+$IBM 250 CALL 9/18 @ 1.73
+$IBM @ 2.18 | 26%
+$IBM @ 4.60 | 165%
+$IBIT @ 2.07 | 36%
+$WMT 111 CALL 9/25 @ @ 0.51
+$WMT @ 0.61 | 20%
+$WMT @ 0.65 | 27%
+$WMT @ 0.71 | 40%
+$WMT UP 100% AT 1.02
+$CRWV 96 CALL 10/9 @ 1.07
+$CRWV @ 1.29 | 20%
+$CRWV @ 1.45 | 35% TRIMMING
+$MSFT 550 CALL 11/13 @ 17.00
+$MSFT @ 21.10 | 24% TRIMMING"""
+
+
+def test_fifteen_days_of_alerts():
+    posted = datetime(2026, 9, 1, 14, tzinfo=timezone.utc)
+    opened = {}
+    for line in _HISTORY.splitlines():
+        r = parse_message(ParsedMessage(content=line, posted_at=posted, channel="dragon"))
+        assert r.status is ParseStatus.PARSED, line
+        s = r.signal
+        assert s.parser == "dragon_alert" and s.asset_type is AssetType.OPTION, line
+        if s.action is SignalAction.BUY:
+            assert s.strike and s.option_type and s.expiration and s.limit_price, line
+            opened[s.symbol] = (s.strike, s.expiration)
+        else:
+            assert s.symbol in opened, f"trim before any entry: {line}"
+            assert s.is_partial_close and s.pnl_percent > 0, line
+    assert opened == {
+        "AAPL": (Decimal("325"), date(2026, 9, 2)),
+        "NKE": (Decimal("40"), date(2026, 10, 16)),
+        "PBR": (Decimal("21"), date(2026, 9, 11)),
+        "WMT": (Decimal("111"), date(2026, 9, 25)),
+        "IBIT": (Decimal("49"), date(2026, 10, 16)),
+        "IBM": (Decimal("250"), date(2026, 9, 18)),
+        "CRWV": (Decimal("96"), date(2026, 10, 9)),
+        "MSFT": (Decimal("550"), date(2026, 11, 13)),
+    }
