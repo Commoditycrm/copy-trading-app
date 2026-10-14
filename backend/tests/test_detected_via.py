@@ -49,6 +49,23 @@ def test_persist_stamps_via_and_the_broker_fill_time():
     assert "broker_filled_at" in src
 
 
+def test_first_writer_wins_so_the_poller_cannot_mask_the_stream():
+    """The column records who got there FIRST, and is never overwritten.
+
+    Stamping on every event measured the opposite of what it appeared to: the
+    REST poller re-reads every order within 5s, so even when the stream arrived
+    first at ~1s the poller overwrote "stream" with "poll" moments later. Every
+    order came back "poll" and the stream looked dead when it may not have been.
+    """
+    import inspect
+    from app.services import webull_listener as wl
+    src = inspect.getsource(wl._persist_and_fanout)
+    assert "if existing.detected_via is None:" in src, \
+        "must not overwrite — the later poll is not a detection"
+    # and the unconditional form must be gone
+    assert "\n            existing.detected_via = via" not in src
+
+
 def test_poll_is_the_default_so_an_untagged_caller_never_claims_stream():
     """A caller that forgets to pass `via` must not have its orders reported as
     realtime — that would overstate the stream's coverage, which is the exact

@@ -681,10 +681,19 @@ def _persist_and_fanout(
                     trader_user_id, existing.id, existing.broker_order_id, client_oid,
                 )
                 existing.broker_order_id = client_oid
-            # Which path is actually doing the work. Stamped on every event,
-            # not only the first, so the column reflects what is carrying the
-            # load NOW rather than whatever happened to arrive first.
-            existing.detected_via = via
+            # Which path got here FIRST — the only question worth asking.
+            #
+            # This used to stamp on every event, which measured the opposite of
+            # what it looks like: the REST poller re-reads every order within
+            # 5s, so even when the stream arrives first at ~1s the poller
+            # overwrites "stream" with "poll" moments later. Every order came
+            # back "poll" and the stream looked dead when it may not have been.
+            #
+            # First writer wins, so the column records who actually won the
+            # race. Never overwritten afterwards: a later poll confirming what
+            # the stream already told us is not the poller detecting anything.
+            if existing.detected_via is None:
+                existing.detected_via = via
             # The broker's own fill time. The stream carries filled_time and we
             # were dropping it on the floor, so trader fill latency could not be
             # measured at all — closed_at is OUR clock, not Webull's.
