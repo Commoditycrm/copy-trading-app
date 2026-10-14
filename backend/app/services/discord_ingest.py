@@ -283,11 +283,13 @@ def _apply_edit(
 
 
 def _channel_of(source: DiscordAlertSource) -> str:
-    """The channel's name and label, for parsers scoped to one channel. Both,
-    because the name is only backfilled once the listener has the channel open,
-    and a subscriber's copy carries the trader's of each."""
+    """The channel's name, label and server name, for parsers scoped to one
+    channel. All three, because the name is only backfilled once the listener
+    has the channel open, the label is whatever the trader typed, and a channel
+    is often known by its server ("Dragon" › #alerts). A subscriber's copy
+    carries the trader's of each."""
     return " ".join(
-        v for v in (getattr(source, "channel_name", None), getattr(source, "label", None)) if v
+        v for v in (getattr(source, k, None) for k in ("channel_name", "label", "guild_name")) if v
     )
 
 

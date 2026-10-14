@@ -139,6 +139,11 @@ class TradeSignal:
     # With close_all_matching and no symbol ("Cutting @here", "Stopped out"):
     # the contract is the one this channel is in — its latest buy still held.
     latest_contract: bool = False
+    # An exit that names only the ticker ("$WMT @ 0.71 | 40%"): when several
+    # contracts in it are held, take the one THIS channel most recently bought
+    # and still holds; with none from the channel, the one held contract in the
+    # ticker as before. Acted on in discord_sources._execute_signal.
+    channel_contract_first: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
@@ -189,6 +194,7 @@ class TradeSignal:
             "nearest_expiry": self.nearest_expiry,
             "close_all_matching": self.close_all_matching,
             "latest_contract": self.latest_contract,
+            "channel_contract_first": self.channel_contract_first,
             "expiry_unspecified": self.expiry_unspecified,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,

@@ -2283,6 +2283,21 @@ def _execute_signal(
         else:
             signal = {**signal, **latest}
 
+    # A ticker-only exit (Dragon's "$WMT @ 0.71 | 40%"): prefer the contract
+    # this channel bought and still holds, so holding a second WMT contract from
+    # elsewhere doesn't make it ambiguous. Nothing from this channel held:
+    # resolve() takes the one held contract in the ticker, as before.
+    if (signal.get("channel_contract_first") and signal.get("symbol")
+            and not (signal.get("strike") and signal.get("option_type"))):
+        try:
+            mine = discord_execution.latest_channel_contract(
+                db, user, msg.source_id, symbol=signal["symbol"])
+        except Exception:  # noqa: BLE001
+            mine = None
+            log.exception("discord: channel-contract lookup failed for alert %s", msg.id)
+        if mine is not None:
+            signal = {**signal, **mine}
+
     # The same channel posting the same entry again (a corrected price, a
     # re-post) is a correction of the trade it already placed, not a second one.
     try:

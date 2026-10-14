@@ -63,6 +63,12 @@ def test_a_put_entry():
     ("$MSFT @ 21.10 | 24% TRIMMING", "MSFT", "21.10", "24"),
     ("$CRWV @ 1.29 | 20%", "CRWV", "1.29", "20"),
     ("$IBIT @ 1.68 | 10% FREE MONEY", "IBIT", "1.68", "10"),
+    # Live, missed: "not a trade alert" / read as a stock sell.
+    ("$WMT @ 0.71 | 40% ", "WMT", "0.71", "40"),
+    ("$CRWV @ 1.45 | 35% TRIMMING", "CRWV", "1.45", "35"),
+    ("$WMT UP 100% AT 1.02", "WMT", "1.02", "100"),
+    ("$WMT 40% @ 0.71", "WMT", "0.71", "40"),
+    ("$WMT @ @ 0.71 | 40%", "WMT", "0.71", "40"),
 ])
 def test_a_trim_sells_part_of_the_held_option(text, sym, price, pct):
     s = _sig(text)
@@ -74,6 +80,22 @@ def test_a_trim_sells_part_of_the_held_option(text, sym, price, pct):
     assert s.pnl_percent == Decimal(pct)
     assert s.is_partial_close and not s.flatten and not s.position_closed
     assert s.source_action == "TRIMMING"
+    # Several held in the ticker: this channel's own contract is taken.
+    assert s.channel_contract_first and s.as_dict()["channel_contract_first"] is True
+
+
+def test_a_trim_with_no_price_still_trims():
+    s = _sig("$WMT UP 100%")
+    assert s.action is SignalAction.SELL and s.limit_price is None and s.limit_price_unspecified
+
+
+def test_down_is_a_loss():
+    assert _sig("$WMT DOWN 30% AT 0.40").pnl_percent == Decimal("-30")
+
+
+def test_matched_by_server_name():
+    # _channel_of joins channel name, label and server name.
+    assert _sig("$WMT @ 0.71 | 40%", channel="alerts Trades Dragon Server").symbol == "WMT"
 
 
 def test_out_after_the_percentage_closes_it_all():
@@ -112,7 +134,8 @@ def test_other_channels_read_as_before(channel):
 
 
 def test_chatter_on_the_dragon_channel_is_not_a_trade():
-    for text in ("gm everyone", "$MSFT looking strong", "$MSFT @ 21.10", "MSFT 550 CALL 11/13 @ 17"):
+    for text in ("gm everyone", "$MSFT looking strong", "$MSFT @ 21.10", "MSFT 550 CALL 11/13 @ 17",
+                 "WMT up 40%"):
         r = _parse(text)
         assert r.status is not ParseStatus.PARSED or r.signal.parser != "dragon_alert", text
 
