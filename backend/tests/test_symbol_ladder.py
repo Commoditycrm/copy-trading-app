@@ -51,7 +51,8 @@ def db():
     s = sessionmaker(bind=eng)()
     s.add(User(id=USER, email="s@x.com", password_hash="x",
                role=UserRole.SUBSCRIBER, is_active=True))
-    s.add(SubscriberSettings(user_id=USER, multiplier=Decimal("1.000"), copy_enabled=True))
+    s.add(SubscriberSettings(user_id=USER, multiplier=Decimal("1.000"), copy_enabled=True,
+                             advanced_settings_enabled=True))
     s.commit()
     return s
 

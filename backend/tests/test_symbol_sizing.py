@@ -49,7 +49,8 @@ def db():
                role=UserRole.SUBSCRIBER, is_active=True))
     s.add(SubscriberSettings(user_id=USER, multiplier=Decimal("2.000"),
                              max_per_contract=Decimal("500"),
-                             max_per_order=Decimal("1000"), copy_enabled=True))
+                             max_per_order=Decimal("1000"), copy_enabled=True,
+                             advanced_settings_enabled=True))
     s.commit()
     return s
 
@@ -174,3 +175,47 @@ def test_the_fanout_actually_applies_the_symbol_caps():
     src = inspect.getsource(ce)
     # The INVOCATION, not the def — "_apply_symbol_caps(db" matches both.
     assert "_apply_symbol_caps(db, _cap_ids" in src
+
+
+# ── caps: the mode gate and the ALL layer ──────────────────────────────────
+
+def _mode(db, advanced):
+    from app.models.settings import SubscriberSettings as SS
+    row = db.get(SS, USER)
+    row.advanced_settings_enabled = advanced
+    db.commit()
+
+
+def test_a_parked_rule_does_not_change_caps_in_risk_controls_mode(db):
+    """Switching modes must not silently change someone's limits."""
+    _rule(db, "AAPL", {"max_per_contract": "1"})
+    _mode(db, False)
+    pc, po = {USER: Decimal("500")}, {}
+    ce._apply_symbol_caps(db, [USER], "AAPL", True, pc, po)
+    assert pc[USER] == Decimal("500")
+
+
+def test_the_all_layer_caps_every_symbol(db):
+    from app.services import subscriber_symbol_settings as sss
+    _rule(db, sss.ALL_SYMBOLS, {"max_per_contract": "300"})
+    pc, po = {USER: Decimal("500")}, {}
+    ce._apply_symbol_caps(db, [USER], "TSLA", True, pc, po)
+    assert pc[USER] == Decimal("300")
+
+
+def test_a_symbol_cap_beats_the_all_layer(db):
+    from app.services import subscriber_symbol_settings as sss
+    _rule(db, sss.ALL_SYMBOLS, {"max_per_contract": "300"})
+    _rule(db, "AAPL", {"max_per_contract": "900"})
+    pc, po = {USER: Decimal("500")}, {}
+    ce._apply_symbol_caps(db, [USER], "AAPL", True, pc, po)
+    assert pc[USER] == Decimal("900")
+
+
+def test_a_symbol_inherits_a_cap_it_does_not_set(db):
+    from app.services import subscriber_symbol_settings as sss
+    _rule(db, sss.ALL_SYMBOLS, {"max_per_contract": "300", "max_per_order": "700"})
+    _rule(db, "AAPL", {"max_per_contract": "900"})
+    pc, po = {USER: Decimal("500")}, {USER: Decimal("1000")}
+    ce._apply_symbol_caps(db, [USER], "AAPL", True, pc, po)
+    assert pc[USER] == Decimal("900") and po[USER] == Decimal("700")

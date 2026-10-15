@@ -70,6 +70,11 @@ LADDER_FIELDS = (
     "discord_trim_trail_amount",
 )
 
+# The reserved scope for the common layer. A real ticker is never "ALL", and
+# the (user, symbol) uniqueness constraint already makes it one per subscriber —
+# so the common settings are just another row, read through the same overlay.
+ALL_SYMBOLS = "ALL"
+
 SYMBOL_FIELDS = SIZING_FIELDS + LADDER_FIELDS
 _FIELDS = frozenset(SYMBOL_FIELDS)
 
@@ -188,17 +193,44 @@ def rule_for(db: Session, user_id: uuid.UUID, symbol: str | None) -> SubscriberS
     ).scalars().first()
 
 
+def advanced_enabled(base: Any) -> bool:
+    """Is this subscriber on Advanced Settings rather than Risk Controls?"""
+    return bool(getattr(base, "advanced_settings_enabled", False))
+
+
 def resolve(db: Session, user_id: uuid.UUID, symbol: str | None) -> Any:
     """The settings that apply to this subscriber for this symbol.
 
-    The subscriber's own row when the symbol has no rule — the same object every
-    caller used before symbol rules existed, so nothing changes for them.
+    Three layers, most specific first:
+
+      1. the SYMBOL's own rule — what it explicitly sets;
+      2. the ALL-Symbols rule — the common configuration, for anything the
+         symbol did not set;
+      3. the subscriber's saved settings — for anything neither set, so
+         switching to Advanced never silently changes a value they had.
+
+    Returns the subscriber's own row untouched when Advanced Settings is off,
+    or when nothing is configured — the same object every caller used before
+    symbol rules existed. That identity is what makes Risk Controls mode
+    behave exactly as it does today: there is no overlay in the path at all.
     """
     base = db.get(SubscriberSettings, user_id)
-    rule = rule_for(db, user_id, symbol)
-    if rule is None:
+    if not advanced_enabled(base):
         return base
-    return SymbolSettings(base, rule.settings or {})
+    common = rule_for(db, user_id, ALL_SYMBOLS)
+    own = rule_for(db, user_id, symbol) if normalize(symbol) != ALL_SYMBOLS else None
+    if common is None and own is None:
+        return base
+    # The symbol's own values land ON TOP of the common ones, key by key — so a
+    # symbol overrides only what it names and inherits the rest. Updating the
+    # common layer therefore cannot erase an individual override, and clearing
+    # one hands that field back to the common layer rather than to the defaults.
+    merged: dict[str, Any] = {}
+    if common is not None:
+        merged.update(common.settings or {})
+    if own is not None:
+        merged.update(own.settings or {})
+    return SymbolSettings(base, merged)
 
 
 def has_rule(db: Session, user_id: uuid.UUID, symbol: str | None) -> bool:
