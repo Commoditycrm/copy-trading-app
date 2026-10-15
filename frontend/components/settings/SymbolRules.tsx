@@ -33,6 +33,10 @@ type SymbolRule = {
 
 const BASE = "/api/settings/subscriber/symbols";
 
+/** The common layer. A real ticker is never "ALL", so it doubles as the scope
+ *  name and needs no separate storage. */
+const ALL = "ALL";
+
 /** The sizing fields, in the order they read. */
 const SIZING: { key: string; label: string; hint: string; step: number }[] = [
   { key: "multiplier", label: "Multiplier", step: 0.05,
@@ -73,11 +77,14 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 
-export function SymbolRules() {
+export function SymbolRules({ advanced, onModeChange }: {
+  advanced: boolean;
+  onModeChange: (next: boolean) => void;
+}) {
   const [rules, setRules] = useState<SymbolRule[] | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
-  const [mode, setMode] = useState<"alerts" | "ladder">("alerts");
+  const [exitMode, setExitMode] = useState<"alerts" | "ladder">("alerts");
   const [adding, setAdding] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -101,7 +108,7 @@ export function SymbolRules() {
     for (const f of SIZING) next[f.key] = asText(rule.settings[f.key]);
     for (const k of LADDER_KEYS) next[k] = asText(rule.settings[k]);
     setDraft(next);
-    setMode(rule.exit_mode);
+    setExitMode(rule.exit_mode);
     setOpen(rule.symbol);
   }
 
@@ -117,7 +124,7 @@ export function SymbolRules() {
       // Only stored when the symbol runs its own ladder. Absent means "On
       // Alerts", which is also what every symbol without a rule does — so the
       // default costs no stored value.
-      if (mode === "ladder") settings[AUTO_TRIM] = true;
+      if (exitMode === "ladder") settings[AUTO_TRIM] = true;
       await api(`${BASE}/${encodeURIComponent(symbol)}`, {
         method: "PUT",
         body: JSON.stringify({ settings }),
@@ -176,25 +183,114 @@ export function SymbolRules() {
     return <div className="py-6 grid place-items-center"><Spinner /></div>;
   }
 
+  const common = rules.find(r => r.symbol === ALL) ?? null;
+
+  async function setConfigMode(next: boolean) {
+    setBusy("__mode__");
+    try {
+      await api(`${BASE}/mode`, { method: "PATCH", body: JSON.stringify({ enabled: next }) });
+      onModeChange(next);
+      notify.success(next ? "Advanced settings on" : "Back to risk controls");
+      await load();
+    } catch (e) {
+      notify.fromError(e, "Could not switch mode");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addCommon() {
+    setBusy(ALL);
+    try {
+      await api(`${BASE}/${ALL}`, { method: "PUT", body: JSON.stringify({ settings: {} }) });
+      await load();
+      setOpen(ALL);
+      setDraft({});
+      setExitMode("alerts");
+    } catch (e) {
+      notify.fromError(e, "Could not create the common settings");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <div className="space-y-3">
-      <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-        Give one symbol its own size and, later, its own way out. Anything you
-        leave blank keeps using your settings above. A symbol covers its stock
-        and every option on it.
-      </p>
+      {/* ── Which mode is live ───────────────────────────────────────────
+          One or the other, never both. The inactive one says WHY it is
+          inactive rather than just greying out. */}
+      <div className="flex flex-col gap-1.5">
+        {([
+          [false, "Risk controls",
+           "Your settings above decide the size of every copied trade."],
+          [true, "Advanced settings",
+           "Per-symbol rules decide the size instead, and can run their own exit ladder. Your multiplier and the two caps above stop applying; daily limits and auto-liquidation keep working."],
+        ] as const).map(([value, label, hint]) => (
+          <label key={String(value)} className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name="subscriber-settings-mode"
+              checked={advanced === value}
+              disabled={busy === "__mode__"}
+              onChange={() => void setConfigMode(value)}
+              className="mt-0.5"
+            />
+            <span>
+              <span className="text-xs block">{label}</span>
+              <span className="text-[10px] block leading-snug" style={{ color: "var(--muted)" }}>
+                {hint}
+              </span>
+            </span>
+          </label>
+        ))}
+      </div>
 
-      {rules.length === 0 && (
+      {!advanced && (
+        <div
+          className="rounded-lg border border-dashed px-3 py-3 text-[11px] leading-snug"
+          style={{ borderColor: "var(--border)", color: "var(--muted)" }}
+        >
+          Advanced settings are off, so nothing here applies — your risk
+          controls above are what run.
+          {rules.length > 0 && " Your saved symbol rules are kept and will apply again if you turn this back on."}
+        </div>
+      )}
+
+      {advanced && (
+        <>
+          <p className="text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+            <strong style={{ color: "var(--text)" }}>ALL Symbols</strong> is the
+            common configuration — it applies to everything you copy. Add an
+            individual symbol only where it should differ; it inherits anything
+            it does not set. A symbol covers its stock and every option on it.
+          </p>
+
+          {/* The common layer, always first — it is what most subscribers
+              will set and the thing everything else inherits from. */}
+          {common === null ? (
+            <button
+              onClick={() => void addCommon()}
+              disabled={busy === ALL}
+              className="w-full rounded-lg border border-dashed px-3 py-3 text-xs"
+              style={{ borderColor: "var(--border)", color: "var(--muted)" }}
+            >
+              + Set common settings for ALL symbols
+            </button>
+          ) : null}
+        </>
+      )}
+
+      {rules.filter(r => r.symbol !== ALL).length === 0 && (
         <div
           className="rounded-lg border border-dashed px-3 py-4 text-xs text-center"
           style={{ borderColor: "var(--border)", color: "var(--muted)" }}
         >
-          No symbols customised — every trade uses your settings above.
+          No individual symbols yet — they all follow ALL Symbols.
         </div>
       )}
 
       <ul className="space-y-2">
-        {rules.map(rule => {
+        {rules.filter(r => r.symbol !== ALL).map(rule => {
           const custom = rule.overridden.length;
           return (
             <li
@@ -280,8 +376,8 @@ export function SymbolRules() {
                           <input
                             type="radio"
                             name={`exit-${rule.symbol}`}
-                            checked={mode === value}
-                            onChange={() => setMode(value)}
+                            checked={exitMode === value}
+                            onChange={() => setExitMode(value)}
                             className="mt-0.5"
                           />
                           <span>
@@ -295,7 +391,7 @@ export function SymbolRules() {
                     </div>
                   </div>
 
-                  {mode === "ladder" && (
+                  {exitMode === "ladder" && (
                     <div className="sm:col-span-3">
                       <div className="grid gap-2" style={{ gridTemplateColumns: "auto 1fr 1fr 1fr" }}>
                         <span />

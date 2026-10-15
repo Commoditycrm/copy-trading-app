@@ -332,6 +332,9 @@ export interface TradeStats {
 }
 
 export interface SubscriberSettings {
+  /** Risk Controls (false) or Advanced Settings (true). Symbol rules are
+   *  stored either way — the flag decides whether they apply. */
+  advanced_settings_enabled?: boolean;
   user_id: string;
   following_trader_id: string | null;
   /** Brand of the trader being followed — surfaced as the app wordmark

@@ -22,6 +22,10 @@ class SubscriberSettingsOut(BaseModel):
     # trades. Reflects TraderSettings.copy_paused / trading_enabled.
     following_trader_copy_active: bool | None = None
     copy_enabled: bool
+    # Risk Controls (False) or Advanced Settings (True). The UI switches which
+    # set of controls is live; symbol rules are stored either way, so toggling
+    # this parks a configuration rather than deleting it.
+    advanced_settings_enabled: bool = False
     multiplier: Decimal
     daily_loss_limit: Decimal | None
     # Symmetric counterpart to daily_loss_limit. Positive amount — e.g. 500

@@ -358,6 +358,21 @@ class SubscriberSettings(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     copy_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+    # Risk Controls (today's behaviour) or Advanced Settings (per-symbol rules).
+    # One or the other, never both: the standard SIZING controls — multiplier,
+    # max per contract, max per order — stop applying while this is on, and the
+    # per-symbol configuration supplies them instead. Everything else in Risk
+    # Controls (daily caps, auto-liquidation, the master switch) keeps working:
+    # those are account-level safety nets and Advanced has no equivalent.
+    #
+    # Off for everyone until they choose it. Symbol rules are stored either way,
+    # so turning this off parks them rather than deleting them.
+    advanced_settings_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     multiplier: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal("1.000"), nullable=False)
 
     # Daily realized-loss kill switch. Stored as a positive amount (e.g. 500 means

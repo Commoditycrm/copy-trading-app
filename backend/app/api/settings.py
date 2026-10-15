@@ -77,6 +77,11 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         following_trader_business_name=trader_business_name,
         following_trader_copy_active=trader_copy_active,
         copy_enabled=s.copy_enabled,
+        # Which mode the settings page shows as live. Omitted here it would
+        # default to False and the page would show Risk Controls for someone
+        # who had chosen Advanced — the stored value is right, the response
+        # was not.
+        advanced_settings_enabled=bool(s.advanced_settings_enabled),
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         daily_profit_limit=s.daily_profit_limit,
