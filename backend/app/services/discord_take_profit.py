@@ -136,10 +136,10 @@ def _px(d: Decimal) -> str:
 
 
 def sizing_note(p: Plan) -> str:
-    """ "sell 70% of 2 = 1.4 → rounded up to 2 contracts" — the trim's size and
-    how it was reached. Every trim rounds UP (guards.rung_quantity), and the
-    trader should see that in the order's Why, not work it out."""
-    unit = "contract" if p.quantity == 1 else "contracts"
+    """ "sell 70% of 2 = 1.4 → rounded up to 2 ctr" — the trim's size and how it
+    was reached. Every trim rounds UP (guards.rung_quantity), and the trader
+    should see that in the order's Why, not work it out."""
+    unit = "ctr"
     if p.qty_pct is None or p.held is None:
         return f"sell {_n(p.quantity)} {unit}"
     exact = Decimal(str(p.held)) * Decimal(str(p.qty_pct)) / Decimal(100)
@@ -437,7 +437,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     from app.services.position_events import because  # noqa: PLC0415
 
     try:
-        with because(f"take-profit for Trim {want.rung}: {sizing_note(want)} at {_px(want.price)}"
+        with because(f"Trim {want.rung}: {sizing_note(want)} at {_px(want.price)}"
                      + (f", linked stop {_px(want.stop_price)}" if want.stop_price is not None else "")):
             if want.stop_price is not None:
                 tp_id, sl_id = place_pair(want.quantity, want.price, want.stop_price)
