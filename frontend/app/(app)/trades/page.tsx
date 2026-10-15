@@ -233,11 +233,15 @@ function orderLiveKey(o: Order): string | null {
 
 /** Filled and submitted rows don't get a live price: a fill is done, and a
  *  submitted order (or a Discord alert that already became one) is past the
- *  decision the price is there to inform. Skipping them also keeps the
- *  25-symbol watch for the rows that still need it. */
+ *  decision the price is there to inform. Neither does anything placed more
+ *  than a day ago — a stale alert is not one you are deciding on now.
+ *  Skipping them keeps the 25-symbol watch for the rows that still need it. */
 const NO_LIVE_PRICE: OrderStatus[] = ["filled", "submitted"];
+const LIVE_PRICE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 function tracksLivePrice(o: Order): boolean {
-  return !NO_LIVE_PRICE.includes(o.status);
+  if (NO_LIVE_PRICE.includes(o.status)) return false;
+  const placed = Date.parse(o.submitted_at ?? o.created_at ?? "");
+  return Number.isFinite(placed) && Date.now() - placed <= LIVE_PRICE_MAX_AGE_MS;
 }
 
 /** Live current-price cell for an order row. Ticks off the central stream (via
