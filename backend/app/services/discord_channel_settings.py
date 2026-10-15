@@ -61,6 +61,10 @@ CHANNEL_FIELDS = (
     "discord_trim_trail_amount",
     "discord_reprice_after_seconds",
     "discord_reprice_pct",
+    # What a risky alert does on the week's last trading day. Deliberately NOT
+    # in _ADDED_LATER: it was account-wide first, so a channel whose own copy
+    # predates it keeps the account's choice until it sets its own.
+    "discord_last_day_risky",
 )
 _FIELDS = frozenset(CHANNEL_FIELDS)
 

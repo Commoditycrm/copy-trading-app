@@ -1,4 +1,4 @@
-"""Account setting: what a risky alert does on the week's last trading day.
+"""Per-channel setting: what a risky alert does on the week's last trading day.
 
 "normal" — half size, as on any day; "half" — half of that (a quarter); "full" —
 the risky words are ignored and the entry is full size. The last trading day is
@@ -77,14 +77,13 @@ def test_dollar_sizing_takes_a_quarter_of_the_amount():
 
 # ── the rule applied to an alert ────────────────────────────────────────────
 
-def _run(monkeypatch, mode, *, friday=True, half=True):
-    acct = SimpleNamespace(discord_last_day_risky=mode)
-    db = SimpleNamespace(get=lambda model, key: acct)
+def _run(monkeypatch, mode, *, friday=True, half=True, ts=None):
+    ts = ts if ts is not None else SimpleNamespace(discord_last_day_risky=mode)
     monkeypatch.setattr(market_hours, "now_et", lambda: datetime(2026, 10, 16 if friday else 15, 10, 0))
     sig = {"action": "buy", "half_size": half}
     msg = SimpleNamespace(parsed_signal=sig)
     sizing = ex.Sizing(multiplier=4)
-    out = ds._last_day_risky(db, SimpleNamespace(id=uuid.uuid4()), msg, sig, sizing)
+    out = ds._last_day_risky(ts, msg, sig, sizing)
     return out, sizing, msg
 
 
@@ -125,12 +124,38 @@ def test_the_account_saves_it():
     assert ds._settings_out(ts).last_day_risky == "full"
 
 
-def test_a_channel_cannot_set_it():
+def test_a_channel_with_its_own_settings_sets_its_own():
     from app.services.discord_channel_settings import ChannelSettings
-    own = ChannelSettings(TraderSettings(user_id=uuid.uuid4()), {})
-    with pytest.raises(HTTPException) as e:
-        ds._apply_settings(own, DiscordSettingsIn(last_day_risky="half"), SimpleNamespace(id=uuid.uuid4()))
-    assert e.value.status_code == 400
+    account = TraderSettings(user_id=uuid.uuid4(), discord_last_day_risky="normal")
+    own = ChannelSettings(account, {})
+    ds._apply_settings(own, DiscordSettingsIn(last_day_risky="half"), SimpleNamespace(id=uuid.uuid4()))
+    assert own.discord_last_day_risky == "half"
+    assert own.to_json()["discord_last_day_risky"] == "half"
+    assert account.discord_last_day_risky == "normal", "the account is untouched"
+
+
+def test_the_channel_s_own_choice_is_what_applies(monkeypatch):
+    from app.services.discord_channel_settings import ChannelSettings
+    account = TraderSettings(user_id=uuid.uuid4(), discord_last_day_risky="full")
+    own = ChannelSettings(account, {"discord_last_day_risky": "half"})
+    out, sizing, _ = _run(monkeypatch, None, ts=own)
+    assert out["half_size"] is True and sizing.risky_factor == D("0.25")
+
+
+def test_a_channel_whose_own_copy_predates_it_keeps_the_account_s_choice(monkeypatch):
+    """It was account-wide first: an older own copy has no value, and reads the
+    account's rather than a default — what applied to it until now."""
+    from app.services.discord_channel_settings import ChannelSettings
+    account = TraderSettings(user_id=uuid.uuid4(), discord_last_day_risky="full")
+    own = ChannelSettings(account, {"discord_quantity_multiplier": 3})
+    out, _, _ = _run(monkeypatch, None, ts=own)
+    assert out["half_size"] is False
+
+
+def test_turning_a_channel_s_own_settings_on_copies_the_account_s_choice():
+    from app.services.discord_channel_settings import snapshot
+    account = TraderSettings(user_id=uuid.uuid4(), discord_last_day_risky="half")
+    assert snapshot(account)["discord_last_day_risky"] == "half"
 
 
 def test_an_unknown_value_is_refused():

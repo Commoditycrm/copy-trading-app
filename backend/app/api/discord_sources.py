@@ -1113,9 +1113,10 @@ def _settings_out(ts) -> DiscordSettingsOut:
     )
 
 
-def _last_day_risky(db: Session, user: User, msg, signal: dict, sizing) -> dict:
-    """Apply the account's last-trading-day rule to a risky entry. Returns the
-    signal to resolve (a new dict when it changed).
+def _last_day_risky(ts, msg, signal: dict, sizing) -> dict:
+    """Apply the last-trading-day rule in ``ts`` — the alert's channel's settings,
+    its own or the account's — to a risky entry. Returns the signal to resolve
+    (a new dict when it changed).
 
     Only an entry the author called risky / light / a lotto (``half_size``) on
     the week's last trading day (ET) is touched:
@@ -1125,11 +1126,9 @@ def _last_day_risky(db: Session, user: User, msg, signal: dict, sizing) -> dict:
     """
     if not signal.get("half_size"):
         return signal
-    from app.models.settings import TraderSettings  # noqa: PLC0415
     from app.services import market_hours  # noqa: PLC0415
 
-    acct = db.get(TraderSettings, user.id)
-    mode = (getattr(acct, "discord_last_day_risky", None) or "normal") if acct else "normal"
+    mode = (getattr(ts, "discord_last_day_risky", None) or "normal") if ts is not None else "normal"
     if mode == "normal" or not market_hours.is_last_trading_day_of_week(market_hours.now_et().date()):
         return signal
     if mode == "half":
@@ -1169,10 +1168,6 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
     if payload.size_cap is not None:
         ts.discord_size_cap = payload.size_cap
     if payload.last_day_risky is not None:
-        from app.models.settings import TraderSettings  # noqa: PLC0415
-
-        if not isinstance(ts, TraderSettings):
-            raise HTTPException(400, "The last-trading-day setting is account level, not per channel")
         ts.discord_last_day_risky = payload.last_day_risky
     if payload.max_per_contract is not None:
         raw = payload.max_per_contract.strip()
@@ -2387,9 +2382,10 @@ def _execute_signal(
         # alert, and a stray resting entry is the lesser problem.
         log.exception("discord: stale-entry cancel failed for alert %s", msg.id)
 
-    # The week's last trading day: the ACCOUNT's choice for an entry the author
-    # called risky / light / a lotto (discord_last_day_risky).
-    signal = _last_day_risky(db, user, msg, signal, sizing)
+    # The week's last trading day: the alert's CHANNEL's choice (its own, or the
+    # account's while it follows them) for an entry the author called risky /
+    # light / a lotto (discord_last_day_risky).
+    signal = _last_day_risky(ts_for_sizing, msg, signal, sizing)
 
     try:
         resolved = discord_execution.resolve(db, user, signal, sizing)
