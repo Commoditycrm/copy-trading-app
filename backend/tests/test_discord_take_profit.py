@@ -604,18 +604,17 @@ def test_the_why_names_the_round_up_and_the_contracts(monkeypatch):
     said = _why(monkeypatch)
     book, g = _Book(), _guard(stop_price=D("0.3600"))       # as the DB column returns it
     _run(book, g, 2, ts=_ts(discord_trim_qty_pct=D("70")))
-    assert said == ["take-profit for Trim 1: sell 70% of 2 = 1.4 → rounded up to 2 contracts "
-                    "at 1.20, linked stop 0.36"]
+    assert said == ["Trim 1: sell 70% of 2 = 1.4 → rounded up to 2 ctr at 1.20, linked stop 0.36"]
 
 
 def test_sizing_note_wording():
     P = tp.Plan
-    assert tp.sizing_note(P(1, D(2), D("1.2"), None, qty_pct=D(50), held=D(4))) == "sell 50% of 4 = 2 contracts"
+    assert tp.sizing_note(P(1, D(2), D("1.2"), None, qty_pct=D(50), held=D(4))) == "sell 50% of 4 = 2 ctr"
     assert tp.sizing_note(P(1, D(1), D("1.2"), None, qty_pct=D(50), held=D(1))) == \
-        "sell 50% of 1 = 0.5 → rounded up to 1 contract"
+        "sell 50% of 1 = 0.5 → rounded up to 1 ctr"
     assert tp.sizing_note(P(1, D(3), D("1.2"), None, qty_pct=D("70.00"), held=D("4.000000"))) == \
-        "sell 70% of 4 = 2.8 → rounded up to 3 contracts"
-    assert tp.sizing_note(P(1, D(2), D("1.2"), None)) == "sell 2 contracts"
+        "sell 70% of 4 = 2.8 → rounded up to 3 ctr"
+    assert tp.sizing_note(P(1, D(2), D("1.2"), None)) == "sell 2 ctr"
 
 
 def test_prices_read_as_the_trader_writes_them():
