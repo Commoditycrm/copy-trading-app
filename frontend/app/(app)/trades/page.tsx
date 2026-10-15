@@ -231,6 +231,15 @@ function orderLiveKey(o: Order): string | null {
   return `${sym}${yy}${mm}${dd}${cp}${String(strikeInt).padStart(8, "0")}`;
 }
 
+/** Filled and submitted rows don't get a live price: a fill is done, and a
+ *  submitted order (or a Discord alert that already became one) is past the
+ *  decision the price is there to inform. Skipping them also keeps the
+ *  25-symbol watch for the rows that still need it. */
+const NO_LIVE_PRICE: OrderStatus[] = ["filled", "submitted"];
+function tracksLivePrice(o: Order): boolean {
+  return !NO_LIVE_PRICE.includes(o.status);
+}
+
 /** Live current-price cell for an order row. Ticks off the central stream (via
  *  the on-demand watch registered for the visible rows). Own component so the
  *  hook stays out of the row .map(). */
@@ -694,8 +703,9 @@ export default function TradesPage() {
   // subscribe the stream to hundreds of stale symbols. The shared hook
   // heartbeats it and pauses while the tab is hidden.
   const watchKeys = useMemo(() => {
-    const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
-    const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
+    const tracked = gridRows.filter(tracksLivePrice);
+    const open = tracked.filter((o) => OPEN_STATUSES.includes(o.status));
+    const rest = tracked.filter((o) => !OPEN_STATUSES.includes(o.status));
     const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
     return Array.from(new Set(keys)).slice(0, 25);
   }, [gridRows]);
@@ -1386,7 +1396,7 @@ export default function TradesPage() {
                       ),
                       expected_price: <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>,
                       filled_price: <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>,
-                      current_price: <LiveOrderPriceCell liveKey={orderLiveKey(o)} />,
+                      current_price: <LiveOrderPriceCell liveKey={tracksLivePrice(o) ? orderLiveKey(o) : null} />,
                       tp: (
                         <td className="px-5 py-3.5 num">
                           {isEntry ? (
