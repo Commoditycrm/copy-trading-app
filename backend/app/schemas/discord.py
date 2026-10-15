@@ -463,6 +463,9 @@ class DiscordSettingsOut(BaseModel):
     size_dollars: str | None = None
     # With contracts: the ONE cap that applies — or none. Ignored with dollars.
     size_cap: Literal["none", "per_contract", "per_order"] = "none"
+    # Account level: a risky alert on the week's last trading day — "normal"
+    # (half, as any day), "half" (half of that) or "full" (risky words ignored).
+    last_day_risky: Literal["normal", "half", "full"] = "normal"
     # Dollar ceiling on ONE CONTRACT's value; null = no ceiling.
     max_per_contract: str | None = None
     # Dollar ceiling on the WHOLE ORDER's value; null = no ceiling. Independent
@@ -520,6 +523,7 @@ class DiscordSettingsIn(BaseModel):
     # Dollars per entry; "" clears it.
     size_dollars: str | None = None
     size_cap: Literal["none", "per_contract", "per_order"] | None = None
+    last_day_risky: Literal["normal", "half", "full"] | None = None
     trail_percent: str | None = None
     # Sent as a string so an empty field can clear it; "" or null = no ceiling.
     max_per_contract: str | None = None

@@ -129,6 +129,19 @@ def is_regular_trading_day(dt_et: datetime | None = None) -> bool:
     return is_trading_weekday(dt) and not is_market_holiday(dt.date())
 
 
+def is_last_trading_day_of_week(d: date) -> bool:
+    """True when ``d`` trades and no later weekday of its week does — Friday,
+    or Thursday when Friday is a market holiday (Good Friday, July 4th …)."""
+    if d.weekday() >= 5 or is_market_holiday(d):
+        return False
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() < 5:
+        if not is_market_holiday(nxt):
+            return False
+        nxt += timedelta(days=1)
+    return True
+
+
 def past_regular_close(dt_et: datetime | None = None) -> bool:
     """True only AFTER the official regular-session close (16:00 ET) on a real
     trading day. False in pre-market, during the session, and on weekends /

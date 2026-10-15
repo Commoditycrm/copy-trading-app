@@ -67,6 +67,12 @@ class Sizing:
     # it will pay, so that is what the dollar amount and both caps are checked
     # against.
     at_market: bool = False
+    # What a risky / light / lotto entry (signal["half_size"]) takes of the
+    # usual size: half, or a quarter on the week's last trading day when the
+    # account asks for half of the usual risky size (discord_last_day_risky).
+    risky_factor: Decimal = Decimal("0.5")
+    # Why the size differs from the usual rule, for the audit trail.
+    risky_note: str | None = None
 
 
 @dataclass
@@ -286,8 +292,9 @@ def resolve(
         # held — a statement about your own position, sized from it.
         averaging = bool(signal.get("double_up")) and (held_quantity or 0) > 0
         if sizing.mode == "dollars" and sizing.dollars and not averaging:
-            quantity = _dollar_quantity(sizing, price, is_option, bool(signal.get("half_size")),
-                                        resolutions)
+            quantity = _dollar_quantity(
+                sizing, price, is_option,
+                sizing.risky_factor if signal.get("half_size") else None, resolutions)
         # A market entry with no price anywhere cannot be measured against the
         # trader's dollar limits, and silently ignoring a limit is worse than
         # not placing the trade — that is the one thing the caps exist to stop.
@@ -897,14 +904,20 @@ def _market_price(adapter, symbol, strike, right, expiry, is_option) -> Decimal 
     return Decimal(str(mark)).quantize(Decimal("0.01")) if mark and mark > 0 else None
 
 
-def _dollar_quantity(sizing, price, is_option, half, resolutions) -> Decimal:
+def _dollar_quantity(sizing, price, is_option, risky_factor, resolutions) -> Decimal:
     """An entry sized by dollars: whole contracts (shares) that fit in the amount.
 
-    "light" halves the amount. When not even one fits, the entry is skipped —
-    buying one anyway would spend more than the amount the trader set."""
+    A risky / light entry takes ``risky_factor`` of the amount (half; a quarter
+    on the last trading day when the account asks). When not even one fits, the
+    entry is skipped — buying one anyway would spend more than the amount the
+    trader set."""
     budget = Decimal(str(sizing.dollars))
-    if half:
-        budget = budget / Decimal(2)
+    part = ""
+    if risky_factor is not None:
+        budget = budget * Decimal(str(risky_factor))
+        part = " — " + (sizing.risky_note or "half, light")
+    elif sizing.risky_note:
+        part = " — " + sizing.risky_note
     if price is None or price <= 0:
         raise ExecutionRefused("Sizing by dollars needs a price, and none is known for this entry.")
     unit = Decimal(str(price)) * (Decimal(100) if is_option else Decimal(1))
@@ -913,11 +926,9 @@ def _dollar_quantity(sizing, price, is_option, half, resolutions) -> Decimal:
     if qty < 1:
         raise ExecutionRefused(
             f"One {what} costs ${unit:.2f}{' at market' if sizing.at_market else ''}, "
-            f"above your ${budget:.2f} per entry{' (half, light)' if half else ''}."
+            f"above your ${budget:.2f} per entry{part.replace(' — ', ' (', 1) + ')' if part else ''}."
         )
-    resolutions["quantity"] = (
-        f"{qty} (${budget:.2f} per entry{' — half, light' if half else ''} ÷ ${unit:.2f} a {what})"
-    )
+    resolutions["quantity"] = f"{qty} (${budget:.2f} per entry{part} ÷ ${unit:.2f} a {what})"
     return qty
 
 
@@ -932,16 +943,22 @@ def _entry_quantity(signal, sizing, resolutions) -> Decimal:
     note = (f"your Contracts per alert; the alert said {stated}"
             if stated is not None and stated > 0 and stated != scaled else None)
 
-    # The author called this one "light" / "not heavy": take half of your size,
-    # rounded UP (the trader's rule, 2026-10-14: "round up always") — so 3 is 2.
+    # The author called this one risky / "light" / "not heavy": take half of
+    # your size (a quarter on the last trading day when the account asks —
+    # sizing.risky_factor), rounded UP (the trader's rule, 2026-10-14: "round up
+    # always") — so half of 3 is 2.
     if signal.get("half_size"):
-        halved = (scaled / Decimal(2)).to_integral_value(rounding=ROUND_CEILING)
-        # Never round down to nothing. You cannot buy half a contract, and
+        factor = Decimal(str(sizing.risky_factor))
+        part = (scaled * factor).to_integral_value(rounding=ROUND_CEILING)
+        # Never round down to nothing. You cannot buy part of a contract, and
         # dropping the trade entirely is not what "smaller" asks for — so a
         # single contract stays a single contract.
-        halved = max(halved, Decimal(1))
-        note = f"{note} then halved (light)" if note else f"half of {scaled} (light)"
-        scaled = halved
+        part = max(part, Decimal(1))
+        why = sizing.risky_note or "halved (light)"
+        note = f"{note} then {why}" if note else f"{why}, of {scaled}"
+        scaled = part
+    elif sizing.risky_note:
+        note = f"{note}; {sizing.risky_note}" if note else sizing.risky_note
 
     if note:
         resolutions["quantity"] = f"{scaled} ({note})"

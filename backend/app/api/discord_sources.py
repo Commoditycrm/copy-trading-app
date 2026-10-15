@@ -1084,6 +1084,7 @@ def _settings_out(ts) -> DiscordSettingsOut:
         size_mode=(getattr(ts, "discord_size_mode", None) or "contracts") if ts else "contracts",
         size_dollars=_plain(getattr(ts, "discord_size_dollars", None)) if ts else None,
         size_cap=discord_channel_settings.active_sizing(ts)["cap"] if ts else "none",
+        last_day_risky=(getattr(ts, "discord_last_day_risky", None) or "normal") if ts else "normal",
         max_per_contract=_plain(ts.discord_max_per_contract) if ts else None,
         max_per_order=_plain(ts.discord_max_per_order) if ts else None,
         trail_percent=(_plain(ts.discord_trail_percent) if ts else "20") or "20",
@@ -1112,6 +1113,35 @@ def _settings_out(ts) -> DiscordSettingsOut:
     )
 
 
+def _last_day_risky(db: Session, user: User, msg, signal: dict, sizing) -> dict:
+    """Apply the account's last-trading-day rule to a risky entry. Returns the
+    signal to resolve (a new dict when it changed).
+
+    Only an entry the author called risky / light / a lotto (``half_size``) on
+    the week's last trading day (ET) is touched:
+      "half" — a quarter of a full entry (half of the usual half);
+      "full" — the risky words are ignored: a full entry. Recorded on the alert
+               too, so a later average treats the position as full-size.
+    """
+    if not signal.get("half_size"):
+        return signal
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import market_hours  # noqa: PLC0415
+
+    acct = db.get(TraderSettings, user.id)
+    mode = (getattr(acct, "discord_last_day_risky", None) or "normal") if acct else "normal"
+    if mode == "normal" or not market_hours.is_last_trading_day_of_week(market_hours.now_et().date()):
+        return signal
+    if mode == "half":
+        sizing.risky_factor = Decimal("0.25")
+        sizing.risky_note = "a quarter — last trading day of the week, half of the usual risky size"
+        return signal
+    sizing.risky_note = "full size — last trading day of the week, risky words ignored"
+    changed = {**signal, "half_size": False, "last_day_full": True}
+    msg.parsed_signal = changed
+    return changed
+
+
 def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
     """Validate and apply a settings PATCH onto ``ts`` — the account's row, or a
     channel's own values (discord_channel_settings.ChannelSettings), which read
@@ -1138,6 +1168,12 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
         ts.discord_size_mode = payload.size_mode
     if payload.size_cap is not None:
         ts.discord_size_cap = payload.size_cap
+    if payload.last_day_risky is not None:
+        from app.models.settings import TraderSettings  # noqa: PLC0415
+
+        if not isinstance(ts, TraderSettings):
+            raise HTTPException(400, "The last-trading-day setting is account level, not per channel")
+        ts.discord_last_day_risky = payload.last_day_risky
     if payload.max_per_contract is not None:
         raw = payload.max_per_contract.strip()
         if not raw:
@@ -2350,6 +2386,10 @@ def _execute_signal(
         # Never let this stop the exit itself — getting OUT is the point of the
         # alert, and a stray resting entry is the lesser problem.
         log.exception("discord: stale-entry cancel failed for alert %s", msg.id)
+
+    # The week's last trading day: the ACCOUNT's choice for an entry the author
+    # called risky / light / a lotto (discord_last_day_risky).
+    signal = _last_day_risky(db, user, msg, signal, sizing)
 
     try:
         resolved = discord_execution.resolve(db, user, signal, sizing)

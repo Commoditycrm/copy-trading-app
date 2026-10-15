@@ -83,6 +83,8 @@ type DiscordSettings = {
   size_dollars?: string | null;
   /** With contracts: the ONE cap that applies. Ignored with dollars. */
   size_cap?: "none" | "per_contract" | "per_order";
+  /** Account level: what a risky alert does on the week's last trading day. */
+  last_day_risky?: LastDayRisky;
   max_per_contract: string | null;
   max_per_order: string | null;
   trail_percent: string;
@@ -95,6 +97,10 @@ type DiscordSettings = {
   trim_price_threshold: string;
   trim_trail_amount: string;
 };
+
+/** The week's last trading day (usually Friday): "normal" — a risky alert is
+ *  half size as on any day; "half" — half of that; "full" — risky words ignored. */
+type LastDayRisky = "normal" | "half" | "full";
 
 type LoginSession = {
   session_id: string;
@@ -304,6 +310,7 @@ export default function DiscordPage() {
   const [sizeModeUi, setSizeModeUi] = useState<"contracts" | "dollars">("contracts");
   const [sizeDollars, setSizeDollars] = useState("");
   const [sizeCap, setSizeCap] = useState<"none" | "per_contract" | "per_order">("none");
+  const [lastDayRisky, setLastDayRisky] = useState<LastDayRisky>("normal");
   const [savedSizeDollars, setSavedSizeDollars] = useState("");
   const [maxPerOrder, setMaxPerOrder] = useState("");
   // What the server currently holds, as distinct from what's in the box —
@@ -401,6 +408,7 @@ export default function DiscordPage() {
       setSizeMode(settings.size_mode ?? "contracts");
       setSizeModeUi(settings.size_mode ?? "contracts");
       setSizeCap(settings.size_cap ?? "none");
+      setLastDayRisky(settings.last_day_risky ?? "normal");
       setSavedMaxPerContract(next.maxPerContract);
       setMaxPerOrder((cur) => (forced("maxPerOrder") || cur === prev.maxPerOrder ? next.maxPerOrder : cur));
       setSavedMaxPerOrder(next.maxPerOrder);
@@ -1641,6 +1649,41 @@ export default function DiscordPage() {
                   );
                 })()}
               </div>
+
+              {/* Account level only, like AI trimming: one rule for every
+                  channel, so it is not offered while a channel is selected. */}
+              {!scope && (
+                <div
+                  className="rounded-xl px-4 py-3 w-full mt-4 flex flex-wrap items-center justify-between gap-3"
+                  style={{ background: "var(--panel-2)", border: "1px solid var(--border)" }}
+                >
+                  <div className="min-w-0 flex-1 basis-full sm:basis-0">
+                    <label htmlFor="last-day-risky" className="text-[11px] font-medium" style={{ color: "var(--text-2)" }}>
+                      Last Trading Day (usually Fridays)
+                    </label>
+                    <p className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
+                      What an alert called risky, high risk, a lotto, light or &ldquo;leave room to add&rdquo; buys on the
+                      week&rsquo;s last trading day (Thursday when Friday is a holiday). Other days it is half size.
+                    </p>
+                  </div>
+                  <select
+                    id="last-day-risky"
+                    value={lastDayRisky}
+                    disabled={modeBusy}
+                    onChange={(e) => {
+                      const v = e.target.value as LastDayRisky;
+                      setLastDayRisky(v);
+                      void saveSizing({ last_day_risky: v });
+                    }}
+                    className="rounded-md border px-2 py-1.5 text-[12px] bg-transparent focus-ring w-full sm:w-auto"
+                    style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                  >
+                    <option value="normal">Do Nothing (half size, as usual)</option>
+                    <option value="half">Half of Usual Risky Trade (a quarter)</option>
+                    <option value="full">Ignore Risky Keywords, Do Full Trade</option>
+                  </select>
+                </div>
+              )}
 
               {/* The exit ladder, below the sizing cards and full width: the
                   grid is three columns of inputs, and squeezed into a flex row
