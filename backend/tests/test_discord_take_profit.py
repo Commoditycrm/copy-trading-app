@@ -602,7 +602,7 @@ def _why(monkeypatch):
 
 def test_the_why_names_the_round_up_and_the_contracts(monkeypatch):
     said = _why(monkeypatch)
-    book, g = _Book(), _guard(stop_price=D("0.36"))
+    book, g = _Book(), _guard(stop_price=D("0.3600"))       # as the DB column returns it
     _run(book, g, 2, ts=_ts(discord_trim_qty_pct=D("70")))
     assert said == ["take-profit for Trim 1: sell 70% of 2 = 1.4 → rounded up to 2 contracts "
                     "at 1.20, linked stop 0.36"]
@@ -616,3 +616,8 @@ def test_sizing_note_wording():
     assert tp.sizing_note(P(1, D(3), D("1.2"), None, qty_pct=D("70.00"), held=D("4.000000"))) == \
         "sell 70% of 4 = 2.8 → rounded up to 3 contracts"
     assert tp.sizing_note(P(1, D(2), D("1.2"), None)) == "sell 2 contracts"
+
+
+def test_prices_read_as_the_trader_writes_them():
+    assert [tp._px(D(x)) for x in ("0.3600", "1.2", "2.38", "0.125", "14")] == \
+        ["0.36", "1.20", "2.38", "0.125", "14.00"]
