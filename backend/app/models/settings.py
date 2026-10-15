@@ -102,7 +102,8 @@ class TraderSettings(Base, TimestampMixin):
     # "per_order" or "none". NULL (never chosen) = whichever has a value, Max per
     # contract first. Sizing by dollars uses no cap — the amount is the rule.
     discord_size_cap: Mapped[str | None] = mapped_column(String(12), nullable=True)
-    # ACCOUNT level (never a channel's own): what an entry the author called
+    # Per channel like the sizing (a channel's own settings can set it; one that
+    # follows the account uses this). What an entry the author called
     # risky / light / a lotto (discord_parsers._HALF_SIZE_RE) does on the week's
     # LAST trading day — usually Friday, Thursday when Friday is a holiday.
     #   "normal" — half size, as on any other day
