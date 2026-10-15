@@ -1185,11 +1185,11 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                                 # A fill first: credit a trim that happened
                                 # rather than leave its ids behind.
                                 _tp.settle(db, guard, ts_g, _canceller,
-                                           in_session=_mh.in_regular_session())
+                                           in_session=_mh.in_regular_session(), held=held)
                             if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
                                 if _tp.release(db, guard, _canceller):
                                     _tp.settle(db, guard, ts_g, _canceller,
-                                               in_session=_mh.in_regular_session())
+                                               in_session=_mh.in_regular_session(), held=held)
                             guard.tp_qty = None
                             _reconcile_stop()
                         # Reconcile first so a resting stop is CANCELLED on

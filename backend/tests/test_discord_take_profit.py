@@ -558,3 +558,61 @@ def test_a_last_trim_of_half_of_one_contract_rests_for_the_one():
     """Every trim rounds UP (2026-10-14): 50% of 1 is the 1, not nothing."""
     p = tp.plan(_guard(sell_count=1), D(1), _ts(discord_trim_count=2), D("1.30"))
     assert p is not None and (p.rung, p.quantity) == (2, D(1))
+
+
+# ── a trim that sells everything leaves no stop to move (QA 2026-10-15) ──────
+# QQQ 718P: 2 contracts, Trim 1 "sell 70%" rounded up to 2 and filled at 2.38.
+# The ladder then logged "Trailing stop raised 0.36 → 2.02" on a position that
+# was already flat, and retired a second later.
+
+def test_a_trim_that_sells_the_whole_position_does_not_move_the_stop():
+    book, g = _Book(), _guard(stop_price=D("0.70"))
+    _run(book, g, 2, ts=_ts(discord_trim_qty_pct=D("70")))
+    assert book.calls[-1][:2] == ("pair", D(2))              # 70% of 2 rounds up to 2
+    book.fill(g.tp_order_id, "1.20")
+    out, _ = _run(book, g, 0, ts=_ts(discord_trim_qty_pct=D("70")), mark=None)
+    assert g.sell_count == 1 and out.startswith("trim 1 filled")
+    assert g.stop_price == D("0.70")                         # not raised: nothing left to protect
+
+
+def test_a_trim_that_leaves_contracts_still_moves_the_stop():
+    book, g = _Book(), _guard(stop_price=D("0.70"))
+    _run(book, g, 4)
+    book.fill(g.tp_order_id, "1.20")
+    _run(book, g, 2, mark="1.22")
+    assert g.stop_price == D("0.75")
+
+
+# ── the order's Why says how the size was reached ────────────────────────────
+
+def _why(monkeypatch):
+    import contextlib
+    from app.services import position_events
+
+    said = []
+
+    @contextlib.contextmanager
+    def _because(text):
+        said.append(text)
+        yield
+
+    monkeypatch.setattr(position_events, "because", _because)
+    return said
+
+
+def test_the_why_names_the_round_up_and_the_contracts(monkeypatch):
+    said = _why(monkeypatch)
+    book, g = _Book(), _guard(stop_price=D("0.36"))
+    _run(book, g, 2, ts=_ts(discord_trim_qty_pct=D("70")))
+    assert said == ["take-profit for Trim 1: sell 70% of 2 = 1.4 → rounded up to 2 contracts "
+                    "at 1.20, linked stop 0.36"]
+
+
+def test_sizing_note_wording():
+    P = tp.Plan
+    assert tp.sizing_note(P(1, D(2), D("1.2"), None, qty_pct=D(50), held=D(4))) == "sell 50% of 4 = 2 contracts"
+    assert tp.sizing_note(P(1, D(1), D("1.2"), None, qty_pct=D(50), held=D(1))) == \
+        "sell 50% of 1 = 0.5 → rounded up to 1 contract"
+    assert tp.sizing_note(P(1, D(3), D("1.2"), None, qty_pct=D("70.00"), held=D("4.000000"))) == \
+        "sell 70% of 4 = 2.8 → rounded up to 3 contracts"
+    assert tp.sizing_note(P(1, D(2), D("1.2"), None)) == "sell 2 contracts"
