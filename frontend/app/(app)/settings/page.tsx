@@ -1405,7 +1405,10 @@ export default function SettingsPage() {
             title="Advanced settings"
             hint="Give an individual symbol its own rules. Anything you don't set here keeps using your settings above."
           >
-            <SymbolRules />
+            <SymbolRules
+              advanced={!!sub.advanced_settings_enabled}
+              onModeChange={(next) => setSub(s => s ? { ...s, advanced_settings_enabled: next } : s)}
+            />
           </Card>
 
           {/* ── Position exits — SL/TP & auto-close, its own surface ──────

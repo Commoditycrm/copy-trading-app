@@ -38,3 +38,13 @@ class SymbolRuleOut(BaseModel):
 
 class SymbolRulesOut(BaseModel):
     symbols: list[SymbolRuleOut]
+
+
+class SymbolModeIn(BaseModel):
+    """Which mode the subscriber wants: Advanced Settings on or off."""
+
+    enabled: bool
+
+
+class SymbolModeOut(BaseModel):
+    advanced_settings_enabled: bool

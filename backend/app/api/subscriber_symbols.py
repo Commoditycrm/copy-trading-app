@@ -23,6 +23,8 @@ from app.models.settings import SubscriberSettings
 from app.models.subscriber_symbol_settings import SubscriberSymbolSettings
 from app.models.user import User
 from app.schemas.subscriber_symbols import (
+    SymbolModeIn,
+    SymbolModeOut,
     SymbolRuleIn,
     SymbolRuleOut,
     SymbolRulesOut,
@@ -53,6 +55,37 @@ def _out(rule: SubscriberSymbolSettings, base: SubscriberSettings | None) -> Sym
         effective=effective,
         exit_mode=symbols.exit_mode(ts),
     )
+
+
+@router.patch("/mode", response_model=SymbolModeOut)
+def set_advanced_mode(
+    payload: SymbolModeIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SymbolModeOut:
+    """Switch between Risk Controls and Advanced Settings.
+
+    Only the flag moves. Symbol rules are left exactly as they are, so turning
+    Advanced off parks a configuration and turning it back on restores it —
+    switching modes must never cost a subscriber their setup.
+    """
+    s = db.get(SubscriberSettings, user.id)
+    if s is None:
+        raise HTTPException(404, "settings_missing")
+    was = bool(s.advanced_settings_enabled)
+    s.advanced_settings_enabled = bool(payload.enabled)
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.advanced_mode_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={"from": was, "to": bool(payload.enabled)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return SymbolModeOut(advanced_settings_enabled=bool(s.advanced_settings_enabled))
 
 
 @router.get("", response_model=SymbolRulesOut)

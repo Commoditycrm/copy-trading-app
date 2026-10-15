@@ -1182,26 +1182,45 @@ def _apply_symbol_caps(db: Session, user_ids, symbol, is_option_order: bool,
                        per_contract: dict, per_order: dict) -> None:
     """Overlay per-symbol caps onto the authoritative cap maps, in place.
 
-    Only the symbol this order is for, and only subscribers who set a cap on it.
-    A rule that does not mention a cap leaves the subscriber's own in place —
-    sparse overrides are what make a partial rule work.
+    Only for subscribers on ADVANCED settings — a parked rule must not bind
+    while they are on Risk Controls, or switching modes would silently change
+    their limits.
 
-    Never raises: on any failure the global caps stand, which is the behaviour
-    before symbol rules existed. A cap must fail CLOSED (keep protecting), never
-    open.
+    Two layers, as everywhere else: the ALL-Symbols common cap, then the
+    symbol's own on top. A rule that does not mention a cap leaves the one
+    below it standing, which is what makes a partial rule work.
+
+    Never raises: on any failure the subscriber's own caps stand, the behaviour
+    before symbol rules existed. A cap must fail CLOSED (keep protecting),
+    never open.
     """
     if not user_ids or not symbol:
         return
     try:
+        from app.models.settings import SubscriberSettings  # noqa: PLC0415
         from app.models.subscriber_symbol_settings import SubscriberSymbolSettings  # noqa: PLC0415
         from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
 
+        ids = list(user_ids)
         root = symbols.normalize(symbol)
+        # Who is actually on Advanced. One indexed read rather than one per
+        # subscriber — this runs inside the fanout for every order.
+        advanced = {
+            uid for uid, on in db.execute(
+                select(SubscriberSettings.user_id,
+                       SubscriberSettings.advanced_settings_enabled)
+                .where(SubscriberSettings.user_id.in_(ids))
+            ).all() if on
+        }
+        if not advanced:
+            return
         rows = db.execute(
-            select(SubscriberSymbolSettings.user_id, SubscriberSymbolSettings.settings)
+            select(SubscriberSymbolSettings.user_id,
+                   SubscriberSymbolSettings.symbol,
+                   SubscriberSymbolSettings.settings)
             .where(
-                SubscriberSymbolSettings.user_id.in_(list(user_ids)),
-                SubscriberSymbolSettings.symbol == root,
+                SubscriberSymbolSettings.user_id.in_(list(advanced)),
+                SubscriberSymbolSettings.symbol.in_([root, symbols.ALL_SYMBOLS]),
                 SubscriberSymbolSettings.enabled.is_(True),
             )
         ).all()
@@ -1210,12 +1229,20 @@ def _apply_symbol_caps(db: Session, user_ids, symbol, is_option_order: bool,
                     "subscribers' own caps", symbol, exc_info=True)
         return
 
-    for uid, values in rows:
-        values = values or {}
+    merged: dict = {}
+    for uid, sym, values in rows:
+        layer = merged.setdefault(uid, {})
+        if sym == symbols.ALL_SYMBOLS:
+            # The common layer goes UNDER anything the symbol itself set.
+            layer.update({k: v for k, v in (values or {}).items() if k not in layer})
+        else:
+            layer.update(values or {})
+
+    for uid, values in merged.items():
         if "max_per_contract" in values and is_option_order:
             cap = _dec_or_none(values["max_per_contract"])
             if cap is None:
-                per_contract.pop(uid, None)      # the symbol lifts the cap
+                per_contract.pop(uid, None)      # this scope lifts the cap
             else:
                 per_contract[uid] = cap
         if "max_per_order" in values:
