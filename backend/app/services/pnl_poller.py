@@ -1022,6 +1022,13 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
             _ladder_engine = getattr(_account_ts, "discord_exit_engine", None) != "ai"
 
             def _settings_for(g):
+                # A Discord channel's ladder first, exactly as before. Then a
+                # SUBSCRIBER's per-symbol ladder: a mirrored position has no
+                # channel behind it, so there was no settings object to run a
+                # ladder on. None from both falls back to the account row, the
+                # behaviour before symbol rules existed.
+                from app.services import subscriber_symbol_settings as _sss  # noqa: PLC0415
+
                 return _dcs.for_guard(db, acct.user_id, g) or _account_ts
 
             _tp_possible = _ladder_engine and _tp.possible(db, acct.user_id, _account_ts)

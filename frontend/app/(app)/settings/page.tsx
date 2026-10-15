@@ -10,6 +10,7 @@ import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import { PercentInput } from "@/components/PercentInput";
 import { SmsNotificationsForm } from "@/components/settings/SmsNotificationsForm";
+import { SymbolRules } from "@/components/settings/SymbolRules";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -1392,6 +1393,19 @@ export default function SettingsPage() {
                 headroomDisplay="—"
               />
             </div>
+          </Card>
+
+          {/* ── Advanced: per-symbol settings ────────────────────────────
+              Everything above applies to every symbol. This is where one
+              symbol can differ — its own size now, its own exit ladder next.
+              Empty by default, so a subscriber who never opens it is on
+              exactly the settings they had before. */}
+          <Card
+            icon={<IconLayers />}
+            title="Advanced settings"
+            hint="Give an individual symbol its own rules. Anything you don't set here keeps using your settings above."
+          >
+            <SymbolRules />
           </Card>
 
           {/* ── Position exits — SL/TP & auto-close, its own surface ──────

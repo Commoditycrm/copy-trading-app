@@ -32,7 +32,8 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal
+from decimal import (ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal,
+                     InvalidOperation)
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -1175,6 +1176,167 @@ def _closeable_quantity(
 
     closeable = net_in_direction - reserved
     return closeable if closeable > 0 else Decimal(0)
+
+
+def _apply_symbol_caps(db: Session, user_ids, symbol, is_option_order: bool,
+                       per_contract: dict, per_order: dict) -> None:
+    """Overlay per-symbol caps onto the authoritative cap maps, in place.
+
+    Only the symbol this order is for, and only subscribers who set a cap on it.
+    A rule that does not mention a cap leaves the subscriber's own in place —
+    sparse overrides are what make a partial rule work.
+
+    Never raises: on any failure the global caps stand, which is the behaviour
+    before symbol rules existed. A cap must fail CLOSED (keep protecting), never
+    open.
+    """
+    if not user_ids or not symbol:
+        return
+    try:
+        from app.models.subscriber_symbol_settings import SubscriberSymbolSettings  # noqa: PLC0415
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        root = symbols.normalize(symbol)
+        rows = db.execute(
+            select(SubscriberSymbolSettings.user_id, SubscriberSymbolSettings.settings)
+            .where(
+                SubscriberSymbolSettings.user_id.in_(list(user_ids)),
+                SubscriberSymbolSettings.symbol == root,
+                SubscriberSymbolSettings.enabled.is_(True),
+            )
+        ).all()
+    except Exception:  # noqa: BLE001
+        log.warning("copy: per-symbol cap lookup failed for %s — using the "
+                    "subscribers' own caps", symbol, exc_info=True)
+        return
+
+    for uid, values in rows:
+        values = values or {}
+        if "max_per_contract" in values and is_option_order:
+            cap = _dec_or_none(values["max_per_contract"])
+            if cap is None:
+                per_contract.pop(uid, None)      # the symbol lifts the cap
+            else:
+                per_contract[uid] = cap
+        if "max_per_order" in values:
+            cap = _dec_or_none(values["max_per_order"])
+            if cap is None:
+                per_order.pop(uid, None)
+            else:
+                per_order[uid] = cap
+
+
+def _dec_or_none(raw) -> Decimal | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _open_symbol_ladder(db: Session, user_id, child) -> None:
+    """Start an exit ladder for a mirrored ENTRY, when its symbol has one.
+
+    Only for a symbol set to "Pre-defined ladder targets": on "On Alerts" the
+    subscriber's exits follow the trader and a ladder would be a second thing
+    selling the same position.
+
+    Entries only — a close has nothing to protect. The entry price is
+    provisional, exactly as it is on the Discord path: the real fill replaces it
+    through sync_entry_price on the next poller tick, which matters because a
+    mirror can fill away from the price it was sent at.
+
+    Never raises. A ladder that fails to open leaves the position exactly as a
+    mirrored position behaved before symbol rules existed — the trader's exits
+    still reach it — so this cannot cost the subscriber an exit.
+    """
+    try:
+        if child is None or getattr(child, "is_closing", False):
+            return
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        ts = symbols.resolve(db, user_id, child.symbol)
+        if symbols.exit_mode(ts) != "ladder":
+            return
+        guards.on_buy(
+            db, user_id, child.symbol,
+            child.option_strike, child.option_right, child.option_expiry,
+            entry_price=child.filled_avg_price or child.limit_price,
+            entry_order_id=child.id,
+        )
+        log.info("copy: opened a symbol ladder for %s on %s", child.symbol, user_id)
+    except Exception:  # noqa: BLE001
+        log.warning("copy: could not open the symbol ladder for %s",
+                    getattr(child, "symbol", "?"), exc_info=True)
+
+
+def _skip_trader_trim(db: Session, user_id, trader_order) -> bool:
+    """Should this subscriber ignore the trader's order?
+
+    True only for a TRIM on a symbol the subscriber has put on its own ladder.
+    Three things have to hold, and each one matters:
+
+      * it is a close — an entry is never suppressed;
+      * it is a PARTIAL close — a trader's full close must always reach the
+        subscriber, or a ladder could leave them holding what the trader has
+        exited;
+      * the symbol is on "Pre-defined ladder targets" — its own rungs decide
+        when to take profit, so mirroring the trim as well would sell the same
+        position twice over.
+    """
+    if not getattr(trader_order, "is_closing", False):
+        return False
+    if not bool(getattr(trader_order, "is_partial_close", False)):
+        return False
+    return not _trims_follow_trader(db, user_id, getattr(trader_order, "symbol", None))
+
+
+def _trims_follow_trader(db: Session, user_id, symbol) -> bool:
+    """Does this subscriber still take the trader's trims for ``symbol``?
+
+    True unless the symbol is on its own ladder. Never raises: on any failure
+    the trim is mirrored, which is the behaviour before symbol rules existed —
+    an exit that does not happen is worse than one that happens twice, because
+    the second is clamped to what is held and the first is not clamped at all.
+    """
+    try:
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        return symbols.trims_follow_trader(db, user_id, symbol)
+    except Exception:  # noqa: BLE001
+        log.warning("copy: per-symbol trim policy lookup failed for %s — "
+                    "mirroring the trim", symbol, exc_info=True)
+        return True
+
+
+def _symbol_multiplier(db: Session, sub, symbol: str | None) -> Decimal:
+    """The multiplier for a FRESH entry in ``symbol``.
+
+    The subscriber's own, unless they have a rule for that symbol. Keyed on the
+    underlying root, so one AAPL rule covers AAPL shares and every AAPL option.
+
+    Never raises and never returns None: a lookup that fails for any reason
+    falls back to the subscriber's global multiplier, which is what every mirror
+    used before symbol rules existed. Sizing is not a place to propagate an
+    error — refusing to size would drop the trade.
+    """
+    fallback = sub.multiplier if sub is not None else Decimal("1.000")
+    if sub is None or not symbol:
+        return fallback
+    try:
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        ts = symbols.resolve(db, sub.user_id, symbol)
+        if ts is sub:
+            return fallback                      # no rule: the usual path
+        value = getattr(ts, "multiplier", None)
+        return Decimal(str(value)) if value is not None else fallback
+    except Exception:  # noqa: BLE001
+        log.warning("copy: per-symbol multiplier lookup failed for %s — using the "
+                    "subscriber's own", symbol, exc_info=True)
+        return fallback
 
 
 def _locked_instrument_multiplier(
@@ -2597,6 +2759,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if _ocap is not None:
                 _fresh_order_caps[_uid] = _ocap
 
+        # A per-symbol rule overrides the caps for THIS order's symbol only.
+        # Applied on top of the authoritative read above, for the same reason
+        # that read exists: a risk cap has to bind on the very next trade, so it
+        # is never served from the fanout cache.
+        _apply_symbol_caps(db, _cap_ids, trader_order.symbol, _is_option_order,
+                           _fresh_caps, _fresh_order_caps)
+
     # Price the max-per-contract gate evaluates against. Prefer the trader's own
     # premium; for a MARKET option fanned out BEFORE its fill commits that isn't
     # recorded yet (filled_avg_price None, no limit_price) — which used to fail
@@ -2855,11 +3024,31 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # This keeps adds proportional and exits un-strandable when the
             # subscriber changes their multiplier mid-position, and falls back to
             # the live setting for legacy positions with no stored multiplier.
+            #
+            # A per-symbol rule changes only the LIVE setting, never the lock:
+            # a position already open keeps the multiplier it was opened at, so
+            # adding a rule mid-position cannot throw its adds or exits out of
+            # proportion. The rule takes effect on the next fresh entry.
             locked_mult = _locked_instrument_multiplier(db, sub.user_id, trader_order)
-            scale_mult = locked_mult if locked_mult is not None else sub.multiplier
+            live_mult = _symbol_multiplier(db, sub, trader_order.symbol)
+            scale_mult = locked_mult if locked_mult is not None else live_mult
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )
+
+            # A symbol on its own exit ladder does not take the trader's
+            # TRIMS: its rungs decide when to take profit, and mirroring the
+            # trim as well would sell the same position twice over. A trader's
+            # full close still flows — that is the line the ladder must not
+            # cross, or the subscriber is left holding what the trader exited.
+            if _skip_trader_trim(db, sub.user_id, trader_order):
+                results.append(FanoutResult(
+                    subscriber_user_id=sub.user_id,
+                    broker_account_id=acct.id,
+                    order_id=None,
+                    status="skipped_symbol_ladder_trim",
+                ))
+                continue
 
             # Close-only (paused) subscriber: admit ONLY genuine closes. An
             # entry (is_closing_effective False) is dropped here so a paused
@@ -3268,6 +3457,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # response itself, so capture the broker's execution time here too
             # — otherwise the fastest fills would be the ones missing it.
             child.broker_filled_at = resp.filled_at
+            # A symbol on its own exit ladder needs a ladder to run: the
+            # engine works off a position guard, and a mirrored position has
+            # never had one. Opened here, where every successful mirror passes.
+            _open_symbol_ladder(db, item.subscriber_user_id, child)
             # SnapTrade serves CACHED brokerage data, so a mirror can be filled
             # at the broker minutes before SnapTrade admits it (prod p90: 22
             # min). Nudge that connection to re-pull now and read it a few

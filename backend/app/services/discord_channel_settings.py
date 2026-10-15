@@ -162,16 +162,33 @@ def source_for_order(db: Session, order_id: uuid.UUID | None) -> uuid.UUID | Non
 
 
 def for_guard(db: Session, user_id: uuid.UUID, guard) -> Any | None:
-    """The settings of the channel that OPENED this position (its exit ladder),
-    or None when the opening order isn't a channel's — the caller then uses the
-    alert's own channel."""
-    # A channel the trader assigned by hand (Positions → Channel) wins over the
-    # one whose alert opened the position.
+    """The settings that govern this POSITION's exit ladder, or None.
+
+    In order:
+
+      1. the channel that OPENED it — a channel the trader assigned by hand
+         (Positions → Channel) wins over the one whose alert opened it;
+      2. a SUBSCRIBER's per-symbol ladder, for a position that has no channel
+         behind it at all. A mirrored position is the case: it was opened by
+         copying a trader, not by an alert, so step 1 finds nothing and every
+         caller then fell back to a TraderSettings row a subscriber does not
+         have — which reads as "no ladder configured" and silently does
+         nothing.
+
+    Resolved HERE rather than at each call site because there are several, they
+    are the paths that place real exits, and one of them drifting out of step
+    is invisible until a position does not get its trim.
+
+    None when neither applies — the caller then uses the alert's own channel,
+    exactly as before.
+    """
     source_id = getattr(guard, "source_id", None) or source_for_order(
         db, getattr(guard, "entry_order_id", None))
-    if source_id is None:
-        return None
-    return effective(db, user_id, source_id)
+    if source_id is not None:
+        return effective(db, user_id, source_id)
+    from app.services import subscriber_symbol_settings as _symbols  # noqa: PLC0415
+
+    return _symbols.settings_for_guard(db, user_id, guard)
 
 
 def active_sizing(ts: Any) -> dict:
