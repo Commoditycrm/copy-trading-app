@@ -38,7 +38,7 @@ honoured (``tp_off``); one the broker refuses is not retried for a while.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal
 
@@ -115,6 +115,30 @@ class Plan:
     # The stop linked to it, on the same contracts. None = no stop level is set
     # (or the market is already at the target), so the take-profit rests alone.
     stop_price: Decimal | None
+    # How ``quantity`` was reached, for the order's "Why" line only: the rung's
+    # sell % and the contracts held. Not part of what rests, so not compared.
+    qty_pct: Decimal | None = field(default=None, compare=False)
+    held: Decimal | None = field(default=None, compare=False)
+
+
+def _n(d: Decimal) -> str:
+    """2.000000 -> "2", 1.40 -> "1.4"."""
+    d = Decimal(str(d)).normalize()
+    return format(d.quantize(Decimal(1)) if d == d.to_integral_value() else d, "f")
+
+
+def sizing_note(p: Plan) -> str:
+    """ "sell 70% of 2 = 1.4 → rounded up to 2 contracts" — the trim's size and
+    how it was reached. Every trim rounds UP (guards.rung_quantity), and the
+    trader should see that in the order's Why, not work it out."""
+    unit = "contract" if p.quantity == 1 else "contracts"
+    if p.qty_pct is None or p.held is None:
+        return f"sell {_n(p.quantity)} {unit}"
+    exact = Decimal(str(p.held)) * Decimal(str(p.qty_pct)) / Decimal(100)
+    head = f"sell {_n(p.qty_pct)}% of {_n(p.held)}"
+    if exact == p.quantity:
+        return f"{head} = {_n(p.quantity)} {unit}"
+    return f"{head} = {_n(exact)} → rounded up to {_n(p.quantity)} {unit}"
 
 
 def target_price(entry: Decimal, gate_pct: Decimal) -> Decimal:
@@ -152,7 +176,8 @@ def plan(guard, held: Decimal, ts, mark: Decimal | None) -> Plan | None:
         # Already at the target: a linked take-profit must sit ABOVE the market,
         # so it goes out as a plain limit, which fills at once.
         stop = None
-    return Plan(rung=rung, quantity=quantity, price=price, stop_price=stop)
+    return Plan(rung=rung, quantity=quantity, price=price, stop_price=stop,
+                qty_pct=Decimal(str(cfg.rung(rung).qty_pct)), held=held)
 
 
 # ── what is resting ─────────────────────────────────────────────────────────
@@ -205,8 +230,13 @@ def release(db: Session, guard, cancel) -> bool:
     return done
 
 
-def settle(db: Session, guard, ts, cancel, *, in_session: bool = True) -> str | None:
+def settle(db: Session, guard, ts, cancel, *, in_session: bool = True,
+           held: Decimal | None = None) -> str | None:
     """Catch up with what happened to the resting orders since the last pass.
+
+    ``held`` is the broker's position this tick, when the caller has it. A trim
+    that sold everything leaves nothing for a stop to protect, so the ladder's
+    stop is not moved.
 
     Returns a short outcome when something changed, else None.
     """
@@ -226,7 +256,14 @@ def settle(db: Session, guard, ts, cancel, *, in_session: bool = True) -> str | 
         stop, trail_pct, peak = guards.rung_stop(
             guard.entry_price, cfg.rung(rung), tp.filled_avg_price or tp.limit_price)
         stop = guards._to_tick(stop)
-        if stop is not None and stop > 0:
+        # The trim sold the whole position: there is nothing left to stop. Moving
+        # the stop anyway logged "Trailing stop raised 0.36 → 2.02" on a flat
+        # position, a second before the ladder retired (QA 2026-10-15, QQQ 718P).
+        flat = held is not None and held <= 0
+        if flat:
+            log.info("take-profit: %s trim %s sold the whole position — no stop to move",
+                     guard.symbol, rung)
+        if stop is not None and stop > 0 and not flat:
             from app.services.position_events import because  # noqa: PLC0415
 
             with because(f"Trim {rung} take-profit filled — the ladder's stop for what is left"):
@@ -329,7 +366,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     then is the take-profit placed, so the two never ask for the same contracts.
     """
     now = now or datetime.now(timezone.utc)
-    settled = settle(db, guard, ts, cancel, in_session=in_session)
+    settled = settle(db, guard, ts, cancel, in_session=in_session, held=held)
 
     want = plan(guard, held, ts, mark)
     released = False
@@ -341,7 +378,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
             # position, so the plan no longer matched. Credit it now and plan the
             # next trim from what is left. The linked leg's cancel is still
             # completing, so the next order waits a pass (released stays True).
-            settled = settle(db, guard, ts, cancel, in_session=in_session) or settled
+            settled = settle(db, guard, ts, cancel, in_session=in_session, held=held) or settled
             want = plan(guard, held, ts, mark)
     resting = guard.tp_order_id is not None
 
@@ -392,7 +429,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     from app.services.position_events import because  # noqa: PLC0415
 
     try:
-        with because(f"take-profit for Trim {want.rung} at {want.price}"
+        with because(f"take-profit for Trim {want.rung}: {sizing_note(want)} at {want.price}"
                      + (f", linked stop {want.stop_price}" if want.stop_price is not None else "")):
             if want.stop_price is not None:
                 tp_id, sl_id = place_pair(want.quantity, want.price, want.stop_price)
