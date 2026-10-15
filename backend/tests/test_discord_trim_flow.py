@@ -56,6 +56,16 @@ class _DB:
     def add(self, obj): pass
     def flush(self): pass
 
+    def execute(self, *_a, **_k):
+        # No per-symbol rules for this trader — what a real session answers,
+        # and what keeps for_guard() on its channel path.
+        class _R:
+            def scalars(self): return self
+            def first(self): return None
+            def all(self): return []
+            def scalar_one_or_none(self): return None
+        return _R()
+
 
 class _User:
     def __init__(self): self.id = uuid.uuid4()

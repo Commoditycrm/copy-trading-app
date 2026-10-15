@@ -368,7 +368,16 @@ def _sweep_trader(db, trader_id, rows) -> None:
     engine = _engine(ts)
     from app.services import discord_channel_settings as dcs  # noqa: PLC0415
 
-    guard_ts = {g.id: (dcs.for_guard(db, trader_id, g) or ts) for g in rows}
+    # A Discord channel's ladder first, then a SUBSCRIBER's per-symbol ladder.
+    # Without the second, a subscriber resolves to None on both sides — they
+    # have no TraderSettings row — and due_rung() reads that as "auto-trim off",
+    # so their symbol ladder would never fire a rung.
+    from app.services import subscriber_symbol_settings as _sss  # noqa: PLC0415
+
+    guard_ts = {
+        g.id: (dcs.for_guard(db, trader_id, g) or ts)
+        for g in rows
+    }
     # On Fill stops first, and before the early return below: they apply with
     # Auto trim off too, and need no broker read.
     try:
