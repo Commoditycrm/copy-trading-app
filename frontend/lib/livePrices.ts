@@ -35,6 +35,15 @@ export function applyPriceTick(
   if (set) set.forEach((fn) => { try { fn(q); } catch { /* ignore */ } });
 }
 
+/** Seed a price for a symbol the stream hasn't ticked yet: the instant quote
+ *  /api/market-data/watch returns. Never overwrites a stream tick, which is
+ *  fresher and carries bid/ask that this seed lacks. */
+export function seedPrice(symbol: string, price: string | number | null | undefined): void {
+  const sym = symbol ? String(symbol).toUpperCase() : "";
+  if (!sym || _store.has(sym)) return;
+  applyPriceTick({ symbol: sym, price: price ?? undefined });
+}
+
 function _subscribe(sym: string, fn: (q: LiveQuote) => void): () => void {
   let set = _subs.get(sym);
   if (!set) { set = new Set(); _subs.set(sym, set); }

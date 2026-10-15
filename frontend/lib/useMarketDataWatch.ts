@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import { api } from "@/lib/api";
+import { seedPrice } from "@/lib/livePrices";
 
 /**
  * Register `symbols` as watched on the central market-data stream, heartbeated
@@ -25,10 +26,18 @@ export function useMarketDataWatch(symbols: string[]): void {
     const ping = () => {
       // Guard again at fire time — the tab may have hidden between ticks.
       if (typeof document !== "undefined" && document.hidden) return;
-      api("/api/market-data/watch", {
+      // The response carries a current price per symbol (cache, else a one-shot
+      // REST quote). Seed the live store with it: without this a cell showed
+      // "—" until the stream ticked, which for a quiet option contract (a
+      // Discord alert awaiting approval in Order History) could be never.
+      api<{ prices?: Record<string, string | null> }>("/api/market-data/watch", {
         method: "POST",
         body: JSON.stringify({ symbols: syms }),
-      }).catch(() => {});
+      })
+        .then((r) => {
+          for (const [sym, px] of Object.entries(r?.prices ?? {})) seedPrice(sym, px);
+        })
+        .catch(() => {});
     };
     const start = () => {
       if (timer) return;
