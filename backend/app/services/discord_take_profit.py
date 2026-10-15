@@ -127,6 +127,14 @@ def _n(d: Decimal) -> str:
     return format(d.quantize(Decimal(1)) if d == d.to_integral_value() else d, "f")
 
 
+def _px(d: Decimal) -> str:
+    """A price as the trader reads it: 0.3600 -> "0.36", 1.2 -> "1.20",
+    0.125 -> "0.125"."""
+    d = Decimal(str(d))
+    cents = d.quantize(_CENT)
+    return format(cents if cents == d else d.normalize(), "f")
+
+
 def sizing_note(p: Plan) -> str:
     """ "sell 70% of 2 = 1.4 → rounded up to 2 contracts" — the trim's size and
     how it was reached. Every trim rounds UP (guards.rung_quantity), and the
@@ -429,8 +437,8 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     from app.services.position_events import because  # noqa: PLC0415
 
     try:
-        with because(f"take-profit for Trim {want.rung}: {sizing_note(want)} at {want.price}"
-                     + (f", linked stop {want.stop_price}" if want.stop_price is not None else "")):
+        with because(f"take-profit for Trim {want.rung}: {sizing_note(want)} at {_px(want.price)}"
+                     + (f", linked stop {_px(want.stop_price)}" if want.stop_price is not None else "")):
             if want.stop_price is not None:
                 tp_id, sl_id = place_pair(want.quantity, want.price, want.stop_price)
             else:
