@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
+    subscriber_symbols,
     admin as admin_api,
     auth,
     brokers,
@@ -168,6 +169,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
     app.include_router(ui_prefs.router)
+    app.include_router(subscriber_symbols.router)
 
     # Shared across the startup/shutdown hooks so the retry scheduler
     # thread can be signalled to exit cleanly when uvicorn shuts down.
