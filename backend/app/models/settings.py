@@ -102,6 +102,15 @@ class TraderSettings(Base, TimestampMixin):
     # "per_order" or "none". NULL (never chosen) = whichever has a value, Max per
     # contract first. Sizing by dollars uses no cap — the amount is the rule.
     discord_size_cap: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # ACCOUNT level (never a channel's own): what an entry the author called
+    # risky / light / a lotto (discord_parsers._HALF_SIZE_RE) does on the week's
+    # LAST trading day — usually Friday, Thursday when Friday is a holiday.
+    #   "normal" — half size, as on any other day
+    #   "half"   — half of the usual risky size (a quarter of a full entry)
+    #   "full"   — ignore the risky words: a full-size entry
+    discord_last_day_risky: Mapped[str] = mapped_column(
+        String(8), default="normal", server_default="normal", nullable=False,
+    )
 
     # Ceiling on the dollar value of a single Discord order (quantity x price x
     # 100 for options). Unlike SubscriberSettings.max_per_contract — which is
