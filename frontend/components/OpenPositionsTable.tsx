@@ -375,14 +375,17 @@ const DEFAULT_TRAIL_PCT = "10";
 /** What Close % starts at on every position. */
 const DEFAULT_CLOSE_PCT = 25;
 const STOP_LEVELS = [-25, -10, 0];
-/** Deeper loss levels, in a red dropdown before the chips. -10 and -25 are
- *  absent because they are already chips — the dropdown holds what the chips
- *  cannot, exactly like the profit one.
+/** Loss levels in the red dropdown: every 5% from -5 to -95.
  *
- *  Stops at -90 rather than -100: the price is entry x (1 + pct/100), so -100%
- *  puts the stop at ZERO, which can never trigger. The API rejects anything
- *  below -99 for the same reason. */
-const LOSS_LEVELS = [-5, -15, -20, -30, -40, -50, -60, -70, -80, -90];
+ *  The full sequence, including the -10 and -25 that are also chips, so the
+ *  list reads as an unbroken ladder rather than one with two holes in it. A
+ *  level picked here simply lights its chip too.
+ *
+ *  It ends at -95, not -100. The stop price is entry x (1 + pct/100), so -100%
+ *  puts the stop at ZERO — a price nothing can trade down to, so the stop could
+ *  never trigger. The API rejects anything below -99 for that reason, and
+ *  offering it would hand someone a stop that silently protects nothing. */
+const LOSS_LEVELS = Array.from({ length: 19 }, (_, i) => -5 * (i + 1));   // -5 … -95
 /** Profit levels, in a green dropdown after the chips: the stop locks that much in. */
 const PROFIT_LEVELS = [25, 35, 50, 60, 70, 80, 100, 120, 150];
 /** A stop level's colour: red below entry, neutral at break-even, green in profit. */
