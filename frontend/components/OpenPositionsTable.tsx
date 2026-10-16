@@ -374,12 +374,18 @@ const DEFAULT_TRAIL_PCT = "10";
 
 /** What Close % starts at on every position. */
 const DEFAULT_CLOSE_PCT = 25;
-const STOP_LEVELS = [-25, -10, 0];
+/** Break-even is the only level left as a chip. -10 and -25 used to sit here
+ *  too, but the loss dropdown now covers -5 to -95 and offered them a second
+ *  time — the same level in two places, where picking one lit both.
+ *
+ *  0 stays a chip because it is in NEITHER dropdown (they start at -5 and +5)
+ *  and "move my stop to break-even" is a decision people make on its own, not
+ *  something they hunt for in a list. */
+const STOP_LEVELS = [0];
 /** Loss levels in the red dropdown: every 5% from -5 to -95.
  *
- *  The full sequence, including the -10 and -25 that are also chips, so the
- *  list reads as an unbroken ladder rather than one with two holes in it. A
- *  level picked here simply lights its chip too.
+ *  An unbroken ladder: every loss level lives here and nowhere else, so there
+ *  is one place to set one.
  *
  *  It ends at -95, not -100. The stop price is entry x (1 + pct/100), so -100%
  *  puts the stop at ZERO — a price nothing can trade down to, so the stop could
