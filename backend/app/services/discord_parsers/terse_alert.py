@@ -41,6 +41,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
+from . import cut_intent
 from ._util import to_decimal
 from .base import (
     AssetType,
@@ -116,6 +117,27 @@ _NOT_TICKERS = {
     # could not be pinned to a symbol.
     "PA", "HOD", "LOD", "IMO", "NFA", "FYI", "TBH", "IDK", "EOW",
 }
+
+# Single letters that are words, not tickers: "Cutting of course I trade…"
+# once read as a close of "I calls".
+_WORD_LETTERS = {"I", "A"}
+# A ticker typed in lower case is still a ticker when calls/puts follow it:
+# "Cutting spy calls".
+_LOWER_TICKER_RE = re.compile(r"(?<![A-Za-z0-9@$])\$?(?P<sym>[a-z]{1,5})\s+(?:calls?|puts?)\b")
+
+
+def _exit_tickers(text: str) -> set[str]:
+    """The tickers an exit names: capitals or $, else a lower-case one before
+    calls/puts. @mentions are never tickers."""
+    bare = re.sub(r"@\s?\w+", " ", text)
+    found = {m.group("sym") for m in _STOP_TICKER_RE.finditer(bare)
+             if m.group("sym") not in _NOT_TICKERS and m.group("sym") not in _WORD_LETTERS}
+    if not found:
+        found = {m.group("sym").upper() for m in _LOWER_TICKER_RE.finditer(bare)
+                 if m.group("sym").upper() not in _NOT_TICKERS | _WORD_LETTERS
+                 and m.group("sym").lower() not in {"my", "the", "our", "those", "these", "all", "some"}}
+    return found
+
 
 # ── a mid-sentence "Adding .50" ─────────────────────────────────────────────
 # _ADD_RE above is anchored to the START of the message on purpose: the word
@@ -262,7 +284,20 @@ class TerseAlertParser(Parser):
         if _STOPPED_RE.search(text):
             return self._stopped_out(text)
         if _CUT_RE.search(text):
-            return self._stopped_out(text, source_action="CUTTING")
+            # Most "cut"s are talk ABOUT cutting — "will cut if…", "we cut
+            # earlier", "cut losers quickly". Only a committed one sells
+            # (cut_intent), and then only off the clause that commits, so a
+            # ticker elsewhere in a long message can't pick the position.
+            intent = cut_intent.classify(message.content or text)
+            if intent.kind == cut_intent.CUT:
+                return self._stopped_out(_clean(intent.clause or text), source_action="CUTTING")
+            if intent.kind == cut_intent.PARTIAL:
+                return self._partial_cut(_clean(intent.clause or text), intent)
+            if intent.kind == cut_intent.BLOCKED:
+                quote = (intent.clause or "").strip()
+                return ParseResult.ignored(
+                    f"talks about cutting but isn't a cut ({intent.reason})"
+                    + (f": “{quote[:80]}”" if quote else ""))
 
         if _TRIM_RE.search(text):
             return self._trim(text)
@@ -315,14 +350,42 @@ class TerseAlertParser(Parser):
 
         return ParseResult.ignored("not a terse alert")
 
+    def _partial_cut(self, text: str, intent) -> ParseResult:
+        """ "Cut half", "cutting a third here": sell part of the position this
+        channel holds — the named ticker's, else the channel's latest — at market.
+        The fraction rides along on the signal (cut_fraction)."""
+        tickers = _exit_tickers(text)
+        if len(tickers) > 1:
+            return ParseResult.invalid("a partial cut that names more than one ticker")
+        right_m = _RIGHT_WORD_RE.search(text)
+        right = right_m.group("right")[0].upper() if right_m else None
+        symbol = tickers.pop() if tickers else None
+        return ParseResult.parsed(TradeSignal(
+            action=SignalAction.SELL,
+            asset_type=AssetType.OPTION,
+            symbol=symbol,
+            option_type=(None if right is None else
+                         OptionType.CALL if right == "C" else OptionType.PUT),
+            quantity=None,                  # a share of what is held
+            order_type=OrderKind.MARKET,
+            limit_price_unspecified=True,
+            is_partial_close=True,
+            cut_fraction=intent.fraction,
+            latest_contract=symbol is None,
+            channel_contract_first=symbol is not None,
+            expiry_unspecified=True,
+            contract_unspecified=True,
+            source_action="CUTTING_PART",
+            parser=self.name,
+        ))
+
     def _stopped_out(self, text: str, source_action: str = "STOPPED_OUT") -> ParseResult:
         """The author is out — stopped out, or cutting the trade: close every
         matching position this channel opened, at market. Execution finds them;
         none held = refused. Naming no ticker means the position the channel is
         in (``latest_contract``), as "Adding .4" does."""
         glued = _GLUED_RE.search(text)
-        tickers = {m.group("sym") for m in _STOP_TICKER_RE.finditer(text)
-                   if m.group("sym") not in _NOT_TICKERS}
+        tickers = _exit_tickers(text)
         if glued:
             tickers = {glued.group("sym")}
         if len(tickers) > 1:

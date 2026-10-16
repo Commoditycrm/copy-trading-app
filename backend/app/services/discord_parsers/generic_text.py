@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 
+from . import cut_intent
 from ._util import parse_expiry, to_decimal
 from .compact_alert import DEFAULT_QUANTITY, _next_trading_day
 from .base import (
@@ -106,6 +107,11 @@ class GenericTextParser(Parser):
 
     def matches(self, message: ParsedMessage) -> bool:
         text = message.text
+        if cut_intent.classify(text).sells:
+            # A committed cut is an exit, read by terse_alert. Here "...the 7800
+            # long... Going to cut remaining position here @ 2.6" was read as a
+            # BUY of "RAFAEL" @ 2.6 off the @mention (QA 2026-10-07).
+            return False
         return bool(_ACTION_RE.search(text) and _TICKER_RE.search(text.upper()))
 
     def parse(self, message: ParsedMessage) -> ParseResult:
