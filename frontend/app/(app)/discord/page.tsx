@@ -1778,36 +1778,39 @@ export default function DiscordPage() {
                       );
                     })}
                   </div>
-                  {exitMode === "manual" && (
-                    <>
-                      <label className="mt-2 flex items-start gap-2 text-[12px] cursor-pointer select-none"
-                             style={{ color: "var(--text)" }}>
-                        <input
-                          type="checkbox"
-                          className="mt-0.5 accent-[var(--accent)]"
-                          checked={cutExits}
-                          disabled={modeBusy}
-                          onChange={(e) => {
-                            const v = e.target.checked;
-                            setCutExits(v);
-                            void saveSizing({ cut_exits: v });
-                          }}
-                        />
-                        <span>
-                          <span className="font-medium">Auto exit on cut</span>
-                          <span className="block text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                            When the trader says they&rsquo;re cutting (&ldquo;Cutting here&rdquo;, &ldquo;Cut half&rdquo;),
-                            sell at market anyway — the whole position, or the share they name. Talk like
-                            &ldquo;I may cut&rdquo; or &ldquo;will cut if it breaks 720&rdquo; never sells. A position
-                            assigned to Self is still left to you.
-                          </span>
+                  {(exitMode === "manual" || exitMode === "orders") && (
+                    <label className="mt-2 flex items-start gap-2 text-[12px] cursor-pointer select-none"
+                           style={{ color: "var(--text)" }}>
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 accent-[var(--accent)]"
+                        checked={cutExits}
+                        disabled={modeBusy}
+                        onChange={(e) => {
+                          const v = e.target.checked;
+                          setCutExits(v);
+                          void saveSizing({ cut_exits: v });
+                        }}
+                      />
+                      <span>
+                        <span className="font-medium">Auto exit on cut</span>
+                        <span className="block text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                          When the trader says they&rsquo;re cutting (&ldquo;Cutting here&rdquo;, &ldquo;Cut half&rdquo;),
+                          sell at market — the whole position, or the share they name.
+                          {exitMode === "orders"
+                            ? " Untick to leave the exit to the resting take-profit and stop."
+                            : " Untick to leave it to you."}
+                          {" "}Talk like &ldquo;I may cut&rdquo; or &ldquo;will cut if it breaks 720&rdquo; never sells,
+                          and a position assigned to Self is always left to you.
                         </span>
-                      </label>
-                      <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                        The trims below are not used while exits are Manual — except for an exit you
-                        type into the alert composer yourself, which still runs on them.
-                      </p>
-                    </>
+                      </span>
+                    </label>
+                  )}
+                  {exitMode === "manual" && (
+                    <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                      The trims below are not used while exits are Manual — except for an exit you
+                      type into the alert composer yourself, which still runs on them.
+                    </p>
                   )}
 
                   {/* One ROW per stage, one COLUMN per setting — read across a

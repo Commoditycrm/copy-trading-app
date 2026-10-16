@@ -216,6 +216,7 @@ def test_cutting_with_no_ticker_closes_the_contract_the_channel_is_in(monkeypatc
 
     monkeypatch.setattr(ex, "channel_held_contracts", _held)
     monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    monkeypatch.setattr(discord_sources, "_channel_cut_left_to_take_profits", lambda *a: False)
     seen = []
     monkeypatch.setattr(discord_sources, "_execute_signal",
                         lambda db, user, msg, bg, req: seen.append(dict(msg.parsed_signal)))

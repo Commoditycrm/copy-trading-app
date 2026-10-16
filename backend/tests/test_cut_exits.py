@@ -103,6 +103,7 @@ def test_a_position_assigned_to_self_is_left_alone(exit_alert, monkeypatch):
 def test_a_stop_out_under_manual_still_does_nothing_but_a_cut_goes_through(monkeypatch):
     seen = []
     monkeypatch.setattr(ds, "_channel_exits_manual", lambda *a: True)
+    monkeypatch.setattr(ds, "_is_self_alert", lambda db, m: False)
     monkeypatch.setattr(ds.discord_channel_settings, "effective",
                         lambda *a, **k: _settings(discord_manual_exit=True, discord_cut_exits=True))
     monkeypatch.setattr(ds.discord_execution, "channel_held_contracts",
@@ -214,3 +215,48 @@ def test_below_the_bid_is_ten_percent_under_and_never_below_a_cent(monkeypatch):
     assert ds._below_the_bid(p) == Decimal("0.01")
     monkeypatch.setattr(market_data_stream, "data_option_bid_ask", lambda occ: (None, None))
     assert ds._below_the_bid(p) is None
+
+
+# ── Take-profit orders ──────────────────────────────────────────────────────
+
+def test_a_cut_sells_under_take_profit_orders_when_ticked(exit_alert):
+    setup, placed = exit_alert
+    _run(setup, _settings(discord_tp_orders=True, discord_cut_exits=True), CUT)
+    assert placed["payload"].quantity == Decimal(4)
+
+
+def test_a_cut_is_left_to_the_take_profits_when_unticked(exit_alert):
+    setup, placed = exit_alert
+    msg, guard = _run(setup, _settings(discord_tp_orders=True, discord_cut_exits=False), CUT)
+    assert placed == {} and "take-profit orders" in msg.status_reason
+    assert (guard.sell_count, guard.stop_price) == (0, None)
+
+
+def test_a_partial_cut_is_left_to_the_take_profits_when_unticked(exit_alert):
+    setup, placed = exit_alert
+    _run(setup, _settings(discord_tp_orders=True, discord_cut_exits=False), HALF)
+    assert placed == {}
+
+
+def test_a_full_close_that_is_not_a_cut_still_closes_under_take_profit_orders(exit_alert):
+    """Unticking it is about cuts only: "Out" / "Stopped out" close as before."""
+    setup, placed = exit_alert
+    _run(setup, _settings(discord_tp_orders=True, discord_cut_exits=False),
+         {"action": "SELL", "symbol": "MSFT", "flatten": True, "source_action": "CLOSING"})
+    assert placed["payload"].quantity == Decimal(4)
+
+
+def test_a_cut_close_all_is_left_to_the_take_profits_when_unticked(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ds, "_channel_exits_manual", lambda *a: False)
+    monkeypatch.setattr(ds, "_is_self_alert", lambda db, m: False)
+    monkeypatch.setattr(ds.discord_channel_settings, "effective",
+                        lambda *a, **k: _settings(discord_tp_orders=True, discord_cut_exits=False))
+    monkeypatch.setattr(ds.discord_execution, "channel_held_contracts",
+                        lambda *a, **k: seen.append("looked") or [])
+    msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), order_id=None, status=None,
+                          status_reason=None,
+                          parsed_signal={"symbol": "SPY", "option_type": "CALL",
+                                         "close_all_matching": True, "source_action": "CUTTING"})
+    ds._close_all_from_channel(None, SimpleNamespace(id=uuid.uuid4()), msg, None, None)
+    assert seen == [] and "take-profit orders" in msg.status_reason

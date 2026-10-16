@@ -216,10 +216,12 @@ class TraderSettings(Base, TimestampMixin):
     discord_manual_exit: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False,
     )
-    # With Manual exits: "Auto exit on cut". When the trader says they are
-    # CUTTING (discord_parsers.cut_intent — a committed cut, full or partial),
-    # sell anyway: it is the trader telling you to get out. Default on. A
-    # position assigned to Self is still left alone.
+    # "Auto exit on cut", with Manual exits or Take-profit orders. When the
+    # trader says they are CUTTING (discord_parsers.cut_intent — a committed
+    # cut, full or partial): ticked (the default) sells anyway — it is the
+    # trader telling you to get out; unticked leaves it to the trader (Manual)
+    # or to the resting take-profit and stop (Take-profit orders). A position
+    # assigned to Self is always left alone.
     discord_cut_exits: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true", nullable=False,
     )
