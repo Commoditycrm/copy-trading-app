@@ -777,6 +777,7 @@ export const OpenPositionsTable = forwardRef<
       { id: "qty", header: "Qty" },
       { id: "side", header: "Side" },
       { id: "close_pct", header: "Close %", locked: true },
+      { id: "close_qty", header: "Close Qty", locked: true },
       { id: "actions", header: "Actions", locked: true },
       { id: "unrealized_pnl", header: "Unrealized P&L" },
       { id: "pnl_pct", header: "P&L %" },
@@ -861,6 +862,11 @@ export const OpenPositionsTable = forwardRef<
     const [limitMode, setLimitMode] = useState<Record<string, ExitMode>>({});
     // Per-row close size as a percentage of the held quantity. Defaults to 25%.
     const [closePercents, setClosePercents] = useState<Record<string, number>>({});
+    // Per-position close quantity, as typed. Empty/absent means "follow the %
+    // buttons"; anything here overrides them. Held as a STRING so a half-typed
+    // value ("", "1.") survives a re-render instead of snapping back to a
+    // number the user did not ask for.
+    const [closeQtys, setCloseQtys] = useState<Record<string, string>>({});
     // Filter: default to options since that's the most common workflow here.
     const [filter, setFilter] = useState<"all" | "stock" | "option">("all");
     // Presentational only — symbol search + column sort.
@@ -879,6 +885,34 @@ export const OpenPositionsTable = forwardRef<
       if (p.instrument_type === "option") qty = Math.min(total, Math.max(1, Math.ceil(qty)));
       else qty = Math.round(qty * 1e6) / 1e6;
       return qty > 0 ? qty : null;
+    }
+
+    /** The quantity a close or average will actually use.
+     *
+     *  A typed Close Qty wins over the % buttons — that is the whole point of
+     *  the column. Falls back to the % when nothing has been typed, so the
+     *  buttons keep working untouched.
+     *
+     *  Returns null when the field holds something unusable (blank, 0, text),
+     *  so the caller refuses rather than guessing a size — silently falling
+     *  back to the % here would place a DIFFERENT order than the one on screen.
+     */
+    function effectiveCloseQty(p: Position, key: string): number | null {
+      const typed = closeQtys[key];
+      if (typed !== undefined && typed !== "") {
+        const n = Number(typed);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return p.instrument_type === "option" ? Math.floor(n) || null : n;
+      }
+      return quantityForPercent(p, closePercents[key] ?? DEFAULT_CLOSE_PCT);
+    }
+
+    /** What the Close Qty box shows: the typed value, else the % result. */
+    function closeQtyDisplay(p: Position, key: string): string {
+      const typed = closeQtys[key];
+      if (typed !== undefined) return typed;
+      const q = quantityForPercent(p, closePercents[key] ?? DEFAULT_CLOSE_PCT);
+      return q == null ? "" : String(q);
     }
 
     // Monotonic id for in-flight refreshes. Without it, two overlapping
@@ -1069,15 +1103,29 @@ export const OpenPositionsTable = forwardRef<
         }
       }
       const pct = closePercents[key] ?? DEFAULT_CLOSE_PCT;
-      const qty = quantityForPercent(p, pct);
+      const typed = closeQtys[key] !== undefined && closeQtys[key] !== "";
+      const qty = effectiveCloseQty(p, key);
       if (qty == null) {
-        notify.warn(`Can't close ${pct}% of this position — would round to zero.`);
+        notify.warn(typed
+          ? "Enter a valid Close Qty."
+          : `Can't close ${pct}% of this position — would round to zero.`);
+        return;
+      }
+      // Never sell more than is held. The backend guards this too, but failing
+      // here says WHY, next to the box they typed it in.
+      const held = Math.abs(Number(p.quantity));
+      if (Number.isFinite(held) && qty > held) {
+        notify.warn(`You hold ${held} — can't close ${qty}.`);
         return;
       }
       setClosing({ key, kind: type });
       try {
         const body: Record<string, unknown> = { order_type: type };
-        if (pct < 100) body.quantity = String(qty);   // 100% lets the backend default to full size
+        // Send the size whenever it was typed, or whenever it is a partial.
+        // A plain 100% with nothing typed still omits it, so the backend closes
+        // whatever is ACTUALLY held right now — the position can have moved
+        // since this page last refreshed.
+        if (typed || pct < 100) body.quantity = String(qty);
         if (type === "limit") body.limit_price = limitFor(key);
         const order = await api<Order>(
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
@@ -1166,15 +1214,23 @@ export const OpenPositionsTable = forwardRef<
           return;
         }
       }
-      // Sized off what is held now, like a close: 50% of 10 adds 5.
+      // Sized off what is held now, like a close: 50% of 10 adds 5 — unless a
+      // Close Qty was typed, which wins for both actions so the number on
+      // screen is always the number that gets sent.
       const pct = closePercents[key] ?? DEFAULT_CLOSE_PCT;
-      const qty = quantityForPercent(p, pct);
+      const typed = closeQtys[key] !== undefined && closeQtys[key] !== "";
+      const qty = effectiveCloseQty(p, key);
       if (qty == null) {
-        notify.warn(`Can't average ${pct}% of this position — would round to zero.`);
+        notify.warn(typed
+          ? "Enter a valid Close Qty."
+          : `Can't average ${pct}% of this position — would round to zero.`);
         return;
       }
+      // No held-quantity cap here: averaging ADDS, so buying more than you
+      // currently hold is a legitimate thing to ask for.
       const at = type === "limit" ? `at ${limitFor(key)}` : "at market";
-      if (!confirm(`Average into ${p.symbol.toUpperCase()}: BUY ${qty} more ${at} (${pct}% of what you hold)?`)) return;
+      const how = typed ? "typed" : `${pct}% of what you hold`;
+      if (!confirm(`Average into ${p.symbol.toUpperCase()}: BUY ${qty} more ${at} (${how})?`)) return;
       setClosing({ key, kind: type });
       try {
         const body: Record<string, unknown> = { order_type: type, quantity: String(qty) };
@@ -1367,6 +1423,7 @@ export const OpenPositionsTable = forwardRef<
       qty: { label: "Qty", sortKey: "quantity" },
       side: { label: "Side" },
       close_pct: { label: "Close %" },
+      close_qty: { label: "Close Qty", title: "Quantity the close or average will use. Set by the % buttons; type here to override." },
       actions: { label: "Actions" },
       unrealized_pnl: { label: "Unrealized P&L", sortKey: "unrealized_pnl" },
       pnl_pct: { label: "P&L %", title: "Unrealized P&L as a % of cost basis" },
@@ -1703,7 +1760,17 @@ export const OpenPositionsTable = forwardRef<
                                 key={pct}
                                 type="button"
                                 disabled={disabled}
-                                onClick={() => setClosePercents(s => ({ ...s, [key]: pct }))}
+                                onClick={() => {
+                                  setClosePercents(s => ({ ...s, [key]: pct }));
+                                  // Push the result into the Close Qty box so
+                                  // the number on screen is always the number
+                                  // that gets sent. Clicking a % is also how
+                                  // you discard a typed override.
+                                  setCloseQtys(s => ({
+                                    ...s,
+                                    [key]: computedQty == null ? "" : String(computedQty),
+                                  }));
+                                }}
                                 title={disabled ? "Too small at this %" : `${pct}% of the position (×${computedQty}) — sizes a close or an average`}
                                 className="px-2 py-0.5 text-[10px] rounded transition-colors"
                                 style={{
@@ -1721,6 +1788,40 @@ export const OpenPositionsTable = forwardRef<
                         </div>
                       </td>
                     ),
+                    close_qty: (() => {
+                      // The size both actions actually use. The % buttons write
+                      // into this box, and typing here overrides them — so
+                      // whatever is shown is what gets sent, with no second
+                      // hidden source of truth to disagree with it.
+                      const held = Math.abs(Number(p.quantity));
+                      const shown = closeQtyDisplay(p, key);
+                      const n = Number(shown);
+                      const tooBig = shown !== "" && Number.isFinite(n) && n > held;
+                      const bad = shown !== "" && (!Number.isFinite(n) || n <= 0);
+                      return (
+                        <td className="px-5 py-3.5">
+                          <input
+                            type="number"
+                            min={p.instrument_type === "option" ? 1 : 0.000001}
+                            step={p.instrument_type === "option" ? 1 : "any"}
+                            max={held || undefined}
+                            value={shown}
+                            onChange={e => setCloseQtys(s => ({ ...s, [key]: e.target.value }))}
+                            aria-label={`Close quantity for ${p.symbol}`}
+                            title={tooBig
+                              ? `You hold ${held}`
+                              : "Quantity the close or average will use — edit to override the %"}
+                            className="px-2 py-0.5 text-[11px] rounded num"
+                            style={{
+                              width: 72,
+                              background: "transparent",
+                              border: `1px solid ${tooBig || bad ? "var(--bad)" : "var(--border)"}`,
+                              color: tooBig || bad ? "var(--bad)" : "var(--text)",
+                            }}
+                          />
+                        </td>
+                      );
+                    })(),
                     actions: (
                       <td className="px-5 py-3.5">
                         <div className="flex gap-2 items-center whitespace-nowrap">
