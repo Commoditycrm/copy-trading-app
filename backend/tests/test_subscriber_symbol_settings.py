@@ -66,14 +66,17 @@ def test_with_no_rules_the_subscribers_own_settings_are_returned(db):
 
 
 def test_a_symbol_without_a_rule_is_unaffected_by_another_symbols_rule(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     base = db.get(SubscriberSettings, USER)
+    # Identity IS the contract here: with no rule the caller gets the raw
+    # settings row, which carries no discord_* attributes at all. That is what
+    # stops an unconfigured symbol being sized the advanced way.
     assert sss.resolve(db, USER, "TSLA") is base
-    assert sss.resolve(db, USER, "TSLA").multiplier == Decimal("2.000")
+    assert not hasattr(base, "discord_quantity_multiplier")
 
 
 def test_a_disabled_rule_does_not_apply(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"}, enabled=False)
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4}, enabled=False)
     assert sss.resolve(db, USER, "AAPL") is db.get(SubscriberSettings, USER)
 
 
@@ -85,21 +88,21 @@ def test_an_empty_symbol_resolves_to_the_global_settings(db, symbol):
 # ── the override itself ────────────────────────────────────────────────────
 
 def test_an_overridden_field_wins(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
-    assert sss.resolve(db, USER, "AAPL").multiplier == Decimal("0.5")
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
+    assert sss.resolve(db, USER, "AAPL").discord_quantity_multiplier == 4
 
 
 def test_an_unset_field_falls_through_to_the_subscriber(db):
     """A partial configuration must work — requirement 5."""
-    ts = sss.resolve(db, USER, "AAPL") if _rule(db, "AAPL", {"multiplier": "0.5"}) else None
-    assert ts.multiplier == Decimal("0.5")          # overridden
-    assert ts.max_per_contract == Decimal("500")    # inherited
+    ts = sss.resolve(db, USER, "AAPL") if _rule(db, "AAPL", {"discord_quantity_multiplier": 4}) else None
+    assert ts.discord_quantity_multiplier == 4          # overridden
+    assert ts.discord_max_per_contract is None    # inherited
 
 
 def test_account_wide_settings_are_never_shadowed(db):
     """A symbol rule can change size and exits, never who you follow or whether
     copying is on."""
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     ts = sss.resolve(db, USER, "AAPL")
     assert ts.copy_enabled is True
     with pytest.raises(AttributeError):
@@ -107,16 +110,16 @@ def test_account_wide_settings_are_never_shadowed(db):
 
 
 def test_the_symbol_is_matched_on_the_root_whatever_the_casing(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     for written in ("AAPL", "aapl", "  AaPl "):
-        assert sss.resolve(db, USER, written).multiplier == Decimal("0.5")
+        assert sss.resolve(db, USER, written).discord_quantity_multiplier == 4
 
 
 # ── stored values keep their type ──────────────────────────────────────────
 
 @pytest.mark.parametrize("field,stored,expected", [
-    ("multiplier", "0.5", Decimal("0.5")),
-    ("max_per_contract", "250", Decimal("250")),
+    ("discord_quantity_multiplier", 4, 4),
+    ("discord_max_per_contract", "250", Decimal("250")),
     ("discord_trim_profit_gate_pct", "20", Decimal("20")),
     ("discord_auto_trim", True, True),
     ("discord_trim_count", 4, 4),
@@ -129,7 +132,7 @@ def test_a_stored_override_comes_back_as_the_right_type(db, field, stored, expec
 def test_a_ladder_field_nobody_set_reads_as_its_own_default(db):
     """The subscriber has no ladder columns at all. Reading None would look
     like "no ladder configured", which is a different thing."""
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     ts = sss.resolve(db, USER, "AAPL")
     assert ts.discord_trim_count == 3
     assert ts.discord_extra_trims == []
@@ -139,12 +142,14 @@ def test_a_ladder_field_nobody_set_reads_as_its_own_default(db):
 # ── the exit mode under the ladder ─────────────────────────────────────────
 
 def test_the_default_exit_mode_follows_the_trader(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "alerts"
 
 
 def test_choosing_the_ladder_switches_the_symbol_to_its_own_rungs(db):
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    # A ladder is targets, not a flag: the rungs have to be able to fire.
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "ladder"
 
 
@@ -155,13 +160,13 @@ def test_a_subscriber_with_no_rules_follows_the_trader(db):
 # ── what the UI needs ──────────────────────────────────────────────────────
 
 def test_it_reports_which_fields_are_custom(db):
-    _rule(db, "AAPL", {"multiplier": "0.5", "discord_trim_profit_gate_pct": "20"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4, "discord_trim_profit_gate_pct": "20"})
     ts = sss.resolve(db, USER, "AAPL")
-    assert ts.overridden == ["multiplier", "discord_trim_profit_gate_pct"]
+    assert ts.overridden == ["discord_quantity_multiplier", "discord_trim_profit_gate_pct"]
 
 
 def test_has_rule_answers_without_resolving(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     assert sss.has_rule(db, USER, "AAPL") is True
     assert sss.has_rule(db, USER, "TSLA") is False
 
@@ -180,17 +185,17 @@ def _mode(db, advanced: bool):
 def test_risk_controls_mode_ignores_symbol_rules_entirely(db):
     """Not "resolves to the same values" — the SAME OBJECT. There is no overlay
     in the path, so Risk Controls behaves exactly as it does today."""
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     _mode(db, False)
     assert sss.resolve(db, USER, "AAPL") is db.get(SubscriberSettings, USER)
 
 
 def test_switching_modes_never_loses_a_configuration(db):
-    _rule(db, "AAPL", {"multiplier": "0.5"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4})
     _mode(db, False)
-    assert sss.resolve(db, USER, "AAPL").multiplier == Decimal("2.000")   # parked
+    assert sss.resolve(db, USER, "AAPL") is db.get(SubscriberSettings, USER)  # parked
     _mode(db, True)
-    assert sss.resolve(db, USER, "AAPL").multiplier == Decimal("0.5")     # restored
+    assert sss.resolve(db, USER, "AAPL").discord_quantity_multiplier == 4     # restored
 
 
 def test_advanced_mode_with_nothing_configured_changes_nothing(db):
@@ -202,63 +207,63 @@ def test_advanced_mode_with_nothing_configured_changes_nothing(db):
 
 def test_all_symbols_applies_to_every_symbol(db):
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25"})
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2})
     for symbol in ("AAPL", "TSLA", "NVDA"):
-        assert sss.resolve(db, USER, symbol).multiplier == Decimal("0.25")
+        assert sss.resolve(db, USER, symbol).discord_quantity_multiplier == 2
 
 
 def test_an_individual_symbol_overrides_all_symbols(db):
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25"})
-    _rule(db, "AAPL", {"multiplier": "3"})
-    assert sss.resolve(db, USER, "AAPL").multiplier == Decimal("3")
-    assert sss.resolve(db, USER, "TSLA").multiplier == Decimal("0.25")
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 9})
+    assert sss.resolve(db, USER, "AAPL").discord_quantity_multiplier == 9
+    assert sss.resolve(db, USER, "TSLA").discord_quantity_multiplier == 2
 
 
 def test_a_symbol_inherits_what_it_does_not_set_from_all_symbols(db):
     """The merge is key by key, not whole-record — which is what makes a
     partial individual configuration useful."""
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25", "max_per_contract": "300"})
-    _rule(db, "AAPL", {"multiplier": "3"})
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2, "discord_max_per_contract": "300"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 9})
     ts = sss.resolve(db, USER, "AAPL")
-    assert ts.multiplier == Decimal("3")              # its own
-    assert ts.max_per_contract == Decimal("300")      # from ALL
+    assert ts.discord_quantity_multiplier == 9              # its own
+    assert ts.discord_max_per_contract == Decimal("300")      # from ALL
 
 
 def test_anything_neither_layer_sets_falls_back_to_the_saved_settings(db):
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25"})
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2})
     # max_per_contract is on neither layer -> the subscriber's own 500.
-    assert sss.resolve(db, USER, "AAPL").max_per_contract == Decimal("500")
+    assert sss.resolve(db, USER, "AAPL").discord_max_per_contract is None
 
 
 def test_updating_all_symbols_does_not_erase_an_individual_override(db):
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25"})
-    _rule(db, "AAPL", {"multiplier": "3"})
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 9})
     rule = sss.rule_for(db, USER, sss.ALL_SYMBOLS)
-    rule.settings = {"multiplier": "0.75", "max_per_order": "900"}
+    rule.settings = {"discord_quantity_multiplier": 5, "discord_max_per_order": "900"}
     db.commit()
     ts = sss.resolve(db, USER, "AAPL")
-    assert ts.multiplier == Decimal("3")              # still its own
-    assert ts.max_per_order == Decimal("900")         # picks up the new common value
+    assert ts.discord_quantity_multiplier == 9              # still its own
+    assert ts.discord_max_per_order == Decimal("900")         # picks up the new common value
 
 
 def test_editing_one_symbol_leaves_the_others_alone(db):
     _mode(db, True)
-    _rule(db, "AAPL", {"multiplier": "3"})
-    _rule(db, "TSLA", {"multiplier": "4"})
-    sss.rule_for(db, USER, "AAPL").settings = {"multiplier": "9"}
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 9})
+    _rule(db, "TSLA", {"discord_quantity_multiplier": 6})
+    sss.rule_for(db, USER, "AAPL").settings = {"discord_quantity_multiplier": 1}
     db.commit()
-    assert sss.resolve(db, USER, "TSLA").multiplier == Decimal("4")
+    assert sss.resolve(db, USER, "TSLA").discord_quantity_multiplier == 6
 
 
 def test_the_all_row_is_not_treated_as_its_own_symbol(db):
     """Resolving "ALL" must not merge the common layer onto itself twice."""
     _mode(db, True)
-    _rule(db, sss.ALL_SYMBOLS, {"multiplier": "0.25"})
-    assert sss.resolve(db, USER, sss.ALL_SYMBOLS).multiplier == Decimal("0.25")
+    _rule(db, sss.ALL_SYMBOLS, {"discord_quantity_multiplier": 2})
+    assert sss.resolve(db, USER, sss.ALL_SYMBOLS).discord_quantity_multiplier == 2
 
 
 def test_the_settings_response_carries_the_mode():
