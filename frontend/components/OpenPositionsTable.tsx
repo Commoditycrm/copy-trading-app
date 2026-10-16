@@ -386,8 +386,16 @@ const STOP_LEVELS = [-25, -10, 0];
  *  never trigger. The API rejects anything below -99 for that reason, and
  *  offering it would hand someone a stop that silently protects nothing. */
 const LOSS_LEVELS = Array.from({ length: 19 }, (_, i) => -5 * (i + 1));   // -5 … -95
-/** Profit levels, in a green dropdown after the chips: the stop locks that much in. */
-const PROFIT_LEVELS = [25, 35, 50, 60, 70, 80, 100, 120, 150];
+/** Profit levels in the green dropdown: every 5% from +5 to +150.
+ *
+ *  Same even ladder as LOSS_LEVELS, so the two dropdowns are read the same way.
+ *  The old set (25, 35, 50, 60, 70, 80, 100, 120, 150) had uneven gaps and
+ *  nothing under 25, so a stop just above break-even — the common thing to want
+ *  once a trade is working — could not be set from the row at all.
+ *
+ *  No ceiling problem at this end: a profit stop is entry x (1 + pct/100), so
+ *  +150% is simply a high price, and the API accepts up to +1000. */
+const PROFIT_LEVELS = Array.from({ length: 30 }, (_, i) => 5 * (i + 1));   // +5 … +150
 /** A stop level's colour: red below entry, neutral at break-even, green in profit. */
 const levelColor = (pct: number) => (pct < 0 ? "var(--bad)" : pct > 0 ? "var(--good)" : "var(--text-2)");
 
