@@ -873,17 +873,24 @@ export const OpenPositionsTable = forwardRef<
     const [search, setSearch] = useState("");
     const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
 
-    /** Translate a chosen percentage into a concrete close quantity. Options
-     *  trade in whole contracts; stocks allow up to 6 decimals (Alpaca's
-     *  fractional precision). Returns null if the result rounds to zero. */
+    /** Translate a chosen percentage into a concrete close quantity.
+     *
+     *  WHOLE UNITS, for stocks as well as options. Stocks used to keep six
+     *  decimals (Alpaca's fractional precision), which put sizes like 1.1875
+     *  and 0.25 on screen — technically placeable, but not a size anyone means
+     *  to send, and unreadable in a column people act on quickly.
+     *
+     *  Round UP, never past what is held: 25% of 1 closes 1, 25% of 6 closes 2.
+     *  Rounding DOWN would let a small position round to zero and do nothing.
+     *
+     *  The clamp is what keeps this honest on a fractional holding: 4.75 shares
+     *  at 100% stays 4.75, because selling 5 of 4.75 is not a close — it is a
+     *  short. So a full exit of a fractional position is the one case that
+     *  still shows a decimal, and it should. */
     function quantityForPercent(p: Position, pct: number): number | null {
       const total = Math.abs(Number(p.quantity));
       if (!Number.isFinite(total) || total <= 0) return null;
-      let qty = total * (pct / 100);
-      // Options round UP to a whole contract, never past what is held: 25% of 1
-      // closes 1, 25% of 6 closes 2. A close that rounded to nothing would do nothing.
-      if (p.instrument_type === "option") qty = Math.min(total, Math.max(1, Math.ceil(qty)));
-      else qty = Math.round(qty * 1e6) / 1e6;
+      const qty = Math.min(total, Math.max(1, Math.ceil(total * (pct / 100))));
       return qty > 0 ? qty : null;
     }
 
