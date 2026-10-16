@@ -26,6 +26,7 @@ type Values = Record<string, unknown>;
 
 const MAX_TRIMS = 6;
 const CONTRACT_CHIPS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const DEFAULT_SIZE_MODE = "dollars";
 
 /** The three columns of trims 1-3, in order. */
 const NAMED = [
@@ -128,7 +129,9 @@ export function AdvancedScopeEditor({ scope, settings, effective, busy, onSave }
   const [fillTrail, setFillTrail] = useState<boolean>(
     () => !!(settings.discord_stop_trails as { fill?: boolean } | undefined)?.fill);
 
-  const sizeMode = String(v.discord_size_mode ?? effective.discord_size_mode ?? "contracts");
+  // Dollars by default: an amount per entry is what most subscribers want, and
+  // it is the one that does not need a contract count chosen first.
+  const sizeMode = String(v.discord_size_mode ?? effective.discord_size_mode ?? DEFAULT_SIZE_MODE);
   const cap = String(v.discord_size_cap ?? effective.discord_size_cap ?? "none");
   const contracts = Number(v.discord_quantity_multiplier ?? effective.discord_quantity_multiplier ?? 1);
 
@@ -149,6 +152,10 @@ export function AdvancedScopeEditor({ scope, settings, effective, busy, onSave }
       // fires, and the backend only lets a ladder take over the trader's exits
       // once it has a target that can.
       discord_auto_trim: true,
+      // The mode shown is the mode stored. Leaving it out would save the
+      // amount a subscriber typed under the OTHER mode, and the entry would be
+      // sized by a contract count they never chose.
+      discord_size_mode: sizeMode,
       ...fromTrims(trims, fillTrail),
     };
     // Strip anything the subscriber left empty — absent means "inherit".
