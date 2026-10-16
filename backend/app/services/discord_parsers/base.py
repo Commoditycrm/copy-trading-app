@@ -150,6 +150,8 @@ class TradeSignal:
     # holds, so this is tracked explicitly rather than inferred from quantity.
     is_partial_close: bool = False
     remaining_quantity: Decimal | None = None
+    # A partial CUT's share of the position ("cut half" = 0.5), from cut_intent.
+    cut_fraction: Decimal | None = None
 
     # What the source actually called it (ENTERING / TRIMMING / CLOSING / BTO …).
     # Kept for display and debugging; never drives execution.
@@ -170,6 +172,7 @@ class TradeSignal:
             "strike": str(self.strike) if self.strike is not None else None,
             "expiration": self.expiration.isoformat() if self.expiration else None,
             "is_partial_close": self.is_partial_close,
+            "cut_fraction": str(self.cut_fraction) if self.cut_fraction is not None else None,
             "remaining_quantity": (
                 str(self.remaining_quantity) if self.remaining_quantity is not None else None
             ),
