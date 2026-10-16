@@ -107,3 +107,33 @@ def test_no_connected_broker(placed):
     with pytest.raises(HTTPException) as exc:
         _re_enter(_DB(_closed(), acct=None, connected=None))
     assert exc.value.status_code == 409 and placed == []
+
+
+# ── at market (the Re-enter button's menu) ──────────────────────────────────
+
+def test_at_market_places_a_market_buy_with_no_price(placed):
+    db = _DB(_closed())
+    trades.re_enter_trade(
+        order_id=db.order.id, payload=ReEnterIn(quantity=D("2"), order_type="market"),
+        request=None, background=None, db=db, user=USER,
+    )
+    payload = placed[0][0]
+    assert payload.order_type.value == "market" and payload.limit_price is None
+    assert payload.side.value == "buy" and payload.quantity == D("2")
+
+
+def test_at_market_ignores_a_price_sent_along(placed):
+    db = _DB(_closed())
+    trades.re_enter_trade(
+        order_id=db.order.id,
+        payload=ReEnterIn(quantity=D("2"), order_type="market", limit_price=D("1.10")),
+        request=None, background=None, db=db, user=USER,
+    )
+    assert placed[0][0].limit_price is None
+
+
+def test_a_limit_re_enter_still_needs_a_price():
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        ReEnterIn(quantity=D("2"))

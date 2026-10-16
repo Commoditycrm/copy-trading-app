@@ -1,6 +1,7 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -90,11 +91,19 @@ class FillOut(BaseModel):
 
 
 class ReEnterIn(BaseModel):
-    """Buy back what a filled close took off, at a limit (Positions page →
-    Closed today → Re-enter)."""
+    """Buy back what a filled close took off (Positions page → Closed today →
+    Re-enter): at a limit, or — from the button's menu — at market."""
 
     quantity: Decimal = Field(gt=0)
-    limit_price: Decimal = Field(gt=0)
+    order_type: Literal["limit", "market"] = "limit"
+    # Required for a limit; ignored at market.
+    limit_price: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _limit_needs_a_price(self):
+        if self.order_type == "limit" and self.limit_price is None:
+            raise ValueError("A limit re-enter needs a price")
+        return self
 
 
 class OrderOut(BaseModel):

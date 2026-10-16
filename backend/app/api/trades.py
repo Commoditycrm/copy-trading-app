@@ -1386,7 +1386,9 @@ def re_enter_trade(
     user: User = Depends(current_user),
 ) -> Order:
     """Buy back the contract (or stock) a filled close took off: a LIMIT buy of
-    ``quantity`` at ``limit_price``, on the account the close was placed on.
+    ``quantity`` at ``limit_price`` — or a MARKET buy when ``order_type`` is
+    "market" (the Re-enter button's menu) — on the account the close was
+    placed on.
 
     An ordinary buy on the user's own order path — the same one the Trade Panel
     and "Average" use — so it is sized, risk-checked and copied like any entry.
@@ -1425,9 +1427,9 @@ def re_enter_trade(
             instrument_type=src.instrument_type,
             symbol=src.symbol,
             side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
+            order_type=OrderType.MARKET if payload.order_type == "market" else OrderType.LIMIT,
             quantity=payload.quantity,
-            limit_price=payload.limit_price,
+            limit_price=None if payload.order_type == "market" else payload.limit_price,
             option_expiry=src.option_expiry if is_option else None,
             option_strike=src.option_strike if is_option else None,
             option_right=src.option_right if is_option else None,
