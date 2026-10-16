@@ -20,7 +20,12 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision = "e1b3d7c409fa"
-down_revision = "c9f2a71b4e38"
+# Re-pointed from c9f2a71b4e38 onto qa's tip when this branch was rebased.
+# Both chains forked at c9f2a71b4e38 — qa added the two trader_settings
+# Discord columns, this branch added the subscriber ones — which left Alembic
+# with two heads and made `upgrade head` ambiguous. The two sets touch
+# different tables, so ordering this chain after qa's is safe.
+down_revision = "e5a7c9b1d3f6"
 branch_labels = None
 depends_on = None
 
