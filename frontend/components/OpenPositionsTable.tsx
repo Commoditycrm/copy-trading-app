@@ -706,6 +706,22 @@ function positionDirection(
 
 /** Full descriptor shown in the Symbol column, Webull style:
  *  stock  → "META";  option → "META C $372 10 Jul 26". */
+/** What an order went out at, for a toast: "@ $1.23", or "at market".
+ *
+ *  The FILL price when there is one — an order that filled on placement went
+ *  out at a price the limit may not match (a market order has no limit at all,
+ *  and a marketable limit can fill better). Falling back to the limit covers
+ *  one still resting, which is the common case for a limit order.
+ */
+function orderPriceLabel(order: { filled_avg_price: string | null; limit_price: string | null }): string {
+  const filled = order.filled_avg_price;
+  if (filled && Number(filled) > 0) return `@ ${fmtUsd(filled)}`;
+  const limit = order.limit_price;
+  if (limit && Number(limit) > 0) return `@ ${fmtUsd(limit)}`;
+  return "at market";
+}
+
+
 export function positionSymbolLabel(
   p: Pick<Position, "symbol" | "instrument_type" | "option_right" | "option_strike" | "option_expiry">,
 ): string {
@@ -1184,7 +1200,7 @@ export const OpenPositionsTable = forwardRef<
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/close?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
-        notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} ×${qty} (${type})`);
+        notify.success(`Close placed: ${order.side.toUpperCase()} ${order.symbol} ×${qty} ${orderPriceLabel(order)}`);
         if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
@@ -1292,7 +1308,7 @@ export const OpenPositionsTable = forwardRef<
           `/api/positions/${encodeURIComponent(p.broker_symbol)}/average?broker_account_id=${p.broker_account_id}`,
           { method: "POST", body: JSON.stringify(body) },
         );
-        notify.success(`Average placed: BUY ${order.symbol} ×${qty} (${type})`);
+        notify.success(`Average placed: BUY ${order.symbol} ×${qty} ${orderPriceLabel(order)}`);
         if (type === "limit") resetLimit(key);
         refresh();
       } catch (e) {
