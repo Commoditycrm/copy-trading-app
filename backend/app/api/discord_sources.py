@@ -33,7 +33,7 @@ import re
 import secrets
 import time
 import uuid
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 
 from fastapi import (
@@ -1080,6 +1080,7 @@ def _settings_out(ts) -> DiscordSettingsOut:
         live_trading=bool(ts and ts.discord_live_trading),
         auto_trim=bool(ts and getattr(ts, "discord_auto_trim", False)),
         exit_mode=discord_channel_settings.exit_mode(ts),
+        cut_exits=discord_channel_settings.cut_exits(ts),
         quantity_multiplier=(ts.discord_quantity_multiplier if ts else 1) or 1,
         size_mode=(getattr(ts, "discord_size_mode", None) or "contracts") if ts else "contracts",
         size_dollars=_plain(getattr(ts, "discord_size_dollars", None)) if ts else None,
@@ -1169,6 +1170,8 @@ def _apply_settings(ts, payload: DiscordSettingsIn, user: User) -> None:
         ts.discord_size_cap = payload.size_cap
     if payload.last_day_risky is not None:
         ts.discord_last_day_risky = payload.last_day_risky
+    if payload.cut_exits is not None:
+        ts.discord_cut_exits = payload.cut_exits
     if payload.max_per_contract is not None:
         raw = payload.max_per_contract.strip()
         if not raw:
@@ -2314,6 +2317,22 @@ def _execute_signal(
         else:
             signal = {**signal, **latest}
 
+    # A partial cut naming no ticker ("cut half here"): the position this channel
+    # is in — its latest buy still held. Nothing held: nothing to cut.
+    if (signal.get("latest_contract") and not signal.get("close_all_matching")
+            and not signal.get("symbol")):
+        try:
+            latest = discord_execution.latest_channel_contract(db, user, msg.source_id)
+        except Exception as exc:  # noqa: BLE001
+            discord_execution.mark_failed(msg, f"Couldn't find this channel's position: {exc}")
+            log.exception("discord: latest-contract lookup failed for alert %s", msg.id)
+            return
+        if latest is None:
+            discord_execution.mark_failed(
+                msg, "A cut with no ticker, and nothing from this channel is held.")
+            return
+        signal = {**signal, **latest}
+
     # A ticker-only exit (Dragon's "$WMT @ 0.71 | 40%"): prefer the contract
     # this channel bought and still holds, so holding a second WMT contract from
     # elsewhere doesn't make it ambiguous. Nothing from this channel held:
@@ -2422,7 +2441,8 @@ def _execute_signal(
         # closing by hand, so it goes through.
         exit_ts = (discord_channel_settings.for_guard(db, user.id, guard)
                    if guard is not None else None) or ts_for_sizing
-        if discord_channel_settings.exits_manual(exit_ts) and not _is_self_alert(db, msg):
+        if (discord_channel_settings.exits_manual(exit_ts) and not _is_self_alert(db, msg)
+                and not _cut_overrides_manual(exit_ts, signal)):
             msg.status = DiscordMessageStatus.PARSED
             msg.status_reason = (
                 "Exits are manual for this channel — this exit alert was not acted on. "
@@ -2440,7 +2460,8 @@ def _execute_signal(
         # "Cutting") still closes: the trader is out, not trimming. Your own
         # alerts (the popup, auto-trim) go through, as with Manual exits.
         if (discord_channel_settings.exit_mode(exit_ts) == "orders"
-                and not signal.get("flatten") and not _is_self_alert(db, msg)):
+                and not signal.get("flatten") and not _is_cut(signal)
+                and not _is_self_alert(db, msg)):
             msg.status = DiscordMessageStatus.PARSED
             msg.status_reason = (
                 "Trim alert ignored — take-profit orders manage the trims for this channel "
@@ -2502,6 +2523,19 @@ def _execute_signal(
                 exit_style=guards.MARKET, retire=True,
                 note=f"close alert — selling all {held}",
             )
+        elif signal.get("cut_fraction"):
+            # "Cut half": exactly that share of what is held, rounded up (the
+            # trader's rule), at market. Not a rung of the ladder — the trader
+            # called the size — so no profit gate and no rung spent; the stop
+            # reconciler resizes the stop to what is left.
+            fraction = Decimal(str(signal["cut_fraction"]))
+            sell = (held * fraction).to_integral_value(rounding=ROUND_CEILING)
+            sell = min(held, max(Decimal(1), sell))
+            plan = guards.TrimPlan(
+                rung=guard.sell_count or 0, guard=guard, sell_qty=sell,
+                exit_style=guards.MARKET, retire=sell >= held,
+                note=f"cut {(fraction * 100).normalize():f}% — selling {sell} of {held}",
+            )
         else:
             plan = guards.plan_exit(guard, held, resolved.mark_price, cfg)
 
@@ -2544,22 +2578,39 @@ def _execute_signal(
         # A resting stop RESERVES the contracts it covers, so the broker would
         # reject this exit for insufficient quantity. Release it first; the
         # poller re-places a correctly sized stop on whatever is left.
+        released = False
         if guard.stop_order_id:
             from app.services import discord_stop_orders  # noqa: PLC0415
 
-            discord_stop_orders.release(
+            released = bool(discord_stop_orders.release(
                 db, guard, _cancel_stop_order(db, user)
-            )
+            )) or released
         # A resting take-profit (and its linked stop) reserves contracts just
         # the same. The poller puts back whatever should rest afterwards.
         if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
             from app.services import discord_take_profit  # noqa: PLC0415
 
-            discord_take_profit.release(db, guard, _cancel_stop_order(db, user))
+            released = bool(discord_take_profit.release(
+                db, guard, _cancel_stop_order(db, user))) or released
             guard.tp_qty = None
 
         # Market exit of this rung's slice.
         p.quantity = plan.sell_qty
+        if _is_cut(signal):
+            # The trader is cutting: this exit must not fail on something we
+            # can see coming. Let the cancels above clear (a broker frees the
+            # contracts only once a cancel completes), then sell what is REALLY
+            # held now — a stop or take-profit may have filled in the meantime,
+            # and selling the old size would be refused or go short.
+            held_now = _cut_held_now(db, resolved, p, released)
+            if held_now is not None:
+                if held_now <= 0:
+                    msg.status = DiscordMessageStatus.PARSED
+                    msg.status_reason = "Cut — nothing left to sell (already closed at the broker)."
+                    return
+                p.quantity = min(p.quantity, held_now)
+            if discord_channel_settings.exits_manual(exit_ts):
+                detail += (" · " if detail else "") + "cut — sold although exits are manual (Auto exit on cut)"
         is_trim = not plan.retire
         trim_guard = guard if is_trim else None
         final_guard = guard if plan.retire else None
@@ -2628,13 +2679,16 @@ def _execute_signal(
             skip_fanout=True,
         )
     except HTTPException as exc:
-        if trim_guard is not None:
-            # The slice was never sold, so don't spend the trim step on it.
-            guards.rollback_exit(trim_guard)
-        _reopen(final_guard)
-        discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
-        log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
-        return
+        order = _retry_cut_below_the_bid(
+            db, user, msg, signal, resolved, exc, background, request, is_trim)
+        if order is None:
+            if trim_guard is not None:
+                # The slice was never sold, so don't spend the trim step on it.
+                guards.rollback_exit(trim_guard)
+            _reopen(final_guard)
+            discord_execution.mark_failed(msg, f"Broker rejected the order: {exc.detail}")
+            log.warning("discord: placement failed for alert %s — %s", msg.id, exc.detail)
+            return
     except Exception as exc:  # noqa: BLE001
         if trim_guard is not None:
             guards.rollback_exit(trim_guard)
@@ -2765,6 +2819,98 @@ def _is_self_alert(db: Session, msg: DiscordMessage) -> bool:
     return src is not None and src.channel_id == _SELF_CHANNEL_ID
 
 
+_CUT_ACTIONS = ("CUTTING", "CUTTING_PART")
+# A broker frees the contracts a cancelled order held only once the cancel
+# completes; a sell placed in the same instant is refused as over-selling.
+_CUT_SETTLE_S = 0.6
+
+
+def _cut_held_now(db: Session, resolved, p, released: bool) -> Decimal | None:
+    """How much of this contract is held right now, read from the broker — after
+    a short pause when resting orders were just cancelled. None when it can't be
+    read (the exit then goes out at the size already worked out)."""
+    from app.brokers import adapter_for  # noqa: PLC0415
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.services.crypto import decrypt_json  # noqa: PLC0415
+
+    if released:
+        time.sleep(_CUT_SETTLE_S)
+    try:
+        acct = db.get(BrokerAccount, resolved.broker_account_id)
+        adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        for pos in adapter.get_positions():
+            if ((pos.symbol or "").upper() == (p.symbol or "").upper()
+                    and pos.option_strike == p.option_strike
+                    and getattr(pos.option_right, "value", pos.option_right)
+                    == getattr(p.option_right, "value", p.option_right)
+                    and pos.option_expiry == p.option_expiry):
+                return abs(Decimal(str(pos.quantity)))
+        return Decimal(0)
+    except Exception:  # noqa: BLE001
+        log.warning("discord: could not re-read %s before the cut", p.symbol, exc_info=True)
+        return None
+
+
+def _below_the_bid(p) -> Decimal | None:
+    """A limit that sells NOW: 10% under the bid (Alpaca data account), floored
+    at a cent. A sell limit below the bid fills at the bid — a market order in
+    all but name, and one a broker that refuses MARKET on a thin contract or a
+    halt will take. None when there is no quote."""
+    from app.brokers.alpaca import build_occ_symbol  # noqa: PLC0415
+    from app.services import market_data_stream  # noqa: PLC0415
+
+    try:
+        occ = build_occ_symbol(p.symbol, p.option_expiry, p.option_strike,
+                               getattr(p.option_right, "value", p.option_right))
+        bid, _ask = market_data_stream.data_option_bid_ask(occ)
+    except Exception:  # noqa: BLE001
+        bid = None
+    if bid is None or bid <= 0:
+        return None
+    return max(Decimal("0.01"), (Decimal(str(bid)) * Decimal("0.9")).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN))
+
+
+def _is_cut(signal) -> bool:
+    """The trader said they are cutting (cut_intent: a committed cut, full or
+    partial) — not a trim alert, not a stop-out."""
+    return (signal or {}).get("source_action") in _CUT_ACTIONS
+
+
+def _cut_overrides_manual(ts, signal) -> bool:
+    """Manual exits, but this is the trader's cut and the channel's "Auto exit
+    on cut" is ticked (the default): sell anyway."""
+    return _is_cut(signal) and discord_channel_settings.cut_exits(ts)
+
+
+def _retry_cut_below_the_bid(db, user, msg, signal, resolved, exc, background, request, is_trim):
+    """A cut's MARKET sell the broker refused as an order TYPE (a thin contract,
+    a halt — "does not support market", "place a limit order"): send it once more
+    as a limit under the bid, which sells at once. Returns the order, or None
+    (the caller then records the original refusal)."""
+    from app.api.positions import _market_order_type_refused  # noqa: PLC0415
+    from app.api.trades import _place_trader_order  # noqa: PLC0415
+
+    p = resolved.payload
+    if not (_is_cut(signal) and resolved.is_closing and p.order_type == OrderType.MARKET
+            and _market_order_type_refused(str(exc.detail))):
+        return None
+    price = _below_the_bid(p)
+    if price is None:
+        return None
+    resolved.payload = p.model_copy(update={"order_type": OrderType.LIMIT, "limit_price": price})
+    log.info("discord: cut %s refused at market (%s) — retrying as a limit at %s",
+             p.symbol, str(exc.detail)[:120], price)
+    try:
+        return _place_trader_order(
+            db, user, resolved.payload, resolved.broker_account_id, background, request,
+            resolve_wash_trade=True, partial_close=is_trim, skip_fanout=True,
+        )
+    except Exception as retry_exc:  # noqa: BLE001
+        log.warning("discord: cut %s refused again as a limit — %s", p.symbol, retry_exc)
+        return None
+
+
 def _channel_exits_manual(db: Session, user: User, msg: DiscordMessage) -> bool:
     """Does the alert's own channel leave exits to the trader? Never true for
     the Self channel: an exit typed there is the trader closing by hand."""
@@ -2803,11 +2949,13 @@ def _close_all_from_channel(
     what = f"{sig.get('symbol')} {(sig.get('option_type') or '').lower() + 's' if sig.get('option_type') else 'options'}"
     # Everything this closes was opened by this channel, so its settings decide:
     # with Manual exits a stop-out is recorded and nothing is sold.
-    if _channel_exits_manual(db, user, msg):
+    if _channel_exits_manual(db, user, msg) and not (_is_cut(sig) and _cut_overrides_manual(
+            discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None)), sig)):
         msg.status = DiscordMessageStatus.PARSED
         msg.status_reason = (
-            f"Exits are manual for this channel — this stop-out of {what} was not acted on. "
-            "Close it from Positions."
+            f"Exits are manual for this channel — this {'cut' if _is_cut(sig) else 'stop-out'} "
+            f"of {what} was not acted on. Close it from Positions"
+            + (", or tick Auto exit on cut." if _is_cut(sig) else ".")
         )
         return
     try:

@@ -58,7 +58,7 @@ const EXIT_MODES: { value: ExitMode; label: string; detail: string; toast: strin
     detail: "Each trim rests at the broker as a take-profit order, with its stop linked. Webull options; on other brokers it works like Auto trim.",
     toast: "Take-profit orders on — each trim rests at the broker at its Profit target" },
   { value: "manual", label: "Manual",
-    detail: "Kopyya never sells. Exit alerts are recorded but not acted on — you close from Positions.",
+    detail: "Kopyya never sells. Exit alerts are recorded but not acted on — you close from Positions (unless Auto exit on cut is ticked).",
     toast: "Manual exits — exit alerts are ignored; close from Positions" },
 ];
 
@@ -71,6 +71,8 @@ type DiscordSettings = {
   /** How a position leaves: on the channel's exit alerts, by auto-trim, or
    *  never on its own (the trader closes it). */
   exit_mode?: ExitMode;
+  /** With Manual exits: still sell when the trader says they are cutting. */
+  cut_exits?: boolean;
   /** The whole exit ladder, in order — any number of trims. */
   trims?: TrimRow[];
   /** "On Fill" stop as a return from entry; null = no stop until the first trim. */
@@ -299,6 +301,7 @@ export default function DiscordPage() {
   const [liveTrading, setLiveTrading] = useState(false);
   const [exitMode, setExitMode] = useState<ExitMode>("alerts");
   const [exitModeBusy, setExitModeBusy] = useState(false);
+  const [cutExits, setCutExits] = useState(true);
   // Which tab of the exits card is open, and which engine actually runs.
   const [exitTab, setExitTab] = useState<"ladder" | "ai">("ladder");
   const [exitEngine, setExitEngine] = useState<"ladder" | "ai">("ladder");
@@ -384,6 +387,7 @@ export default function DiscordPage() {
       setExecMode(settings.execution_mode);
       setLiveTrading(!!settings.live_trading);
       setExitMode(settings.exit_mode ?? (settings.auto_trim ? "auto" : "alerts"));
+      setCutExits(settings.cut_exits ?? true);
       setQtyMultiplier(settings.quantity_multiplier || 1);
 
       const prev = savedRef.current;
@@ -1775,10 +1779,35 @@ export default function DiscordPage() {
                     })}
                   </div>
                   {exitMode === "manual" && (
-                    <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
-                      The trims below are not used while exits are Manual — except for an exit you
-                      type into the alert composer yourself, which still runs on them.
-                    </p>
+                    <>
+                      <label className="mt-2 flex items-start gap-2 text-[12px] cursor-pointer select-none"
+                             style={{ color: "var(--text)" }}>
+                        <input
+                          type="checkbox"
+                          className="mt-0.5 accent-[var(--accent)]"
+                          checked={cutExits}
+                          disabled={modeBusy}
+                          onChange={(e) => {
+                            const v = e.target.checked;
+                            setCutExits(v);
+                            void saveSizing({ cut_exits: v });
+                          }}
+                        />
+                        <span>
+                          <span className="font-medium">Auto exit on cut</span>
+                          <span className="block text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                            When the trader says they&rsquo;re cutting (&ldquo;Cutting here&rdquo;, &ldquo;Cut half&rdquo;),
+                            sell at market anyway — the whole position, or the share they name. Talk like
+                            &ldquo;I may cut&rdquo; or &ldquo;will cut if it breaks 720&rdquo; never sells. A position
+                            assigned to Self is still left to you.
+                          </span>
+                        </span>
+                      </label>
+                      <p className="mt-2 text-[11px] leading-snug" style={{ color: "var(--muted)" }}>
+                        The trims below are not used while exits are Manual — except for an exit you
+                        type into the alert composer yourself, which still runs on them.
+                      </p>
+                    </>
                   )}
 
                   {/* One ROW per stage, one COLUMN per setting — read across a

@@ -216,6 +216,13 @@ class TraderSettings(Base, TimestampMixin):
     discord_manual_exit: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False,
     )
+    # With Manual exits: "Auto exit on cut". When the trader says they are
+    # CUTTING (discord_parsers.cut_intent — a committed cut, full or partial),
+    # sell anyway: it is the trader telling you to get out. Default on. A
+    # position assigned to Self is still left alone.
+    discord_cut_exits: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False,
+    )
 
     # How much of what is STILL HELD each rung sells. Of the remainder, not of
     # the original position — that is what makes the rungs compose: 50/50/100
