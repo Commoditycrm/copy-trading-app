@@ -65,6 +65,7 @@ CHANNEL_FIELDS = (
     # in _ADDED_LATER: it was account-wide first, so a channel whose own copy
     # predates it keeps the account's choice until it sets its own.
     "discord_last_day_risky",
+    "discord_cut_exits",
 )
 _FIELDS = frozenset(CHANNEL_FIELDS)
 
@@ -82,6 +83,8 @@ _ADDED_LATER: dict[str, Any] = {
     "discord_size_mode": "contracts",
     "discord_size_dollars": None,
     "discord_size_cap": None,
+    # A channel whose own copy predates it reads the default — ticked.
+    "discord_cut_exits": True,
 }
 
 
@@ -213,6 +216,14 @@ def exits_manual(ts: Any) -> bool:
     channel's own)? Then nothing sells on its own: not an exit alert, not
     auto-trim, not AI trimming."""
     return bool(ts is not None and getattr(ts, "discord_manual_exit", False))
+
+
+def cut_exits(ts: Any) -> bool:
+    """With Manual exits, does a trader's committed cut still sell? Default yes."""
+    if ts is None:
+        return True
+    value = getattr(ts, "discord_cut_exits", True)
+    return True if value is None else bool(value)
 
 
 def exit_mode(ts: Any) -> str:

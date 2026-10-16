@@ -455,6 +455,8 @@ class DiscordSettingsOut(BaseModel):
     # "manual" (Kopyya never sells; the trader closes it).
     # … or "orders": each trim rests at the broker as a take-profit order.
     exit_mode: Literal["alerts", "auto", "orders", "manual"] = "alerts"
+    # With Manual exits: still sell when the trader says they are cutting.
+    cut_exits: bool = True
     # Contracts per alert, as a multiple of the alert's own size (1..10).
     quantity_multiplier: int = 1
     # "contracts" (quantity_multiplier per entry) or "dollars" (size_dollars per
@@ -518,6 +520,7 @@ class DiscordSettingsIn(BaseModel):
     # Sets auto_trim and manual exits together; wins over auto_trim when both
     # are sent.
     exit_mode: Literal["alerts", "auto", "orders", "manual"] | None = None
+    cut_exits: bool | None = None
     quantity_multiplier: int | None = Field(default=None, ge=1, le=10)
     size_mode: Literal["contracts", "dollars"] | None = None
     # Dollars per entry; "" clears it.
