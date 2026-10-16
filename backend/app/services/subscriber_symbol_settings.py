@@ -97,7 +97,11 @@ _LADDER_DEFAULTS: dict[str, Any] = {
     # Sizing, for a subscriber whose row has no discord_* columns: one contract
     # per entry and no cap — what active_sizing() treats as the default.
     "discord_quantity_multiplier": 1,
-    "discord_size_mode": "contracts",
+    # Dollars, not contracts: an amount per entry is what a subscriber coming
+    # from a multiplier expects, and it needs no contract count chosen first.
+    # Safe as a default — active_sizing only takes the dollars branch once an
+    # AMOUNT is set, so an unconfigured scope still sizes as one contract.
+    "discord_size_mode": "dollars",
     "discord_size_dollars": None,
     "discord_size_cap": "none",
     "discord_max_per_contract": None,
