@@ -1738,7 +1738,25 @@ export const OpenPositionsTable = forwardRef<
                         </span>
                       </td>
                     ),
-                    qty: <td className="px-5 py-3.5 num">{fmtNum(String(Math.abs(qtyNum)), 0)}</td>,
+                    // Show the quantity actually held. This rendered with 0
+                    // decimals, so a fractional stock position read as a whole
+                    // one: 4.75 shares displayed as "5", while Close Qty
+                    // correctly offered 4.75 to flatten it. The two disagreed
+                    // on screen and the Qty column was the one lying — worse
+                    // than cosmetic, since someone reading "5" would think a
+                    // 5-share sell closes the position when it would short it.
+                    // Whole holdings still render clean; only a genuinely
+                    // fractional one shows decimals, trimmed of trailing zeros.
+                    qty: (() => {
+                      const held = Math.abs(qtyNum);
+                      return (
+                        <td className="px-5 py-3.5 num">
+                          {Number.isInteger(held)
+                            ? fmtNum(String(held), 0)
+                            : fmtNum(String(held), 4).replace(/\.?0+$/, "")}
+                        </td>
+                      );
+                    })(),
                     side: (() => {
                       const dirLong = positionDirection(p) === "long";
                       return (
