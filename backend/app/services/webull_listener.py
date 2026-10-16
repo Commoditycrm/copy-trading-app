@@ -31,6 +31,7 @@ import logging
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -48,7 +49,7 @@ from app.models.order import (
     OrderType,
 )
 from app.models.user import User, UserRole
-from app.services import listener_state, order_intent
+from app.services import listener_state, market_hours, order_intent
 from app.brokers.webull import _first, _looks_like_occ  # noqa: PLC2701
 from app.services.crypto import decrypt_json
 
@@ -62,6 +63,8 @@ logging.getLogger("webull.core.http.initializer.client_initializer").setLevel(lo
 # ── module state (same shape as the other listeners) ────────────────────────
 _main_loop: asyncio.AbstractEventLoop | None = None
 _tasks: dict[uuid.UUID, asyncio.Task] = {}
+# (eventType, subscribeType) combinations already reported — one INFO each.
+_seen_event_shapes: set[tuple[str, str]] = set()
 # The live stoppable gRPC client per trader — do_subscribe() blocks in a thread
 # and an asyncio cancel can't interrupt that thread, so we keep the client to
 # call request_stop() (closes the channel + breaks the retry loop).
@@ -98,7 +101,180 @@ _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
 
 get_status = listener_state.get_status
-_set_state = listener_state.set_state
+
+
+def _set_state(trader_user_id: uuid.UUID, state: str, *, error: str | None = None) -> None:
+    """listener_state.set_state, except that a stream the watchdog has caught
+    being silent stays "silent" when a (re)subscribe reports "connected". A
+    fresh subscription is not proof the stream works — that is exactly what QA
+    saw after the 11:41 redeploy (2026-10-14) — so only a real stream frame
+    (_watchdog_stream_frame) clears it."""
+    with _wd_lock:
+        silent_reason = _stream_silent.get(trader_user_id)
+    if state == "connected" and silent_reason is not None:
+        state, error = STREAM_SILENT, silent_reason
+    listener_state.set_state(trader_user_id, state, error=error)
+
+
+# ── stream silence watchdog ──────────────────────────────────────────────────
+# do_subscribe() only returns on a drop or an error, so a stream that is
+# connected but delivers nothing is never recycled on its own. On QA,
+# 2026-10-14, the stream went quiet at 11:10 ET and stayed "connected" while
+# every order arrived via the poller ~10s late. The poller is our witness: when
+# it sees a fill or cancel that the stream has not delivered, that is a miss.
+# Enough misses in a row and we drop the subscription so _run_listener builds a
+# fresh one. Any stream frame proves the stream is alive and resets everything.
+STREAM_SILENT = "silent"
+_STREAM_SILENT_MESSAGE = (
+    "Webull's event stream is connected but has stopped delivering orders; "
+    "orders are arriving by polling (~5-10s slower). Missed {misses} "
+    "order update(s) in a row."
+)
+# Seconds the stream gets, after the poller sees a change, to deliver it too.
+_WD_GRACE_S = 10.0
+# Misses in a row (no stream frame in between) that force a resubscribe.
+_WD_MISSES = 3
+# ...or this many misses once the stream has been quiet for _WD_WINDOW_S.
+_WD_WINDOW_MISSES = 2
+_WD_WINDOW_S = 900.0
+# Never resubscribe more often than this, however many misses pile up.
+_WD_RESUBSCRIBE_GAP_S = 300.0
+# Per-order timestamps older than this are pruned (day orders; bounded memory).
+_WD_PRUNE_S = 3600.0
+# Statuses Webull is known to PUSH on the stream. It does not push the initial
+# new-order ack (see test_webull_stream_poll_logging.py), so a resting order
+# the poller sees first is NOT a miss — counting it would flag healthy streams.
+_WD_STREAMED = (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED, OrderStatus.CANCELED)
+# Nor does it push ANY event for an order whose client_order_id is a dashed,
+# 36-char UUID. Some Webull-app orders get one (others get 32 hex, as our own
+# OpenAPI orders do). Seen live on QA, 2026-10-14: since 12:11 ET 0 of ~15 such
+# events streamed while every 32-hex order streamed within a second. Counting
+# them flagged a healthy stream "silent" and resubscribed it for nothing.
+_UNSTREAMED_CLIENT_ID_LEN = 36
+
+
+def _webull_streams(client_order_id: Any) -> bool:
+    coid = str(client_order_id or "").strip()
+    return not (len(coid) == _UNSTREAMED_CLIENT_ID_LEN and coid.count("-") == 4)
+
+
+@dataclass
+class _Watchdog:
+    since: float                                   # watchdog started (silence reference before any frame)
+    last_frame_at: float | None = None             # last real stream ORDER frame
+    stream_at: dict[str, float] = field(default_factory=dict)   # oid → last stream frame
+    poll_at: dict[str, float] = field(default_factory=dict)     # oid → last poll change
+    pending: dict[str, float] = field(default_factory=dict)     # oid → deadline for the stream
+    misses: int = 0
+    last_resubscribe_at: float | None = None
+
+
+# Stream frames arrive on the gRPC thread, poll changes on the loop: one lock.
+_wd_lock = threading.Lock()
+_watchdogs: dict[uuid.UUID, _Watchdog] = {}
+# trader → last_error to show while the stream is known silent. Sticky across a
+# resubscribe; cleared only by a stream frame or stop_listener.
+_stream_silent: dict[uuid.UUID, str] = {}
+
+
+def _wd(trader_user_id: uuid.UUID, now: float) -> _Watchdog:
+    w = _watchdogs.get(trader_user_id)
+    if w is None:
+        w = _watchdogs[trader_user_id] = _Watchdog(since=now)
+    return w
+
+
+def _watchdog_stream_frame(trader_user_id: uuid.UUID, order_id: str,
+                           now: float | None = None) -> None:
+    """A real stream ORDER frame arrived: the stream is alive."""
+    now = time.monotonic() if now is None else now
+    with _wd_lock:
+        w = _wd(trader_user_id, now)
+        w.last_frame_at = now
+        w.stream_at[order_id] = now
+        w.pending.clear()
+        w.misses = 0
+        was_silent = _stream_silent.pop(trader_user_id, None) is not None
+    if was_silent:
+        log.info("webull-listener[%s] stream delivering again; clearing silent", trader_user_id)
+        _set_state(trader_user_id, "connected")
+
+
+def _watchdog_poll_change(trader_user_id: uuid.UUID, order_id: str,
+                          prev_status: str | None, new_status: str | None,
+                          now: float | None = None, client_order_id: Any = None) -> None:
+    """The poller is about to act on a change to ``order_id``. If it is a status
+    the stream should have pushed and the stream has not delivered this order
+    since the poller last saw it change, give the stream _WD_GRACE_S to catch up
+    before calling it a miss (see _watchdog_tick)."""
+    now = time.monotonic() if now is None else now
+    new = _map_status(new_status)
+    changed = prev_status is None or _map_status(prev_status) != new
+    with _wd_lock:
+        w = _wd(trader_user_id, now)
+        prev_poll = w.poll_at.get(order_id)
+        w.poll_at[order_id] = now
+        if not changed or new not in _WD_STREAMED or not _webull_streams(client_order_id):
+            return
+        streamed = w.stream_at.get(order_id)
+        if streamed is not None and (prev_poll is None or streamed >= prev_poll):
+            return  # the stream already delivered it
+        w.pending.setdefault(order_id, now + _WD_GRACE_S)
+
+
+def _watchdog_tick(trader_user_id: uuid.UUID, now: float | None = None) -> None:
+    """Expire overdue pendings into misses and, past the threshold, mark the
+    stream silent and force a resubscribe (rate-limited). Runs once per poll
+    cycle, on the loop."""
+    now = time.monotonic() if now is None else now
+    with _wd_lock:
+        w = _watchdogs.get(trader_user_id)
+        if w is None:
+            return
+        for oid, deadline in list(w.pending.items()):
+            if deadline <= now:
+                del w.pending[oid]
+                w.misses += 1
+        cutoff = now - _WD_PRUNE_S
+        for m in (w.stream_at, w.poll_at):
+            for oid in [k for k, t in m.items() if t < cutoff]:
+                del m[oid]
+        misses = w.misses
+        quiet_s = now - (w.last_frame_at if w.last_frame_at is not None else w.since)
+        trip = misses >= _WD_MISSES or (misses >= _WD_WINDOW_MISSES and quiet_s >= _WD_WINDOW_S)
+        live = _clients.get(trader_user_id)
+        if not trip or live is None:
+            # No live client = _run_listener is already reconnecting (or the key
+            # is in use elsewhere); leave the state to it.
+            return
+        reason = _STREAM_SILENT_MESSAGE.format(misses=misses)
+        announce = _stream_silent.get(trader_user_id) != reason
+        _stream_silent[trader_user_id] = reason
+        can_resubscribe = (w.last_resubscribe_at is None
+                           or now - w.last_resubscribe_at >= _WD_RESUBSCRIBE_GAP_S)
+        client = live if can_resubscribe else None
+        if client is not None:
+            w.last_resubscribe_at = now
+            w.misses = 0   # the next run of misses is judged against the new subscription
+    if announce:
+        _set_state(trader_user_id, STREAM_SILENT, error=reason)
+    if client is None:
+        return
+    log.warning(
+        "webull-listener[%s] stream connected but silent: %d order update(s) in a row "
+        "arrived by poll only (no stream frame for %.0fs); forcing a resubscribe",
+        trader_user_id, misses, quiet_s,
+    )
+    try:
+        client.request_stop()   # do_subscribe returns → _run_listener reconnects
+    except Exception:  # noqa: BLE001
+        log.exception("webull-listener[%s] resubscribe request_stop failed", trader_user_id)
+
+
+def _watchdog_clear(trader_user_id: uuid.UUID) -> None:
+    with _wd_lock:
+        _watchdogs.pop(trader_user_id, None)
+        _stream_silent.pop(trader_user_id, None)
 
 # Webull allows ONE live events subscription per app key. A second one — the
 # same key active in another environment (QA and local, QA and prod) or another
@@ -180,6 +356,69 @@ def _safe_poll_interval(num_accounts: int) -> float:
     return max(_poll_interval(), _DAYORDERS_PER_ACCOUNT_S * max(1, num_accounts))
 
 
+def _has_working_orders(trader_user_id: uuid.UUID) -> bool:
+    """True if the trader has any still-working order — SUBMITTED / ACCEPTED /
+    PARTIALLY_FILLED, the module's existing ``_WORKING`` set (not a new status
+    list). Only consulted while the market is CLOSED, to choose between the slow
+    idle cadence and a faster one that keeps monitoring outstanding orders. On
+    any DB error, assume True (the safer, faster side)."""
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+        with SessionLocal() as db:
+            row = db.execute(
+                select(Order.id)
+                .where(Order.user_id == trader_user_id,
+                       Order.status.in_(_WORKING))
+                .limit(1)
+            ).first()
+            return row is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# Absolute floor for the closed-market cadence, so a bad config value (0,
+# negative, etc.) can never collapse the poll into a tight loop. Also guarded by
+# the max(base, …) rate-limit floor below.
+_MIN_CLOSED_POLL_S = 5.0
+
+
+def _sane_closed_interval(value: float, fallback: float) -> float:
+    """A configured closed-market interval, floored to a safe minimum. Any
+    non-positive / invalid value falls back to ``fallback`` then the floor."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = fallback
+    if v <= 0:
+        v = fallback
+    return max(_MIN_CLOSED_POLL_S, v)
+
+
+def _poll_plan(num_accounts: int, trader_user_id: uuid.UUID) -> tuple[float, str, bool]:
+    """Decide this cycle's poll cadence. Returns (interval, market_session,
+    active_orders). Full rate while the market is tradable (pre-market, regular,
+    after-hours); when CLOSED, back off to the idle interval — or the faster
+    'active' interval if the trader still has working orders. Never below the
+    rate-limit floor (``_safe_poll_interval``)."""
+    base = _safe_poll_interval(num_accounts)
+    session = market_hours.market_session()
+    if session != market_hours.CLOSED:
+        return base, session, False
+    from app.config import get_settings  # noqa: PLC0415
+    s = get_settings()
+    active = _has_working_orders(trader_user_id)
+    closed = _sane_closed_interval(
+        s.webull_poll_interval_closed_active_seconds if active else s.webull_poll_interval_closed_seconds,
+        20.0 if active else 120.0,
+    )
+    return max(base, closed), session, active
+
+
+def _effective_poll_interval(num_accounts: int, trader_user_id: uuid.UUID) -> float:
+    """The effective poll interval for this cycle (see ``_poll_plan``)."""
+    return _poll_plan(num_accounts, trader_user_id)[0]
+
+
 # ── credentials ─────────────────────────────────────────────────────────────
 def _all_account_ids(creds: dict[str, Any]) -> list[str]:
     """All of the trader's Webull account_ids. A trader often has several
@@ -252,18 +491,32 @@ def _build_stoppable_client(creds: dict[str, Any]):
                     pass
 
         def _build_request(self, app_key, app_secret, accounts):  # noqa: D401 — override
-            # Webull Support (ticket, 2026-08): the ONLY supported subscribeType
-            # is 1. The bundled SDK hardcodes 7 (with a now-stale "1 2 4 allowed"
-            # comment); the gRPC endpoint rejects that, so NO trade events ever
-            # arrive. Rebuild the request with subscribeType=1 — everything else
-            # mirrors the SDK's _build_request (sign → metadata), minus its debug
-            # prints. Ref: developer.webull.com/apis/docs/reference/custom/subscribe-trade-events
+            # subscribeType is a BITMASK, not an enum (Webull Support, ticket
+            # 2026-10, Kobe):
+            #
+            #     1 (0b001)  order events — EQUITIES ONLY
+            #     2 (0b010)  position events
+            #     4 (0b100)  option / PnL events
+            #
+            # so 7 = 1|2|4 = everything, which is the SDK's own default and what
+            # we must send. An earlier reply from the same vendor said 1 was the
+            # only supported value; we believed it, forced 1 here, and the
+            # gateway then filtered out every OPTION event at the source. The
+            # stream authenticated, echoed back "subscribeType: 1", sent Pings
+            # forever and delivered nothing, because this account trades options.
+            # 193 orders over 48h produced zero frames. Do not "simplify" this
+            # back to 1: on an options book that is indistinguishable from the
+            # push scope being switched off.
+            #
+            # The override itself now only exists to drop the SDK's debug prints;
+            # the subscribeType it builds matches the SDK default.
+            # Ref: developer.webull.com/apis/docs/reference/custom/subscribe-trade-events
             import time as _time  # noqa: PLC0415
             import webull.trade.events.events_pb2 as _pb  # noqa: PLC0415
             from webull.core.auth.algorithm import sha_hmac256_new  # noqa: PLC0415
             from webull.trade.events.signature_composer import calc_signature  # noqa: PLC0415
             request = _pb.SubscribeRequest(
-                subscribeType=1,
+                subscribeType=_SUBSCRIBE_ALL,
                 timestamp=int(_time.time() * 1000),  # millis
                 accounts=accounts,
             )
@@ -296,6 +549,15 @@ def _build_stoppable_client(creds: dict[str, Any]):
     host = WEBULL_PAPER_EVENTS_HOST if creds.get("paper") else None
     return _StoppableTradeEvents(creds["app_key"], creds["app_secret"],
                                  creds.get("region_id", "us"), host)
+
+
+# subscribeType bitmask on the gRPC event stream (Webull Support, 2026-10).
+# ORDER events for OPTIONS arrive under 4, not 1 — 1 is equities only — so an
+# options book subscribed with 1 alone receives nothing at all.
+_SUB_ORDERS_EQUITY = 1
+_SUB_POSITIONS = 2
+_SUB_OPTIONS_PNL = 4
+_SUBSCRIBE_ALL = _SUB_ORDERS_EQUITY | _SUB_POSITIONS | _SUB_OPTIONS_PNL   # 7
 
 
 # ── order mapping + option resolution (Stage 3 live path) ───────────────────
@@ -526,7 +788,7 @@ def _is_option_payload(payload: dict) -> bool:
 
 def _persist_and_fanout(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID,
-    creds: dict[str, Any], payload: dict,
+    creds: dict[str, Any], payload: dict, via: str = "poll",
 ) -> None:
     """Live path (shadow OFF only): persist the trader's Webull order and hand
     NEW ones to the fanout — mirrors snaptrade_listener._persist_and_fanout
@@ -593,6 +855,12 @@ def _persist_and_fanout(
                     trader_user_id, existing.id, existing.broker_order_id, client_oid,
                 )
                 existing.broker_order_id = client_oid
+            # The broker's own fill time. The stream carries filled_time and we
+            # were dropping it on the floor, so trader fill latency could not be
+            # measured at all — closed_at is OUR clock, not Webull's.
+            _bft = _parse_wb_time(payload.get("filled_time"))
+            if _bft is not None and existing.broker_filled_at is None:
+                existing.broker_filled_at = _bft
             was_working = existing.status in _WORKING
             # Did THIS event flip the order to FILLED? Used to fire the Discord
             # alert exactly once on the fill transition (not on later quiescent
@@ -601,6 +869,22 @@ def _persist_and_fanout(
                 existing.status != OrderStatus.FILLED
                 and status_enum == OrderStatus.FILLED
             )
+
+            # Which path detected this order — and for a FILL specifically, the
+            # only transition whose latency matters.
+            #
+            # Two earlier attempts measured the wrong thing. Stamping on EVERY
+            # event meant the 5s poller overwrote the stream moments later and
+            # everything read "poll". Stamping only the FIRST event meant the
+            # label was set at SUBMIT — again by the poller — so a fill pushed
+            # over the stream could never change it, and fills read "poll" even
+            # while fill frames were demonstrably arriving.
+            #
+            # So: the fill transition always (re)stamps, because "who told us it
+            # filled" is the question; anything else stamps only to fill a blank,
+            # so a cancelled or still-working order still reports something.
+            if became_filled or existing.detected_via is None:
+                existing.detected_via = via
 
             # ── Trader MODIFY: still-working terms changed → propagate as a
             # cancel-replace onto the mirrors (only when the event carries the
@@ -671,6 +955,23 @@ def _persist_and_fanout(
                     discord_alerts.emit_trader_fill_alert(existing.id)
                 except Exception:  # noqa: BLE001
                     log.exception("webull-listener discord alert failed for %s", existing.id)
+
+            # A SELL that just filled — a take-profit, a stop, a trim — moves the
+            # Discord ladder: the trim is credited and the stop for what is left
+            # goes on. That happens in the P&L poller's pass, which on Webull is
+            # every 15s; make this account due NOW so it runs within a second of
+            # the stream's fill. QA 2026-10-16, QQQ 720P: Trim 1 filled at
+            # 10:42:29 (stream), its trailing stop went on at 10:42:44 — by
+            # then the price had fallen through it. Only makes the account due
+            # (no broker call here); a no-op without a ladder to move.
+            if became_filled and existing.side == OrderSide.SELL:
+                try:
+                    from app.services import pnl_poller  # noqa: PLC0415
+
+                    pnl_poller.poll_now(existing.broker_account_id)
+                except Exception:  # noqa: BLE001
+                    log.warning("webull-listener: could not wake the P&L pass for %s",
+                                existing.id, exc_info=True)
 
             # ── Trader CANCEL → cascade-cancel the subscriber mirrors ──
             if was_working and status_enum == OrderStatus.CANCELED:
@@ -770,6 +1071,8 @@ def _persist_and_fanout(
             limit_price=_dec(payload.get("limit_price")),
             stop_price=_dec(payload.get("stop_price")),
             is_closing=False,   # fanout detects close per-subscriber from held qty
+            detected_via=via,
+            broker_filled_at=_parse_wb_time(payload.get("filled_time")),
             status=status_enum,
             filled_quantity=_dec(payload.get("filled_qty")) or Decimal(0),
             filled_avg_price=_dec(payload.get("filled_price")),
@@ -1060,6 +1363,7 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
     interval = _safe_poll_interval(len(account_ids))
     log.info("webull-poll[%s] started; interval=%.1fs (%d account(s), 10-req/30s cap) accounts=%s",
              trader_user_id, interval, len(account_ids), account_ids)
+    _last_cadence_log: tuple[str, float] | None = None  # (session, interval) last logged
 
     while True:
         try:
@@ -1081,6 +1385,22 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             # the 3rd 429'd 32×/hr, 2026-08-13). One call every interval/N keeps
             # the window under the cap. Per-account poll frequency is unchanged
             # (still once per `interval`), so detection latency is too.
+            #
+            # Recompute the cadence every cycle so it tracks market state: full
+            # rate during regular + extended hours, and a backed-off idle rate
+            # overnight / weekends (faster if the trader still has working
+            # orders). Returns to full rate automatically in pre-market.
+            interval, _session, _active = _poll_plan(len(account_ids), trader_user_id)
+            # Log the cadence only when the session OR the effective interval
+            # changes — not every cycle. Lets you see the open→closed backoff
+            # (and the active-order speed-up) without flooding the log.
+            if _last_cadence_log != (_session, interval):
+                log.info(
+                    "webull-poll[%s] worker=webull_order_poll market_session=%s "
+                    "active_orders=%s poll_interval=%.0fs",
+                    trader_user_id, _session, _active, interval,
+                )
+                _last_cadence_log = (_session, interval)
             gap = interval / max(1, len(account_ids))
             orders: list[dict] = []
             for aid in account_ids:
@@ -1092,7 +1412,10 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
             # HISTORY (never to be replayed) and which are live work we should
             # keep tracking. Everything not baselined falls through to the normal
             # per-order handling below on this very cycle.
-            if trader_user_id not in _poll_baseline:
+            # Catch-up orders on this cycle predate the stream, so the silence
+            # watchdog does not judge it.
+            first_cycle = trader_user_id not in _poll_baseline
+            if first_cycle:
                 _baseline, _pre = await asyncio.to_thread(
                     _build_poll_baseline, trader_user_id, orders,
                 )
@@ -1116,14 +1439,24 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
                 if payload is None:
                     continue
                 fp = _order_fingerprint(payload)
-                if seen.get(oid) == fp:
+                prev_fp = seen.get(oid)
+                if prev_fp == fp:
                     continue  # nothing mutable changed since we last acted on it
                 seen[oid] = fp
+                # Only while a stream is up: a gap during reconnect is not a miss.
+                if not first_cycle and trader_user_id in _clients:
+                    _watchdog_poll_change(
+                        trader_user_id, oid,
+                        prev_fp.split("|", 1)[0] if prev_fp is not None else None,
+                        payload.get("order_status"),
+                        client_order_id=payload.get("client_order_id"),
+                    )
                 # Run off the loop — persist/fanout does blocking DB I/O.
                 await asyncio.to_thread(
                     _on_order_event, trader_user_id, broker_account_id,
                     generation, creds, payload,
                 )
+            _watchdog_tick(trader_user_id)
             # No trailing sleep here — the per-account gaps above already paced
             # the full cycle (N × gap = interval).
             continue
@@ -1141,10 +1474,47 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
 def _on_order_event(
     trader_user_id: uuid.UUID, broker_account_id: uuid.UUID, generation: int,
     creds: dict[str, Any], payload: dict,
+    event_type: Any = None, subscribe_type: Any = None,
 ) -> None:
     """Runs in the gRPC callback thread. Shadow mode (default): log detection
     only — no DB writes, no fanout. Live mode: persist the trader order +
     fanout via ``_persist_and_fanout``."""
+    # We subscribe with the full bitmask (orders | positions | options/PnL), so
+    # three different frame shapes arrive here. Report each NEW combination once
+    # at INFO: we have never seen the position / PnL payloads, and guessing at
+    # their fields in code we cannot test is how the last round of this went.
+    # Where did this frame come from? The gRPC stream passes eventType /
+    # subscribeType; the REST poller calls us positionally and leaves both None.
+    # Without this the two are indistinguishable in the log — which cost an
+    # afternoon: a poller frame was read as proof the stream had come back.
+    _via = "poll" if event_type is None else "stream"
+
+    _shape = (str(event_type), str(subscribe_type))
+    if _shape not in _seen_event_shapes:
+        _seen_event_shapes.add(_shape)
+        log.info(
+            "webull-listener[%s] first %s frame eventType=%s subscribeType=%s; "
+            "keys=%s",
+            trader_user_id, _via, event_type, subscribe_type,
+            sorted(payload)[:20] if isinstance(payload, dict) else type(payload).__name__,
+        )
+
+    # One line per order frame, tagged with its source. The shape log above
+    # fires once per (eventType, subscribeType) then goes quiet — it answers
+    # "what shapes exist", not "which path saw this order, and is it flowing".
+    # The poller reaches here only on a new/changed order (its seen-map skips
+    # unchanged ones), so this is one line per detection/transition, not per
+    # cycle — INFO is affordable. Logging POLL too (the old code logged STREAM
+    # only) makes a placement the stream never delivered visible in the log,
+    # the same split the durable detected_via field records. STREAM stays the
+    # leading token so existing greps keep matching.
+    if isinstance(payload, dict):
+        log.info(
+            "webull-listener[%s] %s %s %s %s filled=%s@%s boid=%s",
+            trader_user_id, _via.upper(), payload.get("symbol"), payload.get("side"),
+            payload.get("order_status"), payload.get("filled_qty"),
+            payload.get("filled_price"), payload.get("order_id"),
+        )
     if log.isEnabledFor(logging.DEBUG) and isinstance(payload, dict):
         log.debug(
             "webull-listener[%s] event %s %s status=%s boid=%s",
@@ -1156,6 +1526,19 @@ def _on_order_event(
         return
     if not isinstance(payload, dict):
         return
+
+    # Only ORDER frames drive the order path. A position or PnL frame carries no
+    # order_id, and the rest of this function — status mapping, fanout, dedup by
+    # broker_order_id — is meaningless without one. Dropping them here keeps
+    # them out of the shadow log too, so that log stays a record of ORDERS.
+    if not str(payload.get("order_id") or "").strip():
+        return
+
+    # A real stream ORDER frame: the only thing that proves the stream is
+    # delivering. Pings never reach here; poll frames must not count.
+    if _via == "stream":
+        listener_state.bump_last_event(trader_user_id)
+        _watchdog_stream_frame(trader_user_id, str(payload.get("order_id")).strip())
 
     if _shadow():
         # Detection-only: log the event + end-to-end latency, nothing else.
@@ -1180,7 +1563,7 @@ def _on_order_event(
 
     # Live mode — persist + fanout. Isolated so a bad event can't kill the stream.
     try:
-        _persist_and_fanout(trader_user_id, broker_account_id, creds, payload)
+        _persist_and_fanout(trader_user_id, broker_account_id, creds, payload, via=_via)
     except Exception:  # noqa: BLE001
         log.exception(
             "webull-listener[%s] live persist/fanout failed for order %s",
@@ -1333,6 +1716,7 @@ def stop_listener(trader_user_id: uuid.UUID) -> None:
         ptask.cancel()
     _poll_baseline.pop(trader_user_id, None)
     _poll_status.pop(trader_user_id, None)
+    _watchdog_clear(trader_user_id)
     _set_state(trader_user_id, "disconnected")
 
 
@@ -1372,10 +1756,15 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
                 backoff = min(_BACKOFF_MAX, backoff * 2)
                 continue
 
+            # Keep eventType / subscribeType: with the full bitmask we now
+            # receive POSITION and OPTION/PnL frames alongside order frames, and
+            # the order path must be able to tell them apart rather than try to
+            # read every frame as an order.
             client.on_events_message = (
                 lambda et, st, payload, raw, _tid=trader_user_id,
                 _aid=broker_account_id, _gen=generation, _creds=creds:
-                _on_order_event(_tid, _aid, _gen, _creds, payload)
+                _on_order_event(_tid, _aid, _gen, _creds, payload,
+                                event_type=et, subscribe_type=st)
             )
             # Log SDK frames at the level the SDK assigns them: Pings are DEBUG
             # (hidden under the default INFO config, so no flood), while subscribe
@@ -1401,6 +1790,13 @@ async def _run_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID)
             try:
                 # Blocks until the stream ends (stopped, or a non-retryable error).
                 await asyncio.to_thread(client.do_subscribe, account_ids)
+            except Exception:
+                # We closed the channel ourselves (the silence watchdog's
+                # resubscribe); the SDK surfaces that as "Channel closed!".
+                # That is a clean stop, not an error to log and show.
+                stop = getattr(client, "_stop_event", None)
+                if stop is None or not stop.is_set():
+                    raise
             finally:
                 _clients.pop(trader_user_id, None)
 
@@ -1436,3 +1832,10 @@ __all__ = [
     "bind_loop", "start_all_listeners", "start_listener", "stop_listener",
     "stop_all_listeners", "has_running_listener", "running_trader_ids", "get_status",
 ]
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+_run_poller = webull_usage.tagged("Order poll")(_run_poller)
+_run_listener = webull_usage.tagged("Order stream")(_run_listener)

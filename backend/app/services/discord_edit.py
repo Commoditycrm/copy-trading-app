@@ -58,6 +58,10 @@ _WORKING = (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.ACCEPTED)
 # match would silently change what we are buying.
 _CONTRACT_KEYS = ("action", "symbol", "asset_type", "strike", "option_type", "expiration")
 
+# apply_price_edit's outcome when the edit switched contracts. Named so the
+# caller can hand the switch to services/discord_repost rather than match text.
+DIFFERENT_CONTRACT = "the edit names a different contract — not repriced"
+
 
 def _dec(v) -> Decimal | None:
     if v in (None, ""):
@@ -137,7 +141,7 @@ def apply_price_edit(db: Session, msg: DiscordMessage) -> str:
     if not same_contract(before, after):
         # Deliberately no fallback. Guessing which of the two contracts was
         # meant is the worst outcome available here.
-        return "the edit names a different contract — not repriced"
+        return DIFFERENT_CONTRACT
 
     # Record the intent BEFORE trying, so a broker that refuses right now is a
     # delay rather than a lost correction.

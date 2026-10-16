@@ -56,7 +56,12 @@ def _pos(sym="NIO", qty="2"):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # These test the in-process cache; the cross-process snapshot (Redis) has
+    # its own tests in test_webull_positions_snapshot.py.
+    monkeypatch.setattr(wb, "_snapshot_read", lambda *a: None)
+    monkeypatch.setattr(wb, "_snapshot_write", lambda *a: None)
+    monkeypatch.setattr(wb, "_snapshot_mark_stale", lambda *a: None)
     wb._positions_cache.clear()
     wb._positions_locks.clear()
     yield

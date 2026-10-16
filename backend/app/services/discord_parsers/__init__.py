@@ -2,6 +2,7 @@
 
     Parser
      ├── AlertCardParser    structured ENTERING/TRIMMING/CLOSING embeds
+     ├── DragonAlertParser  the Dragon channel only ("$MSFT @ 21.10 | 24% TRIMMING")
      ├── CompactAlertParser terse one-liners ("$TSLA 375 CALL 0DTE @0.95",
      │                      "✂️ $SPY 769c +361%") — no action word
      └── GenericTextParser  free-text ("BUY AAPL 250C SEP18 @ 2.15")
@@ -25,6 +26,7 @@ import re
 
 from .alert_card import AlertCardParser
 from .compact_alert import CompactAlertParser
+from .dragon_alert import DragonAlertParser
 from .base import (
     AssetType,
     OptionType,
@@ -48,7 +50,30 @@ log = logging.getLogger(__name__)
 # Word-bounded on purpose. A bare "light" must not fire on "lighten", which is
 # the opposite instruction (trim a position), nor on "delight" or "flashlight".
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
-_HALF_SIZE_RE = re.compile(r"\bnot[\s-]+heavy\b|\blight\b", re.IGNORECASE)
+# Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
+# "small(er) size" and "half size". And "lotto" / "lottos" — a long-shot
+# entry — and "risky" / "high risk", so half the size too.
+#
+# "Leave room to add" says the same thing from the other end: the author is
+# deliberately entering under their full size so there is room to average in
+# later (live 2026-10-13, "$SPY 779 PUT 0DTE @0.98, Leave room to add! @Clint",
+# which filled at full size). "Leaving room" and "leave some room" are the same
+# instruction typed differently.
+_HALF_SIZE_RE = re.compile(
+    r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b"
+    r"|\blottos?\b|\brisky\b|\bhigh[\s-]+risk\b"
+    r"|\bleav(?:e|es|ing)\s+(?:some\s+|a\s+little\s+|a\s+bit\s+of\s+)?room\b",
+    re.IGNORECASE,
+)
+
+# The author asking to be filled at MARKET: "@market" / "@ market" anywhere in
+# the alert, or "out the gate" (buy now, at whatever it is). Execution then
+# places the entry at market in the regular session, sized and capped at the
+# live price — the same as a Market channel or "@Market" typed in the popup.
+_AT_MARKET_RE = re.compile(
+    r"@\s*market\b|\bout\s+(?:of\s+)?the\s+gate\b",
+    re.IGNORECASE,
+)
 
 
 def _is_half_size(text: str) -> bool:
@@ -56,6 +81,10 @@ def _is_half_size(text: str) -> bool:
 
 # Most specific first.
 PARSERS: list[Parser] = [
+    # The Dragon channel only (matched by channel name) — first, so its trims
+    # aren't read as stock sells by the free-text parser. Never matches on any
+    # other channel.
+    DragonAlertParser(),
     AlertCardParser(),
     # Before the free-text parser: "$TSLA 375 CALL 0DTE @0.95" has no action
     # word, so the generic parser would ignore it entirely.
@@ -107,6 +136,7 @@ def parse_message(message: ParsedMessage, *, parser_key: str | None = None) -> P
                 first_ignored = result
             continue
         _mark_half_size(message, result)
+        _mark_at_market(message, result)
         return result
 
     if first_ignored is not None:
@@ -126,6 +156,16 @@ def _mark_half_size(message: ParsedMessage, result: ParseResult) -> None:
     for signal in result.signals or []:
         if signal.action is SignalAction.BUY:
             signal.half_size = True
+
+
+def _mark_at_market(message: ParsedMessage, result: ParseResult) -> None:
+    """Flag BUY signals the author asked to fill at market. Entries only: an
+    exit already goes at market."""
+    if not _AT_MARKET_RE.search(message.text or ""):
+        return
+    for signal in result.signals or []:
+        if signal.action is SignalAction.BUY:
+            signal.at_market = True
 
 
 __all__ = [

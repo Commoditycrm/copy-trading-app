@@ -1,0 +1,32 @@
+ip2loc: "US"
+proxyRemoteSsl: true
+proxyRemoteHost: "https://api.ibkr.com"
+listenPort: 5000
+listenSsl: true
+ccp: false
+svcEnvironment: "v1"
+sslCert: "vertx.jks"
+sslPwd: "mywebapi"
+authDelay: 3000
+portalBaseURL: ""
+serverOptions:
+    blockedThreadCheckInterval: 1000000
+    eventLoopPoolSize: 20
+    workerPoolSize: 20
+    maxWorkerExecuteTime: 100
+    internalBlockingPoolSize: 20
+cors:
+    origin.allowed: "*"
+    allowCredentials: false
+webApps:
+    - name: "demo"
+      index: "index.html"
+# Only the compose network (backend / worker containers) and the container
+# itself may talk to this gateway. Port 5000 is never published to the host.
+ips:
+  allow:
+    - 127.0.0.1
+    - 10.*
+    - 172.*
+    - 192.168.*
+  deny: []

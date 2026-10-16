@@ -192,7 +192,7 @@ def test_both_manual_close_paths_release_it():
 def test_a_pinned_contract_rests_no_stop_at_the_broker():
     from app.services import pnl_poller
 
-    src = inspect.getsource(pnl_poller._enforce_discord_trailing_stops)
+    src = inspect.getsource(pnl_poller._enforce_discord_ladder)
     pinned = src[src.index("_pinned(acct.user_id, guard)"):]
     assert pinned.index("release(") < pinned.index("continue") < pinned.index("reconcile(")
 

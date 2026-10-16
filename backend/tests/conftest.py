@@ -16,3 +16,17 @@ def _disable_snaptrade_nudge():
     snaptrade_nudge.set_enabled(False)
     yield
     snaptrade_nudge.set_enabled(False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_alpaca_quotes(monkeypatch):
+    """Stops and trailing exits are judged on Alpaca's live quote
+    (services/live_marks), read from the shared price cache or the data API.
+    A test must not pick up whatever quote a developer's local Redis happens to
+    hold, or call Alpaca: no quote, so decisions use the position's own mark —
+    the price each test sets. Tests of live_marks itself replace these."""
+    from app.services import market_data_stream
+
+    monkeypatch.setattr(market_data_stream, "get_live_price", lambda *a, **k: None)
+    monkeypatch.setattr(market_data_stream, "fetch_rest_quote", lambda *a, **k: None)
+    yield

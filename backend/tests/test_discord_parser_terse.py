@@ -188,3 +188,189 @@ def test_add_to_latest_is_resolved_before_the_order_is_built():
 
     src = inspect.getsource(discord_sources._execute_signal)
     assert src.index("latest_channel_contract(") < src.index("discord_execution.resolve(db, user, signal, sizing)")
+
+
+# ── "Average down on SPY @0.80" ─────────────────────────────────────────────
+
+def _avg(text):
+    return parse_message(ParsedMessage(content=text))
+
+
+@pytest.mark.parametrize("text,price", [
+    ("Average down on SPY @0.80", "0.80"),
+    ("averaging down $SPY .8", "0.8"),
+    ("avg down on SPY 0.75 @here", "0.75"),
+])
+def test_average_down_doubles_the_open_position(text, price):
+    s = _avg(text).signals[0]
+    assert (s.action.value, s.symbol, s.double_up, s.contract_unspecified) == ("BUY", "SPY", True, True)
+    assert str(s.limit_price) == price and s.quantity is None
+
+
+def test_average_down_without_a_price_is_refused():
+    r = _avg("Average down on SPY")
+    assert r.status is ParseStatus.INVALID and "no price" in r.reason
+
+
+def test_chatter_about_averaging_down_is_ignored():
+    assert _avg("I might average down later").status is ParseStatus.IGNORED
+
+
+def test_an_at_price_is_never_stripped_as_a_mention():
+    s = _avg("AMZN245P @0.55").signals[0]
+    assert str(s.limit_price) == "0.55"
+
+
+def _held(strike, right, qty=3):
+    return SimpleNamespace(option_strike=Decimal(strike), option_right=right,
+                           option_expiry=date(2026, 10, 1), quantity=Decimal(qty))
+
+
+def test_execution_doubles_the_one_held_spy_contract():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    held = [_held("767", OptionRight.CALL, 3)]
+    res = {}
+    strike, right, expiry = ex._resolve_contract(sig, held, res)
+    assert (strike, right) == (Decimal("767"), OptionRight.CALL)
+    qty = ex._resolve_quantity(sig, held, strike, right, expiry, False, ex.Sizing(multiplier=4), res)
+    assert qty == Decimal(3)          # doubles the 3 held — not your Contracts per alert
+
+
+def test_execution_refuses_when_two_spy_contracts_are_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="2 of your open contracts"):
+        ex._resolve_contract(sig, [_held("767", OptionRight.CALL), _held("760", OptionRight.PUT)], {})
+
+
+def test_execution_refuses_when_no_spy_contract_is_held():
+    sig = _avg("Average down on SPY @0.80").signals[0].as_dict()
+    with pytest.raises(ex.ExecutionRefused, match="no matching position"):
+        ex._resolve_contract(sig, [], {})
+
+
+# ── "In SPY 763P 1.01": a spaced contract after an entry word ───────────────
+
+@pytest.mark.parametrize("text,sym,strike,right,price", [
+    ("In SPY 763P @here @Sniper 1.01", "SPY", "763", "PUT", "1.01"),
+    ("Entry: QQQ 600P @0.95", "QQQ", "600", "PUT", "0.95"),
+    ("In $SPY 765c .80", "SPY", "765", "CALL", "0.80"),
+])
+def test_an_entry_word_then_a_spaced_contract_is_an_entry(text, sym, strike, right, price):
+    s = parse_message(ParsedMessage(content=text)).signals[0]
+    assert (s.action.value, s.symbol, str(s.strike), s.option_type.value) == ("BUY", sym, strike, right)
+    assert str(s.limit_price) == price and s.nearest_expiry is True
+
+
+@pytest.mark.parametrize("text", ["SPY 763P hit 1.50", "I'm in SPY 763P 1.01", "watching SPY 763P 1.01"])
+def test_a_spaced_contract_without_a_leading_entry_word_is_not_an_entry(text):
+    assert parse_message(ParsedMessage(content=text)).status is ParseStatus.IGNORED
+
+
+def test_an_entry_with_no_price_is_refused():
+    assert parse_message(ParsedMessage(content="In SPY 763P")).status is ParseStatus.IGNORED
+
+
+# ── a pinged, spaced, price-less call (missed live 2026-10-06) ──────────────
+
+def test_a_pinged_spaced_contract_with_no_price_is_an_entry_priced_at_execution():
+    s = _sig("QQQ 759P @here @everyone out the gate high risk")
+    assert (s.action, s.symbol, s.strike, s.option_type) == (SignalAction.BUY, "QQQ", Decimal("759"), OptionType.PUT)
+    assert s.limit_price is None and s.limit_price_unspecified is True
+    assert s.nearest_expiry is True and s.quantity == Decimal(1)
+
+
+def test_a_pinged_glued_contract_with_no_price_is_an_entry_too():
+    s = _sig("QQQ759P @here")
+    assert s.symbol == "QQQ" and s.limit_price_unspecified is True
+
+
+@pytest.mark.parametrize("text", [
+    "QQQ 759P looking juicy",           # not pinged: commentary
+    "SPY 763P hit 1.50",                # not pinged
+    "QQQ 759P @here up 40%",            # pinged, but a gain report
+    "QQQ 759P @here trimmed",           # pinged, but an exit
+    "QQQ 759P @everyone out of the rest",
+])
+def test_these_are_never_a_buy(text):
+    r = parse_message(ParsedMessage(content=text, posted_at=TS))
+    assert not any(s.action is SignalAction.BUY for s in (r.signals or []))
+
+
+def test_execution_buys_a_price_less_entry_at_the_live_ask():
+    sig = {"action": "BUY", "limit_price": None, "limit_price_unspecified": True}
+    adapter = SimpleNamespace()
+    resolutions = {}
+    original = ex._quote
+    ex._quote = lambda *a, **k: (Decimal("0.40"), Decimal("0.44"))
+    try:
+        price = ex._resolve_limit_price(sig, adapter, "QQQ", Decimal(759), OptionRight.PUT,
+                                        date(2026, 10, 6), ex.OrderSide.BUY, resolutions)
+    finally:
+        ex._quote = original
+    assert price == Decimal("0.44") and "live quote" in resolutions["limit_price"]
+
+
+# ── a mid-paragraph "Adding .50" ────────────────────────────────────────────
+# Live 2026-10-09: the instruction sat inside a paragraph of commentary, so the
+# anchored _ADD_RE never saw it and the alert produced no trade at all. What
+# separates it from musing is the stated result — "new avg .73" is only written
+# after an add that really happened.
+
+REAL_ALERT = (
+    "AAPL is being very stupid QQQ breaking Lows and somehow after a basic gap "
+    "down on bad news bulls are buying the dip on AAPL sadly @everyone @Sniper  "
+    "I do believe we were just early . Adding .50 here new avg .73 if you want "
+    "I truly don’t think this PA on AAPL makes sense rn"
+)
+
+
+def test_the_live_alert_adds_to_the_aapl_contract():
+    s = _sig(REAL_ALERT)
+    assert s.action is SignalAction.BUY
+    assert s.limit_price == Decimal("0.50")   # the add price, not the new average
+    assert s.double_up is True
+    # QQQ is named too, but only as market colour — the add's own sentence
+    # names AAPL, which is the position being averaged.
+    assert s.symbol == "AAPL"
+
+
+def test_the_new_average_is_never_mistaken_for_the_add_price():
+    assert _sig(REAL_ALERT).limit_price != Decimal("0.73")
+
+
+def test_a_message_initial_add_still_names_no_symbol():
+    # Unchanged behaviour: the contract comes from add_to_latest.
+    s = _sig("Adding .50 here new avg .73")
+    assert s.symbol is None and s.add_to_latest is True and s.limit_price == Decimal("0.50")
+
+
+@pytest.mark.parametrize("text,symbol", [
+    ("TSLA looks done here. Adding .40 new avg .61", "TSLA"),
+    ("Adding .50 here new avg .73, down 30%", None),   # a percent is not an exit
+])
+def test_a_corroborated_mid_sentence_add_fires(text, symbol):
+    s = _sig(text)
+    assert s is not None and s.double_up is True and s.symbol == symbol
+
+
+@pytest.mark.parametrize("text", [
+    "I might add .50, new avg would be .73",        # hedged: an average that WOULD be
+    "not adding .50 here, new avg stays .73",       # negated
+    "I do believe we were early . Adding .50 here",  # no stated average to corroborate
+    "I might be adding .50 later if it keeps dropping",
+    "leave room to add in case they want a bit more of a bounce",
+    "sold half. new avg .73 after adding .50",      # an exit, not an add
+])
+def test_chatter_about_adding_never_buys(text):
+    # These are IGNORED, not PARSED, so _sig's status assert does not apply —
+    # check directly that nothing would be bought.
+    r = parse_message(ParsedMessage(content=text, posted_at=TS))
+    assert not any(sig.action is SignalAction.BUY for sig in (r.signals or [])), \
+        f"{text!r} must not place an order"
+
+
+def test_price_action_is_not_read_as_a_ticker():
+    # "this PA on AAPL" previously counted as two tickers, leaving the add
+    # unable to name the position it was averaging.
+    from app.services.discord_parsers.terse_alert import _tickers_in
+    assert _tickers_in("I truly don't think this PA on AAPL makes sense") == ["AAPL"]

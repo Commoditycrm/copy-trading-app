@@ -761,6 +761,22 @@ class SnapTradeAdapter(BrokerAdapter):
             f"SnapTrade order {broker_order_id} not found in recent history"
         )
 
+    def get_orders_snapshot(self) -> dict[str, BrokerOrderResult]:
+        """Every order get_order could find, from the ONE list call it makes.
+
+        get_order has no by-id endpoint and pulls the whole history each time,
+        so fills_sync._refresh_open_orders paid one full list per working order
+        — a subscriber resting a stop and a take-profit cost two identical reads
+        of SnapTrade's shared quota per sweep. Keyed exactly as get_order
+        matches, so a miss here is a miss there; an empty map (the read failed)
+        sends the caller back to per-order reads.
+        """
+        out: dict[str, BrokerOrderResult] = {}
+        for o in self.list_recent_activities():
+            oid = str(_attr(o, "brokerage_order_id", "id"))
+            out.setdefault(oid, self._order_to_result(o))
+        return out
+
     def cancel_order(self, broker_order_id: str) -> bool:
         """SnapTrade's cancel endpoint takes brokerage_order_id.
 

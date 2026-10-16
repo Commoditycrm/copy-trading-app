@@ -10,13 +10,19 @@ const STATE_COLORS: Record<string, { bg: string; color: string }> = {
   credentials_invalid:{ bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
   mfa_required:       { bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
   in_use_elsewhere:   { bg: "rgba(249,115,22,0.12)", color: "#f97316" },
+  // Webull: subscribed but the stream delivers nothing; orders come by polling.
+  silent:             { bg: "rgba(245,158,11,0.12)", color: "#f59e0b" },
+};
+
+const STATE_TEXT: Record<string, string> = {
+  silent: "connected, silent (polling)",
 };
 
 function StateBadge({ state }: { state: string }) {
   const c = STATE_COLORS[state] ?? { bg: "rgba(255,255,255,0.08)", color: "var(--text-2)" };
   return (
     <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: c.bg, color: c.color }}>
-      {state?.replace(/_/g, " ") ?? "unknown"}
+      {STATE_TEXT[state] ?? state?.replace(/_/g, " ") ?? "unknown"}
     </span>
   );
 }

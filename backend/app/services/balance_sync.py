@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session  # noqa: F401 — re-exported type hint convenience
 
 from app.brokers import adapter_for
+from app.brokers.ibkr import IBKRAdapter
 from app.brokers.alpaca import AlpacaAdapter
 from app.brokers.snaptrade import SnapTradeAdapter
 from app.brokers.webull import WebullAdapter
@@ -78,7 +79,7 @@ def refresh_account_balance(acct: BrokerAccount, creds: dict[str, Any]) -> bool:
     self-heals once the broker is reachable again."""
     try:
         adapter = adapter_for(acct, creds)
-        if not isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter)):
+        if not isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter, IBKRAdapter)):
             return False
         bal = adapter.get_balance_snapshot()
         acct.cash = bal["cash"]

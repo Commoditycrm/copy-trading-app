@@ -9,12 +9,13 @@ import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, TraderSettings, User } from "@/lib/types";
 import { ListenerPill } from "@/components/ListenerPill";
+import { HEADER_STATS_SLOT_ID } from "@/lib/headerSlot";
 import { CopyDiscordPromptModal } from "@/components/CopyDiscordPromptModal";
 import { emitDiscordChanged, onDiscordChanged } from "@/lib/traderSync";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { NotificationBell } from "@/components/NotificationBell";
 import { ProfileModal } from "@/components/profile/ProfileModal";
-import { ChevronsLeft, ChevronsRight } from "lucide-react";
+import { ChevronsLeft, ChevronsRight, X } from "lucide-react";
 
 function IconGrid() {
   return (
@@ -416,8 +417,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           router.replace("/admin");
           return;
         }
+        // The footer copy switch renders only once this state has loaded. A
+        // failed first fetch (backend mid-reload, a transient 5xx) used to hide
+        // the switch until a full page reload, so retry a few times before
+        // giving up.
+        const withRetry = <T,>(load: () => Promise<T>, apply: (v: T) => void, attempts = 4) => {
+          const go = (n: number) => load().then(apply).catch(() => {
+            if (n > 1) setTimeout(() => go(n - 1), 2500);
+          });
+          go(attempts);
+        };
         if (u.role === "trader") {
-          api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+          withRetry(() => api<BulkCopyState>("/api/subscribers/copy-state"), setBulkCopy);
           api<TraderSettings>("/api/settings/trader")
             .then((t) => setTraderDiscord({
               enabled: !!t.discord_alerts_enabled,
@@ -425,7 +436,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             }))
             .catch(() => {});
         } else {
-          api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
+          withRetry(() => api<SubscriberSettings>("/api/settings/subscriber"), setSubCopy);
         }
         // Hydrate bell badge for both roles. Today only subscribers
         // receive notifications (copy.retry_failed) but the table is
@@ -460,10 +471,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // 5xx) shouldn't leave the switch stale. Re-fetch the true copy state whenever
   // the tab regains focus, so returning to a background tab corrects it.
   useEffect(() => {
-    if (user?.role !== "trader") return;
+    if (!user || user.role === "admin") return;
     const refetch = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState !== "visible") return;
+      if (user.role === "trader") {
         api<BulkCopyState>("/api/subscribers/copy-state").then(setBulkCopy).catch(() => {});
+      } else {
+        api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
       }
     };
     window.addEventListener("focus", refetch);
@@ -575,6 +589,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, []);
   // Close the drawer on navigation.
   useEffect(() => { setMobileOpen(false); }, [pathname]);
+  // …and on Escape.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMobileOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mobileOpen]);
 
   if (loading) {
     return (
@@ -652,6 +673,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
       {/* ── Sidebar — static column on desktop, slide-in drawer on mobile ── */}
       <aside
+        id="app-sidebar"
+        aria-hidden={!isDesktop && !mobileOpen}
         className={`flex flex-col h-full shrink-0 z-50 fixed inset-y-0 left-0 lg:static transition-[transform,width] duration-200 ${mobileOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}
         style={{
           width: SIDEBAR_W,
@@ -663,7 +686,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {/* Wordmark — derived per role (trader's own business_name, or the
             followed trader's for subscribers). First-letter fallback when
             collapsed so the chrome still reads as branded at narrow widths. */}
-        <div className={`flex items-center ${navCollapsed ? "px-4 justify-center" : "px-5"} pt-6 pb-7`}>
+        <div className={`flex items-center ${navCollapsed ? "px-4 justify-center" : "px-5 justify-between gap-2"} pt-6 pb-7`}>
           <div className="flex items-center gap-2.5 min-w-0">
             <div
               className="grid place-items-center shrink-0 rounded-token"
@@ -690,6 +713,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               </div>
             )}
           </div>
+          {/* Mobile-only close — the hamburger sits under the overlay once the
+              drawer is open, so the drawer needs its own way out. */}
+          <button
+            type="button"
+            onClick={() => setMobileOpen(false)}
+            aria-label="Close navigation menu"
+            className="lg:hidden grid place-items-center rounded-token shrink-0 focus-ring"
+            style={{ width: 36, height: 36, border: "1px solid var(--border)", background: "rgba(255,255,255,0.02)", color: "var(--text-2)" }}
+          >
+            <X size={18} strokeWidth={2} />
+          </button>
         </div>
 
         {/* Nav — scrolls within sidebar if it ever overflows */}
@@ -768,27 +802,30 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* ── Right column: navbar on top, scrollable main below ──────────── */}
       <div className="flex flex-col flex-1 min-w-0 h-full overflow-hidden">
         <header
-          className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 shrink-0 mx-3 sm:mx-4 mt-3 rounded-xl"
+          // z-30 below lg / z-50 at lg+: lifts the header (and the notification
+          // dropdown inside it) above the scrollable <main> content — the
+          // backdrop-filter already makes the header its own stacking context,
+          // so without a z-index the cards in <main> (later in the DOM) paint
+          // over the open dropdown. On mobile it must stay BELOW the drawer
+          // overlay (z-40) and the drawer itself (z-50): the header is later in
+          // the DOM, so at z-50 it would paint over the open drawer and swallow
+          // the taps meant to close it.
+          className="relative z-30 lg:z-50 flex items-center justify-between gap-3 px-4 sm:px-5 py-3 shrink-0 mx-3 sm:mx-4 mt-3 rounded-xl"
           style={{
             background: "var(--header-bg)",
             border: "1px solid var(--border)",
             backdropFilter: "blur(10px)",
             boxShadow: "var(--shadow-card)",
-            // Lift the whole header (and the notification dropdown that
-            // renders inside it) above the scrollable <main> content. The
-            // backdrop-filter above already makes the header its own
-            // stacking context, so without an explicit z-index the cards in
-            // <main> (later in the DOM) paint on top of the open dropdown.
-            position: "relative",
-            zIndex: 50,
           }}
         >
           {/* Left: hamburger (mobile only) + listener/SSE status pills. */}
           <div className="flex items-center gap-2 min-w-0">
             <button
               type="button"
-              onClick={() => setMobileOpen(true)}
-              aria-label="Open navigation menu"
+              onClick={() => setMobileOpen(o => !o)}
+              aria-label={mobileOpen ? "Close navigation menu" : "Open navigation menu"}
+              aria-expanded={mobileOpen}
+              aria-controls="app-sidebar"
               className="lg:hidden grid place-items-center rounded-token shrink-0 focus-ring"
               style={{ width: 36, height: 36, border: "1px solid var(--border)", background: "rgba(255,255,255,0.02)", color: "var(--text-2)" }}
             >
@@ -798,6 +835,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="hidden sm:block">
               <SseStatusPill state={sseStatus.state} lastEventAt={sseStatus.lastEventAt} />
             </div>
+            {/* A page's headline figures (the Positions page puts its Day's P&L,
+                Unrealized P&L, Market value and Account value here). Empty elsewhere. */}
+            <div id={HEADER_STATS_SLOT_ID} className="hidden xl:flex items-center ml-1 min-w-0" />
           </div>
           {/* Right: theme toggle + bell + who's signed in + role chip. */}
           <div className="flex items-center gap-2 sm:gap-3">

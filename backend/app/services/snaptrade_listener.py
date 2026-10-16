@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.brokers.snaptrade import SnapTradeAdapter, parse_snaptrade_order_symbol
@@ -1108,24 +1108,45 @@ def _reconcile_subscriber_fills_once() -> None:
     orders and re-pull their order status from SnapTrade. Only accounts with
     something pending are polled, so quota use is proportional to real work.
     Sequential + best-effort per account so one bad account can't stall the
-    rest or burst SnapTrade's shared rate limit."""
+    rest or burst SnapTrade's shared rate limit.
+
+    Pending work is a copy mirror anywhere, OR any working order on a SnapTrade
+    account. Mirrors alone used to be the test, and every order the copy engine
+    did not create carries a NULL parent — a Discord subscriber's ladder stop,
+    take-profit and limit entry among them. A subscriber whose only working
+    orders were those was never swept: a stop that fired at the broker stayed
+    "working" in our DB, so the ladder never saw the stop-out and the sell never
+    reached Closed today. Same fix the Alpaca / Webull / IBKR twins carry
+    (tests/test_subscriber_reconciler_scope.py).
+
+    Traders are excluded by role: their SnapTrade listener already reads their
+    orders, and a second reader would spend the shared quota twice."""
     with SessionLocal() as db:
+        snaptrade_accts = select(BrokerAccount.id).where(
+            BrokerAccount.broker == BrokerName.SNAPTRADE,
+        )
         working_user_ids = (
             select(Order.user_id)
             .where(
-                Order.parent_order_id.is_not(None),
                 Order.status.in_(_WORKING_STATUSES),
                 Order.broker_order_id.is_not(None),
+                or_(
+                    Order.parent_order_id.is_not(None),
+                    Order.broker_account_id.in_(snaptrade_accts),
+                ),
             )
             .distinct()
         )
         targets = [
             (a.user_id, a.id)
             for a in db.execute(
-                select(BrokerAccount).where(
+                select(BrokerAccount)
+                .join(User, User.id == BrokerAccount.user_id)
+                .where(
                     BrokerAccount.broker == BrokerName.SNAPTRADE,
                     BrokerAccount.connection_status == "connected",
                     BrokerAccount.user_id.in_(working_user_ids),
+                    User.role != UserRole.TRADER,
                 )
             ).scalars()
         ]

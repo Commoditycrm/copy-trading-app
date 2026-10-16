@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String, Text
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Numeric, String, Text, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -71,6 +71,9 @@ class BrokerAccount(Base, TimestampMixin):
     # Broker's own account number/id for display
     broker_account_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)
+    # Kopyya-hosted IBKR gateway slot (ibkr-gw-<slot>), NULL for every other
+    # account. Unique: a gateway holds exactly one IBKR login. Released on delete.
+    ibkr_gateway_slot: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Underlying broker when this account is routed through an aggregator.

@@ -51,27 +51,16 @@ def _key_of_guard(g) -> tuple:
 
 
 def _current_price(pos, user_id=None) -> Decimal | None:
-    """The price this position is being judged at.
+    """The price this position is being judged at: Alpaca's live quote (see
+    services/live_marks), else the broker's own mark.
 
     A hand-pinned price wins when the feature is switched on, which is how the
     ladder gets tested without waiting for the market. It is off by default and
     must stay off in production — see services/price_override.
     """
-    if user_id is not None:
-        from app.services import price_override  # noqa: PLC0415
-        pinned = price_override.apply_to(user_id, pos)
-        if pinned is not None:
-            log.info("discord stops: using pinned price %s for %s", pinned, pos.symbol)
-            return pinned
+    from app.services import live_marks  # noqa: PLC0415
 
-    raw = getattr(pos, "current_price", None)
-    if raw is None:
-        return None
-    try:
-        price = Decimal(str(raw))
-    except Exception:  # noqa: BLE001
-        return None
-    return price if price > 0 else None
+    return live_marks.position_mark(pos, user_id)
 
 
 STOP = "stop"
@@ -93,7 +82,13 @@ def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal]
     # Skipped when a real order rests at the broker for this level: it will
     # fire on its own, and enforcing here as well would sell the same
     # contracts twice.
-    stop = None if guard.stop_order_id else guard.stop_price
+    # A take-profit's linked stop counts too: on the last trim it is the ONLY
+    # stop resting, covering everything held.
+    # A trailing stop follows a new high up first; the resting order (if any)
+    # is moved to it by the stop reconciler on its next pass.
+    guards.ratchet_stop(guard, price)
+    rests = guard.stop_order_id or getattr(guard, "tp_stop_order_id", None)
+    stop = None if rests else guard.stop_price
     if stop is not None and price <= stop:
         return STOP, held, stop
 
@@ -114,7 +109,7 @@ def decide(guard, price: Decimal, held: Decimal) -> tuple[str, Decimal, Decimal]
     return TRAIL, min(qty, held), peak
 
 
-def enforce(db: Session, user_id, adapter, close_position) -> int:
+def enforce(db: Session, user_id, adapter, close_position, positions=None) -> int:
     """Advance every protection this trader has live. Returns how many fired.
 
     ``close_position(position, guard, quantity)`` is injected so this module
@@ -125,12 +120,13 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
     if not rows:
         return 0
 
-    try:
-        positions = adapter.get_positions()
-    except Exception:  # noqa: BLE001
-        # A failed read is not a reason to exit anything. Skip the tick.
-        log.warning("discord stops: position read failed for user=%s", user_id, exc_info=True)
-        return 0
+    if positions is None:            # the caller's read of this tick, when it has one
+        try:
+            positions = adapter.get_positions()
+        except Exception:  # noqa: BLE001
+            # A failed read is not a reason to exit anything. Skip the tick.
+            log.warning("discord stops: position read failed for user=%s", user_id, exc_info=True)
+            return 0
 
     by_contract = {_key_of_position(p): p for p in positions}
     fired = 0
@@ -151,7 +147,12 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             guards.retire(db, guard, "position no longer held")
             continue
 
-        decision = decide(guard, price, held)
+        from app.services.position_events import because  # noqa: PLC0415
+
+        with because(f"trailing stop follows a new high of {price}"):
+            decision = decide(guard, price, held)
+            if getattr(guard, "stop_trail_pct", None) is not None and hasattr(db, "flush"):
+                db.flush()                 # record a raise under this reason
         if decision is None:
             continue
         kind, sell, level = decision
@@ -174,7 +175,8 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
             log.info("discord stops: %s at %s broke its %s stop — closing %s",
                      guard.symbol, price, level, held)
             try:
-                close_position(pos, guard, held)
+                with because(f"stop {level} hit at {price} — selling all {held}"):
+                    close_position(pos, guard, held)
             except Exception:  # noqa: BLE001
                 # Leave it armed so the next tick tries again — an exit that
                 # failed once must not be forgotten.
@@ -189,7 +191,8 @@ def enforce(db: Session, user_id, adapter, close_position) -> int:
         log.info("discord stops: %s gave back %s from %s — trailing out %s",
                  guard.symbol, guard.trail_amount, level, sell)
         try:
-            close_position(pos, guard, sell)
+            with because(f"trailing exit: gave back {guard.trail_amount} from the high of {level}"):
+                close_position(pos, guard, sell)
         except Exception:  # noqa: BLE001
             log.exception("discord stops: trailing exit failed for %s", guard.symbol)
             continue

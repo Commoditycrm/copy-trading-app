@@ -223,14 +223,14 @@ def relay_for_subscriber(db: Session, subscriber: User, parent: DiscordAlertSour
     """Ingest one trader-channel batch into this subscriber's mirror and act on
     it as the subscriber. Caller commits."""
     from app.api import discord_sources  # noqa: PLC0415 — cycle
-    from app.services import discord_edit, discord_ingest  # noqa: PLC0415
+    from app.services import discord_ingest  # noqa: PLC0415
 
     trader = followed_discord_trader(db, subscriber)
     if trader is None or trader.id != parent.user_id:
         return
     mirror = ensure_mirror(db, subscriber, parent)
     ensure_settings(db, subscriber, trader)
-    auto = discord_sources._auto_approve(db, subscriber.id)
+    auto = discord_sources._auto_approve(db, subscriber.id, mirror.id)
     report = discord_ingest.ingest_batch(db, mirror, batch, auto_approve=auto, publish=False)
 
     for msg in report.stored:
@@ -241,15 +241,15 @@ def relay_for_subscriber(db: Session, subscriber: User, parent: DiscordAlertSour
                 msg.status_reason = reason
                 msg.decision = None
                 continue
+        from app.services import discord_freshness  # noqa: PLC0415
+
+        if discord_freshness.hold_if_stale(msg):
+            continue                      # a late entry waits for approval
         if msg.decision is SignalDecision.APPROVED:
             discord_sources._execute_signal(db, subscriber, msg, background, request)
 
-    for msg in report.edited:
-        try:
-            msg.status_reason = f"Edited alert: {discord_edit.apply_price_edit(db, msg)}"[:480]
-        except Exception as exc:  # noqa: BLE001
-            msg.status_reason = f"Edited alert: handling failed — {exc}"[:480]
-            log.exception("discord: subscriber edit failed for %s", msg.discord_message_id)
+    discord_sources._handle_edits(db, subscriber, report.edited, background, request)
+    discord_sources._handle_deletions(db, report.deleted, background)
 
 
 class _RelayRequest:

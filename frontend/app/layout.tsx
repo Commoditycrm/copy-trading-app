@@ -3,6 +3,7 @@ import "react-toastify/dist/ReactToastify.css";
 import type { Metadata } from "next";
 import { ThemeProvider } from "@/components/theme/ThemeProvider";
 import { ThemedToaster } from "@/components/theme/ThemedToaster";
+import { NumberInputWheelGuard } from "@/components/NumberInputWheelGuard";
 
 export const metadata: Metadata = {
   title: "Copy Trading Platform",
@@ -27,6 +28,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body suppressHydrationWarning>
         <ThemeProvider>
+          {/* Keeps the mouse wheel from silently editing number inputs. Mounted
+              here rather than in AppShell because the admin pages do not render
+              AppShell and have number inputs of their own. */}
+          <NumberInputWheelGuard />
           {children}
           <ThemedToaster />
         </ThemeProvider>

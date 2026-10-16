@@ -54,37 +54,49 @@ _WORKING = (
 
 
 def _due_order_ids() -> list[uuid.UUID]:
-    """Discord entries still working past their trader's reprice delay.
+    """Discord entries still working past their reprice delay.
 
-    The delay lives in the join so one query covers every trader. Partially
-    filled orders are included on purpose — the rest of the position is still
-    missing, which is the thing being fixed.
+    The delay is the order's CHANNEL setting (or the account's while the channel
+    follows it), so candidates are read with only the shortest possible delay in
+    SQL and each is held to its own delay here. Partially filled orders are
+    included on purpose — the rest of the position is still missing, which is
+    the thing being fixed.
     """
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+
     started = func.coalesce(Order.submitted_at, Order.created_at)
-    threshold = func.now() - func.make_interval(
-        0, 0, 0, 0, 0, 0, TraderSettings.discord_reprice_after_seconds
-    )
+    min_delay = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, 5)
     with SessionLocal() as db:
-        return list(
-            db.execute(
-                select(Order.id)
-                .join(TraderSettings, TraderSettings.user_id == Order.user_id)
-                .join(DiscordMessage, DiscordMessage.order_id == Order.id)
-                .where(
-                    Order.side == OrderSide.BUY,          # entries only
-                    Order.order_type == OrderType.LIMIT,  # nothing else can rest on price
-                    Order.is_closing.is_(False),
-                    Order.status.in_(_WORKING),
-                    Order.broker_order_id.isnot(None),
-                    Order.broker_account_id.isnot(None),
-                    Order.limit_price.isnot(None),
-                    Order.discord_repriced_at.is_(None),  # one attempt, ever
-                    started <= threshold,
-                )
-                .order_by(started.asc())
-                .limit(BATCH_SIZE)
-            ).scalars()
-        )
+        rows = db.execute(
+            select(Order.id, Order.user_id, DiscordMessage.source_id, started)
+            .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+            .where(
+                Order.side == OrderSide.BUY,          # entries only
+                Order.order_type == OrderType.LIMIT,  # nothing else can rest on price
+                Order.is_closing.is_(False),
+                Order.status.in_(_WORKING),
+                Order.broker_order_id.isnot(None),
+                Order.broker_account_id.isnot(None),
+                Order.limit_price.isnot(None),
+                Order.discord_repriced_at.is_(None),  # one attempt, ever
+                started <= min_delay,
+            )
+            .order_by(started.asc())
+            .limit(BATCH_SIZE * 4)
+        ).all()
+        now = datetime.now(timezone.utc)
+        due: list[uuid.UUID] = []
+        delays: dict = {}
+        for oid, user_id, source_id, at in rows:
+            key = (user_id, source_id)
+            if key not in delays:
+                ts = dcs.effective(db, user_id, source_id)
+                delays[key] = int(getattr(ts, "discord_reprice_after_seconds", None) or 30)
+            if at is not None and (now - at).total_seconds() >= delays[key]:
+                due.append(oid)
+            if len(due) >= BATCH_SIZE:
+                break
+        return due
 
 
 def _breaches_ceiling(
@@ -161,7 +173,9 @@ def reprice_one(order_id: uuid.UUID) -> str:
             )
             return "skipped (no atomic replace)"
 
-        ts = db.get(TraderSettings, order.user_id)
+        from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+
+        ts = dcs.effective(db, order.user_id, dcs.source_for_order(db, order.id))
         pct = Decimal(str(getattr(ts, "discord_reprice_pct", None) or 10))
         original = Decimal(str(order.limit_price))
         new_price = (original * (Decimal(1) + pct / Decimal(100))).quantize(Decimal("0.01"))

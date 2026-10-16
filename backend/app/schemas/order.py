@@ -1,6 +1,7 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -89,6 +90,22 @@ class FillOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReEnterIn(BaseModel):
+    """Buy back what a filled close took off (Positions page → Closed today →
+    Re-enter): at a limit, or — from the button's menu — at market."""
+
+    quantity: Decimal = Field(gt=0)
+    order_type: Literal["limit", "market"] = "limit"
+    # Required for a limit; ignored at market.
+    limit_price: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _limit_needs_a_price(self):
+        if self.order_type == "limit" and self.limit_price is None:
+            raise ValueError("A limit re-enter needs a price")
+        return self
+
+
 class OrderOut(BaseModel):
     id: uuid.UUID
     parent_order_id: uuid.UUID | None
@@ -135,6 +152,11 @@ class OrderOut(BaseModel):
     # the column existed — clients must fall back to closed_at and mark it
     # approximate rather than presenting it as the broker's time.
     broker_filled_at: datetime | None = None
+    # "stream" = the broker's realtime push told us about this order; "poll" =
+    # our REST sweep did. NULL where neither path records it. Diagnostic: it is
+    # how you tell a realtime feed that is genuinely carrying the load from one
+    # that is merely connected.
+    detected_via: str | None = None
     closed_at: datetime | None
     reject_reason: str | None
     created_at: datetime
@@ -146,6 +168,9 @@ class OrderOut(BaseModel):
     # opening orders / anything that realized nothing. Populated by the trades
     # endpoints from pnl.realized_pnl_by_order; not a DB column.
     realized_pnl: Decimal | None = None
+    # A sell-to-close / buy-to-close — an order that took contracts or shares
+    # OFF a position (exits, trims, closes).
+    is_closing: bool = False
     # True when this order was placed by a Sell-All Re-Enter (from a snapshot).
     # Transient flag attached by trades.py; not a DB column.
     is_reentry: bool = False

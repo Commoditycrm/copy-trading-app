@@ -46,8 +46,15 @@ _CAPS: dict[BrokerName, BrokerCapabilities] = {
         account_pnl_push=False,
         recommended_refresh_interval_s=30,  # 2 reads / 2s window — no room to poll faster
     ),
-    # IBKR: not verified for this app; declare nothing until checked.
-    BrokerName.IBKR: BrokerCapabilities(),
+    # IBKR (direct, Client Portal Gateway): verified on paper 2026-10-07 —
+    # /iserver/account/pnl/partitioned gives a live day P&L (dpl) and
+    # /portfolio positions carry unrealizedPnl. No activity/fill history is
+    # read yet, so no FIFO realized inference or expiry synthesis.
+    BrokerName.IBKR: BrokerCapabilities(
+        live_daily_pnl=True,
+        authoritative_open_pnl=True,
+        recommended_refresh_interval_s=15,
+    ),
     # Fake: test broker — its "history" is whatever a test sets, so complete
     # by construction.
     BrokerName.FAKE: BrokerCapabilities(

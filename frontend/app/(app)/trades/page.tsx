@@ -8,6 +8,7 @@ import { ArrowDown, ArrowUp, Check, ChevronsUpDown, Download, Inbox, Search, X }
 import { api } from "@/lib/api";
 import { useLivePrice } from "@/lib/livePrices";
 import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
+import { orderLiveKey } from "@/lib/liveKey";
 import { useTableColumns, type ColumnDef, type ResolvedColumn } from "@/lib/useTableColumns";
 import { ColumnsMenu, ResizeHandle } from "@/components/ColumnsMenu";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
@@ -16,6 +17,7 @@ import { PositionIcon, orderKind } from "@/components/PositionIcon";
 import { fmtDateTimeMs, fmtDuration, fmtSignedUsd, fmtUsd } from "@/lib/format";
 import { useEventStream } from "@/lib/sse";
 import { notify } from "@/lib/toast";
+import { DiscordAlertComposer } from "@/components/DiscordAlertComposer";
 import { Spinner } from "@/components/Spinner";
 import { AnimatedNumber } from "@/components/dashboard/AnimatedNumber";
 import { InlineBracketCell } from "@/components/InlineBracketCell";
@@ -102,29 +104,6 @@ type DiscordSignal = {
  *
  *  `broker_account_id` is deliberately null: no broker order exists, and that
  *  is what suppresses the Cancel action on the row. */
-/** What the backend says happened to a hand-submitted alert — the stored
- *  message's own verdict, so the modal can be specific instead of saying
- *  "sent" and leaving the trader to go hunting in another tab. */
-type SelfAlertResult = {
-  id: string;
-  content: string;
-  status: string;
-  status_reason: string | null;
-  decision: string | null;
-  order_id: string | null;
-  parsed_signal: Record<string, unknown> | null;
-};
-
-/** Discord's mark. Inline rather than an icon-set import because lucide has no
- *  Discord glyph and this button has to be recognisable at 14px. */
-function DiscordGlyph({ size = 15 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M20.317 4.369a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.249a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.036A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.099.246.198.373.292a.077.077 0 0 1-.006.127 12.3 12.3 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.331c-1.182 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" />
-    </svg>
-  );
-}
-
 function signalToOrder(sig: DiscordSignal): Order {
   const failed = sig.status === "invalid" || sig.status === "order_failed";
   // The trader's decision outranks the parse status once one exists:
@@ -234,23 +213,18 @@ function orderSymbolLabel(o: Order): string {
   return [o.symbol.toUpperCase(), cp, strike, exp].filter(Boolean).join(" ");
 }
 
-/** Live-cache key for an order's symbol — the ticker for stocks, the OCC for
- *  options (matching the stream/backend format). Null when we can't build one. */
-function orderLiveKey(o: Order): string | null {
-  const sym = (o.symbol || "").toUpperCase();
-  if (!sym || sym === "—") return null;
-  if (o.instrument_type !== "option") return sym;
-  if (!o.option_expiry || o.option_strike == null || o.option_strike === "" || !o.option_right) return null;
-  const iso = o.option_expiry;
-  const d = new Date(iso.length === 10 ? iso + "T00:00:00Z" : iso);
-  if (Number.isNaN(d.getTime())) return null;
-  const yy = String(d.getUTCFullYear()).slice(-2);
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const cp = o.option_right === "call" ? "C" : "P";
-  const strikeInt = Math.round(Number(o.option_strike) * 1000);
-  if (!Number.isFinite(strikeInt)) return null;
-  return `${sym}${yy}${mm}${dd}${cp}${String(strikeInt).padStart(8, "0")}`;
+
+/** Filled and submitted rows don't get a live price: a fill is done, and a
+ *  submitted order (or a Discord alert that already became one) is past the
+ *  decision the price is there to inform. Neither does anything placed more
+ *  than a day ago — a stale alert is not one you are deciding on now.
+ *  Skipping them keeps the 25-symbol watch for the rows that still need it. */
+const NO_LIVE_PRICE: OrderStatus[] = ["filled", "submitted"];
+const LIVE_PRICE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+function tracksLivePrice(o: Order): boolean {
+  if (NO_LIVE_PRICE.includes(o.status)) return false;
+  const placed = Date.parse(o.submitted_at ?? o.created_at ?? "");
+  return Number.isFinite(placed) && Date.now() - placed <= LIVE_PRICE_MAX_AGE_MS;
 }
 
 /** Live current-price cell for an order row. Ticks off the central stream (via
@@ -716,8 +690,9 @@ export default function TradesPage() {
   // subscribe the stream to hundreds of stale symbols. The shared hook
   // heartbeats it and pauses while the tab is hidden.
   const watchKeys = useMemo(() => {
-    const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
-    const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
+    const tracked = gridRows.filter(tracksLivePrice);
+    const open = tracked.filter((o) => OPEN_STATUSES.includes(o.status));
+    const rest = tracked.filter((o) => !OPEN_STATUSES.includes(o.status));
     const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
     return Array.from(new Set(keys)).slice(0, 25);
   }, [gridRows]);
@@ -825,50 +800,6 @@ export default function TradesPage() {
     expires: { label: "Expires in Days", sortKey: "expires" },
   };
 
-  // "Self" channel: paste an alert the system missed and replay it through the
-  // normal Discord pipeline. Same parser, same rules, same execution — the
-  // backend has no second path, which is the whole point of the feature.
-  const [selfOpen, setSelfOpen] = useState(false);
-  const [selfText, setSelfText] = useState("");
-  const [selfBusy, setSelfBusy] = useState(false);
-
-  const sendSelfAlert = useCallback(async () => {
-    const content = selfText.trim();
-    if (!content || selfBusy) return;
-    setSelfBusy(true);
-    try {
-      const r = await api<SelfAlertResult>("/api/discord-sources/self/alert", {
-        method: "POST",
-        body: JSON.stringify({ content }),
-      });
-      // The alert's own verdict decides the tone. A parse that produced no
-      // trade, or an order the executor refused, is NOT a success — saying
-      // "sent" for those is how a missed alert stays missed. The toast carries
-      // the reason, so the modal doesn't have to stay open to show it.
-      if (r.status === "order_created") {
-        notify.success("Alert placed");
-      } else if (r.status === "order_failed" || r.status === "invalid") {
-        notify.warn(r.status_reason || "The alert could not be placed");
-      } else if (r.status === "ignored") {
-        notify.warn(r.status_reason || "Not read as a trade alert");
-      } else {
-        notify.success("Alert queued for your approval");
-      }
-      // Answered, whatever the verdict — close and clear, so the next paste
-      // starts from an empty box rather than the previous alert.
-      setSelfText("");
-      setSelfOpen(false);
-      await Promise.all([loadPage(), loadStats()]);
-    } catch (e) {
-      // Left OPEN on purpose: nothing reached the backend, so closing would
-      // throw away the text with no record of it anywhere. The trader can
-      // retry without re-pasting.
-      notify.fromError(e, "could not submit the alert");
-    } finally {
-      setSelfBusy(false);
-    }
-  }, [selfText, selfBusy, loadPage, loadStats]);
-
   // Must match the number of <Th> cells below — it sizes the loading skeleton
   // and the empty-state row, both of which misalign if a column is added or
   // removed without updating it. Channel is conditional, so this is too.
@@ -935,24 +866,7 @@ export default function TradesPage() {
               Channel column uses, so the toolbar doesn't advertise a feature
               the account cannot reach. */}
           {showChannel && (
-            <button
-              type="button"
-              onClick={() => setSelfOpen(true)}
-              aria-haspopup="dialog"
-              aria-label="Submit a Discord alert manually"
-              title="Paste a Discord alert the system missed"
-              className="focus-ring rounded px-2 py-1.5 border transition-colors"
-              // Discord's own blurple. --muted made a 15px glyph read as a
-              // disabled control next to the search box; the brand colour is
-              // both brighter and self-explanatory, and it carries its own
-              // contrast in light and dark rather than tracking the theme's
-              // text tokens.
-              style={{ borderColor: "rgba(88,101,242,0.45)", color: "#5865F2", background: "rgba(88,101,242,0.10)" }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(88,101,242,0.20)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(88,101,242,0.10)"; }}
-            >
-              <DiscordGlyph />
-            </button>
+            <DiscordAlertComposer onSent={() => Promise.all([loadPage(), loadStats()])} />
           )}
           <div className="relative">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "var(--muted)" }} />
@@ -1441,11 +1355,22 @@ export default function TradesPage() {
                           style={{
                             background: st.bg, color: st.color, borderColor: "transparent",
                             // Only hint at a tooltip when there is one to show.
-                            ...(o.reject_reason
+                            ...(o.reject_reason || o.detected_via
                               ? { cursor: "help", textDecoration: "underline dotted", textUnderlineOffset: 3 }
                               : null),
                           }}
-                          title={o.reject_reason || undefined}
+                          title={[
+                            o.reject_reason || null,
+                            // How we learned about this order. A realtime feed
+                            // that is connected but losing the race to the
+                            // poller looks identical in every other column, so
+                            // this is the only place the two are told apart.
+                            o.detected_via === "stream"
+                              ? "Detected by the broker's realtime push"
+                              : o.detected_via === "poll"
+                              ? "Detected by our REST poll, not the realtime feed"
+                              : null,
+                          ].filter(Boolean).join("\n\n") || undefined}
                         >
                           {statusLabel}{o.parent_order_id ? " · copy" : ""}
                         </span>
@@ -1458,7 +1383,7 @@ export default function TradesPage() {
                       ),
                       expected_price: <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>,
                       filled_price: <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>,
-                      current_price: <LiveOrderPriceCell liveKey={orderLiveKey(o)} />,
+                      current_price: <LiveOrderPriceCell liveKey={tracksLivePrice(o) ? orderLiveKey(o) : null} />,
                       tp: (
                         <td className="px-5 py-3.5 num">
                           {isEntry ? (
@@ -1571,87 +1496,6 @@ export default function TradesPage() {
         )}
       </div>
 
-      {/* Self-channel composer. Deliberately plain: one textarea and one
-          button, because the backend does the reading. Anything clever here —
-          a symbol picker, a side toggle — would be a second way to describe a
-          trade, and the point of the feature is that there is only one. */}
-      {selfOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: "rgba(0,0,0,0.45)" }}
-          onClick={() => !selfBusy && setSelfOpen(false)}
-          role="presentation"
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Submit a Discord alert"
-            className="card w-full max-w-lg p-5 flex flex-col gap-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2" style={{ color: "var(--text)" }}>
-                <DiscordGlyph size={17} />
-                <span className="font-medium">Submit an alert</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelfOpen(false)}
-                disabled={selfBusy}
-                aria-label="Close"
-                className="focus-ring rounded"
-                style={{ color: "var(--muted)" }}
-              >
-                <X size={16} />
-              </button>
-            </div>
-
-            <p className="text-xs" style={{ color: "var(--muted)" }}>
-              Paste an alert the system missed. It is read by the same parser as
-              a live channel and follows your Discord settings — so in manual
-              mode it waits for your approval rather than placing.
-            </p>
-
-            <textarea
-              value={selfText}
-              onChange={(e) => setSelfText(e.target.value)}
-              onKeyDown={(e) => {
-                // Enter alone must NOT send: a multi-line message is one alert
-                // and people paste them.
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                  e.preventDefault();
-                  void sendSelfAlert();
-                }
-              }}
-              rows={4}
-              autoFocus
-              spellCheck={false}
-              placeholder="$SPY 771 CALL 0DTE @0.68"
-              aria-label="Discord alert text"
-              className="w-full px-3 py-2 text-sm font-mono resize-y"
-            />
-
-            <div className="flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setSelfOpen(false)}
-                disabled={selfBusy}
-                className="btn-ghost px-3 py-1.5 text-sm"
-              >
-                Close
-              </button>
-              <button
-                type="button"
-                onClick={() => void sendSelfAlert()}
-                disabled={selfBusy || !selfText.trim()}
-                className="btn-primary px-4 py-1.5 text-sm"
-              >
-                {selfBusy ? "Sending…" : "Send"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

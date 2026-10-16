@@ -239,6 +239,17 @@ export default function CalendarPage() {
         </div>
       </div>
 
+      {/* Phones: seven 112px-tall cells can't share a 375px width without
+          squeezing to ~45px and clipping the P&L figures, so the grid is sized
+          to show exactly THREE columns and scrolls sideways for the rest. The
+          weekday header lives inside the same scroller so it stays aligned with
+          the columns. From md up the wrapper is inert (no min width, overflow
+          visible).
+          Width maths: 7 columns + 6 gaps of 6px (gap-1.5). For 3 cells + 2 gaps
+          to equal the scroller's content width C: 3·(G−36)/7 + 12 = C, so
+          G = 7/3·(C−12) + 36 = 233.333% + 8px. */}
+      <div className="overflow-x-auto md:overflow-visible -mx-4 px-4 sm:-mx-5 sm:px-5 md:mx-0 md:px-0">
+      <div className="min-w-[calc(233.333%+8px)] md:min-w-0">
       <div className="grid grid-cols-7 gap-1.5 text-[11px] font-medium mb-1.5" style={{ color: "var(--muted)" }}>
         {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(d => <div key={d} className="px-2">{d}</div>)}
       </div>
@@ -352,6 +363,8 @@ export default function CalendarPage() {
             </motion.button>
           );
         })}
+      </div>
+      </div>
       </div>
       {loading && <p className="mt-3 text-sm" style={{ color: "var(--muted)" }}>Loading…</p>}
     </div>

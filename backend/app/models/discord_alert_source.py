@@ -73,6 +73,12 @@ class DiscordAlertSource(Base, TimestampMixin):
 
     # Trader on/off for THIS source. The listener only opens enabled sources.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Switched off by "Pause ALL channels" (not by hand), so "Resume ALL
+    # channels" turns back on exactly these and leaves a channel the trader had
+    # already turned off, off. Cleared whenever the switch is set by hand.
+    paused_by_pause_all: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
 
     # Set on a SUBSCRIBER's copy of a trader's channel (see
     # services/discord_subscribers.py): the trader channel it mirrors. The copy
@@ -83,6 +89,22 @@ class DiscordAlertSource(Base, TimestampMixin):
     # SET NULL, not CASCADE: the trader removing a channel stops the relay but
     # must not delete the subscriber's own alert history and order links. A
     # detached copy is re-attached if the channel comes back.
+    # Alert handling for THIS channel. True (the default): follow the account's
+    # Discord settings. False: use ``channel_settings`` — a copy of the
+    # account's taken when the switch was turned off, then edited. See
+    # services/discord_channel_settings.py. AI trimming stays account-wide.
+    use_account_settings: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+    channel_settings: Mapped[dict] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), default=dict, server_default="{}", nullable=False,
+    )
+    # How entries from this channel go out: "limit" at the alert's price (the
+    # default, as before) or "market". Exits always follow the exit ladder.
+    entry_order_type: Mapped[str] = mapped_column(
+        String(10), default="limit", server_default="limit", nullable=False
+    )
+
     parent_source_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("discord_alert_sources.id", ondelete="SET NULL"),

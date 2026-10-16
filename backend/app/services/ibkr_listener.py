@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.brokers.ibkr import IBKRAdapter
+from app.brokers.ibkr import IBKRAdapter, parse_contract_desc
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import (
@@ -253,13 +254,61 @@ _BUY = OrderSide.BUY
 _SELL = OrderSide.SELL
 
 
-# IBKR → our OrderType.
+# IBKR → our OrderType. The orders feed spells types out ("Limit", "Stop
+# Limit") while placement uses the short codes; accept both. Normalised
+# UPPER_SNAKE before lookup. An unknown type is NOT defaulted to MARKET —
+# see _order_type_in.
 _TYPE_IN = {
-    "MKT":     OrderType.MARKET,
-    "LMT":     OrderType.LIMIT,
-    "STP":     OrderType.STOP,
-    "STP_LMT": OrderType.STOP_LIMIT,
+    "MKT":        OrderType.MARKET,
+    "MARKET":     OrderType.MARKET,
+    "LMT":        OrderType.LIMIT,
+    "LIMIT":      OrderType.LIMIT,
+    "STP":        OrderType.STOP,
+    "STOP":       OrderType.STOP,
+    "STP_LMT":    OrderType.STOP_LIMIT,
+    "STOP_LIMIT": OrderType.STOP_LIMIT,
+    "STOPLIMIT":  OrderType.STOP_LIMIT,
 }
+
+
+def _order_type_in(order_obj: Any) -> OrderType:
+    """Our OrderType for an IBKR feed row. Falls back to LIMIT when a price is
+    present and MARKET otherwise, so an unmapped spelling never records a
+    priced order as a market order (the 2026-10-06 paper test recorded a
+    "Limit 320.00" as market)."""
+    raw = str(_attr(order_obj, "orderType", "origOrderType") or "").upper().replace(" ", "_")
+    mapped = _TYPE_IN.get(raw)
+    if mapped is not None:
+        return mapped
+    if _to_dec(_attr(order_obj, "price")) is not None:
+        return OrderType.LIMIT
+    return OrderType.MARKET
+
+
+def _app_order_ref_uuid(order_obj: Any) -> uuid.UUID | None:
+    """Our own Order id, if this feed row is an order the app placed. IBKR
+    echoes the ``cOID`` we send back as ``order_ref`` (older payloads: ``cOID``),
+    truncated to 32 characters — which is why the adapter sends the 32-char
+    hex form of the UUID. Returns None for external orders and for anything
+    that doesn't parse as a UUID."""
+    ref = _attr(order_obj, "order_ref", "orderRef", "cOID", "clientOrderId", "client_order_id")
+    if not ref:
+        return None
+    try:
+        return uuid.UUID(str(ref).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _terms_from_ibkr(order_obj: Any) -> tuple[str, OrderSide, Decimal, InstrumentType]:
+    """(symbol, side, quantity, instrument) of a feed row — the match key for
+    order_intent.adopt_app_placed_order."""
+    side = _BUY if str(_attr(order_obj, "side") or "").upper() == "BUY" else _SELL
+    sec_type = (_attr(order_obj, "secType") or "").upper()
+    instrument = InstrumentType.OPTION if sec_type in ("OPT", "FOP") else InstrumentType.STOCK
+    symbol = str(_attr(order_obj, "ticker", "symbol", "contractDesc") or "").split(" ")[0].upper()
+    qty = _to_dec(_attr(order_obj, "totalSize", "quantity")) or Decimal(0)
+    return symbol, side, qty, instrument
 
 
 def _poll_once(
@@ -295,11 +344,20 @@ def _poll_once(
             prev = seen.get(broker_order_id)
             if prev == status_str:
                 continue
+            try:
+                _persist_and_fanout(
+                    trader_user_id, broker_account_id, broker_order_id, status_str, o,
+                    adapter=adapter,
+                )
+            except Exception:  # noqa: BLE001
+                # Leave it unmarked so the next poll retries this transition;
+                # keep going so one bad row can't stall every other order.
+                log.exception(
+                    "ibkr-listener[%s] failed to persist order %s (%s)",
+                    trader_user_id, broker_order_id, status_str,
+                )
+                continue
             seen[broker_order_id] = status_str
-
-            _persist_and_fanout(
-                trader_user_id, broker_account_id, broker_order_id, status_str, o
-            )
 
 
 # IBKR order status → our enum (same mapping as the adapter, kept local
@@ -328,6 +386,7 @@ def _persist_and_fanout(
     broker_order_id: str,
     status_str: str,
     order_obj: Any,
+    adapter: IBKRAdapter | None = None,
 ) -> None:
     status_enum = _STATUS_IN.get(status_str, OrderStatus.SUBMITTED)
 
@@ -335,9 +394,14 @@ def _persist_and_fanout(
         acct_gate = db.get(BrokerAccount, broker_account_id)
         if not broker_filters.should_persist_order(acct_gate, status_enum):
             return
+        # Oldest row wins if a duplicate pair ever exists (the app-placed row
+        # predates anything the listener inserted) — never raise on it.
         existing = db.execute(
-            select(Order).where(Order.broker_order_id == broker_order_id)
-        ).scalar_one_or_none()
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .order_by(Order.created_at.asc())
+            .limit(1)
+        ).scalars().first()
 
         if existing is not None:
             # Track whether *this* poll observed a status transition — the
@@ -421,25 +485,53 @@ def _persist_and_fanout(
         # differently) is inserted a SECOND time and fanned out again, giving
         # every subscriber two mirrors for one trade. trade_listener has had
         # this guard since the Alpaca doubling bug; it was never carried across.
-        _coid = _attr(order_obj, "cOID", "clientOrderId", "client_order_id")
-        if _coid:
-            try:
-                _app_oid = uuid.UUID(str(_coid).strip())
-            except (ValueError, TypeError, AttributeError):
-                _app_oid = None
-            if _app_oid is not None and order_intent.is_app_originated(_app_oid):
+        _app_oid = _app_order_ref_uuid(order_obj)
+        if _app_oid is not None:
+            own = db.get(Order, _app_oid)
+            if own is not None and own.user_id == trader_user_id:
+                # Ours — the Trade Panel row may not have its broker id committed
+                # yet (the poll can land inside that window). Attach the id and
+                # let the matched-order path above apply status on the next poll.
+                if own.broker_order_id != broker_order_id:
+                    own.broker_order_id = broker_order_id
+                    db.commit()
+                log.info(
+                    "ibkr-listener[%s] ibkr order %s is app order %s — adopted, not re-inserted",
+                    trader_user_id, broker_order_id, _app_oid,
+                )
+                return
+            if order_intent.is_app_originated(_app_oid):
                 log.info(
                     "ibkr-listener[%s] skipping app-originated order "
-                    "(cOID=%s, ibkr order=%s) — the Trade Panel owns it",
-                    trader_user_id, _coid, broker_order_id,
+                    "(ref=%s, ibkr order=%s) — the Trade Panel owns it",
+                    trader_user_id, _app_oid, broker_order_id,
                 )
+                return
+        # Ref present but not one of ours (IBKR stamps its own numeric
+        # order_ref on orders placed in its apps) → a genuine external order;
+        # fall through to insert + fanout. Only when the ref is MISSING
+        # entirely, or is one of our UUIDs cut short by an older truncation,
+        # do we fall back to matching instrument/side/qty against recent
+        # app-placed orders — otherwise an external "buy 1 AAPL" could be
+        # mistaken for an app order of the same shape.
+        _raw_ref = str(_attr(order_obj, "order_ref", "orderRef", "cOID") or "").strip()
+        _looks_like_our_ref = bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{0,12}", _raw_ref))
+        if _app_oid is None and (not _raw_ref or _looks_like_our_ref):
+            _sym, _side, _qty, _instr = _terms_from_ibkr(order_obj)
+            adopted = order_intent.adopt_app_placed_order(
+                db, trader_user_id, broker_order_id,
+                symbol=_sym, side=_side, quantity=_qty, instrument_type=_instr,
+            )
+            if adopted is not None:
+                db.commit()
                 return
 
         order = _insert_order_from_ibkr(
-            db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum
+            db, trader_user_id, broker_account_id, broker_order_id, order_obj, status_enum,
+            adapter=adapter,
         )
         order.trader_submitted_at = _as_dt(
-            _attr(order_obj, "lastExecutionTime", "submittedTime", "time")
+            _attr(order_obj, "lastExecutionTime_r", "lastExecutionTime", "submittedTime", "time")
         )
         order.socket_received_at = datetime.now(timezone.utc)
 
@@ -506,17 +598,18 @@ def _insert_order_from_ibkr(
     broker_order_id: str,
     order_obj: Any,
     status_enum: OrderStatus,
+    adapter: IBKRAdapter | None = None,
 ) -> Order:
     """Translate an IBKR order payload into our Order schema and INSERT.
 
-    Stocks-only for now (matches the adapter's placement scope). Option
-    detection lives in the contract description; once IBKR option
-    placement is implemented we'll parse expiry/strike/right out here."""
+    Options carry expiry/strike/right so the copy engine can place the
+    mirror: resolved from the order's conid via ``adapter.option_details``
+    (authoritative, cached), falling back to parsing IBKR's contract
+    description when the lookup is unavailable."""
     side_raw = str(_attr(order_obj, "side") or "").upper()
     side = _BUY if side_raw == "BUY" else _SELL
 
-    type_raw = str(_attr(order_obj, "orderType") or "MKT").upper().replace(" ", "_")
-    order_type = _TYPE_IN.get(type_raw, OrderType.MARKET)
+    order_type = _order_type_in(order_obj)
 
     sec_type = (_attr(order_obj, "secType") or "").upper()
     instrument = (
@@ -528,13 +621,42 @@ def _insert_order_from_ibkr(
     symbol_raw = str(_attr(order_obj, "ticker", "symbol", "contractDesc") or "")
     symbol = symbol_raw.split(" ")[0].upper()
 
+    option_expiry = option_strike = option_right = None
+    if instrument == InstrumentType.OPTION:
+        details = None
+        conid = _attr(order_obj, "conid", "conId")
+        if adapter is not None and conid is not None:
+            details = adapter.option_details(conid)
+        if details is None:
+            desc1 = str(_attr(order_obj, "description1") or "")
+            desc2 = str(_attr(order_obj, "description2") or "")
+            for candidate in (
+                _attr(order_obj, "contractDesc"),
+                f"{desc1} {desc2}".strip(),
+                desc2,
+                _attr(order_obj, "localSymbol", "local_symbol"),
+            ):
+                details = parse_contract_desc(candidate)
+                if details is not None:
+                    break
+        if details is not None:
+            symbol, option_expiry, option_strike, option_right = details
+        else:
+            log.warning(
+                "ibkr-listener[%s] option order %s has no readable contract "
+                "(conid=%s, desc=%r) — recorded without expiry/strike/right",
+                trader_user_id, broker_order_id, conid, symbol_raw,
+            )
+
     qty = _to_dec(_attr(order_obj, "totalSize", "quantity")) or Decimal(0)
     limit_price = _to_dec(_attr(order_obj, "price"))
     stop_price = _to_dec(_attr(order_obj, "auxPrice", "stopPrice"))
     filled_q = _to_dec(_attr(order_obj, "filledQuantity", "cumQty")) or Decimal(0)
     filled_avg = _to_dec(_attr(order_obj, "avgPrice", "lastPrice"))
+    # lastExecutionTime is a compact "YYMMDDhhmmss" string; the _r variant is
+    # epoch ms, which _as_dt understands.
     submitted_at = (
-        _as_dt(_attr(order_obj, "lastExecutionTime", "submittedTime", "time"))
+        _as_dt(_attr(order_obj, "lastExecutionTime_r", "lastExecutionTime", "submittedTime", "time"))
         or datetime.now(timezone.utc)
     )
 
@@ -543,13 +665,9 @@ def _insert_order_from_ibkr(
         broker_account_id=broker_account_id,
         instrument_type=instrument,
         symbol=symbol,
-        # Option fields stay None for stocks; option placement is a TODO,
-        # but if a trader places an option on IBKR's app directly we'll
-        # detect it as instrument_type=OPTION with the underlying as
-        # symbol — a follow-up will parse expiry/strike/right.
-        option_expiry=None,
-        option_strike=None,
-        option_right=None,
+        option_expiry=option_expiry,
+        option_strike=option_strike,
+        option_right=option_right,
         side=side,
         order_type=order_type,
         quantity=qty,

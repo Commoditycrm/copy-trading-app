@@ -222,3 +222,9 @@ def _reconcile_once() -> None:
                 db.commit()
         except Exception:  # noqa: BLE001
             log.exception("webull subscriber reconcile: account %s failed", acct_id)
+
+
+# Count this loop's Webull calls under its own name (services/webull_usage.py).
+from app.services import webull_usage  # noqa: E402
+
+_reconcile_once = webull_usage.tagged("Subscriber sync")(_reconcile_once)

@@ -5,6 +5,7 @@
  *
  *   🟢 Live           ← connected and receiving
  *   🟡 Reconnecting   ← drop detected, retrying
+ *   🟠 Silent         ← connected, but the stream stopped delivering (orders by polling)
  *   🔴 Offline        ← disconnected (or credentials missing)
  *   ⚪ No broker      ← no broker connected
  *
@@ -41,6 +42,7 @@ const STATE_LABEL: Record<ListenerStatus["state"], string> = {
   no_trader: "No trader followed",
   no_broker: "No broker",
   in_use_elsewhere: "Live elsewhere",
+  silent: "Connected but silent (orders by polling)",
 };
 
 const STATE_COLOR: Record<ListenerStatus["state"], string> = {
@@ -52,6 +54,7 @@ const STATE_COLOR: Record<ListenerStatus["state"], string> = {
   no_trader: "#94a3b8",
   no_broker: "#94a3b8",
   in_use_elsewhere: "#f97316",
+  silent: "#f59e0b",
 };
 
 /* The maps above are typed against the union so a state added to ListenerStatus
@@ -151,6 +154,10 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_trader") return "Pick a trader to follow on the Settings page";
     if (s === "credentials_invalid") return "Broker credentials missing or revoked";
     if (s === "in_use_elsewhere") return status?.last_error || "Webull is live somewhere else";
+    if (s === "silent") {
+      const lastStream = status?.last_event_at ? fmtRel(status.last_event_at) : "never";
+      return `${status?.last_error || "The broker stream stopped delivering orders; they are arriving by polling."} · last stream event ${lastStream}`;
+    }
     const last = status?.last_event_at ? `last event ${fmtRel(status.last_event_at)}` : "no events yet";
     return `${prefix} ${label.toLowerCase()} · ${last}`;
   })();
@@ -168,6 +175,7 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_trader") return "No trader followed";
     if (s === "credentials_invalid") return `${prefix} disconnected`;
     if (s === "in_use_elsewhere") return "Webull live elsewhere";
+    if (s === "silent") return label;
     return `${prefix} ${label.toLowerCase()}`;
   })();
 

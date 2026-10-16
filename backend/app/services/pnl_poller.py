@@ -131,16 +131,34 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
     # 0DTE contract that can move a long way in that minute. 15s reads positions
     # four times a minute against a 60/minute allowance.
     BrokerName.WEBULL: 15.0,
+    # IBKR gateway: generous rate budget, but every call shares the user's
+    # single brokerage session with the order poll — 15s is plenty.
+    BrokerName.IBKR: 15.0,
 }
 
 
-def _interval_for_broker(broker: BrokerName) -> float:
-    """Return the current per-tick interval for ``broker``, reading any
-    runtime override every call. For Alpaca this checks Redis (~0.5ms);
-    for everything else it uses the static map above.
+# Floor for the market-closed P&L cadence, so a bad config value (0/negative/
+# invalid) can never tighten the poll — also guarded by max(base, …) below.
+_MIN_PNL_CLOSED_S = 30.0
 
-    Called on the hot path (stamping the next-due time after each tick)
-    so an admin change lands on the very next tick without restart."""
+
+def _closed_pnl_interval() -> float:
+    """Configured closed-market P&L interval (``pnl_poll_interval_closed_seconds``),
+    floored to a safe minimum. Invalid/non-positive values fall back to 180s."""
+    from app.config import get_settings  # noqa: PLC0415
+    try:
+        v = float(get_settings().pnl_poll_interval_closed_seconds)
+    except (TypeError, ValueError):
+        v = 180.0
+    if v <= 0:
+        v = 180.0
+    return max(_MIN_PNL_CLOSED_S, v)
+
+
+def _base_interval_for_broker(broker: BrokerName) -> float:
+    """The full-cadence per-tick interval for ``broker``, reading any runtime
+    override every call. For Alpaca this checks Redis (~0.5ms); for everything
+    else it uses the static map above."""
     if broker == BrokerName.ALPACA:
         try:
             from app.services.platform_config import (  # noqa: PLC0415
@@ -154,6 +172,21 @@ def _interval_for_broker(broker: BrokerName) -> float:
             )
             return _INTERVAL_BY_BROKER[BrokerName.ALPACA]
     return _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
+
+
+def _interval_for_broker(broker: BrokerName) -> float:
+    """Per-tick interval for ``broker``. Full cadence during regular + extended
+    hours; backed off to the closed floor overnight / weekends, since account
+    P&L (and therefore the daily kill-switch / auto-liquidation / TP-SL the
+    poller enforces) can't change while the market is shut. This cuts CPU and
+    broker REST calls (Alpaca included) off-hours; full cadence resumes
+    automatically in pre-market. Called on the hot path (stamping next-due) so a
+    change lands on the next tick without restart."""
+    base = _base_interval_for_broker(broker)
+    from app.services import market_hours  # noqa: PLC0415
+    if not market_hours.is_tradable_now():
+        return max(base, _closed_pnl_interval())
+    return base
 
 # Per-account monotonic timestamp of the earliest time the account is
 # allowed to be polled again. The outer loop ticks every POLL_INTERVAL_S
@@ -222,7 +255,7 @@ def _snapshot_or_last_known(
 # (a) the adapter implements ``get_pnl_snapshot()``, and (b) the broker
 # is listed here, and (c) the broker has an entry in
 # ``_INTERVAL_BY_BROKER``.
-_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.WEBULL)
+_SUPPORTED_BROKERS = (BrokerName.ALPACA, BrokerName.SNAPTRADE, BrokerName.WEBULL, BrokerName.IBKR)
 
 # Concurrency gate for SnapTrade. Even with skip-idle and 60s cadence,
 # if 30+ subscribers all become due in the same tick they would burst
@@ -274,6 +307,27 @@ async def stop() -> None:
     _task = None
 
 
+_last_session_log: str | None = None
+
+
+def _maybe_log_session() -> None:
+    """Log once when the market session changes (e.g. after-hours → closed),
+    with the resulting P&L cadence — never every tick."""
+    global _last_session_log
+    from app.services import market_hours  # noqa: PLC0415
+    session = market_hours.market_session()
+    if session == _last_session_log:
+        return
+    _last_session_log = session
+    log.info(
+        "pnl_poller: worker=pnl_poller market_session=%s tradable=%s "
+        "alpaca_interval=%.0fs webull_interval=%.0fs",
+        session, session != market_hours.CLOSED,
+        _interval_for_broker(BrokerName.ALPACA),
+        _interval_for_broker(BrokerName.WEBULL),
+    )
+
+
 async def _run() -> None:
     """Outer loop ticks every POLL_INTERVAL_S. On each tick:
 
@@ -287,6 +341,7 @@ async def _run() -> None:
     """
     while True:
         try:
+            _maybe_log_session()
             accts = await asyncio.to_thread(_load_active_accounts)
             now = time.monotonic()
             due = [a for a in accts if _next_due_at.get(a.id, 0.0) <= now]
@@ -331,22 +386,45 @@ def _load_active_accounts() -> list[BrokerAccount]:
 
 
 def _has_discord_ladder_work(db, user_id) -> bool:
-    """A live Discord guard with a stop level or an armed trail — the same
-    selection the trader gate below uses."""
+    """A live Discord guard this poller has something to do for: a stop level,
+    an armed trail, a resting take-profit, or an option holding whose entry has
+    filled.
+
+    The last one matters: a filled entry with nothing set yet is exactly the
+    holding that still needs its first protection — the entry price adopted
+    from the fill, then its On Fill stop and first take-profit. Gating on a stop
+    alone skipped it, so a market entry (no price to seed the ladder with) on a
+    Discord subscriber who has no other risk policy was never protected at all
+    (QA 2026-10-13, SPY 776P "out the gate": the trader got a stop and T1, the
+    subscriber got nothing).
+    """
+    from sqlalchemy import exists as _exists  # noqa: PLC0415
     from sqlalchemy import or_ as _or  # noqa: PLC0415
     from sqlalchemy import select as _select  # noqa: PLC0415
 
     from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+    from app.models.order import Order, OrderStatus  # noqa: PLC0415
 
-    return db.execute(
-        _select(DiscordPositionGuard.id).where(
-            DiscordPositionGuard.user_id == user_id,
-            DiscordPositionGuard.closed_at.is_(None),
+    G = DiscordPositionGuard
+    live = (G.user_id == user_id, G.closed_at.is_(None))
+    if db.execute(
+        _select(G.id).where(
+            *live,
             _or(
-                DiscordPositionGuard.stop_price.isnot(None),
-                DiscordPositionGuard.trail_qty.isnot(None),
+                G.stop_price.isnot(None),
+                G.trail_qty.isnot(None),
+                G.tp_order_id.isnot(None),
+                G.tp_stop_order_id.isnot(None),
             ),
         ).limit(1)
+    ).scalar_one_or_none() is not None:
+        return True
+    entry_filled = _exists().where(
+        Order.id == G.entry_order_id,
+        Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+    )
+    return db.execute(
+        _select(G.id).where(*live, G.option_strike.isnot(None), entry_filled).limit(1)
     ).scalar_one_or_none() is not None
 
 
@@ -427,12 +505,9 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
             # trader-side work. Without this the gate would skip the account and
             # the trail would never be enforced.
             if not has_setup:
-                from app.models.discord_position_guard import (  # noqa: PLC0415
-                    DiscordPositionGuard,
-                )
-
-                # Must match what discord_position_guard.armed() selects, or the
-                # account is skipped before the work is ever reached.
+                # The same selection the subscriber gate uses, a superset of
+                # what discord_position_guard.armed() selects — or the account
+                # is skipped before the work is ever reached.
                 #
                 # armed_at is set ONLY when a TRAILING exit is armed. A guard
                 # protected by a plain stop level has it NULL — which is every
@@ -440,18 +515,7 @@ def _account_role(user_id: uuid.UUID) -> tuple[str, bool]:
                 # trims exit at market. Gating on armed_at therefore skipped
                 # exactly the positions that had a stop to place, and their
                 # guards were never retired when the position closed either.
-                from sqlalchemy import or_ as _or  # noqa: PLC0415
-
-                has_setup = db.execute(
-                    _select(DiscordPositionGuard.id).where(
-                        DiscordPositionGuard.user_id == user_id,
-                        DiscordPositionGuard.closed_at.is_(None),
-                        _or(
-                            DiscordPositionGuard.stop_price.isnot(None),
-                            DiscordPositionGuard.trail_qty.isnot(None),
-                        ),
-                    ).limit(1)
-                ).scalar_one_or_none() is not None
+                has_setup = _has_discord_ladder_work(db, user_id)
             # Also tick if Discord trade-alerts are on — the trader tick sweeps
             # newly-filled orders to the webhook (see _enforce_one_trader), a
             # periodic backstop to the real-time listener + page-sync emits.
@@ -476,14 +540,25 @@ def _enforce_one_safe(acct: BrokerAccount) -> None:
     if not should_run:
         return
 
-    if acct.broker == BrokerName.SNAPTRADE:
-        with _SNAPTRADE_SEM:
-            _enforce_one_inner(acct, role)
-        return
-    _enforce_one_inner(acct, role)
+    # Count this loop's Webull calls under its own name (services/webull_usage.py).
+    from app.services import webull_usage  # noqa: PLC0415
+
+    with webull_usage.tag("P&L poller"):
+        if acct.broker == BrokerName.SNAPTRADE:
+            with _SNAPTRADE_SEM:
+                _enforce_one_inner(acct, role)
+            return
+        _enforce_one_inner(acct, role)
 
 
 def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
+    # One coalescing window per account per tick: the sub-enforcers below each
+    # read this account's positions LIVE, and on Webull those near-simultaneous
+    # reads 429. risk_tick shares ONE fresh read across them (a mutating
+    # place_order invalidates it). Each account runs in its own thread/context
+    # (asyncio.to_thread), so ticks never share a snapshot. See risk_tick.py.
+    from app.services import risk_tick  # noqa: PLC0415
+    token = risk_tick.begin()
     try:
         if role == "trader":
             _enforce_one_trader(acct)
@@ -498,6 +573,15 @@ def _enforce_one_inner(acct: BrokerAccount, role: str) -> None:
             "pnl_poller: enforce failed for account %s (user %s, role=%s)",
             acct.id, acct.user_id, role,
         )
+    finally:
+        tick = risk_tick.end(token)
+        if tick is not None and (tick.fresh_fetches or tick.reuses):
+            # DEBUG so it never floods prod; proves the coalescing per account.
+            log.debug(
+                "risk_tick: account=%s positions_fresh_fetches=%d "
+                "positions_snapshot_reuses=%d refreshes=%d",
+                acct.id, tick.fresh_fetches, tick.reuses, tick.refreshes,
+            )
 
 
 def _reconcile_brackets_for_subscriber(acct: BrokerAccount) -> None:
@@ -634,24 +718,135 @@ def _make_stop_placer(db, live_acct, acct, guard):
     return _place
 
 
+def _make_limit_placer(db, live_acct, acct, guard):
+    """Place a take-profit: a resting LIMIT sell for this contract, through the
+    normal order path like the ladder stop (tracked, audited, never fanned out)."""
+    def _place(quantity, price):
+        from app.api.trades import _place_trader_order  # noqa: PLC0415
+        from app.models.order import (  # noqa: PLC0415
+            InstrumentType, OptionRight, OrderSide, OrderType,
+        )
+        from app.models.user import User  # noqa: PLC0415
+        from app.schemas.order import PlaceOrderIn  # noqa: PLC0415
+        from fastapi import BackgroundTasks  # noqa: PLC0415
+
+        right = guard.option_right
+        payload = PlaceOrderIn(
+            instrument_type=(
+                InstrumentType.OPTION if guard.option_strike is not None
+                else InstrumentType.STOCK
+            ),
+            symbol=guard.symbol.upper(),
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=quantity,
+            limit_price=Decimal(str(price)).quantize(Decimal("0.01")),
+            option_expiry=guard.option_expiry,
+            option_strike=guard.option_strike,
+            option_right=OptionRight(right) if right else None,
+        )
+        order = _place_trader_order(
+            db, db.get(User, acct.user_id), payload, live_acct.id,
+            BackgroundTasks(), _PollerRequest(),
+            resolve_wash_trade=True,      # a close, so option SELLs go SELL_TO_CLOSE
+            partial_close=True,
+            skip_fanout=True,
+            skip_dedup=True,
+        )
+        return order.id
+    return _place
+
+
+def _make_pair_placer(db, live_acct, acct, adapter, guard):
+    """Place a take-profit LIMIT and its linked STOP on the same contracts, in
+    one broker call (BrokerAdapter.place_exit_pair). Returns both order ids.
+
+    Not through _place_trader_order: that places ONE order, and its close-path
+    recovery (cancel whatever conflicts, then retry) is exactly wrong for a pair
+    that is meant to sit beside the ladder stop. Two rows, one call; a refusal
+    is recorded and raised, and nothing else is touched.
+    """
+    def _place(quantity, price, stop_price):
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        from app.api.trades import broker_request_for  # noqa: PLC0415
+        from app.models.order import (  # noqa: PLC0415
+            InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType,
+        )
+        from app.services import audit, copy_engine, events, order_intent  # noqa: PLC0415
+
+        now = datetime.now(timezone.utc)
+        right = guard.option_right
+        common = dict(
+            user_id=acct.user_id, broker_account_id=live_acct.id,
+            instrument_type=InstrumentType.OPTION, symbol=guard.symbol.upper(),
+            option_expiry=guard.option_expiry, option_strike=guard.option_strike,
+            option_right=OptionRight(right) if right else None,
+            side=OrderSide.SELL, quantity=quantity, status=OrderStatus.PENDING,
+            is_closing=True, is_partial_close=True, fanned_out_to_subscribers=False,
+            trader_submitted_at=now,
+        )
+        tp = Order(order_type=OrderType.LIMIT,
+                   limit_price=Decimal(str(price)).quantize(Decimal("0.01")), **common)
+        sl = Order(order_type=OrderType.STOP,
+                   stop_price=Decimal(str(stop_price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+                   **common)
+        db.add_all([tp, sl])
+        db.flush()
+        # Before the broker call, as for any order of ours: the listener must
+        # not take the echo for an order placed elsewhere and import it twice.
+        order_intent.mark_app_originated(tp.id)
+        order_intent.mark_app_originated(sl.id)
+        try:
+            r_tp, r_sl = adapter.place_exit_pair(
+                broker_request_for(tp, False), broker_request_for(sl, False))
+        except Exception as exc:  # noqa: BLE001
+            tp.status = OrderStatus.REJECTED
+            tp.reject_reason = str(exc)[:480]
+            tp.closed_at = now
+            # The stop leg never existed. Left behind as a REJECTED STOP it
+            # would read to the stop reconciler as "the broker refuses stops on
+            # this contract", whose answer is to close the position.
+            db.delete(sl)
+            audit.record(
+                db, actor_user_id=acct.user_id, action="discord.take_profit_rejected",
+                entity_type="order", entity_id=tp.id, metadata={"error": str(exc)[:480]},
+            )
+            db.commit()
+            raise
+        for order, result in ((tp, r_tp), (sl, r_sl)):
+            order.broker_order_id = result.broker_order_id
+            order.status = result.status
+            order.submitted_at = result.submitted_at
+            order.broker_accepted_at = now
+        audit.record(
+            db, actor_user_id=acct.user_id, action="discord.take_profit_placed",
+            entity_type="order", entity_id=tp.id,
+            metadata={"symbol": tp.symbol, "qty": str(quantity), "limit": str(tp.limit_price),
+                      "stop": str(sl.stop_price), "stop_order_id": str(sl.id)},
+        )
+        db.commit()
+        for order in (tp, sl):
+            try:
+                events.publish(acct.user_id, copy_engine._order_event("order.placed", order))
+            except Exception:  # noqa: BLE001
+                log.warning("take-profit: order event failed for %s", order.id, exc_info=True)
+        return tp.id, sl.id
+    return _place
+
+
 def _make_stop_canceller(db, adapter):
-    """Cancel a resting stop by our order id, and mark the row cancelled."""
+    """Cancel a resting ladder order by our order id, and record what the broker
+    says happened to it — a fill that beat the cancel is a fill, not a cancel
+    (see exit_confirm.cancel_and_record)."""
     def _cancel(order_id):
-        from app.models.order import Order, OrderStatus  # noqa: PLC0415
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services.exit_confirm import cancel_and_record  # noqa: PLC0415
 
         order = db.get(Order, order_id)
         if order is None:
             return
-        if order.broker_order_id:
-            try:
-                adapter.cancel_order(order.broker_order_id)
-            except Exception:  # noqa: BLE001
-                # Already gone at the broker is the usual reason, and it means
-                # the same thing we wanted: nothing is resting any more.
-                log.warning(
-                    "discord stop: broker cancel failed for %s", order_id, exc_info=True
-                )
-        order.status = OrderStatus.CANCELED
+        cancel_and_record(adapter, order)
     return _cancel
 
 
@@ -673,6 +868,28 @@ def _bid_for(adapter, pos) -> "Decimal | None":
     except Exception:  # noqa: BLE001
         log.warning("discord stops: quote lookup failed for %s", pos.symbol, exc_info=True)
         return None
+
+
+def exit_freeing_reservations(db, trader, live_acct, adapter, pos, quantity):
+    """Exit at market — after freeing the contracts resting orders reserve.
+
+    The ladder's stop and a resting take-profit (with its linked stop) each
+    hold contracts at the broker, and a sell of the same contracts on top of
+    them is refused: QA 2026-10-08, SPY 775P — a trailing stop armed after T1
+    fired three times and Webull rejected every market sell, because T2's
+    take-profit pair and the 0.76 stop were holding the 5 contracts. The manual
+    close always released them first (release_for_position); the poller's
+    exits — a trailing exit, an emulated stop, a refused stop's fallback — now
+    do the same. The next pass puts back whatever should still rest.
+    """
+    from app.services import discord_stop_orders  # noqa: PLC0415
+
+    try:
+        discord_stop_orders.release_for_position(db, trader, pos)
+    except Exception:  # noqa: BLE001 — try the exit anyway; a refusal is reported
+        log.warning("pnl_poller: could not release resting orders before exiting %s",
+                    getattr(pos, "symbol", "?"), exc_info=True)
+    return place_exit(db, trader, live_acct, adapter, pos, quantity)
 
 
 def place_exit(db, trader, live_acct, adapter, pos, quantity, *, partial: bool = False):
@@ -763,7 +980,21 @@ def _pinned(user_id, guard) -> bool:
     return price_override.get_pin(user_id, key) is not None
 
 
-def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
+def _enforce_discord_trailing_stops(acct: BrokerAccount, seen: dict | None = None) -> None:
+    """The Discord ladder pass for one account, holding the user's ladder lock.
+
+    The one-second trailing-stop loop (services/trail_ratchet) raises the same
+    guards' stops between these passes. Without the shared lock this pass could
+    load a guard, the loop raise its stop, and this pass then write its stale,
+    LOWER level back over it.
+    """
+    from app.services import trail_ratchet  # noqa: PLC0415
+
+    with trail_ratchet.user_lock(acct.user_id):
+        _enforce_discord_ladder(acct, seen)
+
+
+def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> None:
     """Advance the stops and trailing exits a Discord trim left behind.
 
     Set by the trim ladder: a stop level under what's still held, and sometimes
@@ -781,8 +1012,27 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
     try:
         with SessionLocal() as db:
             from app.services import discord_position_guard as _guards  # noqa: PLC0415
+            from app.services import discord_channel_settings as _dcs  # noqa: PLC0415
+            from app.services import discord_take_profit as _tp  # noqa: PLC0415
+            from app.models.settings import TraderSettings as _TS  # noqa: PLC0415
 
-            if not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
+            # Holdings whose channel rests take-profit orders need a pass even
+            # with no stop set yet — the first take-profit goes on at the fill.
+            _account_ts = db.get(_TS, acct.user_id)
+            _ladder_engine = getattr(_account_ts, "discord_exit_engine", None) != "ai"
+
+            def _settings_for(g):
+                return _dcs.for_guard(db, acct.user_id, g) or _account_ts
+
+            _tp_possible = _ladder_engine and _tp.possible(db, acct.user_id, _account_ts)
+            _tp_waiting = [
+                g for g in _guards.live(db, acct.user_id)
+                if g.option_strike is not None
+                and (g.tp_order_id is not None or g.tp_stop_order_id is not None
+                     or (_tp_possible and _tp.enabled(_settings_for(g))
+                         and not _guards.is_manual(db, g)))       # Self: no take-profit
+            ]
+            if not _tp_waiting and not [g for g in _guards.armed(db) if g.user_id == acct.user_id]:
                 return  # nothing armed for this trader
 
             live_acct = db.get(BrokerAccount, acct.id)
@@ -790,15 +1040,65 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                 return
             adapter = adapter_for(live_acct, decrypt_json(live_acct.encrypted_credentials))
 
+            # A sell this ladder confirmed but never got a price or close time
+            # for: fill them in, or it is missing from Closed today and the
+            # day's P&L. Nothing else re-reads it — a Discord subscriber's
+            # Webull account has no order listener.
+            try:
+                from app.services import fills_sync as _fills  # noqa: PLC0415
+
+                if _fills.repair_unrecorded_fills(db, live_acct, adapter):
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                log.warning("discord stop: fill repair failed for user=%s",
+                            acct.user_id, exc_info=True)
+
+            # Guards this pass has already sent an exit for. The positions read
+            # below is taken ONCE, before anything sells, so a second exit later
+            # in the same pass sizes itself from contracts that are already gone.
+            # QA 2026-10-16, QQQ 720P: the stop reconciler's refused stop exited
+            # 3 at market (filled), then the emulated stop — reading the same
+            # pre-exit snapshot, 3 still "held" — sold 3 again 2s later; Webull
+            # refused it ("Close intent mismatches position direction"). One exit
+            # per position per pass; the next pass reads what is really left.
+            exited_this_pass: set = set()
+
             def _close(pos, guard, quantity) -> None:
                 """Exit at market — a stop that fires has to fill.
 
                 ``quantity`` is what this protection covers: the whole position
                 for a stop-out, or just the earmarked slice for a trailing exit.
+
+                Resting orders are released first (they hold the contracts),
+                then the sell goes out, and then — once the sell is CONFIRMED
+                filled — this account is made due so the stop on whatever is
+                left goes back on the next wake instead of the next full
+                interval. A trailing exit that sells part of a position used to
+                leave the remainder unprotected for the rest of the interval.
+
+                Confirmed, never assumed: poking the reconciler while the sell
+                is still working would size the stop to the whole position and
+                reserve the very contracts the sell is taking.
                 """
                 from app.models.user import User  # noqa: PLC0415
+                from app.services import exit_confirm  # noqa: PLC0415
 
-                place_exit(db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
+                if guard.id in exited_this_pass:
+                    log.info("discord stops: %s already exited this pass — not selling "
+                             "%s again from the same positions read", guard.symbol, quantity)
+                    return
+                exited_this_pass.add(guard.id)
+                sold = exit_freeing_reservations(
+                    db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
+                try:
+                    if exit_confirm.confirm_filled(db, live_acct.id, sold):
+                        poll_now(live_acct.id)
+                except Exception:  # noqa: BLE001
+                    # The stop still goes out on the next tick; this only ever
+                    # makes it sooner, so a failure must not fail the exit.
+                    log.warning("pnl_poller: could not expedite the stop after exiting %s",
+                                getattr(pos, "symbol", "?"), exc_info=True)
 
             # Keep a REAL stop order resting at the broker for each protected
             # position. Reconciled every tick rather than placed once, so it
@@ -809,6 +1109,8 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
 
             try:
                 positions = adapter.get_positions()
+                if seen is not None:
+                    seen["positions"] = positions   # the option-SL monitor reuses it
             except Exception:  # noqa: BLE001
                 positions = None
                 log.warning(
@@ -824,7 +1126,12 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                     ): p
                     for p in positions
                 }
-                for guard in [g for g in _g.armed(db) if g.user_id == acct.user_id]:
+                _armed = [g for g in _g.armed(db) if g.user_id == acct.user_id]
+                _seen = {g.id for g in _armed}
+                _canceller = _make_stop_canceller(db, adapter)
+                from app.services import market_hours as _mh  # noqa: PLC0415
+
+                for guard in _armed + [g for g in _tp_waiting if g.id not in _seen]:
                     pos = by_key.get((
                         (guard.symbol or "").upper(), guard.option_strike,
                         guard.option_right, guard.option_expiry,
@@ -842,20 +1149,64 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                             discord_stop_orders.release(
                                 db, guard, _make_stop_canceller(db, adapter),
                             )
+                        _tp.release(db, guard, _canceller)      # same reason
                         continue
                     try:
-                        discord_stop_orders.reconcile(
-                            db, guard, held,
-                            place_stop=_make_stop_placer(db, live_acct, acct, guard),
-                            cancel_stop=_make_stop_canceller(db, adapter),
-                            # If the broker refuses the stop, exit instead of
-                            # holding the position with nothing protecting it.
-                            # Same market exit a fired stop would have taken.
-                            close_position=(
-                                (lambda q, _p=pos, _g=guard: _close(_p, _g, q))
-                                if pos is not None else None
-                            ),
-                        )
+                        def _reconcile_stop(_guard=guard, _pos=pos, _held=held) -> str:
+                            return discord_stop_orders.reconcile(
+                                db, _guard, _held,
+                                place_stop=_make_stop_placer(db, live_acct, acct, _guard),
+                                cancel_stop=_canceller,
+                                # If the broker refuses the stop, exit instead of
+                                # holding the position with nothing protecting it.
+                                # Same market exit a fired stop would have taken.
+                                close_position=(
+                                    (lambda q, _p=_pos, _g=_guard: _close(_p, _g, q))
+                                    if _pos is not None else None
+                                ),
+                            )
+
+                        ts_g = _settings_for(guard)
+                        # An average that filled moves the entry — and the
+                        # ladder's stop with it — before anything is measured.
+                        # Assigned to Self: the trader manages it. Only a stop
+                        # they set themselves is kept resting; the ladder does
+                        # nothing else (no take-profit, no re-pricing).
+                        manual = _g.is_manual(db, guard)
+                        if _ladder_engine and pos is not None:
+                            _g.sync_entry_price(db, guard, None if manual else ts_g)
+                        if (_ladder_engine and not manual and guard.option_strike is not None
+                                and _tp.active(ts_g, adapter)):
+                            # Take-profit orders: the next trim rests at the
+                            # broker, and the stop is sized around it. The fill
+                            # price first — the target is measured from it.
+                            _g.sync_entry_price(db, guard, ts_g)
+                            from app.services import live_marks  # noqa: PLC0415
+
+                            outcome = _tp.reconcile(
+                                db, guard, held, ts_g,
+                                live_marks.position_mark(pos, acct.user_id) if pos is not None else None,
+                                place_limit=_make_limit_placer(db, live_acct, acct, guard),
+                                place_pair=_make_pair_placer(db, live_acct, acct, adapter, guard),
+                                cancel=_canceller,
+                                reconcile_stop=_reconcile_stop,
+                                in_session=_mh.in_regular_session(),
+                            )
+                            log.info("take-profit: %s — %s", guard.symbol, outcome)
+                        else:
+                            # The mode was switched off (or never on) with an
+                            # order still resting: take it down, then the stop.
+                            if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+                                # A fill first: credit a trim that happened
+                                # rather than leave its ids behind.
+                                _tp.settle(db, guard, ts_g, _canceller,
+                                           in_session=_mh.in_regular_session(), held=held)
+                            if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+                                if _tp.release(db, guard, _canceller):
+                                    _tp.settle(db, guard, ts_g, _canceller,
+                                               in_session=_mh.in_regular_session(), held=held)
+                            guard.tp_qty = None
+                            _reconcile_stop()
                         # Reconcile first so a resting stop is CANCELLED on
                         # the way out; retiring the guard alone would leave the
                         # order behind with nothing tracking it.
@@ -866,7 +1217,8 @@ def _enforce_discord_trailing_stops(acct: BrokerAccount) -> None:
                         )
                 db.commit()
 
-            closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close)
+            # The same read as the stops above — not a second one this tick.
+            closed = discord_trailing_stop.enforce(db, acct.user_id, adapter, _close, positions=positions)
             db.commit()
             if closed:
                 log.info(
@@ -903,7 +1255,10 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
         enforce_trader_option_sl,
     )
 
-    _enforce_discord_trailing_stops(acct)
+    # One positions read per tick: the option-SL monitor below reuses the
+    # stop pass's read rather than making a second one milliseconds later.
+    seen: dict = {}
+    _enforce_discord_trailing_stops(acct, seen)
 
     # Discord: for a Discord-enabled trader, periodically pull their latest fills
     # and broadcast any new ones — a path-independent backstop so alerts fire
@@ -930,7 +1285,7 @@ def _enforce_one_trader(acct: BrokerAccount) -> None:
     notifications_to_send: list[dict[str, Any]] = []
 
     with SessionLocal() as db:
-        closures = enforce_trader_option_sl(db, acct.user_id, acct.id)
+        closures = enforce_trader_option_sl(db, acct.user_id, acct.id, positions=seen.get("positions"))
         if not closures:
             return
         for c in closures:
