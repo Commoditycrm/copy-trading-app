@@ -4,8 +4,10 @@
  * Today's closed orders — everything that took contracts or shares OFF a
  * position today (trims, full closes, stops that fired), shown under the
  * Positions table, each with a Re-enter: buy the same contract back, at a limit.
- * Re-enter qty starts at what the close took off and Re-enter price at its
- * fill price; both can be changed before pressing the button.
+ * Re-enter qty starts at what the close took off. Re-enter price follows the
+ * market — the live ask, else the mid — until you click into the box, which
+ * freezes it there to edit; after a re-enter it follows the market again.
+ * The ▾ beside Re-enter buys back at market instead.
  *
  * "Closing" = the order is marked as a close, or it realized P&L (a close placed
  * in the broker's own app is only recognisable by the latter). Filled or
@@ -23,11 +25,15 @@
  * this browser; which groups are open is not.
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, History } from "lucide-react";
 import { api } from "@/lib/api";
 import { fmtNum, fmtSignedUsd } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
+import { orderLiveKey } from "@/lib/liveKey";
+import { peekLiveQuote, useLivePrices } from "@/lib/livePrices";
+import { useMarketDataWatch } from "@/lib/useMarketDataWatch";
 import { getSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
 import type { Order, Position, User } from "@/lib/types";
 import { positionSymbolLabel } from "@/components/OpenPositionsTable";
@@ -115,9 +121,79 @@ function defaultQty(o: Order): string {
   return o.instrument_type === "option" ? String(Math.round(n)) : String(n);
 }
 
-function defaultPrice(o: Order): string {
+/** What re-entering pays now: the live ask (a buy pays the ask), else the
+ *  live mid, else — before any live price — the close's own fill price. */
+function marketPrice(o: Order): string {
+  const q = peekLiveQuote(orderLiveKey(o));
+  const live = q?.ask ?? q?.mid;
+  if (live != null && Number.isFinite(live) && live > 0) return live.toFixed(2);
   const n = Number(o.filled_avg_price);
   return Number.isFinite(n) && n > 0 ? n.toFixed(2) : "";
+}
+
+/** The ▾ beside Re-enter: buy back at market. Rendered in a portal at fixed
+ *  coordinates so the table's scroll area can't clip it on the last rows. */
+function ReEnterMenu({ disabled, onMarket }: { disabled: boolean; onMarket: () => void }) {
+  const [at, setAt] = useState<{ top: number; left: number } | null>(null);
+  const btn = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!at) return;
+    const close = (e: Event) => {
+      const t = e.target as Node;
+      if (btn.current?.contains(t) || menu.current?.contains(t)) return;
+      setAt(null);
+    };
+    const shut = () => setAt(null);
+    document.addEventListener("mousedown", close);
+    window.addEventListener("scroll", shut, true);
+    window.addEventListener("resize", shut);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("scroll", shut, true);
+      window.removeEventListener("resize", shut);
+    };
+  }, [at]);
+  return (
+    <>
+      <button
+        ref={btn}
+        type="button"
+        disabled={disabled}
+        aria-label="More re-enter options"
+        aria-haspopup="menu"
+        aria-expanded={!!at}
+        onClick={() => {
+          if (at) return setAt(null);
+          const r = btn.current?.getBoundingClientRect();
+          if (r) setAt({ top: r.bottom + 4, left: Math.max(8, r.right - 140) });
+        }}
+        className="btn-primary px-1 py-1 text-[12px] inline-flex items-center disabled:opacity-50"
+        style={{ borderTopLeftRadius: 0, borderBottomLeftRadius: 0, borderLeft: "1px solid rgba(255,255,255,0.2)" }}
+      >
+        <ChevronDown size={12} />
+      </button>
+      {at && createPortal(
+        <div
+          ref={menu}
+          role="menu"
+          className="fixed z-50 flex flex-col rounded-lg py-1 text-xs shadow-lg"
+          style={{ top: at.top, left: at.left, minWidth: 140, background: "var(--panel)", border: "1px solid var(--border)" }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => { setAt(null); onMarket(); }}
+            className="block w-full text-left px-3 py-1.5 hover:bg-[var(--panel-2)] whitespace-nowrap"
+            style={{ color: "var(--text-2)" }}
+          >
+            At market
+          </button>
+        </div>,
+        document.body,
+      )}
+    </>
+  );
 }
 
 function isClosedToday(o: Order): boolean {
@@ -194,21 +270,26 @@ export function ClosedTodayTable() {
     pending.current = setTimeout(() => void load(), 1500);
   });
 
-  async function reEnter(o: Order) {
+  async function reEnter(o: Order, atMarket = false) {
     const label = positionSymbolLabel(o as unknown as Position);
     const qty = Number(reQty[o.id] ?? defaultQty(o));
-    const price = Number(rePrice[o.id] ?? defaultPrice(o));
+    const price = Number(rePrice[o.id] ?? marketPrice(o));
     if (!Number.isFinite(qty) || qty <= 0) return notify.warn("Enter a re-enter quantity");
     if (o.instrument_type === "option" && !Number.isInteger(qty)) return notify.warn("Options trade in whole contracts");
-    if (!Number.isFinite(price) || price <= 0) return notify.warn("Enter a re-enter price");
-    if (!confirm(`Re-enter ${label}: BUY ${qty} at ${price.toFixed(2)} (limit)?`)) return;
+    if (!atMarket && (!Number.isFinite(price) || price <= 0)) return notify.warn("Enter a re-enter price");
+    const how = atMarket ? "at market" : `at ${price.toFixed(2)} (limit)`;
+    if (!confirm(`Re-enter ${label}: BUY ${qty} ${how}?`)) return;
     setBusyId(o.id);
     try {
       await api<Order>(`/api/trades/${o.id}/re-enter`, {
         method: "POST",
-        body: JSON.stringify({ quantity: String(qty), limit_price: price.toFixed(2) }),
+        body: JSON.stringify(atMarket
+          ? { quantity: String(qty), order_type: "market" }
+          : { quantity: String(qty), order_type: "limit", limit_price: price.toFixed(2) }),
       });
-      notify.success(`Re-enter placed: BUY ${label} ×${qty} at ${price.toFixed(2)}`);
+      notify.success(`Re-enter placed: BUY ${label} ×${qty} ${how}`);
+      // The price box follows the market again.
+      setRePrice((s) => { const n = { ...s }; delete n[o.id]; return n; });
       void load();
     } catch (e) {
       notify.fromError(e, "re-enter failed");
@@ -216,6 +297,16 @@ export function ClosedTodayTable() {
       setBusyId(null);
     }
   }
+
+  // Live prices for what can be re-entered. Closed contracts aren't held, so the
+  // stream only sends them while this table asks it to watch them.
+  const liveKeys = useMemo(
+    () => Array.from(new Set((orders ?? []).filter((o) => !reEnterBlock(o))
+      .map(orderLiveKey).filter(Boolean) as string[])).slice(0, 25),
+    [orders],
+  );
+  useMarketDataWatch(liveKeys);
+  useLivePrices(liveKeys);          // re-render as they tick
 
   const total = useMemo(() => sumPnl(orders ?? []), [orders]);
   const groups = useMemo(() => buildGroups(orders ?? [], groupBy), [orders, groupBy]);
@@ -279,21 +370,27 @@ export function ClosedTodayTable() {
             <input
               type="number" min="0.01" step="0.01"
               aria-label={`Re-enter price for ${label}`}
-              title="Re-enter price (limit)"
-              value={rePrice[o.id] ?? defaultPrice(o)}
+              title={o.id in rePrice ? "Re-enter price (limit) — yours" : "Re-enter price (limit) — follows the market (ask); click to set your own"}
+              value={rePrice[o.id] ?? marketPrice(o)}
+              // Follows the market until clicked into; then it holds there to edit.
+              onFocus={() => setRePrice((s) => (o.id in s ? s : { ...s, [o.id]: marketPrice(o) }))}
               onChange={(e) => setRePrice((s) => ({ ...s, [o.id]: e.target.value }))}
               disabled={!!blocked}
               className={`${inputCls} w-20 disabled:opacity-50`} style={inputStyle}
             />
-            <button
-              type="button"
-              onClick={() => void reEnter(o)}
-              disabled={!!blocked || busyId === o.id}
-              title={blocked ?? "Buy this back: a limit order for this quantity and price"}
-              className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
-            >
-              {busyId === o.id ? "Placing…" : "Re-enter"}
-            </button>
+            <div className="inline-flex">
+              <button
+                type="button"
+                onClick={() => void reEnter(o)}
+                disabled={!!blocked || busyId === o.id}
+                title={blocked ?? "Buy this back: a limit order for this quantity and price"}
+                className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
+                style={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
+              >
+                {busyId === o.id ? "Placing…" : "Re-enter"}
+              </button>
+              <ReEnterMenu disabled={!!blocked || busyId === o.id} onMarket={() => void reEnter(o, true)} />
+            </div>
           </div>
         </td>
       </tr>

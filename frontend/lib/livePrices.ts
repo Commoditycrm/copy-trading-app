@@ -96,6 +96,12 @@ export function peekLivePrice(symbol: string | null | undefined): number | null 
   return sym ? _store.get(sym)?.mid ?? null : null;
 }
 
+/** Read a symbol's full live quote (mid/bid/ask) without subscribing. */
+export function peekLiveQuote(symbol: string | null | undefined): LiveQuote | null {
+  const sym = symbol ? String(symbol).toUpperCase() : "";
+  return sym ? _store.get(sym) ?? null : null;
+}
+
 /** Subscribe to a SET of symbols; returns a counter that bumps only when one of
  *  THEM ticks (not every symbol platform-wide). Consumers read current values
  *  with peekLivePrice(). Re-subscribes when the set changes. Keeps aggregate
