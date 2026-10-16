@@ -42,9 +42,20 @@ from app.models.subscriber_symbol_settings import SubscriberSymbolSettings
 # contradicts the instrument-lock rule, which fixes a position's multiplier at
 # first entry so later adds and exits stay proportional.
 SIZING_FIELDS = (
-    "multiplier",
-    "max_per_contract",
-    "max_per_order",
+    # The DISCORD sizing fields, deliberately — an advanced symbol is sized the
+    # way a Discord channel is: a fixed number of contracts per entry, or a
+    # dollar amount, with at most one cap. Not the copy multiplier, so an entry
+    # no longer scales with the trader's quantity while Advanced is on.
+    #
+    # Same names the Discord settings use so discord_channel_settings.
+    # active_sizing() reads a symbol's values with no translation, and the one
+    # sizing contract stays in one place.
+    "discord_quantity_multiplier",   # contracts per entry, in "contracts" mode
+    "discord_size_mode",             # "contracts" | "dollars"
+    "discord_size_dollars",
+    "discord_size_cap",              # "none" | "per_contract" | "per_order"
+    "discord_max_per_contract",
+    "discord_max_per_order",
 )
 
 # The exit ladder, named as the ladder engine reads them so no translation is
@@ -83,6 +94,14 @@ _FIELDS = frozenset(SYMBOL_FIELDS)
 # fresh symbol rule behave like the ladder's own defaults rather than like a
 # half-configured one.
 _LADDER_DEFAULTS: dict[str, Any] = {
+    # Sizing, for a subscriber whose row has no discord_* columns: one contract
+    # per entry and no cap — what active_sizing() treats as the default.
+    "discord_quantity_multiplier": 1,
+    "discord_size_mode": "contracts",
+    "discord_size_dollars": None,
+    "discord_size_cap": "none",
+    "discord_max_per_contract": None,
+    "discord_max_per_order": None,
     "discord_auto_trim": False,       # "On Alerts": exits follow the trader
     "discord_manual_exit": False,
     "discord_tp_orders": False,
@@ -239,6 +258,29 @@ def has_rule(db: Session, user_id: uuid.UUID, symbol: str | None) -> bool:
     return rule_for(db, user_id, symbol) is not None
 
 
+def sizing_for(db: Session, user_id: uuid.UUID, symbol: str | None) -> dict | None:
+    """How to size an entry in this symbol, or None to size it as before.
+
+    None whenever Advanced is off or nothing is configured — the caller then
+    scales the trader's quantity by the subscriber's multiplier, exactly as it
+    always has.
+
+    Otherwise the Discord sizing contract, read by the SAME function the Discord
+    path uses (active_sizing): a fixed number of contracts per entry, or a
+    dollar amount, with at most one cap. An advanced entry no longer tracks what
+    the trader traded — that is what choosing a fixed size means.
+    """
+    base = db.get(SubscriberSettings, user_id)
+    if not advanced_enabled(base):
+        return None
+    ts = resolve(db, user_id, symbol)
+    if ts is base:
+        return None
+    from app.services.discord_channel_settings import active_sizing  # noqa: PLC0415
+
+    return active_sizing(ts)
+
+
 def settings_for_guard(db: Session, user_id: uuid.UUID, guard: Any) -> Any | None:
     """The symbol settings a POSITION's ladder should run on, or None.
 
@@ -281,6 +323,51 @@ def trims_follow_trader(db: Session, user_id: uuid.UUID, symbol: str | None) -> 
     return exit_mode(ts) != "ladder"
 
 
+# The fields that carry a trim's profit target, across the named rungs.
+_GATE_FIELDS = (
+    "discord_trim_profit_gate_pct",
+    "discord_trim2_profit_gate_pct",
+    "discord_trim3_profit_gate_pct",
+)
+
+
+def has_ladder(ts: Any) -> bool:
+    """Does this scope have a target of its OWN that can fire?
+
+    Its own, not the resolved value: the ladder's built-in Trim 1 default is
+    20%, so reading the resolved rungs would say "yes" for a rule that set
+    nothing but a size. Only what the subscriber (or the ALL layer) actually
+    configured counts.
+
+    A target of zero does not count either — zero means "keep waiting" to the
+    engine, because "reached 0% profit" is true the moment a position is up a
+    cent.
+
+    This is what stops a sizing-only rule taking over the exits: it would stop
+    the trader's trims being mirrored while firing nothing itself, and nobody
+    would trim the position.
+    """
+    values = getattr(ts, "to_json", None)
+    values = values() if callable(values) else {}
+    for field in _GATE_FIELDS:
+        raw = values.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            if Decimal(str(raw)) > 0:
+                return True
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+    # Trims 4+ live in a list of their own.
+    for extra in (values.get("discord_extra_trims") or []):
+        try:
+            if Decimal(str((extra or {}).get("profit_gate_pct") or 0)) > 0:
+                return True
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+    return False
+
+
 def exit_mode(ts: Any) -> str:
     """How this symbol gets out — the choice under the ladder.
 
@@ -294,7 +381,9 @@ def exit_mode(ts: Any) -> str:
     already reads that field to decide whether rungs fire by themselves, so the
     two options are a setting the engine understands, not a parallel concept.
     """
-    return "ladder" if bool(getattr(ts, "discord_auto_trim", False)) else "alerts"
+    return ("ladder"
+            if bool(getattr(ts, "discord_auto_trim", False)) and has_ladder(ts)
+            else "alerts")
 
 
 __all__ = [

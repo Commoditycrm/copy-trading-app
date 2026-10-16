@@ -1261,14 +1261,14 @@ def _apply_symbol_caps(db: Session, user_ids, symbol, is_option_order: bool,
             layer.update(values or {})
 
     for uid, values in merged.items():
-        if "max_per_contract" in values and is_option_order:
-            cap = _dec_or_none(values["max_per_contract"])
+        if "discord_max_per_contract" in values and is_option_order:
+            cap = _dec_or_none(values["discord_max_per_contract"])
             if cap is None:
                 per_contract.pop(uid, None)      # this scope lifts the cap
             else:
                 per_contract[uid] = cap
-        if "max_per_order" in values:
-            cap = _dec_or_none(values["max_per_order"])
+        if "discord_max_per_order" in values:
+            cap = _dec_or_none(values["discord_max_per_order"])
             if cap is None:
                 per_order.pop(uid, None)
             else:
@@ -1358,6 +1358,36 @@ def _trims_follow_trader(db: Session, user_id, symbol) -> bool:
         log.warning("copy: per-symbol trim policy lookup failed for %s — "
                     "mirroring the trim", symbol, exc_info=True)
         return True
+
+
+def _fixed_entry_size(db: Session, sub, trader_order, is_closing: bool) -> Decimal | None:
+    """The contracts this ENTRY buys under Advanced settings, or None.
+
+    None means "size it the old way" — Advanced off, nothing configured for the
+    symbol, a close, or a dollar-sized entry, which needs a live price and is
+    resolved at placement rather than here.
+
+    Never raises: a lookup that fails falls back to scaling the trader's
+    quantity, which is what every mirror did before Advanced existed.
+    """
+    if sub is None or is_closing or getattr(trader_order, "is_closing", False):
+        return None
+    try:
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        sizing = symbols.sizing_for(db, sub.user_id, getattr(trader_order, "symbol", None))
+        if not sizing or sizing.get("mode") != "contracts":
+            return None
+        contracts = sizing.get("contracts")
+        if contracts is None:
+            return None
+        qty = Decimal(str(contracts))
+        return qty if qty > 0 else None
+    except Exception:  # noqa: BLE001
+        log.warning("copy: advanced entry sizing failed for %s — scaling the "
+                    "trader's quantity instead",
+                    getattr(trader_order, "symbol", "?"), exc_info=True)
+        return None
 
 
 def _symbol_multiplier(db: Session, sub, symbol: str | None) -> Decimal:
@@ -3111,6 +3141,14 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )
+            # Advanced settings size an ENTRY outright — a fixed number of
+            # contracts for this symbol — instead of scaling what the trader
+            # traded. Entries only: a close is sized from the position held,
+            # never from the other side's quantity, so overriding it here would
+            # strand or oversell part of a holding.
+            fixed = _fixed_entry_size(db, sub, trader_order, is_closing_effective)
+            if fixed is not None:
+                scaled = fixed
 
             # A symbol on its own exit ladder does not take the trader's
             # TRIMS: its rungs decide when to take profit, and mirroring the

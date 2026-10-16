@@ -84,12 +84,14 @@ def test_a_sizing_only_rule_leaves_exits_with_the_trader(db):
 
 
 def test_choosing_the_ladder_stops_the_trader_s_trims(db):
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     assert sss.trims_follow_trader(db, USER, "AAPL") is False
 
 
 def test_other_symbols_still_take_the_trader_s_trims(db):
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     assert sss.trims_follow_trader(db, USER, "TSLA") is True
 
 
@@ -133,7 +135,8 @@ def test_nothing_to_resolve_is_not_a_ladder(db, guard):
 # ── opening the ladder on a mirrored entry ─────────────────────────────────
 
 def test_a_mirrored_entry_opens_a_ladder_for_a_ladder_symbol(db):
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     ce._open_symbol_ladder(db, USER, _child(db))
     guard = db.query(DiscordPositionGuard).one()
     assert guard.symbol == "AAPL" and guard.entry_price == Decimal("1.00")
@@ -152,13 +155,15 @@ def test_a_symbol_with_no_rule_opens_no_ladder(db):
 
 def test_a_close_never_opens_a_ladder(db):
     """A close has nothing to protect."""
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     ce._open_symbol_ladder(db, USER, _child(db, closing=True))
     assert db.query(DiscordPositionGuard).count() == 0
 
 
 def test_a_failure_to_open_never_breaks_the_mirror(db, monkeypatch):
-    _rule(db, "AAPL", {"discord_auto_trim": True})
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
     import app.services.discord_position_guard as guards
     monkeypatch.setattr(guards, "on_buy",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -186,7 +191,8 @@ def test_the_fanout_actually_asks_before_mirroring_a_trim():
     (False, True,  "ladder", False),  # not a close at all
 ])
 def test_only_a_trim_on_a_ladder_symbol_is_suppressed(db, closing, partial, mode, expected):
-    _rule(db, "AAPL", {"discord_auto_trim": mode == "ladder"})
+    _rule(db, "AAPL", {"discord_auto_trim": mode == "ladder",
+                       "discord_trim_profit_gate_pct": "25" if mode == "ladder" else "0"})
     order = SimpleNamespace(symbol="AAPL", is_closing=closing, is_partial_close=partial)
     assert ce._skip_trader_trim(db, USER, order) is expected
 
@@ -314,3 +320,44 @@ def test_a_channel_still_wins_over_a_symbol_rule(db):
     guard = SimpleNamespace(symbol="AAPL", source_id=src.id, entry_order_id=None)
     ts = dcs.for_guard(db, USER, guard)
     assert ts.discord_trim_profit_gate_pct == Decimal("99"), "the symbol rule overrode the channel"
+
+
+# ── a ladder is targets, not a flag ────────────────────────────────────────
+# The exit-mode cards are gone from the UI, so every advanced scope is saved
+# with auto-trim on. What decides whether the ladder OWNS the exits is whether
+# it has a target that can actually fire.
+
+def test_a_sizing_only_rule_still_takes_the_traders_trims(db):
+    """The trap: auto-trim on with no targets would stop the trader's trims
+    being mirrored while firing nothing itself — the position would then never
+    be trimmed by anyone."""
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 4, "discord_auto_trim": True})
+    assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "alerts"
+    assert sss.trims_follow_trader(db, USER, "AAPL") is True
+
+
+def test_a_rule_with_a_real_target_owns_the_exits(db):
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "25"})
+    assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "ladder"
+    assert sss.trims_follow_trader(db, USER, "AAPL") is False
+
+
+def test_a_zero_target_is_not_a_ladder(db):
+    """Zero means "keep waiting" to the engine, so it cannot own the exits."""
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim_profit_gate_pct": "0"})
+    assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "alerts"
+
+
+def test_a_target_on_any_rung_counts(db):
+    _rule(db, "AAPL", {"discord_auto_trim": True,
+                       "discord_trim2_profit_gate_pct": "40"})
+    assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "ladder"
+
+
+def test_a_target_inherited_from_all_symbols_counts(db):
+    _rule(db, sss.ALL_SYMBOLS, {"discord_auto_trim": True,
+                                "discord_trim_profit_gate_pct": "30"})
+    _rule(db, "AAPL", {"discord_quantity_multiplier": 2})
+    assert sss.exit_mode(sss.resolve(db, USER, "AAPL")) == "ladder"
