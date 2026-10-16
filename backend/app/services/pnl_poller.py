@@ -1054,6 +1054,16 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                 log.warning("discord stop: fill repair failed for user=%s",
                             acct.user_id, exc_info=True)
 
+            # Guards this pass has already sent an exit for. The positions read
+            # below is taken ONCE, before anything sells, so a second exit later
+            # in the same pass sizes itself from contracts that are already gone.
+            # QA 2026-10-16, QQQ 720P: the stop reconciler's refused stop exited
+            # 3 at market (filled), then the emulated stop — reading the same
+            # pre-exit snapshot, 3 still "held" — sold 3 again 2s later; Webull
+            # refused it ("Close intent mismatches position direction"). One exit
+            # per position per pass; the next pass reads what is really left.
+            exited_this_pass: set = set()
+
             def _close(pos, guard, quantity) -> None:
                 """Exit at market — a stop that fires has to fill.
 
@@ -1074,6 +1084,11 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                 from app.models.user import User  # noqa: PLC0415
                 from app.services import exit_confirm  # noqa: PLC0415
 
+                if guard.id in exited_this_pass:
+                    log.info("discord stops: %s already exited this pass — not selling "
+                             "%s again from the same positions read", guard.symbol, quantity)
+                    return
+                exited_this_pass.add(guard.id)
                 sold = exit_freeing_reservations(
                     db, db.get(User, acct.user_id), live_acct, adapter, pos, quantity)
                 try:
