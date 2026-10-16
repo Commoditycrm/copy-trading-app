@@ -2459,6 +2459,19 @@ def _execute_signal(
         # no rung used, no stop moved. A full exit ("Out", "Stopped out",
         # "Cutting") still closes: the trader is out, not trimming. Your own
         # alerts (the popup, auto-trim) go through, as with Manual exits.
+        if (not _is_self_alert(db, msg)
+                and _cut_left_to_take_profits(exit_ts, signal)):
+            msg.status = DiscordMessageStatus.PARSED
+            msg.status_reason = (
+                "Cut not acted on — take-profit orders manage this channel's exits and "
+                "Auto exit on cut is off."
+            )
+            log.info("discord: cut %s for %s left to take-profit orders", msg.id, p.symbol)
+            events.publish(user.id, {
+                "type": "discord.trim_skipped", "message_id": str(msg.id),
+                "symbol": p.symbol, "rung": 0, "reason": "take-profit orders; Auto exit on cut is off",
+            })
+            return
         if (discord_channel_settings.exit_mode(exit_ts) == "orders"
                 and not signal.get("flatten") and not _is_cut(signal)
                 and not _is_self_alert(db, msg)):
@@ -2883,6 +2896,14 @@ def _cut_overrides_manual(ts, signal) -> bool:
     return _is_cut(signal) and discord_channel_settings.cut_exits(ts)
 
 
+def _cut_left_to_take_profits(ts, signal) -> bool:
+    """Take-profit orders with "Auto exit on cut" UNticked: the trader's cut is
+    not acted on — the resting take-profit and stop manage the exit. (Ticked,
+    the default, a cut sells as it always has.)"""
+    return (_is_cut(signal) and discord_channel_settings.exit_mode(ts) == "orders"
+            and not discord_channel_settings.cut_exits(ts))
+
+
 def _retry_cut_below_the_bid(db, user, msg, signal, resolved, exc, background, request, is_trim):
     """A cut's MARKET sell the broker refused as an order TYPE (a thin contract,
     a halt — "does not support market", "place a limit order"): send it once more
@@ -2909,6 +2930,13 @@ def _retry_cut_below_the_bid(db, user, msg, signal, resolved, exc, background, r
     except Exception as retry_exc:  # noqa: BLE001
         log.warning("discord: cut %s refused again as a limit — %s", p.symbol, retry_exc)
         return None
+
+
+def _channel_cut_left_to_take_profits(db: Session, user: User, msg: DiscordMessage, sig) -> bool:
+    """The alert's channel runs Take-profit orders with Auto exit on cut off, so
+    this cut is not acted on. Never true for the Self channel."""
+    ts = discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None))
+    return _cut_left_to_take_profits(ts, sig) and not _is_self_alert(db, msg)
 
 
 def _channel_exits_manual(db: Session, user: User, msg: DiscordMessage) -> bool:
@@ -2956,6 +2984,13 @@ def _close_all_from_channel(
             f"Exits are manual for this channel — this {'cut' if _is_cut(sig) else 'stop-out'} "
             f"of {what} was not acted on. Close it from Positions"
             + (", or tick Auto exit on cut." if _is_cut(sig) else ".")
+        )
+        return
+    if _is_cut(sig) and _channel_cut_left_to_take_profits(db, user, msg, sig):
+        msg.status = DiscordMessageStatus.PARSED
+        msg.status_reason = (
+            f"Cut of {what} not acted on — take-profit orders manage this channel's exits and "
+            "Auto exit on cut is off."
         )
         return
     try:
