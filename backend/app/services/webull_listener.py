@@ -956,6 +956,23 @@ def _persist_and_fanout(
                 except Exception:  # noqa: BLE001
                     log.exception("webull-listener discord alert failed for %s", existing.id)
 
+            # A SELL that just filled — a take-profit, a stop, a trim — moves the
+            # Discord ladder: the trim is credited and the stop for what is left
+            # goes on. That happens in the P&L poller's pass, which on Webull is
+            # every 15s; make this account due NOW so it runs within a second of
+            # the stream's fill. QA 2026-10-16, QQQ 720P: Trim 1 filled at
+            # 10:42:29 (stream), its trailing stop went on at 10:42:44 — by
+            # then the price had fallen through it. Only makes the account due
+            # (no broker call here); a no-op without a ladder to move.
+            if became_filled and existing.side == OrderSide.SELL:
+                try:
+                    from app.services import pnl_poller  # noqa: PLC0415
+
+                    pnl_poller.poll_now(existing.broker_account_id)
+                except Exception:  # noqa: BLE001
+                    log.warning("webull-listener: could not wake the P&L pass for %s",
+                                existing.id, exc_info=True)
+
             # ── Trader CANCEL → cascade-cancel the subscriber mirrors ──
             if was_working and status_enum == OrderStatus.CANCELED:
                 from app.api.trades import _run_cancel_fanout_in_background  # noqa: PLC0415
