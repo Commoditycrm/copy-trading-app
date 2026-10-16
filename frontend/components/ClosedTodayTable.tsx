@@ -18,8 +18,9 @@
  * Grouping: two pills beside the count — Channel (Discord users only) and
  * Symbol. Pressing one groups by it and marks it "1"; pressing the other then
  * groups within that and marks it "2". Pressing an active pill takes it out
- * (the other becomes "1"). Each group shows its count and realized P&L.
- * Remembered in this browser.
+ * (the other becomes "1"). Each group shows its count and realized P&L, and
+ * starts collapsed — click its row to open it. The grouping is remembered in
+ * this browser; which groups are open is not.
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, History } from "lucide-react";
@@ -162,6 +163,10 @@ export function ClosedTodayTable() {
   const [busyId, setBusyId] = useState<string | null>(null);
   // Rows whose position summary is open (the icon beside the symbol).
   const [summaryOpen, setSummaryOpen] = useState<Record<string, boolean>>({});
+  // Groups the trader has opened. Every group starts collapsed — one line each,
+  // with its count and P&L — and opens on a click. Keyed by the group's path, so
+  // a regrouping starts collapsed again.
+  const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     try {
@@ -312,15 +317,29 @@ export function ClosedTodayTable() {
 
   const cols = showChannel ? 7 : 6;
   /** A group's header row — its value, how many closes, their realized P&L —
-   *  then its subgroups or its rows. */
-  const renderGroups = (nodes: GroupNode[], depth = 0): ReactNode[] =>
+   *  then, once opened, its subgroups or its rows. Collapsed by default. */
+  const renderGroups = (nodes: GroupNode[], depth = 0, parent = ""): ReactNode[] =>
     nodes.map((g) => {
       const pnl = sumPnl(g.orders);
+      const path = `${parent}/${g.key}:${g.value}`;
+      const open = !!groupOpen[path];
       return (
-        <Fragment key={`${depth}:${g.key}:${g.value}`}>
-          <tr style={{ borderTop: "1px solid var(--border)", background: depth === 0 ? "var(--panel-2)" : "transparent" }}>
+        <Fragment key={path}>
+          <tr
+            style={{ borderTop: "1px solid var(--border)", background: depth === 0 ? "var(--panel-2)" : "transparent", cursor: "pointer" }}
+            onClick={() => setGroupOpen((m) => ({ ...m, [path]: !m[path] }))}
+          >
             <td colSpan={cols - 2} className="px-4 py-2 text-[12px]" style={{ paddingLeft: 16 + depth * 18 }}>
-              <span className="font-semibold" style={{ color: "var(--text)" }}>{g.value}</span>
+              <button
+                type="button"
+                aria-expanded={open}
+                aria-label={`${open ? "Collapse" : "Expand"} ${g.value}`}
+                onClick={(e) => { e.stopPropagation(); setGroupOpen((m) => ({ ...m, [path]: !m[path] })); }}
+                className="focus-ring inline-flex items-center gap-1.5 text-left"
+              >
+                {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                <span className="font-semibold" style={{ color: "var(--text)" }}>{g.value}</span>
+              </button>
               <span className="ml-2 text-[11px]" style={{ color: "var(--muted)" }}>
                 {GROUP_LABEL[g.key]} · {g.orders.length} {g.orders.length === 1 ? "close" : "closes"}
               </span>
@@ -330,7 +349,9 @@ export function ClosedTodayTable() {
             </td>
             <td />
           </tr>
-          {g.children ? renderGroups(g.children, depth + 1) : g.orders.map((o) => renderOrder(o, depth + 1))}
+          {open && (g.children
+            ? renderGroups(g.children, depth + 1, path)
+            : g.orders.map((o) => renderOrder(o, depth + 1)))}
         </Fragment>
       );
     });
