@@ -375,6 +375,14 @@ const DEFAULT_TRAIL_PCT = "10";
 /** What Close % starts at on every position. */
 const DEFAULT_CLOSE_PCT = 25;
 const STOP_LEVELS = [-25, -10, 0];
+/** Deeper loss levels, in a red dropdown before the chips. -10 and -25 are
+ *  absent because they are already chips — the dropdown holds what the chips
+ *  cannot, exactly like the profit one.
+ *
+ *  Stops at -90 rather than -100: the price is entry x (1 + pct/100), so -100%
+ *  puts the stop at ZERO, which can never trigger. The API rejects anything
+ *  below -99 for the same reason. */
+const LOSS_LEVELS = [-5, -15, -20, -30, -40, -50, -60, -70, -80, -90];
 /** Profit levels, in a green dropdown after the chips: the stop locks that much in. */
 const PROFIT_LEVELS = [25, 35, 50, 60, 70, 80, 100, 120, 150];
 /** A stop level's colour: red below entry, neutral at break-even, green in profit. */
@@ -468,6 +476,27 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
     close_pct: (
       <td className="px-5 pb-3 pt-1">
         <div className="flex gap-1">
+          {/* Deeper losses: one red dropdown, mirroring the green profit one.
+              The three chips stay as chips because a stop-loss is the everyday
+              action on this row and should not cost an extra click. */}
+          <select
+            aria-label={`Stop at a deeper loss level for ${label}`}
+            value={level != null && LOSS_LEVELS.includes(level) ? String(level) : ""}
+            onChange={e => setLevel(e.target.value ? Number(e.target.value) : null)}
+            title="Stop below entry: the % P&L from entry it sits at"
+            className="px-1 py-0.5 text-[10px] rounded"
+            style={{
+              border: `1px solid ${level != null && LOSS_LEVELS.includes(level) ? "var(--bad)" : "rgba(220,70,70,0.45)"}`,
+              background: level != null && LOSS_LEVELS.includes(level) ? "var(--bad-soft)" : "transparent",
+              color: "var(--bad)",
+            }}
+          >
+            <option value="">− loss</option>
+            {LOSS_LEVELS.map(pct => {
+              const px = levelPrice(pct);
+              return <option key={pct} value={pct}>{pct}%{px != null ? ` (${px.toFixed(2)})` : ""}</option>;
+            })}
+          </select>
           {STOP_LEVELS.map(pct => {
             const selected = level === pct;
             const px = levelPrice(pct);
