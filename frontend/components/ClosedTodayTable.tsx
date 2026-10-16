@@ -14,8 +14,14 @@
  * fills today is included. Refreshes on order events and every 30 s.
  * Collapsible: the header (count + realized total) stays; the choice is
  * remembered in this browser.
+ *
+ * Grouping: two pills beside the count — Channel (Discord users only) and
+ * Symbol. Pressing one groups by it and marks it "1"; pressing the other then
+ * groups within that and marks it "2". Pressing an active pill takes it out
+ * (the other becomes "1"). Each group shows its count and realized P&L.
+ * Remembered in this browser.
  */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, History } from "lucide-react";
 import { api } from "@/lib/api";
 import { fmtNum, fmtSignedUsd } from "@/lib/format";
@@ -28,6 +34,53 @@ import { PositionSummary } from "@/components/PositionSummary";
 
 const ET = "America/New_York";
 const COLLAPSED_KEY = "positions.closedToday.collapsed";
+const GROUP_KEY = "positions.closedToday.groupBy";
+
+type GroupKey = "channel" | "symbol";
+const GROUP_LABEL: Record<GroupKey, string> = { channel: "Channel", symbol: "Symbol" };
+
+function readGroupBy(): GroupKey[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GROUP_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((k): k is GroupKey => k === "channel" || k === "symbol") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The value a row is grouped under. Symbol is the contract as the Symbol
+ *  column shows it, so a position's trims and its final close fall together. */
+function groupValue(o: Order, key: GroupKey): string {
+  if (key === "channel") return o.discord_channel || "No channel";
+  return positionSymbolLabel(o as unknown as Position);
+}
+
+type GroupNode = { key: GroupKey; value: string; orders: Order[]; children: GroupNode[] | null };
+
+/** Rows into nested groups, in the order of ``keys``. Groups keep the order of
+ *  their newest fill, as the rows do. */
+function buildGroups(rows: Order[], keys: GroupKey[]): GroupNode[] {
+  if (keys.length === 0) return [];
+  const [key, ...rest] = keys;
+  const byValue = new Map<string, Order[]>();
+  for (const o of rows) {
+    const v = groupValue(o, key);
+    const list = byValue.get(v);
+    if (list) list.push(o);
+    else byValue.set(v, [o]);
+  }
+  return [...byValue.entries()].map(([value, orders]) => ({
+    key, value, orders, children: rest.length ? buildGroups(orders, rest) : null,
+  }));
+}
+
+function sumPnl(rows: Order[]): number {
+  return rows.reduce((acc, o) => acc + (Number(o.realized_pnl) || 0), 0);
+}
+
+function pnlColor(n: number | null): string {
+  return n == null ? "var(--muted)" : n > 0 ? "var(--good)" : n < 0 ? "var(--bad)" : "var(--text)";
+}
 
 function readCollapsed(): boolean {
   try {
@@ -86,6 +139,23 @@ export function ClosedTodayTable() {
       return !c;
     });
   const showChannel = !!getSnapshot<User>(USER_SNAPSHOT_KEY)?.discord_available;
+  // Grouping, in the order the pills were pressed. Channel only for Discord users.
+  const [groupByRaw, setGroupByRaw] = useState<GroupKey[]>([]);
+  useEffect(() => setGroupByRaw(readGroupBy()), []);
+  const groupBy = useMemo(
+    () => groupByRaw.filter((k) => k !== "channel" || showChannel),
+    [groupByRaw, showChannel],
+  );
+  const toggleGroup = (key: GroupKey) =>
+    setGroupByRaw((cur) => {
+      const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
+      try {
+        localStorage.setItem(GROUP_KEY, JSON.stringify(next));
+      } catch {
+        /* per-browser convenience only */
+      }
+      return next;
+    });
   // What the trader typed per row; until then the boxes show the defaults.
   const [reQty, setReQty] = useState<Record<string, string>>({});
   const [rePrice, setRePrice] = useState<Record<string, string>>({});
@@ -142,20 +212,134 @@ export function ClosedTodayTable() {
     }
   }
 
-  const total = useMemo(
-    () => (orders ?? []).reduce((acc, o) => acc + (Number(o.realized_pnl) || 0), 0),
-    [orders],
-  );
+  const total = useMemo(() => sumPnl(orders ?? []), [orders]);
+  const groups = useMemo(() => buildGroups(orders ?? [], groupBy), [orders, groupBy]);
 
   const th = "px-4 py-2 text-left text-[11px] font-medium uppercase tracking-wide";
   const td = "px-4 py-2.5 text-[13px]";
   const inputCls = "px-2 py-1 text-xs border rounded-[var(--r-sm)] text-right num";
   const inputStyle = { borderColor: "var(--border)", background: "var(--bg)", color: "var(--text)" } as const;
 
+  /** One closed order's row (and its position summary when open). ``depth``
+   *  indents it under its groups. */
+  const renderOrder = (o: Order, depth = 0) => {
+    const indent = depth ? { paddingLeft: 16 + depth * 18 } : undefined;
+    const pnl = o.realized_pnl == null || o.realized_pnl === "" ? null : Number(o.realized_pnl);
+    const label = positionSymbolLabel(o as unknown as Position);
+    const blocked = reEnterBlock(o);
+    const isOption = o.instrument_type === "option";
+    const open = !!summaryOpen[o.id];
+    return (
+      <Fragment key={o.id}>
+      <tr style={{ borderTop: "1px solid var(--border)" }}>
+        {showChannel && <td className={td} style={indent}>{o.discord_channel || "—"}</td>}
+        <td className={`${td} whitespace-nowrap font-medium`} style={{ color: "var(--text)", ...(showChannel ? {} : indent) }}>
+          <span className="inline-flex items-center gap-1.5">
+            {label}
+            {o.broker_account_id && <button
+              type="button"
+              onClick={() => setSummaryOpen((m) => ({ ...m, [o.id]: !m[o.id] }))}
+              aria-expanded={open}
+              aria-label={`${open ? "Hide" : "Show"} the position summary for ${label}`}
+              title="Position summary — every buy and sell, with Rem.Qty"
+              className="focus-ring inline-flex items-center justify-center rounded-full"
+              style={{
+                width: 20, height: 20, background: "var(--panel-2)", color: "var(--text-2)",
+                boxShadow: open ? "0 0 0 1.5px var(--text-2)" : "none",
+              }}
+            >
+              <History size={12} />
+            </button>}
+          </span>
+        </td>
+        <td className={`${td} num text-right`}>{fmtNum(o.filled_quantity, 0)}</td>
+        <td className={`${td} capitalize`}>{String(o.order_type).replace(/_/g, " ")}</td>
+        <td className={`${td} num text-right`}>{o.filled_avg_price ? fmtNum(o.filled_avg_price, 2) : "—"}</td>
+        <td className={`${td} num text-right`} style={{ color: pnl == null ? "var(--muted)" : pnl > 0 ? "var(--good)" : pnl < 0 ? "var(--bad)" : "var(--text)" }}>
+          {pnl == null ? "—" : fmtSignedUsd(pnl)}
+        </td>
+        {/* Qty, price and the button as one group, side by side. */}
+        <td className={`${td} whitespace-nowrap`}>
+          <div className="flex items-center gap-1.5">
+            <input
+              type="number" min={isOption ? 1 : 0.000001} step={isOption ? 1 : "any"}
+              aria-label={`Re-enter quantity for ${label}`}
+              title="Re-enter quantity"
+              value={reQty[o.id] ?? defaultQty(o)}
+              onChange={(e) => setReQty((s) => ({ ...s, [o.id]: e.target.value }))}
+              disabled={!!blocked}
+              className={`${inputCls} w-16 disabled:opacity-50`} style={inputStyle}
+            />
+            <span className="text-[11px]" style={{ color: "var(--muted)" }}>@</span>
+            <input
+              type="number" min="0.01" step="0.01"
+              aria-label={`Re-enter price for ${label}`}
+              title="Re-enter price (limit)"
+              value={rePrice[o.id] ?? defaultPrice(o)}
+              onChange={(e) => setRePrice((s) => ({ ...s, [o.id]: e.target.value }))}
+              disabled={!!blocked}
+              className={`${inputCls} w-20 disabled:opacity-50`} style={inputStyle}
+            />
+            <button
+              type="button"
+              onClick={() => void reEnter(o)}
+              disabled={!!blocked || busyId === o.id}
+              title={blocked ?? "Buy this back: a limit order for this quantity and price"}
+              className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
+            >
+              {busyId === o.id ? "Placing…" : "Re-enter"}
+            </button>
+          </div>
+        </td>
+      </tr>
+      {open && o.broker_account_id && (
+        <tr style={{ background: "var(--panel-2)" }}>
+          <td colSpan={showChannel ? 7 : 6} className="px-4 py-2.5">
+            <PositionSummary target={{
+              brokerAccountId: o.broker_account_id,
+              symbol: o.symbol,
+              optionStrike: o.option_strike,
+              optionRight: o.option_right,
+              optionExpiry: o.option_expiry,
+              throughOrderId: o.id,
+            }} />
+          </td>
+        </tr>
+      )}
+      </Fragment>
+    );
+  };
+
+  const cols = showChannel ? 7 : 6;
+  /** A group's header row — its value, how many closes, their realized P&L —
+   *  then its subgroups or its rows. */
+  const renderGroups = (nodes: GroupNode[], depth = 0): ReactNode[] =>
+    nodes.map((g) => {
+      const pnl = sumPnl(g.orders);
+      return (
+        <Fragment key={`${depth}:${g.key}:${g.value}`}>
+          <tr style={{ borderTop: "1px solid var(--border)", background: depth === 0 ? "var(--panel-2)" : "transparent" }}>
+            <td colSpan={cols - 2} className="px-4 py-2 text-[12px]" style={{ paddingLeft: 16 + depth * 18 }}>
+              <span className="font-semibold" style={{ color: "var(--text)" }}>{g.value}</span>
+              <span className="ml-2 text-[11px]" style={{ color: "var(--muted)" }}>
+                {GROUP_LABEL[g.key]} · {g.orders.length} {g.orders.length === 1 ? "close" : "closes"}
+              </span>
+            </td>
+            <td className="px-4 py-2 num text-right text-[13px] font-semibold" style={{ color: pnlColor(pnl) }}>
+              {fmtSignedUsd(pnl)}
+            </td>
+            <td />
+          </tr>
+          {g.children ? renderGroups(g.children, depth + 1) : g.orders.map((o) => renderOrder(o, depth + 1))}
+        </Fragment>
+      );
+    });
+
+
   return (
     <div className="card overflow-hidden">
       <div
-        className="flex items-center justify-between px-4 py-3"
+        className="flex flex-wrap items-center justify-between gap-y-2 px-4 py-3"
         style={{ borderBottom: collapsed ? "none" : "1px solid var(--border)" }}
       >
         <button
@@ -174,6 +358,41 @@ export function ClosedTodayTable() {
             </span>
           )}
         </button>
+        {!collapsed && orders && orders.length > 0 && (
+          <div role="group" aria-label="Group closed orders" className="flex items-center gap-1.5 ml-2 mr-auto">
+            {(showChannel ? (["channel", "symbol"] as const) : (["symbol"] as const)).map((key) => {
+              const at = groupBy.indexOf(key);
+              const on = at >= 0;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => toggleGroup(key)}
+                  aria-pressed={on}
+                  title={on
+                    ? `Grouped by ${GROUP_LABEL[key].toLowerCase()}${groupBy.length > 1 ? ` (level ${at + 1})` : ""} — press to remove`
+                    : `Group by ${GROUP_LABEL[key].toLowerCase()}`}
+                  className="focus-ring inline-flex items-center gap-1 rounded-full text-[11px] font-medium px-2.5 py-0.5"
+                  style={{
+                    border: `1px solid ${on ? "var(--good)" : "var(--border)"}`,
+                    background: on ? "color-mix(in srgb, var(--good) 16%, transparent)" : "var(--panel-2)",
+                    color: on ? "var(--good)" : "var(--muted)",
+                  }}
+                >
+                  {GROUP_LABEL[key]}
+                  {on && (
+                    <span
+                      className="num inline-flex items-center justify-center rounded-full text-[10px] font-semibold"
+                      style={{ width: 15, height: 15, background: "var(--good)", color: "var(--bg)" }}
+                    >
+                      {at + 1}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
         {orders && orders.length > 0 && (
           <span className="text-[12px]" style={{ color: "var(--muted)" }}>
             Realized today{" "}
@@ -203,92 +422,7 @@ export function ClosedTodayTable() {
               </tr>
             </thead>
             <tbody>
-              {orders.map((o) => {
-                const pnl = o.realized_pnl == null || o.realized_pnl === "" ? null : Number(o.realized_pnl);
-                const label = positionSymbolLabel(o as unknown as Position);
-                const blocked = reEnterBlock(o);
-                const isOption = o.instrument_type === "option";
-                const open = !!summaryOpen[o.id];
-                return (
-                  <Fragment key={o.id}>
-                  <tr style={{ borderTop: "1px solid var(--border)" }}>
-                    {showChannel && <td className={td}>{o.discord_channel || "—"}</td>}
-                    <td className={`${td} whitespace-nowrap font-medium`} style={{ color: "var(--text)" }}>
-                      <span className="inline-flex items-center gap-1.5">
-                        {label}
-                        {o.broker_account_id && <button
-                          type="button"
-                          onClick={() => setSummaryOpen((m) => ({ ...m, [o.id]: !m[o.id] }))}
-                          aria-expanded={open}
-                          aria-label={`${open ? "Hide" : "Show"} the position summary for ${label}`}
-                          title="Position summary — every buy and sell, with Rem.Qty"
-                          className="focus-ring inline-flex items-center justify-center rounded-full"
-                          style={{
-                            width: 20, height: 20, background: "var(--panel-2)", color: "var(--text-2)",
-                            boxShadow: open ? "0 0 0 1.5px var(--text-2)" : "none",
-                          }}
-                        >
-                          <History size={12} />
-                        </button>}
-                      </span>
-                    </td>
-                    <td className={`${td} num text-right`}>{fmtNum(o.filled_quantity, 0)}</td>
-                    <td className={`${td} capitalize`}>{String(o.order_type).replace(/_/g, " ")}</td>
-                    <td className={`${td} num text-right`}>{o.filled_avg_price ? fmtNum(o.filled_avg_price, 2) : "—"}</td>
-                    <td className={`${td} num text-right`} style={{ color: pnl == null ? "var(--muted)" : pnl > 0 ? "var(--good)" : pnl < 0 ? "var(--bad)" : "var(--text)" }}>
-                      {pnl == null ? "—" : fmtSignedUsd(pnl)}
-                    </td>
-                    {/* Qty, price and the button as one group, side by side. */}
-                    <td className={`${td} whitespace-nowrap`}>
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="number" min={isOption ? 1 : 0.000001} step={isOption ? 1 : "any"}
-                          aria-label={`Re-enter quantity for ${label}`}
-                          title="Re-enter quantity"
-                          value={reQty[o.id] ?? defaultQty(o)}
-                          onChange={(e) => setReQty((s) => ({ ...s, [o.id]: e.target.value }))}
-                          disabled={!!blocked}
-                          className={`${inputCls} w-16 disabled:opacity-50`} style={inputStyle}
-                        />
-                        <span className="text-[11px]" style={{ color: "var(--muted)" }}>@</span>
-                        <input
-                          type="number" min="0.01" step="0.01"
-                          aria-label={`Re-enter price for ${label}`}
-                          title="Re-enter price (limit)"
-                          value={rePrice[o.id] ?? defaultPrice(o)}
-                          onChange={(e) => setRePrice((s) => ({ ...s, [o.id]: e.target.value }))}
-                          disabled={!!blocked}
-                          className={`${inputCls} w-20 disabled:opacity-50`} style={inputStyle}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void reEnter(o)}
-                          disabled={!!blocked || busyId === o.id}
-                          title={blocked ?? "Buy this back: a limit order for this quantity and price"}
-                          className="btn-primary px-3 py-1 text-[12px] disabled:opacity-50"
-                        >
-                          {busyId === o.id ? "Placing…" : "Re-enter"}
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                  {open && o.broker_account_id && (
-                    <tr style={{ background: "var(--panel-2)" }}>
-                      <td colSpan={showChannel ? 7 : 6} className="px-4 py-2.5">
-                        <PositionSummary target={{
-                          brokerAccountId: o.broker_account_id,
-                          symbol: o.symbol,
-                          optionStrike: o.option_strike,
-                          optionRight: o.option_right,
-                          optionExpiry: o.option_expiry,
-                          throughOrderId: o.id,
-                        }} />
-                      </td>
-                    </tr>
-                  )}
-                  </Fragment>
-                );
-              })}
+              {groupBy.length > 0 ? renderGroups(groups) : orders.map((o) => renderOrder(o))}
             </tbody>
           </table>
         </div>
