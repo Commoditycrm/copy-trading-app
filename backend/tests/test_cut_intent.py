@@ -136,3 +136,41 @@ def test_talk_about_cutting_is_ignored_with_the_reason():
 def test_a_cut_is_never_read_as_an_entry():
     res = _parse("@Rafael the 7800 long is weak. Going to cut remaining position here @ 2.6")
     assert all(s.action.value == "SELL" for s in res.signals)
+
+
+# ── a stop loss that was hit is a cut (the trader's call, 2026-10-19) ───────
+
+from app.services.discord_parsers.cut_intent import stop_hit  # noqa: E402
+
+
+@pytest.mark.parametrize("text", [
+    "SL Hit, -35%\n@Julia", "SL hit", "SL got hit", "Stop loss hit -40%", "stop-loss hit",
+    "Stop hit on SPY", "Hit my stop", "hit SL", "SL triggered on QQQ puts", "Stopped out",
+    "Stopped out of rest of SPY calls",
+])
+def test_a_stop_loss_hit_is_a_cut(text):
+    assert stop_hit(text).kind == CUT
+    s = _parse(text).signals[0]
+    assert s.action.value == "SELL" and s.source_action == "CUTTING" and s.close_all_matching
+
+
+@pytest.mark.parametrize("text, reason", [
+    ("SL hit?", "question"), ("If SL hit I'm out", "conditional"), ("SL hit, not yet", "negated"),
+    ("Almost hit my stop", "hedged"), ("Got stopped out yesterday", "past"),
+])
+def test_talk_about_a_stop_loss_is_not_a_cut(text, reason):
+    v = stop_hit(text)
+    assert v.kind == BLOCKED and v.reason == reason, v
+    assert not [s for s in (_parse(text).signals or []) if s.action.value == "SELL"]
+
+
+def test_setting_a_stop_is_not_a_hit():
+    assert stop_hit("SL at 0.20").kind == NONE
+    assert stop_hit("SL not hit yet").kind == NONE
+    assert not _parse("SL not hit yet").signals
+
+
+def test_sl_is_never_the_ticker():
+    assert _parse("SL Hit, -35%").signals[0].symbol is None          # the channel's position
+    s = _parse("SL triggered on QQQ puts").signals[0]
+    assert (s.symbol, s.option_type.value) == ("QQQ", "PUT")

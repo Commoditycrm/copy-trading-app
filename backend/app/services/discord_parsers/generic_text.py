@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 
-from . import cut_intent
+from . import add_intent, cut_intent
 from ._util import parse_expiry, to_decimal
 from .compact_alert import DEFAULT_QUANTITY, _next_trading_day
 from .base import (
@@ -40,6 +40,7 @@ _SELL_WORDS = r"SELL|SOLD|STO|STC|CLOSE[DS]?|CLOSING|EXIT(?:ING|ED)?|TRIM(?:MING
 _ACTION_RE = re.compile(rf"\b(?P<buy>{_BUY_WORDS})\b|\b(?P<sell>{_SELL_WORDS})\b", re.IGNORECASE)
 
 _TICKER_RE = re.compile(r"\$?\b([A-Z]{1,6})\b")
+_ADD_WORD_RE = re.compile(r"add(?:s|ed|ing)?", re.IGNORECASE)
 # "250C" / "250P" / "250 CALL" / "250 PUT" / "STRIKE 250"
 _CONTRACT_RE = re.compile(
     r"\$?(?P<strike>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
@@ -107,7 +108,7 @@ class GenericTextParser(Parser):
 
     def matches(self, message: ParsedMessage) -> bool:
         text = message.text
-        if cut_intent.classify(text).sells:
+        if cut_intent.classify(text).sells or add_intent.classify(text).adds:
             # A committed cut is an exit, read by terse_alert. Here "...the 7800
             # long... Going to cut remaining position here @ 2.6" was read as a
             # BUY of "RAFAEL" @ 2.6 off the @mention (QA 2026-10-07).
@@ -122,6 +123,14 @@ class GenericTextParser(Parser):
         if not action_m:
             return ParseResult.ignored("no buy/sell instruction in this message")
         action = SignalAction.BUY if action_m.group("buy") else SignalAction.SELL
+        # "Add" is never a fresh entry here: an add has its own rules (compact_alert,
+        # terse_alert's add_intent) and averages into a position. Read as a buy it
+        # took the first word as a ticker — "This is my last add here" became a
+        # BUY of "THIS", "…most likely going to start adding…" a BUY of "I".
+        if action is SignalAction.BUY and all(
+                _ADD_WORD_RE.fullmatch(m.group("buy") or "") for m in _ACTION_RE.finditer(text)
+                if m.group("buy")):
+            return ParseResult.ignored("an add, not an entry — read by the add rules")
 
         symbol = self._symbol(upper)
         if not symbol:

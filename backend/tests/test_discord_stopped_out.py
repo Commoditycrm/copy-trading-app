@@ -58,8 +58,8 @@ def test_a_stop_out_naming_two_tickers_is_refused():
 
 
 @pytest.mark.parametrize("text, action", [
-    ("Stopped out", "STOPPED_OUT"),
-    ("Stopped out @here @Sniper", "STOPPED_OUT"),
+    ("Stopped out", "CUTTING"),
+    ("Stopped out @here @Sniper", "CUTTING"),
     ("Cutting @here @Sniper 10% loss", "CUTTING"),        # live 2026-10-07, missed
 ])
 def test_a_close_out_naming_no_ticker_closes_the_channels_position(text, action):
@@ -170,6 +170,7 @@ def test_each_contract_is_closed_in_full_and_summarised(monkeypatch):
     ]
     monkeypatch.setattr(ex, "channel_held_contracts", lambda *a, **k: contracts)
     monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    monkeypatch.setattr(discord_sources, "_channel_cut_left_to_take_profits", lambda *a: False)
     seen = []
     first = uuid.uuid4()
 
@@ -197,6 +198,7 @@ def test_each_contract_is_closed_in_full_and_summarised(monkeypatch):
 def test_nothing_held_from_the_channel_is_refused(monkeypatch):
     monkeypatch.setattr(ex, "channel_held_contracts", lambda *a, **k: [])
     monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    monkeypatch.setattr(discord_sources, "_channel_cut_left_to_take_profits", lambda *a: False)
     sig = parse_message(ParsedMessage(content="Stopped out of rest of SPY calls")).signals[0].as_dict()
     msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), parsed_signal=sig,
                           order_id=None, status=None, status_reason=None)
@@ -231,6 +233,7 @@ def test_cutting_with_no_ticker_closes_the_contract_the_channel_is_in(monkeypatc
 def test_cutting_with_nothing_held_from_the_channel_is_refused(monkeypatch):
     monkeypatch.setattr(ex, "latest_channel_contract", lambda db, user, sid: None)
     monkeypatch.setattr(discord_sources, "_channel_exits_manual", lambda *a: False)
+    monkeypatch.setattr(discord_sources, "_channel_cut_left_to_take_profits", lambda *a: False)
     sig = parse_message(ParsedMessage(content="Cutting @here 10% loss")).signals[0].as_dict()
     msg = SimpleNamespace(id=uuid.uuid4(), source_id=uuid.uuid4(), parsed_signal=sig,
                           order_id=None, status=None, status_reason=None)
