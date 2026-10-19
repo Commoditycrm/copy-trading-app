@@ -232,6 +232,16 @@ def release(db: Session, guard, cancel) -> bool:
             log.info("take-profit: %s's order filled before it could be released — "
                      "crediting the trim", guard.symbol)
             return True
+    # …or that the broker could not say what happened (a rate limit, most
+    # often), and the row is still working. Forgetting it then is how a fill was
+    # lost: QA 2026-10-19, QQQ 722P — Trim 1 sold 8 @ 1.22, was recorded as
+    # cancelled, and Trim 1 then sold the 2 left for Trim 2. Keep the ids: the
+    # next pass asks again.
+    for oid in (guard.tp_order_id, guard.tp_stop_order_id):
+        if oid is not None and _working(db.get(Order, oid)):
+            log.warning("take-profit: %s's cancel is not confirmed — keeping the order "
+                        "and asking the broker again next pass", guard.symbol)
+            return True
     _clear(guard)
     if done:
         log.info("take-profit: released %s's resting orders to make room for an exit", guard.symbol)
@@ -358,9 +368,52 @@ def in_sync(db: Session, guard, want: Plan | None) -> bool:
     return sl.stop_price is not None and Decimal(str(sl.stop_price)) == want.stop_price
 
 
+# A take-profit for more contracts than are held can only have (partly)
+# filled — it reserves what it covers, so nothing else could have sold them.
+# While the broker still calls it working, wait this long for it to say filled
+# before replacing it anyway.
+LOOKS_FILLED_WAIT = timedelta(minutes=2)
+
+
+def _age(order, now: datetime) -> timedelta | None:
+    placed = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+    if placed is None:
+        return None
+    if placed.tzinfo is None:
+        placed = placed.replace(tzinfo=timezone.utc)
+    return now - placed
+
+
+def _refresh_resting(db: Session, guard, refresh) -> bool:
+    """Ask the broker what became of the resting take-profit and its linked
+    stop, onto their rows. False when a leg could not be read."""
+    from app.models.order import Order  # noqa: PLC0415
+
+    ok = True
+    for oid in (guard.tp_order_id, guard.tp_stop_order_id):
+        if oid is not None and _working(db.get(Order, oid)):
+            ok = refresh(oid) and ok
+    return ok
+
+
+def _why_wait(db: Session, guard, held: Decimal, now: datetime) -> str | None:
+    """A reason not to cancel the resting take-profit yet, or None."""
+    from app.models.order import Order  # noqa: PLC0415
+
+    tp = db.get(Order, guard.tp_order_id) if guard.tp_order_id else None
+    if not _working(tp):
+        return None
+    qty = Decimal(str(tp.quantity))
+    age = _age(tp, now)
+    if held < qty and age is not None and age < LOOKS_FILLED_WAIT:
+        return (f"{_n(held)} held is fewer than its {_n(qty)}, so it has filled — "
+                "waiting for the broker to report it")
+    return None
+
+
 def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
               place_limit, place_pair, cancel, reconcile_stop,
-              in_session: bool = True, now: datetime | None = None) -> str:
+              refresh=None, in_session: bool = True, now: datetime | None = None) -> str:
     """Make the broker match the ladder for one holding. Returns an outcome.
 
     Injected, so this never talks to a broker itself:
@@ -368,6 +421,16 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
       ``place_pair(quantity, price, stop_price) -> (tp_order_id, stop_order_id)``
       ``cancel(order_id)``
       ``reconcile_stop() -> str``   the plain ladder stop's own reconcile
+      ``refresh(order_id) -> bool`` read one order from the broker onto its row;
+                                    False when the broker could not be read
+
+    Nothing that rests is replaced on the word of our own rows alone. A
+    take-profit can fill with nothing here hearing of it (a Discord
+    subscriber's Webull account has no order listener), and the position then
+    no longer matches the plan — which reads exactly like a resize. So before a
+    resting take-profit is cancelled the broker is asked what became of it, and
+    while it cannot say, or says "working" for more contracts than are held,
+    everything is left as it is for the pass.
 
     The order matters. The earmark (``tp_qty``) is set first, then the ladder
     stop is reconciled — shrinking it to what the take-profit leaves — and only
@@ -378,6 +441,19 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
 
     want = plan(guard, held, ts, mark)
     released = False
+    if not in_sync(db, guard, want) and refresh is not None and guard.tp_order_id is not None:
+        readable = _refresh_resting(db, guard, refresh)
+        settled = settle(db, guard, ts, cancel, in_session=in_session, held=held) or settled
+        want = plan(guard, held, ts, mark)
+        if not in_sync(db, guard, want):
+            why = (_why_wait(db, guard, held, now) if readable
+                   else "the broker could not be read — asking again next pass")
+            if why is not None:
+                # Neither leg is touched, and nor is the stop: sizing it around
+                # an earmark that may already have sold would pull the stop
+                # off what is left.
+                log.info("take-profit: %s — %s", guard.symbol, why)
+                return (f"{settled}; " if settled else "") + f"take-profit kept: {why}"
     if not in_sync(db, guard, want):
         released = release(db, guard, cancel)
         if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
@@ -389,6 +465,8 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
             settled = settle(db, guard, ts, cancel, in_session=in_session, held=held) or settled
             want = plan(guard, held, ts, mark)
     resting = guard.tp_order_id is not None
+    # A cancel the broker could not confirm leaves the old take-profit resting.
+    unconfirmed = released and resting
 
     # Nothing new goes out while the market is closed (a DAY order would only
     # expire) or while backing off after a refusal — but what rests stays.
@@ -401,9 +479,20 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
 
     # Earmark only contracts a take-profit actually holds, or is about to —
     # including the one going out next pass, so the stop is sized around it now.
-    guard.tp_qty = (want.quantity if (want is not None and (resting or will_place or released))
-                    else None)
+    # What rests is what is earmarked — the order at the broker, which is the
+    # plan's size except while a cancel is unconfirmed.
+    if resting:
+        from app.models.order import Order  # noqa: PLC0415
+
+        row = db.get(Order, guard.tp_order_id)
+        guard.tp_qty = (Decimal(str(row.quantity)) if row is not None
+                        else (want.quantity if want is not None else None))
+    else:
+        guard.tp_qty = (want.quantity if (want is not None and (will_place or released))
+                        else None)
     stop_outcome = reconcile_stop()
+    if unconfirmed:
+        return settled or f"cancel not confirmed — asking again next pass (stop: {stop_outcome})"
     if want is None:
         return settled or f"no take-profit (stop: {stop_outcome})"
     if resting:
@@ -461,5 +550,5 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     return (f"{settled}; " if settled else "") + f"placed trim {want.rung}: {want.quantity} @ {want.price}"
 
 
-__all__ = ["CONFLICT_BACKOFF", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
+__all__ = ["CONFLICT_BACKOFF", "LOOKS_FILLED_WAIT", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
            "in_sync", "reconcile", "BACKOFF"]

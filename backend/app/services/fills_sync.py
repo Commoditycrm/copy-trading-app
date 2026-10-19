@@ -148,8 +148,70 @@ def repair_unrecorded_fills(db: Session, acct: BrokerAccount, adapter: Any) -> i
         repaired += 1
         log.info("fills_sync: recorded the fill of %s %s (price %s)",
                  order.symbol, order.id, order.filled_avg_price)
+    repaired += _repair_cancelled_sells(db, acct, adapter, _REPAIR_MAX_READS - len(rows), now)
     if repaired:
         db.flush()
+    return repaired
+
+
+def _repair_cancelled_sells(db: Session, acct: BrokerAccount, adapter: Any,
+                            budget: int, now: datetime) -> int:
+    """Ask the broker once about each limit sell we recorded CANCELED with
+    nothing traded and no close time — the mark of a cancel we recorded
+    ourselves (an end the broker reports stamps a close time).
+
+    A take-profit can fill in the moment it is cancelled, and a cancel the
+    broker could not confirm was recorded as a cancel: QA 2026-10-19, QQQ 722P —
+    Trim 1 sold 8 @ 1.22 at Webull, and the sale was missing from the timeline,
+    Closed today and the day's P&L. A fill found is recorded as a fill; anything
+    else is stamped closed, so each order is read once.
+    """
+    from app.services.exit_confirm import _filled_quantity, record_fill_details  # noqa: PLC0415
+
+    if budget <= 0:
+        return 0
+    rows = list(db.execute(
+        select(Order).where(
+            Order.broker_account_id == acct.id,
+            Order.status == OrderStatus.CANCELED,
+            Order.side == OrderSide.SELL,
+            Order.order_type == OrderType.LIMIT,
+            Order.closed_at.is_(None),
+            Order.broker_order_id.isnot(None),
+            func.coalesce(Order.filled_quantity, 0) == 0,
+            Order.created_at >= now - _REPAIR_WINDOW,
+        ).order_by(Order.created_at.desc()).limit(budget)
+    ).scalars())
+    repaired = 0
+    for order in rows:
+        try:
+            res = adapter.get_order(order.broker_order_id)
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: re-read of cancelled %s failed", order.id, exc_info=True)
+            res = None
+        status = getattr(res, "status", None)
+        if status is None:
+            created = order.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created is not None and now - created > _REPAIR_GIVE_UP:
+                order.closed_at = now
+                repaired += 1
+            continue
+        got = _filled_quantity(res)
+        if status == OrderStatus.FILLED or got > 0:
+            if got > 0:
+                order.filled_quantity = got
+            if status == OrderStatus.FILLED:
+                order.status = OrderStatus.FILLED
+            record_fill_details(order, res)
+            log.warning("fills_sync: %s %s was recorded cancelled but %s at the broker "
+                        "(%s @ %s) — recorded the fill",
+                        order.symbol, order.id, getattr(status, "value", status),
+                        order.filled_quantity, order.filled_avg_price)
+        else:
+            order.closed_at = now
+        repaired += 1
     return repaired
 
 
