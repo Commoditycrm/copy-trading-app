@@ -1666,7 +1666,7 @@ export default function DiscordPage() {
                     Last Trading Day (usually Fridays)
                   </label>
                   <p className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
-                    What an alert called risky, high risk, a lotto, light or &ldquo;leave room to add&rdquo; buys on the
+                    What an alert called risky, high risk, degen, a lotto, light or &ldquo;leave room to add&rdquo; buys on the
                     week&rsquo;s last trading day (Thursday when Friday is a holiday). Other days it is half size.
                     {scope ? " For this channel." : " For every channel that follows the account."}
                   </p>
