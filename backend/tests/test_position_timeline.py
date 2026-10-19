@@ -151,15 +151,35 @@ def test_an_earlier_holding_s_events_stay_with_it(db):
     assert [r["label"] for r in _timeline(db, through_order_id=first_close.id)] == ["Entry", "Stop set", "T1"]
 
 
-def test_a_sell_shows_the_realized_pnl_the_rest_of_the_app_reports(db, monkeypatch):
-    """Closed today and Order History use pnl.realized_pnl_by_order (FIFO); the
-    summary shows the same figure rather than its own."""
-    from app.services import pnl
+def test_a_sell_s_pnl_is_against_the_average_cost_and_says_so(db):
+    """QA 2026-10-19, SPY 765P: 7 @ 0.92, averaged with 2 @ 0.56 and 9 @ 0.53
+    (avg 0.685), then 5 sold @ 0.69. First-in-first-out (the rest of the app)
+    books -$115.00 against the 0.92 lot; the summary — beside its Avg.Price
+    column — shows +$2.50 against the average, and the Why says how."""
+    _order(db, OrderSide.BUY, OrderType.MARKET, 7, 0, price="0.92")
+    _order(db, OrderSide.BUY, OrderType.LIMIT, 2, 8, price="0.56", limit="0.60")
+    _order(db, OrderSide.BUY, OrderType.MARKET, 9, 9, price="0.53")
+    _order(db, OrderSide.SELL, OrderType.LIMIT, 5, 28, price="0.69", limit="0.69")
+    sell = _timeline(db)[-1]
+    assert (sell["avg_price"], sell["pnl"]) == ("0.685", "2.50")
+    assert sell["pnl_calc"] == "P/L at average cost: 5 × (0.69 − 0.685) × 100 = +$2.50"
 
+
+def test_a_loss_at_average_cost_reads_as_one(db):
     _order(db, OrderSide.BUY, OrderType.MARKET, 2, 0, price="2.00")
-    loss = _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="1.60")
-    monkeypatch.setattr(pnl, "realized_pnl_by_order", lambda db_, uid: {loss.id: D("-41.25")})
-    assert _timeline(db)[-1]["pnl"] == "-41.25"
+    sell = _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="1.60")
+    row = [r for r in _timeline(db) if r["label"] == "T1"][0]
+    assert row["pnl"] == "-40.00" and row["pnl_calc"].endswith("= −$40.00")
+
+
+def test_the_rest_of_the_app_is_not_asked_for_its_figure(db, monkeypatch):
+    """Average cost is the summary's own figure — no first-in-first-out walk."""
+    from app.services import pnl
+    monkeypatch.setattr(pnl, "realized_pnl_by_order",
+                        lambda *a, **k: pytest.fail("the summary must not use the FIFO figure"))
+    _order(db, OrderSide.BUY, OrderType.MARKET, 2, 0, price="2.00")
+    _order(db, OrderSide.SELL, OrderType.MARKET, 1, 5, price="2.40")
+    assert _timeline(db)[-1]["pnl"] == "40.00"
 
 
 # ── why: every event and order carries the reason it happened ───────────────
