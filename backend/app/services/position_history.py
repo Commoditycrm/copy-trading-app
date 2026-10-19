@@ -218,16 +218,13 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
         t = _utc(t)
         return t is not None and (start is None or t >= start) and (end is None or t <= end)
 
-    # Each sell's realized P&L as the rest of the app reports it (Closed today,
-    # Order History): a FIFO walk over the user's whole history. Falls back to
-    # the sell against this summary's average cost when it has no figure.
-    try:
-        from app.services.pnl import realized_pnl_by_order  # noqa: PLC0415
-
-        realized = realized_pnl_by_order(db, user_id)
-    except Exception:  # noqa: BLE001
-        realized = {}
-
+    # Each sell's P/L here is against the AVERAGE COST of what was held — the
+    # Avg.Price column beside it (the trader's call, 2026-10-19). The rest of the
+    # app (Closed today, the calendar, the daily limits) books first-in-first-out,
+    # which matches a sell to the OLDEST lot: after averaging 7 @ 0.92 down with
+    # 2 @ 0.56 and 9 @ 0.53, selling 5 @ 0.69 read -$115.00 (vs the 0.92 lot)
+    # beside an average of 0.685. Both total the same once the position is flat.
+    # The Why column says how the figure was worked out.
     reasons = _order_reasons(db, [o.id for o in orders])
 
     items: list[tuple] = []
@@ -245,6 +242,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
         buy = o.side == OrderSide.BUY
         price = Decimal(str(o.filled_avg_price)) if o.filled_avg_price is not None else None
         pnl = None
+        calc = None
         if mine and buy:
             buys += 1
             label = "Entry" if buys == 1 else ("Average" if price is not None and avg and price < avg else "Add")
@@ -252,13 +250,13 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
                 avg = ((avg * held) + price * filled) / (held + filled) if held + filled else price
             held += filled
         elif mine:
-            # What this sell realized: the order's own figure (what Closed today
-            # shows), else the fill against the average cost it sold from.
-            if o.id in realized:
-                pnl = Decimal(str(realized[o.id]))
-            elif price is not None and avg:
+            # What this sell realized against the average cost it sold from.
+            if price is not None and avg and filled > 0:
                 mult = Decimal(100) if o.instrument_type == InstrumentType.OPTION else Decimal(1)
                 pnl = (price - avg) * filled * mult
+                calc = (f"P/L at average cost: {_s(filled)} × ({_s(price)} − {_px(avg)})"
+                        + (" × 100" if mult == 100 else "")
+                        + f" = {'+' if pnl >= 0 else '−'}${abs(pnl).quantize(Decimal('0.01')):,.2f}")
             if o.order_type in _STOP_TYPES:
                 label = "Stopped out"
             else:
@@ -286,6 +284,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "pnl": (f"{pnl.quantize(Decimal('0.01')):f}" if pnl is not None else None),
             # Why it was placed: the alert, auto-trim, a stop, you on Positions …
             "note": reasons.get(o.id) or _fallback_reason(o, mine),
+            # How a sell's P/L was worked out — shown in the Why column.
+            "pnl_calc": calc,
             "detail": None,
         }))
 
@@ -309,7 +309,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "at": at.isoformat(),
             "label": _EVENT_LABELS.get(e.kind, e.kind),
             "side": None, "requested": None, "filled": None, "status": None, "remaining": None,
-            "avg_price": None, "pnl": None,
+            "avg_price": None, "pnl": None, "pnl_calc": None,
             "note": getattr(e, "note", None),
             "detail": _event_detail(e),
         }))

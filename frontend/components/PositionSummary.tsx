@@ -34,8 +34,11 @@ type Item = {
   remaining: string | null;
   /** Average cost of what is still held after this fill (null when flat). */
   avg_price: string | null;
-  /** Realized P&L of a sell, in dollars (signed); null for buys and events. */
+  /** Realized P&L of a sell against the average cost, in dollars (signed);
+   *  null for buys and events. */
   pnl: string | null;
+  /** How that P/L was worked out ("P/L at average cost: 5 × (0.69 − 0.685) × 100 = +$2.50"). */
+  pnl_calc?: string | null;
   /** Why it happened: the alert, auto-trim, a stop, you on Positions … */
   note: string | null;
   detail: string | null;
@@ -142,7 +145,7 @@ export function PositionSummary({ target, placed }: { target: SummaryTarget; pla
           <span style={muted}>Filled</span>
           <span className="text-right" style={muted}>Rem.Qty</span>
           <span className="text-right" style={muted} title="Average cost of what is still held">Avg.Price</span>
-          <span className="text-right" style={muted} title="What each sell realized">P/L</span>
+          <span className="text-right" style={muted} title="What each sell realized, against the average cost (Avg.Price)">P/L</span>
           <span style={muted}>Why</span>
           {items.map((it, i) => <Row key={i} it={it} />)}
         </div>
@@ -208,7 +211,7 @@ function Row({ it }: { it: Item }) {
         {filled ? (it.avg_price ?? "—") : ""}
       </span>
       <PnlCell value={it.pnl} />
-      <Why note={it.note} />
+      <Why note={[it.note, it.pnl_calc].filter(Boolean).join(" · ") || null} />
     </>
   );
 }
