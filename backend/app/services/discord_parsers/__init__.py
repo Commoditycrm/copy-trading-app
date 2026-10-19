@@ -52,7 +52,8 @@ log = logging.getLogger(__name__)
 # "not heavy" tolerates a hyphen or extra spaces because people type both.
 # Also "lightly" (live 2026-10-01: "BTO SPY 764 Calls … filled lightly"),
 # "small(er) size" and "half size". And "lotto" / "lottos" — a long-shot
-# entry — and "risky" / "high risk", so half the size too.
+# entry — "risky" / "high risk", and "degen" / "degens" ("degen play",
+# "for the degens"), so half the size too.
 #
 # "Leave room to add" says the same thing from the other end: the author is
 # deliberately entering under their full size so there is room to average in
@@ -61,7 +62,7 @@ log = logging.getLogger(__name__)
 # instruction typed differently.
 _HALF_SIZE_RE = re.compile(
     r"\bnot[\s-]+heavy\b|\blight(?:ly)?\b|\b(?:small(?:er)?|half)[\s-]+size[sd]?\b"
-    r"|\blottos?\b|\brisky\b|\bhigh[\s-]+risk\b"
+    r"|\blottos?\b|\brisky\b|\bhigh[\s-]+risk\b|\bdegens?\b"
     r"|\bleav(?:e|es|ing)\s+(?:some\s+|a\s+little\s+|a\s+bit\s+of\s+)?room\b",
     re.IGNORECASE,
 )

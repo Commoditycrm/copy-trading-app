@@ -43,6 +43,19 @@ def test_high_risk_is_half_size(text):
     assert _entry(text).half_size is True
 
 
+@pytest.mark.parametrize("text", [
+    "QQQ 759P @here .42 degen", "QQQ 759P @here .42 degen play", "QQQ 759P @here .42 for the degens",
+    "$SPY 771 CALL 0DTE @0.68 Degen lotto",
+])
+def test_degen_is_half_size(text):
+    assert _entry(text).half_size is True
+
+
+@pytest.mark.parametrize("text", ["$SPY 771 CALL 0DTE @0.68 degenerate move today"])
+def test_degen_is_word_bounded(text):
+    assert _entry(text).half_size is False
+
+
 def test_a_plain_entry_is_neither():
     s = _entry("$SPY 771 CALL 0DTE @0.68")
     assert s.at_market is False and s.half_size is False
