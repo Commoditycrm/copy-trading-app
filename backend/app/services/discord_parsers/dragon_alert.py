@@ -74,7 +74,7 @@ _SYMBOL = r"\$(?P<symbol>[A-Za-z][A-Za-z0-9.]{0,9})"
 _ENTRY_RE = re.compile(
     rf"^\s*{_SYMBOL}\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\s+"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s*"
+    rf"(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s*"
     rf"{_AT}\$?(?P<price>{_NUM})(?![\d.])"
     rf"(?P<trailing>.*)$",
     re.IGNORECASE,

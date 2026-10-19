@@ -88,7 +88,7 @@ def _root(m: re.Match) -> str:
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
+    rf"(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -108,7 +108,7 @@ _ENTRY_RE = re.compile(
 # tried first, so the two cannot disagree about a line.
 _ENTRY_EXP_FIRST_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE}\s+"
+    rf"(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE}\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -120,7 +120,7 @@ _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
+    rf"(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -231,7 +231,7 @@ _ADD_RE = re.compile(
     rf"^\s*(?:ADD|ADDING|ADDED)\s+(?:TO\s+|ON\s+|MORE\s+)?"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
-    rf"\s*(?:(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
+    rf"\s*(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -665,6 +665,10 @@ def _next_trading_day(day: date) -> date:
     return nxt
 
 
+# The furthest "NDTE" read as an expiry. Alerts name days, not months, this way.
+_MAX_DTE = 30
+
+
 def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool = False):
     """Returns ``(expiry, unspecified, error)``."""
     # "ODTE" with the letter O is a common mistype of "0DTE" and means the same
@@ -677,10 +681,20 @@ def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool
             return None, False, "0DTE alert has no timestamp to resolve the expiry against"
         return message.posted_at.date(), False, None
 
-    if raw and raw.upper() == "1DTE":
+    # "1DTE", "2DTE" … "30DTE": that many TRADING days after the message (a
+    # Friday 2DTE is Tuesday). Holidays are not known here — see
+    # _next_trading_day; execution refuses an expiry that doesn't exist.
+    dte = re.fullmatch(r"(\d{1,2})DTE", raw.upper()) if raw else None
+    if dte:
+        days = int(dte.group(1))
+        if days > _MAX_DTE:
+            return None, False, f"{days}DTE is further out than an alert expiry is read ({_MAX_DTE} days)"
         if message.posted_at is None:
-            return None, False, "1DTE alert has no timestamp to resolve the expiry against"
-        return _next_trading_day(message.posted_at.date()), False, None
+            return None, False, f"{days}DTE alert has no timestamp to resolve the expiry against"
+        expiry = message.posted_at.date()
+        for _ in range(days):
+            expiry = _next_trading_day(expiry)
+        return expiry, False, None
 
     if not raw:
         if allow_missing:
