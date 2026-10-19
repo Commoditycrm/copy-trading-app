@@ -28,6 +28,7 @@ callers cancel it before placing an exit of their own.
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -104,6 +105,59 @@ def _is_transient(msg: str) -> bool:
     return any(k in m for k in _TRANSIENT_MARKERS)
 
 
+# The broker refused a SELL stop because the market is already at or through it:
+# Webull "OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE … (0.3)", Alpaca
+# "stop price must be less than …". Not a failure of protection — the stop would
+# have fired the moment it rested, and the ladder sells at market instead.
+_CROSSED_MARKERS = (
+    "stop price must be less than", "stop_price must be less than",
+    "stop price must not be greater", "must be less than market price",
+)
+_QUOTED_PRICE_RE = re.compile(r"[（(]\s*(\d+(?:\.\d+)?)\s*[)）]")
+
+
+def is_stop_crossed(msg: str) -> bool:
+    """Was this stop refused because the market had already crossed it?"""
+    m = str(msg or "").lower().replace("_", " ")
+    return any(k in m for k in _CROSSED_MARKERS)
+
+
+def _notify_crossed(db, guard, quantity, price, msg: str, outcome: str) -> None:
+    """Tell the trader what happened in plain words, in place of the broker's
+    "order was rejected" — which read as a failure when the app had in fact
+    sold at market a second later (QA 2026-10-12, 10-16, 10-19)."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from app.models.order import InstrumentType, OptionRight  # noqa: PLC0415
+    from app.services import notifications  # noqa: PLC0415
+
+    try:
+        label = notifications.instrument_label(SimpleNamespace(
+            symbol=guard.symbol,
+            instrument_type=InstrumentType.OPTION if guard.option_strike is not None else InstrumentType.STOCK,
+            option_right=OptionRight(guard.option_right) if guard.option_right else None,
+            option_strike=guard.option_strike, option_expiry=guard.option_expiry,
+        ))
+        quoted = _QUOTED_PRICE_RE.findall(msg or "")
+        market = f" (market {quoted[-1]})" if quoted else ""
+        qty = f"{Decimal(str(quantity)).normalize():f}"
+        stop = f"{Decimal(str(price)).quantize(Decimal('0.01'))}"
+        then = {
+            "exit sent": f"sold {qty} at market",
+            "exit already working": "an exit was already working for it",
+            "exit deferred to the regular session": f"the {qty} sell at market when the regular session opens",
+        }.get(outcome, f"selling {qty} at market")
+        notifications.create_notification(
+            db, user_id=guard.user_id, type="discord.stop_crossed",
+            message=f"{label}: the stop at {stop} was already crossed{market} — {then}.",
+            metadata={"symbol": guard.symbol, "instrument": label, "stop_price": stop,
+                      "quantity": qty, "outcome": outcome, "reason": str(msg)[:300]},
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("discord stop: could not send the crossed-stop notice for %s",
+                    getattr(guard, "symbol", "?"), exc_info=True)
+
+
 def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> str | None:
     """Place the stop; if the broker refuses it, exit the position instead.
 
@@ -140,7 +194,9 @@ def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> s
             "the position would otherwise be left unprotected",
             guard.symbol, price, msg[:160], quantity,
         )
-        _exit_instead(db, guard, quantity, close_position)
+        outcome = _exit_instead(db, guard, quantity, close_position)
+        if is_stop_crossed(msg):
+            _notify_crossed(db, guard, quantity, price, msg, outcome)
         return None
 
 
