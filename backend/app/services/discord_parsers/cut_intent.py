@@ -211,4 +211,55 @@ def stop_hit(text: str) -> CutIntent:
     return first_block or CutIntent(BLOCKED, "no committed stop hit")
 
 
-__all__ = ["CUT", "PARTIAL", "BLOCKED", "NONE", "CutIntent", "classify", "stop_hit"]
+# ── "Out of SPY puts" is a cut ───────────────────────────────────────────────
+# The trader's call (2026-10-19): a trader saying they are OUT — "Out of SPY
+# puts.", "Out of rest SPY calls", "Out of calls", "I'm out here at 0.60", "out
+# the rest", "Out remaining cons", Mark's "Out", "Out of META -20%", "-25% out
+# of SPY" — closes the position like a cut. Every one of these on QA was
+# ignored. The clause has to OPEN with the "out" (after an optional result %
+# and "I'm" / "all"), which keeps "crawl back out of it", "stay out of
+# trading" and "right out the gate" out of it.
+_OUT_START_RE = re.compile(
+    r"^\W*(?:[+\-−]?\d+(?:\.\d+)?\s*%\s*)?(?:i'?m\s+|i\s+am\s+|we'?re\s+|we\s+are\s+)?"
+    r"(?:all\s+|fully\s+|completely\s+)?out\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+# "Out the gate" is an ENTRY ("buy now"); "out of the money" is a description.
+_OUT_NOT_EXIT_RE = re.compile(
+    r"^\s*(?:of\s+)?the\s+gate\b|^\s*of\s+the\s+money\b|^\s*of\s+(?:it|trading|town|the\s+office)\b",
+    re.IGNORECASE,
+)
+_OUT_HEDGE_RE = re.compile(
+    r"\b(?:would|i'd|might|may|will|going\s+to|gonna|likely|if|when|unless|soon|later|"
+    r"stay|as\s+we\s+approach)\b|\?",
+    re.IGNORECASE,
+)
+_OUT_EVERYTHING_RE = re.compile(r"^\s*of\s+(?:everything|all\s+(?:positions|of\s+it))\b", re.IGNORECASE)
+
+
+def out_exit(text: str) -> CutIntent:
+    """The trader saying they are out of a position — a CUT — or BLOCKED when
+    it is talk ("I'd be completely out of calls as we approach 7750"), or NONE
+    (no clause opens with "out", or it is "out the gate" / "out of the money")."""
+    text = _normalise(text)
+    first_block: CutIntent | None = None
+    for clause in _clauses(text):
+        bare = _MENTION_RE.sub(" ", clause).strip()
+        m = _OUT_START_RE.match(bare)
+        if not m:
+            continue
+        rest = m.group("rest")
+        if _OUT_NOT_EXIT_RE.search(rest):
+            continue
+        if _OUT_HEDGE_RE.search(bare):
+            first_block = first_block or CutIntent(BLOCKED, "hedged", clause)
+            continue
+        if _OUT_EVERYTHING_RE.search(rest):
+            first_block = first_block or CutIntent(
+                BLOCKED, "out of everything — close those from Positions", clause)
+            continue
+        return CutIntent(CUT, "trader is out", clause)
+    return first_block or CutIntent(NONE, "no out")
+
+
+__all__ = ["CUT", "PARTIAL", "BLOCKED", "NONE", "CutIntent", "classify", "stop_hit", "out_exit"]

@@ -174,3 +174,39 @@ def test_sl_is_never_the_ticker():
     assert _parse("SL Hit, -35%").signals[0].symbol is None          # the channel's position
     s = _parse("SL triggered on QQQ puts").signals[0]
     assert (s.symbol, s.option_type.value) == ("QQQ", "PUT")
+
+
+# ── "Out of SPY puts" is a cut (the trader's call, 2026-10-19) ──────────────
+# Real messages from QA that were all ignored before.
+
+@pytest.mark.parametrize("text, symbol", [
+    ("Out of SPY puts. Breakout above the premarket high.", "SPY"),       # Clint 10-19
+    ("Out of rest SPY calls. Done for the day.", "SPY"),                  # Clint 10-15
+    ("Out of calls. There is no V recovery", None),                       # Clint 10-14
+    ("Out of SPY calls runners. Good trade.", "SPY"),                     # Clint 10-08
+    ("I'm out here at 0.60. Very choppy market.", None),                  # Clint 10-07
+    ("out the rest @here @Sniper", None),                                 # Breakdownsniper 10-12
+    ("Out remaining cons @here @Sniper break even", None),                # Breakdownsniper 10-08
+    ("Out @Mark", None), ("Out of META -20% @Mark", "META"), ("-25% out of SPY @Mark", "SPY"),
+    ("All out of QQQ puts", "QQQ"),
+])
+def test_the_trader_saying_they_are_out_is_a_cut(text, symbol):
+    s = _parse(text).signals[0]
+    assert s.action.value == "SELL" and s.source_action == "CUTTING" and s.close_all_matching
+    assert s.symbol == symbol
+
+
+@pytest.mark.parametrize("text", [
+    "I'd be completely out of calls as we approach 7750. Huge dealer short",   # Rafael
+    "Going to stay out of trading for now. Not my kind of market",             # Clint
+    "Yes, I'm currently in a slump. I will crawl back out of it.",             # Clint
+    "those puts are out of the money",
+    "I'm out of everything for now",           # all of the channel's positions: not handled yet
+])
+def test_talk_about_being_out_sells_nothing(text):
+    assert not [s for s in (_parse(text).signals or []) if s.action.value == "SELL"]
+
+
+@pytest.mark.parametrize("text", ["QQQ 759P @here @everyone out the gate high risk", "Out the gate QQQ 759P @here"])
+def test_out_the_gate_is_still_an_entry(text):
+    assert _parse(text).signals[0].action.value == "BUY"
