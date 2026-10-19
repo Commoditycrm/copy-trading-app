@@ -3,6 +3,7 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -983,6 +984,10 @@ def broker_request_for(
     )
 
 
+class _QuietRejection(Exception):
+    """Internal: skip the generic rejection notice (see ``quiet_rejection``)."""
+
+
 def _place_trader_order(
     db: Session,
     trader: User,
@@ -994,6 +999,7 @@ def _place_trader_order(
     resolve_wash_trade: bool = False,
     partial_close: bool = False,
     skip_dedup: bool = False,
+    quiet_rejection: Callable[[str], bool] | None = None,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -1289,8 +1295,14 @@ def _place_trader_order(
             # Notify the trader too — in-app + SMS for opted-in traders. Always
             # fired (not gated on will_fanout): the trader wants to know their
             # own order was rejected regardless of copy scope.
+            # …unless the caller handles this refusal itself and says so better:
+            # ``quiet_rejection(reason)`` True skips the generic notice (the
+            # Discord ladder's stop placer, for a stop the market had already
+            # crossed — it sells at market and explains that instead).
             try:
                 from app.services import notifications as notif_svc  # noqa: PLC0415
+                if quiet_rejection is not None and quiet_rejection(str(exc)):
+                    raise _QuietRejection
                 notif_svc.create_notification(
                     db,
                     user_id=trader.id,
@@ -1308,6 +1320,8 @@ def _place_trader_order(
                         "reason": str(exc)[:300],
                     },
                 )
+            except _QuietRejection:
+                pass
             except Exception:  # noqa: BLE001
                 import logging  # noqa: PLC0415
                 logging.getLogger(__name__).exception(

@@ -707,12 +707,17 @@ def _make_stop_placer(db, live_acct, acct, guard):
             option_strike=guard.option_strike,
             option_right=OptionRight(right) if right else None,
         )
+        from app.services import discord_stop_orders  # noqa: PLC0415
+
         order = _place_trader_order(
             db, db.get(User, acct.user_id), payload, live_acct.id,
             BackgroundTasks(), _PollerRequest(),
             resolve_wash_trade=True,      # a close, so option SELLs go SELL_TO_CLOSE
             # A Discord ladder stop — subscribers hold their own (see place_exit).
             skip_fanout=True,
+            # A stop the market already crossed: the ladder sells at market and
+            # says so (discord_stop_orders._notify_crossed) — not "rejected".
+            quiet_rejection=discord_stop_orders.is_stop_crossed,
         )
         return order.id
     return _place
