@@ -135,7 +135,9 @@ def _exit_tickers(text: str) -> set[str]:
     if not found:
         found = {m.group("sym").upper() for m in _LOWER_TICKER_RE.finditer(bare)
                  if m.group("sym").upper() not in _NOT_TICKERS | _WORD_LETTERS
-                 and m.group("sym").lower() not in {"my", "the", "our", "those", "these", "all", "some"}}
+                 and m.group("sym").lower() not in {
+                     "my", "the", "our", "those", "these", "all", "some", "of", "out", "rest", "in",
+                     "on", "to", "at", "and", "no", "any", "more", "few", "two", "my", "your"}}
     return found
 
 
@@ -253,6 +255,7 @@ class TerseAlertParser(Parser):
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
             or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text) or _CUT_RE.search(text)
             or cut_intent.stop_hit(message.content or text).kind != cut_intent.NONE
+            or cut_intent.out_exit(message.content or text).kind != cut_intent.NONE
             or add_intent.classify(message.content or text).adds
             or _SPACED_ENTRY_RE.match(text) or _pinged_entry(message, text)
             or _mid_add(text) is not None
@@ -294,6 +297,16 @@ class TerseAlertParser(Parser):
             quote = (hit.clause or "").strip()
             return ParseResult.ignored(
                 f"talks about a stop loss but isn't one hitting ({hit.reason})"
+                + (f": “{quote[:80]}”" if quote else ""))
+        # "Out of SPY puts", "Out", "out the rest", "-25% out of SPY": the trader
+        # is out — a CUT, read off the clause that says it (cut_intent.out_exit).
+        out = cut_intent.out_exit(message.content or text)
+        if out.kind == cut_intent.CUT:
+            return self._stopped_out(_clean(out.clause or text), source_action="CUTTING")
+        if out.kind == cut_intent.BLOCKED:
+            quote = (out.clause or "").strip()
+            return ParseResult.ignored(
+                f"talks about being out but isn't an exit ({out.reason})"
                 + (f": “{quote[:80]}”" if quote else ""))
         if _CUT_RE.search(text):
             # Most "cut"s are talk ABOUT cutting — "will cut if…", "we cut
