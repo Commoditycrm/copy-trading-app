@@ -544,20 +544,29 @@ def test_an_add_without_a_price_is_still_a_limit_order():
     "body",
     [
         "Leave room to add incase the want a bit more of a bounce",
-        "Adding more here",
         "might add later",
+        "Will be adding to SPY around 776.10",
     ],
 )
 def test_prose_about_adding_is_not_an_order(body):
-    """The word "add" appears constantly in commentary. An order needs a $ticker
-    or an explicit contract — otherwise this parser would trade on chatter."""
+    """The word "add" appears constantly in commentary. Only a committed add
+    acts (discord_parsers.add_intent) — otherwise this parser would trade on
+    chatter."""
     assert parse_message(text(body)).status is not ParseStatus.PARSED
+
+
+def test_a_committed_add_with_no_ticker_is_an_add_into_the_channel_s_position():
+    """"Adding more here" names no ticker: it means the position this channel is
+    in (2026-10-19, the trader's call — Julia's "Added to my position" and
+    Mark's "Added here" were being ignored)."""
+    s = parse_message(text("Adding more here")).signals[0]
+    assert s.action.value == "BUY" and s.add_to_latest and s.double_up and s.symbol is None
 
 
 def test_prose_about_adding_is_ignored_not_invalid():
     """INVALID is for things that look like an instruction. Commentary must not
     fill the review queue."""
-    assert parse_message(text("Adding more here")).status is ParseStatus.IGNORED
+    assert parse_message(text("might add later")).status is ParseStatus.IGNORED
 
 
 # ── Always limit, never market ───────────────────────────────────────────────

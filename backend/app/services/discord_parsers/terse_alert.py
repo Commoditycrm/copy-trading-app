@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from . import cut_intent
+from . import add_intent, cut_intent
 from ._util import to_decimal
 from .base import (
     AssetType,
@@ -120,7 +120,7 @@ _NOT_TICKERS = {
 
 # Single letters that are words, not tickers: "Cutting of course I trade…"
 # once read as a close of "I calls".
-_WORD_LETTERS = {"I", "A"}
+_WORD_LETTERS = {"I", "A", "SL", "TP", "STOP", "LOSS", "HIT"}   # …and stop-loss words ("SL Hit")
 # A ticker typed in lower case is still a ticker when calls/puts follow it:
 # "Cutting spy calls".
 _LOWER_TICKER_RE = re.compile(r"(?<![A-Za-z0-9@$])\$?(?P<sym>[a-z]{1,5})\s+(?:calls?|puts?)\b")
@@ -252,6 +252,8 @@ class TerseAlertParser(Parser):
         return bool(text) and bool(
             _TRIM_RE.search(text) or _ADD_RE.match(text) or _GLUED_RE.search(text)
             or _AVG_DOWN_RE.search(text) or _STOPPED_RE.search(text) or _CUT_RE.search(text)
+            or cut_intent.stop_hit(message.content or text).kind != cut_intent.NONE
+            or add_intent.classify(message.content or text).adds
             or _SPACED_ENTRY_RE.match(text) or _pinged_entry(message, text)
             or _mid_add(text) is not None
         )
@@ -281,8 +283,18 @@ class TerseAlertParser(Parser):
 
         # Trim first: "what an add trim ... AMZN 25%" is an exit, whatever
         # else the sentence says.
-        if _STOPPED_RE.search(text):
-            return self._stopped_out(text)
+        # A stop-loss hit — "SL Hit, -35%", "Stopped out", "hit my stop" — is a
+        # CUT: the whole position, at market, with the cut's sure exit and its
+        # "Auto exit on cut" setting (the trader's call, 2026-10-19). Read off the
+        # clause that says it, so a ticker elsewhere can't pick the position.
+        hit = cut_intent.stop_hit(message.content or text)
+        if hit.kind == cut_intent.CUT:
+            return self._stopped_out(_clean(hit.clause or text), source_action="CUTTING")
+        if hit.kind == cut_intent.BLOCKED:
+            quote = (hit.clause or "").strip()
+            return ParseResult.ignored(
+                f"talks about a stop loss but isn't one hitting ({hit.reason})"
+                + (f": “{quote[:80]}”" if quote else ""))
         if _CUT_RE.search(text):
             # Most "cut"s are talk ABOUT cutting — "will cut if…", "we cut
             # earlier", "cut losers quickly". Only a committed one sells
@@ -318,6 +330,29 @@ class TerseAlertParser(Parser):
         mid = _mid_add(text)
         if mid is not None:
             return ParseResult.parsed(self._add(*mid))
+
+        # A committed add with no price — Julia's "Added to my position", Mark's
+        # "Added", "Added here", "Last Add", "Added to Meta". Into the named
+        # ticker's position from this channel, else the position this channel
+        # is in; priced at execution from the live quote, the way a no-price
+        # "Added to SPY" already is (compact_alert).
+        intent = add_intent.classify(message.content or text)
+        if intent.adds and not _GLUED_RE.search(text):
+            return ParseResult.parsed(TradeSignal(
+                action=SignalAction.BUY,
+                asset_type=AssetType.OPTION,
+                symbol=intent.symbol,
+                quantity=None,              # sized from the position (double_up)
+                order_type=OrderKind.LIMIT,
+                limit_price=None,
+                limit_price_unspecified=True,
+                double_up=True,
+                add_to_latest=True,
+                contract_unspecified=True,
+                expiry_unspecified=True,
+                source_action="ADD",
+                parser=self.name,
+            ))
 
         pinged = bool(_PING_RE.search(message.content or "")) and not _EXIT_TALK_RE.search(text)
         glued = (_GLUED_RE.search(text) or _SPACED_ENTRY_RE.match(text)

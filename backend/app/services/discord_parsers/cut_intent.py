@@ -171,4 +171,44 @@ def classify(text: str) -> CutIntent:
     return first_block or CutIntent(BLOCKED, "no committed cut")
 
 
-__all__ = ["CUT", "PARTIAL", "BLOCKED", "NONE", "CutIntent", "classify"]
+# ── a stop-loss that was hit is a cut ────────────────────────────────────────
+# The trader's call (2026-10-19): "SL Hit, -35%" (Julia) — and any stop-loss hit,
+# "Stopped out" included — means get out, exactly like "Cutting". Today only
+# "Stopped out" closed; "SL hit", "stop loss hit", "hit my stop" were ignored.
+_STOP_HIT_RE = re.compile(
+    r"\b(?:sl|s/l|stop[\s-]?loss|stop)\s+(?:got\s+|was\s+|just\s+|has\s+been\s+|been\s+)?"
+    r"(?:hit|triggered|taken\s+out|filled)\b"
+    r"|\bhit\s+(?:my|the|our)?\s*(?:sl|s/l|stop(?:[\s-]?loss)?)\b"
+    r"|\bstopped\s+out\b",
+    re.IGNORECASE,
+)
+_STOP_HIT_BLOCKERS: tuple[tuple[str, re.Pattern], ...] = (
+    ("question", re.compile(r"\?")),
+    ("conditional", re.compile(r"\b(?:if|unless|when|once|before|in\s+case)\b", re.IGNORECASE)),
+    ("negated", re.compile(r"\b(?:not|no|never|didn't|didnt|hasn't|hasnt|wasn't|wasnt|yet)\b", re.IGNORECASE)),
+    ("hedged", re.compile(r"\b(?:will|would|might|may|could|almost|nearly|close\s+to|about\s+to)\b",
+                          re.IGNORECASE)),
+    ("past", re.compile(r"\b(?:yesterday|earlier|last\s+week|ago)\b", re.IGNORECASE)),
+)
+
+
+def stop_hit(text: str) -> CutIntent:
+    """A stop-loss the trader says was hit — a CUT of the whole position — or
+    BLOCKED when it is talk ("If SL hits", "SL hit?", "SL not hit yet"), or NONE."""
+    text = _normalise(text)
+    if not _STOP_HIT_RE.search(text):
+        return CutIntent(NONE, "no stop hit")
+    first_block: CutIntent | None = None
+    for clause in _clauses(text):
+        bare = _MENTION_RE.sub(" ", clause)
+        if not _STOP_HIT_RE.search(bare):
+            continue
+        blocked = next((name for name, p in _STOP_HIT_BLOCKERS if p.search(bare)), None)
+        if blocked is not None:
+            first_block = first_block or CutIntent(BLOCKED, blocked, clause)
+            continue
+        return CutIntent(CUT, "stop loss hit", clause)
+    return first_block or CutIntent(BLOCKED, "no committed stop hit")
+
+
+__all__ = ["CUT", "PARTIAL", "BLOCKED", "NONE", "CutIntent", "classify", "stop_hit"]
