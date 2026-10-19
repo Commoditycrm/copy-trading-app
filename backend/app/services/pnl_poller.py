@@ -855,6 +855,33 @@ def _make_stop_canceller(db, adapter):
     return _cancel
 
 
+def _make_tp_canceller(db, adapter):
+    """The take-profit's canceller: as _make_stop_canceller, except that a
+    cancel the broker cannot confirm leaves the row working, so the ladder asks
+    again rather than recording a cancel that may have been a fill."""
+    def _cancel(order_id):
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services.exit_confirm import cancel_and_record  # noqa: PLC0415
+
+        order = db.get(Order, order_id)
+        if order is None:
+            return
+        cancel_and_record(adapter, order, unconfirmed=None)
+    return _cancel
+
+
+def _make_order_refresher(db, adapter):
+    """Read one of our orders from the broker onto its row (exit_confirm.
+    refresh_from_broker). False when the broker could not be read."""
+    def _refresh(order_id) -> bool:
+        from app.models.order import Order  # noqa: PLC0415
+        from app.services.exit_confirm import refresh_from_broker  # noqa: PLC0415
+
+        order = db.get(Order, order_id)
+        return order is not None and refresh_from_broker(adapter, order)
+    return _refresh
+
+
 def _bid_for(adapter, pos) -> "Decimal | None":
     """Current bid for a held option, or None. Never raises — a missing quote
     means we fall back to a market order, not that we skip the exit."""
@@ -1193,8 +1220,9 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                                 live_marks.position_mark(pos, acct.user_id) if pos is not None else None,
                                 place_limit=_make_limit_placer(db, live_acct, acct, guard),
                                 place_pair=_make_pair_placer(db, live_acct, acct, adapter, guard),
-                                cancel=_canceller,
+                                cancel=_make_tp_canceller(db, adapter),
                                 reconcile_stop=_reconcile_stop,
+                                refresh=_make_order_refresher(db, adapter),
                                 in_session=_mh.in_regular_session(),
                             )
                             log.info("take-profit: %s — %s", guard.symbol, outcome)

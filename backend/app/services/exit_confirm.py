@@ -71,6 +71,10 @@ def _is_filled(result: Any) -> bool:
     return str(status or "").lower() in _FILLED_STATES
 
 
+# cancel_and_record's default: what it did before ``unconfirmed`` existed.
+_AS_CANCELLED_DEFAULT = object()
+
+
 def record_fill_details(order: Any, result: Any) -> None:
     """Copy a filled broker order's price and execution time onto our row, and
     stamp the close time. Fills only what is missing — never overwrites."""
@@ -90,7 +94,7 @@ def record_fill_details(order: Any, result: Any) -> None:
         order.closed_at = at or datetime.now(timezone.utc)
 
 
-def cancel_and_record(adapter: Any, order: Any) -> None:
+def cancel_and_record(adapter: Any, order: Any, *, unconfirmed: Any = _AS_CANCELLED_DEFAULT) -> None:
     """Cancel one of our resting orders and record what ACTUALLY happened to it.
 
     The ladder's cancels used to mark the row CANCELED whatever the broker said.
@@ -104,7 +108,8 @@ def cancel_and_record(adapter: Any, order: Any) -> None:
     So: an accepted cancel is CANCELED. Anything else — refused as already
     terminal, or an error — asks the broker once and records its answer (a fill
     with its price and time). Only when the broker cannot be read does it fall
-    back to CANCELED, as before.
+    back to CANCELED, as before — or, with ``unconfirmed=None``, leaves the row
+    as it is, for a caller that would rather ask again than guess.
     """
     from app.models.order import OrderStatus  # noqa: PLC0415
 
@@ -119,7 +124,44 @@ def cancel_and_record(adapter: Any, order: Any) -> None:
     if accepted is True:
         order.status = OrderStatus.CANCELED
         return
-    record_cancel_outcome(adapter, order, refused=accepted is False)
+    if unconfirmed is _AS_CANCELLED_DEFAULT:
+        record_cancel_outcome(adapter, order, refused=accepted is False)
+    else:
+        record_cancel_outcome(adapter, order, refused=accepted is False, fallback=unconfirmed)
+
+
+def refresh_from_broker(adapter: Any, order: Any) -> bool:
+    """Read one of our orders from the broker onto its row: a fill (quantity,
+    price, time) or the end it came to. False when the broker could not be read
+    — the row is then left exactly as it was.
+
+    For an account nothing else keeps current: a Discord subscriber's Webull
+    account has no order listener, so a take-profit that filled still reads
+    SUBMITTED here until something asks.
+    """
+    from app.models.order import OrderStatus  # noqa: PLC0415
+
+    if not getattr(order, "broker_order_id", None):
+        return False
+    try:
+        result = adapter.get_order(str(order.broker_order_id))
+    except Exception:  # noqa: BLE001
+        log.warning("refresh: could not read %s", getattr(order, "id", "?"), exc_info=True)
+        return False
+    status = getattr(result, "status", None)
+    if status is None:
+        return False
+    got = _filled_quantity(result)
+    if got > 0:
+        order.filled_quantity = got
+    if status == OrderStatus.FILLED:
+        order.status = OrderStatus.FILLED
+        record_fill_details(order, result)
+        log.info("refresh: %s filled at the broker (%s @ %s)",
+                 getattr(order, "id", "?"), order.filled_quantity, order.filled_avg_price)
+    elif status != order.status:
+        order.status = status
+    return True
 
 
 _AS_CANCELLED = object()
