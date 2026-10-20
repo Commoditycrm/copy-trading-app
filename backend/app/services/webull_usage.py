@@ -116,6 +116,19 @@ def record(app_key: str | None, action: str, status: Any, ms: float, caller: str
         pass
 
 
+def record_wait(app_key: str | None, action: str, waited_s: float) -> None:
+    """A call the pacer held back: counted, with how long it waited."""
+    try:
+        minute = int(time.time() // 60)
+        r = _redis()
+        h = app_hash(app_key)
+        r.hincrby(_KEY.format(minute), f"paced|{h}|{action}", 1)
+        r.hincrby(_KEY.format(minute), f"paced_ms|{h}|{action}", int(waited_s * 1000))
+        r.expire(_KEY.format(minute), _KEEP_S)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def install() -> None:
     """Wrap the Webull SDK's single-request method. Idempotent; a missing SDK
     is fine (nothing calls Webull then)."""
@@ -129,6 +142,22 @@ def install() -> None:
     original = ApiClient._handle_single_request
 
     def _counted(self, endpoint, request, *args, **kwargs):
+        try:
+            action = request.get_action_name() if hasattr(request, "get_action_name") else "?"
+        except Exception:  # noqa: BLE001
+            action = "?"
+        action = str(action or "?")
+        app_key = getattr(self, "_app_key", None)
+        # Take a turn on the endpoint's 2-per-2s counter before sending, rather
+        # than be refused and retry (services/webull_pacer.py).
+        try:
+            from app.services import webull_pacer  # noqa: PLC0415
+
+            waited = webull_pacer.wait_turn(app_hash(app_key), action)
+            if waited > 0:
+                record_wait(app_key, action, waited)
+        except Exception:  # noqa: BLE001 — pacing must never break a broker call
+            pass
         t0 = time.perf_counter()
         status = None
         try:
@@ -136,12 +165,7 @@ def install() -> None:
             status = result[0] if isinstance(result, tuple) and result else None
             return result
         finally:
-            try:
-                action = request.get_action_name() if hasattr(request, "get_action_name") else "?"
-            except Exception:  # noqa: BLE001
-                action = "?"
-            record(getattr(self, "_app_key", None), str(action or "?"), status,
-                   (time.perf_counter() - t0) * 1000)
+            record(app_key, action, status, (time.perf_counter() - t0) * 1000)
 
     ApiClient._handle_single_request = _counted
     _installed = True
@@ -155,6 +179,8 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
     total = limited = 0
     by_caller: dict[str, dict[str, int]] = {}
     by_endpoint: dict[str, int] = {}
+    limited_by: dict[tuple[str, str], int] = {}
+    paced: dict[str, dict[str, int]] = {}
     per_minute: list[dict] = []
     try:
         r = _redis()
@@ -163,6 +189,13 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
             count = 0
             for field, n in raw.items():
                 field = field.decode() if isinstance(field, bytes) else field
+                if field.startswith(("paced|", "paced_ms|")):
+                    kind, _sep, rest = field.partition("|")
+                    h, _sep, action = rest.partition("|")
+                    if h in hashes:
+                        p = paced.setdefault(action, {"calls": 0, "waited_ms": 0})
+                        p["calls" if kind == "paced" else "waited_ms"] += int(n)
+                    continue
                 parts = field.split("|", 3)
                 if len(parts) != 4 or parts[0] not in hashes:
                     continue
@@ -175,6 +208,7 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
                 if code == "429":
                     c["rate_limited"] += n
                     limited += n
+                    limited_by[(caller, action)] = limited_by.get((caller, action), 0) + n
                 by_endpoint[action] = by_endpoint.get(action, 0) + n
             per_minute.append({"minute": m * 60, "calls": count})
     except Exception:  # noqa: BLE001
@@ -190,8 +224,21 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
         "by_endpoint": sorted(
             ({"endpoint": k, "calls": v} for k, v in by_endpoint.items()), key=lambda x: -x["calls"],
         ),
+        # Each 429: what made the call, and which Webull endpoint refused it.
+        "rate_limited_by": sorted(
+            ({"caller": c, "endpoint": e, "calls": v} for (c, e), v in limited_by.items()),
+            key=lambda x: -x["calls"],
+        ),
+        # Calls the pacer held back for their turn instead of letting them be
+        # refused (services/webull_pacer.py), and how long they waited.
+        "paced": sorted(
+            ({"endpoint": k, "calls": v["calls"],
+              "avg_wait_ms": round(v["waited_ms"] / v["calls"]) if v["calls"] else 0}
+             for k, v in paced.items()),
+            key=lambda x: -x["calls"],
+        ),
     }
 
 
-__all__ = ["tag", "tagged", "install", "record", "summary", "app_hash",
+__all__ = ["tag", "tagged", "install", "record", "record_wait", "summary", "app_hash",
            "set_request_caller", "reset_request_caller", "current_caller"]

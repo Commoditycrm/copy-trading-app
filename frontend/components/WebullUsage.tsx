@@ -20,6 +20,11 @@ interface Usage {
   per_minute: { minute: number; calls: number }[];
   by_caller: { caller: string; calls: number; rate_limited: number }[];
   by_endpoint: { endpoint: string; calls: number }[];
+  /** Each 429: what made the call and which Webull endpoint refused it. */
+  rate_limited_by?: { caller: string; endpoint: string; calls: number }[];
+  /** Calls held back for their turn on an endpoint's 2-per-2s counter instead
+   *  of being refused (services/webull_pacer.py). */
+  paced?: { endpoint: string; calls: number; avg_wait_ms: number }[];
 }
 
 const WINDOWS = [1, 5, 15, 60] as const;
@@ -46,6 +51,9 @@ export function WebullUsage() {
 
   const perMin = usage.minutes > 0 ? usage.total / usage.minutes : 0;
   const limitedTone = usage.rate_limited > 0 ? "var(--bad)" : "var(--muted)";
+  const limitedBy = usage.rate_limited_by ?? [];
+  const paced = usage.paced ?? [];
+  const pacedTotal = paced.reduce((n, p) => n + p.calls, 0);
 
   return (
     <div
@@ -66,6 +74,7 @@ export function WebullUsage() {
         <span className="num" style={{ color: "var(--text)", fontWeight: 600 }}>{usage.total}</span>
         <span>({perMin.toFixed(1)}/min)</span>
         <span style={{ color: limitedTone }}>· {usage.rate_limited} rate-limited</span>
+        {pacedTotal > 0 && <span style={{ color: "var(--muted)" }}>· {pacedTotal} waited their turn</span>}
       </button>
 
       {open && (
@@ -130,6 +139,50 @@ export function WebullUsage() {
               </tbody>
             </table>
           </div>
+          {(limitedBy.length > 0 || paced.length > 0) && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {limitedBy.length > 0 && (
+                <table className="w-full">
+                  <thead>
+                    <tr style={{ color: "var(--muted)" }}>
+                      <th className="text-left font-medium py-1">Rate-limited: what made the call</th>
+                      <th className="text-left font-medium py-1">Endpoint that refused it</th>
+                      <th className="text-right font-medium py-1">429s</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {limitedBy.map((l) => (
+                      <tr key={`${l.caller}|${l.endpoint}`} style={{ borderTop: "1px solid var(--border)" }}>
+                        <td className="py-1" style={{ color: "var(--text)" }}>{l.caller}</td>
+                        <td className="py-1 font-mono text-[11px]">{l.endpoint}</td>
+                        <td className="py-1 text-right num" style={{ color: "var(--bad)" }}>{l.calls}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {paced.length > 0 && (
+                <table className="w-full">
+                  <thead>
+                    <tr style={{ color: "var(--muted)" }} title="Held back a moment so two calls never reach the same Webull endpoint at once — instead of being refused">
+                      <th className="text-left font-medium py-1">Waited their turn</th>
+                      <th className="text-right font-medium py-1">Calls</th>
+                      <th className="text-right font-medium py-1">Avg wait</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paced.map((p) => (
+                      <tr key={p.endpoint} style={{ borderTop: "1px solid var(--border)" }}>
+                        <td className="py-1 font-mono text-[11px]" style={{ color: "var(--text)" }}>{p.endpoint}</td>
+                        <td className="py-1 text-right num">{p.calls}</td>
+                        <td className="py-1 text-right num">{(p.avg_wait_ms / 1000).toFixed(2)} s</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
           <p className="text-[11px]" style={{ color: "var(--muted)" }}>
             Counted across the whole app (pages and background jobs) for your Webull app key.
             Refreshes every 15 s; this readout itself never calls Webull.
