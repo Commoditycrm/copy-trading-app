@@ -65,11 +65,23 @@ def test_reads_of_one_endpoint_at_the_same_instant_are_spaced(r):
     assert w == [0.0, pacer.GAP_S, 2 * pacer.GAP_S]
 
 
-def test_each_endpoint_has_its_own_turn(r):
-    """Webull keeps a counter per endpoint: a balance read does not wait on positions."""
-    w = _run(["/openapi/assets/positions", "/openapi/assets/balance", "/trade/orders/list-today",
-              "/openapi/trade/order/detail"])
-    assert w == [0.0, 0.0, 0.0, 0.0]
+def test_positions_balance_and_orders_each_have_their_own_turn(r):
+    """A balance read does not wait on positions, nor an order query on either."""
+    w = _run(["/openapi/assets/positions", "/openapi/assets/balance", "/trade/orders/list-today"])
+    assert w == [0.0, 0.0, 0.0]
+
+
+def test_the_order_queries_take_turns_as_one(r):
+    """QA 2026-10-20: order-detail reads paced only against each other were
+    still refused beside the order poll's list of today's orders."""
+    w = _run(["/trade/orders/list-today", "/openapi/trade/order/detail"])
+    assert w == [0.0, pacer.GAP_S]
+
+
+def test_three_calls_span_well_over_two_seconds():
+    """2 per 2s, judged where the call LANDS: the third must leave room for it
+    to arrive late."""
+    assert 2 * pacer.GAP_S >= 2.4
 
 
 def test_orders_are_never_paced(r):
@@ -92,9 +104,9 @@ def test_app_keys_do_not_wait_on_each_other(r):
 
 
 def test_a_queue_longer_than_the_cap_sends_at_once_and_reserves_nothing(r):
-    w = _run(["/openapi/assets/positions"] * 5)
-    assert w[:3] == [0.0, pacer.GAP_S, 2 * pacer.GAP_S]
-    assert w[3:] == [0.0, 0.0]                         # 3.15s away > MAX_WAIT_S: unpaced
+    w = _run(["/openapi/assets/positions"] * 6)
+    assert w[:4] == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 3 * pacer.GAP_S]
+    assert w[4:] == [0.0, 0.0]                         # 5s away > MAX_WAIT_S: unpaced
     assert len(r.last) == 1
 
 
@@ -156,7 +168,7 @@ def test_the_lua_reservation_against_redis():
     key = f"test-{uuid.uuid4().hex}"
     try:
         waits = [pacer.wait_turn(key, "/openapi/assets/positions", sleep=lambda s: None, clock=lambda: 5000.0)
-                 for _ in range(4)]
-        assert waits == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 0.0]
+                 for _ in range(5)]
+        assert waits == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 3 * pacer.GAP_S, 0.0]
     finally:
-        real.delete(f"webull:pace:{key}:assets/positions")
+        real.delete(f"webull:pace:{key}:positions")

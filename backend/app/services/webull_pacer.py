@@ -31,22 +31,30 @@ import time
 
 log = logging.getLogger(__name__)
 
-# 2 per 2 seconds, and never two at once: one per GAP_S, with a margin.
-GAP_S = 1.05
+# 2 per 2 seconds, and never two at once: one per GAP_S. The margin is wide on
+# purpose. A slot is when a call LEAVES; it reaches Webull a variable moment
+# later, so at 1.05s apart a third call could land just inside 2s of the first
+# — QA 2026-10-20, two order-detail reads refused while paced 1.05s apart. At
+# 1.25s the third call is 2.5s after the first.
+GAP_S = 1.25
 # Longer than this and the call goes out unpaced: a caller should not sit for
 # seconds behind a queue, and a display read has its snapshot to fall back on.
-MAX_WAIT_S = 2.5
+MAX_WAIT_S = 4.0
 _KEY = "webull:pace:{}:{}"
 
-# The endpoints with the 2/2s counter, by the SDK's action path. Matched by
-# suffix so /openapi/... and /trading/... spellings both count.
+# The endpoints with the 2/2s counter, by the SDK's action path, and the counter
+# each draws on. Matched by suffix so /openapi/... and /trading/... spellings
+# both count. The order queries take turns as ONE: the order poll lists today's
+# orders every few seconds, and order-detail reads paced only against each other
+# were still refused beside it (QA 2026-10-20) — while positions and balance,
+# paced on their own, were not.
 _PACED = (
-    "assets/positions",
-    "assets/balance",
-    "orders/list-today",
-    "orders/list-open",
-    "orders/history",
-    "order/detail",
+    ("assets/positions", "positions"),
+    ("assets/balance", "balance"),
+    ("orders/list-today", "orders"),
+    ("orders/list-open", "orders"),
+    ("orders/history", "orders"),
+    ("order/detail", "orders"),
 )
 
 # Reserve the next slot, atomically: max(now, last + gap). Returns the slot (ms),
@@ -66,9 +74,9 @@ return slot
 def paced(action: str | None) -> str | None:
     """The counter this endpoint draws on, or None when it is not paced."""
     a = (action or "").rstrip("/")
-    for suffix in _PACED:
+    for suffix, counter in _PACED:
         if a.endswith(suffix):
-            return suffix
+            return counter
     return None
 
 
