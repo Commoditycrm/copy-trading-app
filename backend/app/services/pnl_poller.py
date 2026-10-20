@@ -1207,6 +1207,17 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                         manual = _g.is_manual(db, guard)
                         if _ladder_engine and pos is not None:
                             _g.sync_entry_price(db, guard, None if manual else ts_g)
+                        if _ladder_engine and pos is not None and not guard.fill_stop_done:
+                            # The On Fill stop before anything rests. It is
+                            # also set by the auto-trim sweep, but that runs
+                            # on its own clock: QA 2026-10-19, QQQ 722P, this
+                            # pass placed Trim 1 0.1s before the sweep set the
+                            # stop — so Trim 1 went out with no linked stop, no
+                            # stop rested on the other 2, and the position had
+                            # no stop at the broker until it was sold.
+                            from app.services import discord_auto_trim  # noqa: PLC0415
+
+                            discord_auto_trim.apply_fill_stop(db, guard, ts_g, "ladder")
                         if (_ladder_engine and not manual and guard.option_strike is not None
                                 and _tp.active(ts_g, adapter)):
                             # Take-profit orders: the next trim rests at the
