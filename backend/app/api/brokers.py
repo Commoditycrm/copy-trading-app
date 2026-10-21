@@ -444,6 +444,41 @@ def _after_release(released: list[BrokerAccount]) -> str | None:
             "Webull allows only one live connection per key.")
 
 
+def _shared_with_trader_notice(
+    db: Session, user: User, acct: BrokerAccount, request: Request,
+) -> str | None:
+    """A subscriber connecting the very account their trader trades from. The
+    fanout skips it (mirroring there loops through the trader's listener), so
+    tell them now instead of letting copying silently do nothing. Warn only —
+    not blocked."""
+    if user.role != UserRole.SUBSCRIBER or not acct.broker_account_number:
+        return None
+    from app.models.settings import SubscriberSettings  # noqa: PLC0415
+    from app.services.copy_engine import self_mirror_account_ids  # noqa: PLC0415
+
+    # advisory only — never fail a connect over it
+    try:
+        ss = db.get(SubscriberSettings, user.id)
+        trader_id = ss.following_trader_id if ss is not None else None
+        if trader_id is None or acct.id not in self_mirror_account_ids(db, trader_id, [user.id]):
+            return None
+    except Exception:  # noqa: BLE001
+        log.warning("shared-account check failed for broker account %s", acct.id, exc_info=True)
+        return None
+    log.warning(
+        "subscriber %s connected broker account %s — same %s account as trader %s",
+        user.id, acct.id, acct.broker.value, trader_id,
+    )
+    audit.record(
+        db, actor_user_id=user.id, action="broker.shared_with_trader",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"broker": acct.broker.value, "trader_user_id": str(trader_id)},
+        ip_address=client_ip(request),
+    )
+    return ("This is the same brokerage account your trader trades from, so their "
+            "trades will not be copied into it. Connect your own account to copy.")
+
+
 def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
     """Start the trader's listener inline when this process runs background
     workers. In the web/worker split the worker's listeners.reconcile() picks
@@ -777,6 +812,7 @@ def snaptrade_finish(
 
     db.add(acct)
     db.flush()
+    shared_notice = _shared_with_trader_notice(db, user, acct, request)
     audit.record(
         db, actor_user_id=user.id, action="broker.connected",
         entity_type="broker_account", entity_id=acct.id,
@@ -790,6 +826,7 @@ def snaptrade_finish(
     )
     db.commit()
     db.refresh(acct)
+    acct.notice = shared_notice
     cache.invalidate_broker_accounts(user.id)
     _clear_snaptrade_session(user.id)
 
@@ -1020,6 +1057,7 @@ def connect(
         db.add(acct)
     db.flush()
     released = _release_webull_app_key(db, acct, creds, user, request)
+    shared_notice = _shared_with_trader_notice(db, user, acct, request)
     audit.record(
         db, actor_user_id=user.id, action="broker.connected",
         entity_type="broker_account", entity_id=acct.id,
@@ -1030,7 +1068,7 @@ def connect(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
-    acct.notice = _after_release(released)
+    acct.notice = " ".join(n for n in (_after_release(released), shared_notice) if n) or None
 
     # If the connecting user is a trader, spin up the listener so trades
     # placed directly at the broker propagate to subscribers. The

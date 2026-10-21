@@ -678,6 +678,15 @@ def _persist_and_fanout(
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
             return
 
+        # Known subscriber mirror on the trader's feed = shared broker account.
+        # SnapTrade has no client_order_id, so this can only match on the id.
+        if order_intent.is_mirror_echo(db, trader_user_id, broker_account_id, broker_order_id, None):
+            log.warning(
+                "snaptrade-listener[%s] ignoring echo of a known mirror/foreign "
+                "order %s — shared broker account?", trader_user_id, broker_order_id,
+            )
+            return
+
         # Before creating a "new external order", check whether this is just OUR
         # OWN recently-placed order resurfacing under a different feed id.
         #
