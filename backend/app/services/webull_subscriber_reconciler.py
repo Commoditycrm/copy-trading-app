@@ -58,10 +58,16 @@ _next_due_at: dict[uuid.UUID, float] = {}
 
 def _intervals() -> tuple[float, float, float]:
     from app.config import get_settings  # noqa: PLC0415
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
     s = get_settings()
+    # The two cadences are runtime knobs (admin API page); the fast WINDOW
+    # stays env-only — it decides which accounts are "hot", not how often we
+    # call, so it is not a rate control.
     return (
-        float(s.webull_subscriber_sync_interval_s),
-        float(s.webull_subscriber_sync_idle_interval_s),
+        int_knob_or("webull_subscriber_sync_interval_s",
+                    s.webull_subscriber_sync_interval_s),
+        int_knob_or("webull_subscriber_sync_idle_interval_s",
+                    s.webull_subscriber_sync_idle_interval_s),
         float(s.webull_subscriber_sync_fast_window_s),
     )
 

@@ -240,6 +240,72 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # The other three brokers' pnl_poller intervals. Same env-default +
+    # Redis-override shape as alpaca_pnl_poll_interval_s above, so an admin can
+    # retune each broker independently without a restart; these values are the
+    # fallback when Redis is unreachable. The rationale for each default lives
+    # beside it in pnl_poller._INTERVAL_BY_BROKER, which stays as the
+    # last-resort map. Bounds enforced in the setters (services.platform_config):
+    #   webull 5-300s, snaptrade 30-600s, ibkr 5-300s.
+    # SnapTrade's floor is the highest because its 250/min quota is shared
+    # platform-wide — halving this interval doubles the spend for EVERY user,
+    # not just the account being tuned.
+    webull_pnl_poll_interval_s: int = 15
+    snaptrade_pnl_poll_interval_s: int = 60
+    ibkr_pnl_poll_interval_s: int = 15
+    # How often the SnapTrade order listener pulls list_recent_activities for
+    # each connected TRADER account. This is the single largest consumer of
+    # SnapTrade's shared quota (12 req/min per trader at the 5s default), which
+    # is why the setter floors it at 5s — it can be relaxed, never tightened
+    # past where it already is. Ignored while snaptrade_webhook_enabled is on:
+    # the listener then runs at its 60s backstop instead. Bounds: 5-120s.
+    snaptrade_poll_interval_s: int = 5
+    # ── Order feed / order status ───────────────────────────────────────
+    # IBKR order poll. Shares the user's single brokerage session with every
+    # other IBKR call, so a tight cadence competes with order placement rather
+    # than with a published quota. Bounds: 2-60s.
+    ibkr_order_poll_interval_s: int = 3
+    # How often the no-listener subscriber reconcilers refresh working mirror
+    # orders (one get_order each). Alpaca and SnapTrade run flat; Webull and
+    # IBKR use a fast cadence while an account has just traded and an idle one
+    # otherwise. Bounds: 10-300s flat, 2-120s fast, 10-600s idle.
+    alpaca_subscriber_reconcile_interval_s: int = 30
+    snaptrade_subscriber_reconcile_interval_s: int = 30
+    ibkr_subscriber_sync_interval_s: int = 5
+    ibkr_subscriber_sync_idle_interval_s: int = 30
+    # ── Account balance ─────────────────────────────────────────────────
+    # The background sweep that keeps stored equity current for accounts
+    # nobody is looking at. Bounds: 60-7200s.
+    balance_sync_interval_s: int = 900
+    # GET /api/brokers refreshes any balance older than this INLINE, so with a
+    # page open this is the effective balance cadence and the sweep above is
+    # nearly redundant. Raising it trades freshness for fewer calls on every
+    # page load. Bounds: 30-3600s.
+    broker_balance_stale_s: int = 120
+    # ── Positions ───────────────────────────────────────────────────────
+    # Webull display-read cache. Concurrent DISPLAY callers within this window
+    # share one answer; decision paths (liquidation, TP/SL, retry) always read
+    # live and are unaffected. Raising it cuts 429s on the positions page at
+    # the cost of showing a position that was just closed for longer.
+    # Bounds: 1-30s.
+    webull_positions_cache_ttl_s: int = 2
+    # ── Order fill (SnapTrade nudge) ────────────────────────────────────
+    # After placing a subscriber mirror, force_resync() fires at once and then
+    # we read back. These control that read-back, not the 30s sweep that also
+    # catches the fill. Bounds: 1-60s, 1-120s, 1-5 reads, 10-250 req/min.
+    snaptrade_nudge_read_delay_s: int = 4
+    snaptrade_nudge_retry_delay_s: int = 6
+    snaptrade_nudge_max_reads: int = 2
+    snaptrade_nudge_budget_per_min: int = 90
+    # ── Broker calendar ─────────────────────────────────────────────────
+    # The realized-P&L snapshot sweep the Calendar reads for past days.
+    # Bounds: 300-86400s.
+    pnl_snapshot_interval_s: int = 3600
+    # How long one computed account Day P&L is shared across every tab and
+    # process (GET /api/positions/day-pnl). This is the only thing stopping N
+    # open tabs becoming N broker calls, so lowering it multiplies page load.
+    # Bounds: 1-120s.
+    day_pnl_share_s: int = 10
     # Extended-hours (pre/post-market) mirror pricing. Alpaca is LIMIT-only then,
     # so a forced entry/close is routed as a marketable limit. When we know the
     # TRADER's fill price we anchor that limit to it ± this percent (a BUY bids

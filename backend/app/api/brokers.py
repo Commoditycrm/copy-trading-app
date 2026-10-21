@@ -1196,6 +1196,13 @@ def broker_features(user: User = Depends(current_user)) -> dict:
 _BALANCE_STALE_S = 120
 
 
+def _balance_stale_s() -> float:
+    """Runtime knob (admin API page); _BALANCE_STALE_S is the fallback. Read
+    per request, so raising it cuts broker calls on the very next page load."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("broker_balance_stale_s", _BALANCE_STALE_S)
+
+
 @router.get("", response_model=list[BrokerAccountOut])
 def list_my_brokers(
     db: Session = Depends(get_db), user: User = Depends(current_user)
@@ -1214,7 +1221,7 @@ def list_my_brokers(
         if acct.connection_status != "connected":
             continue
         age = (now - acct.balance_updated_at).total_seconds() if acct.balance_updated_at else None
-        if age is None or age > _BALANCE_STALE_S:
+        if age is None or age > _balance_stale_s():
             try:
                 balance_sync.refresh_account_balance(
                     acct, decrypt_json(acct.encrypted_credentials)

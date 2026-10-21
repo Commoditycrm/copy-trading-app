@@ -353,4 +353,8 @@ async def _run_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("pnl_snapshot: sweep failed")
-        await asyncio.sleep(SNAPSHOT_INTERVAL_S)
+        # Runtime knob; SNAPSHOT_INTERVAL_S is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "pnl_snapshot_interval_s", SNAPSHOT_INTERVAL_S,
+        ))

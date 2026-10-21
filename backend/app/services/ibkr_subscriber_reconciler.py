@@ -54,6 +54,21 @@ _task: "asyncio.Task | None" = None
 _next_due_at: dict[uuid.UUID, float] = {}
 
 
+def _fast_interval() -> float:
+    """Outer-tick and hot-account cadence. Runtime knob (admin API page), read
+    per use so a change lands on the next tick; FAST_INTERVAL_S is the
+    fallback."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("ibkr_subscriber_sync_interval_s", FAST_INTERVAL_S)
+
+
+def _idle_interval() -> float:
+    """Cadence for an account with no recent activity. IDLE_INTERVAL_S is the
+    fallback."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("ibkr_subscriber_sync_idle_interval_s", IDLE_INTERVAL_S)
+
+
 def _is_hot(newest: "datetime | None") -> bool:
     if newest is None:
         return False
@@ -100,7 +115,7 @@ async def _run() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("ibkr subscriber order reconciler: tick failed")
-        await asyncio.sleep(FAST_INTERVAL_S)
+        await asyncio.sleep(_fast_interval())
 
 
 def reconcile_once() -> int:
@@ -136,14 +151,15 @@ def reconcile_once() -> int:
     now = time.monotonic()
     acct_ids: list[uuid.UUID] = []
     for acct_id, newest in candidates:
+        fast, idle = _fast_interval(), _idle_interval()
         hot = _is_hot(newest)
         due = _next_due_at.get(acct_id, 0.0)
-        if hot and due > now + FAST_INTERVAL_S:
+        if hot and due > now + fast:
             due = now
         if now < due:
             continue
         acct_ids.append(acct_id)
-        _next_due_at[acct_id] = now + (FAST_INTERVAL_S if hot else IDLE_INTERVAL_S)
+        _next_due_at[acct_id] = now + (fast if hot else idle)
     live = {a for a, _ in candidates}
     for gone in [a for a in _next_due_at if a not in live]:
         _next_due_at.pop(gone, None)

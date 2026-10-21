@@ -291,6 +291,13 @@ def today_realized(
 # again after every order event. Uncached, four tabs and a burst of order
 # events were ~500 Webull calls an hour, a sixth of them refused (QA 2026-10-06).
 _DAY_PNL_SHARE_S = 10
+
+
+def _day_pnl_share_s() -> int:
+    """How long one computed Day P&L is reused across tabs and processes.
+    Runtime knob (admin API page); _DAY_PNL_SHARE_S is the fallback."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int(int_knob_or("day_pnl_share_s", _DAY_PNL_SHARE_S))
 _DAY_PNL_LOCK_S = 5          # one request computes; the rest wait for its answer
 _DAY_PNL_WAIT_S = 3.0
 
@@ -327,7 +334,7 @@ def _shared_day_pnl(user_id, compute: Callable[[], dict]) -> dict:
     try:
         out = compute()
         try:
-            r.set(key, json.dumps(out), ex=_DAY_PNL_SHARE_S)
+            r.set(key, json.dumps(out), ex=_day_pnl_share_s())
             r.delete(key + ":lock")
         except Exception:  # noqa: BLE001
             log.debug("day-pnl: shared write failed", exc_info=True)

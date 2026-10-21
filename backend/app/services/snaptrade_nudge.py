@@ -99,15 +99,38 @@ RESYNC_MIN_INTERVAL_S = 60.0
 _BUDGET_PER_MIN = 90.0
 
 
+# The four tunables above are runtime knobs (admin API page). Each is read at
+# the point of USE rather than captured, so a change applies to nudges already
+# in flight as well as new ones; the module constants are the fallbacks.
+def _read_delay() -> float:
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("snaptrade_nudge_read_delay_s", READ_DELAY_S)
+
+
+def _retry_delay() -> float:
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("snaptrade_nudge_retry_delay_s", READ_RETRY_S)
+
+
+def _max_reads() -> int:
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int(int_knob_or("snaptrade_nudge_max_reads", MAX_READS))
+
+
+def _budget_per_min() -> float:
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("snaptrade_nudge_budget_per_min", _BUDGET_PER_MIN)
+
+
 @dataclass
 class _Nudge:
     user_id: uuid.UUID
     account_id: uuid.UUID
     due_at: float                 # time.monotonic()
     # default_factory, not a plain default: a dataclass default is bound at
-    # class-creation time, which would freeze MAX_READS and diverge from the
+    # class-creation time, which would freeze the reads knob and diverge from
     # top-up in schedule() that reads the module global live.
-    reads_left: int = field(default_factory=lambda: MAX_READS)
+    reads_left: int = field(default_factory=lambda: _max_reads())
     resync_done: bool = False
     # Built once on the first stage and reused for the rest of this nudge —
     # constructing it costs a BrokerAccount load plus a credential decrypt, and
@@ -117,15 +140,19 @@ class _Nudge:
 
 @dataclass
 class _Bucket:
-    """Plain token bucket. Refills continuously at _BUDGET_PER_MIN."""
-    tokens: float = _BUDGET_PER_MIN
+    """Plain token bucket. Refills continuously at the budget knob's rate, so
+    lowering the budget takes effect on the next refill rather than at restart.
+    The starting fill uses the knob too, via default_factory — a plain default
+    would freeze it at import time."""
+    tokens: float = field(default_factory=lambda: _budget_per_min())
     updated: float = field(default_factory=time.monotonic)
 
     def take(self) -> bool:
         now = time.monotonic()
+        budget = _budget_per_min()
         self.tokens = min(
-            _BUDGET_PER_MIN,
-            self.tokens + (now - self.updated) * (_BUDGET_PER_MIN / 60.0),
+            budget,
+            self.tokens + (now - self.updated) * (budget / 60.0),
         )
         self.updated = now
         if self.tokens < 1.0:
@@ -166,7 +193,7 @@ def schedule(user_id: uuid.UUID, account_id: uuid.UUID) -> None:
                 # Another mirror for the same account this fanout. Keep the
                 # earlier deadline and top the read budget back up rather than
                 # queueing a second nudge for the same connection.
-                existing.reads_left = MAX_READS
+                existing.reads_left = _max_reads()
                 return
             _pending[account_id] = _Nudge(
                 user_id=user_id,
@@ -190,7 +217,7 @@ def _ensure_worker() -> None:
     log.info(
         "snaptrade fill nudge: worker started "
         "(read at +%.0fs, %d reads max, budget %.0f calls/min)",
-        READ_DELAY_S, MAX_READS, _BUDGET_PER_MIN,
+        _read_delay(), _max_reads(), _budget_per_min(),
     )
 
 
@@ -255,7 +282,7 @@ def _step(nudge: _Nudge) -> bool:
 
     if not nudge.resync_done:
         nudge.resync_done = True
-        nudge.due_at = time.monotonic() + READ_DELAY_S
+        nudge.due_at = time.monotonic() + _read_delay()
         last = _last_resync.get(nudge.account_id)
         recently = last is not None and (time.monotonic() - last) < RESYNC_MIN_INTERVAL_S
         # _refresh_unsupported is the listener's memo of connections whose
@@ -273,7 +300,7 @@ def _step(nudge: _Nudge) -> bool:
     if nudge.reads_left <= 0 or not _take_token():
         return False
     nudge.reads_left -= 1
-    attempt = MAX_READS - nudge.reads_left
+    attempt = _max_reads() - nudge.reads_left
     sl.reconcile_subscriber_account(
         nudge.user_id, nudge.account_id, adapter=adapter, light=True
     )
@@ -285,11 +312,11 @@ def _step(nudge: _Nudge) -> bool:
         "snaptrade nudge: account %s %s on read %d/%d",
         nudge.account_id,
         "settled" if settled else "still working",
-        attempt, MAX_READS,
+        attempt, _max_reads(),
     )
     if nudge.reads_left <= 0 or settled:
         return False
-    nudge.due_at = time.monotonic() + READ_RETRY_S
+    nudge.due_at = time.monotonic() + _retry_delay()
     return True
 
 
@@ -337,7 +364,7 @@ def _take_token() -> bool:
     if not ok:
         log.warning(
             "snaptrade nudge: call budget exhausted (%.0f/min) — falling back "
-            "to the 30s sweep for this order", _BUDGET_PER_MIN,
+            "to the 30s sweep for this order", _budget_per_min(),
         )
     return ok
 

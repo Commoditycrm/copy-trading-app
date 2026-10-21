@@ -214,7 +214,13 @@ async def _run_listener(
                     )
                     _set_state(trader_user_id, "reconnecting", error=str(exc)[:300])
                     break
-                await asyncio.sleep(POLL_INTERVAL_S)
+                # Runtime knob (admin API page), read each cycle so a
+                # change lands on the next one. POLL_INTERVAL_S is the
+                # fallback when the knob is unreadable.
+                from app.services.platform_config import int_knob_or  # noqa: PLC0415
+                await asyncio.sleep(
+                    int_knob_or("ibkr_order_poll_interval_s", POLL_INTERVAL_S)
+                )
 
         except asyncio.CancelledError:
             log.info("ibkr-listener[%s] cancelled", trader_user_id)

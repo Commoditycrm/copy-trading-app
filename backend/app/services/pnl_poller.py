@@ -168,23 +168,38 @@ def _closed_pnl_interval() -> float:
     return max(_MIN_PNL_CLOSED_S, v)
 
 
+# Which runtime knob carries each broker's interval. A broker listed here is
+# retunable from the admin API page without a restart; one that isn't falls
+# through to the static map above. Keep the names in step with
+# platform_config.INT_KNOBS — a typo here means a knob the page writes and
+# nothing reads, which is worse than no knob at all, so a test asserts the
+# names resolve.
+_KNOB_BY_BROKER: dict[BrokerName, str] = {
+    BrokerName.ALPACA: "alpaca_pnl_poll_interval_s",
+    BrokerName.WEBULL: "webull_pnl_poll_interval_s",
+    BrokerName.SNAPTRADE: "snaptrade_pnl_poll_interval_s",
+    BrokerName.IBKR: "ibkr_pnl_poll_interval_s",
+}
+
+
 def _base_interval_for_broker(broker: BrokerName) -> float:
     """The full-cadence per-tick interval for ``broker``, reading any runtime
-    override every call. For Alpaca this checks Redis (~0.5ms); for everything
-    else it uses the static map above."""
-    if broker == BrokerName.ALPACA:
-        try:
-            from app.services.platform_config import (  # noqa: PLC0415
-                get_alpaca_pnl_poll_interval_sync,
-            )
-            return float(get_alpaca_pnl_poll_interval_sync())
-        except Exception:  # noqa: BLE001
-            log.warning(
-                "pnl_poller: alpaca interval lookup failed; using fallback %ss",
-                _INTERVAL_BY_BROKER[BrokerName.ALPACA],
-            )
-            return _INTERVAL_BY_BROKER[BrokerName.ALPACA]
-    return _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
+    override every call (Redis, ~0.5ms) so an admin change lands on the next
+    tick. Falls back to the static map for a broker with no knob, and for any
+    lookup that fails — a dead cache tier must not stop the poller."""
+    knob = _KNOB_BY_BROKER.get(broker)
+    fallback = _INTERVAL_BY_BROKER.get(broker, POLL_INTERVAL_S)
+    if knob is None:
+        return fallback
+    try:
+        from app.services.platform_config import get_int_knob  # noqa: PLC0415
+        return float(get_int_knob(knob))
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "pnl_poller: %s interval lookup failed; using fallback %ss",
+            broker, fallback,
+        )
+        return fallback
 
 
 def _interval_for_broker(broker: BrokerName) -> float:

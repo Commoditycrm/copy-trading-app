@@ -82,7 +82,11 @@ async def _run() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("alpaca subscriber fill reconciler: tick failed")
-        await asyncio.sleep(_RECONCILE_INTERVAL_S)
+        # Runtime knob; _RECONCILE_INTERVAL_S is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "alpaca_subscriber_reconcile_interval_s", _RECONCILE_INTERVAL_S,
+        ))
 
 
 def _reconcile_once() -> None:
