@@ -327,3 +327,69 @@ def test_cancels_the_broker_reported_and_stops_are_not_re_read():
         assert adapter.reads == 0
     finally:
         db.rollback()
+
+
+# ── a fill whose re-plan is the same order ───────────────────────────────────
+# QA 2026-10-21, QQQ 726C (Srini): 2 held, Trim 1 = 50% → 1 @ 1.13 with a linked
+# stop at 0.22, and a plain 0.22 stop on the other 1. Trim 1 filled at 14:02:47;
+# re-planned on the 1 left it was "50% of 1 = 1 @ 1.13" — identical — so nothing
+# was out of sync and nobody asked. The stop stayed at 0.22 instead of moving to
+# break-even, Trim 2 never rested, and the trader sold by hand in the selloff.
+
+def _srini_ts():
+    return _ts(discord_trim_profit_gate_pct=D("25"), discord_trim_stop_pct=D("0"), discord_trim_qty_pct=D("50"),
+               discord_trim2_profit_gate_pct=D("50"), discord_trim2_stop_pct=D("0"),
+               discord_trim2_qty_pct=D("50"), discord_fill_stop_pct=D("-75"))
+
+
+def _srini(book):
+    g = _guard(entry_price=D("0.90"), stop_price=D("0.22"), id=uuid.uuid4())
+    out = tp.reconcile(book, g, D(2), _srini_ts(), D("0.95"),
+                       place_limit=book.place_limit, place_pair=book.place_pair, cancel=book.cancel,
+                       reconcile_stop=lambda: "in sync", refresh=book.refresh, now=NOW)
+    assert book.calls == [("pair", D(1), D("1.13"), D("0.22"))], out
+    g.stop_order_id = book._new(quantity=D(1), stop_price=D("0.22")).id      # the plain stop on the other 1
+    return g
+
+
+def _pass(book, g, held, mark, now):
+    return tp.reconcile(book, g, D(held), _srini_ts(), D(mark),
+                        place_limit=book.place_limit, place_pair=book.place_pair, cancel=book.cancel,
+                        reconcile_stop=lambda: "in sync", refresh=book.refresh, now=now)
+
+
+def test_a_fill_whose_re_plan_is_the_same_order_is_still_seen():
+    book = _Book()
+    g = _srini(book)
+    t1 = g.tp_order_id
+    book.fills_at_broker(t1, "1.13")
+    out = _pass(book, g, 1, "1.14", NOW + timedelta(minutes=10))
+    assert ("read", t1) in book.calls, "1 held, but Trim 1 and the stop cover 2: ask"
+    assert g.sell_count == 1 and "trim 1 filled" in out
+    assert g.stop_price == D("0.90"), "Trim 1's stop 0%: break-even on what is left"
+
+
+def test_then_trim_two_rests_for_the_last_contract():
+    book = _Book()
+    g = _srini(book)
+    book.fills_at_broker(g.tp_order_id, "1.13")
+    _pass(book, g, 1, "1.14", NOW + timedelta(minutes=10))
+    _pass(book, g, 1, "1.14", NOW + timedelta(minutes=10, seconds=5))
+    assert book.calls[-1] == ("pair", D(1), D("1.35"), D("0.90"))
+
+
+def test_while_everything_is_held_nothing_is_read():
+    book = _Book()
+    g = _srini(book)
+    _pass(book, g, 2, "1.00", NOW + timedelta(seconds=5))
+    assert not [c for c in book.calls if c[0] == "read"]
+
+
+def test_a_mismatch_the_broker_keeps_calling_working_is_asked_about_at_most_every_15s():
+    book = _Book()
+    g = _srini(book)
+    t0 = NOW + timedelta(minutes=10)
+    for s in (0, 5, 10, 16):
+        _pass(book, g, 1, "1.00", t0 + timedelta(seconds=s))
+    reads = [c for c in book.calls if c == ("read", g.tp_order_id)]
+    assert len(reads) == 2, reads

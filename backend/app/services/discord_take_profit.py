@@ -385,15 +385,55 @@ def _age(order, now: datetime) -> timedelta | None:
 
 
 def _refresh_resting(db: Session, guard, refresh) -> bool:
-    """Ask the broker what became of the resting take-profit and its linked
-    stop, onto their rows. False when a leg could not be read."""
+    """Ask the broker what became of the resting take-profit, its linked stop
+    and the plain ladder stop, onto their rows. False when one could not be read."""
     from app.models.order import Order  # noqa: PLC0415
 
     ok = True
-    for oid in (guard.tp_order_id, guard.tp_stop_order_id):
+    for oid in (guard.tp_order_id, guard.tp_stop_order_id, getattr(guard, "stop_order_id", None)):
         if oid is not None and _working(db.get(Order, oid)):
             ok = refresh(oid) and ok
     return ok
+
+
+# How often a holding that holds FEWER contracts than its resting orders cover
+# asks the broker about them, while the answer keeps coming back "working".
+CHECK_EVERY = timedelta(seconds=15)
+_last_check: dict = {}
+
+
+def _sold_unseen(db: Session, guard, held: Decimal, now: datetime) -> bool:
+    """Fewer contracts held than our resting sells cover — the take-profit's
+    slice plus the plain stop on the rest — so one of them has sold without
+    our rows hearing of it. Each resting sell reserves its contracts, so
+    nothing else could have taken them.
+
+    QA 2026-10-21, QQQ 726C (Srini): Trim 1 (1 of 2) filled at 14:02:47 and
+    Webull then held 1. Re-planned, Trim 1 was "50% of 1 = 1 @ 1.13" — the very
+    order that had filled — so nothing was out of sync and nobody asked. The
+    stop stayed at 0.22 instead of moving to break-even, Trim 2 never rested,
+    and the trader sold the last contract by hand in the 10:04 selloff.
+    """
+    from app.models.order import Order  # noqa: PLC0415
+
+    tp = db.get(Order, guard.tp_order_id) if guard.tp_order_id else None
+    if not _working(tp):
+        return False
+    covered = Decimal(str(tp.quantity))
+    stop_id = getattr(guard, "stop_order_id", None)
+    stop = db.get(Order, stop_id) if stop_id else None
+    if _working(stop):
+        covered += Decimal(str(stop.quantity))
+    if held >= covered:
+        return False
+    key = getattr(guard, "id", None) or id(guard)
+    last = _last_check.get(key)
+    if last is not None and now - last < CHECK_EVERY:
+        return False
+    _last_check[key] = now
+    if len(_last_check) > 1000:
+        _last_check.clear()
+    return True
 
 
 def _why_wait(db: Session, guard, held: Decimal, now: datetime) -> str | None:
@@ -441,7 +481,8 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
 
     want = plan(guard, held, ts, mark)
     released = False
-    if not in_sync(db, guard, want) and refresh is not None and guard.tp_order_id is not None:
+    if (refresh is not None and guard.tp_order_id is not None
+            and (not in_sync(db, guard, want) or _sold_unseen(db, guard, held, now))):
         readable = _refresh_resting(db, guard, refresh)
         settled = settle(db, guard, ts, cancel, in_session=in_session, held=held) or settled
         want = plan(guard, held, ts, mark)
@@ -550,5 +591,5 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     return (f"{settled}; " if settled else "") + f"placed trim {want.rung}: {want.quantity} @ {want.price}"
 
 
-__all__ = ["CONFLICT_BACKOFF", "LOOKS_FILLED_WAIT", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
+__all__ = ["CHECK_EVERY", "CONFLICT_BACKOFF", "LOOKS_FILLED_WAIT", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
            "in_sync", "reconcile", "BACKOFF"]
