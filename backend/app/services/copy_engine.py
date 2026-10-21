@@ -1375,6 +1375,12 @@ def _fixed_entry_size(db: Session, sub, trader_order, is_closing: bool) -> Decim
     try:
         from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
 
+        # The cached subscriber already knows whether Advanced is on, so a
+        # subscriber on Risk Controls — nearly all of them — never reaches the
+        # database for this. Checked here rather than inside sizing_for so the
+        # common case costs no query at all.
+        if not symbols.advanced_enabled(sub):
+            return None
         sizing = symbols.sizing_for(db, sub.user_id, getattr(trader_order, "symbol", None))
         if not sizing or sizing.get("mode") != "contracts":
             return None
@@ -1388,34 +1394,6 @@ def _fixed_entry_size(db: Session, sub, trader_order, is_closing: bool) -> Decim
                     "trader's quantity instead",
                     getattr(trader_order, "symbol", "?"), exc_info=True)
         return None
-
-
-def _symbol_multiplier(db: Session, sub, symbol: str | None) -> Decimal:
-    """The multiplier for a FRESH entry in ``symbol``.
-
-    The subscriber's own, unless they have a rule for that symbol. Keyed on the
-    underlying root, so one AAPL rule covers AAPL shares and every AAPL option.
-
-    Never raises and never returns None: a lookup that fails for any reason
-    falls back to the subscriber's global multiplier, which is what every mirror
-    used before symbol rules existed. Sizing is not a place to propagate an
-    error — refusing to size would drop the trade.
-    """
-    fallback = sub.multiplier if sub is not None else Decimal("1.000")
-    if sub is None or not symbol:
-        return fallback
-    try:
-        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
-
-        ts = symbols.resolve(db, sub.user_id, symbol)
-        if ts is sub:
-            return fallback                      # no rule: the usual path
-        value = getattr(ts, "multiplier", None)
-        return Decimal(str(value)) if value is not None else fallback
-    except Exception:  # noqa: BLE001
-        log.warning("copy: per-symbol multiplier lookup failed for %s — using the "
-                    "subscriber's own", symbol, exc_info=True)
-        return fallback
 
 
 def _locked_instrument_multiplier(
@@ -3131,13 +3109,13 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # subscriber changes their multiplier mid-position, and falls back to
             # the live setting for legacy positions with no stored multiplier.
             #
-            # A per-symbol rule changes only the LIVE setting, never the lock:
-            # a position already open keeps the multiplier it was opened at, so
-            # adding a rule mid-position cannot throw its adds or exits out of
-            # proportion. The rule takes effect on the next fresh entry.
+            # A symbol rule does NOT change this multiplier: `multiplier` is not
+            # in SYMBOL_FIELDS, deliberately — the copy model scales the
+            # trader's quantity, and a per-symbol override would contradict the
+            # instrument lock. Advanced sizing replaces the scaled quantity
+            # outright instead, a few lines below in _fixed_entry_size.
             locked_mult = _locked_instrument_multiplier(db, sub.user_id, trader_order)
-            live_mult = _symbol_multiplier(db, sub, trader_order.symbol)
-            scale_mult = locked_mult if locked_mult is not None else live_mult
+            scale_mult = locked_mult if locked_mult is not None else sub.multiplier
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )

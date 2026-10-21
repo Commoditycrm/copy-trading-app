@@ -127,6 +127,37 @@ def test_a_symbol_with_no_rule_has_no_ladder(db):
     assert sss.settings_for_guard(db, USER, SimpleNamespace(symbol="TSLA")) is None
 
 
+def test_a_parked_rule_does_not_run_a_ladder(db):
+    """Switching back to Risk Controls PARKS the rules rather than deleting
+    them, so a ladder configured earlier must stop firing.
+
+    The position guard outlives the mode switch: it was opened while Advanced
+    was on and is still held afterwards. Without the mode check here, its rungs
+    would keep selling on rules the subscriber believes are parked.
+    """
+    _rule(db, "AAPL", {"discord_auto_trim": True, "discord_trim_profit_gate_pct": "25"})
+    guard = SimpleNamespace(symbol="AAPL")
+    assert sss.settings_for_guard(db, USER, guard) is not None   # Advanced on
+
+    db.get(SubscriberSettings, USER).advanced_settings_enabled = False
+    db.commit()
+    assert sss.settings_for_guard(db, USER, guard) is None
+
+
+def test_turning_advanced_back_on_restores_the_ladder(db):
+    """Parked, not destroyed — the other half of the contract."""
+    _rule(db, "AAPL", {"discord_auto_trim": True, "discord_trim_profit_gate_pct": "25"})
+    base = db.get(SubscriberSettings, USER)
+    base.advanced_settings_enabled = False
+    db.commit()
+    assert sss.settings_for_guard(db, USER, SimpleNamespace(symbol="AAPL")) is None
+
+    base.advanced_settings_enabled = True
+    db.commit()
+    ts = sss.settings_for_guard(db, USER, SimpleNamespace(symbol="AAPL"))
+    assert ts is not None and ts.discord_trim_profit_gate_pct == Decimal("25")
+
+
 @pytest.mark.parametrize("guard", [None, SimpleNamespace(symbol=None), SimpleNamespace(symbol="")])
 def test_nothing_to_resolve_is_not_a_ladder(db, guard):
     assert sss.settings_for_guard(db, USER, guard) is None
