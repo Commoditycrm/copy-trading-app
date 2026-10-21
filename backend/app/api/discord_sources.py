@@ -2205,24 +2205,37 @@ def _alert_reason(db: Session, msg) -> str:
 def _with_alert_reason(fn):
     """Everything an alert does — its order, the stop it moves — is recorded in
     the position summary as caused by that alert. An outer reason (auto-trim,
-    which submits its own alert) is kept."""
+    which submits its own alert) is kept. And the alert reads positions from
+    the broker once, not once per check."""
     import functools  # noqa: PLC0415
 
     @functools.wraps(fn)
     def _w(db, user, msg, background, request):
-        from app.services import position_events  # noqa: PLC0415
+        from app.services import position_events, risk_tick  # noqa: PLC0415
 
-        with position_events.because(_alert_reason(db, msg), keep_outer=True):
-            result = fn(db, user, msg, background, request)
-            # Save what the alert changed WHILE its reason is still set: the
-            # caller commits later, after this block — and a stop it moved was
-            # then recorded with no "Why".
-            if hasattr(db, "flush"):
-                try:
-                    db.flush()
-                except Exception:  # noqa: BLE001 — the caller's commit reports it
-                    log.debug("discord: flush after alert %s failed", getattr(msg, "id", None), exc_info=True)
-            return result
+        # One positions read for the whole alert. Sizing, the cap checks and
+        # the close-quantity check each read positions LIVE within a second or
+        # two, and Webull allows 2 reads per 2s: one alert of Srini's made 15
+        # calls and 4 were refused (QA 2026-10-21). risk_tick shares the first
+        # read and drops it on every order placed, so nothing decides off a
+        # view from before its own order. An outer tick (auto-trim's own
+        # alert, inside the P&L poller) is kept.
+        token = None if risk_tick.active() else risk_tick.begin()
+        try:
+            with position_events.because(_alert_reason(db, msg), keep_outer=True):
+                result = fn(db, user, msg, background, request)
+                # Save what the alert changed WHILE its reason is still set: the
+                # caller commits later, after this block — and a stop it moved was
+                # then recorded with no "Why".
+                if hasattr(db, "flush"):
+                    try:
+                        db.flush()
+                    except Exception:  # noqa: BLE001 — the caller's commit reports it
+                        log.debug("discord: flush after alert %s failed", getattr(msg, "id", None), exc_info=True)
+                return result
+        finally:
+            if token is not None:
+                risk_tick.end(token)
     return _w
 
 
