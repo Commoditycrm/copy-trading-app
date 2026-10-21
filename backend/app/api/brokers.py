@@ -78,7 +78,7 @@ from app.schemas.broker import (
     StartSnaptradeOut,
     WebullAccountOut,
 )
-from app.services import audit, balance_sync, cache, listeners, snaptrade_listener
+from app.services import audit, balance_sync, cache, listeners, shared_accounts, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
 from app.services.notifications import create_notification
 from app.services.redis_client import get_sync_redis
@@ -444,6 +444,26 @@ def _after_release(released: list[BrokerAccount]) -> str | None:
             "Webull allows only one live connection per key.")
 
 
+def _refuse_shared_account(
+    db: Session, user: User, broker: BrokerName, number: str | None, request: Request,
+) -> None:
+    """409 when (broker, number) is the brokerage account of this user's trader
+    or of one of their followers. Runs before anything is written, on connect
+    AND activate — an inactive row coming back must pass the same check."""
+    if not shared_accounts.connect_conflict(db, user, broker, number):
+        return
+    who = "the trader you follow" if user.role == UserRole.SUBSCRIBER else "one of your subscribers"
+    log.warning("refused %s account for user %s: shared with %s", broker.value, user.id, who)
+    db.rollback()
+    audit.record(
+        db, actor_user_id=user.id, action="broker.connect_refused",
+        metadata={"broker": broker.value, "reason": "shared_broker_account", "account": number},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who=who))
+
+
 def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
     """Start the trader's listener inline when this process runs background
     workers. In the web/worker split the worker's listeners.reconcile() picks
@@ -775,6 +795,7 @@ def snaptrade_finish(
         db.commit()
         raise HTTPException(400, f"snaptrade_verify_failed: {exc}")
 
+    _refuse_shared_account(db, user, acct.broker, acct.broker_account_number, request)
     db.add(acct)
     db.flush()
     audit.record(
@@ -988,6 +1009,7 @@ def connect(
     # round-trip, which for Webull includes the token/2FA flow and can run for
     # seconds. Verification has no side effects, so letting both requests verify
     # and serialising only the write is both safe and cheap.
+    _refuse_shared_account(db, user, acct.broker, acct.broker_account_number, request)
     _lock_user_brokers(db, user.id)
 
     # One ACTIVE broker per user. The current one goes inactive (kept, not
@@ -1346,6 +1368,11 @@ def activate_broker(
             else f"broker_error: {exc}",
         ) from exc
 
+    # Same guard as connect: reactivating must not bring back a trader/follower
+    # shared account (QA 2026-10-21 11:16 restarted the loop exactly this way).
+    _refuse_shared_account(
+        db, user, acct.broker, info.broker_account_id or acct.broker_account_number, request,
+    )
     _lock_user_brokers(db, user.id)
     _deactivate_other_brokers(db, user, request, keep_id=acct.id, reason="switched")
     released = _release_webull_app_key(db, acct, creds, user, request)

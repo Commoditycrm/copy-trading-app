@@ -19,7 +19,7 @@ from app.models.follow_request import FollowRequest, FollowRequestStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.follow import FollowRequestCreate, FollowRequestOut
-from app.services import audit, cache, notifications
+from app.services import audit, cache, notifications, shared_accounts
 from app.services.email import send_follow_decision_email, send_follow_request_email
 
 router = APIRouter(prefix="/api/follow-requests", tags=["follow-requests"])
@@ -199,6 +199,9 @@ def _decide(
         raise HTTPException(404, "not_found")
     if fr.status != FollowRequestStatus.PENDING:
         raise HTTPException(409, "not_pending")
+    # Approving auto-follows, so it's a follow change: same shared-account guard.
+    if approve and shared_accounts.follow_conflict(db, fr.subscriber_id, user.id):
+        raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who="this subscriber"))
 
     fr.status = FollowRequestStatus.APPROVED if approve else FollowRequestStatus.REJECTED
     fr.decided_at = datetime.now(timezone.utc)

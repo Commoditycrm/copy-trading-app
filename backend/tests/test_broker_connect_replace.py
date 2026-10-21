@@ -35,6 +35,7 @@ from app.brokers.base import ConnectionInfo
 from app.models.audit_log import AuditLog
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order
+from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.broker import AlpacaCredentialsIn, ConnectBrokerIn
 
@@ -72,6 +73,8 @@ def _make_session():
     # SQLAlchemy read `orders` to null out broker_account_id (ON DELETE SET NULL
     # keeps history alive across a broker swap). The table has to exist.
     Order.__table__.create(eng)
+    # connect/activate check the follow relationship (shared-account guard)
+    SubscriberSettings.__table__.create(eng)
     db = sessionmaker(bind=eng)()
     db.add(User(
         id=_USER, email="sub@example.com", password_hash="x",

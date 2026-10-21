@@ -1007,6 +1007,7 @@ def _persist_and_fanout(
         # trade_listener has had this guard since the Alpaca "doubling" bug; it
         # was never carried across to the other listeners.
         _coid = payload.get("client_order_id")
+        _app_oid = None
         if _coid:
             try:
                 # Webull caps client_order_id at 32 chars, so we send the Order
@@ -1022,6 +1023,16 @@ def _persist_and_fanout(
                     trader_user_id, _coid, broker_order_id,
                 )
                 return
+
+        # A known subscriber mirror on this feed = shared broker account; don't
+        # turn it into a trader order (it would fan out into itself).
+        if order_intent.is_mirror_echo(db, trader_user_id, broker_account_id, broker_order_id, _app_oid):
+            log.warning(
+                "webull-listener[%s] ignoring echo of a known mirror/foreign order "
+                "(client_order_id=%s, webull order_id=%s) — shared broker account?",
+                trader_user_id, _coid, broker_order_id,
+            )
+            return
 
         owner = db.get(User, trader_user_id)
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
@@ -1635,6 +1646,10 @@ async def start_all_listeners() -> None:
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     if not _enabled():
+        return
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
         return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():

@@ -59,6 +59,7 @@ from app.services.order_retry import (
     live_closeable_quantity,
 )
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
+from app.services.shared_accounts import self_mirror_account_ids
 
 log = logging.getLogger(__name__)
 
@@ -2298,6 +2299,15 @@ def trader_can_trade(db: Session, trader: User) -> bool:
     return bool(settings and settings.trading_enabled)
 
 
+# A subscriber row that points at one of the TRADER's own broker accounts (same
+# broker + account number) must never get a mirror: it lands in the account the
+# trader's listener watches, comes back as a "new" trader order and fans out
+# again. QA 2026-10-21: one trade became 52 trader orders + 361 mirrors in 8 min.
+# Checked on every fanout, so pairings that predate the connect-time guard are
+# caught too. See services/shared_accounts.
+_warned_self_mirror: set[uuid.UUID] = set()
+
+
 # ── Async fanout (the live path used by BackgroundTasks) ──────────────────
 
 
@@ -2612,6 +2622,8 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     if _fresh_caps or _fresh_order_caps:
         _gate_px = _entry_gate_price(db, trader, trader_order)
 
+    self_mirror_ids = self_mirror_account_ids(db, trader.id, _cap_ids)
+
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
         # gate (EOD lockout, daily kill switch, symbol filters) and, in the
@@ -2794,6 +2806,22 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             continue
 
         for acct in sub_accounts:
+            if acct.id in self_mirror_ids:
+                if acct.id not in _warned_self_mirror:
+                    _warned_self_mirror.add(acct.id)
+                    log.warning(
+                        "fanout: subscriber %s broker account %s is trader %s's own "
+                        "account — not mirroring into it (would loop via the listener)",
+                        sub.user_id, acct.id, trader.id,
+                    )
+                results.append(FanoutResult(
+                    subscriber_user_id=sub.user_id,
+                    broker_account_id=acct.id,
+                    order_id=None,
+                    status="skipped_self_mirror",
+                ))
+                continue
+
             # ── Externally-placed bracket handling (SnapTrade/Webull) ──
             # A trader bracket arrives as 3 linked orders: a TRIGGER entry (which
             # our listener stamps with take_profit_price/stop_loss_price) and its
@@ -3194,6 +3222,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # INSERTs go to Postgres as a single transactional batch.
     if pending:
         db.flush()
+        # The mirror rows aren't committed until Phase 3, but a broker can echo
+        # the order onto a listener's stream within ms. Mark them so a listener
+        # never mistakes one for a fresh trader order (see is_mirror_echo).
+        order_intent.mark_app_originated_many(p.child_order_id for p in pending)
 
     # ── Phase 2: fire all broker calls in parallel via asyncio ────────────
     # _place_one returns the actual exception object (not just its string)

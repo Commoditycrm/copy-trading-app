@@ -27,6 +27,7 @@ from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter, _looks_like_occ, _parse_occ
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
+from app.services import order_intent
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -499,6 +500,13 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             # window). We deliberately DON'T add activity_id to `existing`, so
             # the next sync re-processes it.
             if (datetime.now(timezone.utc) - trade_at) < _SYNTH_ORDER_GRACE:
+                skipped += 1
+                continue
+            # Already recorded for ANOTHER user on this same brokerage account
+            # (a subscriber's mirror, or the other holder's own trade): not ours.
+            # Synthesizing it gave a trader a phantom order that the listener's
+            # backfill then fanned out, and double-counted shared-account P&L.
+            if order_intent.is_mirror_echo(db, acct.user_id, acct.id, broker_oid, None):
                 skipped += 1
                 continue
             order = Order(

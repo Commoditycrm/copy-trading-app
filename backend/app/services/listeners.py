@@ -210,7 +210,12 @@ def reconcile_once() -> None:
                 BrokerAccount.broker.in_(_listened_brokers()),
             )
         ).all()
+    from app.services import shared_accounts  # noqa: PLC0415
     for user_id, acct_id in rows:
+        # A trader account another user also holds is quarantined: leaving it
+        # out of `desired` also stops a listener that's already running on it.
+        if shared_accounts.listener_blocked(acct_id):
+            continue
         # One-broker-per-user; if duplicates ever exist, last wins (arbitrary
         # but stable enough — the listener restarts cleanly either way).
         desired[user_id] = acct_id

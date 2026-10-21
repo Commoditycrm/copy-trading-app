@@ -85,7 +85,7 @@ def gateway_verify(
     # Local imports: these helpers live beside the connect endpoint.
     from app.api.brokers import (  # noqa: PLC0415
         _deactivate_other_brokers, _lock_user_brokers, _refresh_balance_into,
-        _start_trader_listener,
+        _refuse_shared_account, _start_trader_listener,
     )
 
     acct = _hosted_account(db, account_id, user)
@@ -129,6 +129,8 @@ def gateway_verify(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, f"broker_error: {exc}") from exc
 
+    # The hosted IBKR account number is only known here, so this is its connect check.
+    _refuse_shared_account(db, user, acct.broker, info.broker_account_id, request)
     _lock_user_brokers(db, user.id)
     was_connected = acct.connection_status == "connected"
     if not was_connected:

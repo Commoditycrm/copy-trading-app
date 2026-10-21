@@ -163,6 +163,10 @@ async def start_all_listeners() -> None:
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
+        return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
         log.info("snaptrade-listener[%s] restart requested", trader_user_id)
@@ -676,6 +680,15 @@ def _persist_and_fanout(
         # sources, so skip creation — matched updates still flow through above.
         owner = db.get(User, trader_user_id)
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
+            return
+
+        # Known subscriber mirror on the trader's feed = shared broker account.
+        # SnapTrade has no client_order_id, so this can only match on the id.
+        if order_intent.is_mirror_echo(db, trader_user_id, broker_account_id, broker_order_id, None):
+            log.warning(
+                "snaptrade-listener[%s] ignoring echo of a known mirror/foreign "
+                "order %s — shared broker account?", trader_user_id, broker_order_id,
+            )
             return
 
         # Before creating a "new external order", check whether this is just OUR
