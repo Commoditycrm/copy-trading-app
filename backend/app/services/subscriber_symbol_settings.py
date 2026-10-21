@@ -307,7 +307,15 @@ def settings_for_guard(db: Session, user_id: uuid.UUID, guard: Any) -> Any | Non
     rule = rule_for(db, user_id, symbol)
     if rule is None:
         return None
-    ts = SymbolSettings(db.get(SubscriberSettings, user_id), rule.settings or {})
+    base = db.get(SubscriberSettings, user_id)
+    # A rule only binds while the subscriber is ON Advanced. Rules are kept
+    # when the mode is switched off, so without this check a ladder opened
+    # while Advanced was on would keep firing its rungs afterwards — selling a
+    # position on rules the subscriber believes are parked. Checked AFTER the
+    # rule lookup so the no-rule path still costs one query.
+    if not advanced_enabled(base):
+        return None
+    ts = SymbolSettings(base, rule.settings or {})
     return ts if exit_mode(ts) == "ladder" else None
 
 

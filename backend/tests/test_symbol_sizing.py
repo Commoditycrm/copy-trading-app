@@ -202,3 +202,63 @@ def test_the_fanout_applies_both(db):
     src = inspect.getsource(ce)
     assert "_apply_symbol_caps(db, _cap_ids" in src
     assert "_fixed_entry_size(db, sub, trader_order, is_closing_effective)" in src
+
+
+# ── the fanout passes a CACHED subscriber, not an ORM row ──────────────────
+# The fanout reads subscribers from Redis (cache.CachedSubscriber), so anything
+# the sizing path needs from them has to survive that round trip. This caught a
+# real bug: the no-rule fast path compared `ts is sub`, which can never be true
+# across those two types, so it never fired.
+
+def _cached(**over):
+    """A CachedSubscriber the way the fanout actually gets one."""
+    from app.services.cache import CachedSubscriber
+    kw = dict(user_id=USER, following_trader_id=uuid.uuid4(), copy_enabled=True,
+              multiplier=Decimal("2.000"), daily_loss_limit=None)
+    kw.update(over)
+    return CachedSubscriber(**kw)
+
+
+def test_the_cached_subscriber_carries_the_advanced_flag():
+    """Without this the fanout reads False for everyone and symbol rules never
+    apply — the same failure the eod_autoclose flag hit before it was cached."""
+    from app.services.cache import _sub_from_dict, _sub_to_dict
+
+    round_tripped = _sub_from_dict(_sub_to_dict(_cached(advanced_settings_enabled=True)))
+    assert round_tripped.advanced_settings_enabled is True
+    assert sss.advanced_enabled(round_tripped) is True
+
+
+def test_an_entry_cached_before_the_flag_existed_reads_as_risk_controls():
+    """Entries already in Redis have no such key. False is the safe default:
+    it means Risk Controls, the behaviour that predates symbol rules."""
+    from app.services.cache import _sub_from_dict, _sub_to_dict
+
+    payload = _sub_to_dict(_cached(advanced_settings_enabled=True))
+    del payload["advanced_settings_enabled"]
+    assert _sub_from_dict(payload).advanced_settings_enabled is False
+
+
+def test_a_symbol_rule_cannot_change_the_copy_multiplier(db):
+    """The copy multiplier is account-wide, deliberately: the copy model scales
+    the trader's quantity, and a per-symbol override would contradict the
+    instrument lock that fixes a position's multiplier at first entry.
+
+    Advanced sizing replaces the scaled quantity outright (_fixed_entry_size)
+    rather than bending this number. A rule that names `multiplier` is simply
+    ignored by the overlay — this test exists because a helper once tried to
+    read one back and could only ever return the subscriber's own.
+    """
+    assert "multiplier" not in sss.SYMBOL_FIELDS
+    _rule(db, "AAPL", {"multiplier": "0.5"})
+    ts = sss.resolve(db, USER, "AAPL")
+    assert ts.multiplier == Decimal("2.000")      # the subscriber's own, untouched
+
+
+def test_fixed_entry_size_skips_the_database_on_risk_controls(db, monkeypatch):
+    _rule(db, "AAPL", {"sizing_mode": "contracts", "discord_contracts_per_entry": "3"})
+    monkeypatch.setattr(sss, "sizing_for",
+                        lambda *a, **k: pytest.fail("sizing_for() must not be reached"))
+    sub = _cached(advanced_settings_enabled=False)
+    order = SimpleNamespace(symbol="AAPL", quantity=Decimal("10"), is_closing=False)
+    assert ce._fixed_entry_size(db, sub, order, False) is None
