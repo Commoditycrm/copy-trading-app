@@ -2428,6 +2428,11 @@ def _last_marked_snapshot(
     return Decimal(row[0]), (Decimal(row[1]) if row[1] is not None else None), row[2]
 
 
+# The calendar page POSTs /trades/sync-fills on mount, then loads this, which
+# syncs again; skip accounts synced this recently (by that or the poller).
+_CALENDAR_SYNC_MIN_INTERVAL = timedelta(seconds=10)
+
+
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
 def calendar_pnl(
     db: Session = Depends(get_db),
@@ -2464,7 +2469,7 @@ def calendar_pnl(
     # excluded from the P&L query and the day would look empty. Sync first
     # so freshly-filled mirrors land on the right day.
     try:
-        fills_sync.sync_user_fills(db, target_user_id)
+        fills_sync.sync_user_fills(db, target_user_id, min_interval=_CALENDAR_SYNC_MIN_INTERVAL)
         db.commit()
     except Exception:  # noqa: BLE001
         # Sync failures are non-fatal; we still return whatever P&L exists.

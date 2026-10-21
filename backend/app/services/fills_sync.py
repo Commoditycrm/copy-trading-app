@@ -13,13 +13,15 @@ Caller commits the session.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -359,32 +361,74 @@ def _refresh_open_orders(
                 "fills_sync: position.auto_closed publish failed for order=%s", order.id
             )
 
-    # Deferred-close hook (own sessions inside): a subscriber entry that just
-    # FILLED fires any close parked behind it; one that DIED cancels it.
+    # Deferred-close hook: a subscriber entry that just FILLED fires any close
+    # parked behind it; one that DIED cancels it. Run after the caller commits,
+    # off this thread — see _queue_entry_hooks.
     if filled_entries or dead_entries:
-        from app.services import copy_engine  # noqa: PLC0415
-        from app.services import events as _events  # noqa: PLC0415
-        for e in filled_entries:
-            # A mirror entry just filled → a new open position exists. The
-            # subscriber has no real-time listener, so this poll is the only
-            # place that fill is seen; publish order.placed (the same event the
-            # trader websocket emits on fill, and the one the positions table
-            # already refreshes on) so the position shows up live instead of
-            # only after a manual reload.
-            try:
-                _events.publish(e.user_id, copy_engine._order_event("order.placed", e))  # noqa: SLF001
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: order.placed publish failed for entry=%s", e.id)
-            try:
-                copy_engine.fire_deferred_closes_for_entry(e)
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: fire deferred closes failed for entry=%s", e.id)
-        for e in dead_entries:
-            try:
-                copy_engine.cancel_deferred_closes_for_entry(e)
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
+        _queue_entry_hooks(db, filled_entries, dead_entries)
     return refreshed
+
+
+# The entry hooks open their own sessions. Run inline they made the caller —
+# holding a pool connection and, via sync_user_fills, the per-user advisory
+# lock — wait on a SECOND connection. QA 2026-10-21: requests queued on that
+# lock filled the pool, so each hook sat out pool_timeout while still holding
+# the lock, and the web tier 500'd until restart. Queued on the session and run
+# in a thread once its transaction commits; dropped on rollback, so the next
+# sweep sees the transition again.
+_ENTRY_HOOKS = "fills_sync.entry_hooks"
+
+
+def _queue_entry_hooks(db: Session, filled: "list[Order]", dead: "list[Order]") -> None:
+    # Column snapshots: the rows expire at commit and must not lazy-load
+    # through the caller's session from another thread.
+    def snap(o: Order) -> SimpleNamespace:
+        return SimpleNamespace(**{c.key: getattr(o, c.key) for c in Order.__mapper__.column_attrs})
+
+    q = db.info.setdefault(_ENTRY_HOOKS, ([], []))
+    q[0].extend(snap(e) for e in filled)
+    q[1].extend(snap(e) for e in dead)
+
+
+@event.listens_for(Session, "after_commit")
+def _entry_hooks_after_commit(session: Session) -> None:
+    if session.in_nested_transaction():
+        return
+    q = session.info.pop(_ENTRY_HOOKS, None)
+    if q:
+        threading.Thread(target=_run_entry_hooks, args=q, daemon=True,
+                         name="fills-entry-hooks").start()
+
+
+@event.listens_for(Session, "after_rollback")
+def _entry_hooks_after_rollback(session: Session) -> None:
+    if not session.in_nested_transaction():
+        session.info.pop(_ENTRY_HOOKS, None)
+
+
+def _run_entry_hooks(filled: "list[Any]", dead: "list[Any]") -> None:
+    from app.services import copy_engine  # noqa: PLC0415
+    from app.services import events as _events  # noqa: PLC0415
+    for e in filled:
+        # A mirror entry just filled → a new open position exists. The
+        # subscriber has no real-time listener, so this poll is the only
+        # place that fill is seen; publish order.placed (the same event the
+        # trader websocket emits on fill, and the one the positions table
+        # already refreshes on) so the position shows up live instead of
+        # only after a manual reload.
+        try:
+            _events.publish(e.user_id, copy_engine._order_event("order.placed", e))  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: order.placed publish failed for entry=%s", e.id)
+        try:
+            copy_engine.fire_deferred_closes_for_entry(e)
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: fire deferred closes failed for entry=%s", e.id)
+    for e in dead:
+        try:
+            copy_engine.cancel_deferred_closes_for_entry(e)
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
 
 
 def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
@@ -637,17 +681,27 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
     )
 
 
-def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
-    """Sync every connected broker for one app user."""
-    # Serialize concurrent fills-sync for the SAME user. Every calendar and
-    # positions load triggers this, so two requests can run it at once and race
-    # the check-then-insert in sync_account_fills, each synthesizing the same
-    # external order — the root cause of duplicate FILLED rows that double-count
-    # realized P&L. This transaction-scoped advisory lock makes the second wait;
-    # under READ COMMITTED its later SELECT then sees the first's committed row
-    # and updates it instead of inserting. Auto-released at transaction end.
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-               {"k": f"fills_sync:{user_id}"})
+def sync_user_fills(
+    db: Session, user_id: uuid.UUID, min_interval: timedelta | None = None,
+) -> dict[str, Any]:
+    """Sync every connected broker for one app user.
+
+    ``min_interval`` skips an account synced more recently than that (by any
+    process — the worker's poller stamps the same column)."""
+    # One fills-sync per user at a time. Every calendar and positions load
+    # triggers this, and two at once race the check-then-insert in
+    # sync_account_fills, each synthesizing the same external order — duplicate
+    # FILLED rows that double-count realized P&L. TRY, not wait: a blocking lock
+    # parked every page load on a pool connection behind a slow sync until the
+    # pool ran dry (QA 2026-10-21). The sync already running covers this one.
+    got = db.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
+                     {"k": f"fills_sync:{user_id}"}).scalar()
+    if not got:
+        log.info("fills_sync: sync for user=%s already running — skipped", user_id)
+        return {"per_account": [], "fills_added": 0, "orders_added": 0, "in_progress": True}
+    # Backstop: a holder stuck between statements (a hung broker call) is
+    # killed rather than keeping the lock and its connection indefinitely.
+    db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
 
     accts = list(db.execute(
         select(BrokerAccount).where(
@@ -660,7 +714,14 @@ def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
     per_account: list[dict[str, Any]] = []
     total_fills = 0
     total_orders = 0
+    now = datetime.now(timezone.utc)
     for acct in accts:
+        last = acct.last_activity_sync_at
+        if min_interval is not None and last is not None:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if now - last < min_interval:
+                continue
         try:
             res = sync_account_fills(db, acct)
             per_account.append({
