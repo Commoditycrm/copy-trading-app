@@ -59,6 +59,7 @@ from app.services.order_retry import (
     live_closeable_quantity,
 )
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
+from app.services.shared_accounts import self_mirror_account_ids
 
 log = logging.getLogger(__name__)
 
@@ -2302,36 +2303,9 @@ def trader_can_trade(db: Session, trader: User) -> bool:
 # broker + account number) must never get a mirror: it lands in the account the
 # trader's listener watches, comes back as a "new" trader order and fans out
 # again. QA 2026-10-21: one trade became 52 trader orders + 361 mirrors in 8 min.
+# Checked on every fanout, so pairings that predate the connect-time guard are
+# caught too. See services/shared_accounts.
 _warned_self_mirror: set[uuid.UUID] = set()
-
-
-def self_mirror_account_ids(
-    db: Session, trader_id: uuid.UUID, sub_user_ids: "list[uuid.UUID]",
-) -> set[uuid.UUID]:
-    """Ids of the subscribers' broker rows that are really one of the trader's
-    accounts. A blank/NULL account number never matches — we can't tell."""
-    if not sub_user_ids:
-        return set()
-    trader_keys = {
-        (broker, num.strip())
-        for broker, num in db.execute(
-            select(BrokerAccount.broker, BrokerAccount.broker_account_number).where(
-                BrokerAccount.user_id == trader_id,
-                BrokerAccount.broker_account_number.isnot(None),
-            )
-        ).all()
-        if num and num.strip()
-    }
-    if not trader_keys:
-        return set()
-    rows = db.execute(
-        select(BrokerAccount.id, BrokerAccount.broker, BrokerAccount.broker_account_number).where(
-            BrokerAccount.user_id.in_(sub_user_ids),
-            BrokerAccount.broker.in_({b for b, _ in trader_keys}),
-            BrokerAccount.broker_account_number.isnot(None),
-        )
-    ).all()
-    return {aid for aid, broker, num in rows if (broker, (num or "").strip()) in trader_keys}
 
 
 # ── Async fanout (the live path used by BackgroundTasks) ──────────────────

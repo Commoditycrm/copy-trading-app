@@ -34,7 +34,7 @@ from app.schemas.settings import (
     UnfilledTimeoutIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit, cache, market_hours
+from app.services import audit, cache, market_hours, shared_accounts
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -941,6 +941,8 @@ def follow_trader(
             ).scalar_one_or_none()
             if approved is None:
                 raise HTTPException(403, "follow_not_approved")
+        if shared_accounts.follow_conflict(db, user.id, payload.trader_id):
+            raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who="this trader"))
     old_trader_id = s.following_trader_id
     s.following_trader_id = payload.trader_id
     audit.record(

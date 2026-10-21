@@ -302,23 +302,3 @@ def test_is_mirror_echo_needs_the_same_brokerage_account_for_an_id_match(db):
     db.flush()
     assert order_intent.is_mirror_echo(db, trader.id, t_acct.id, "12345", None)
 
-
-# ── connect-time warning ──────────────────────────────────────────────────
-
-
-def test_connect_warns_subscriber_who_connects_their_traders_account(db):
-    from app.api.brokers import _shared_with_trader_notice
-
-    trader = _user(db, UserRole.TRADER)
-    sub = _user(db, UserRole.SUBSCRIBER)
-    db.flush()
-    _acct(db, trader.id, "PA3SHARED")
-    _follow(db, sub.id, trader.id)
-    shared = _acct(db, sub.id, "PA3SHARED")
-    own = _acct(db, sub.id, "PA3MINE")
-    db.flush()
-
-    assert _shared_with_trader_notice(db, sub, shared, None)
-    assert _shared_with_trader_notice(db, sub, own, None) is None
-    # the trader connecting their own account is not a warning
-    assert _shared_with_trader_notice(db, trader, shared, None) is None

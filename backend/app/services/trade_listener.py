@@ -161,6 +161,10 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
       - a sync FastAPI handler thread (uses the loop captured by bind_loop
         at startup, scheduled via call_soon_threadsafe)
     """
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
+        return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
         # Already running for this trader. Restart cleanly so credentials

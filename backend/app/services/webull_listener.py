@@ -1647,6 +1647,10 @@ async def start_all_listeners() -> None:
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
     if not _enabled():
         return
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
+        return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
         stop_listener(trader_user_id)
