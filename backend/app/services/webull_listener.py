@@ -311,9 +311,22 @@ def _shadow() -> bool:
     return bool(get_settings().webull_direct_shadow_mode)
 
 
+# How long the poll task parks between checks while the switch is off. Only
+# cost is one Redis GET per interval, so it can afford to be responsive — an
+# admin flipping the switch back on shouldn't wait a poll cycle to see it.
+_POLL_DISABLED_IDLE_S = 10.0
+
+
 def _poll_enabled() -> bool:
-    from app.config import get_settings  # noqa: PLC0415
-    return bool(get_settings().webull_direct_poll_enabled)
+    """Runtime switch, read every poll cycle (admin API page). Falls back to the
+    env default if Redis is unreachable, so a dead cache tier leaves detection
+    exactly as the deployment configured it."""
+    from app.services.platform_config import get_bool_knob  # noqa: PLC0415
+    try:
+        return get_bool_knob("webull_direct_poll_enabled")
+    except Exception:  # noqa: BLE001
+        from app.config import get_settings  # noqa: PLC0415
+        return bool(get_settings().webull_direct_poll_enabled)
 
 
 # Webull's published limits (developer.webull.com/apis/docs/rate-limits,
@@ -344,9 +357,17 @@ _DAYORDERS_PER_ACCOUNT_S = 1.2           # spacing between accounts in one cycle
 
 
 def _poll_interval() -> float:
-    """Configured base interval, floored to the single-account rate limit."""
+    """Configured base interval, floored to the single-account rate limit.
+
+    Runtime knob (admin API page), read every cycle. The floor is applied AFTER
+    the knob, so no admin value can push the cadence under the rate limit."""
     from app.config import get_settings  # noqa: PLC0415
-    return max(_DAYORDERS_MIN_INTERVAL_S, float(get_settings().webull_poll_interval_seconds))
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    configured = int_knob_or(
+        "webull_poll_interval_seconds",
+        get_settings().webull_poll_interval_seconds,
+    )
+    return max(_DAYORDERS_MIN_INTERVAL_S, configured)
 
 
 def _safe_poll_interval(num_accounts: int) -> float:
@@ -405,10 +426,19 @@ def _poll_plan(num_accounts: int, trader_user_id: uuid.UUID) -> tuple[float, str
     if session != market_hours.CLOSED:
         return base, session, False
     from app.config import get_settings  # noqa: PLC0415
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
     s = get_settings()
     active = _has_working_orders(trader_user_id)
+    # Both closed-market cadences are runtime knobs; the env value is the
+    # fallback and _sane_closed_interval still applies its 5s floor on top.
     closed = _sane_closed_interval(
-        s.webull_poll_interval_closed_active_seconds if active else s.webull_poll_interval_closed_seconds,
+        int_knob_or(
+            "webull_poll_interval_closed_active_seconds",
+            s.webull_poll_interval_closed_active_seconds,
+        ) if active else int_knob_or(
+            "webull_poll_interval_closed_seconds",
+            s.webull_poll_interval_closed_seconds,
+        ),
         20.0 if active else 120.0,
     )
     return max(base, closed), session, active
@@ -1358,28 +1388,62 @@ async def _run_poller(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -
     """Pull the trader's Webull orders on a short interval and hand any NEW
     order or status transition to _on_order_event (shadow/live routing + dedup
     are shared with the stream). Primes a baseline on the first cycle so the
-    trader's earlier-in-day orders are never replayed as fresh signals."""
-    if not _poll_enabled():
-        return
+    trader's earlier-in-day orders are never replayed as fresh signals.
+
+    The on/off switch is checked at the TOP OF EVERY CYCLE, not at entry, so an
+    admin toggling it at runtime takes effect both ways. While it is off this
+    task parks on a cheap idle sleep and makes no broker calls; the baseline is
+    dropped on the way out so that turning it back on re-primes rather than
+    replaying everything that happened while it was off."""
     generation = _generation.get(trader_user_id, 0)
     _poll_baseline.pop(trader_user_id, None)
     _poll_status[trader_user_id] = {}
 
     # Resolve the account list once — accounts rarely change and get_account_list
     # every cycle would burn rate limit. Fall back to the configured account.
-    creds0 = _load_creds(broker_account_id)
-    account_ids: list[str] = (
-        await asyncio.to_thread(_all_account_ids, creds0) if creds0 else []
-    )
-    interval = _safe_poll_interval(len(account_ids))
-    log.info("webull-poll[%s] started; interval=%.1fs (%d account(s), 10-req/30s cap) accounts=%s",
-             trader_user_id, interval, len(account_ids), account_ids)
+    #
+    # Skipped while the switch is off: get_account_list is a BROKER call, and a
+    # disabled poller must cost nothing. The loop below re-resolves whenever
+    # account_ids is empty, so deferring it is free.
+    _was_enabled = _poll_enabled()
+    account_ids: list[str] = []
+    if _was_enabled:
+        creds0 = _load_creds(broker_account_id)
+        account_ids = (
+            await asyncio.to_thread(_all_account_ids, creds0) if creds0 else []
+        )
+        interval = _safe_poll_interval(len(account_ids))
+        log.info("webull-poll[%s] started; interval=%.1fs (%d account(s), 10-req/30s cap) accounts=%s",
+                 trader_user_id, interval, len(account_ids), account_ids)
+    else:
+        interval = _safe_poll_interval(1)
+        log.info(
+            "webull-poll[%s] spawned but DISABLED (webull_direct_poll_enabled is "
+            "off) — idling until an admin turns it on", trader_user_id,
+        )
     _last_cadence_log: tuple[str, float] | None = None  # (session, interval) last logged
 
     while True:
         try:
             if _generation.get(trader_user_id) != generation:
                 return  # a newer listener/poller superseded us
+            if not _poll_enabled():
+                if _was_enabled:
+                    log.info(
+                        "webull-poll[%s] DISABLED by webull_direct_poll_enabled "
+                        "— idling; the gRPC stream is now the only path to this "
+                        "trader's fills", trader_user_id,
+                    )
+                    _was_enabled = False
+                    # Drop the baseline so a re-enable re-primes from what is on
+                    # screen then, instead of replaying the whole quiet period.
+                    _poll_baseline.pop(trader_user_id, None)
+                    _poll_status[trader_user_id] = {}
+                await asyncio.sleep(_POLL_DISABLED_IDLE_S)
+                continue
+            if not _was_enabled:
+                log.info("webull-poll[%s] RE-ENABLED — resuming", trader_user_id)
+                _was_enabled = True
             creds = _load_creds(broker_account_id)
             if creds is None or not creds.get("app_key"):
                 await asyncio.sleep(30)
@@ -1689,9 +1753,14 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
         # Poll backstop runs alongside the stream (dedup keeps them from
         # double-firing). It's the reliable detection path while Webull's
         # push scope is disabled; harmless when the stream also works.
-        if _poll_enabled():
-            ptask = loop.create_task(_run_poller(trader_user_id, broker_account_id))
-            _poll_tasks[trader_user_id] = ptask
+        #
+        # Spawned UNCONDITIONALLY, even when the switch is currently off: the
+        # task checks _poll_enabled() every cycle and idles while off, so an
+        # admin can turn polling back on without restarting the worker. Gating
+        # the spawn instead (as this did) meant a re-enable did nothing,
+        # because there was no task left to notice it.
+        ptask = loop.create_task(_run_poller(trader_user_id, broker_account_id))
+        _poll_tasks[trader_user_id] = ptask
         _set_state(trader_user_id, "connecting")
 
     if on_loop:

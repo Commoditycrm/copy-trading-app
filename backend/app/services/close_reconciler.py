@@ -85,7 +85,12 @@ async def run_loop(shutdown_check=None) -> None:
             await _tick()
         except Exception:  # noqa: BLE001
             log.exception("close_reconciler tick failed")
-        await asyncio.sleep(get_settings().close_reconcile_interval_s)
+        # Runtime knob; the env value is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "close_reconcile_interval_s",
+            get_settings().close_reconcile_interval_s,
+        ))
 
 
 async def _tick() -> None:

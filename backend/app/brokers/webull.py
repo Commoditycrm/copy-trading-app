@@ -592,6 +592,15 @@ def trade_client_for(app_key: str, app_secret: str, region_id: str = "us",
 # them a 2-second-old snapshot risks closing a position that is already closed.
 # Those keep the uncached path — correctness over call count.
 _POSITIONS_TTL_S = 2.0
+
+
+def _positions_ttl() -> float:
+    """Display-cache window. Runtime knob (admin API page) read per call, so
+    raising it to relieve the positions page takes effect immediately.
+    _POSITIONS_TTL_S is the fallback. Decision paths pass cached_ok=False and
+    never consult this at all."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("webull_positions_cache_ttl_s", _POSITIONS_TTL_S)
 _positions_cache: dict[str, "tuple[float, list]"] = {}
 _positions_locks: dict[str, threading.Lock] = {}
 _positions_lock_guard = threading.Lock()
@@ -1123,7 +1132,7 @@ class WebullAdapter(BrokerAdapter):
         key = f"{self.app_key}:{self.account_id}"
         with _positions_lock_for(key):
             hit = _positions_cache.get(key)
-            if not fresh and hit is not None and (time.monotonic() - hit[0]) < _POSITIONS_TTL_S:
+            if not fresh and hit is not None and (time.monotonic() - hit[0]) < _positions_ttl():
                 return hit[1]
             # Reuse the shared snapshot another process (usually the risk worker)
             # just wrote, instead of a second Webull call into its burst window.

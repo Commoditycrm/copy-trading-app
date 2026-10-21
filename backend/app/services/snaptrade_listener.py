@@ -123,9 +123,26 @@ def _should_force_resync(
 
 
 def _poll_interval() -> float:
-    """5s normally; 60s backstop when a webhook drives detection."""
-    from app.config import get_settings
-    return POLL_INTERVAL_BACKSTOP_S if get_settings().snaptrade_webhook_enabled else POLL_INTERVAL_S
+    """The active cadence, or the 60s backstop when a webhook drives detection.
+
+    Both the switch and the interval are runtime knobs (admin API page), read
+    on every tick so a change lands on the next one. Redis trouble falls back
+    to the env defaults — never to a tighter cadence than configured, since
+    this loop is the largest consumer of SnapTrade's shared quota."""
+    from app.services.platform_config import (  # noqa: PLC0415
+        get_bool_knob,
+        get_int_knob,
+    )
+    try:
+        if get_bool_knob("snaptrade_webhook_enabled"):
+            return POLL_INTERVAL_BACKSTOP_S
+        return float(get_int_knob("snaptrade_poll_interval_s"))
+    except Exception:  # noqa: BLE001
+        from app.config import get_settings  # noqa: PLC0415
+        s = get_settings()
+        if s.snaptrade_webhook_enabled:
+            return POLL_INTERVAL_BACKSTOP_S
+        return float(s.snaptrade_poll_interval_s)
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -1113,7 +1130,11 @@ async def _run_subscriber_reconciler() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("snaptrade subscriber fill reconciler: tick failed")
-        await asyncio.sleep(_RECONCILE_INTERVAL_S)
+        # Runtime knob; _RECONCILE_INTERVAL_S is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "snaptrade_subscriber_reconcile_interval_s", _RECONCILE_INTERVAL_S,
+        ))
 
 
 def _reconcile_subscriber_fills_once() -> None:

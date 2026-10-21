@@ -321,7 +321,8 @@ def test_schedule_dedupes_per_account():
             nudge._pending[a] = nudge._Nudge(_SUB, a, time.monotonic(), reads_left=0)
         nudge.schedule(_SUB, a)
         assert len(nudge._pending) == 1
-        assert nudge._pending[a].reads_left == nudge.MAX_READS, "read budget topped up"
+        assert nudge._pending[a].reads_left == nudge._max_reads(), \
+            "read budget topped up"
     finally:
         nudge._pending.clear()
         nudge.set_enabled(False)
@@ -357,10 +358,17 @@ def test_worker_thread_runs_the_full_sequence():
     _order(db, acct)
     adapter = _FakeAdapter()
 
-    saved = (nudge.READ_DELAY_S, nudge.READ_RETRY_S, nudge.MIN_GAP_S, nudge.MAX_READS)
+    # Drive the KNOB GETTERS, not the module constants: the constants are now
+    # just the fallback for an unreadable Redis, so patching them alone would
+    # leave the real timings in place (and make this test depend on whatever
+    # override is sitting in the local Redis).
+    saved = (nudge._read_delay, nudge._retry_delay, nudge._max_reads,
+             nudge.MIN_GAP_S)
     with _Harness(db, adapter):
-        nudge.READ_DELAY_S = nudge.READ_RETRY_S = nudge.MIN_GAP_S = 0.01
-        nudge.MAX_READS = 1
+        nudge._read_delay = lambda: 0.01
+        nudge._retry_delay = lambda: 0.01
+        nudge._max_reads = lambda: 1
+        nudge.MIN_GAP_S = 0.01
         nudge.set_enabled(True)
         try:
             nudge._pending.clear()
@@ -371,8 +379,8 @@ def test_worker_thread_runs_the_full_sequence():
             time.sleep(0.2)
         finally:
             nudge.set_enabled(False)
-            (nudge.READ_DELAY_S, nudge.READ_RETRY_S,
-             nudge.MIN_GAP_S, nudge.MAX_READS) = saved
+            (nudge._read_delay, nudge._retry_delay, nudge._max_reads,
+             nudge.MIN_GAP_S) = saved
 
     assert adapter.calls == ["force_resync", "list_recent_activities"], adapter.calls
 
