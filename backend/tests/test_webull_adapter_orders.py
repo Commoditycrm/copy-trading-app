@@ -627,6 +627,27 @@ def test_orders_snapshot_is_empty_on_failure_not_raising():
     assert a.get_orders_snapshot() == {}
 
 
+def test_a_linked_pair_is_read_leg_by_leg():
+    """QA 2026-10-21, QQQ 726C: our take-profit and its linked stop are one
+    combo with two legs, each under its own client_order_id. Reading the first
+    leg's status for the row left the take-profit "working" after it filled."""
+    a = _adapter()
+    a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(200, {  # type: ignore[method-assign]
+        "orders": [{
+            "client_order_id": "tp1", "combo_type": "STOP_PROFIT",
+            "items": [
+                {"client_order_id": "sl1", "order_status": "SUBMITTED", "filled_qty": "0"},
+                {"client_order_id": "tp1", "order_status": "FILLED", "filled_qty": "1",
+                 "filled_price": "1.13"},
+            ],
+        }]
+    })))
+    snap = a.get_orders_snapshot()
+    assert snap["tp1"].status == OrderStatus.FILLED and snap["tp1"].filled_quantity == Decimal("1")
+    assert snap["tp1"].filled_avg_price == Decimal("1.13")
+    assert snap["sl1"].status == OrderStatus.SUBMITTED
+
+
 def test_orders_snapshot_skips_rows_without_a_client_order_id():
     a = _adapter()
     a._trade_client = lambda: _FakeListTrade(_FakeListOps(_FakeResp(200, {  # type: ignore[method-assign]
