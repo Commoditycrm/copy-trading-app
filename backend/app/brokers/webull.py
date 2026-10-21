@@ -1509,36 +1509,45 @@ class WebullAdapter(BrokerAdapter):
             # We key every order we place by our own client_order_id, and that is
             # what our broker_order_id column holds — see place_order.
             coid = str(_first(o, "client_order_id", "clientOrderId") or "").strip()
-            if not coid:
+            legs = [x for x in (o.get("items") or o.get("legs") or []) if isinstance(x, dict)]
+            # A linked pair (our take-profit + its stop: one combo, two legs)
+            # carries each leg under its OWN client_order_id. Each leg is its
+            # own order of ours, so each is read from its own leg — taking the
+            # first leg's status for the row left a take-profit reading
+            # "working" after it filled when the first leg was the stop (QA
+            # 2026-10-21, QQQ 726C: a Trim 1 fill seen only 4 minutes later).
+            own = [(str(_first(x, "client_order_id", "clientOrderId") or "").strip(), x) for x in legs]
+            own = [(c, x) for c, x in own if c]
+            if own:
+                entries = own
+            elif coid:
+                entries = [(coid, legs[0] if legs else o)]
+            else:
                 continue
-            legs = o.get("items") or o.get("legs") or []
-            leg = legs[0] if legs and isinstance(legs[0], dict) else o
-            status_raw = str(
-                _first(leg, "order_status", "status")
-                or _first(o, "order_status", "status") or ""
-            ).upper()
-            if not status_raw:
-                continue
-            out[coid] = BrokerOrderResult(
-                broker_order_id=coid,
-                status=_STATUS_MAP.get(status_raw, OrderStatus.SUBMITTED),
-                submitted_at=now,
-                filled_quantity=(
-                    # Query Day Orders uses filled_qty; the order-detail endpoint
-                    # uses filled_quantity. Accept both — see _fetch_detail.
-                    _dec(_first(leg, "filled_qty", "filled_quantity", "filledQty",
-                                "cumulative_quantity"))
-                    or Decimal(0)
-                ),
-                filled_avg_price=_dec(
-                    _first(leg, "filled_price", "avg_fill_price", "filledPrice")
-                ),
-                filled_at=_fill_time(leg if isinstance(leg, dict) else {}, o),
-            )
-            _log_missing_fill_time(
-                out[coid].status, out[coid].filled_at,
-                leg if isinstance(leg, dict) else o,
-            )
+            for key, leg in entries:
+                status_raw = str(
+                    _first(leg, "order_status", "status")
+                    or _first(o, "order_status", "status") or ""
+                ).upper()
+                if not status_raw:
+                    continue
+                out[key] = BrokerOrderResult(
+                    broker_order_id=key,
+                    status=_STATUS_MAP.get(status_raw, OrderStatus.SUBMITTED),
+                    submitted_at=now,
+                    filled_quantity=(
+                        # Query Day Orders uses filled_qty; the order-detail endpoint
+                        # uses filled_quantity. Accept both — see _fetch_detail.
+                        _dec(_first(leg, "filled_qty", "filled_quantity", "filledQty",
+                                    "cumulative_quantity"))
+                        or Decimal(0)
+                    ),
+                    filled_avg_price=_dec(
+                        _first(leg, "filled_price", "avg_fill_price", "filledPrice")
+                    ),
+                    filled_at=_fill_time(leg, o),
+                )
+                _log_missing_fill_time(out[key].status, out[key].filled_at, leg)
         if body.get("hasNext") if isinstance(body, dict) else False:
             log.info(
                 "webull orders snapshot: more than %d orders today for account %s; "
