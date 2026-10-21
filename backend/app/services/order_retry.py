@@ -473,9 +473,6 @@ def is_duplicate_client_id_error(exc: BaseException) -> bool:
     return bool(_DUPLICATE_CLIENT_ID_RE.search(str(exc)))
 
 
-# Pause before a contract-match lookup: SnapTrade's order list lags placement.
-DEFAULT_SETTLE_S = 3.0
-
 # reject_reason of a mirror parked after an unconfirmed send. retry_scheduler
 # keys off it: such a mirror is looked up before any re-place.
 OUTCOME_UNKNOWN_REASON = "broker did not confirm the order, will verify before retrying"
@@ -486,17 +483,20 @@ def lookup_placed_order(
     request: BrokerOrderRequest,
     *,
     placed_after: datetime,
-    exclude_ids: frozenset[str] = frozenset(),
 ) -> tuple[str, AdoptedOrderResult | None]:
-    """("found", result), ("absent", None), ("failed", None) when the lookup
-    errored, or ("unsupported", None) when the adapter can't look up."""
+    """("found", result), ("absent", None), ("ambiguous", None) when several
+    broker orders fit, ("failed", None) when the lookup errored, or
+    ("unsupported", None) when the adapter can't look up."""
     find = getattr(adapter, "find_placed_order", None)
     if find is None:
         return "unsupported", None
     try:
-        found = find(request, placed_after=placed_after, exclude_ids=exclude_ids)
+        found = find(request, placed_after=placed_after)
     except NotImplementedError:
         return "unsupported", None
+    except BrokerAdapter.AmbiguousMatch:
+        log.warning("order_retry: ambiguous order lookup for %s", request.client_order_id, exc_info=True)
+        return "ambiguous", None
     except Exception:  # noqa: BLE001
         log.warning("order_retry: order lookup failed for %s", request.client_order_id, exc_info=True)
         return "failed", None
@@ -512,16 +512,15 @@ def place_order_with_recovery(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     initial_backoff_s: float = DEFAULT_INITIAL_BACKOFF_S,
     max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
-    settle_s: float = DEFAULT_SETTLE_S,
-    exclude_ids: frozenset[str] = frozenset(),
 ) -> BrokerOrderResult:
     """Call adapter.place_order() with retry on transient errors and clean
     messages on user-fixable errors. Re-raises unknown errors as-is.
 
-    A timeout is never retried blind: the broker is asked whether the order
-    landed first. Found → that order is returned (an AdoptedOrderResult).
-    Absent → re-sent only where the broker dedupes client ids; elsewhere
-    OrderOutcomeUnknown is raised so the caller can park it.
+    A timeout is never retried blind. Where the broker dedupes client ids it is
+    asked whether the order landed: found → that order is returned (an
+    AdoptedOrderResult), absent → re-sent with the same id. Elsewhere
+    OrderOutcomeUnknown is raised at once; reconciling a contract match needs
+    the DB context retry_scheduler has.
 
     Raises:
         RecoverableOrderError — caller should record `.friendly_message` as
@@ -542,9 +541,7 @@ def place_order_with_recovery(
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if dedupes and is_duplicate_client_id_error(exc):
-                _, found = lookup_placed_order(
-                    adapter, request, placed_after=sent_at, exclude_ids=exclude_ids,
-                )
+                _, found = lookup_placed_order(adapter, request, placed_after=sent_at)
                 if found is not None:
                     log.warning("order_retry: %s already at broker, adopting %s",
                                 request.client_order_id, found.broker_order_id)
@@ -552,17 +549,13 @@ def place_order_with_recovery(
                 raise
             if is_outcome_unknown_error(exc):
                 if not dedupes:
-                    time.sleep(settle_s)
-                _, found = lookup_placed_order(
-                    adapter, request, placed_after=sent_at, exclude_ids=exclude_ids,
-                )
+                    raise OrderOutcomeUnknown(exc) from exc
+                _, found = lookup_placed_order(adapter, request, placed_after=sent_at)
                 if found is not None:
                     log.warning("order_retry: %s landed despite %s, adopting %s",
                                 request.client_order_id, type(exc).__name__,
                                 found.broker_order_id)
                     return found
-                if not dedupes:
-                    raise OrderOutcomeUnknown(exc) from exc
                 # Absent or unreadable, but a repeat of this client id is
                 # refused, so re-sending can't double the order.
             cls = classify_error(exc)

@@ -77,8 +77,8 @@ class FakeAdapter(BrokerAdapter):
             raise out
         return out
 
-    def find_placed_order(self, req, *, placed_after, exclude_ids=frozenset()):
-        self.looked.append({"req": req, "placed_after": placed_after, "exclude_ids": exclude_ids})
+    def find_placed_order(self, req, *, placed_after):
+        self.looked.append({"req": req, "placed_after": placed_after})
         out = self.lookups.pop(0)
         if isinstance(out, BaseException):
             raise out
@@ -151,11 +151,13 @@ def test_failed_lookup_on_deduping_broker_still_resends():
 
 # ── contract-matched brokers (SnapTrade) ────────────────────────────────────
 
-def test_non_deduping_timeout_not_found_raises_without_resend():
-    a = FakeAdapter([ReadTimeout("timed out")], [None], dedupes=False)
+def test_non_deduping_timeout_raises_without_lookup_or_resend():
+    # A contract match needs the scheduler's view of our other orders, so the
+    # inline path neither adopts nor re-sends.
+    a = FakeAdapter([ReadTimeout("timed out")], [], dedupes=False)
     with pytest.raises(OrderOutcomeUnknown):
         place_order_with_recovery(a, _req(), initial_backoff_s=0)
-    assert len(a.placed) == 1
+    assert len(a.placed) == 1 and a.looked == []
 
 
 class _FakeSnapClient:
@@ -196,23 +198,27 @@ def _snap_order(oid, *, symbol="AAPL", action="BUY", qty=3, placed=None, option=
     return o
 
 
-def test_snaptrade_timeout_with_matching_recent_order_adopts_and_never_places_twice():
+def test_snaptrade_timeout_never_places_twice_and_lookup_finds_the_one_match():
     a = _snap([
         _snap_order("old", placed=datetime.now(timezone.utc) - timedelta(hours=2)),
         _snap_order("other-qty", qty=5),
+        _snap_order("other-side", action="SELL"),
         _snap_order("live"),
     ])
-    out = place_order_with_recovery(a, _req(), initial_backoff_s=0)
-    assert isinstance(out, AdoptedOrderResult) and out.broker_order_id == "live"
-    assert out.status == OrderStatus.FILLED
-    assert a._client.place_calls == 1
-
-
-def test_snaptrade_lookup_skips_orders_we_already_own():
-    a = _snap([_snap_order("sibling")])
+    req = _req()
     with pytest.raises(OrderOutcomeUnknown):
-        place_order_with_recovery(a, _req(), initial_backoff_s=0, exclude_ids=frozenset({"sibling"}))
+        place_order_with_recovery(a, req, initial_backoff_s=0)
     assert a._client.place_calls == 1
+    found = a.find_placed_order(req, placed_after=datetime.now(timezone.utc))
+    assert found.broker_order_id == "live" and found.status == OrderStatus.FILLED
+
+
+def test_snaptrade_two_matching_orders_are_ambiguous():
+    a = _snap([_snap_order("one"), _snap_order("two")])
+    with pytest.raises(BrokerAdapter.AmbiguousMatch):
+        a.find_placed_order(_req(), placed_after=datetime.now(timezone.utc))
+    state, found = order_retry.lookup_placed_order(a, _req(), placed_after=datetime.now(timezone.utc))
+    assert (state, found) == ("ambiguous", None)
 
 
 def test_snaptrade_matches_option_contract():
@@ -244,8 +250,10 @@ class _Session:
     def get(self, model, key):
         return self._objs.get((model, key))
 
-    def execute(self, *a, **k):
-        return SimpleNamespace(scalars=lambda: iter(()))
+    def scalar(self, *a, **k):
+        return self.owners
+
+    owners = 0
 
     def commit(self):
         self.commits += 1
@@ -325,12 +333,27 @@ def test_scheduler_send_that_times_out_is_only_looked_up_next_time(scheduler):
     # After a 429 the scheduler sends; that send times out unconfirmed. It's
     # parked for a lookup-only re-check, which finds nothing → review. One send total.
     child, objs = _scheduled_child("transient broker error, will retry")
-    a = FakeAdapter([ReadTimeout("timed out")], [None, None], dedupes=False)
+    a = FakeAdapter([ReadTimeout("timed out")], [None], dedupes=False)
     assert scheduler(child, objs, a) == "rescheduled"
     assert child.reject_reason == OUTCOME_UNKNOWN_REASON
     child.status = OrderStatus.RETRY_PENDING
     assert scheduler(child, objs, a) == "needs_review"
     assert len(a.placed) == 1
+
+
+def test_scheduler_reviews_without_lookup_when_another_order_could_own_it(scheduler, monkeypatch):
+    child, objs = _scheduled_child(OUTCOME_UNKNOWN_REASON)
+    monkeypatch.setattr(retry_scheduler, "_possible_owners", lambda *a: 1)
+    a = FakeAdapter([], [], dedupes=False)
+    assert scheduler(child, objs, a) == "needs_review"
+    assert a.placed == [] and a.looked == []
+
+
+def test_scheduler_reviews_an_ambiguous_broker_match(scheduler):
+    child, objs = _scheduled_child(OUTCOME_UNKNOWN_REASON)
+    a = FakeAdapter([], [BrokerAdapter.AmbiguousMatch("2 match")], dedupes=False)
+    assert scheduler(child, objs, a) == "needs_review"
+    assert a.placed == []
 
 
 def test_scheduler_client_id_broker_resends_when_absent(scheduler):

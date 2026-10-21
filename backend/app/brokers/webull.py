@@ -1476,7 +1476,6 @@ class WebullAdapter(BrokerAdapter):
         req: BrokerOrderRequest,
         *,
         placed_after: datetime,
-        exclude_ids: frozenset[str] = frozenset(),
     ) -> BrokerOrderResult | None:
         if not req.client_order_id:
             raise NotImplementedError("webull lookup needs a client_order_id")

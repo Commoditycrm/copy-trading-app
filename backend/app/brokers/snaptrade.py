@@ -794,11 +794,10 @@ class SnapTradeAdapter(BrokerAdapter):
         req: BrokerOrderRequest,
         *,
         placed_after: datetime,
-        exclude_ids: frozenset[str] = frozenset(),
     ) -> BrokerOrderResult | None:
         """SnapTrade takes no client id, so match the contract instead: same
-        instrument, side and quantity, placed since ``placed_after``, not
-        already one of ours. Earliest match wins."""
+        instrument, side and quantity, placed since ``placed_after``. Two or
+        more fits can't be told apart, so that raises AmbiguousMatch."""
         resp = self._c().account_information.get_user_account_orders(
             user_id=self._user_id,
             user_secret=self._user_secret,
@@ -807,19 +806,20 @@ class SnapTradeAdapter(BrokerAdapter):
         body = getattr(resp, "body", resp) or []
         rows = list(body.get("orders") or []) if isinstance(body, dict) else list(body)
         since = placed_after - timedelta(seconds=self._LOOKUP_SKEW_S)
-        best: tuple[datetime, Any] | None = None
+        hits = []
         for o in rows:
-            oid = str(_attr(o, "brokerage_order_id", "id") or "")
-            if not oid or oid in exclude_ids:
+            if not _attr(o, "brokerage_order_id", "id"):
                 continue
             placed = _as_dt(_attr(o, "time_placed", "created_at"))
             if placed is None or placed < since:
                 continue
-            if not _order_matches_request(o, req):
-                continue
-            if best is None or placed < best[0]:
-                best = (placed, o)
-        return self._order_to_result(best[1]) if best else None
+            if _order_matches_request(o, req):
+                hits.append(o)
+        if len(hits) > 1:
+            raise self.AmbiguousMatch(
+                f"{len(hits)} SnapTrade orders match {req.side.value} {req.quantity} {req.symbol}"
+            )
+        return self._order_to_result(hits[0]) if hits else None
 
     def get_orders_snapshot(self) -> dict[str, BrokerOrderResult]:
         """Every order get_order could find, from the ONE list call it makes.

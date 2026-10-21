@@ -194,12 +194,14 @@ class BrokerAdapter(ABC):
     # the worst case is a duplicate-id rejection, which we resolve by lookup.
     dedupes_client_order_id: bool = False
 
+    class AmbiguousMatch(LookupError):
+        """More than one broker order fits a contract-matched lookup."""
+
     def find_placed_order(
         self,
         req: BrokerOrderRequest,
         *,
         placed_after: datetime,
-        exclude_ids: frozenset[str] = frozenset(),
     ) -> BrokerOrderResult | None:
         """The order a timed-out ``place_order(req)`` may have created.
 
@@ -207,7 +209,7 @@ class BrokerAdapter(ABC):
         lookup itself failed (outcome still unknown); NotImplementedError when
         this adapter can't look orders up at all. ``placed_after`` bounds the
         search for adapters that match by contract rather than client id;
-        ``exclude_ids`` are broker ids already owned by other orders of ours."""
+        those raise AmbiguousMatch when more than one order fits."""
         raise NotImplementedError
 
     def cancel_order(self, broker_order_id: str) -> bool:

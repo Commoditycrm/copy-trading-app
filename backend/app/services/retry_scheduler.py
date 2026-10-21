@@ -20,8 +20,9 @@ A timeout may have placed the order. Before re-placing, the broker is asked
 whether it has it; a match is adopted (``copy.retry_adopted``), not re-sent.
 Brokers that refuse a repeated client_order_id (Alpaca, Webull) can always be
 re-sent safely. Others (SnapTrade) are NEVER re-sent after an unconfirmed
-send: the order is adopted if the contract lookup finds it, otherwise the
-mirror goes to manual review (``copy.retry_needs_review``).
+send: the order is adopted only if the contract lookup finds exactly one and
+no other order of ours on the account could own it; otherwise the mirror goes
+to manual review (``copy.retry_needs_review``).
 
 Retry count
 -----------
@@ -48,7 +49,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, adapter_for
@@ -189,18 +190,26 @@ def _reschedule(child: Order, sub_settings: SubscriberSettings) -> None:
     child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
 
-def _known_broker_ids(db: Session, child: Order, placed_after: datetime) -> frozenset[str]:
-    """Broker ids our other orders on this account already own, so a contract
-    match never adopts a sibling mirror's order."""
-    rows = db.execute(
-        select(Order.broker_order_id).where(
+def _possible_owners(db: Session, child: Order, placed_after: datetime) -> int:
+    """Our other orders on this account that a contract match can't be told
+    apart from: same instrument, side and quantity, active around the send.
+    Counted whatever their broker_order_id — null if their send also went
+    unconfirmed, or no longer the id the broker lists if it changed it."""
+    lo = placed_after - timedelta(hours=1)
+    return db.scalar(
+        select(func.count()).select_from(Order).where(
             Order.broker_account_id == child.broker_account_id,
-            Order.broker_order_id.is_not(None),
             Order.id != child.id,
-            Order.created_at >= placed_after - timedelta(hours=1),
+            Order.instrument_type == child.instrument_type,
+            Order.symbol == child.symbol,
+            Order.side == child.side,
+            Order.quantity == child.quantity,
+            Order.option_expiry.is_not_distinct_from(child.option_expiry),
+            Order.option_strike.is_not_distinct_from(child.option_strike),
+            Order.option_right.is_not_distinct_from(child.option_right),
+            or_(Order.created_at >= lo, Order.updated_at >= lo),
         )
-    ).scalars()
-    return frozenset(str(r) for r in rows)
+    ) or 0
 
 
 def _needs_review(
@@ -339,16 +348,22 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
         unknown_before = (child.reject_reason or "").startswith(OUTCOME_UNKNOWN_REASON)
         dedupes = getattr(adapter, "dedupes_client_order_id", False)
         placed_after = child.created_at or (datetime.now(timezone.utc) - timedelta(hours=1))
-        exclude = frozenset() if dedupes else _known_broker_ids(db, child, placed_after)
         resp = None
-        if dedupes or unknown_before:
-            state, resp = lookup_placed_order(
-                adapter, request, placed_after=placed_after, exclude_ids=exclude,
-            )
-            if resp is None and unknown_before and not dedupes:
-                # A re-send isn't deduped here, so reconcile or escalate — never send.
-                if state == "absent":
-                    return _needs_review(db, child, trader_order, "order not found at broker")
+        if dedupes:
+            _, resp = lookup_placed_order(adapter, request, placed_after=placed_after)
+        elif unknown_before:
+            # A re-send isn't deduped here, so reconcile or escalate — never
+            # send. Adopt only an order that can be nobody else's.
+            owners = _possible_owners(db, child, placed_after)
+            if owners:
+                return _needs_review(
+                    db, child, trader_order,
+                    f"{owners} other order(s) on this account share the contract/side/qty",
+                )
+            state, resp = lookup_placed_order(adapter, request, placed_after=placed_after)
+            if resp is None and state in ("absent", "ambiguous"):
+                return _needs_review(db, child, trader_order, f"order lookup {state}")
+            if resp is None:
                 return _hold_unverified(db, child, trader_order, sub_settings, max_attempts, state)
 
         # Broker call — succeed, fail, or surface a clean reason.
@@ -356,7 +371,7 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
         broker_friendly: str | None = None
         if resp is None:
             try:
-                resp = place_order_with_recovery(adapter, request, exclude_ids=exclude)
+                resp = place_order_with_recovery(adapter, request)
             except RecoverableOrderError as rec:
                 broker_exc = rec
                 broker_friendly = rec.friendly_message
