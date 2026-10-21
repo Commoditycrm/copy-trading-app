@@ -300,16 +300,44 @@ def test_scheduler_adopts_found_order_without_placing(scheduler):
     assert scheduler.audits == ["copy.retry_adopted"]
 
 
-def test_scheduler_resends_once_then_reviews(scheduler):
-    # Non-deduping broker, first send unconfirmed, nothing found → ONE re-send.
-    # That one also times out and isn't found → manual review, no third send.
+def test_scheduler_never_resends_an_unconfirmed_non_deduping_send(scheduler):
+    # SnapTrade-style: first send unconfirmed, lookup finds nothing → review,
+    # not a re-send (absence on a lagging order list proves nothing).
     child, objs = _scheduled_child(OUTCOME_UNKNOWN_REASON)
-    a = FakeAdapter([ReadTimeout("timed out")], [None, None], dedupes=False)
+    a = FakeAdapter([], [None], dedupes=False)
     assert scheduler(child, objs, a) == "needs_review"
-    assert len(a.placed) == 1
+    assert a.placed == []
     assert child.status == OrderStatus.REJECTED
     assert child.reject_reason == retry_scheduler.NEEDS_REVIEW_REASON
     assert scheduler.audits == ["copy.retry_needs_review"]
+
+
+def test_scheduler_reviews_when_lookup_keeps_failing(scheduler):
+    child, objs = _scheduled_child(OUTCOME_UNKNOWN_REASON)
+    child.retry_count = 2                       # last of 3 attempts
+    a = FakeAdapter([], [RuntimeError("list orders 503")], dedupes=False)
+    assert scheduler(child, objs, a) == "needs_review"
+    assert a.placed == []
+    assert scheduler.audits == ["copy.retry_needs_review"]
+
+
+def test_scheduler_send_that_times_out_is_only_looked_up_next_time(scheduler):
+    # After a 429 the scheduler sends; that send times out unconfirmed. It's
+    # parked for a lookup-only re-check, which finds nothing → review. One send total.
+    child, objs = _scheduled_child("transient broker error, will retry")
+    a = FakeAdapter([ReadTimeout("timed out")], [None, None], dedupes=False)
+    assert scheduler(child, objs, a) == "rescheduled"
+    assert child.reject_reason == OUTCOME_UNKNOWN_REASON
+    child.status = OrderStatus.RETRY_PENDING
+    assert scheduler(child, objs, a) == "needs_review"
+    assert len(a.placed) == 1
+
+
+def test_scheduler_client_id_broker_resends_when_absent(scheduler):
+    child, objs = _scheduled_child(OUTCOME_UNKNOWN_REASON)
+    a = FakeAdapter([_result("brk-2")], [None], dedupes=True)
+    assert scheduler(child, objs, a) == "succeeded"
+    assert [r.client_order_id for r in a.placed] == [str(child.id)]
 
 
 def test_scheduler_holds_when_lookup_cannot_run(scheduler):

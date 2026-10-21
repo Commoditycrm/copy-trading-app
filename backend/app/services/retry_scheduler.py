@@ -19,9 +19,9 @@ Unconfirmed sends
 A timeout may have placed the order. Before re-placing, the broker is asked
 whether it has it; a match is adopted (``copy.retry_adopted``), not re-sent.
 Brokers that refuse a repeated client_order_id (Alpaca, Webull) can always be
-re-sent safely. Others (SnapTrade) get at most ONE automatic re-send after an
-unconfirmed one; past that the mirror goes to manual review
-(``copy.retry_needs_review``) instead of looping.
+re-sent safely. Others (SnapTrade) are NEVER re-sent after an unconfirmed
+send: the order is adopted if the contract lookup finds it, otherwise the
+mirror goes to manual review (``copy.retry_needs_review``).
 
 Retry count
 -----------
@@ -337,7 +337,7 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
         # checked (one by-id read); contract-matched ones only after a send we
         # couldn't confirm, since a 429/refusal placed nothing.
         unknown_before = (child.reject_reason or "").startswith(OUTCOME_UNKNOWN_REASON)
-        dedupes = adapter.dedupes_client_order_id
+        dedupes = getattr(adapter, "dedupes_client_order_id", False)
         placed_after = child.created_at or (datetime.now(timezone.utc) - timedelta(hours=1))
         exclude = frozenset() if dedupes else _known_broker_ids(db, child, placed_after)
         resp = None
@@ -345,8 +345,10 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             state, resp = lookup_placed_order(
                 adapter, request, placed_after=placed_after, exclude_ids=exclude,
             )
-            if resp is None and unknown_before and not dedupes and state != "absent":
-                # Can't prove the first send missed, and a re-send isn't deduped.
+            if resp is None and unknown_before and not dedupes:
+                # A re-send isn't deduped here, so reconcile or escalate — never send.
+                if state == "absent":
+                    return _needs_review(db, child, trader_order, "order not found at broker")
                 return _hold_unverified(db, child, trader_order, sub_settings, max_attempts, state)
 
         # Broker call — succeed, fail, or surface a clean reason.
@@ -358,11 +360,6 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             except RecoverableOrderError as rec:
                 broker_exc = rec
                 broker_friendly = rec.friendly_message
-            except OrderOutcomeUnknown as unk:
-                if unknown_before:
-                    # That was the one automatic re-send; don't gamble again.
-                    return _needs_review(db, child, trader_order, str(unk.original))
-                broker_exc = unk
             except Exception as exc:  # noqa: BLE001
                 broker_exc = exc
                 broker_friendly = None
@@ -395,6 +392,7 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
         child.retry_count += 1
         new_count = child.retry_count
 
+        # This send went unconfirmed: the next run only looks it up.
         if isinstance(broker_exc, OrderOutcomeUnknown) and new_count < max_attempts:
             _reschedule(child, sub_settings)
             child.reject_reason = OUTCOME_UNKNOWN_REASON

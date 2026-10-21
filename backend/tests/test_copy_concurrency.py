@@ -299,6 +299,8 @@ def test_inline_timeout_retry_resends_the_same_client_order_id(monkeypatch):
     seen: list = []
 
     class _Adapter:
+        dedupes_client_order_id = True   # Alpaca/Webull; a non-deduping broker never re-sends
+
         def place_order(self, req):
             seen.append(req.client_order_id)
             if len(seen) == 1:
@@ -334,7 +336,7 @@ def test_scheduled_retry_reuses_the_mirrors_own_id(world, monkeypatch):
     monkeypatch.setattr(retry_scheduler, "adapter_for", lambda acct, creds: object())
     monkeypatch.setattr(retry_scheduler.events, "publish", lambda *a, **k: None)
 
-    def _place(adapter, req):
+    def _place(adapter, req, **kw):
         sent.append(req.client_order_id)
         return BrokerOrderResult(broker_order_id="B-RETRY", status=OrderStatus.ACCEPTED,
                                  submitted_at=datetime.now(timezone.utc),

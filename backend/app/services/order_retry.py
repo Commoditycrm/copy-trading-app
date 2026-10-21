@@ -490,10 +490,11 @@ def lookup_placed_order(
 ) -> tuple[str, AdoptedOrderResult | None]:
     """("found", result), ("absent", None), ("failed", None) when the lookup
     errored, or ("unsupported", None) when the adapter can't look up."""
+    find = getattr(adapter, "find_placed_order", None)
+    if find is None:
+        return "unsupported", None
     try:
-        found = adapter.find_placed_order(
-            request, placed_after=placed_after, exclude_ids=exclude_ids,
-        )
+        found = find(request, placed_after=placed_after, exclude_ids=exclude_ids)
     except NotImplementedError:
         return "unsupported", None
     except Exception:  # noqa: BLE001
@@ -532,7 +533,7 @@ def place_order_with_recovery(
     backoff = initial_backoff_s
     attempt = 0
     last_exc: BaseException | None = None
-    dedupes = adapter.dedupes_client_order_id and bool(request.client_order_id)
+    dedupes = getattr(adapter, "dedupes_client_order_id", False) and bool(request.client_order_id)
     while attempt < max_attempts:
         attempt += 1
         sent_at = datetime.now(timezone.utc)
