@@ -211,10 +211,12 @@ def reconcile_once() -> None:
             )
         ).all()
     from app.services import shared_accounts  # noqa: PLC0415
+    quarantined: dict[uuid.UUID, uuid.UUID] = {}
     for user_id, acct_id in rows:
         # A trader account another user also holds is quarantined: leaving it
         # out of `desired` also stops a listener that's already running on it.
         if shared_accounts.listener_blocked(acct_id):
+            quarantined[user_id] = acct_id
             continue
         # One-broker-per-user; if duplicates ever exist, last wins (arbitrary
         # but stable enough — the listener restarts cleanly either way).
@@ -231,18 +233,22 @@ def reconcile_once() -> None:
     for trader_id in running - desired_ids:
         log.info("reconcile: stopping orphaned listener for trader %s", trader_id)
         _stop_listener_local(trader_id)
+        if trader_id in quarantined:
+            # the stop just wrote "disconnected"; put the reason back
+            shared_accounts.listener_blocked(quarantined[trader_id])
 
     # Clear stale status keys: a trader with neither a connected broker (not
     # desired) nor a live task (not running) but still a lingering
     # listener:state key — e.g. a disconnect whose stop message was lost, or a
     # listener that died across a restart. Without this their pill (and any
-    # subscriber following them) shows "online" forever.
+    # subscriber following them) shows "online" forever. A quarantined trader's
+    # key is the reason they see, not stale — keep it.
     for tid_str in list(listener_state.get_all_statuses().keys()):
         try:
             tid = uuid.UUID(tid_str)
         except ValueError:
             continue
-        if tid not in desired_ids and tid not in running:
+        if tid not in desired_ids and tid not in running and tid not in quarantined:
             log.info("reconcile: clearing stale listener state for %s", tid)
             listener_state.clear(tid)
 

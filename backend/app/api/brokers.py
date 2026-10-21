@@ -464,6 +464,19 @@ def _refuse_shared_account(
     raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who=who))
 
 
+def _notices(*parts: str | None) -> str | None:
+    return " ".join(p for p in parts if p) or None
+
+
+def _shared_notice(db: Session, user: User, acct: BrokerAccount) -> str | None:
+    """A trader may connect an account some unrelated user also holds (no
+    follow between them, so no loop), but its listener stays quarantined. Say
+    so now rather than leaving them to find a silent "Broker offline"."""
+    if user.role != UserRole.TRADER or not shared_accounts.shared_with_another_user(db, acct):
+        return None
+    return shared_accounts.QUARANTINE_MESSAGE
+
+
 def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
     """Start the trader's listener inline when this process runs background
     workers. In the web/worker split the worker's listeners.reconcile() picks
@@ -1052,7 +1065,7 @@ def connect(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
-    acct.notice = _after_release(released)
+    acct.notice = _notices(_after_release(released), _shared_notice(db, user, acct))
 
     # If the connecting user is a trader, spin up the listener so trades
     # placed directly at the broker propagate to subscribers. The
@@ -1393,7 +1406,7 @@ def activate_broker(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
-    acct.notice = _after_release(released)
+    acct.notice = _notices(_after_release(released), _shared_notice(db, user, acct))
     _start_trader_listener(user, acct)
     return acct
 

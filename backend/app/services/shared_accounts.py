@@ -126,19 +126,42 @@ def listener_blocked(broker_account_id: uuid.UUID) -> bool:
         with SessionLocal() as db:
             acct = db.get(BrokerAccount, broker_account_id)
             blocked = acct is not None and shared_with_another_user(db, acct)
+            owner = acct.user_id if acct is not None else None
     except Exception:  # noqa: BLE001
         log.warning("shared-account check failed for %s", broker_account_id, exc_info=True)
         return False
     if not blocked:
         _quarantined.discard(broker_account_id)
-    elif broker_account_id not in _quarantined:
+        return False
+    if broker_account_id not in _quarantined:
         _quarantined.add(broker_account_id)
         log.warning(
             "listener NOT started for broker account %s: another user has the same "
             "brokerage account, so its orders would be copied as this trader's",
             broker_account_id,
         )
-    return blocked
+    _show_quarantine(owner)
+    return True
+
+
+QUARANTINE_STATE = "shared_account"
+QUARANTINE_MESSAGE = (
+    "This brokerage account is also connected by another Kopyya user, so orders "
+    "placed outside Kopyya can't be told apart and aren't copied. Trade Panel "
+    "orders still copy. Connect an account no other user has to restore it."
+)
+
+
+def _show_quarantine(trader_id: uuid.UUID | None) -> None:
+    """Without this the trader just saw "Broker offline" (no listener → no
+    status) with no hint why. Written only on change so state_changed_at holds."""
+    if trader_id is None:
+        return
+    from app.services import listener_state  # noqa: PLC0415
+
+    cur = listener_state.get_status(trader_id)
+    if cur is None or cur.state != QUARANTINE_STATE:
+        listener_state.set_state(trader_id, QUARANTINE_STATE, error=QUARANTINE_MESSAGE)
 
 
 CONFLICT_MESSAGE = (
