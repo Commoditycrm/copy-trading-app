@@ -56,7 +56,10 @@ export interface ListenerStatus {
     | "in_use_elsewhere"
     // Webull: subscribed, but the stream stopped delivering orders; the REST
     // poller is carrying them (a few seconds slower) until it recovers.
-    | "silent";
+    | "silent"
+    // Another Kopyya user has the same brokerage account; the listener is
+    // held off so their orders aren't copied as this trader's. last_error says why.
+    | "shared_account";
   last_event_at: string | null;
   state_changed_at: string | null;
   last_error: string | null;

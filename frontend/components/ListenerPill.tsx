@@ -6,6 +6,7 @@
  *   🟢 Live           ← connected and receiving
  *   🟡 Reconnecting   ← drop detected, retrying
  *   🟠 Silent         ← connected, but the stream stopped delivering (orders by polling)
+ *   🟠 Shared account ← another user has the same brokerage account; outside orders aren't copied
  *   🔴 Offline        ← disconnected (or credentials missing)
  *   ⚪ No broker      ← no broker connected
  *
@@ -33,6 +34,9 @@ interface Props {
   role: "trader" | "subscriber";
 }
 
+const SHARED_ACCOUNT_HINT =
+  "Another Kopyya user has this brokerage account connected, so orders placed outside Kopyya aren't copied. Connect an account no one else uses.";
+
 const STATE_LABEL: Record<ListenerStatus["state"], string> = {
   connecting: "Connecting…",
   connected: "Live",
@@ -43,6 +47,7 @@ const STATE_LABEL: Record<ListenerStatus["state"], string> = {
   no_broker: "No broker",
   in_use_elsewhere: "Live elsewhere",
   silent: "Connected but silent (orders by polling)",
+  shared_account: "Shared account",
 };
 
 const STATE_COLOR: Record<ListenerStatus["state"], string> = {
@@ -55,6 +60,7 @@ const STATE_COLOR: Record<ListenerStatus["state"], string> = {
   no_broker: "#94a3b8",
   in_use_elsewhere: "#f97316",
   silent: "#f59e0b",
+  shared_account: "#f97316",
 };
 
 /* The maps above are typed against the union so a state added to ListenerStatus
@@ -142,6 +148,9 @@ export function ListenerPill({ role }: Props) {
     if (s === "in_use_elsewhere" && prevState.current !== s) {
       notify.warn(status?.last_error || "Webull is live somewhere else — deactivate it there.");
     }
+    if (s === "shared_account" && prevState.current !== s) {
+      notify.warn(status?.last_error || SHARED_ACCOUNT_HINT);
+    }
     prevState.current = s;
   }, [s, status?.last_error]);
   const color = colorFor(s);
@@ -154,6 +163,7 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_trader") return "Pick a trader to follow on the Settings page";
     if (s === "credentials_invalid") return "Broker credentials missing or revoked";
     if (s === "in_use_elsewhere") return status?.last_error || "Webull is live somewhere else";
+    if (s === "shared_account") return status?.last_error || SHARED_ACCOUNT_HINT;
     if (s === "silent") {
       const lastStream = status?.last_event_at ? fmtRel(status.last_event_at) : "never";
       return `${status?.last_error || "The broker stream stopped delivering orders; they are arriving by polling."} · last stream event ${lastStream}`;
@@ -175,6 +185,7 @@ export function ListenerPill({ role }: Props) {
     if (s === "no_trader") return "No trader followed";
     if (s === "credentials_invalid") return `${prefix} disconnected`;
     if (s === "in_use_elsewhere") return "Webull live elsewhere";
+    if (s === "shared_account") return "Broker shared — outside orders not copied";
     if (s === "silent") return label;
     return `${prefix} ${label.toLowerCase()}`;
   })();
