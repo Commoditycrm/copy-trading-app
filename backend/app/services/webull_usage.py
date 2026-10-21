@@ -129,6 +129,18 @@ def record_wait(app_key: str | None, action: str, waited_s: float) -> None:
         pass
 
 
+def record_queue_full(app_key: str | None, action: str) -> None:
+    """A call sent at once because its endpoint's queue was already longer than
+    the pacer lets a caller wait: more reads wanted than Webull allows."""
+    try:
+        minute = int(time.time() // 60)
+        r = _redis()
+        r.hincrby(_KEY.format(minute), f"queue_full|{app_hash(app_key)}|{action}", 1)
+        r.expire(_KEY.format(minute), _KEEP_S)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def install() -> None:
     """Wrap the Webull SDK's single-request method. Idempotent; a missing SDK
     is fine (nothing calls Webull then)."""
@@ -154,7 +166,9 @@ def install() -> None:
             from app.services import webull_pacer  # noqa: PLC0415
 
             waited = webull_pacer.wait_turn(app_hash(app_key), action)
-            if waited > 0:
+            if waited == webull_pacer.QUEUE_FULL:
+                record_queue_full(app_key, action)
+            elif waited > 0:
                 record_wait(app_key, action, waited)
         except Exception:  # noqa: BLE001 — pacing must never break a broker call
             pass
@@ -181,6 +195,7 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
     by_endpoint: dict[str, int] = {}
     limited_by: dict[tuple[str, str], int] = {}
     paced: dict[str, dict[str, int]] = {}
+    queue_full: dict[str, int] = {}
     per_minute: list[dict] = []
     try:
         r = _redis()
@@ -189,6 +204,11 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
             count = 0
             for field, n in raw.items():
                 field = field.decode() if isinstance(field, bytes) else field
+                if field.startswith("queue_full|"):
+                    _kind, h, action = field.split("|", 2)
+                    if h in hashes:
+                        queue_full[action] = queue_full.get(action, 0) + int(n)
+                    continue
                 if field.startswith(("paced|", "paced_ms|")):
                     kind, _sep, rest = field.partition("|")
                     h, _sep, action = rest.partition("|")
@@ -237,8 +257,14 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
              for k, v in paced.items()),
             key=lambda x: -x["calls"],
         ),
+        # Calls sent without waiting because their endpoint's queue was already
+        # full — more reads wanted than Webull allows. These are the ones that
+        # can still be refused.
+        "queue_full": sorted(
+            ({"endpoint": k, "calls": v} for k, v in queue_full.items()), key=lambda x: -x["calls"],
+        ),
     }
 
 
-__all__ = ["tag", "tagged", "install", "record", "record_wait", "summary", "app_hash",
+__all__ = ["tag", "tagged", "install", "record", "record_wait", "record_queue_full", "summary", "app_hash",
            "set_request_caller", "reset_request_caller", "current_caller"]

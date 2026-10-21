@@ -96,8 +96,12 @@ def _redis():
     return get_sync_redis()
 
 
+QUEUE_FULL = -1.0
+
+
 def wait_turn(app_hash: str, action: str | None, *, sleep=time.sleep, clock=time.time) -> float:
-    """Wait for this call's slot. Returns the seconds waited (0 when not paced)."""
+    """Wait for this call's slot. Returns the seconds waited (0 when not paced),
+    or QUEUE_FULL when the queue was too long and the call goes out at once."""
     endpoint = paced(action)
     if endpoint is None or not app_hash or _on_event_loop_thread():
         return 0.0
@@ -111,11 +115,11 @@ def wait_turn(app_hash: str, action: str | None, *, sleep=time.sleep, clock=time
     if slot < 0:
         log.info("webull pacer: %s queue is over %.1fs for key=%s — sending unpaced",
                  endpoint, MAX_WAIT_S, app_hash[:8])
-        return 0.0
+        return QUEUE_FULL
     wait = (slot - now) / 1000.0
     if wait > 0:
         sleep(wait)
     return wait
 
 
-__all__ = ["GAP_S", "MAX_WAIT_S", "paced", "wait_turn"]
+__all__ = ["GAP_S", "MAX_WAIT_S", "QUEUE_FULL", "paced", "wait_turn"]

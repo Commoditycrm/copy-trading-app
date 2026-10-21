@@ -216,6 +216,12 @@ def live_closeable_quantity(
       * ``None`` when positions couldn't be read — callers must then NOT clamp
         (we can't prove the size is wrong, so leave the order untouched).
     """
+    # Read LIVE, not a positions read shared earlier in this alert or tick
+    # (risk_tick): the broker has just refused this close for its size, which
+    # is the moment the earlier view is in doubt. Only reached after a refusal.
+    from app.services import risk_tick  # noqa: PLC0415
+
+    risk_tick.invalidate()
     try:
         positions = adapter.get_positions()
     except Exception:  # noqa: BLE001

@@ -106,7 +106,7 @@ def test_app_keys_do_not_wait_on_each_other(r):
 def test_a_queue_longer_than_the_cap_sends_at_once_and_reserves_nothing(r):
     w = _run(["/openapi/assets/positions"] * 6)
     assert w[:4] == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 3 * pacer.GAP_S]
-    assert w[4:] == [0.0, 0.0]                         # 5s away > MAX_WAIT_S: unpaced
+    assert w[4:] == [pacer.QUEUE_FULL, pacer.QUEUE_FULL]   # 5s away > MAX_WAIT_S: sent at once
     assert len(r.last) == 1
 
 
@@ -169,6 +169,96 @@ def test_the_lua_reservation_against_redis():
     try:
         waits = [pacer.wait_turn(key, "/openapi/assets/positions", sleep=lambda s: None, clock=lambda: 5000.0)
                  for _ in range(5)]
-        assert waits == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 3 * pacer.GAP_S, 0.0]
+        assert waits == [0.0, pacer.GAP_S, 2 * pacer.GAP_S, 3 * pacer.GAP_S, pacer.QUEUE_FULL]
     finally:
         real.delete(f"webull:pace:{key}:positions")
+
+
+def test_a_call_sent_because_the_queue_was_full_is_counted(r, monkeypatch):
+    from webull.core.client import ApiClient
+
+    monkeypatch.setattr(pacer, "wait_turn", lambda h, action: pacer.QUEUE_FULL)
+    monkeypatch.setattr(ApiClient, "_handle_single_request", lambda self, e, req, *a, **k: (429, {}, b"", None, None))
+    monkeypatch.setattr(wu, "_installed", False)
+    wu.install()
+    client = ApiClient.__new__(ApiClient)
+    client._app_key = "KEY"
+    req = type("Req", (), {"get_action_name": lambda self: "/openapi/assets/positions"})()
+    ApiClient._handle_single_request(client, None, req)
+    s = wu.summary(["KEY"], minutes=5)
+    assert s["queue_full"] == [{"endpoint": "/openapi/assets/positions", "calls": 1}]
+    assert s["paced"] == [] and s["total"] == 1
+
+
+# ── one positions read per Discord alert ─────────────────────────────────────
+
+def _alert(fetches, *, place_between=False):
+    from app.api import discord_sources as ds
+    from app.services import risk_tick
+
+    def _fetch():
+        fetches.append(1)
+        return ["positions"]
+
+    @ds._with_alert_reason
+    def _execute(db, user, msg, background, request):
+        for i in range(4):                             # sizing, caps, close check, …
+            risk_tick.get_or_fetch("KEY:acct", _fetch)
+            if place_between and i == 1:
+                risk_tick.invalidate("KEY:acct")       # what a placed order does
+        return "ok"
+
+    db = type("Db", (), {"get": lambda self, *a: None})()
+    msg = type("Msg", (), {"content": "SPY 700C @1.00", "source_id": None})()
+    return _execute(db, None, msg, None, None)
+
+
+def test_one_alert_reads_positions_once():
+    """QA 2026-10-21: one of Srini's alerts made 15 Webull calls and 4 positions
+    reads were refused."""
+    fetches = []
+    assert _alert(fetches) == "ok"
+    assert len(fetches) == 1
+
+
+def test_an_order_placed_in_the_alert_makes_the_next_read_live():
+    fetches = []
+    _alert(fetches, place_between=True)
+    assert len(fetches) == 2
+
+
+def test_each_alert_reads_afresh():
+    fetches = []
+    _alert(fetches)
+    _alert(fetches)
+    assert len(fetches) == 2
+
+
+def test_an_outer_tick_is_kept():
+    """Auto-trim submits its own alert inside the P&L poller's tick."""
+    from app.services import risk_tick
+
+    token = risk_tick.begin()
+    try:
+        risk_tick.get_or_fetch("KEY:acct", lambda: ["outer"])
+        fetches = []
+        _alert(fetches)
+        assert fetches == [], "the outer tick's read is shared"
+        assert risk_tick.active()
+    finally:
+        risk_tick.end(token)
+
+
+def test_after_a_refused_close_positions_are_read_live():
+    from app.services import order_retry, risk_tick
+
+    token = risk_tick.begin()
+    try:
+        risk_tick.get_or_fetch("KEY:acct", lambda: ["stale"])
+        assert "KEY:acct" in risk_tick._tick.get().snapshots
+        req = type("Req", (), {"symbol": "SPY", "side": None, "option_right": None})()
+        adapter = type("A", (), {"get_positions": lambda self: []})()
+        order_retry.live_closeable_quantity(adapter, req)
+        assert risk_tick._tick.get().snapshots == {}
+    finally:
+        risk_tick.end(token)

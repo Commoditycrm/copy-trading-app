@@ -25,6 +25,9 @@ interface Usage {
   /** Calls held back for their turn on an endpoint's 2-per-2s counter instead
    *  of being refused (services/webull_pacer.py). */
   paced?: { endpoint: string; calls: number; avg_wait_ms: number }[];
+  /** Sent at once because the endpoint's queue was already full — more reads
+   *  wanted than Webull allows; these are the calls that can still be refused. */
+  queue_full?: { endpoint: string; calls: number }[];
 }
 
 const WINDOWS = [1, 5, 15, 60] as const;
@@ -54,6 +57,8 @@ export function WebullUsage() {
   const limitedBy = usage.rate_limited_by ?? [];
   const paced = usage.paced ?? [];
   const pacedTotal = paced.reduce((n, p) => n + p.calls, 0);
+  const queueFull = usage.queue_full ?? [];
+  const queueFullTotal = queueFull.reduce((n, q) => n + q.calls, 0);
 
   return (
     <div
@@ -75,6 +80,7 @@ export function WebullUsage() {
         <span>({perMin.toFixed(1)}/min)</span>
         <span style={{ color: limitedTone }}>· {usage.rate_limited} rate-limited</span>
         {pacedTotal > 0 && <span style={{ color: "var(--muted)" }}>· {pacedTotal} waited their turn</span>}
+        {queueFullTotal > 0 && <span style={{ color: "var(--warn)" }}>· {queueFullTotal} sent without waiting (queue full)</span>}
       </button>
 
       {open && (
@@ -139,7 +145,7 @@ export function WebullUsage() {
               </tbody>
             </table>
           </div>
-          {(limitedBy.length > 0 || paced.length > 0) && (
+          {(limitedBy.length > 0 || paced.length > 0 || queueFull.length > 0) && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {limitedBy.length > 0 && (
                 <table className="w-full">
@@ -176,6 +182,24 @@ export function WebullUsage() {
                         <td className="py-1 font-mono text-[11px]" style={{ color: "var(--text)" }}>{p.endpoint}</td>
                         <td className="py-1 text-right num">{p.calls}</td>
                         <td className="py-1 text-right num">{(p.avg_wait_ms / 1000).toFixed(2)} s</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {queueFull.length > 0 && (
+                <table className="w-full">
+                  <thead>
+                    <tr style={{ color: "var(--muted)" }} title="More reads were wanted than Webull allows, so these went out without waiting — the calls that can still be refused">
+                      <th className="text-left font-medium py-1">Sent without waiting (queue full)</th>
+                      <th className="text-right font-medium py-1">Calls</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {queueFull.map((q) => (
+                      <tr key={q.endpoint} style={{ borderTop: "1px solid var(--border)" }}>
+                        <td className="py-1 font-mono text-[11px]" style={{ color: "var(--text)" }}>{q.endpoint}</td>
+                        <td className="py-1 text-right num" style={{ color: "var(--warn)" }}>{q.calls}</td>
                       </tr>
                     ))}
                   </tbody>
