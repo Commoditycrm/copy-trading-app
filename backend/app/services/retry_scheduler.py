@@ -14,6 +14,15 @@ incremented, retry_at pushed forward by the subscriber's retry interval.
 On final failure (retry_count == retry_max_attempts) → status=REJECTED,
 audit ``copy.retry_failed``, persistent Notification for the subscriber.
 
+Unconfirmed sends
+-----------------
+A timeout may have placed the order. Before re-placing, the broker is asked
+whether it has it; a match is adopted (``copy.retry_adopted``), not re-sent.
+Brokers that refuse a repeated client_order_id (Alpaca, Webull) can always be
+re-sent safely. Others (SnapTrade) get at most ONE automatic re-send after an
+unconfirmed one; past that the mirror goes to manual review
+(``copy.retry_needs_review``) instead of looping.
+
 Retry count
 -----------
 The subscriber controls how many additional attempts are made via
@@ -53,7 +62,14 @@ from app.services import audit, events
 from app.services.copy_engine import _order_event, _RETRY_INTERVAL_MINUTES
 from app.services.crypto import decrypt_json
 from app.services.notifications import create_notification
-from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
+from app.services.order_retry import (
+    OUTCOME_UNKNOWN_REASON,
+    AdoptedOrderResult,
+    OrderOutcomeUnknown,
+    RecoverableOrderError,
+    lookup_placed_order,
+    place_order_with_recovery,
+)
 from app.services.pnl import today_realized_pnl
 
 log = logging.getLogger(__name__)
@@ -157,12 +173,86 @@ def _passes_gates(db: Session, child: Order, trader_order: Order) -> str | None:
     return None
 
 
+NEEDS_REVIEW_REASON = (
+    "The broker never confirmed this order and it couldn't be verified, so it "
+    "wasn't re-sent. Check your broker account before placing it yourself."
+)
+
+
+def _reschedule(child: Order, sub_settings: SubscriberSettings) -> None:
+    interval = (
+        sub_settings.retry_interval_close if child.is_closing
+        else sub_settings.retry_interval_open
+    )
+    minutes = _RETRY_INTERVAL_MINUTES.get(interval, 1)
+    child.status = OrderStatus.RETRY_PENDING
+    child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+
+def _known_broker_ids(db: Session, child: Order, placed_after: datetime) -> frozenset[str]:
+    """Broker ids our other orders on this account already own, so a contract
+    match never adopts a sibling mirror's order."""
+    rows = db.execute(
+        select(Order.broker_order_id).where(
+            Order.broker_account_id == child.broker_account_id,
+            Order.broker_order_id.is_not(None),
+            Order.id != child.id,
+            Order.created_at >= placed_after - timedelta(hours=1),
+        )
+    ).scalars()
+    return frozenset(str(r) for r in rows)
+
+
+def _needs_review(
+    db: Session, child: Order, trader_order: Order, error: str, *, counted: bool = False,
+) -> str:
+    """Stop retrying a mirror whose placement can't be proven either way."""
+    if not counted:
+        child.retry_count += 1
+    child.status = OrderStatus.REJECTED
+    child.reject_reason = NEEDS_REVIEW_REASON
+    child.closed_at = datetime.now(timezone.utc)
+    audit.record(
+        db, actor_user_id=child.user_id, action="copy.retry_needs_review",
+        entity_type="order", entity_id=child.id,
+        metadata={"parent_order_id": str(trader_order.id), "error": error[:300],
+                  "attempts_made": child.retry_count},
+    )
+    _notify_retry_failed(db, child, trader_order, child.retry_count)
+    db.commit()
+    events.publish(child.user_id, _order_event("order.copy_failed", child))
+    return "needs_review"
+
+
+def _hold_unverified(
+    db: Session, child: Order, trader_order: Order,
+    sub_settings: SubscriberSettings, max_attempts: int, lookup_state: str,
+) -> str:
+    """The lookup couldn't run: check again later, or give up to review."""
+    child.retry_count += 1
+    if child.retry_count >= max_attempts:
+        return _needs_review(db, child, trader_order, f"order lookup {lookup_state}", counted=True)
+    _reschedule(child, sub_settings)
+    child.reject_reason = OUTCOME_UNKNOWN_REASON
+    audit.record(
+        db, actor_user_id=child.user_id, action="copy.retry_rescheduled",
+        entity_type="order", entity_id=child.id,
+        metadata={"attempt": child.retry_count, "max_attempts": max_attempts,
+                  "retry_at": child.retry_at.isoformat(), "lookup": lookup_state,
+                  "outcome_unknown": True},
+    )
+    db.commit()
+    events.publish(child.user_id, _order_event("order.copy_retry_scheduled", child))
+    return "rescheduled"
+
+
 # ── per-order retry ─────────────────────────────────────────────────────────
 
 def _retry_one_order(order_id: uuid.UUID) -> str:
     """Pick up one RETRY_PENDING order, run gates + broker call. Returns
-    a short outcome string for logging: "succeeded" / "rescheduled" /
-    "gate_failed:<reason>" / "broker_failed" / "vanished"."""
+    a short outcome string for logging: "succeeded" / "adopted" /
+    "rescheduled" / "needs_review" / "gate_failed:<reason>" /
+    "broker_failed" / "vanished"."""
     with SessionLocal() as db:
         child = db.get(Order, order_id)
         if child is None or child.status != OrderStatus.RETRY_PENDING:
@@ -243,20 +333,43 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             client_order_id=str(child.id),
         )
 
+        # An earlier send may already have landed. Deduping brokers are always
+        # checked (one by-id read); contract-matched ones only after a send we
+        # couldn't confirm, since a 429/refusal placed nothing.
+        unknown_before = (child.reject_reason or "").startswith(OUTCOME_UNKNOWN_REASON)
+        dedupes = adapter.dedupes_client_order_id
+        placed_after = child.created_at or (datetime.now(timezone.utc) - timedelta(hours=1))
+        exclude = frozenset() if dedupes else _known_broker_ids(db, child, placed_after)
+        resp = None
+        if dedupes or unknown_before:
+            state, resp = lookup_placed_order(
+                adapter, request, placed_after=placed_after, exclude_ids=exclude,
+            )
+            if resp is None and unknown_before and not dedupes and state != "absent":
+                # Can't prove the first send missed, and a re-send isn't deduped.
+                return _hold_unverified(db, child, trader_order, sub_settings, max_attempts, state)
+
         # Broker call — succeed, fail, or surface a clean reason.
         broker_exc: Exception | None = None
         broker_friendly: str | None = None
-        try:
-            resp = place_order_with_recovery(adapter, request)
-        except RecoverableOrderError as rec:
-            broker_exc = rec
-            broker_friendly = rec.friendly_message
-        except Exception as exc:  # noqa: BLE001
-            broker_exc = exc
-            broker_friendly = None
+        if resp is None:
+            try:
+                resp = place_order_with_recovery(adapter, request, exclude_ids=exclude)
+            except RecoverableOrderError as rec:
+                broker_exc = rec
+                broker_friendly = rec.friendly_message
+            except OrderOutcomeUnknown as unk:
+                if unknown_before:
+                    # That was the one automatic re-send; don't gamble again.
+                    return _needs_review(db, child, trader_order, str(unk.original))
+                broker_exc = unk
+            except Exception as exc:  # noqa: BLE001
+                broker_exc = exc
+                broker_friendly = None
 
         if broker_exc is None:
             # Success on retry
+            adopted = isinstance(resp, AdoptedOrderResult)
             child.status = resp.status
             child.broker_order_id = resp.broker_order_id
             child.submitted_at = resp.submitted_at
@@ -265,7 +378,8 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             child.retry_count += 1
             child.reject_reason = None
             audit.record(
-                db, actor_user_id=child.user_id, action="copy.retry_succeeded",
+                db, actor_user_id=child.user_id,
+                action="copy.retry_adopted" if adopted else "copy.retry_succeeded",
                 entity_type="order", entity_id=child.id,
                 metadata={
                     "parent_order_id": str(trader_order.id),
@@ -275,21 +389,31 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             )
             db.commit()
             events.publish(child.user_id, _order_event("order.copy_submitted", child))
-            return "succeeded"
+            return "adopted" if adopted else "succeeded"
 
         # Broker call failed — decide whether to reschedule or give up.
         child.retry_count += 1
         new_count = child.retry_count
 
+        if isinstance(broker_exc, OrderOutcomeUnknown) and new_count < max_attempts:
+            _reschedule(child, sub_settings)
+            child.reject_reason = OUTCOME_UNKNOWN_REASON
+            audit.record(
+                db, actor_user_id=child.user_id, action="copy.retry_rescheduled",
+                entity_type="order", entity_id=child.id,
+                metadata={"attempt": new_count, "max_attempts": max_attempts,
+                          "retry_at": child.retry_at.isoformat(),
+                          "error": str(broker_exc)[:300], "outcome_unknown": True},
+            )
+            db.commit()
+            events.publish(child.user_id, _order_event("order.copy_retry_scheduled", child))
+            return "rescheduled"
+        if isinstance(broker_exc, OrderOutcomeUnknown):
+            return _needs_review(db, child, trader_order, str(broker_exc.original), counted=True)
+
         if new_count < max_attempts:
             # More retries allowed — reschedule.
-            interval = (
-                sub_settings.retry_interval_close if child.is_closing
-                else sub_settings.retry_interval_open
-            )
-            minutes = _RETRY_INTERVAL_MINUTES.get(interval, 1)
-            child.status = OrderStatus.RETRY_PENDING
-            child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            _reschedule(child, sub_settings)
             reason_str = broker_friendly or str(broker_exc)
             child.reject_reason = f"transient broker error, will retry ({new_count}/{max_attempts})"
             audit.record(

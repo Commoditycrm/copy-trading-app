@@ -189,6 +189,27 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def get_order(self, broker_order_id: str) -> BrokerOrderResult: ...
 
+    # True when the broker refuses a second order carrying a client_order_id it
+    # has already accepted. Re-sending after a timeout then can't double-execute;
+    # the worst case is a duplicate-id rejection, which we resolve by lookup.
+    dedupes_client_order_id: bool = False
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+        exclude_ids: frozenset[str] = frozenset(),
+    ) -> BrokerOrderResult | None:
+        """The order a timed-out ``place_order(req)`` may have created.
+
+        None means the broker positively has no such order. Raises when the
+        lookup itself failed (outcome still unknown); NotImplementedError when
+        this adapter can't look orders up at all. ``placed_after`` bounds the
+        search for adapters that match by contract rather than client id;
+        ``exclude_ids`` are broker ids already owned by other orders of ours."""
+        raise NotImplementedError
+
     def cancel_order(self, broker_order_id: str) -> bool:
         """Cancel a working order.
 
