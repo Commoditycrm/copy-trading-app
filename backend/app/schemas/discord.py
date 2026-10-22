@@ -411,6 +411,12 @@ class DiscordSignalOut(BaseModel):
     # The alert named ONLY a symbol ("META -> 100%") — the whole contract has to
     # come from the open position.
     contract_unspecified: bool = False
+    # The symbol the "Current price" column follows (OCC for an option, the
+    # ticker for a stock): the alert's contract, completed from the channel's
+    # open position or the nearest listed expiry when the alert left part of it
+    # out. Null for rows not worth a live price — older than an hour, or already
+    # submitted or accepted. See services/discord_signal_prices.py.
+    live_symbol: str | None = None
     # Always a limit order; True when the price still has to come from the live
     # quote because the alert didn't state one.
     limit_price_unspecified: bool = False

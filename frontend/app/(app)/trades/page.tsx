@@ -81,6 +81,10 @@ type DiscordSignal = {
   original_quantity: string | null;
   position_closed: boolean;
   expiry_unspecified: boolean;
+  /** The symbol the Current price follows (OCC for an option): the alert's
+   *  contract, completed from the channel's open position or the nearest
+   *  listed expiry. Null when the row gets no live price. */
+  live_symbol?: string | null;
   contract_unspecified: boolean;
   limit_price_unspecified: boolean;
   source_action: string | null;
@@ -225,6 +229,18 @@ function tracksLivePrice(o: Order): boolean {
   if (NO_LIVE_PRICE.includes(o.status)) return false;
   const placed = Date.parse(o.submitted_at ?? o.created_at ?? "");
   return Number.isFinite(placed) && Date.now() - placed <= LIVE_PRICE_MAX_AGE_MS;
+}
+
+/** A Discord alert row is priced for one hour after it is posted, and only
+ *  while it awaits a decision — not once it is submitted or accepted. The
+ *  server applies the same rule when it works out the contract (live_symbol);
+ *  checking the age here too stops a row ticking once the hour passes without
+ *  a reload. */
+const SIGNAL_LIVE_PRICE_MAX_AGE_MS = 60 * 60 * 1000;
+function tracksSignalLivePrice(o: Order): boolean {
+  if (o.status === "submitted" || o.status === "accepted" || o.status === "filled") return false;
+  const posted = Date.parse(o.submitted_at ?? o.created_at ?? "");
+  return Number.isFinite(posted) && Date.now() - posted <= SIGNAL_LIVE_PRICE_MAX_AGE_MS;
 }
 
 /** Live current-price cell for an order row. Ticks off the central stream (via
@@ -689,13 +705,28 @@ export default function TradesPage() {
   // them, then fill from the rest, capped so a big history load doesn't
   // subscribe the stream to hundreds of stale symbols. The shared hook
   // heartbeats it and pauses while the tab is hidden.
+  // A Discord row is priced by the contract the server worked out for it
+  // (live_symbol — the alert often names no expiry, or no contract at all),
+  // and only within its hour; an order row by its own contract.
+  const signalLiveSymbol = useMemo(
+    () => new Map(signals.map((sig) => [sig.row_key, sig.live_symbol ?? null])),
+    [signals],
+  );
+  const rowLiveKey = useCallback(
+    (o: Order): string | null => {
+      if (tab === "discord") {
+        return tracksSignalLivePrice(o) ? signalLiveSymbol.get(o.id) ?? null : null;
+      }
+      return tracksLivePrice(o) ? orderLiveKey(o) : null;
+    },
+    [tab, signalLiveSymbol],
+  );
   const watchKeys = useMemo(() => {
-    const tracked = gridRows.filter(tracksLivePrice);
-    const open = tracked.filter((o) => OPEN_STATUSES.includes(o.status));
-    const rest = tracked.filter((o) => !OPEN_STATUSES.includes(o.status));
-    const keys = [...open, ...rest].map(orderLiveKey).filter(Boolean) as string[];
+    const open = gridRows.filter((o) => OPEN_STATUSES.includes(o.status));
+    const rest = gridRows.filter((o) => !OPEN_STATUSES.includes(o.status));
+    const keys = [...open, ...rest].map(rowLiveKey).filter(Boolean) as string[];
     return Array.from(new Set(keys)).slice(0, 25);
-  }, [gridRows]);
+  }, [gridRows, rowLiveKey]);
   useMarketDataWatch(watchKeys);
   const isLoading = tab === "discord" ? signalsLoading : loading;
   // Row id -> the alert behind it, so the Actions cell can reach the decision
@@ -1383,7 +1414,7 @@ export default function TradesPage() {
                       ),
                       expected_price: <td className="px-5 py-3.5 num">{fmt(expectedPrice(o), 2)}</td>,
                       filled_price: <td className="px-5 py-3.5 num">{fmt(o.filled_avg_price, 2)}</td>,
-                      current_price: <LiveOrderPriceCell liveKey={tracksLivePrice(o) ? orderLiveKey(o) : null} />,
+                      current_price: <LiveOrderPriceCell liveKey={rowLiveKey(o)} />,
                       tp: (
                         <td className="px-5 py-3.5 num">
                           {isEntry ? (
