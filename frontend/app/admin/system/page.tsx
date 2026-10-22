@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import AwsCostSection from "./AwsCostSection";
 
 interface ContainerStat {
   name: string;
@@ -389,6 +390,9 @@ export default function SystemUsagePage() {
           <ContainersCard u={u} />
         </>
       )}
+
+      {/* own slow timer; independent of the live usage above */}
+      <AwsCostSection />
     </div>
   );
 }
