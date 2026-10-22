@@ -950,6 +950,7 @@ def list_signals(
         joined = joined.where(
             DiscordMessage.status != DiscordMessageStatus.IGNORED
         )
+        joined = _hide_unmarketable(db, user, joined)
     if search:
         joined = joined.where(DiscordMessage.content.ilike(f"%{search}%"))
 
@@ -1004,6 +1005,50 @@ def list_signals(
         limit=limit,
         offset=offset,
     )
+
+
+def _hide_unmarketable(db: Session, user: User, joined):
+    """Leave out of the tab the rows that name nothing that trades (QA
+    2026-10-22): chatter read as a trade — "Haha I bought 2 cons" as BUY HAHA,
+    "Yeah mine up 30%" as BUY YEAH — and rows with no symbol at all, the "—"
+    lines of alerts that couldn't be read.
+
+    Kept: an exit that names no contract ("SL hit") while its channel has an
+    open position — it acts on that position, and may be waiting for a
+    decision. Kept too, whenever the list of tradable symbols can't be had:
+    hiding a real alert is worse than showing a misread one.
+
+    Done in the query, so paging and the tab's count agree with what is shown.
+    """
+    from sqlalchemy import exists, not_  # noqa: PLC0415
+
+    from app.models.discord_position_guard import DiscordPositionGuard as G  # noqa: PLC0415
+    from app.services import market_symbols  # noqa: PLC0415
+
+    sym = func.upper(DiscordMessage.parsed_signal["symbol"].astext)
+    action = DiscordMessage.parsed_signal["action"].astext
+
+    # Which of this trader's alert symbols don't trade. One distinct-symbol
+    # read, then a set lookup each (the list is cached for a day).
+    seen = db.execute(
+        select(sym).distinct().where(
+            DiscordMessage.user_id == user.id,
+            DiscordMessage.status != DiscordMessageStatus.IGNORED,
+            DiscordMessage.parsed_signal.isnot(None),
+        )
+    ).scalars().all()
+    unlisted = [x for x in seen if x and market_symbols.is_listed(x) is False]
+
+    has_open_position = exists().where(
+        G.user_id == user.id, G.source_id == DiscordMessage.source_id, G.closed_at.is_(None),
+    )
+    no_symbol = or_(sym.is_(None), sym == "", sym == "—", sym == "-")
+    keep_no_symbol = (action == "SELL") & has_open_position
+    joined = joined.where(or_(not_(no_symbol), keep_no_symbol))
+    if unlisted:
+        # NULL-safe: a kept no-symbol exit must not fall out on NOT IN.
+        joined = joined.where(or_(sym.is_(None), not_(sym.in_(unlisted))))
+    return joined
 
 
 def _effective_quantity(m: DiscordMessage, sig: dict, multiplier: int, placed: dict) -> str | None:
