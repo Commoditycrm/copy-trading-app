@@ -329,6 +329,21 @@ def test_garbage_file_is_unavailable(cost_file, body):
     assert out["status"] == "unavailable" and out["error_code"] == "unreadable"
 
 
+def test_file_the_backend_cannot_read_is_unavailable(cost_file, monkeypatch):
+    cost_file.write_text(json.dumps({"status": "ok", "fetched_at": NOW.isoformat()}))
+    real_open = open
+
+    def denied(path, *a, **kw):
+        if str(path) == str(cost_file):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", denied)
+    out = reader.read_costs(NOW)
+    assert out["status"] == "unavailable" and out["error_code"] == "unreadable"
+    assert "PermissionError" in out["reason"]
+
+
 def test_backend_has_no_aws_sdk_or_credentials_path():
     src = Path(reader.__file__).read_text(encoding="utf-8")
     assert "boto3" not in src and "169.254" not in src

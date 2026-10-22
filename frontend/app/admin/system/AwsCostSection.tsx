@@ -180,6 +180,10 @@ export default function AwsCostSection() {
 
   const m = c?.month_to_date;
   const fetched = c?.fetched_at ? new Date(c.fetched_at) : null;
+  // The cards must say when a figure is an allocation, not only the table.
+  const basis = !m || m.qa_total_usd == null ? ""
+    : m.allocated_usd == null ? "direct (tagged)"
+    : m.direct_usd == null ? "allocated estimate" : "direct + allocated estimate";
 
   return (
     <div className="space-y-3">
@@ -233,11 +237,14 @@ export default function AwsCostSection() {
 
           <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}>
             <Stat label="Month-to-date (QA)" value={fmt(m.qa_total_usd)}
-                  sub={m.estimated ? "includes AWS estimates" : undefined} />
+                  sub={[basis, m.estimated ? "includes AWS estimates" : ""].filter(Boolean).join(" · ") || undefined} />
             <Stat label="Projected this month" value={fmt(c.projected_month_usd)}
-                  sub={c.projection_method === "aws_forecast" ? "AWS forecast" : c.projection_method ? "linear from daily average" : undefined} />
-            <Stat label={`Previous month${c.previous_month ? ` (${c.previous_month.month})` : ""}`} value={fmt(c.previous_month?.qa_total_usd)} />
-            <Stat label="Average daily" value={fmt(c.average_daily_usd)} sub="complete days only" />
+                  sub={[basis, c.projection_method === "aws_forecast" ? "AWS forecast" : c.projection_method ? "linear from daily average" : ""]
+                         .filter(Boolean).join(" · ") || undefined} />
+            <Stat label={`Previous month${c.previous_month ? ` (${c.previous_month.month})` : ""}`} value={fmt(c.previous_month?.qa_total_usd)}
+                  sub={basis || undefined} />
+            <Stat label="Average daily" value={fmt(c.average_daily_usd)}
+                  sub={[basis, "complete days only"].filter(Boolean).join(" · ")} />
           </div>
 
           <div className={card} style={cardStyle}>

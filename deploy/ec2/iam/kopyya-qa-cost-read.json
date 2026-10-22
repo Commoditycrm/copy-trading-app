@@ -11,7 +11,8 @@
       "Sid": "KopyyaQaAllocationCheck",
       "Effect": "Allow",
       "Action": ["ec2:DescribeInstances"],
-      "Resource": "*"
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-2"}}
     }
   ]
 }
