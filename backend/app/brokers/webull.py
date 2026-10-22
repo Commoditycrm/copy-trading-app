@@ -172,6 +172,9 @@ _OPTION_CONTAINER_KEYS = ("option", "option_info", "optionInfo", "contract",
 # before matching, so the padded form ("AAPL  250620C00220000") also lands here.
 _OCC_RE = re.compile(r"^([A-Z][A-Z.]{0,5})(\d{6})([CP])(\d{8})$")
 
+# A detail read of a client_order_id Webull never accepted.
+_ORDER_NOT_FOUND_RE = re.compile(r"not[\s_-]*(?:found|exist)|no[\s_-]*such[\s_-]*order", re.I)
+
 
 def _parse_occ(s: str) -> tuple[str, date, Decimal, OptionRight] | None:
     """OCC option symbol → (underlying root, expiry, strike, right), or None."""
@@ -1465,6 +1468,39 @@ class WebullAdapter(BrokerAdapter):
             filled_at=filled_at,
         )
 
+    # Reusing a client_order_id is refused (see the identity note above).
+    dedupes_client_order_id = True
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+    ) -> BrokerOrderResult | None:
+        if not req.client_order_id:
+            raise NotImplementedError("webull lookup needs a client_order_id")
+        coid = self._client_order_id(req)
+        # Called directly rather than via _fetch_detail, which folds "no such
+        # order" and "lookup failed" into the same None.
+        resp = self._trade_client().order_v3.get_order_detail(self.account_id, coid)
+        code = getattr(resp, "status_code", None)
+        if code != 200:
+            if code == 404 or _ORDER_NOT_FOUND_RE.search(self._error_text(resp)):
+                return None
+            raise RuntimeError(f"webull order lookup failed: {self._error_text(resp)}")
+        body = resp.json() or {}
+        if not body:
+            return None
+        _body, _is_opt, status, filled_qty, filled_px, filled_at = self._parse_detail(body)
+        return BrokerOrderResult(
+            broker_order_id=coid,
+            status=status,
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=filled_qty,
+            filled_avg_price=filled_px,
+            filled_at=filled_at,
+        )
+
     # How many of today's orders one snapshot call pulls back. Anything beyond
     # this falls back to a per-order read, so a large day degrades in cost rather
     # than in correctness.
@@ -1818,7 +1854,10 @@ class WebullAdapter(BrokerAdapter):
             return None
         if getattr(resp, "status_code", None) != 200:
             return None
-        body = resp.json() or {}
+        return self._parse_detail(resp.json() or {})
+
+    @staticmethod
+    def _parse_detail(body: Any):
         order = body if isinstance(body, dict) else {}
         legs = (
             order.get("items") or order.get("legs")

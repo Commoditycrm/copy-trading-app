@@ -50,13 +50,17 @@ from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
 from app.services.order_retry import (
+    OUTCOME_UNKNOWN_REASON,
     classify_error,
     clean_broker_error,
+    is_duplicate_client_id_error,
     is_no_position_close_error,
     is_order_conflict_error,
+    is_outcome_unknown_error,
     is_rate_limit_error,
     is_replace_chain_pending_error,
     live_closeable_quantity,
+    lookup_placed_order,
 )
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
 from app.services.shared_accounts import self_mirror_account_ids
@@ -840,6 +844,23 @@ def _retry_stock_market_as_limit(item: "_PendingMirror", req: BrokerOrderRequest
     item.request = retry
     log.info("mirror %s market refused (halt/illiquid) — retrying as LIMIT %s", req.symbol, limit)
     return item.adapter.place_order(retry)
+
+
+def _adopt_if_landed(
+    item: "_PendingMirror", exc: BaseException, sent_at: datetime,
+) -> BrokerOrderResult | None:
+    """After a timeout / duplicate-id refusal, the order this mirror's send
+    created, when a client-id lookup finds one. Contract-matched brokers are
+    left to retry_scheduler, which looks only after their order list settles."""
+    if not getattr(item.adapter, "dedupes_client_order_id", False):
+        return None
+    if not (is_outcome_unknown_error(exc) or is_duplicate_client_id_error(exc)):
+        return None
+    _, found = lookup_placed_order(item.adapter, item.request, placed_after=sent_at)
+    if found is not None:
+        log.warning("copy: mirror %s landed despite %s, adopting %s",
+                    item.child_order_id, type(exc).__name__, found.broker_order_id)
+    return found
 
 
 def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderResult:
@@ -3239,6 +3260,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # success and error, so the Performance page can surface the raw
             # broker round-trip ("Broker Response" / broker_call_ms).
             start = time.perf_counter()
+            sent_at = datetime.now(timezone.utc)
             last_exc: BaseException | None = None
             for attempt in range(_RATE_LIMIT_ATTEMPTS):
                 try:
@@ -3260,6 +3282,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     if is_rate_limit_error(exc) and attempt < _RATE_LIMIT_ATTEMPTS - 1:
                         await asyncio.sleep(_RATE_LIMIT_BACKOFF_S * (attempt + 1))
                         continue
+                    adopted = await asyncio.to_thread(_adopt_if_landed, item, exc, sent_at)
+                    if adopted is not None:
+                        return item, adopted, None, int((time.perf_counter() - start) * 1000)
                     return item, None, exc, int((time.perf_counter() - start) * 1000)
             return item, None, last_exc, int((time.perf_counter() - start) * 1000)
 
@@ -3554,7 +3579,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
                 # Preserve child.is_closing — resetting a close mirror to
                 # opening broke its retry interval + P&L basis (DEF-COPY-001).
-                child.reject_reason = "transient broker error, will retry"
+                # An unconfirmed send is flagged so the scheduler looks before
+                # it re-places.
+                child.reject_reason = (
+                    OUTCOME_UNKNOWN_REASON if is_outcome_unknown_error(exc)
+                    else "transient broker error, will retry"
+                )
                 # Don't set closed_at — order isn't terminal.
                 audit.record(
                     db,
@@ -3589,7 +3619,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 # exception with its HTTP-header dump, and never blank (exc was
                 # None) — so the user sees a real sentence. The raw string is
                 # preserved verbatim in the audit metadata for debugging.
-                clean = clean_broker_error(err)
+                clean = (
+                    "The broker didn't confirm this order (timed out) — it may "
+                    "still have been placed. Check your broker account."
+                    if exc is not None and is_outcome_unknown_error(exc)
+                    else clean_broker_error(err)
+                )
                 child.status = OrderStatus.REJECTED
                 child.reject_reason = clean[:480]
                 child.closed_at = datetime.now(timezone.utc)

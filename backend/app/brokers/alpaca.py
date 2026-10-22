@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from alpaca.trading.enums import OrderSide as AlpacaSide
@@ -308,7 +309,29 @@ class AlpacaAdapter(BrokerAdapter):
         )
 
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
-        resp = self._c().get_order_by_id(broker_order_id)
+        return self._to_result(self._c().get_order_by_id(broker_order_id))
+
+    # Alpaca 422s a reused client_order_id ("client_order_id must be unique").
+    dedupes_client_order_id = True
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+    ) -> BrokerOrderResult | None:
+        if not req.client_order_id:
+            raise NotImplementedError("alpaca lookup needs a client_order_id")
+        try:
+            resp = self._c().get_order_by_client_id(req.client_order_id)
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404 or "not found" in str(exc).lower():
+                return None
+            raise
+        return self._to_result(resp)
+
+    @staticmethod
+    def _to_result(resp: Any) -> BrokerOrderResult:
         return BrokerOrderResult(
             broker_order_id=str(resp.id),
             status=_STATUS_IN.get(resp.status, OrderStatus.SUBMITTED),
