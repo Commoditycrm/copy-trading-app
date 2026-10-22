@@ -980,14 +980,23 @@ def list_signals(
             for o in db.execute(select(Order).where(Order.id.in_(order_ids))).scalars()
         }
 
+    from app.services import discord_signal_prices  # noqa: PLC0415
+
     items: list[DiscordSignalOut] = []
+    price_cache: dict = {}
     for m, src in rows:
         signals = list(m.parsed_signals or ([m.parsed_signal] if m.parsed_signal else []))
         if not signals:
             items.append(_signal_out(m, src, {}, 0, multiplier, placed))
             continue
         for idx, sig in enumerate(signals):
-            items.append(_signal_out(m, src, sig or {}, idx, multiplier, placed))
+            row = _signal_out(m, src, sig or {}, idx, multiplier, placed)
+            try:
+                row.live_symbol = discord_signal_prices.live_symbol(
+                    db, user.id, m, sig or {}, cache=price_cache)
+            except Exception:  # noqa: BLE001 — a price is never worth failing the page for
+                log.warning("discord: no live symbol for %s", m.id, exc_info=True)
+            items.append(row)
 
     return Page[DiscordSignalOut](
         items=items,
