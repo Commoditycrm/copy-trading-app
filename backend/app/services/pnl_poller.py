@@ -141,6 +141,19 @@ _INTERVAL_BY_BROKER: dict[BrokerName, float] = {
 # invalid) can never tighten the poll — also guarded by max(base, …) below.
 _MIN_PNL_CLOSED_S = 30.0
 
+# Take-profit outcomes where the pass changed nothing. They repeat for every
+# guard on every tick (~90% of the worker's log on QA), so they go to DEBUG;
+# anything placed, cancelled, refused, closing or market-closed stays INFO.
+_TP_STEADY_OUTCOMES = frozenset({
+    "no take-profit (stop: idle)",
+    "no take-profit (stop: in sync)",
+})
+
+
+def _log_take_profit(symbol: str, outcome: str) -> None:
+    level = logging.DEBUG if outcome in _TP_STEADY_OUTCOMES else logging.INFO
+    log.log(level, "take-profit: %s — %s", symbol, outcome)
+
 
 def _closed_pnl_interval() -> float:
     """Configured closed-market P&L interval (``pnl_poll_interval_closed_seconds``),
@@ -1230,7 +1243,7 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                                 refresh=_make_order_refresher(db, adapter),
                                 in_session=_mh.in_regular_session(),
                             )
-                            log.info("take-profit: %s — %s", guard.symbol, outcome)
+                            _log_take_profit(guard.symbol, outcome)
                         else:
                             # The mode was switched off (or never on) with an
                             # order still resting: take it down, then the stop.
