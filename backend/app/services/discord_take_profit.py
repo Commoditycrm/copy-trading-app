@@ -542,7 +542,11 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
         return settled or "replacing — the new take-profit goes out next pass"
     if not will_place:
         return settled or ("market closed" if not in_session else "backing off")
-    if stop_outcome.startswith("closed") or stop_outcome == "exit sent":
+    if (stop_outcome.startswith("closed") or stop_outcome == "exit sent"
+            or stop_outcome in ("waiting (exit working)", "exit already working")):
+        # An exit is selling these contracts (a trim, a manual close, a refused
+        # stop's exit): a take-profit placed now would reserve them and the
+        # broker would refuse that exit. The stop waits for it; so does this.
         guard.tp_qty = None
         return f"position being closed (stop: {stop_outcome})"
 

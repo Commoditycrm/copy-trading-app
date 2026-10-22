@@ -1181,7 +1181,16 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                 _canceller = _make_stop_canceller(db, adapter)
                 from app.services import market_hours as _mh  # noqa: PLC0415
 
+                from app.services import ladder_hold  # noqa: PLC0415
+
                 for guard in _armed + [g for g in _tp_waiting if g.id not in _seen]:
+                    if ladder_hold.held(guard.id):
+                        # Being closed by hand right now: its stop and
+                        # take-profit were released for the close, and putting
+                        # them back would reserve the contracts it is selling.
+                        log.info("discord ladder: %s held for a manual close — skipped this pass",
+                                 guard.symbol)
+                        continue
                     pos = by_key.get((
                         (guard.symbol or "").upper(), guard.option_strike,
                         guard.option_right, guard.option_expiry,
