@@ -87,6 +87,7 @@ class _MinimalRequestShim:
             self.client = None
 
 from app.services.position_events import tagged as _tagged  # noqa: E402
+from app.services import ladder_hold  # noqa: E402
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
@@ -1939,6 +1940,7 @@ def _cancel_working_orders_for_position(
 
 @router.post("/{broker_symbol}/close", response_model=OrderOut)
 @_tagged("closed by you on Positions")
+@ladder_hold.released_after
 def close_position(
     broker_symbol: str,
     payload: ClosePositionIn,
@@ -1987,8 +1989,22 @@ def close_position(
     # re-places a stop sized to the remainder once the close has settled.
     released = False
     if pos.quantity > 0:
+        from app.services import discord_position_guard as _guards  # noqa: PLC0415
         from app.services import discord_stop_orders  # noqa: PLC0415
 
+        # Hold the ladder off this position until the close has been sent:
+        # otherwise its next pass, finding nothing resting, puts the
+        # take-profit and stop straight back on the contracts this close is
+        # about to sell, and the broker refuses the close (QA 2026-10-22, CSCO
+        # 103P). Cleared when this request ends — see services/ladder_hold.py.
+        try:
+            _g = _guards.find(db, user.id, pos.symbol, pos.option_strike,
+                              getattr(pos, "option_right", None), pos.option_expiry)
+        except Exception:  # noqa: BLE001 — a hold is never worth failing a close for
+            log.warning("close: could not look up %s's ladder to hold it", pos.symbol, exc_info=True)
+            _g = None
+        if _g is not None:
+            ladder_hold.hold_for_request(_g.id)
         released = bool(discord_stop_orders.release_for_position(db, user, pos))
         db.commit()
 
