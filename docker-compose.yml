@@ -83,6 +83,9 @@ services:
     # once and reused everywhere — the trader confirms 2FA only on first connect.
     volumes:
       - webull_token:/data/webull_token
+      # Host telemetry for Admin → System, written by scripts/host_metrics.py
+      # on the host. Read-only; no collector = "unavailable" on the page.
+      - /var/lib/kopyya-metrics:/host-metrics:ro
     # Force IPv4 to outbound services (broker APIs); Lightsail has no IPv6 egress.
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1

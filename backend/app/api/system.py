@@ -1,15 +1,22 @@
-"""Admin System → Usage: live host telemetry for the Lightsail box.
+"""Admin System → Usage: live telemetry for the host this backend runs on.
 
-Reads CPU / memory / disk / swap / load / network of the instance this backend
-runs on. In-container psutil reports HOST figures — CPU and memory aren't
-namespaced, and the overlay root reflects the host partition — so no docker.sock
-mount and no AWS credentials are needed. The endpoint reports the LOCAL box, so
-prod's admin shows prod and QA's admin shows QA.
+CPU / memory / swap / disk / uptime come from psutil in-container: those aren't
+namespaced (and the overlay root reflects the host partition), so they are the
+host's figures. Network counters, the process table and the hostname ARE
+namespaced — read in-container they describe only the backend container. Those
+come from the host collector (scripts/host_metrics.py, systemd timer) via a
+read-only bind mount, together with per-container stats. No docker.sock, no
+host /proc inside the hardened containers.
+
+Without a fresh collector file the host network / processes are reported as
+unavailable rather than passing the container's numbers off as the host's.
 
 Admin-only (require_admin).
 """
 from __future__ import annotations
 
+import json
+import os
 import socket
 import time
 from datetime import datetime, timezone
@@ -26,6 +33,39 @@ router = APIRouter(prefix="/api/admin/system", tags=["admin", "system"])
 # stays snappy while still giving a real reading (a single call with no window
 # returns 0.0 on the first hit).
 _CPU_SAMPLE_SECONDS = 0.4
+
+# The collector runs every 15s; past this its numbers are no longer "live".
+_HOST_METRICS_MAX_AGE_S = 60
+
+
+def _host_metrics_path() -> str:
+    return os.environ.get("HOST_METRICS_FILE", "/host-metrics/host.json")
+
+
+def read_host_metrics(now: float | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """(collector data or None, status). Data is None when missing, unreadable
+    or stale — callers must not fall back to container-scoped values."""
+    now = time.time() if now is None else now
+    try:
+        with open(_host_metrics_path()) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, {"available": False, "reason": "collector not installed"}
+    except (OSError, ValueError) as exc:
+        return None, {"available": False, "reason": f"unreadable: {type(exc).__name__}"}
+    collected = data.get("collected_at") if isinstance(data, dict) else None
+    if not isinstance(collected, (int, float)):
+        return None, {"available": False, "reason": "no collected_at"}
+    age = max(0.0, now - collected)
+    status: dict[str, Any] = {
+        "available": age <= _HOST_METRICS_MAX_AGE_S,
+        "collected_at": datetime.fromtimestamp(collected, timezone.utc).isoformat(),
+        "age_seconds": round(age, 1),
+    }
+    if not status["available"]:
+        status["reason"] = "collector stale"
+        return None, status
+    return data, status
 
 
 @router.get("/usage")
@@ -46,13 +86,18 @@ def system_usage(_: User = Depends(require_admin)) -> dict[str, Any]:
     du = psutil.disk_usage("/")
     net = psutil.net_io_counters()
     boot = psutil.boot_time()
+    host, host_status = read_host_metrics()
+    host = host or {}
+    host_net = host.get("network")
 
     return {
-        "hostname": socket.gethostname(),
+        "hostname": host.get("hostname") or socket.gethostname(),
+        "hostname_scope": "host" if host.get("hostname") else "container",
         "sampled_at": datetime.now(timezone.utc).isoformat(),
         "boot_time": datetime.fromtimestamp(boot, timezone.utc).isoformat(),
         "uptime_seconds": int(time.time() - boot),
-        "process_count": len(psutil.pids()),
+        "process_count": host.get("process_count"),
+        "host_metrics": host_status,
         "cpu": {
             "percent": overall,
             "cores": len(per_core),
@@ -73,10 +118,20 @@ def system_usage(_: User = Depends(require_admin)) -> dict[str, Any]:
             "free": du.free,
             "percent": du.percent,
         },
-        "network": {
+        # Host NIC since host boot; None without a fresh collector file.
+        "network": None if not host_net else {
+            "interface": host_net.get("interface"),
+            "bytes_sent": host_net.get("bytes_sent"),
+            "bytes_recv": host_net.get("bytes_recv"),
+            "packets_sent": host_net.get("packets_sent"),
+            "packets_recv": host_net.get("packets_recv"),
+        },
+        # This container's own eth0: includes backend↔db/redis traffic that
+        # never leaves the host, and resets when the container restarts.
+        "backend_container_network": {
             "bytes_sent": net.bytes_sent,
             "bytes_recv": net.bytes_recv,
-            "packets_sent": net.packets_sent,
-            "packets_recv": net.packets_recv,
         },
+        "containers": host.get("containers") or [],
+        "containers_error": host.get("containers_error"),
     }
