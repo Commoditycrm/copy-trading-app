@@ -210,7 +210,8 @@ function ContainersCard({ u }: { u: Usage }) {
                 <th className="py-1 pr-3 font-medium">Status</th>
                 <th className="py-1 pr-3 font-medium text-right">CPU</th>
                 <th className="py-1 pr-3 font-medium text-right">Memory</th>
-                <th className="py-1 pr-3 font-medium text-right">Procs</th>
+                {/* Docker's PIDs count includes threads: discord-listener is 16 processes, ~180 tasks. */}
+                <th className="py-1 pr-3 font-medium text-right" title="Processes and threads (Docker's PIDs count)">Tasks</th>
                 <th className="py-1 pr-3 font-medium text-right">Net in / out</th>
                 <th className="py-1 font-medium text-right">Restarts</th>
               </tr>
