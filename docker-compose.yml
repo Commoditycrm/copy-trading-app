@@ -262,14 +262,19 @@ services:
   ibkr-gw-2:
     <<: *ibkr-gw
 
+  # Spare capacity: QA runs two (IBKR_GATEWAY_POOL_SIZE=2); enable these with
+  # COMPOSE_PROFILES=...,ibkr-extra and raise the pool size to 5.
   ibkr-gw-3:
     <<: *ibkr-gw
+    profiles: [ibkr-extra]
 
   ibkr-gw-4:
     <<: *ibkr-gw
+    profiles: [ibkr-extra]
 
   ibkr-gw-5:
     <<: *ibkr-gw
+    profiles: [ibkr-extra]
 
 # Persistent named volume for the Webull OpenAPI token, shared by backend +
 # worker. Survives container recreation/deploys, so the verified token (and thus
