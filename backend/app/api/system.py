@@ -135,3 +135,14 @@ def system_usage(_: User = Depends(require_admin)) -> dict[str, Any]:
         "containers": host.get("containers") or [],
         "containers_error": host.get("containers_error"),
     }
+
+
+@router.get("/aws-costs")
+def aws_costs(refresh: bool = False, _: User = Depends(require_admin)) -> dict[str, Any]:
+    """QA (EC2) AWS cost & usage from Cost Explorer. Cached server-side for hours
+    and throttled on refresh — never polled with the live usage above. Returns
+    status=unavailable (with the reason) rather than a number it can't back."""
+    from app.services import aws_costs as svc  # noqa: PLC0415
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    return svc.get_costs(get_sync_redis(), refresh=refresh)
