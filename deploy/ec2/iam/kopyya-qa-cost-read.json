@@ -4,13 +4,18 @@
     {
       "Sid": "KopyyaQaCostExplorerRead",
       "Effect": "Allow",
-      "Action": ["ce:GetCostAndUsage", "ce:GetCostForecast"],
+      "Action": ["ce:GetCostAndUsage"],
       "Resource": "*"
     },
     {
-      "Sid": "KopyyaQaAllocationCheck",
+      "Sid": "KopyyaQaResourceDiscovery",
       "Effect": "Allow",
-      "Action": ["ec2:DescribeInstances"],
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeSnapshots"
+      ],
       "Resource": "*",
       "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-2"}}
     }
