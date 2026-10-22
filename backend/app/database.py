@@ -33,3 +33,20 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+
+def release_connection(db: Session) -> None:
+    """End db's transaction so its connection goes back to the pool, keeping
+    loaded objects readable. Call before slow broker I/O: a request session
+    otherwise sits "idle in transaction" on a pooled connection for the whole
+    call (QA 2026-10-21: 40 concurrent page loads exhausted 10+10 this way).
+    The next query checks out a fresh connection. Commits, so only use where
+    nothing pending needs to stay atomic with later writes."""
+    if not db.in_transaction():
+        return
+    keep = db.expire_on_commit
+    db.expire_on_commit = False
+    try:
+        db.commit()
+    finally:
+        db.expire_on_commit = keep

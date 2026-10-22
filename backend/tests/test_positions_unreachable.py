@@ -217,6 +217,9 @@ class _StubDB:
         self._accts = accts
         self._scalared = False
 
+    def in_transaction(self):
+        return False  # release_connection: no connection to hand back
+
     def execute(self, *_a, **_k):
         self._scalared = False
         return self

@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter, _looks_like_occ, _parse_occ
+from app.database import release_connection
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.services import order_intent
@@ -431,13 +432,14 @@ def _run_entry_hooks(filled: "list[Any]", dead: "list[Any]") -> None:
             log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
 
 
-def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
+def sync_account_fills(db: Session, acct: BrokerAccount, adapter: Any = None) -> SyncResult:
     """Pull activities for `acct` from its broker and upsert fills locally.
-    Idempotent — re-runs are safe."""
-    creds = decrypt_json(acct.encrypted_credentials)
-    adapter = adapter_for(acct, creds)
-    if not isinstance(adapter, AlpacaAdapter):
-        return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
+    Idempotent — re-runs are safe. ``adapter`` may be a _Prefetched one, so
+    the writes here run without broker I/O (see sync_user_fills)."""
+    if adapter is None:
+        adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        if not isinstance(adapter, AlpacaAdapter):
+            return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
 
     # Fast path: refresh status/qty/price for orders we placed that haven't
     # terminalized yet. Catches fills the moment they happen, instead of
@@ -681,28 +683,121 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
     )
 
 
+# A user's sync is claimed in Redis for its whole run, broker reads included,
+# so concurrent page loads skip it without holding a DB connection. Outlives a
+# crashed holder by at most this long.
+_CLAIM_TTL_S = 120
+_RELEASE_CLAIM = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) end return 0"
+)
+_IN_PROGRESS = {"per_account": [], "fills_added": 0, "orders_added": 0, "in_progress": True}
+
+
+def _claim_key(user_id: uuid.UUID) -> str:
+    return f"fills_sync:claim:{user_id}"
+
+
+def _claim_sync(user_id: uuid.UUID) -> "tuple[bool, str | None]":
+    """(False, None): another sync for this user is running. Redis down →
+    (True, None): run unclaimed; the write-phase advisory lock still keeps
+    two syncs from writing the same rows."""
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    token = uuid.uuid4().hex
+    try:
+        if get_sync_redis().set(_claim_key(user_id), token, nx=True, ex=_CLAIM_TTL_S):
+            return True, token
+        return False, None
+    except Exception:  # noqa: BLE001
+        log.debug("fills_sync: redis claim unavailable", exc_info=True)
+        return True, None
+
+
+def _release_claim(user_id: uuid.UUID, token: str) -> None:
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    try:
+        get_sync_redis().eval(_RELEASE_CLAIM, 1, _claim_key(user_id), token)
+    except Exception:  # noqa: BLE001
+        log.debug("fills_sync: redis claim release failed", exc_info=True)
+
+
+class _Prefetched:
+    """An account's broker reads, taken before the write phase opens a
+    transaction, served to _refresh_open_orders / sync_account_fills from
+    memory."""
+
+    def __init__(self, orders: "dict[str, Any]", activities: list):
+        self._orders = orders
+        self._activities = activities
+
+    def get_orders_snapshot(self) -> "dict[str, Any]":
+        return self._orders
+
+    def get_order(self, broker_order_id: str) -> Any:
+        if broker_order_id not in self._orders:
+            raise LookupError(f"order {broker_order_id} not read this sync")
+        return self._orders[broker_order_id]
+
+    def list_recent_activities(self) -> list:
+        return self._activities
+
+
+def _prefetch(adapter: Any, open_ids: "list[str]") -> _Prefetched:
+    # Same reads the inline sweep made: one snapshot when there is more than
+    # one order to check, get_order for anything it missed.
+    orders: dict[str, Any] = {}
+    batch = getattr(adapter, "get_orders_snapshot", None)
+    if len(open_ids) > 1 and batch is not None:
+        try:
+            orders.update(batch() or {})
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: batch order snapshot failed — per-order reads", exc_info=True)
+    for boid in open_ids:
+        if boid not in orders:
+            try:
+                orders[boid] = adapter.get_order(boid)
+            except Exception:  # noqa: BLE001
+                continue  # stale/cancelled id — as before, not worth failing the sync
+    return _Prefetched(orders, adapter.list_recent_activities())
+
+
+def _account_row(acct: BrokerAccount, res: "SyncResult | None" = None,
+                 exc: "Exception | None" = None) -> dict[str, Any]:
+    row: dict[str, Any] = {"broker_account_id": str(acct.id), "broker": acct.broker.value}
+    if exc is not None:
+        row["error"] = str(exc)[:300]
+    elif res is not None:
+        row.update(fills_added=res.fills_added, orders_added=res.orders_added, skipped=res.skipped)
+    return row
+
+
 def sync_user_fills(
     db: Session, user_id: uuid.UUID, min_interval: timedelta | None = None,
 ) -> dict[str, Any]:
     """Sync every connected broker for one app user.
 
     ``min_interval`` skips an account synced more recently than that (by any
-    process — the worker's poller stamps the same column)."""
-    # One fills-sync per user at a time. Every calendar and positions load
-    # triggers this, and two at once race the check-then-insert in
-    # sync_account_fills, each synthesizing the same external order — duplicate
-    # FILLED rows that double-count realized P&L. TRY, not wait: a blocking lock
-    # parked every page load on a pool connection behind a slow sync until the
-    # pool ran dry (QA 2026-10-21). The sync already running covers this one.
-    got = db.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
-                     {"k": f"fills_sync:{user_id}"}).scalar()
-    if not got:
-        log.info("fills_sync: sync for user=%s already running — skipped", user_id)
-        return {"per_account": [], "fills_added": 0, "orders_added": 0, "in_progress": True}
-    # Backstop: a holder stuck between statements (a hung broker call) is
-    # killed rather than keeping the lock and its connection indefinitely.
-    db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
+    process — the worker's poller stamps the same column).
 
+    Ends ``db``'s open transaction: the broker reads run with no pooled
+    connection checked out, between a short read and a short write."""
+    # One fills-sync per user at a time. Every calendar and positions load
+    # triggers this; a second one skips rather than waits (QA 2026-10-21: page
+    # loads queued behind a slow sync ran the pool dry).
+    claimed, token = _claim_sync(user_id)
+    if not claimed:
+        log.info("fills_sync: sync for user=%s already running — skipped", user_id)
+        return dict(_IN_PROGRESS)
+    try:
+        return _sync_user_fills(db, user_id, min_interval)
+    finally:
+        if token is not None:
+            _release_claim(user_id, token)
+
+
+def _sync_user_fills(db: Session, user_id: uuid.UUID, min_interval: timedelta | None) -> dict[str, Any]:
     accts = list(db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == user_id,
@@ -712,8 +807,7 @@ def sync_user_fills(
     ).scalars())
 
     per_account: list[dict[str, Any]] = []
-    total_fills = 0
-    total_orders = 0
+    plans: list[tuple[BrokerAccount, Any, list[str]]] = []
     now = datetime.now(timezone.utc)
     for acct in accts:
         last = acct.last_activity_sync_at
@@ -723,22 +817,53 @@ def sync_user_fills(
             if now - last < min_interval:
                 continue
         try:
-            res = sync_account_fills(db, acct)
-            per_account.append({
-                "broker_account_id": str(acct.id),
-                "broker": acct.broker.value,
-                "fills_added": res.fills_added,
-                "orders_added": res.orders_added,
-                "skipped": res.skipped,
-            })
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        except Exception as exc:  # noqa: BLE001
+            per_account.append(_account_row(acct, exc=exc))
+            continue
+        if not isinstance(adapter, AlpacaAdapter):
+            per_account.append(_account_row(acct, SyncResult(0, 0, 0, 0)))
+            continue
+        open_ids = list(db.execute(
+            select(Order.broker_order_id).where(
+                Order.broker_account_id == acct.id,
+                Order.status.in_(_NON_TERMINAL_STATUSES),
+                Order.broker_order_id.isnot(None),
+            )
+        ).scalars())
+        plans.append((acct, adapter, open_ids))
+
+    fetched: list[tuple[BrokerAccount, _Prefetched]] = []
+    if plans:
+        release_connection(db)
+        for acct, adapter, open_ids in plans:
+            try:
+                fetched.append((acct, _prefetch(adapter, open_ids)))
+            except Exception as exc:  # noqa: BLE001
+                per_account.append(_account_row(acct, exc=exc))
+
+    total_fills = 0
+    total_orders = 0
+    if fetched:
+        # The check-then-insert that synthesizes external orders must not run
+        # twice at once — duplicate FILLED rows double-count realized P&L. The
+        # Redis claim normally guarantees that; this covers Redis being down.
+        # Only DB work happens under it, so it is held for milliseconds.
+        got = db.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
+                         {"k": f"fills_sync:{user_id}"}).scalar()
+        if not got:
+            log.info("fills_sync: another sync for user=%s is writing — skipped", user_id)
+            return dict(_IN_PROGRESS)
+        db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
+        for acct, pre in fetched:
+            try:
+                res = sync_account_fills(db, acct, pre)
+            except Exception as exc:  # noqa: BLE001
+                per_account.append(_account_row(acct, exc=exc))
+                continue
+            per_account.append(_account_row(acct, res))
             total_fills += res.fills_added
             total_orders += res.orders_added
-        except Exception as exc:  # noqa: BLE001
-            per_account.append({
-                "broker_account_id": str(acct.id),
-                "broker": acct.broker.value,
-                "error": str(exc)[:300],
-            })
 
     return {
         "per_account": per_account,

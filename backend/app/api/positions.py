@@ -31,7 +31,7 @@ from decimal import Decimal
 from app.brokers import adapter_for
 from app.brokers.capabilities import capabilities_for
 from app.brokers.base import BrokerPosition
-from app.database import get_db
+from app.database import get_db, release_connection
 from app.models.broker_account import BrokerAccount, BrokerName
 from datetime import date, datetime, timezone
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
@@ -131,6 +131,9 @@ def list_positions(
         )
     ).scalars().all()
 
+    # Broker reads below; hand the connection back meanwhile — the attach
+    # steps after reopen one briefly.
+    release_connection(db)
     out: list[PositionOut] = []
     unreachable: list[UnreachableAccount] = []
     stale: list[StaleAccount] = []
@@ -348,6 +351,7 @@ def account_day_pnl(
     when the broker exposes no live day figure (UI shows '--'); a genuine broker
     0.00 comes back as 0.0; a failed live fetch falls back to the last-known
     broker value flagged stale — mirroring the calendar exactly."""
+    release_connection(db)  # may wait on another tab's broker read
     return _shared_day_pnl(user.id, lambda: _account_day_pnl_now(db, user.id))
 
 
@@ -966,9 +970,11 @@ def _snapshot_detail(db: Session, snap: SellAllSnapshot, adapter, today_et: date
         except (ValueError, TypeError):
             return False
 
+    reentry = [_reentry_info(db, p) for p in snap.positions]
+    if adapter is not None:
+        release_connection(db)  # quotes below are broker reads
     positions = []
-    for p in snap.positions:
-        st, reentry_price, reentry_filled_at = _reentry_info(db, p)
+    for p, (st, reentry_price, reentry_filled_at) in zip(snap.positions, reentry):
         # Overlay expiry only on a not-yet-re-entered row; a filled/working one
         # keeps its status (it already has an order).
         if st == "pending" and _is_expired_option(p):
