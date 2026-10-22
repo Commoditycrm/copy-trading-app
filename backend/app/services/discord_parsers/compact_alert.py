@@ -368,7 +368,7 @@ class CompactAlertParser(Parser):
         if strike is None or strike <= 0:
             return None, f"couldn't read the strike in {m.group(0).strip()!r}"
 
-        expiry, unspecified, err = _read_expiry(
+        expiry, unspecified, err, expiry_assumed = _read_expiry(
             m.group("exp"), message, allow_missing=average_down
         )
         if err:
@@ -384,6 +384,7 @@ class CompactAlertParser(Parser):
                 strike=strike,
                 expiration=expiry,
                 expiry_unspecified=unspecified,
+                expiry_assumed=expiry_assumed,
                 # The format never states size; one lot is the convention —
                 # except on an average-down, where the position decides.
                 quantity=DEFAULT_QUANTITY,
@@ -409,7 +410,7 @@ class CompactAlertParser(Parser):
         strike = to_decimal(m.group("strike")) if m.group("strike") else None
         right = _right(m.group("right")) if m.group("right") else None
 
-        expiry, unspecified, err = _read_expiry(m.group("exp"), message, allow_missing=True)
+        expiry, unspecified, err, _assumed = _read_expiry(m.group("exp"), message, allow_missing=True)
         if err:
             return None, err
 
@@ -558,7 +559,7 @@ class CompactAlertParser(Parser):
 
         # An exit alert usually names no expiry — it assumes you know what you
         # hold. Leave it unset and let execution resolve it from the position.
-        expiry, unspecified, err = _read_expiry(
+        expiry, unspecified, err, _assumed = _read_expiry(
             m.group("exp"), message, allow_missing=True
         )
         if err:
@@ -670,7 +671,11 @@ _MAX_DTE = 30
 
 
 def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool = False):
-    """Returns ``(expiry, unspecified, error)``."""
+    """Returns ``(expiry, unspecified, error, assumed)``.
+
+    ``assumed`` is True only when the alert stated no expiry on an entry and
+    the message date was filled in for it — see TradeSignal.expiry_assumed.
+    """
     # "ODTE" with the letter O is a common mistype of "0DTE" and means the same
     # thing. Reading it as an unknown expiry rejects an otherwise valid alert.
     #
@@ -678,8 +683,8 @@ def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool
     # re-reading an old alert doesn't move its expiry.
     if raw and raw.upper() in ("0DTE", "ODTE"):
         if message.posted_at is None:
-            return None, False, "0DTE alert has no timestamp to resolve the expiry against"
-        return message.posted_at.date(), False, None
+            return None, False, "0DTE alert has no timestamp to resolve the expiry against", False
+        return message.posted_at.date(), False, None, False
 
     # "1DTE", "2DTE" … "30DTE": that many TRADING days after the message (a
     # Friday 2DTE is Tuesday). Holidays are not known here — see
@@ -688,27 +693,28 @@ def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool
     if dte:
         days = int(dte.group(1))
         if days > _MAX_DTE:
-            return None, False, f"{days}DTE is further out than an alert expiry is read ({_MAX_DTE} days)"
+            return None, False, f"{days}DTE is further out than an alert expiry is read ({_MAX_DTE} days)", False
         if message.posted_at is None:
-            return None, False, f"{days}DTE alert has no timestamp to resolve the expiry against"
+            return None, False, f"{days}DTE alert has no timestamp to resolve the expiry against", False
         expiry = message.posted_at.date()
         for _ in range(days):
             expiry = _next_trading_day(expiry)
-        return expiry, False, None
+        return expiry, False, None, False
 
     if not raw:
         if allow_missing:
-            return None, True, None
+            return None, True, None, False
         # An ENTRY that names a contract and a price but no expiry is a same-day
         # trade. Several channels post SPY scalps that way ("SPY 763c @ .55")
         # and never write the date at all, so refusing them rejects every alert
         # those channels send. The entry gate still requires a price here, which
         # is what keeps a bare contract mention from becoming an order.
         if message.posted_at is not None:
-            return message.posted_at.date(), False, None
-        return None, False, "the alert has no expiry and no timestamp to date it from"
+            # Ours, not the trader's — flagged so execution can shift it.
+            return message.posted_at.date(), False, None, True
+        return None, False, "the alert has no expiry and no timestamp to date it from", False
 
     expiry, err = parse_expiry(raw, posted_at=message.posted_at)
     if err:
-        return None, False, err
-    return expiry, False, None
+        return None, False, err, False
+    return expiry, False, None, False

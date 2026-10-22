@@ -139,7 +139,20 @@ def resolve(
         # when MSFT only has Friday weeklies — and the broker's rejection
         # ("asset not found") tells the trader nothing useful. Checking the chain
         # here turns that into a specific, actionable message.
-        _check_contract_exists(adapter, symbol, strike, right, expiry)
+        shifted = _check_contract_exists(
+            adapter, symbol, strike, right, expiry,
+            # Only an entry whose date WE supplied may be moved.
+            expiry_assumed=bool(signal.get("expiry_assumed")) and not is_closing,
+        )
+        if shifted is not None:
+            resolutions["expiration"] = (
+                f"{shifted} (nearest listed — the alert gave no date and "
+                f"nothing expires {expiry})"
+            )
+            expiry = shifted
+            # Re-check on the new date: the shift fixes the expiry, it does not
+            # excuse a strike the chain doesn't list.
+            _check_contract_exists(adapter, symbol, strike, right, expiry)
     else:
         strike = right = expiry = None
 
@@ -731,15 +744,39 @@ def _chain_root(symbol: str) -> str:
     return _CHAIN_ROOTS.get(symbol.upper(), symbol.upper())
 
 
-def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: date) -> None:
+def _next_listed_expiry(adapter: Any, root: str, wanted: date) -> date | None:
+    """The soonest expiry the chain lists at or after ``wanted``.
+
+    Never earlier: shifting an entry BACKWARDS would buy a contract with less
+    time than the alert implied, which is the opposite of erring safely.
+    """
+    found = []
+    for raw in _nearby_expiries(adapter, root, wanted):
+        try:
+            when = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if when >= wanted:
+            found.append(when)
+    return min(found) if found else None
+
+
+def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: date,
+                           *, expiry_assumed: bool = False) -> date | None:
     """Verify the option chain actually lists this contract.
+
+    Returns ``None`` when the contract is fine, or a REPLACEMENT expiry when
+    the date was our own assumption and nothing expires that day — see
+    TradeSignal.expiry_assumed. An alert that stated its date is still refused,
+    because silently moving a trader's stated expiry buys a contract they did
+    not ask for.
 
     Skipped silently when the adapter can't enumerate contracts — the broker
     would still reject an invalid one, so a missing capability must not block
     otherwise-valid orders.
     """
     if not hasattr(adapter, "list_option_contracts"):
-        return
+        return None
     root = _chain_root(symbol)
     try:
         contracts = adapter.list_option_contracts(
@@ -749,9 +786,16 @@ def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: dat
         # A chain lookup failure is not evidence the contract is bad. Let the
         # broker be the judge rather than refusing a probably-fine order.
         log.warning("discord_execution: chain lookup failed for %s", symbol, exc_info=True)
-        return
+        return None
 
     if not contracts:
+        if expiry_assumed:
+            # We picked this date, not the trader. NVDA has no Thursday expiry,
+            # so "NVDA 215P 1.4" posted on a Thursday asked for a contract that
+            # has never existed. Correct our own guess rather than refuse.
+            shifted = _next_listed_expiry(adapter, root, expiry)
+            if shifted is not None:
+                return shifted
         near = _nearby_expiries(adapter, root, expiry)
         hint = f" Nearest expiries: {', '.join(near)}." if near else ""
         raise ExecutionRefused(
@@ -763,7 +807,7 @@ def _check_contract_exists(adapter: Any, symbol: str, strike, right, expiry: dat
     for c in contracts:
         c_strike = _dec(getattr(c, "strike_price", None))
         if c_strike == strike and _contract_type(c) == want_cp:
-            return
+            return None
 
     strikes = sorted({
         _dec(getattr(c, "strike_price", None)) for c in contracts
