@@ -296,11 +296,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=120, group=GROUP_ORDERS,
         label="SnapTrade · order feed",
         why=(
-            "The largest single consumer of the shared SnapTrade quota: 12 "
-            "req/min per connected trader at 5s. Floored at 5s so it can only "
-            "be relaxed from where it is today. Ignored entirely while the "
-            "SnapTrade webhook switch is on (the listener then runs at its 60s "
-            "backstop)."
+            "How often we ask SnapTrade for the trader's latest orders. This is "
+            "the single biggest user of our shared SnapTrade request allowance "
+            "(about 12 requests a minute per trader at 5s). Lower = fills noticed "
+            "sooner but more requests. Cannot go below 5s. Ignored while 'Trust "
+            "webhook' is on."
         ),
     ),
     IntKnob(
@@ -310,11 +310,12 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=300, group=GROUP_ORDERS,
         label="Webull · order list poll (market open)",
         why=(
-            "Runs ALONGSIDE the gRPC stream, permanently — it is a second "
-            "detection channel, not a fallback. The listener floors the "
-            "effective value at 1.2s × accounts and spaces the per-account "
-            "calls across the cycle, so this is a target rather than a "
-            "guarantee. Turn the poll off entirely with the switch below."
+            "How often we ask Webull for the trader's order list while the market "
+            "is open. This runs in addition to Webull's live stream, as a second "
+            "way to catch fills. With several Webull traders the real gap can be "
+            "a little longer than set, because the calls are spread out so they "
+            "don't bunch up. Use the 'Order poll on/off' switch to turn it off "
+            "completely."
         ),
     ),
     IntKnob(
@@ -324,9 +325,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=600, group=GROUP_ORDERS,
         label="Webull · order list poll (market closed)",
         why=(
-            "Overnight and weekend cadence, used when the trader has NO working "
-            "orders. Nothing can fill while the market is shut, so this exists "
-            "only to notice a cancel or an external change."
+            "How often we check the trader's Webull orders overnight and on "
+            "weekends when they have no open orders. Nothing can fill while the "
+            "market is closed, so this only needs to notice a cancel or a change "
+            "made outside Kopyya. It can be slow."
         ),
     ),
     IntKnob(
@@ -336,9 +338,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=600, group=GROUP_ORDERS,
         label="Webull · order list poll (closed, orders working)",
         why=(
-            "Faster closed-market cadence used while the trader still has "
-            "working orders, since those can be cancelled or amended "
-            "out-of-hours. Floored at 5s."
+            "How often we check the trader's Webull orders while the market is "
+            "closed but they still have open orders. Those can still be cancelled "
+            "or changed after hours, so this runs faster than the plain "
+            "closed-market check. Cannot go below 5s."
         ),
     ),
     IntKnob(
@@ -348,10 +351,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=2, hi=60, group=GROUP_ORDERS,
         label="IBKR · order poll",
         why=(
-            "IBKR has no order stream, so this poll is the ONLY way a trader's "
-            "fills are detected. Every call shares the user's single brokerage "
-            "session, so a tight cadence competes with order placement rather "
-            "than with a published quota."
+            "How often we ask IBKR for the trader's orders. IBKR has no live "
+            "stream, so this is the only way a trader's fills are noticed. Lower "
+            "= noticed sooner, but every call shares the trader's single IBKR "
+            "session with order placement, so going too low can slow down placing "
+            "orders."
         ),
     ),
     IntKnob(
@@ -361,10 +365,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=10, hi=300, group=GROUP_ORDERS,
         label="Alpaca · subscriber order status",
         why=(
-            "Subscriber mirror accounts get no stream, so without this a mirror "
-            "that fills stays WORKING in our DB — which breaks close detection "
-            "and order history, not just the display. One get_order per "
-            "unfilled order per pass."
+            "How often we check Alpaca for each subscriber's unfilled mirror "
+            "orders to see if they filled or were cancelled. Subscribers get no "
+            "live stream, so without this a filled mirror would stay 'working' in "
+            "Kopyya, which breaks close detection and order history. One request "
+            "per unfilled order per check."
         ),
     ),
     IntKnob(
@@ -374,10 +379,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=10, hi=300, group=GROUP_ORDERS,
         label="SnapTrade · subscriber order status",
         why=(
-            "Same job as the Alpaca one, but each pass costs one get_order per "
-            "unfilled order PLUS a positions read, against a quota shared by "
-            "the whole platform. This is the knob that makes stuck working "
-            "orders expensive."
+            "How often we check SnapTrade for each subscriber's unfilled mirror "
+            "orders. Same job as the Alpaca one, but each check costs one request "
+            "per unfilled order plus a positions read, taken from the SnapTrade "
+            "allowance shared by everyone. Many stuck orders plus a fast interval "
+            "means a lot of requests."
         ),
     ),
     IntKnob(
@@ -387,8 +393,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=2, hi=120, group=GROUP_ORDERS,
         label="Webull · subscriber order status (just traded)",
         why=(
-            "Fast cadence used for an account with order activity inside the "
-            "90s window. Inert unless direct-Webull execution is enabled."
+            "How often we check a Webull subscriber's orders right after they "
+            "traded (within the last 90 seconds). Fast, so a mirror shows as "
+            "filled quickly. Only matters for subscribers who execute directly on "
+            "Webull."
         ),
     ),
     IntKnob(
@@ -397,7 +405,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         broker="webull", row="Subscriber order status · idle",
         lo=10, hi=600, group=GROUP_ORDERS,
         label="Webull · subscriber order status (idle)",
-        why="Cadence for a Webull subscriber account with nothing recent.",
+        why=(
+            "How often we check a Webull subscriber's orders when nothing has "
+            "happened recently. Slower, to save requests."
+        ),
     ),
     IntKnob(
         name="ibkr_subscriber_sync_interval_s",
@@ -406,9 +417,9 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=2, hi=120, group=GROUP_ORDERS,
         label="IBKR · subscriber order status (just traded)",
         why=(
-            "Fast cadence for a recently-active IBKR subscriber account. This "
-            "is the only thing that moves an IBKR mirror from SUBMITTED to "
-            "FILLED or CANCELED."
+            "How often we check an IBKR subscriber's orders right after they "
+            "traded. This is the only thing that moves an IBKR mirror from "
+            "'submitted' to 'filled' or 'cancelled', so keep it fast."
         ),
     ),
     IntKnob(
@@ -417,7 +428,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         broker="ibkr", row="Subscriber order status · idle",
         lo=10, hi=600, group=GROUP_ORDERS,
         label="IBKR · subscriber order status (idle)",
-        why="Cadence for an IBKR subscriber account with nothing recent.",
+        why=(
+            "How often we check an IBKR subscriber's orders when nothing has "
+            "happened recently. Slower, to save requests."
+        ),
     ),
     # ── Order fill ──────────────────────────────────────────────────────
     IntKnob(
@@ -427,11 +441,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=1, hi=60, group=GROUP_FILL,
         label="SnapTrade fill nudge · first read",
         why=(
-            "SnapTrade serves cached brokerage data, so a mirror can be filled "
-            "long before our reads can see it. force_resync() fires the moment "
-            "we place; this is how long we then wait before reading back. Too "
-            "short and the resync hasn't landed; too long and the 30s sweep "
-            "would have caught it anyway."
+            "After placing a mirror order on SnapTrade, how long we wait before "
+            "reading it back to see if it filled. SnapTrade shows slightly "
+            "delayed data, so we ask it to refresh first and then wait this long. "
+            "Too short and the refresh hasn't happened yet; too long and the "
+            "regular 30s check would have caught it anyway."
         ),
     ),
     IntKnob(
@@ -440,7 +454,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         broker="snaptrade", row="Fill nudge · retry gap",
         lo=1, hi=120, group=GROUP_FILL,
         label="SnapTrade fill nudge · retry gap",
-        why="Wait before the second read, when the first found nothing settled.",
+        why=(
+            "If the first read-back finds the mirror order still unfilled, how "
+            "long to wait before the second read."
+        ),
     ),
     IntKnob(
         name="snaptrade_nudge_max_reads",
@@ -450,10 +467,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         kind="count", unit_label="reads",
         label="SnapTrade fill nudge · reads per placement",
         why=(
-            "How many read-backs one placement may cost. Counted in REQUESTS, "
-            "not seconds — raising it multiplies nudge spend by every mirror "
-            "placed, which on a wide fanout is the burstiest thing we do to "
-            "SnapTrade."
+            "How many read-backs we allow per placed mirror order. This is a "
+            "number of requests, not seconds. Raising it costs extra SnapTrade "
+            "requests for every mirror placed, which adds up fast when one trade "
+            "fans out to many subscribers."
         ),
     ),
     IntKnob(
@@ -464,10 +481,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         kind="rate", unit_label="req/min",
         label="SnapTrade fill nudge · request budget",
         why=(
-            "Hard ceiling on nudge requests per minute, independent of how many "
-            "orders are placed. This is the circuit breaker that stops a large "
-            "fanout's nudges starving the order listener of quota — lower it if "
-            "SnapTrade ever gets tight."
+            "Hard limit on how many read-back requests per minute all mirrors "
+            "together may use, no matter how many orders are placed. This is the "
+            "safety valve that stops a big fanout from using up the SnapTrade "
+            "allowance needed to watch the trader's orders. Lower it if SnapTrade "
+            "requests get tight."
         ),
     ),
     # ── P&L ─────────────────────────────────────────────────────────────
@@ -479,10 +497,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         group=GROUP_PNL,
         label="Alpaca · P&L poll",
         why=(
-            "200 req/min per account key, so there is ample headroom. Note this "
-            "knob ALSO sets the browser's positions-page refresh rate via "
-            "brokers.capabilities.effective_day_pnl_interval_s — lowering it "
-            "speeds up the page as well as the worker."
+            "How often we refresh each Alpaca account's open P&L. Alpaca allows "
+            "plenty of requests, so this can be fast. It also sets how often the "
+            "Positions page refreshes in the browser, so lowering it makes that "
+            "page update faster too."
         ),
     ),
     IntKnob(
@@ -492,10 +510,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=300, group=GROUP_PNL,
         label="Webull · P&L poll",
         why=(
-            "Reads cost 2 per 2s per endpoint (60/min). Volume is not the "
-            "constraint — bunching is. Floored at 5s because the risk-tick "
-            "sub-enforcers already share one read per tick and a tighter "
-            "cadence starts colliding with the positions page."
+            "How often we refresh each Webull account's open P&L. Webull limits "
+            "how closely calls can be bunched together, so going below 5s causes "
+            "clashes with the Positions page and the risk checks that already "
+            "share each read."
         ),
     ),
     IntKnob(
@@ -505,9 +523,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=30, hi=600, group=GROUP_PNL,
         label="SnapTrade · P&L poll",
         why=(
-            "SnapTrade's 250 req/min is shared across the WHOLE platform, so "
-            "this is the most expensive knob here: halving it doubles the spend "
-            "for every user at once. Floored at 30s."
+            "How often we refresh each SnapTrade account's open P&L. SnapTrade's "
+            "request allowance (250 a minute) is shared by the whole platform, so "
+            "this is the most expensive setting here: halving it doubles the cost "
+            "for every user at once. Cannot go below 30s."
         ),
     ),
     IntKnob(
@@ -517,9 +536,9 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=5, hi=300, group=GROUP_PNL,
         label="IBKR · P&L poll",
         why=(
-            "Generous rate budget, but every call shares the user's single "
-            "brokerage session with the IBKR order poll, so a tight cadence "
-            "competes with order detection rather than with a quota."
+            "How often we refresh each IBKR account's open P&L. Every call shares "
+            "the user's single IBKR session with the order poll, so going too low "
+            "can slow down fill detection."
         ),
     ),
     # ── Positions ───────────────────────────────────────────────────────
@@ -530,11 +549,12 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=1, hi=30, group=GROUP_POSITIONS,
         label="Webull · positions read cache",
         why=(
-            "DISPLAY reads inside this window share one answer; the risk path "
-            "(liquidation, TP/SL, retry) always reads live and is unaffected. "
-            "Raising it is the most direct fix for the positions page 429ing "
-            "under the post-order refresh burst — at the cost of showing a "
-            "position that was just closed for up to this long."
+            "How long a Webull positions read is reused for display before we ask "
+            "Webull again. Risk checks (liquidation, take-profit/stop-loss, "
+            "retries) always read live and are not affected. Raise it if the "
+            "Positions page hits Webull's rate limit right after an order; the "
+            "trade-off is that a just-closed position may still show for up to "
+            "this long."
         ),
     ),
     IntKnob(
@@ -544,10 +564,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=10, hi=600, group=GROUP_POSITIONS,
         label="Close reconciler · positions sweep",
         why=(
-            "Reads each subscriber's positions to find ones the trader has "
-            "already exited but the subscriber still holds. One positions read "
-            "per subscriber per pass. Inert unless close_reconcile_enabled is "
-            "on, which it is not by default."
+            "How often we read every subscriber's positions to find ones the "
+            "trader has already exited but the subscriber still holds. One "
+            "positions read per subscriber per check. Does nothing unless the "
+            "close reconciler is turned on (it is off by default)."
         ),
     ),
     # ── Broker calendar ─────────────────────────────────────────────────
@@ -558,10 +578,10 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=300, hi=86400, group=GROUP_CALENDAR,
         label="Calendar · realized P&L snapshot",
         why=(
-            "The sweep that stores broker-direct realized P&L for past days, "
-            "which is what the Calendar shows. Cheap (hourly), and if it stops "
-            "running the Calendar silently falls back to an approximate value "
-            "derived from our own rows."
+            "How often we save each account's realised P&L for past days straight "
+            "from the broker, which is what the Calendar shows. Cheap, runs about "
+            "hourly. If it stops, the Calendar quietly falls back to an estimate "
+            "built from Kopyya's own records."
         ),
     ),
     IntKnob(
@@ -571,11 +591,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=1, hi=120, group=GROUP_CALENDAR,
         label="Day P&L · shared-result window",
         why=(
-            "One computed account Day P&L is reused for this long across every "
-            "tab and every process. It is the only thing stopping N open tabs "
-            "becoming N broker calls, so lowering it multiplies page-driven "
-            "load directly. Note the Calendar's own today figure does NOT go "
-            "through this cache."
+            "How long one calculated Day P&L for an account is reused across "
+            "every open tab and process. It is what stops ten open tabs turning "
+            "into ten broker calls, so lowering it directly multiplies the load "
+            "coming from web pages. The Calendar's 'today' figure does not use "
+            "this."
         ),
     ),
     # ── Account balance ─────────────────────────────────────────────────
@@ -586,8 +606,9 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=60, hi=7200, group=GROUP_BALANCE,
         label="Balance sweep (background)",
         why=(
-            "Keeps stored equity current for accounts nobody has open. One "
-            "get_account per connected account per pass, across all brokers."
+            "How often we refresh the stored balance of accounts nobody has open "
+            "in the browser. One balance request per connected account per sweep, "
+            "across all brokers."
         ),
     ),
     IntKnob(
@@ -597,10 +618,11 @@ INT_KNOBS: tuple[IntKnob, ...] = (
         lo=30, hi=3600, group=GROUP_BALANCE,
         label="Balance freshness on page load",
         why=(
-            "GET /api/brokers refreshes any balance older than this INLINE, so "
-            "with a page open this — not the sweep above — is the real balance "
-            "cadence. Every Brokers, Positions and Calendar page load consults "
-            "it, so raising it cuts calls on a per-page-load basis."
+            "When a Brokers, Positions or Calendar page loads, any balance older "
+            "than this is refreshed from the broker on the spot. So while someone "
+            "has the app open, this (not the background sweep) is what really "
+            "decides how often balances are fetched. Raise it to cut requests "
+            "caused by page loads."
         ),
     ),
 )
@@ -613,12 +635,12 @@ BOOL_KNOBS: tuple[BoolKnob, ...] = (
         group=GROUP_ORDERS,
         label="SnapTrade · trust the webhook",
         why=(
-            "On = assume SnapTrade's webhook delivers fills, so the order "
-            "listener drops from its poll interval to a 60s backstop. This is "
-            "the single biggest available reduction in SnapTrade spend (12 "
-            "req/min → 1 per trader) and costs nothing in detection latency "
-            "IF the webhook is actually arriving. Turn it on only once you have "
-            "confirmed deliveries."
+            "On = trust SnapTrade's webhook to tell us about the trader's fills, "
+            "so the order poll slows down to once every 60s as a safety net. This "
+            "is the biggest possible saving on SnapTrade requests (about 12 a "
+            "minute down to 1 per trader) and costs no speed if the webhook "
+            "really is arriving. Turn it on only after you have confirmed webhook "
+            "deliveries."
         ),
     ),
     BoolKnob(
@@ -628,11 +650,11 @@ BOOL_KNOBS: tuple[BoolKnob, ...] = (
         group=GROUP_ORDERS,
         label="Webull · order list poll",
         why=(
-            "Webull detects orders on two channels at once: the gRPC stream and "
-            "this REST poll. Off = the stream becomes the SOLE path to detecting "
-            "a trader's fills. The stream was silent for two months before the "
-            "subscribeType fix and this poll is what carried detection through "
-            "it, so turn it off only with stream evidence in hand."
+            "Webull fills are detected two ways at once: the live stream and this "
+            "order-list poll. Off = the stream becomes the only way to notice a "
+            "trader's fills. The stream once went silent for two months and this "
+            "poll is what kept detection working, so turn it off only if you have "
+            "proof the stream is healthy."
         ),
     ),
 )
@@ -652,19 +674,21 @@ BROKER_LABELS: dict[str, str] = {
 # rest are self-evident from the row name.
 NA_NOTES: dict[tuple[str, str], str] = {
     ("alpaca", "Trader order feed"):
-        "Alpaca pushes order events over a WebSocket — there is no poll to tune.",
+        "Alpaca pushes the trader's order updates to us instantly over a live "
+        "connection, so there is nothing to poll.",
     ("alpaca", "Subscriber order status · idle"):
-        "Alpaca's subscriber reconciler runs at one flat interval, with no "
-        "separate idle cadence.",
+        "Alpaca subscribers are checked at one fixed interval; there is no "
+        "separate slower rate for quiet accounts.",
     ("snaptrade", "Subscriber order status · idle"):
-        "SnapTrade's subscriber reconciler runs at one flat interval, with no "
-        "separate idle cadence.",
+        "SnapTrade subscribers are checked at one fixed interval; there is no "
+        "separate slower rate for quiet accounts.",
     ("alpaca", "Positions read cache"):
-        "Only the Webull adapter caches display reads; Alpaca reads live.",
+        "Only Webull reuses recent positions reads; Alpaca always reads live.",
     ("snaptrade", "Positions read cache"):
-        "Only the Webull adapter caches display reads; SnapTrade reads live.",
+        "Only Webull reuses recent positions reads; SnapTrade always reads "
+        "live.",
     ("ibkr", "Positions read cache"):
-        "Only the Webull adapter caches display reads; IBKR reads live.",
+        "Only Webull reuses recent positions reads; IBKR always reads live.",
 }
 
 

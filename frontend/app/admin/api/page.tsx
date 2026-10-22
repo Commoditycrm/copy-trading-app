@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { Info } from "lucide-react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 
@@ -199,7 +200,7 @@ export default function AdminApiPage() {
 
   const naNote = (broker: string, row: string) =>
     cfg.na_notes.find((n) => n.broker === broker && n.row === row)?.note
-    ?? "Not applicable for this broker — there is no such loop.";
+    ?? "Not applicable — this broker has no such check.";
 
   const sections = cfg.groups
     .map((group) => ({
@@ -327,12 +328,9 @@ export default function AdminApiPage() {
                   style={{ borderTop: i === 0 ? undefined : "1px solid var(--border)" }}
                 >
                   <td className="px-3 py-2 align-middle" style={{ minWidth: "17rem" }}>
-                    <span
-                      title={knob.why}
-                      className="cursor-help border-b border-dotted"
-                      style={{ borderColor: "var(--border)" }}
-                    >
+                    <span className="inline-flex items-center gap-1.5">
                       {knob.row}
+                      <InfoTip text={knob.why} label={knob.row} />
                     </span>
                   </td>
                   <td
@@ -356,8 +354,8 @@ export default function AdminApiPage() {
       </div>
 
       <p className="text-[11px]" style={{ color: "var(--muted)" }}>
-        Hover a setting&apos;s name — or a blank cell — for what it controls and
-        why. Durations are stored in seconds; minutes and hours are just for
+        Hover the ⓘ next to a setting&apos;s name — or a blank cell — for what it
+        controls and why. Durations are stored in seconds; minutes and hours are just for
         entry, and the server re-checks the range whichever unit you use.
       </p>
     </div>
@@ -392,19 +390,39 @@ function Section({
   );
 }
 
-/** A row's tooltip comes from whichever knob sits in it — they all explain the
- *  same mechanism, so the first one found is representative. */
+/** A row's tooltip explains every broker's setting in that row. With one
+ *  broker it is just that text; with several, each broker gets its own
+ *  paragraph so the reader can find the column they are about to change. */
 function RowLabel({ row, cfg }: { row: string; cfg: PollingConfig }) {
-  const any =
-    cfg.switches.find((k) => k.row === row) ??
-    cfg.intervals.find((k) => k.row === row);
+  const knobs = [...cfg.switches, ...cfg.intervals].filter((k) => k.row === row);
+  const label = (b: string | null) => cfg.brokers.find((x) => x.name === b)?.label ?? b;
+  const ordered = cfg.brokers
+    .map((b) => knobs.find((k) => k.broker === b.name))
+    .filter((k): k is NonNullable<typeof k> => Boolean(k));
+  const text =
+    ordered.length <= 1
+      ? ordered[0]?.why
+      : ordered.map((k) => `${label(k.broker)}: ${k.why}`).join("\n\n");
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {row}
+      {text && <InfoTip text={text} label={row} />}
+    </span>
+  );
+}
+
+/** The ⓘ after a setting's name: what the setting controls and why, shown
+ *  only when the icon itself is hovered (or focused) — the name stays plain. */
+function InfoTip({ text, label }: { text: string; label: string }) {
   return (
     <span
-      title={any?.why}
-      className="cursor-help border-b border-dotted"
-      style={{ borderColor: "var(--border)" }}
+      tabIndex={0}
+      title={text}
+      aria-label={`About ${label}: ${text}`}
+      className="inline-flex items-center cursor-help rounded-full transition-opacity opacity-60 hover:opacity-100 focus:opacity-100 focus:outline-none"
+      style={{ color: "var(--muted)" }}
     >
-      {row}
+      <Info size={13} aria-hidden />
     </span>
   );
 }
