@@ -85,6 +85,13 @@ class TradeSignal:
     # The expiry must then be resolved from the OPEN POSITION at execution time,
     # never guessed here. Display shows the contract without a date.
     expiry_unspecified: bool = False
+    # True when the alert stated NO expiry on an ENTRY and we filled in the
+    # message's own date. A same-day read is right for the channels that post
+    # "SPY 763c @ .55" and never write a date — but it is OUR assumption, not
+    # the trader's instruction. When nothing expires that day (NVDA has no
+    # Thursday expiry) execution shifts to the nearest listed expiry instead of
+    # refusing; a date the trader actually wrote is never shifted.
+    expiry_assumed: bool = False
     # True when the alert named ONLY a symbol ("META -> 100%") — no strike, no
     # call/put, no expiry. The entire contract has to come from the open
     # position; there is nothing here to identify it with.
@@ -199,6 +206,7 @@ class TradeSignal:
             "latest_contract": self.latest_contract,
             "channel_contract_first": self.channel_contract_first,
             "expiry_unspecified": self.expiry_unspecified,
+            "expiry_assumed": self.expiry_assumed,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,
             "source_action": self.source_action,

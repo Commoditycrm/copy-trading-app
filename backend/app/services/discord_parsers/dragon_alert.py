@@ -179,7 +179,7 @@ class DragonAlertParser(Parser):
         if price is None or price <= 0:
             return None, f"couldn't read the price in {m.group(0).strip()!r}"
 
-        expiry, unspecified, err = _read_expiry(m.group("exp"), message)
+        expiry, unspecified, err, expiry_assumed = _read_expiry(m.group("exp"), message)
         if err:
             return None, err
 
@@ -192,6 +192,7 @@ class DragonAlertParser(Parser):
                 strike=strike,
                 expiration=expiry,
                 expiry_unspecified=unspecified,
+                expiry_assumed=expiry_assumed,
                 quantity=DEFAULT_QUANTITY,
                 order_type=OrderKind.LIMIT,
                 limit_price=price,
