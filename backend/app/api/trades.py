@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.config import get_settings
-from app.database import SessionLocal, get_db
+from app.database import SessionLocal, get_db, release_connection
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
@@ -2327,6 +2327,8 @@ def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     ).scalars().all()
     if not accts:
         return None
+    # Broker reads below; hand the connection back meanwhile.
+    release_connection(db)
     total = Decimal(0)
     n_got = 0
     for acct in accts:
@@ -2377,6 +2379,8 @@ def _live_day_pnl_today(
             return None  # a broker with no live day P&L → keep the calculated cell
         brokers.add(a.broker)
     source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
+    # Broker reads below; hand the connection back meanwhile.
+    release_connection(db)
     total = Decimal(0)
     day_start = Decimal(0)
     n_got = 0

@@ -734,6 +734,10 @@ def alpaca_marked_by_day(
     except SQLAlchemyError:
         return {}
 
+    from app.database import release_connection  # noqa: PLC0415
+
+    if accts:
+        release_connection(db)  # portfolio-history is a slow broker read
     out: dict[date, tuple[Decimal, Decimal | None]] = {}
     single = len(accts) == 1
     for acct in accts:
