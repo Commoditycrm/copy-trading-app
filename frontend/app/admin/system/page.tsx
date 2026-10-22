@@ -130,7 +130,8 @@ function MarketStreamsCard() {
 
 function fmtBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const u = ["B", "KB", "MB", "GB", "TB"];
+  // Divides by 1024, so the units are IEC (GiB), not decimal GB.
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
   const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
   return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
 }
