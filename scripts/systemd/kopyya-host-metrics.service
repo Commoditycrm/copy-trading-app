@@ -1,0 +1,9 @@
+[Unit]
+Description=Kopyya: host + container telemetry for the admin System page
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/kopyya/host_metrics.py
+Nice=10
