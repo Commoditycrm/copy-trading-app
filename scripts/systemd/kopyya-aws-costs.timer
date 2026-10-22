@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the QA AWS cost snapshot every 8h (Cost Explorer bills $0.01/request)
+
+[Timer]
+OnCalendar=*-*-* 00/8:10:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

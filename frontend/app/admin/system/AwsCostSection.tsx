@@ -2,9 +2,9 @@
 
 /**
  * Admin System → "AWS Testing — Cost & Usage". QA (EC2) only; production on
- * Lightsail is shown as excluded, never added in. Fetched on its own slow
- * timer — the backend caches Cost Explorer for hours (it bills per request),
- * so this never rides the 3s CPU poll. Unknown figures render as "Unavailable",
+ * Lightsail is shown as excluded, never added in. The figures are a snapshot a
+ * host timer takes from Cost Explorer every 8h, so reloading here is free and
+ * this never rides the 3s CPU poll. Unknown figures render as "Unavailable",
  * never as $0.
  */
 import { useCallback, useEffect, useState } from "react";
@@ -45,9 +45,12 @@ interface CostPayload {
     unattributed_usd: string | null;
     production_lightsail_excluded_usd: string | null;
     account_total_usd: string | null;
+    account_credits_usd?: string | null;
+    account_net_usd?: string | null;
     estimated: boolean;
   };
   previous_month?: { month: string; qa_total_usd: string | null; account_total_usd: string | null };
+  basis?: string;
   projected_month_usd?: string | null;
   projection_method?: string | null;
   average_daily_usd?: string | null;
@@ -56,9 +59,9 @@ interface CostPayload {
   data_through?: string | null;
   unattributed_by_service?: { service: string; cost_usd: string; production: boolean }[];
   fetched_at?: string;
-  cache_age_seconds?: number;
-  cache_ttl_seconds?: number;
-  refresh_throttled?: boolean;
+  interval_seconds?: number;
+  age_seconds?: number | null;
+  stale?: boolean;
 }
 
 const POLL_MS = 30 * 60 * 1000;
@@ -155,16 +158,15 @@ export default function AwsCostSection() {
   const [err, setErr] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async (refresh = false) => {
+  const load = useCallback(async (manual = false) => {
     setBusy(true);
     try {
-      const r = await api<CostPayload>(`/api/admin/system/aws-costs${refresh ? "?refresh=true" : ""}`);
+      const r = await api<CostPayload>("/api/admin/system/aws-costs");
       setC(r);
       setErr(false);
-      if (refresh && r.refresh_throttled) notify.info("Showing cached figures — AWS billing refreshes at most hourly.");
     } catch (e) {
       setErr(true);
-      if (refresh) notify.fromError(e, "Could not load AWS costs");
+      if (manual) notify.fromError(e, "Could not load AWS costs");
     } finally {
       setBusy(false);
     }
@@ -186,15 +188,22 @@ export default function AwsCostSection() {
           <h3 className="text-lg font-bold">AWS Testing — Cost &amp; Usage</h3>
           <p className="text-xs mt-0.5" style={muted}>
             QA environment on EC2{c?.instance_id ? ` (${c.instance_id}, ${c.region})` : ""} only. Production on Lightsail is excluded.
-            {c?.metric ? ` ${c.metric}, ${c.currency}.` : ""}
+            {c?.metric ? ` ${c.metric}, ${c.currency}${c.basis ? `, ${c.basis}` : ""}.` : ""}
           </p>
         </div>
         <button onClick={() => load(true)} disabled={busy}
                 className="text-sm px-3 py-1.5 rounded-lg"
                 style={{ background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-2)", opacity: busy ? 0.6 : 1 }}>
-          {busy ? "Loading…" : "Refresh"}
+          {busy ? "Loading…" : "Reload"}
         </button>
       </div>
+
+      {c?.stale && c.status !== "unavailable" && (
+        <div className="rounded-xl p-3 text-xs" style={{ ...cardStyle, border: `1px solid ${warn}`, color: warn }}>
+          These figures are out of date{c.age_seconds != null ? ` (collected ${Math.round(c.age_seconds / 3600)}h ago)` : ""} —
+          the cost collector on the QA host has missed its runs.
+        </div>
+      )}
 
       {err && !c && (
         <div className={card} style={{ ...cardStyle, border: "1px solid var(--bad, #b3261e)", color: "var(--bad, #b3261e)" }}>
@@ -284,6 +293,8 @@ export default function AwsCostSection() {
             <div className="text-xs mb-2" style={muted}>
               Rest of the AWS account this month: {fmt(m.unattributed_usd)} (account total {fmt(m.account_total_usd)}).
               Production on Lightsail: {fmt(m.production_lightsail_excluded_usd)} — excluded.
+              {m.account_credits_usd != null && Number(m.account_credits_usd) !== 0 &&
+                ` Credits/refunds applied to the account: ${fmt(m.account_credits_usd)} (net ${fmt(m.account_net_usd)}).`}
             </div>
             {(c.unattributed_by_service ?? []).length > 0 && (
               <table className="w-full text-xs tabular-nums">
@@ -312,8 +323,8 @@ export default function AwsCostSection() {
             <div>
               Billing data through {c.data_through ?? "—"}; AWS updates it several times a day and current-month
               figures stay estimates until the invoice closes.
-              {fetched && ` Last refreshed ${fetched.toLocaleString()}`}
-              {c.cache_ttl_seconds ? ` · cached for ${Math.round(c.cache_ttl_seconds / 3600)}h.` : "."}
+              {fetched && ` Collected from Cost Explorer ${fetched.toLocaleString()}`}
+              {c.interval_seconds ? ` · every ${Math.round(c.interval_seconds / 3600)}h.` : "."}
             </div>
           </div>
         </>
