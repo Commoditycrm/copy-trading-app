@@ -27,6 +27,8 @@ type Item = {
   type: "order" | "event";
   at: string | null;
   label: string;
+  /** For an event: "bad" (refused, rate-limited) or "warn" (waiting, retried). */
+  tone?: "bad" | "warn" | null;
   side: "buy" | "sell" | null;
   requested: string | null;
   filled: string | null;
@@ -183,7 +185,13 @@ function Row({ it }: { it: Item }) {
     return (
       <>
         {time}
-        <span className="whitespace-nowrap" style={{ color: "var(--text-2)" }}>{it.label}</span>
+        <span className="whitespace-nowrap"
+              style={{
+                color: it.tone === "bad" ? "var(--bad)" : it.tone === "warn" ? "var(--warn)" : "var(--text-2)",
+                fontWeight: it.tone ? 600 : undefined,
+              }}>
+          {it.label}
+        </span>
         <span className="num" style={{ gridColumn: "span 2", color: "var(--text-2)" }}>{it.detail}</span>
         <span />
         <span />

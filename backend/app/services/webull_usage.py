@@ -28,7 +28,13 @@ log = logging.getLogger("webull.usage")
 
 _caller: contextvars.ContextVar[str | None] = contextvars.ContextVar("webull_caller", default=None)
 _KEY = "webull:usage:{}"            # one Redis hash per minute
-_KEEP_S = 2 * 3600
+# Long enough to look back at a trading day after the close, and over a weekend
+# at Friday (the trader's ask, 2026-10-23: today's 429s had already gone by the
+# evening with two hours kept).
+_KEEP_S = 3 * 24 * 3600
+_REFUSALS_KEY = "webull:usage:429:{}"       # one list per app key: the refused calls, newest first
+_REFUSALS_MAX = 500
+_RECENT_KEY = "webull:usage:recent:{}:{}"   # per app key + endpoint: send times of the last few seconds
 _installed = False
 
 # Friendlier names for the app's own routes (path with ids replaced by {id}).
@@ -102,7 +108,8 @@ def _redis():
     return get_sync_redis()
 
 
-def record(app_key: str | None, action: str, status: Any, ms: float, caller: str | None = None) -> None:
+def record(app_key: str | None, action: str, status: Any, ms: float, caller: str | None = None,
+           *, waited: float | None = None) -> None:
     caller = caller or current_caller()
     code = str(status or "error")
     log.info("webull-call %s → %s %s (%.0f ms) key=%s", caller, action, code, ms, app_hash(app_key)[:8])
@@ -113,6 +120,44 @@ def record(app_key: str | None, action: str, status: Any, ms: float, caller: str
         r.hincrby(_KEY.format(minute), field, 1)
         r.expire(_KEY.format(minute), _KEEP_S)
     except Exception:  # noqa: BLE001 — counting must never break a broker call
+        pass
+    _record_refusal(app_key, action, code, ms, caller, waited)
+
+
+def _record_refusal(app_key, action: str, code: str, ms: float, caller: str, waited) -> None:
+    """Keep each 429 with what explains it: when, what made it, how long it
+    waited for its turn (or that its queue was full), and how many calls the
+    same endpoint had sent in the 2 seconds before it.
+
+    Many calls just before -> too many at once. Spaced calls refused anyway ->
+    Webull counts stricter than the pacer spaces them. Hardly any calls from
+    here just before -> something else is using the same app key."""
+    import json  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    try:
+        r = _redis()
+        h = app_hash(app_key)
+        now = time.time()
+        sent_at = now - (ms or 0) / 1000.0
+        recent = _RECENT_KEY.format(h, action)
+        r.zadd(recent, {f"{sent_at:.3f}:{_uuid.uuid4().hex[:6]}": sent_at})
+        r.zremrangebyscore(recent, 0, now - 5)
+        r.expire(recent, 10)
+        if code != "429":
+            return
+        before = max(0, int(r.zcount(recent, sent_at - 2.0, sent_at)) - 1)
+        from app.services import webull_pacer  # noqa: PLC0415
+
+        r.lpush(_REFUSALS_KEY.format(h), json.dumps({
+            "at": sent_at, "caller": caller, "endpoint": action,
+            "waited_s": None if waited is None or waited == webull_pacer.QUEUE_FULL else round(float(waited), 2),
+            "queue_full": waited == webull_pacer.QUEUE_FULL,
+            "calls_2s_before": before,
+        }))
+        r.ltrim(_REFUSALS_KEY.format(h), 0, _REFUSALS_MAX - 1)
+        r.expire(_REFUSALS_KEY.format(h), _KEEP_S)
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -141,6 +186,48 @@ def record_queue_full(app_key: str | None, action: str) -> None:
         pass
 
 
+_FRIENDLY = (
+    ("assets/positions", "positions read"),
+    ("assets/balance", "balance read"),
+    ("orders/list-today", "today's-orders read"),
+    ("order/detail", "order-status read"),
+    ("order/cancel", "cancel"),
+    ("order/replace", "order change"),
+    ("order/place", "order placement"),
+)
+
+
+def friendly(action: str) -> str:
+    """"/openapi/assets/positions" -> "positions read"."""
+    for suffix, name in _FRIENDLY:
+        if (action or "").rstrip("/").endswith(suffix):
+            return name
+    return action or "call"
+
+
+def _note_on_position(action: str, waited: float) -> None:
+    """A 429 while acting on one position: say so in that position's summary
+    (services/position_events). Nothing when no position is being acted on."""
+    try:
+        from app.services import position_events, webull_pacer  # noqa: PLC0415
+
+        if position_events.current_position() is None:
+            return
+        if waited == webull_pacer.QUEUE_FULL:
+            how = "sent without waiting — the queue for it was full"
+        elif waited > 0:
+            how = f"after waiting {waited:.1f}s for its turn"
+        else:
+            how = "with no wait"
+        position_events.record_issue(
+            "rate_limited",
+            f"Webull refused a {friendly(action)} (rate limit, 429), {how}. Made by {current_caller()}.",
+            dedupe_s=60,
+        )
+    except Exception:  # noqa: BLE001 — a note is never worth breaking a broker call
+        pass
+
+
 def install() -> None:
     """Wrap the Webull SDK's single-request method. Idempotent; a missing SDK
     is fine (nothing calls Webull then)."""
@@ -162,6 +249,7 @@ def install() -> None:
         app_key = getattr(self, "_app_key", None)
         # Take a turn on the endpoint's 2-per-2s counter before sending, rather
         # than be refused and retry (services/webull_pacer.py).
+        waited = 0.0
         try:
             from app.services import webull_pacer  # noqa: PLC0415
 
@@ -179,7 +267,9 @@ def install() -> None:
             status = result[0] if isinstance(result, tuple) and result else None
             return result
         finally:
-            record(app_key, action, status, (time.perf_counter() - t0) * 1000)
+            record(app_key, action, status, (time.perf_counter() - t0) * 1000, waited=waited)
+            if str(status) == "429":
+                _note_on_position(action, waited)
 
     ApiClient._handle_single_request = _counted
     _installed = True
@@ -199,8 +289,16 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
     per_minute: list[dict] = []
     try:
         r = _redis()
-        for m in range(now_min - minutes + 1, now_min + 1):
-            raw = r.hgetall(_KEY.format(m)) or {}
+        mins = list(range(now_min - minutes + 1, now_min + 1))
+        try:
+            pipe = r.pipeline()
+            for m in mins:
+                pipe.hgetall(_KEY.format(m))
+            raws = pipe.execute()
+        except Exception:  # noqa: BLE001 — a client without pipelines
+            raws = [r.hgetall(_KEY.format(m)) for m in mins]
+        for m, raw in zip(mins, raws):
+            raw = raw or {}
             count = 0
             for field, n in raw.items():
                 field = field.decode() if isinstance(field, bytes) else field
@@ -263,7 +361,30 @@ def summary(app_keys: Iterable[str], minutes: int = 5) -> dict:
         "queue_full": sorted(
             ({"endpoint": k, "calls": v} for k, v in queue_full.items()), key=lambda x: -x["calls"],
         ),
+        # Each refused call in the window, newest first, with what explains it
+        # (see _record_refusal).
+        "refusals": _refusals(hashes, now_min * 60 - (minutes - 1) * 60),
     }
+
+
+def _refusals(hashes: set[str], since: float, limit: int = 100) -> list[dict]:
+    import json  # noqa: PLC0415
+
+    out: list[dict] = []
+    try:
+        r = _redis()
+        for h in hashes:
+            for raw in r.lrange(_REFUSALS_KEY.format(h), 0, _REFUSALS_MAX - 1) or []:
+                try:
+                    e = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                if float(e.get("at") or 0) >= since:
+                    out.append(e)
+    except Exception:  # noqa: BLE001
+        return out
+    out.sort(key=lambda e: -float(e.get("at") or 0))
+    return out[:limit]
 
 
 __all__ = ["tag", "tagged", "install", "record", "record_wait", "record_queue_full", "summary", "app_hash",

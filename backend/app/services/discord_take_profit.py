@@ -368,6 +368,16 @@ def in_sync(db: Session, guard, want: Plan | None) -> bool:
     return sl.stop_price is not None and Decimal(str(sl.stop_price)) == want.stop_price
 
 
+def _issue(guard, kind: str, note: str) -> None:
+    """A line in the position's summary (services/position_events). Only for a
+    real guard — the planning tests drive plain stand-ins."""
+    if getattr(guard, "user_id", None) is None:
+        return
+    from app.services import position_events  # noqa: PLC0415
+
+    position_events.record_issue(kind, note, guard=guard)
+
+
 # A take-profit for more contracts than are held can only have (partly)
 # filled — it reserves what it covers, so nothing else could have sold them.
 # While the broker still calls it working, wait this long for it to say filled
@@ -494,6 +504,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
                 # an earmark that may already have sold would pull the stop
                 # off what is left.
                 log.info("take-profit: %s — %s", guard.symbol, why)
+                _issue(guard, "waiting", f"Take-profit left as it is: {why}.")
                 return (f"{settled}; " if settled else "") + f"take-profit kept: {why}"
     if not in_sync(db, guard, want):
         released = release(db, guard, cancel)
@@ -533,6 +544,7 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
                         else None)
     stop_outcome = reconcile_stop()
     if unconfirmed:
+        _issue(guard, "waiting", "Webull didn't confirm the take-profit's cancel — asking again next pass.")
         return settled or f"cancel not confirmed — asking again next pass (stop: {stop_outcome})"
     if want is None:
         return settled or f"no take-profit (stop: {stop_outcome})"
@@ -587,6 +599,12 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
             CONFLICT_BACKOFF if is_reservation_conflict(str(exc)) else BACKOFF)
         log.warning("take-profit: %s trim %s refused (%s) — retrying after %s",
                     guard.symbol, want.rung, str(exc)[:200], guard.tp_backoff_until)
+        from app.services import position_events, market_hours  # noqa: PLC0415
+
+        retry_at = guard.tp_backoff_until.astimezone(market_hours.ET).strftime("%H:%M:%S")
+        _issue(guard, "refused",
+               f"Webull refused Trim {want.rung}'s take-profit ({_n(want.quantity)} @ {_px(want.price)}): "
+               f"{position_events.short_reason(str(exc))}. Trying again after {retry_at} ET.")
         return "refused — backing off"
     guard.tp_order_id, guard.tp_stop_order_id, guard.tp_rung = tp_id, sl_id, want.rung
     log.info("take-profit: resting SELL %s %s @ %s for trim %s%s",

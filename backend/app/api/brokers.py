@@ -1151,7 +1151,7 @@ def _connect_hosted_ibkr(
 
 @router.get("/webull-usage")
 def webull_usage_summary(
-    minutes: int = Query(5, ge=1, le=60),
+    minutes: int = Query(5, ge=1, le=3 * 24 * 60),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:

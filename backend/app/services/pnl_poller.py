@@ -1183,7 +1183,13 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
 
                 from app.services import ladder_hold  # noqa: PLC0415
 
+                from app.services import position_events as _pe  # noqa: PLC0415
+
                 for guard in _armed + [g for g in _tp_waiting if g.id not in _seen]:
+                    # What Webull refuses while this position is worked on goes
+                    # into its summary (position_events.record_issue).
+                    _pe.set_position(guard.user_id, guard.symbol, guard.option_strike,
+                                     guard.option_right, guard.option_expiry)
                     if ladder_hold.held(guard.id):
                         # Being closed by hand right now: its stop and
                         # take-profit were released for the close, and putting
@@ -1275,6 +1281,7 @@ def _enforce_discord_ladder(acct: BrokerAccount, seen: dict | None = None) -> No
                         log.exception(
                             "discord stop: reconcile failed for %s", guard.symbol
                         )
+                _pe.set_position(None)
                 db.commit()
 
             # The same read as the stops above — not a second one this tick.

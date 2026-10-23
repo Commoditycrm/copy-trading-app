@@ -120,55 +120,68 @@ def ratchet_one(guard_id) -> str | None:
     """One guard: raise its trailing stop on a new high and move the resting
     order to it. Caller holds the user's lock. Returns an outcome, or None."""
     from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
-    from app.models.order import Order  # noqa: PLC0415
-    from app.services import discord_position_guard as guards  # noqa: PLC0415
-    from app.services import market_hours  # noqa: PLC0415
-    from app.services.position_events import because  # noqa: PLC0415
+    from app.services import position_events  # noqa: PLC0415
 
     with SessionLocal() as db:
         g = db.get(DiscordPositionGuard, guard_id)
         if g is None or g.closed_at is not None or g.stop_trail_pct is None or g.stop_price is None:
             return None
-        price = _live_price(g)
-        if price is None:
-            return None
-        before = Decimal(str(g.stop_price))
-        with because(f"trailing stop raised on a new high (live price {price})"):
-            raised = guards.ratchet_stop(g, price)
-            db.flush()
-        outcome = f"{g.symbol} trailing stop {_px(before)} -> {_px(g.stop_price)}" if raised else None
+        # What Webull refuses here goes into the position's summary.
+        with position_events.about(g.user_id, g.symbol, g.option_strike, g.option_right, g.option_expiry):
+            return _ratchet(db, g)
 
-        resting = db.get(Order, g.stop_order_id) if g.stop_order_id else None
-        if resting is None and getattr(g, "tp_stop_order_id", None) is None:
-            # Nothing at the broker for this level (between a cancel and its
-            # re-place, or refused): the poller enforces it — now, not in 15s.
-            if price <= Decimal(str(g.stop_price)):
-                db.commit()
-                _wake(db, g.user_id)
-                return "through the stop with nothing resting — poller woken"
+
+def _ratchet(db, g) -> str | None:
+    from app.models.order import Order  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+    from app.services import market_hours, position_events  # noqa: PLC0415
+    from app.services.position_events import because  # noqa: PLC0415
+
+    price = _live_price(g)
+    if price is None:
+        return None
+    before = Decimal(str(g.stop_price))
+    with because(f"trailing stop raised on a new high (live price {price})"):
+        raised = guards.ratchet_stop(g, price)
+        db.flush()
+    outcome = f"{g.symbol} trailing stop {_px(before)} -> {_px(g.stop_price)}" if raised else None
+
+    resting = db.get(Order, g.stop_order_id) if g.stop_order_id else None
+    if resting is None and getattr(g, "tp_stop_order_id", None) is None:
+        # Nothing at the broker for this level (between a cancel and its
+        # re-place, or refused): the poller enforces it — now, not in 15s.
+        if price <= Decimal(str(g.stop_price)):
             db.commit()
-            return outcome
-
-        if (_working(resting) and resting.stop_price is not None
-                and Decimal(str(resting.stop_price)) < Decimal(str(g.stop_price))
-                and market_hours.in_regular_session()):
-            now = time.monotonic()
-            if now - _last_modify.get(g.id, 0.0) >= MIN_MODIFY_GAP_S:
-                _last_modify[g.id] = now
-                old = resting.stop_price
-                try:
-                    moved = _modify_stop(db, resting, Decimal(str(g.stop_price)))
-                except Exception as exc:  # noqa: BLE001
-                    # The original stays working at its old level (an in-place
-                    # replace is atomic); the poller re-places it on its pass.
-                    resting.stop_price = old
-                    log.warning("trail ratchet: could not move %s's stop to %s: %s",
-                                g.symbol, g.stop_price, str(exc)[:200])
-                    moved = "modify failed"
-                outcome = (f"{outcome or g.symbol + ' stop behind its level'}; broker stop "
-                           f"{_px(old)} -> {_px(resting.stop_price)} ({moved})")
+            _wake(db, g.user_id)
+            return "through the stop with nothing resting — poller woken"
         db.commit()
         return outcome
+
+    if (_working(resting) and resting.stop_price is not None
+            and Decimal(str(resting.stop_price)) < Decimal(str(g.stop_price))
+            and market_hours.in_regular_session()):
+        now = time.monotonic()
+        if now - _last_modify.get(g.id, 0.0) >= MIN_MODIFY_GAP_S:
+            _last_modify[g.id] = now
+            old = resting.stop_price
+            try:
+                moved = _modify_stop(db, resting, Decimal(str(g.stop_price)))
+            except Exception as exc:  # noqa: BLE001
+                # The original stays working at its old level (an in-place
+                # replace is atomic); the poller re-places it on its pass.
+                resting.stop_price = old
+                log.warning("trail ratchet: could not move %s's stop to %s: %s",
+                            g.symbol, g.stop_price, str(exc)[:200])
+                position_events.record_issue(
+                    "refused",
+                    f"Webull refused moving the trailing stop {_px(old)} → {_px(g.stop_price)}: "
+                    f"{position_events.short_reason(str(exc))}. It stays at {_px(old)}; "
+                    "the ladder's next pass tries again.", guard=g)
+                moved = "modify failed"
+            outcome = (f"{outcome or g.symbol + ' stop behind its level'}; broker stop "
+                       f"{_px(old)} -> {_px(resting.stop_price)} ({moved})")
+    db.commit()
+    return outcome
 
 
 def _wake(db, user_id) -> None:
