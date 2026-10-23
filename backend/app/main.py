@@ -24,6 +24,7 @@ from app.api import (
     settings,
     subscribers,
     system as system_api,
+    paper_autotrade as paper_autotrade_api,
     trades,
     ui_prefs,
 )
@@ -175,6 +176,7 @@ def create_app() -> FastAPI:
     app.include_router(market_data_api.router)
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
+    app.include_router(paper_autotrade_api.router)
     app.include_router(ui_prefs.router)
     app.include_router(subscriber_symbols.router)
 

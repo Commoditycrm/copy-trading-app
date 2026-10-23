@@ -324,6 +324,17 @@ class Settings(BaseSettings):
     # Blank in production.
     sms_environment_label: str = ""
 
+    # ── QA automatic Alpaca PAPER trading (services/paper_autotrade.py) ──
+    # Off in production by never being set. With it on, the listed broker
+    # accounts are checked to be Alpaca paper before every order; automation
+    # also needs the admin toggle. Comma-separated broker_accounts ids.
+    qa_paper_autotrade_enabled: bool = False
+    qa_paper_autotrade_accounts: str = ""
+    # Runaway-volume caps per listed account; hitting one holds the account
+    # until an admin resets it.
+    qa_paper_autotrade_max_orders_per_minute: int = 10
+    qa_paper_autotrade_max_orders_per_day: int = 200
+
     # ── Inbound Discord alert-copying (browser listener) ──────────────────
     # Master switch for the whole inbound Discord feature. OFF by default so an
     # environment without the discord-listener container behaves exactly as it

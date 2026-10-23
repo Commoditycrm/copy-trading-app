@@ -2848,6 +2848,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
         _gate_px = _entry_gate_price(db, trader, trader_order)
 
     self_mirror_ids = self_mirror_account_ids(db, trader.id, _cap_ids)
+    # QA paper auto-trading: a listed paper account's orders are copied only
+    # into simulated accounts and Alpaca paper accounts (checked again at
+    # placement), never into a live one.
+    from app.services import paper_autotrade  # noqa: PLC0415
+
+    paper_parent = paper_autotrade.governs(trader_order.broker_account_id)
 
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
@@ -3046,6 +3052,29 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     status="skipped_self_mirror",
                 ))
                 continue
+
+            if paper_parent:
+                try:
+                    _target_creds = cache.decrypt_creds_cached(acct.id, acct.encrypted_credentials)
+                except Exception:  # noqa: BLE001
+                    _target_creds = None
+                _why = paper_autotrade.copy_target_problem(acct.broker, _target_creds)
+                if _why:
+                    log.warning("fanout: QA paper auto-trade — not copying into account %s (%s)",
+                                acct.id, _why)
+                    audit.record(
+                        db, actor_user_id=sub.user_id, action="paper_autotrade.copy_target_skipped",
+                        entity_type="broker_account", entity_id=acct.id,
+                        metadata={"parent_order_id": str(trader_order.id), "reason": _why},
+                    )
+                    results.append(FanoutResult(
+                        subscriber_user_id=sub.user_id,
+                        broker_account_id=acct.id,
+                        order_id=None,
+                        status="skipped_not_paper",
+                        detail=_why,
+                    ))
+                    continue
 
             # ── Externally-placed bracket handling (SnapTrade/Webull) ──
             # A trader bracket arrives as 3 linked orders: a TRIGGER entry (which
@@ -3416,6 +3445,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 # cache DTO has the same .broker attribute it needs.
                 sub_creds = cache.decrypt_creds_cached(acct.id, acct.encrypted_credentials)
                 sub_adapter = adapter_for(acct, sub_creds)
+                if paper_parent:
+                    # the copy's own account is proven paper before it's sent
+                    paper_autotrade.attach(sub_adapter, acct.id, sub_creds)
             except Exception as exc:  # noqa: BLE001
                 child.status = OrderStatus.REJECTED
                 child.reject_reason = f"Broker credentials error: {exc}"[:480]

@@ -2741,6 +2741,15 @@ def _execute_signal(
             # entry there would just sit until the open. Keep the alert's limit.
             detail += (" · " if detail else "") + "limit — market entries need the regular session"
 
+    # QA paper auto-trading: on a listed Alpaca paper account the approved alert
+    # is sent to the broker even in simulate-only mode. The account is checked
+    # to be paper before the order goes (services/paper_autotrade).
+    from app.services import paper_autotrade  # noqa: PLC0415
+
+    if not live and paper_autotrade.governs(resolved.broker_account_id):
+        live = True
+        detail += (" · " if detail else "") + "QA paper auto-trade"
+
     if not live:
         # Paper: everything above ran for real; only the broker call is skipped.
         discord_execution.mark_failed(
