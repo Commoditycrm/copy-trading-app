@@ -13,6 +13,7 @@ import { notify } from "@/lib/toast";
 import AwsCostSection from "./AwsCostSection";
 import StorageSection from "./StorageSection";
 import LogsSection from "./LogsSection";
+import SmsCostSection from "./SmsCostSection";
 
 interface ContainerStat {
   name: string;
@@ -399,6 +400,8 @@ export default function SystemUsagePage() {
       <LogsSection />
 
       <AwsCostSection />
+
+      <SmsCostSection />
     </div>
   );
 }
