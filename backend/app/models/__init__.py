@@ -16,6 +16,7 @@ from app.models.position_event import PositionEvent
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.sell_all_snapshot import SellAllSnapshot
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
+from app.models.sms_notification import SmsNotification
 from app.models.ui_prefs import UserUiPrefs
 from app.models.user import User, UserRole
 
@@ -46,6 +47,7 @@ __all__ = [
     "PositionEvent",
     "RetryInterval",
     "SellAllSnapshot",
+    "SmsNotification",
     "SubscriberSettings",
     "TestResult",
     "TraderSettings",

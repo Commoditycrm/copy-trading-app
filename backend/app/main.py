@@ -400,6 +400,18 @@ def create_app() -> FastAPI:
             daemon=True,
         ).start()
 
+        # Rejected-trade texts: sends what services/rejected_trade_sms queued
+        # and reads Twilio's delivery status back. Only with the flag on, so
+        # an environment without it runs exactly as before.
+        if get_settings().rejected_trade_sms_enabled:
+            from app.services import sms_outbox
+            threading.Thread(
+                target=sms_outbox.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="sms-outbox",
+                daemon=True,
+            ).start()
+
         # Discord entry reprice: a buy alert placed as a LIMIT can rest unfilled
         # while the contract moves, turning a good alert into a missed trade.
         # Gives such an entry ONE attempt at a higher price. Gated on the same
