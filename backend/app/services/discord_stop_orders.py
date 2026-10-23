@@ -83,6 +83,14 @@ _CONFLICT_MARKERS = (
     "naked call", "naked put", "net moeny not enough", "net money not enough",
     "new naked", "cash-secured", "cash secured", "insufficient", "intent mismatch",
     "position intent", "exceeds", "not enough position", "available quantity",
+    # Webull: "This order cannot be entered because it will reverse an existing
+    # position. You may need to close an open position, or cancel an open
+    # order" (OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION) — the contracts are
+    # held by another resting sell. QA 2026-10-23, TSLA 375P: a stop placed
+    # while the old take-profit pair still held both contracts was refused this
+    # way, read as "the stop will never rest", and a contract was sold at
+    # market — then again after each of two averages.
+    "reverse an existing position", "not support reverse", "cancel an open order",
 )
 
 
@@ -440,6 +448,34 @@ def _recent_rejection_age_s(db: Session, guard) -> float | None:
     return (datetime.now(timezone.utc) - at).total_seconds()
 
 
+def _latest_buy_at(db: Session, guard):
+    """When the latest filled BUY of this contract was placed, or None."""
+    from datetime import timezone  # noqa: PLC0415
+
+    from sqlalchemy import func, select  # noqa: PLC0415
+
+    from app.models.order import Order, OrderSide, OrderStatus  # noqa: PLC0415
+
+    try:
+        at = db.execute(
+            select(func.max(Order.created_at)).where(
+                Order.user_id == guard.user_id,
+                Order.symbol == guard.symbol,
+                Order.option_strike.is_not_distinct_from(guard.option_strike),
+                Order.option_expiry.is_not_distinct_from(guard.option_expiry),
+                Order.side == OrderSide.BUY,
+                Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+            )
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 — a stand-in session in tests, or no orders yet
+        return None
+    from datetime import datetime  # noqa: PLC0415
+
+    if not isinstance(at, datetime):
+        return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+
+
 def _recent_rejection_reason(db: Session, guard) -> str | None:
     """The broker's reason for the most recent refused stop, or None.
 
@@ -464,6 +500,13 @@ def _recent_rejection_reason(db: Session, guard) -> str | None:
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         since = max(since, created)
+    # …nor further back than the latest BUY into this position. An average or an
+    # add changes what is held: a stop refused before it is about a position
+    # that no longer exists, and reading it as "refused, so sell" sold the new
+    # contract straight after each average (QA 2026-10-23, TSLA 375P).
+    last_buy = _latest_buy_at(db, guard)
+    if last_buy is not None:
+        since = max(since, last_buy)
     row = db.execute(
         select(Order.reject_reason).where(
             Order.user_id == guard.user_id,
