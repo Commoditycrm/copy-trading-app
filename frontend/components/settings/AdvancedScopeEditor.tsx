@@ -327,7 +327,7 @@ export function AdvancedScopeEditor({ scope, settings, effective, busy, onSave }
             + Add trim
           </button>
           <span className="text-[10px]" style={{ color: "var(--muted)" }}>
-            If the last trim is not 100% it rounds down and leaves a runner.
+            If the last trim is under 100%, what it doesn't sell stays as a runner. Trims round up.
           </span>
         </div>
       </div>
@@ -346,7 +346,8 @@ export function AdvancedScopeEditor({ scope, settings, effective, busy, onSave }
           Trim of rem. qty is a share of what is STILL held, so 50 / 50 / 100
           takes a position of 4 down as 2, then 1, then 1. A trim only fires
           above its profit target; its stop applies to whatever is left after
-          it. Stop is a level from entry; Trail follows the high and exits on a
+          it. A trim of 0% sells nothing: at its target the stop moves and the
+          ladder goes on. Stop is a level from entry; Trail follows the high and exits on a
           give-back of that %. Leave a box empty to inherit it.
         </p>
       </div>

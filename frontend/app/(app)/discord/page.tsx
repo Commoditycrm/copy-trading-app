@@ -1984,7 +1984,8 @@ export default function DiscordPage() {
                     </button>
                     <p className="text-[11px] leading-snug"
                        style={{ color: lastTrimLeavesRunner ? "var(--warn, #b45309)" : "var(--muted)" }}>
-                      If the last trim is not 100% then it will round down and leave runners.
+                      If the last trim is under 100%, what it doesn't sell stays as a runner, protected by that
+                      trim's stop. Trims round up, so a small position may have no runner.
                     </p>
                   </div>
 
@@ -2001,6 +2002,8 @@ export default function DiscordPage() {
                       Trim of rem. qty is a share of what is STILL held, so 50 / 50 / 100 works a
                       position of 4 down as 2, then 1, then 1. A trim only fires above
                       its profit target; its stop applies to whatever is left after it.
+                      A trim of 0% sells nothing: when its target is reached the stop moves and the
+                      ladder goes on to the next trim.
                       Stop is a level from entry; Trail follows the high and exits on a
                       give-back of that %.
                     </p>

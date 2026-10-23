@@ -155,6 +155,56 @@ def target_price(entry: Decimal, gate_pct: Decimal) -> Decimal:
     return (entry * (Decimal(1) + gate_pct / Decimal(100))).quantize(_CENT, rounding=ROUND_CEILING)
 
 
+def pass_stop_only_trims(db: Session, guard, held: Decimal, ts, mark: Decimal | None) -> str | None:
+    """A trim that sells 0% moves the stop and nothing else — so there is no
+    take-profit to rest for it, and in this mode the ladder only advanced when
+    one FILLED. A 0% trim therefore stalled it: QA 2026-10-23, Clint QQQ 708C
+    (T1 +20% sell 0% stop +1%) ran to +67% and the ladder never left the start —
+    no stop lock, and T2's take-profit was never placed.
+
+    So a 0% trim is watched by price instead: once the live price reaches its
+    target the rung is passed, its stop applied — raised to, never lowered from
+    where it is — and the next trim's take-profit rests on the same pass.
+    Several 0% trims in a row are all passed. Returns what happened, or None.
+    """
+    if guard.closed_at is not None or held <= 0 or mark is None or mark <= 0:
+        return None
+    entry = guard.entry_price
+    if entry is None or entry <= 0:
+        return None
+    cfg = discord_ladder.trim_config(ts)
+    done: list[str] = []
+    while True:
+        rung = (guard.sell_count or 0) + 1
+        if rung > cfg.count:
+            break
+        rung_cfg = cfg.rung(rung)
+        if Decimal(str(rung_cfg.qty_pct or 0)) > 0:
+            break                              # a real trim: its take-profit handles it
+        gate = rung_cfg.profit_gate_pct or Decimal(0)
+        if gate <= 0:
+            break                              # no target: it waits for its alert
+        target = target_price(Decimal(str(entry)), gate)
+        if mark < target:
+            break
+        from app.services.position_events import because  # noqa: PLC0415
+
+        stop, trail_pct, peak = guards.rung_stop(entry, rung_cfg, mark)
+        stop = guards._to_tick(stop)
+        current = Decimal(str(guard.stop_price)) if guard.stop_price is not None else None
+        with because(f"Trim {rung} sells 0%: +{_n(gate)}% reached ({_px(mark)} ≥ {_px(target)}) — "
+                     "nothing to sell, the ladder moves on"):
+            guard.sell_count = rung
+            if stop is not None and stop > 0 and (current is None or stop > current):
+                guard.stop_price = stop
+                guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+            if hasattr(db, "flush"):
+                db.flush()
+        done.append(f"trim {rung} (0%) passed at {_px(mark)}, stop {_px(guard.stop_price) if guard.stop_price else '—'}")
+        log.info("take-profit: %s %s", guard.symbol, done[-1])
+    return "; ".join(done) or None
+
+
 def plan(guard, held: Decimal, ts, mark: Decimal | None) -> Plan | None:
     """What should rest for the NEXT trim, or None. Pure — no DB, no broker."""
     if guard.tp_off or held <= 0 or guard.closed_at is not None:
@@ -488,6 +538,9 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     """
     now = now or datetime.now(timezone.utc)
     settled = settle(db, guard, ts, cancel, in_session=in_session, held=held)
+    passed = pass_stop_only_trims(db, guard, held, ts, mark)
+    if passed:
+        settled = f"{settled}; {passed}" if settled else passed
 
     want = plan(guard, held, ts, mark)
     released = False
@@ -613,5 +666,5 @@ def reconcile(db: Session, guard, held: Decimal, ts, mark: Decimal | None, *,
     return (f"{settled}; " if settled else "") + f"placed trim {want.rung}: {want.quantity} @ {want.price}"
 
 
-__all__ = ["CHECK_EVERY", "CONFLICT_BACKOFF", "LOOKS_FILLED_WAIT", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
+__all__ = ["CHECK_EVERY", "CONFLICT_BACKOFF", "LOOKS_FILLED_WAIT", "pass_stop_only_trims", "enabled", "active", "possible", "Plan", "plan", "target_price", "settle", "release",
            "in_sync", "reconcile", "BACKOFF"]
