@@ -10,6 +10,7 @@ import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -1005,56 +1006,61 @@ def test_an_average_down_still_obeys_the_order_ceiling(monkeypatch):
         )
 
 
-# ── averaging into a position that was opened LIGHT ──────────────────────────
-# light / not heavy / lotto / risky entries are sized down on purpose. Doubling
-# one on every average grows it 1, 2, 4, 8; it adds the opening size instead.
+# ── an average buys the OPENING size again ───────────────────────────────────
+# The trader's rule (2026-10-22): opened with 5, each average adds 5 — 10, then
+# 15. Opened with 10 and 5 more bought by hand, each average adds 10. It used
+# to double what was held (5, 10, 20, 40) except for a light entry.
 
-def test_an_average_into_a_light_position_adds_the_opening_size(monkeypatch):
-    """Opened light with 2, averaged once already (4 held): the next average
-    adds 2 again, not 4."""
-    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="4")]))
-    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: Decimal("2"))
+def test_an_average_adds_the_opening_size(monkeypatch):
+    """Opened with 5, averaged once already (10 held): the next average adds 5."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="10")]))
+    monkeypatch.setattr(ex, "opening_quantity", lambda *a, **k: Decimal("5"))
     r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=4))
-    assert r.payload.quantity == Decimal("2")
-    assert r.held_quantity == Decimal("4")
+    assert r.payload.quantity == Decimal("5")
+    assert r.held_quantity == Decimal("10")
     assert "opening size" in r.resolutions["quantity"]
 
 
-def test_an_average_into_an_ordinary_position_still_doubles(monkeypatch):
-    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="4")]))
-    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: None)
+def test_a_manual_add_does_not_change_what_an_average_buys(monkeypatch):
+    """Opened with 10, 5 bought by hand (15 held): an average adds 10."""
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="15")]))
+    monkeypatch.setattr(ex, "opening_quantity", lambda *a, **k: Decimal("10"))
     r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
-    assert r.payload.quantity == Decimal("4") and r.held_quantity == Decimal("4")
+    assert r.payload.quantity == Decimal("10") and r.held_quantity == Decimal("15")
+
+
+def test_with_the_opening_size_unknown_an_average_doubles_as_before(monkeypatch):
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty="4")]))
+    monkeypatch.setattr(ex, "opening_quantity", lambda *a, **k: None)
+    r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing())
+    assert r.payload.quantity == Decimal("4") and "opening size unknown" in r.resolutions["quantity"]
 
 
 def test_with_nothing_held_the_opening_size_rule_does_not_apply(monkeypatch):
     """No position, so nothing to add the opening size to: a plain re-entry."""
     _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
-    monkeypatch.setattr(ex, "light_entry_quantity", lambda *a, **k: Decimal("2"))
+    monkeypatch.setattr(ex, "opening_quantity", lambda *a, **k: Decimal("2"))
     r = ex.resolve(None, _User(), _signal(double_up=True), ex.Sizing(multiplier=5))
     assert r.payload.quantity == Decimal("5") and "reentry" in r.resolutions
 
 
-class _LightDB:
-    """The opening order's (filled, ordered, parsed alert) row."""
+class _OpeningDB:
+    """The opening order, by id."""
 
-    def __init__(self, row):
-        self._row = row
+    def __init__(self, order):
+        self._order = order
 
-    def execute(self, _stmt):
-        row = self._row
-        return type("R", (), {"first": lambda self: row})()
+    def get(self, _model, _oid):
+        return self._order
 
 
-@pytest.mark.parametrize("row, guard_order, expected", [
-    ((Decimal("2"), Decimal("2"), {"half_size": True}), True, Decimal("2")),    # light entry
-    ((Decimal("0"), Decimal("3"), {"half_size": True}), True, Decimal("3")),    # not filled yet: what was ordered
-    ((Decimal("2"), Decimal("2"), {"half_size": False}), True, None),           # ordinary entry
-    ((Decimal("2"), Decimal("2"), None), True, None),                           # no alert behind it
-    (None, True, None),                                                         # opening order not from an alert
-    ((Decimal("2"), Decimal("2"), {"half_size": True}), False, None),           # no opening order known
+@pytest.mark.parametrize("order, guard_order, expected", [
+    (SimpleNamespace(filled_quantity=Decimal("5"), quantity=Decimal("5")), True, Decimal("5")),
+    (SimpleNamespace(filled_quantity=Decimal("0"), quantity=Decimal("3")), True, Decimal("3")),   # not filled yet
+    (None, True, None),                                                                         # order gone
+    (SimpleNamespace(filled_quantity=Decimal("5"), quantity=Decimal("5")), False, None),       # no opening order known
 ])
-def test_light_entry_quantity_reads_the_opening_order(monkeypatch, row, guard_order, expected):
+def test_opening_quantity_reads_the_ladders_opening_order(monkeypatch, order, guard_order, expected):
     import types
     import uuid as _uuid
 
@@ -1062,12 +1068,11 @@ def test_light_entry_quantity_reads_the_opening_order(monkeypatch, row, guard_or
 
     guard = types.SimpleNamespace(entry_order_id=_uuid.uuid4() if guard_order else None)
     monkeypatch.setattr(guards, "find", lambda *a, **k: guard)
-    got = ex.light_entry_quantity(_LightDB(row), _User(), "SPY", Decimal("764"), None, None)
-    assert got == expected
+    assert ex.opening_quantity(_OpeningDB(order), _User(), "SPY", Decimal("764"), None, None) == expected
 
 
-def test_light_entry_quantity_without_a_ladder_or_a_db():
-    assert ex.light_entry_quantity(None, _User(), "SPY", None, None, None) is None
+def test_opening_quantity_without_a_ladder_or_a_db():
+    assert ex.opening_quantity(None, _User(), "SPY", None, None, None) is None
 
 
 # ── sizing by dollars, at the price the order will pay ───────────────────────
