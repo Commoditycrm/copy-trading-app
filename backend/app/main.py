@@ -22,6 +22,7 @@ from app.api import (
     performance,
     positions,
     settings,
+    sms_costs as sms_costs_api,
     subscribers,
     system as system_api,
     paper_autotrade as paper_autotrade_api,
@@ -178,6 +179,7 @@ def create_app() -> FastAPI:
     app.include_router(system_api.router)
     app.include_router(paper_autotrade_api.router)
     app.include_router(ui_prefs.router)
+    app.include_router(sms_costs_api.router)
     app.include_router(subscriber_symbols.router)
 
     # Shared across the startup/shutdown hooks so the retry scheduler
