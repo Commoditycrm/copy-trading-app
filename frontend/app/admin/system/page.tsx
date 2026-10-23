@@ -12,6 +12,7 @@ import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import AwsCostSection from "./AwsCostSection";
 import StorageSection from "./StorageSection";
+import LogsSection from "./LogsSection";
 
 interface ContainerStat {
   name: string;
@@ -394,6 +395,8 @@ export default function SystemUsagePage() {
 
       {/* own slow timer; independent of the live usage above */}
       <StorageSection />
+
+      <LogsSection />
 
       <AwsCostSection />
     </div>

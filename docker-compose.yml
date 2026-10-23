@@ -86,6 +86,10 @@ services:
       # Host telemetry for Admin → System, written by scripts/host_metrics.py
       # on the host. Read-only; no collector = "unavailable" on the page.
       - /var/lib/kopyya-metrics:/host-metrics:ro
+      # Log-cleanup requests and the retention setting for the host agent
+      # (scripts/host_log_cleanup.py). The only writable host path; the agent
+      # decides what may be deleted, never this container.
+      - /var/lib/kopyya-ops:/host-ops
     # Force IPv4 to outbound services (broker APIs); Lightsail has no IPv6 egress.
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
