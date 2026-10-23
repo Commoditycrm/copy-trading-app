@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Kopyya host storage breakdown every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

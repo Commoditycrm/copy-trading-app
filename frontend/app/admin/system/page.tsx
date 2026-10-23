@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import AwsCostSection from "./AwsCostSection";
+import StorageSection from "./StorageSection";
 
 interface ContainerStat {
   name: string;
@@ -392,6 +393,8 @@ export default function SystemUsagePage() {
       )}
 
       {/* own slow timer; independent of the live usage above */}
+      <StorageSection />
+
       <AwsCostSection />
     </div>
   );

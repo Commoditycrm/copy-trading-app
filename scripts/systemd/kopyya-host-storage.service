@@ -1,0 +1,11 @@
+[Unit]
+Description=Kopyya: host disk usage by category for the admin System page
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/kopyya/host_storage.py
+# du over the whole disk: keep it out of the trading containers' way
+Nice=19
+IOSchedulingClass=idle
