@@ -1044,6 +1044,38 @@ def test_with_nothing_held_the_opening_size_rule_does_not_apply(monkeypatch):
     assert r.payload.quantity == Decimal("5") and "reentry" in r.resolutions
 
 
+@pytest.mark.parametrize("sizing, expected", [
+    (ex.Sizing(multiplier=10), Decimal("5")),                                    # risky: half of 10
+    (ex.Sizing(multiplier=3), Decimal("2")),                                     # half of 3, rounded up
+    (ex.Sizing(multiplier=10, risky_factor=Decimal("0.25"),
+               risky_note="a quarter (last trading day)"), Decimal("3")),        # a quarter of 10, rounded up
+])
+def test_the_opening_size_an_average_repeats_is_the_risky_sized_entry(monkeypatch, sizing, expected):
+    """The opening size is what the entry actually bought, so the risky / light
+    halving (and a last-trading-day quarter) is already in it — and each average
+    repeats exactly that, not the full size and not halved again."""
+    import types
+    import uuid as _uuid
+
+    import app.services.discord_position_guard as guards
+
+    # The entry: a risky alert, sized by the trader's settings.
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[]))
+    entry = ex.resolve(None, _User(), _signal(half_size=True), sizing)
+    assert entry.payload.quantity == expected
+
+    # It filled; the ladder keeps it as the opening order.
+    opening_order = SimpleNamespace(filled_quantity=entry.payload.quantity, quantity=entry.payload.quantity)
+    monkeypatch.setattr(guards, "find", lambda *a, **k: types.SimpleNamespace(entry_order_id=_uuid.uuid4()))
+    opening = ex.opening_quantity(_OpeningDB(opening_order), _User(), "SPY", Decimal("764"), None, None)
+
+    # Each average — even one that itself says "light" — adds that size again.
+    _wire(monkeypatch, _ChainAdapter(contracts=[_Contract(100)], positions=[_Pos(qty=str(expected))]))
+    monkeypatch.setattr(ex, "opening_quantity", lambda *a, **k: opening)
+    avg = ex.resolve(None, _User(), _signal(double_up=True, half_size=True), sizing)
+    assert avg.payload.quantity == expected
+
+
 class _OpeningDB:
     """The opening order, by id."""
 
