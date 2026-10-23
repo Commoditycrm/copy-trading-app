@@ -22,9 +22,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.api.deps import require_admin
+from app.database import get_db
 from app.models.user import User
 
 router = APIRouter(prefix="/api/admin/system", tags=["admin", "system"])
@@ -154,3 +157,46 @@ def storage(_: User = Depends(require_admin)) -> dict[str, Any]:
     from app.services import host_storage  # noqa: PLC0415
 
     return host_storage.read_storage()
+
+
+# ── logs: clear and retain (the host agent does the deleting) ─────────────
+
+
+class CleanupIn(BaseModel):
+    categories: list[str]
+    inventory_id: str
+    confirm: bool = False
+
+
+class RetentionIn(BaseModel):
+    enabled: bool
+    rotated_log_days: int
+
+
+@router.get("/logs")
+def logs(db: Session = Depends(get_db), _: User = Depends(require_admin)) -> dict[str, Any]:
+    """Which logs could be cleared (with every file and size), whether cleanup
+    is live or dry-run on this host, the retention setting, the last result."""
+    from app.services import log_cleanup  # noqa: PLC0415
+
+    return log_cleanup.status(db)
+
+
+@router.post("/logs/cleanup")
+def logs_cleanup(body: CleanupIn, db: Session = Depends(get_db), admin: User = Depends(require_admin)) -> dict[str, Any]:
+    from app.services import log_cleanup  # noqa: PLC0415
+
+    try:
+        return log_cleanup.request_cleanup(db, admin.id, admin.email, body.categories, body.inventory_id, body.confirm)
+    except log_cleanup.CleanupRefused as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.put("/logs/retention")
+def logs_retention(body: RetentionIn, db: Session = Depends(get_db), admin: User = Depends(require_admin)) -> dict:
+    from app.services import log_cleanup  # noqa: PLC0415
+
+    try:
+        return log_cleanup.set_retention(db, admin.id, body.enabled, body.rotated_log_days)
+    except log_cleanup.CleanupRefused as exc:
+        raise HTTPException(422, str(exc)) from exc
