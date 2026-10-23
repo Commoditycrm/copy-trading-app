@@ -315,6 +315,14 @@ class Settings(BaseSettings):
     # number in E.164, e.g. +15551234567). One of the two must be set to send.
     twilio_messaging_service_sid: str = ""
     twilio_from_number: str = ""
+    # Rejected-trade texts from one place (services/rejected_trade_sms.py): every
+    # terminal rejection, once per order, tracked to Twilio delivery. OFF keeps
+    # today's behaviour exactly — only the three placement/after-accept notices
+    # text, fire-and-forget.
+    rejected_trade_sms_enabled: bool = False
+    # Shown in the text's heading, e.g. "QA" → "Kopyya QA: Trade Rejected".
+    # Blank in production.
+    sms_environment_label: str = ""
 
     # ── Inbound Discord alert-copying (browser listener) ──────────────────
     # Master switch for the whole inbound Discord feature. OFF by default so an

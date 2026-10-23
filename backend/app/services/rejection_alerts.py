@@ -31,44 +31,83 @@ log = logging.getLogger(__name__)
 
 _ACCEPTED = (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _KEY = "rejection_alerts.pending"
+# Every change INTO rejected, for services/rejected_trade_sms.py (flag-gated)
+_SMS_KEY = "rejection_alerts.sms"
+_NEW = object()
 _installed = False
 
 
-def _was_accepted(session: Session, order: Order) -> bool:
-    """Is this order changing from accepted to REJECTED in this flush?"""
+def _previous_status(session: Session, order: Order):  # noqa: ANN202
+    """The status this order is leaving in this flush, or _NEW for an order
+    being inserted, or None when the status isn't changing to REJECTED."""
     if order.status != OrderStatus.REJECTED:
-        return False
+        return None
     hist = inspect(order).attrs.status.history
     if not hist.has_changes():
-        return False
+        return None
     if hist.deleted:
-        return hist.deleted[0] in _ACCEPTED
+        return hist.deleted[0]
     # Set on a row whose loaded values had expired (after a commit): the
     # previous status isn't in memory, so read what the database still holds.
     from sqlalchemy import select  # noqa: PLC0415
 
     with session.no_autoflush:
         before = session.execute(select(Order.status).where(Order.id == order.id)).scalar_one_or_none()
-    return before in _ACCEPTED
+    return before if before != OrderStatus.REJECTED else None
+
+
+def _was_accepted(session: Session, order: Order) -> bool:
+    """Is this order changing from accepted to REJECTED in this flush?"""
+    return _previous_status(session, order) in _ACCEPTED
 
 
 def _before_flush(session: Session, flush_context, instances) -> None:  # noqa: ANN001, ARG001
+    from app.services import rejected_trade_sms  # noqa: PLC0415
+
     try:
+        sms_on = rejected_trade_sms.enabled()
         for obj in list(session.dirty):
-            if isinstance(obj, Order) and _was_accepted(session, obj):
+            if not isinstance(obj, Order):
+                continue
+            previous = _previous_status(session, obj)
+            if previous is None:
+                continue
+            if previous in _ACCEPTED:
                 session.info.setdefault(_KEY, set()).add(obj.id)
+            if sms_on:
+                session.info.setdefault(_SMS_KEY, []).append((obj, previous))
+        if sms_on:
+            # listener inserts and orders created already rejected
+            for obj in list(session.new):
+                if isinstance(obj, Order) and obj.status == OrderStatus.REJECTED:
+                    session.info.setdefault(_SMS_KEY, []).append((obj, _NEW))
     except Exception:  # noqa: BLE001 — a notice is never worth failing a flush for
         log.exception("rejection alerts: could not check an order")
 
 
 def _after_commit(session: Session) -> None:
     ids = session.info.pop(_KEY, None)
+    rejected = session.info.pop(_SMS_KEY, None)
     if ids:
         notify(ids)
+    if rejected:
+        from app.services import rejected_trade_sms  # noqa: PLC0415
+
+        items, seen = [], set()
+        for obj, previous in rejected:
+            # the id is known once flushed; read it without a refresh
+            ident = inspect(obj).identity
+            if not ident or ident[0] in seen:
+                continue
+            seen.add(ident[0])
+            items.append((ident[0], None if previous is _NEW else previous))
+        if items:
+            rejected_trade_sms.queue_after_commit(items)
 
 
 def _after_rollback(session: Session) -> None:
     session.info.pop(_KEY, None)
+    session.info.pop(_SMS_KEY, None)
 
 
 def message_for(order: Order) -> tuple[str, str]:

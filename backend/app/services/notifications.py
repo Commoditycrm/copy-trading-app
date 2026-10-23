@@ -102,9 +102,20 @@ _SMS_PREF_PREFIX = (
 )
 
 
+# With REJECTED_TRADE_SMS_ENABLED these are texted by services/rejected_trade_sms
+# (once per order, tracked to delivery) — the notice stays in-app only here so
+# the same rejection isn't texted twice.
+_CENTRAL_REJECTION_TYPES = ("order.rejected", "copy.rejected")
+
+
 def _sms_pref_attr(notif_type: str) -> str | None:
     """The User flag gating SMS for this notification type, or None when the
     type is in-app only."""
+    if notif_type in _CENTRAL_REJECTION_TYPES:
+        from app.config import get_settings  # noqa: PLC0415
+
+        if get_settings().rejected_trade_sms_enabled:
+            return None
     attr = _SMS_PREF_EXACT.get(notif_type)
     if attr is not None:
         return attr
