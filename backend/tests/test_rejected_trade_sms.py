@@ -41,6 +41,7 @@ def flag(monkeypatch):
     def set_(on=True, label="QA"):
         monkeypatch.setattr(get_settings(), "rejected_trade_sms_enabled", on)
         monkeypatch.setattr(get_settings(), "sms_environment_label", label)
+        monkeypatch.setattr(get_settings(), "frontend_base_url", "https://test.kopyya.com")
     set_(False, "")
     return set_
 
@@ -169,19 +170,13 @@ def test_the_text_carries_the_trade_details(world):
     o = world.order(t, world.account(t), reason="insufficient buying power")
     o.closed_at = ET_1032
     body = rts.message_for(world.db, o, "broker_rejected", ET_1032)
-    assert body.splitlines() == [
-        "Kopyya QA: Trade Rejected",
-        "Your trade",
-        "TSLA 450C 10/23",
-        "BUY 2 contracts, LIMIT $5.1",
-        "Broker: Alpaca Paper",
-        "Reason: insufficient buying power",
-        "Time: Oct 23, 10:32 AM ET",
-        f"Ref: {str(o.id).replace('-', '')[:8].upper()}",
-    ]
+    ref = str(o.id).replace("-", "")[:8].upper()
+    # the shape of the A2P sample: "Your BUY TSLA order was rejected: <reason>. View: <link>"
+    assert body == ("Kopyya QA: Your BUY 2 TSLA 450C 10/23 order (LIMIT $5.1, Alpaca Paper) was rejected: "
+                    f"insufficient buying power. Oct 23 10:32 AM ET, Ref {ref}. View: https://test.kopyya.com/trades")
     final = sms.compose(body)
-    assert final.startswith("Kopyya QA: Trade Rejected") and final.count("Kopyya") == 1
-    assert final.endswith("Reply STOP to opt out.")
+    assert final.startswith("Kopyya QA: Your BUY") and final.count("Kopyya") == 1
+    assert final.endswith("Reply STOP to opt out.") and "\n" not in final
 
 
 def test_a_copy_names_the_trader_and_a_stock_reads_in_shares(world):
@@ -191,10 +186,8 @@ def test_a_copy_names_the_trader_and_a_stock_reads_in_shares(world):
                          status=OrderStatus.FILLED)
     child = world.order(s, world.account(s, BrokerName.WEBULL, paper=False), option=False, qty="1",
                         otype=OrderType.MARKET, limit=None, parent=parent.id, side=OrderSide.SELL)
-    lines = rts.message_for(world.db, child, "broker_rejected", ET_1032).splitlines()
-    assert lines[0] == "Kopyya: Trade Rejected"                          # no environment label
-    assert lines[1] == "Copy of Trader Joe's trade"
-    assert lines[2:5] == ["TSLA", "SELL 1 share, MARKET", "Broker: Webull"]
+    body = rts.message_for(world.db, child, "broker_rejected", ET_1032)
+    assert body.startswith("Kopyya: Your copy of Trader Joe's SELL 1 TSLA order (MARKET, Webull) was rejected:")
 
 
 def test_outcome_unknown_is_never_called_rejected(world):
@@ -202,8 +195,7 @@ def test_outcome_unknown_is_never_called_rejected(world):
     o = world.order(t, world.account(t), reason=NEEDS_REVIEW_REASON)
     body = rts.message_for(world.db, o, "needs_review", ET_1032)
     assert "Rejected" not in body and "rejected" not in body
-    assert body.splitlines()[0].endswith("Trade Needs Review")
-    assert "may have been placed" in body
+    assert "was not confirmed by the broker and may have been placed" in body
 
 
 @pytest.mark.parametrize("raw,clean", [
@@ -232,8 +224,18 @@ def test_the_worst_case_text_stays_gsm7_and_within_two_segments(world):
     final = sms.compose(rts.message_for(world.db, child, "broker_rejected", ET_1032))
     assert len(final) <= rts.MAX_CHARS
     assert set(final) <= rts._GSM7                                       # noqa: SLF001
-    assert "Reason: " in final and final.endswith("Reply STOP to opt out.")
-    assert "Copy of Jayyyyyyyy \"The Sniper\" - Opti's trade" in final     # emoji gone, then 30 chars
+    assert "was rejected: xxx" in final and "xxx..." in final and "...." not in final
+    assert final.endswith("Reply STOP to opt out.")
+    assert "Your copy of Jayyyyyyyy \"The Sniper\" - Opti's BUY" in final   # emoji gone, then 30 chars
+
+
+@pytest.mark.parametrize("outcome,verb", [("failed", "could not be placed: "),
+                                           ("blocked", "was not placed: "), ("internal", "was not placed: ")])
+def test_other_outcomes_say_what_happened(world, outcome, verb):
+    t = world.user()
+    o = world.order(t, world.account(t), reason="retry_skipped: daily_loss_limit_hit")
+    body = rts.message_for(world.db, o, outcome, ET_1032)
+    assert verb in body and "rejected" not in body
 
 
 def test_the_flag_and_label_default_off_and_blank():
