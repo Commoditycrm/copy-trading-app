@@ -1847,6 +1847,9 @@ def _read_positions_for_close(adapter: Any) -> list:
 
 def _cancel_working_orders_for_position(
     db: Session, user: User, acct: BrokerAccount, adapter: Any, pos: BrokerPosition,
+    *, side: OrderSide | None = None,
+    reason: str = "Cancelled automatically to free the position for a close you placed "
+                  "from the positions table.",
 ) -> list[uuid.UUID]:
     """Cancel every still-working order on the SAME contract before closing it.
 
@@ -1882,6 +1885,7 @@ def _cancel_working_orders_for_position(
             Order.option_right.is_not_distinct_from(pos.option_right),
             Order.status.in_(_RESERVING_STATUSES),
             Order.broker_order_id.isnot(None),
+            *([Order.side == side] if side is not None else []),
         )
     ).scalars().all()
     if not rows:
@@ -1916,10 +1920,7 @@ def _cancel_working_orders_for_position(
                 continue
         o.status = OrderStatus.CANCELED
         o.closed_at = now
-        o.reject_reason = (
-            "Cancelled automatically to free the position for a close you placed "
-            "from the positions table."
-        )[:480]
+        o.reject_reason = reason[:480]
         cancelled.append(o.id)
         touched.append(o)
 
@@ -2237,6 +2238,87 @@ def _resting_stop_orders(db: Session, user_id, pos) -> list:
                               OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)),
         )
     ).scalars())
+
+
+@router.post("/{broker_symbol}/reapply-ladder")
+@_tagged("exit ladder reapplied by you on Positions")
+@ladder_hold.released_after
+def reapply_exit_ladder(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Start the position's Discord exit ladder over from what is held now.
+
+    For a position worked on by hand — a stop moved or removed, a take-profit
+    cancelled, contracts added. Every resting SELL on the contract goes (the
+    ladder's stop and take-profit, and any other sell); resting buys stay. The
+    ladder then restarts at T1 from the position's current average cost: the
+    On Fill stop from that cost, the first take-profit sized from what is held.
+    The orders themselves go out on the ladder's next pass, which this wakes.
+
+    Open to the position's OWNER, trader or subscriber — the account check below
+    is what protects it.
+    """
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import audit, discord_stop_orders  # noqa: PLC0415
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+    from app.services import pnl_poller  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    positions = _read_positions_for_close(adapter)
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity <= 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.instrument_type != InstrumentType.OPTION:
+        raise HTTPException(409, "The exit ladder runs on options only.")
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        getattr(pos, "option_right", None), pos.option_expiry)
+    if guard is None:
+        raise HTTPException(409, "This position has no exit ladder — it wasn't opened from a channel. "
+                                 "Assign it to a channel first.")
+    if guards.is_manual(db, guard):
+        raise HTTPException(409, "This position is assigned to Self, so its exits are yours — "
+                                 "there is no ladder to reapply.")
+    ts = dcs.for_guard(db, user.id, guard) or db.get(TraderSettings, user.id)
+
+    # Keep the ladder's own pass off it while its orders come down and the
+    # ladder is reset; it places the new ones once this request ends.
+    ladder_hold.hold_for_request(guard.id)
+    discord_stop_orders.release_for_position(db, user, pos)
+    db.commit()
+    cancelled = _cancel_working_orders_for_position(
+        db, user, acct, adapter, pos, side=OrderSide.SELL,
+        reason="Cancelled so the exit ladder could start over (Reapply exit ladder).",
+    )
+    guards.reapply(db, guard, ts, average_cost=getattr(pos, "avg_entry_price", None))
+    audit.record(
+        db, actor_user_id=user.id, action="positions.ladder_reapplied",
+        entity_type="discord_position_guard", entity_id=guard.id,
+        metadata={"broker_symbol": pos.broker_symbol, "held": str(pos.quantity),
+                  "entry": str(guard.entry_price), "stop": str(guard.stop_price),
+                  "cancelled": [str(c) for c in cancelled]},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    try:
+        pnl_poller.poll_now(acct.id)
+    except Exception:  # noqa: BLE001 — the regular pass places them anyway
+        log.warning("reapply: could not wake the ladder for %s", pos.symbol, exc_info=True)
+    return {
+        "ok": True,
+        "held": str(pos.quantity),
+        "entry": str(guard.entry_price) if guard.entry_price is not None else None,
+        "stop": str(guard.stop_price) if guard.stop_price is not None else None,
+        "cancelled": len(cancelled),
+    }
 
 
 @router.post("/{broker_symbol}/stops/cancel")

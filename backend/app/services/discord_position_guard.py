@@ -959,6 +959,56 @@ def rollback_exit(guard: DiscordPositionGuard) -> None:
     clear_trail(guard)
 
 
+def reapply(db: Session, guard: DiscordPositionGuard, ts, *,
+            average_cost: Decimal | None = None) -> None:
+    """Start this position's exit ladder over, from the position as it is now
+    — the "Reapply exit ladder" button on the position summary.
+
+    For a position the trader has worked on by hand (a stop moved or removed,
+    a take-profit cancelled, contracts added): back to T1, the entry at what
+    the position costs now, the On Fill stop from that entry, and nothing the
+    trader removed left switched off. The caller has already cancelled every
+    resting sell; the stop reconciler and the take-profit reconcile place the
+    new ones on their next pass, sized from what is held.
+    """
+    from app.services import discord_ladder  # noqa: PLC0415
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("exit ladder reapplied by you on Positions — starts over at T1 from the position as it is"):
+        guard.closed_at = None
+        guard.sell_count = 0
+        guard.tp_off = False
+        guard.tp_backoff_until = None
+        guard.tp_order_id = guard.tp_stop_order_id = None
+        guard.tp_rung = None
+        guard.tp_qty = None
+        guard.stop_order_id = None
+        clear_trail(guard)
+        guard.trail_percent = None
+        clear_stop_trail(guard)
+        if average_cost is not None and Decimal(str(average_cost)) > 0:
+            guard.entry_price = Decimal(str(average_cost))
+        else:
+            sync_entry_price(db, guard)
+        guard.stop_price = None
+        fill = discord_ladder.fill_stop_pct(ts) if ts is not None else None
+        if fill is not None and guard.entry_price:
+            stop, trail_pct, peak = rung_stop(
+                guard.entry_price,
+                RungConfig(stop_pct=fill, stop_trail=discord_ladder.fill_stop_trails(ts)), None,
+                # The ladder starts here: the entry is the high a trail gives back from.
+                anchor_to_entry=True)
+            stop = _to_tick(stop)
+            if stop is not None and stop > 0:
+                guard.stop_price = stop
+                guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
+        guard.fill_stop_done = True
+        if hasattr(db, "flush"):
+            db.flush()
+    log.info("discord guard: %s ladder reapplied — entry %s, stop %s",
+             guard.symbol, guard.entry_price, guard.stop_price)
+
+
 def retire(db: Session, guard: DiscordPositionGuard, reason: str) -> None:
     """Retire a guard once its position is gone. Kept rather than deleted so the
     history survives and a new position can reuse the same contract."""
@@ -1001,5 +1051,5 @@ __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "rung_stop", "trailing_stop", "apply_stop",
     "ratchet_stop", "clear_stop_trail", "find", "on_buy", "plan_exit",
-    "dormant", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
+    "dormant", "reapply", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
 ]

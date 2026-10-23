@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, Search, Shield, Target, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, RotateCcw, Search, Shield, Target, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
@@ -294,6 +294,33 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
     finally { setBusy(null); }
   }
 
+  const [reapplying, setReapplying] = useState(false);
+
+  /** Start the position's exit ladder over from what is held now: every open
+   *  sell and stop on it goes, and the ladder places its stop and take-profit
+   *  again from T1 — for a position worked on by hand. */
+  async function reapplyLadder() {
+    if (!confirm(
+      `Reapply the exit ladder on ${label}?\n\n` +
+      "Every stop and open sell order on it is cancelled, and the ladder starts over at T1 " +
+      "from the position as it is now — its current size and average cost. The new stop and " +
+      "take-profit are placed within a few seconds. The position stays open."
+    )) return;
+    setReapplying(true);
+    try {
+      const r = await api<{ entry: string | null; stop: string | null; cancelled: number }>(
+        `/api/positions/${encodeURIComponent(brokerSymbol)}/reapply-ladder?broker_account_id=${brokerAccountId}`,
+        { method: "POST" },
+      );
+      notify.success(
+        `Exit ladder reapplied — entry ${r.entry ?? "—"}${r.stop ? `, stop ${r.stop}` : ""}` +
+        (r.cancelled ? ` (${r.cancelled} order${r.cancelled === 1 ? "" : "s"} cancelled)` : ""),
+      );
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not reapply the exit ladder"); }
+    finally { setReapplying(false); }
+  }
+
   const rows = [...items].sort((a, b) => PROTECTION_ORDER.indexOf(a.kind) - PROTECTION_ORDER.indexOf(b.kind));
   const unit = isOption ? "contract" : "share";
   // What is placed, as ONE line beside the rules — each protection a short
@@ -336,6 +363,19 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
           </span>
         );
       })}
+      {isOption && (
+        <button
+          type="button"
+          onClick={() => void reapplyLadder()}
+          disabled={reapplying || busy !== null}
+          title="Cancel every stop and open sell on this position and start the exit ladder over from T1, from the position as it is now"
+          className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-0.5 disabled:opacity-40"
+          style={{ border: "1px solid var(--border-strong)", color: "var(--text)" }}
+        >
+          {reapplying ? <Spinner /> : <RotateCcw size={12} />}
+          Reapply exit ladder
+        </button>
+      )}
     </div>
   );
   return (
