@@ -208,6 +208,22 @@ def create_app() -> FastAPI:
             )
         )
 
+        # Carry any admin override that still lives only in Redis into the
+        # database. Redis is a cache for these (no persistence, LRU eviction),
+        # so without this the first deploy of DB-backed knobs would look exactly
+        # like the bug it fixes: every polling setting silently back at its env
+        # default. Idempotent and never overwrites an existing row, so running
+        # it in every web worker is harmless.
+        try:
+            from app.services.platform_config import (  # noqa: PLC0415
+                backfill_overrides_from_cache,
+            )
+            carried = await asyncio.to_thread(backfill_overrides_from_cache)
+            if carried:
+                log.info("platform config: carried %d override(s) into the database", carried)
+        except Exception:  # noqa: BLE001
+            log.exception("platform config: override backfill failed — defaults still apply")
+
         # ── Web/worker split ──────────────────────────────────────────────
         # Background singletons (broker listeners, P&L poller, retry
         # scheduler, crash-recovery sweep) must run in EXACTLY ONE process.

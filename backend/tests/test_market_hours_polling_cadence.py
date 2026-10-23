@@ -6,7 +6,11 @@ CLOSED (overnight, weekends, holidays). Copy-trading/risk cadence during
 tradable hours is unchanged.
 
 All tests use frozen ET timestamps — no dependence on today's date, the machine
-timezone, the live market state, or the network.
+timezone, the live market state, or the network. The cadence assertions below
+name the ENV defaults, so they also need no dependence on whatever override a
+developer happens to have set locally: `_no_local_overrides` neutralises the
+runtime knobs for this module. Without it, one stray `config:*` value in a
+developer's Redis or app_settings fails the suite on an unrelated machine.
 """
 import os
 import sys
@@ -20,6 +24,19 @@ from zoneinfo import ZoneInfo
 from app.config import get_settings
 from app.models.broker_account import BrokerName
 from app.services import market_hours as mh, pnl_poller, webull_listener
+
+import pytest
+
+from app.services import platform_config as pc
+
+
+@pytest.fixture(autouse=True)
+def _no_local_overrides(monkeypatch):
+    """Every knob reads as "no override", so these tests measure the env
+    defaults they assert and nothing a developer configured locally."""
+    monkeypatch.setattr(pc, "_stored", lambda key: None)
+    pc._db_cache.clear()
+
 
 ET = ZoneInfo("America/New_York")
 
