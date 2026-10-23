@@ -30,6 +30,14 @@ interface Rejection {
   is_closing: boolean;
   broker_order_id: string | null;
   broker_call_ms: number | null;
+  // Rejected-trade text; null = none recorded (texts off, or not texted)
+  sms: { status: string; skip_reason: string | null; twilio_error_code: number | null } | null;
+}
+
+function smsText(s: Rejection["sms"]): string {
+  if (!s) return "—";
+  if (s.status === "skipped") return `not sent (${s.skip_reason ?? "?"})`;
+  return s.twilio_error_code ? `${s.status} (${s.twilio_error_code})` : s.status;
 }
 
 // Rebuild the order the way it was sent to the broker. The raw broker request
@@ -336,13 +344,14 @@ export default function AdminRejectedPage() {
                 <SortableTh label="Broker" colKey="broker"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Status" colKey="status"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Reason</th>
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Text</th>
                 <SortableTh label="When"   colKey="created_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
             </thead>
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={8} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
                     No rejected trades match this filter.
                   </td>
                 </tr>
@@ -381,12 +390,16 @@ export default function AdminRejectedPage() {
                     <td className="px-4 py-3" style={{ color: r.reject_reason ? "var(--bad)" : "var(--muted)", maxWidth: 360 }}>
                       <div className="truncate" style={{ maxWidth: 340 }}>{r.reject_reason ?? "—"}</div>
                     </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-xs"
+                        style={{ color: r.sms?.status === "undelivered" || r.sms?.status === "failed" ? "var(--bad)" : "var(--muted)" }}>
+                      {smsText(r.sms)}
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap text-xs" style={{ color: "var(--muted)" }}>{fmtTime(r.created_at)}</td>
                   </tr>
 
                   {open && (
                     <tr style={{ borderBottom: border, background: "rgba(255,255,255,0.02)" }}>
-                      <td colSpan={7} className="px-4 pb-4 pt-1">
+                      <td colSpan={8} className="px-4 pb-4 pt-1">
                         <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
                           {/* Reconstructed payload */}
                           <div>

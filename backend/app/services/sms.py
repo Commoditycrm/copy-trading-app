@@ -72,6 +72,12 @@ def send_sms(to: str, body: str) -> bool:
     """Send one SMS to ``to`` (E.164, e.g. "+15551234567"). Returns True on a
     Twilio accept (HTTP 2xx), False otherwise. Never raises — SMS is
     best-effort; callers must not crash if Twilio is down."""
+    return send_sms_sid(to, body) is not None
+
+
+def send_sms_sid(to: str, body: str) -> str | None:
+    """send_sms, returning Twilio's message SID on accept (so delivery can be
+    looked up later), None otherwise. Never raises."""
     s = get_settings()
     text = compose(body)
 
@@ -79,7 +85,7 @@ def send_sms(to: str, body: str) -> bool:
         # No credentials — log instead of sending so dev/QA flows work.
         # Log the composed text so what dev sees is what prod would send.
         log.warning("sms: TWILIO creds not set; NOT sending. to=%s body=%r", to, text)
-        return False
+        return None
 
     # Sender: a Messaging Service SID wins; else a from-number. One is required.
     data = {"To": to, "Body": text}
@@ -92,7 +98,7 @@ def send_sms(to: str, body: str) -> bool:
             "sms: no sender configured (set TWILIO_MESSAGING_SERVICE_SID or "
             "TWILIO_FROM_NUMBER); NOT sending. to=%s", to,
         )
-        return False
+        return None
 
     url = f"{_API_ROOT}/Accounts/{s.twilio_account_sid}/Messages.json"
     try:
@@ -104,13 +110,31 @@ def send_sms(to: str, body: str) -> bool:
         )
     except Exception:  # noqa: BLE001
         log.exception("sms: Twilio request failed for to=%s", to)
-        return False
+        return None
 
     if resp.status_code // 100 == 2:
         log.info("sms: sent to=%s status=%s", to, resp.status_code)
-        return True
+        try:
+            return str(resp.json().get("sid") or "")
+        except Exception:  # noqa: BLE001
+            return ""
     log.error(
         "sms: Twilio rejected to=%s status=%s body=%s",
         to, resp.status_code, resp.text[:500],
     )
-    return False
+    return None
+
+
+def message_status(sid: str) -> dict | None:
+    """Twilio's current record for one message (status, error_code), or None
+    when it can't be read. Never raises."""
+    s = get_settings()
+    if not (s.twilio_account_sid and s.twilio_auth_token and sid):
+        return None
+    try:
+        resp = httpx.get(f"{_API_ROOT}/Accounts/{s.twilio_account_sid}/Messages/{sid}.json",
+                         auth=(s.twilio_account_sid, s.twilio_auth_token), timeout=_TIMEOUT)
+        return resp.json() if resp.status_code == 200 else None
+    except Exception:  # noqa: BLE001
+        log.warning("sms: status lookup failed for sid=%s", sid)
+        return None

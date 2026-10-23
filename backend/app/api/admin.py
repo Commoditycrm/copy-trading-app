@@ -1603,10 +1603,23 @@ def admin_rejected_orders(
             select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
         ).scalars()}
 
+    # Rejected-trade text per order (services/rejected_trade_sms.py)
+    from app.models.sms_notification import SmsNotification  # noqa: PLC0415
+
+    texts: dict[uuid.UUID, SmsNotification] = {}
+    if rows:
+        texts = {t.order_id: t for t in db.execute(
+            select(SmsNotification).where(SmsNotification.order_id.in_([o.id for o, _u in rows]))
+        ).scalars()}
+
     rejections = []
     for o, u in rows:
         acct = accounts.get(o.broker_account_id) if o.broker_account_id else None
+        t = texts.get(o.id)
         rejections.append({
+            # null: no text recorded (texts off, or not texted)
+            "sms": None if t is None else {"status": t.status, "skip_reason": t.skip_reason,
+                                           "twilio_error_code": t.twilio_error_code},
             "order_id": str(o.id),
             "user_id": str(o.user_id),
             "user_email": u.email if u else None,

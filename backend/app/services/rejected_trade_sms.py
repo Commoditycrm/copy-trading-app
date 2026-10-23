@@ -25,18 +25,21 @@ again within REPEAT_WINDOW.
 
 All of this runs in a background thread after the trade's own commit and
 swallows its errors: a failed or slow text never touches order processing.
+Twilio's delivery result (delivered / undelivered + error code) is read back
+by delivery_loop and shown on Admin → Rejected trades.
 """
 from __future__ import annotations
 
 import logging
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -51,6 +54,9 @@ log = logging.getLogger(__name__)
 CATEGORY = "trade_rejected"
 REPEAT_WINDOW = timedelta(minutes=15)   # same contract already texted → don't again
 TEXTED = ("broker_rejected", "failed", "needs_review")
+DELIVERY_FINAL = ("delivered", "undelivered", "failed")
+CHECK_EVERY = timedelta(minutes=2)
+CHECK_FOR = timedelta(hours=24)            # Twilio settles well within this
 _ET = ZoneInfo("America/New_York")
 _ACCEPTED = (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 
@@ -249,8 +255,7 @@ def _why_not(db: Session, user: User | None, subject: str, now: datetime) -> str
     if not user.sms_on_trade_rejected:
         return "category_disabled"
     recent = db.scalar(select(SmsNotification.id).where(
-        SmsNotification.subject_key == subject, SmsNotification.status == "sent",
-        SmsNotification.sent_at >= now - REPEAT_WINDOW).limit(1))
+        SmsNotification.subject_key == subject, SmsNotification.sent_at >= now - REPEAT_WINDOW).limit(1))
     return "repeat_within_15m" if recent is not None else None
 
 
@@ -258,9 +263,9 @@ def handle(db: Session, order: Order, previous: OrderStatus | None, now: datetim
            send=None) -> str:  # noqa: ANN001
     """Record this rejection once and text it if it should be. Returns the
     row's final status ("sent" / "failed" / "skipped"), or "duplicate"."""
-    from app.services.sms import send_sms  # noqa: PLC0415
+    from app.services.sms import send_sms_sid  # noqa: PLC0415
 
-    send = send or send_sms
+    send = send or send_sms_sid
     now = now or datetime.now(timezone.utc)
     outcome = classify(order, previous)
     user = db.get(User, order.user_id)
@@ -279,13 +284,57 @@ def handle(db: Session, order: Order, previous: OrderStatus | None, now: datetim
     db.commit()                                   # claim the order before the slow send
     if why:
         return "skipped"
-    ok = send(user.phone, body)
+    sid = send(user.phone, body)                  # Twilio message SID, None if refused
     row = db.get(SmsNotification, row_id)
-    row.status, row.attempts, row.updated_at = ("sent" if ok else "failed"), 1, now
-    row.sent_at = now if ok else None
+    row.status, row.attempts, row.updated_at = ("failed" if sid is None else "sent"), 1, now
+    row.sent_at = None if sid is None else now
+    row.twilio_sid = sid or None
     row.phone_last4 = user.phone[-4:]
     db.commit()
     return row.status
+
+
+def check_delivery(db: Session, now: datetime | None = None, fetch=None) -> int:  # noqa: ANN001
+    """Read Twilio's result for texts sent in the last CHECK_FOR; a row becomes
+    delivered / undelivered / failed once Twilio knows. Returns rows checked."""
+    from app.services.sms import message_status  # noqa: PLC0415
+
+    fetch = fetch or message_status
+    now = now or datetime.now(timezone.utc)
+    rows = db.execute(select(SmsNotification).where(
+        SmsNotification.category == CATEGORY, SmsNotification.status == "sent",
+        SmsNotification.twilio_sid.is_not(None), SmsNotification.sent_at >= now - CHECK_FOR,
+        or_(SmsNotification.status_checked_at.is_(None), SmsNotification.status_checked_at <= now - CHECK_EVERY),
+    ).limit(50)).scalars().all()
+    for row in rows:
+        msg = fetch(row.twilio_sid) or {}
+        row.status_checked_at = row.updated_at = now
+        row.twilio_status = msg.get("status") or row.twilio_status
+        try:
+            row.twilio_error_code = int(msg["error_code"]) if msg.get("error_code") else row.twilio_error_code
+        except (TypeError, ValueError):
+            pass
+        if msg.get("error_message"):
+            row.last_error = str(msg["error_message"])[:300]
+        if row.twilio_status in DELIVERY_FINAL:
+            row.status = row.twilio_status
+    db.commit()
+    return len(rows)
+
+
+def delivery_loop(shutdown_check) -> None:  # noqa: ANN001
+    from app.database import SessionLocal  # noqa: PLC0415
+
+    while not shutdown_check():
+        try:
+            with SessionLocal() as db:
+                check_delivery(db)
+        except Exception:  # noqa: BLE001
+            log.exception("rejected_trade_sms: delivery check failed")
+        for _ in range(int(CHECK_EVERY.total_seconds())):
+            if shutdown_check():
+                return
+            time.sleep(1)
 
 
 def _run(items: list[tuple[uuid.UUID, OrderStatus | None]]) -> None:
@@ -310,5 +359,5 @@ def queue_after_commit(items: list[tuple[uuid.UUID, OrderStatus | None]]) -> Non
         log.exception("rejected_trade_sms: could not start the sender")
 
 
-__all__ = ["classify", "clean_reason", "contract_label", "enabled", "handle", "message_for",
-           "queue_after_commit"]
+__all__ = ["check_delivery", "classify", "clean_reason", "contract_label", "delivery_loop", "enabled",
+           "handle", "message_for", "queue_after_commit"]

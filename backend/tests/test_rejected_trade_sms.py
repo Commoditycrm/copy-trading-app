@@ -1,15 +1,16 @@
 """Rejected-trade texts (REJECTED_TRADE_SMS_ENABLED): what each rejection path
 is classified as, how the text reads, that one rejection seen by several paths
 is texted once, that retry loops don't text every attempt, that opt-in is
-respected, that Twilio trouble never reaches trading, and that with the flag
-off nothing changes.
+respected, that Twilio trouble never reaches trading, that Twilio's
+delivered/undelivered result is read back, and that with the flag off nothing
+changes.
 
 Uses the database at DATABASE_URL (like test_rejection_alerts). Twilio is never
 called: httpx is replaced for the whole module and sends go through a fake,
 run inline instead of on the background thread.
 """
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -54,13 +55,13 @@ class FakeTwilio:
         self.sent.append((to, body))
         if isinstance(self.ok, Exception):
             raise self.ok
-        return self.ok
+        return f"SM{len(self.sent)}" if self.ok else None              # Twilio's SID, None if refused
 
 
 @pytest.fixture
 def twilio(monkeypatch):
     tw = FakeTwilio()
-    monkeypatch.setattr(sms, "send_sms", tw)
+    monkeypatch.setattr(sms, "send_sms_sid", tw)
     monkeypatch.setattr(rts, "queue_after_commit", rts._run)              # noqa: SLF001 — inline, not a thread
     return tw
 
@@ -297,7 +298,7 @@ def test_a_rejection_from_any_status_is_texted_once_after_the_commit(world, befo
     reject(world, o)
     [row] = world.rows(o)
     assert len(world.twilio.sent) == 1 and world.twilio.sent[0][0] == "+15555550123"
-    assert (row.status, row.attempts, row.phone_last4) == ("sent", 1, "0123")
+    assert (row.status, row.attempts, row.phone_last4, row.twilio_sid) == ("sent", 1, "0123", "SM1")
     assert row.dedup_key == f"trade_rejected:{o.id}"
     assert row.outcome == ("failed" if before == OrderStatus.RETRY_PENDING else "broker_rejected")
 
@@ -449,3 +450,108 @@ def test_a_refused_take_profit_is_texted_with_a_tidy_reason(world):
 def test_compose_brands_once(body, expected_start):
     out = sms.compose(body)
     assert out.startswith(expected_start) and out.count("Kopyya") == 1
+
+
+# ── delivery result ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tw_status,code,final", [("delivered", None, "delivered"),
+                                               ("undelivered", 30034, "undelivered"),
+                                               ("failed", 30007, "failed"),
+                                               ("sent", None, "sent")])            # not settled yet
+def test_twilio_delivery_result_is_read_back(world, tw_status, code, final):
+    _, o = rejected(world)
+    [row] = world.rows(o)
+    asked = []
+
+    def fetch(sid):
+        asked.append(sid)
+        return {"status": tw_status, "error_code": code, "error_message": "Unregistered number" if code else None}
+    rts.check_delivery(world.db, now=row.sent_at + timedelta(minutes=1), fetch=fetch)
+    [r] = world.rows(o)
+    assert asked == ["SM1"] and (r.status, r.twilio_status, r.twilio_error_code) == (final, tw_status, code)
+
+
+def test_settled_and_old_texts_are_not_asked_again(world):
+    _, o = rejected(world)
+    [row] = world.rows(o)
+    asked = []
+    fetch = lambda sid: asked.append(sid) or {"status": "delivered"}  # noqa: E731
+    rts.check_delivery(world.db, now=row.sent_at + timedelta(minutes=1), fetch=fetch)
+    rts.check_delivery(world.db, now=row.sent_at + timedelta(minutes=10), fetch=fetch)
+    assert asked == ["SM1"]                                              # delivered is final
+    _, o2 = rejected(world, phone="+15555550999")
+    [r2] = world.rows(o2)
+    rts.check_delivery(world.db, now=r2.sent_at + rts.CHECK_FOR + timedelta(minutes=1), fetch=fetch)
+    assert asked == ["SM1"]                                              # too old to chase
+
+
+def test_a_twilio_read_failure_leaves_the_row_for_later(world):
+    _, o = rejected(world)
+    [row] = world.rows(o)
+    rts.check_delivery(world.db, now=row.sent_at + timedelta(minutes=1), fetch=lambda sid: None)
+    [r] = world.rows(o)
+    assert r.status == "sent" and r.status_checked_at is not None
+
+
+def test_the_repeat_guard_still_holds_after_delivery(world):
+    world.flag(True)
+    t = world.user()
+    acct = world.account(t)
+    first = world.order(t, acct, side=OrderSide.SELL)
+    reject(world, first, "position_stop_loss_error: rejected")
+    [r1] = world.rows(first)
+    rts.check_delivery(world.db, now=r1.sent_at + timedelta(seconds=30), fetch=lambda sid: {"status": "delivered"})
+    second = world.order(t, acct, side=OrderSide.SELL)
+    reject(world, second, "position_stop_loss_error: rejected")
+    assert len(world.twilio.sent) == 1 and world.rows(second)[0].skip_reason == "repeat_within_15m"
+
+
+def test_admin_rejected_shows_the_text_result(world):
+    from app.api.admin import admin_rejected_orders
+    _, o = rejected(world)
+    [row] = world.rows(o)
+    rts.check_delivery(world.db, now=row.sent_at + timedelta(minutes=1),
+                       fetch=lambda sid: {"status": "undelivered", "error_code": 30034})
+    world.db.expire_all()
+    out = admin_rejected_orders(db=world.db, _=None, role=None, from_=None, to=None, limit=500)
+    mine = next(r for r in out["rejections"] if r["order_id"] == str(o.id))
+    assert mine["sms"] == {"status": "undelivered", "skip_reason": None, "twilio_error_code": 30034}
+
+
+# ── Twilio client ─────────────────────────────────────────────────────────
+
+
+class Resp:
+    def __init__(self, code, body):
+        self.status_code, self._body, self.text = code, body, str(body)
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture
+def twilio_creds(monkeypatch):
+    s = get_settings()
+    monkeypatch.setattr(s, "twilio_account_sid", "ACtest")
+    monkeypatch.setattr(s, "twilio_auth_token", "tok")
+    monkeypatch.setattr(s, "twilio_messaging_service_sid", "MGtest")
+
+
+@pytest.mark.parametrize("resp,sid", [(Resp(201, {"sid": "SMx", "status": "accepted"}), "SMx"),
+                                      (Resp(400, {"code": 21211, "message": "Invalid 'To'"}), None),
+                                      (Resp(503, {}), None)])
+def test_the_sid_is_kept_and_send_sms_is_unchanged(twilio_creds, monkeypatch, resp, sid):
+    monkeypatch.setattr(sms.httpx, "post", lambda *a, **k: resp)
+    assert sms.send_sms_sid("+15555550123", "x") == sid
+    assert sms.send_sms("+15555550123", "x") is (sid is not None)
+
+
+def test_status_lookup_never_raises(twilio_creds, monkeypatch):
+    monkeypatch.setattr(sms.httpx, "get", lambda *a, **k: Resp(200, {"status": "delivered"}))
+    assert sms.message_status("SMx") == {"status": "delivered"}
+
+    def down(*a, **k):
+        raise OSError("reset")
+    monkeypatch.setattr(sms.httpx, "get", down)
+    assert sms.message_status("SMx") is None
