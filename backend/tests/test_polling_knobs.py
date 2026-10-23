@@ -39,8 +39,26 @@ class _FakeRedis:
 
 @pytest.fixture
 def fake_redis(monkeypatch):
+    """Fakes BOTH tiers. Redis is only the cache now — a write goes to
+    app_settings first — so patching Redis alone would let these tests write
+    real rows into the developer's database, where they leak into whatever runs
+    next (one such row pinned the Alpaca interval at 5s for an unrelated test).
+    """
     r = _FakeRedis()
+    rows: dict[str, str] = {}
     monkeypatch.setattr(pc, "get_sync_redis", lambda: r)
+    monkeypatch.setattr(pc, "_db_get", lambda key: rows.get(key))
+
+    def _set(key, value):
+        if value is None:
+            rows.pop(key, None)
+        else:
+            rows[key] = value
+        pc._db_cache.pop(key, None)
+
+    monkeypatch.setattr(pc, "_db_set", _set)
+    pc._db_cache.clear()
+    r.rows = rows
     return r
 
 

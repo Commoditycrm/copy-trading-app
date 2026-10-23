@@ -35,28 +35,177 @@ _ALPACA_PNL_POLL_MIN_S = 1
 _ALPACA_PNL_POLL_MAX_S = 300
 
 
+# ── the durable store ────────────────────────────────────────────────────────
+#
+# Redis is a CACHE for these overrides, never the source of truth. QA runs it
+# as `--save "" --appendonly no --maxmemory-policy allkeys-lru`, so a restart
+# or memory pressure drops every key — and because a miss was indistinguishable
+# from "no override set", an admin's setting silently reverted to the env
+# default and the page then showed "-" as though nobody had ever set one.
+#
+# The row in ``app_settings`` is what survives. Reads go cache → Redis → DB →
+# env default, each layer bounding the one below: the in-process TTL keeps a
+# dead Redis from turning a 1-per-second hot path into a database read per
+# tick. Writes go to the DB first, because that is the copy that matters.
+
+_DB_CACHE_TTL_S = 10.0
+# key -> (expires_at, raw stored value or None). None is cached too: "no
+# override" is an answer, and re-asking the database every tick for it is the
+# cost this layer exists to avoid.
+_db_cache: dict[str, tuple[float, str | None]] = {}
+
+
+def _db_get(key: str) -> str | None:
+    """The stored override for ``key``, or None. Never raises: a missing table
+    (pre-migration) or a transient database error reads as "no override", which
+    is the same answer this module gave before it had a database at all."""
+    import time  # noqa: PLC0415
+
+    hit = _db_cache.get(key)
+    now = time.monotonic()
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    raw: str | None = None
+    try:
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.database import SessionLocal  # noqa: PLC0415
+        from app.models.app_setting import AppSetting  # noqa: PLC0415
+
+        with SessionLocal() as db:
+            raw = db.execute(
+                select(AppSetting.value).where(AppSetting.key == key)
+            ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001
+        log.warning("platform_config: db read failed for %s — treating as unset", key)
+        raw = None
+    _db_cache[key] = (now + _DB_CACHE_TTL_S, raw)
+    return raw
+
+
+def _db_set(key: str, value: str | None) -> None:
+    """Upsert or delete the durable override and bust the in-process cache.
+
+    Raises on failure, deliberately: an admin write that did not persist must
+    not report success, or we are back to settings that quietly disappear.
+    """
+    from app.database import SessionLocal  # noqa: PLC0415
+    from app.models.app_setting import AppSetting  # noqa: PLC0415
+
+    with SessionLocal() as db:
+        row = db.get(AppSetting, key)
+        if value is None:
+            if row is not None:
+                db.delete(row)
+        elif row is None:
+            db.add(AppSetting(key=key, value=value))
+        else:
+            row.value = value
+        db.commit()
+    _db_cache.pop(key, None)
+
+
+def _stored(key: str) -> str | None:
+    """The raw override behind ``key``: Redis if it has it, else the database.
+
+    A database hit warms Redis so the next tick is cheap again. A Redis miss is
+    no longer an answer on its own — that conflation is what let a restart wipe
+    the configuration.
+    """
+    try:
+        raw = get_sync_redis().get(key)
+    except Exception:  # noqa: BLE001
+        log.warning("redis get failed for %s — reading the database instead", key)
+        raw = None
+    if raw is not None:
+        return raw if isinstance(raw, str) else raw.decode()
+    stored = _db_get(key)
+    if stored is not None:
+        try:
+            get_sync_redis().set(key, stored)
+        except Exception:  # noqa: BLE001
+            pass      # the value still stands; only the cache went unwarmed
+    return stored
+
+
+def _write_through(key: str, value: str | None) -> None:
+    """Durable first, then the cache. If the database write fails the caller
+    sees the exception and Redis is left untouched, so the two never disagree
+    about a value the admin was told was saved."""
+    _db_set(key, value)
+    try:
+        r = get_sync_redis()
+        if value is None:
+            r.delete(key)
+        else:
+            r.set(key, value)
+    except Exception:  # noqa: BLE001
+        log.warning("platform_config: %s saved, but the cache was not updated", key)
+
+
+def backfill_overrides_from_cache() -> int:
+    """Copy any override that exists only in Redis into the database. Returns
+    how many were carried over.
+
+    Run once at startup: without it, the first deploy of DB-backed knobs looks
+    exactly like the failure it fixes — every admin setting reset to its env
+    default. Idempotent, and never overwrites a row that already exists.
+    """
+    carried = 0
+    for key in [k.key for k in INT_KNOBS] + [k.key for k in BOOL_KNOBS] + [
+        _K_ALPACA_PNL_POLL_INTERVAL, _K_FANOUT_BATCH_THRESHOLD,
+    ]:
+        try:
+            raw = get_sync_redis().get(key)
+        except Exception:  # noqa: BLE001
+            return carried        # no cache to read; nothing to carry over
+        if raw is None:
+            continue
+        if _db_get(key) is not None:
+            continue
+        try:
+            _db_set(key, raw if isinstance(raw, str) else raw.decode())
+            carried += 1
+            log.info("platform_config: carried %s over to the database", key)
+        except Exception:  # noqa: BLE001
+            log.exception("platform_config: could not carry %s over", key)
+    return carried
+
+
 def get_fanout_batch_threshold_sync() -> int:
     """Sync getter for callers outside an async context (admin handlers,
     initialization code). Falls back to env default if Redis is down or the
     override is missing/malformed."""
     env_default = get_settings().fanout_batch_threshold
-    try:
-        raw = get_sync_redis().get(_K_FANOUT_BATCH_THRESHOLD)
-    except Exception:  # noqa: BLE001
-        log.warning("redis get failed for %s — falling back to env default", _K_FANOUT_BATCH_THRESHOLD)
-        return env_default
-    return _coerce_threshold(raw, env_default)
+    return _coerce_threshold(_stored(_K_FANOUT_BATCH_THRESHOLD), env_default)
 
 
 async def get_fanout_batch_threshold_async() -> int:
-    """Async getter used by copy_engine on the fanout hot path. Same
-    fall-back semantics as the sync variant."""
+    """Async getter used by copy_engine on the fanout hot path.
+
+    Reads the cache only. Unlike the sync accessors this does NOT fall through
+    to the database: the database read is blocking, and this runs on the event
+    loop while a fanout is in flight — one slow query would stall every
+    subscriber's order, which is a far worse failure than briefly using the
+    env default for a batching threshold.
+
+    It stays correct in practice because the cache is kept warm from the other
+    side: ``backfill_overrides_from_cache`` at startup, and every sync read
+    re-warming Redis from the database. The window where this can disagree is
+    between a cache loss and the next sync read, and the cost of being wrong is
+    a batch size, not a wrong trade.
+    """
     env_default = get_settings().fanout_batch_threshold
     try:
         raw = await get_async_redis().get(_K_FANOUT_BATCH_THRESHOLD)
     except Exception:  # noqa: BLE001
         log.warning("redis get failed for %s — falling back to env default", _K_FANOUT_BATCH_THRESHOLD)
         return env_default
+    if raw is None:
+        # Not a cache miss we can resolve here — see above. Use the in-process
+        # copy if a sync reader already fetched it; never block to find out.
+        hit = _db_cache.get(_K_FANOUT_BATCH_THRESHOLD)
+        raw = hit[1] if hit is not None else None
     return _coerce_threshold(raw, env_default)
 
 
@@ -64,13 +213,12 @@ def set_fanout_batch_threshold(value: int | None) -> None:
     """Admin write. ``value=None`` deletes the override (effective value
     becomes the env default again). Raises ValueError for non-positive ints
     so we never end up with a nonsensical 0/negative threshold."""
-    r = get_sync_redis()
     if value is None:
-        r.delete(_K_FANOUT_BATCH_THRESHOLD)
+        _write_through(_K_FANOUT_BATCH_THRESHOLD, None)
         return
     if value < 1:
         raise ValueError("fanout_batch_threshold must be >= 1")
-    r.set(_K_FANOUT_BATCH_THRESHOLD, str(value))
+    _write_through(_K_FANOUT_BATCH_THRESHOLD, str(value))
 
 
 def get_fanout_batch_threshold_state() -> dict[str, int | bool | None]:
@@ -78,11 +226,7 @@ def get_fanout_batch_threshold_state() -> dict[str, int | bool | None]:
     an override is currently set. UI uses this to show 'Default' vs
     'Override' badges."""
     env_default = get_settings().fanout_batch_threshold
-    try:
-        raw = get_sync_redis().get(_K_FANOUT_BATCH_THRESHOLD)
-    except Exception:  # noqa: BLE001
-        raw = None
-    override = _coerce_optional(raw)
+    override = _coerce_optional(_stored(_K_FANOUT_BATCH_THRESHOLD))
     return {
         "default": env_default,
         "override": override,
@@ -129,15 +273,7 @@ def get_alpaca_pnl_poll_interval_sync() -> int:
     _ALPACA_PNL_POLL_MAX_S]; out-of-range or malformed Redis values
     fall back to env default."""
     env_default = get_settings().alpaca_pnl_poll_interval_s
-    try:
-        raw = get_sync_redis().get(_K_ALPACA_PNL_POLL_INTERVAL)
-    except Exception:  # noqa: BLE001
-        log.warning(
-            "redis get failed for %s — falling back to env default",
-            _K_ALPACA_PNL_POLL_INTERVAL,
-        )
-        return _clamp_alpaca_interval(env_default, env_default)
-    return _clamp_alpaca_interval(raw, env_default)
+    return _clamp_alpaca_interval(_stored(_K_ALPACA_PNL_POLL_INTERVAL), env_default)
 
 
 def set_alpaca_pnl_poll_interval(value: int | None) -> None:
@@ -145,16 +281,15 @@ def set_alpaca_pnl_poll_interval(value: int | None) -> None:
     becomes the env default again). Raises ValueError if outside the
     [5, 300] bound — protects against a misclicked extra zero pinning
     the poller at hours-per-tick."""
-    r = get_sync_redis()
     if value is None:
-        r.delete(_K_ALPACA_PNL_POLL_INTERVAL)
+        _write_through(_K_ALPACA_PNL_POLL_INTERVAL, None)
         return
     if value < _ALPACA_PNL_POLL_MIN_S or value > _ALPACA_PNL_POLL_MAX_S:
         raise ValueError(
             f"alpaca_pnl_poll_interval_s must be between "
             f"{_ALPACA_PNL_POLL_MIN_S} and {_ALPACA_PNL_POLL_MAX_S}"
         )
-    r.set(_K_ALPACA_PNL_POLL_INTERVAL, str(value))
+    _write_through(_K_ALPACA_PNL_POLL_INTERVAL, str(value))
 
 
 def get_alpaca_pnl_poll_interval_state() -> dict[str, int | bool | None]:
@@ -163,10 +298,7 @@ def get_alpaca_pnl_poll_interval_state() -> dict[str, int | bool | None]:
     the poller is silently using the env default and the UI should
     reflect that)."""
     env_default = get_settings().alpaca_pnl_poll_interval_s
-    try:
-        raw = get_sync_redis().get(_K_ALPACA_PNL_POLL_INTERVAL)
-    except Exception:  # noqa: BLE001
-        raw = None
+    raw = _stored(_K_ALPACA_PNL_POLL_INTERVAL)
     override = _coerce_optional_in_range(
         raw, _ALPACA_PNL_POLL_MIN_S, _ALPACA_PNL_POLL_MAX_S,
     )
@@ -724,12 +856,7 @@ def get_int_knob(name: str) -> int:
     caller — never raises, never blocks on a dead Redis."""
     knob = _INT_BY_NAME[name]
     env_default = _env_int(knob)
-    try:
-        raw = get_sync_redis().get(knob.key)
-    except Exception:  # noqa: BLE001
-        log.warning("redis get failed for %s — falling back to env default", knob.key)
-        return env_default
-    return _clamp_in_range(raw, env_default, knob.lo, knob.hi)
+    return _clamp_in_range(_stored(knob.key), env_default, knob.lo, knob.hi)
 
 
 def int_knob_or(name: str, fallback: float) -> float:
@@ -758,36 +885,26 @@ def set_int_knob(name: str, value: int | None) -> None:
     out-of-bounds, which the endpoint turns into a 422 — a misclicked extra
     zero must not silently pin a poller at hours per tick."""
     knob = _INT_BY_NAME[name]
-    r = get_sync_redis()
     if value is None:
-        r.delete(knob.key)
+        _write_through(knob.key, None)
         return
     if value < knob.lo or value > knob.hi:
         raise ValueError(f"{knob.name} must be between {knob.lo} and {knob.hi}")
-    r.set(knob.key, str(value))
+    _write_through(knob.key, str(value))
 
 
 def get_bool_knob(name: str) -> bool:
     """Effective value for a switch. Same fallback contract as get_int_knob."""
     knob = _BOOL_BY_NAME[name]
     env_default = bool(getattr(get_settings(), knob.setting))
-    try:
-        raw = get_sync_redis().get(knob.key)
-    except Exception:  # noqa: BLE001
-        log.warning("redis get failed for %s — falling back to env default", knob.key)
-        return env_default
-    parsed = _coerce_optional_bool(raw)
+    parsed = _coerce_optional_bool(_stored(knob.key))
     return env_default if parsed is None else parsed
 
 
 def set_bool_knob(name: str, value: bool | None) -> None:
     """Admin write. ``value=None`` clears the override."""
     knob = _BOOL_BY_NAME[name]
-    r = get_sync_redis()
-    if value is None:
-        r.delete(knob.key)
-        return
-    r.set(knob.key, "1" if value else "0")
+    _write_through(knob.key, None if value is None else ("1" if value else "0"))
 
 
 def get_polling_knobs_state() -> dict[str, list[dict]]:
@@ -797,11 +914,7 @@ def get_polling_knobs_state() -> dict[str, list[dict]]:
     ints: list[dict] = []
     for knob in INT_KNOBS:
         env_default = _env_int(knob)
-        try:
-            raw = get_sync_redis().get(knob.key)
-        except Exception:  # noqa: BLE001
-            raw = None
-        override = _coerce_optional_in_range(raw, knob.lo, knob.hi)
+        override = _coerce_optional_in_range(_stored(knob.key), knob.lo, knob.hi)
         ints.append({
             "name": knob.name,
             "group": knob.group,
@@ -821,10 +934,7 @@ def get_polling_knobs_state() -> dict[str, list[dict]]:
     bools: list[dict] = []
     for bknob in BOOL_KNOBS:
         env_default = bool(getattr(get_settings(), bknob.setting))
-        try:
-            raw = get_sync_redis().get(bknob.key)
-        except Exception:  # noqa: BLE001
-            raw = None
+        raw = _stored(bknob.key)
         override = _coerce_optional_bool(raw)
         bools.append({
             "name": bknob.name,
