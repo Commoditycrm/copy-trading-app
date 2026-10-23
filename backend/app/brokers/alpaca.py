@@ -136,6 +136,9 @@ log = logging.getLogger(__name__)
 
 class AlpacaAdapter(BrokerAdapter):
     name = "alpaca"
+    # Set by services/paper_autotrade.attach on QA paper-autotrade accounts:
+    # raises before any place/replace that isn't provably on paper.
+    paper_guard = None
 
     def __init__(self, credentials: dict[str, Any]):
         self.credentials = credentials
@@ -172,6 +175,8 @@ class AlpacaAdapter(BrokerAdapter):
     # ── orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        if self.paper_guard is not None:
+            self.paper_guard()
         # Build the symbol: OCC for options, plain ticker for stocks.
         if req.instrument_type == InstrumentType.OPTION:
             if not (req.option_expiry and req.option_strike and req.option_right):
@@ -368,6 +373,8 @@ class AlpacaAdapter(BrokerAdapter):
         left working untouched. Never releases the position's share reservation —
         the whole reason to prefer this over cancel+place for a re-price. Only the
         changed fields (qty / limit / stop) are sent; the rest carry over."""
+        if self.paper_guard is not None:
+            self.paper_guard()
         qty = (
             int(req.quantity)
             if req.instrument_type == InstrumentType.OPTION

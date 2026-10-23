@@ -36,7 +36,12 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
     needed where direct Webull is actually used.
     """
     if broker_account.broker == BrokerName.ALPACA:
-        return AlpacaAdapter(credentials)
+        from app.services import paper_autotrade  # noqa: PLC0415
+
+        adapter = AlpacaAdapter(credentials)
+        if paper_autotrade.guards(getattr(broker_account, "id", None)):
+            paper_autotrade.attach(adapter, broker_account.id, credentials)
+        return adapter
     if broker_account.broker == BrokerName.SNAPTRADE:
         return SnapTradeAdapter(credentials)
     if broker_account.broker == BrokerName.IBKR:
