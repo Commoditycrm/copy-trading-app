@@ -1557,7 +1557,7 @@ export default function DiscordPage() {
                       <p className="text-[11px] mt-2 leading-snug" style={{ color: "var(--muted)" }}>
                         Each entry buys as many whole contracts as fit in this amount, at the price it will pay — the live
                         price for a market entry. Light alerts spend half; if one contract costs more, the entry is skipped.
-                        Averaging down still doubles what you hold. A close always sells the position you hold.
+                        An average buys your opening size again (opened with 5: 10, then 15). A close always sells the position you hold.
                       </p>
                     </>
                   )}

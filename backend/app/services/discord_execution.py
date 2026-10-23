@@ -93,7 +93,7 @@ class Resolved:
     # reference for a position the trim ladder never saw open.
     position_entry_price: Decimal | None = None
     # For an averaging-down add: how much was held BEFORE it. The add is no
-    # longer always the same size as the holding (see light_entry_quantity), and
+    # the same size as the holding (it is the opening size — see opening_quantity), and
     # the ladder needs both to re-average its cost basis.
     held_quantity: Decimal | None = None
 
@@ -143,15 +143,14 @@ def resolve(
     else:
         strike = right = expiry = None
 
-    # An averaging-down add into a position that was OPENED light adds the
-    # opening size again instead of doubling whatever is held now.
-    light_original = (
-        light_entry_quantity(db, user, symbol, strike, right, expiry)
+    # An average buys the OPENING size again — never a multiple of what is held.
+    opening = (
+        opening_quantity(db, user, symbol, strike, right, expiry)
         if signal.get("double_up") and not is_closing else None
     )
     quantity = _resolve_quantity(
         signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
-        light_original=light_original,
+        opening=opening,
     )
     held_quantity = None
     if signal.get("double_up") and not is_closing:
@@ -346,37 +345,29 @@ def resolve(
     )
 
 
-def light_entry_quantity(db, user: User, symbol: str, strike, right, expiry) -> Decimal | None:
-    """The size this holding was OPENED with, when its entry was a half-size one
-    — the author called it "light", "not heavy", a "lotto" or "risky". None for
-    an ordinary entry, or when the opening order isn't known.
+def opening_quantity(db, user: User, symbol: str, strike, right, expiry) -> Decimal | None:
+    """The size this holding was OPENED with — its first buy, before any
+    average or manual add. None when the opening order isn't known (a position
+    adopted from the broker, or assigned to a channel by hand).
 
-    Read from the live ladder's opening order and the alert that placed it.
-    Never raises: without an answer an average simply doubles, as it always has.
+    Read from the live ladder's opening order, which later buys never replace
+    (discord_position_guard.on_buy). Never raises: without an answer an average
+    doubles what is held, as it did before.
     """
     if db is None:
         return None
     try:
-        from sqlalchemy import select  # noqa: PLC0415
-
         from app.models.order import Order  # noqa: PLC0415
         from app.services import discord_position_guard as guards  # noqa: PLC0415
 
         guard = guards.find(db, user.id, symbol, strike, right, expiry)
         if guard is None or guard.entry_order_id is None:
             return None
-        row = db.execute(
-            select(Order.filled_quantity, Order.quantity, DiscordMessage.parsed_signal)
-            .join(DiscordMessage, DiscordMessage.order_id == Order.id)
-            .where(Order.id == guard.entry_order_id)
-            .limit(1)
-        ).first()
-        if row is None:
+        order = db.get(Order, guard.entry_order_id)
+        if order is None:
             return None
-        filled, ordered, parsed = row
-        if not (parsed or {}).get("half_size"):
-            return None
-        qty = filled if filled and filled > 0 else ordered
+        filled = order.filled_quantity
+        qty = filled if filled and filled > 0 else order.quantity
         return Decimal(str(qty)) if qty and qty > 0 else None
     except Exception:  # noqa: BLE001
         log.warning("discord: could not read the opening size for %s", symbol, exc_info=True)
@@ -829,9 +820,15 @@ def _check_expiry(expiry: date | None) -> None:
         raise ExecutionRefused(f"That contract expired on {expiry}.")
 
 
+def _qty_text(q: Decimal) -> str:
+    """5.000000 -> "5"."""
+    q = Decimal(str(q)).normalize()
+    return format(q.quantize(Decimal(1)) if q == q.to_integral_value() else q, "f")
+
+
 def _resolve_quantity(
     signal, positions, strike, right, expiry, is_closing, sizing, resolutions,
-    light_original: Decimal | None = None,
+    opening: Decimal | None = None,
 ) -> Decimal:
     """How many contracts.
 
@@ -852,14 +849,15 @@ def _resolve_quantity(
         resolutions["quantity"] = f"{qty} (your full position)"
         return qty
 
-    # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
-    # held, so the position doubles.
+    # "$SPY 768 PUT averaging down @0.48" — buy the position's OPENING size
+    # again. Opened with 5: the first average takes it to 10, the next to 15.
+    # Opened with 10 and 5 more bought by hand: each average adds 10. (It used
+    # to double what was held — 5, 10, 20, 40 — except for a light entry; the
+    # trader's call, 2026-10-22, is the opening size for every average.)
     #
     # Sized from the POSITION, not the alert, and deliberately outside the
-    # multiplier and the "light" halving below. Those scale the author's size
-    # into yours; this one is a statement about your own holding, which the
-    # multiplier already shaped when it was opened. Running it through again
-    # would quadruple a 2x account instead of doubling it.
+    # multiplier and the "light" halving below. Those already shaped the
+    # opening size; running them again would scale it twice.
     if signal.get("double_up"):
         held = next(
             (p for p in positions
@@ -874,17 +872,14 @@ def _resolve_quantity(
             # it as a NEW position, sized like any entry (below).
             resolutions["reentry"] = "nothing held — re-entering as a new position"
             return _entry_quantity(signal, sizing, resolutions)
-        # A position opened LIGHT (light / not heavy / lotto / risky) is one the
-        # author sized down on purpose. Doubling it on every average grows it
-        # geometrically — 1, 2, 4, 8 — so it adds the opening size again
-        # instead: 1, 2, 3, 4.
-        if light_original is not None and light_original > 0:
+        if opening is not None and opening > 0:
             resolutions["quantity"] = (
-                f"{light_original} (your opening size — the entry was light, "
-                f"so not doubling your {qty} held)"
+                f"{_qty_text(opening)} (your opening size again — {_qty_text(qty)} held now)"
             )
-            return light_original
-        resolutions["quantity"] = f"{qty} (doubling your {qty} held)"
+            return opening
+        # The opening order isn't known (a position adopted from the broker or
+        # assigned by hand): as before, as much again as is held.
+        resolutions["quantity"] = f"{_qty_text(qty)} (doubling your {_qty_text(qty)} held — opening size unknown)"
         return qty
 
     return _entry_quantity(signal, sizing, resolutions)
