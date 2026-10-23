@@ -51,13 +51,6 @@ CATEGORY = "trade_rejected"
 SEND_DELAY = timedelta(seconds=60)      # lets a fallback/retry attempt land first
 REPEAT_WINDOW = timedelta(minutes=15)   # same contract already texted → don't again
 TEXTED = ("broker_rejected", "failed", "needs_review")
-HEADING = {
-    "broker_rejected": "Trade Rejected",
-    "failed": "Trade Failed",
-    "needs_review": "Trade Needs Review",
-    "blocked": "Trade Blocked",
-    "internal": "Trade Not Placed",
-}
 _ET = ZoneInfo("America/New_York")
 _ACCEPTED = (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 
@@ -109,13 +102,6 @@ def contract_label(order: Order) -> str:
     strike = _num(order.option_strike) if order.option_strike is not None else "?"
     exp = f" {order.option_expiry.month}/{order.option_expiry.day}" if order.option_expiry else ""
     return f"{sym} {strike}{right}{exp}"
-
-
-def _quantity(order: Order) -> str:
-    q = _num(order.quantity or 0)
-    if order.instrument_type == InstrumentType.OPTION:
-        return f"{q} contract{'' if q == '1' else 's'}"
-    return f"{q} share{'' if q == '1' else 's'}"
 
 
 def _order_type(order: Order) -> str:
@@ -171,44 +157,50 @@ def clean_reason(reason: str | None, outcome: str) -> str:
     return text[:110] + ("..." if len(text) > 110 else "")
 
 
-def _context(db: Session, order: Order, owner: User | None) -> str:
+def _whose(db: Session, order: Order) -> str:
     if order.parent_order_id is not None:
         parent = db.get(Order, order.parent_order_id)
         trader = db.get(User, parent.user_id) if parent is not None else None
         name = gsm_safe(trader.display_name or "") if trader is not None else ""
-        return f"Copy of {(name or 'your trader')[:30].rstrip()}'s trade"
-    role = getattr(getattr(owner, "role", None), "value", "")
-    return "Your trade" if role == "trader" else "Your order"
+        return f"Your copy of {(name or 'your trader')[:30].rstrip()}'s"
+    return "Your"
+
+
+# One sentence in the shape of the sample filed on the A2P campaign:
+# "Your BUY TSLA order was rejected: <reason>. View: https://kopyya.com/trades"
+_VERB = {
+    "broker_rejected": "was rejected: {reason}.",
+    "failed": "could not be placed: {reason}.",
+    "needs_review": "was not confirmed by the broker and may have been placed. Check your broker before re-entering.",
+    "blocked": "was not placed: {reason}.",
+    "internal": "was not placed: {reason}.",
+}
 
 
 def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
     label = get_settings().sms_environment_label.strip()
     brand = f"Kopyya {label}".strip()
-    owner = db.get(User, order.user_id)
     acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
     side = (order.side.value if order.side else "").upper()
+    qty = _num(order.quantity or 0)
     when = at.astimezone(_ET)
-    head = [
-        f"{brand}: {HEADING[outcome]}",
-        _context(db, order, owner),
-        contract_label(order),
-        f"{side} {_quantity(order)}, {_order_type(order)}".strip(", "),
-        f"Broker: {broker_label(acct)}",
-    ]
-    tail = [
-        f"Time: {when:%b} {when.day}, {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET",
-        f"Ref: {str(order.id).replace('-', '')[:8].upper()}",
-    ]
-    head = [gsm_safe(x) for x in head]
+    stamp = f"{when:%b} {when.day} {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET"
+    ref = str(order.id).replace("-", "")[:8].upper()
+    base = get_settings().frontend_base_url.rstrip("/")
+    lead = gsm_safe(f"{brand}: {_whose(db, order)} {side} {qty} {contract_label(order)} order "
+                    f"({_order_type(order)}, {broker_label(acct)})")
+    tail = f" {stamp}, Ref {ref}. View: {base}/trades"
+    verb = _VERB[outcome]
+    if "{reason}" not in verb:
+        return f"{lead} {verb}{tail}"
     # the reason gets what's left of two segments once the opt-out is added
     from app.services.sms import compose  # noqa: PLC0415
 
-    fixed = len(compose("\n".join(head + ["Reason: "] + tail)))
-    room = max(30, MAX_CHARS - fixed)
-    reason = gsm_safe(clean_reason(order.reject_reason, outcome))
+    room = max(30, MAX_CHARS - len(compose(f"{lead} {verb.format(reason='')}{tail}")))
+    reason = gsm_safe(clean_reason(order.reject_reason, outcome)).rstrip(".")
     if len(reason) > room:
         reason = reason[:room - 3].rstrip() + "..."
-    return "\n".join(head + [f"Reason: {reason}"] + tail)
+    return f"{lead} {verb.format(reason=reason)}".replace("....", "...") + tail
 
 
 # Two concatenated GSM-7 segments. One character outside GSM-7 (an emoji in a
