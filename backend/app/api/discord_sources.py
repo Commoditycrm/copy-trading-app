@@ -2541,7 +2541,8 @@ def _execute_signal(
         # "Cutting") still closes: the trader is out, not trimming. Your own
         # alerts (the popup, auto-trim) go through, as with Manual exits.
         if (not _is_self_alert(db, msg)
-                and _cut_left_to_take_profits(exit_ts, signal)):
+                and _cut_left_to_take_profits(exit_ts, signal,
+                                              exit_pair=_exit_pair_ok(db, user))):
             msg.status = DiscordMessageStatus.PARSED
             msg.status_reason = (
                 "Cut not acted on — take-profit orders manage this channel's exits and "
@@ -2553,7 +2554,8 @@ def _execute_signal(
                 "symbol": p.symbol, "rung": 0, "reason": "take-profit orders; Auto exit on cut is off",
             })
             return
-        if (discord_channel_settings.exit_mode(exit_ts) == "orders"
+        if (discord_channel_settings.exit_mode(
+                    exit_ts, exit_pair=_exit_pair_ok(db, user)) == "orders"
                 and not signal.get("flatten") and not _is_cut(signal)
                 and not _is_self_alert(db, msg)):
             msg.status = DiscordMessageStatus.PARSED
@@ -2977,11 +2979,34 @@ def _cut_overrides_manual(ts, signal) -> bool:
     return _is_cut(signal) and discord_channel_settings.cut_exits(ts)
 
 
-def _cut_left_to_take_profits(ts, signal) -> bool:
+def _exit_pair_ok(db: Session, user: User) -> bool:
+    """Can THIS user's broker actually rest a linked take-profit/stop pair?
+
+    Anything we cannot determine — no connected account, or several — keeps the
+    answer this code gave before (True), so the only behaviour that changes is
+    where we positively know the broker cannot do it.
+    """
+    from app.brokers import broker_supports_exit_pair  # noqa: PLC0415
+    try:
+        acct = discord_execution._broker_account(db, user)
+    except Exception:  # noqa: BLE001
+        # No connected account, several of them, or a caller that cannot look
+        # one up: fall back to the answer this code gave before the capability
+        # was consulted, so an unrelated failure here never changes an exit.
+        return True
+    return broker_supports_exit_pair(getattr(acct, "broker", None))
+
+
+def _cut_left_to_take_profits(ts, signal, *, exit_pair: bool = True) -> bool:
     """Take-profit orders with "Auto exit on cut" UNticked: the trader's cut is
     not acted on — the resting take-profit and stop manage the exit. (Ticked,
-    the default, a cut sells as it always has.)"""
-    return (_is_cut(signal) and discord_channel_settings.exit_mode(ts) == "orders"
+    the default, a cut sells as it always has.)
+
+    Only where the broker can REST that pair — otherwise there is nothing
+    managing the exit and the cut must go through. See exit_mode's note.
+    """
+    return (_is_cut(signal)
+            and discord_channel_settings.exit_mode(ts, exit_pair=exit_pair) == "orders"
             and not discord_channel_settings.cut_exits(ts))
 
 
@@ -3017,7 +3042,8 @@ def _channel_cut_left_to_take_profits(db: Session, user: User, msg: DiscordMessa
     """The alert's channel runs Take-profit orders with Auto exit on cut off, so
     this cut is not acted on. Never true for the Self channel."""
     ts = discord_channel_settings.effective(db, user.id, getattr(msg, "source_id", None))
-    return _cut_left_to_take_profits(ts, sig) and not _is_self_alert(db, msg)
+    return (_cut_left_to_take_profits(ts, sig, exit_pair=_exit_pair_ok(db, user))
+            and not _is_self_alert(db, msg))
 
 
 def _channel_exits_manual(db: Session, user: User, msg: DiscordMessage) -> bool:

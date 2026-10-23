@@ -22,6 +22,20 @@ IBKRAdapter.capabilities = capabilities_for(BrokerName.IBKR)
 FakeBrokerAdapter.capabilities = capabilities_for(BrokerName.FAKE)
 
 
+# Which brokers can rest a take-profit LINKED to a stop on the SAME held
+# contracts, one filling cancelling the other. Mirrors
+# ``BrokerAdapter.supports_exit_pair``, but answerable from a BrokerAccount
+# alone — callers deciding whether that exit mode is RUNNING have no adapter,
+# and building one needs decrypted credentials (and Webull's SDK). Kept in step
+# with the adapter classes by test_exit_pair_capability.py.
+_EXIT_PAIR_BROKERS = frozenset({BrokerName.WEBULL})
+
+
+def broker_supports_exit_pair(broker: BrokerName | None) -> bool:
+    """Can this broker rest a linked take-profit/stop pair on a held position?"""
+    return broker in _EXIT_PAIR_BROKERS
+
+
 def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapter:
     """Construct an adapter for the broker_account using its decrypted credentials.
 
