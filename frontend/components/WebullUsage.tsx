@@ -28,9 +28,19 @@ interface Usage {
   /** Sent at once because the endpoint's queue was already full — more reads
    *  wanted than Webull allows; these are the calls that can still be refused. */
   queue_full?: { endpoint: string; calls: number }[];
+  /** Each refused call, newest first, with what explains it. */
+  refusals?: {
+    at: number; caller: string; endpoint: string;
+    waited_s: number | null; queue_full: boolean; calls_2s_before: number;
+  }[];
 }
 
-const WINDOWS = [1, 5, 15, 60] as const;
+const WINDOWS = [1, 5, 15, 60, 1440, 4320] as const;
+const windowLabel = (m: number) => (m < 60 ? `${m} min` : m === 60 ? "1 hr" : m === 1440 ? "1 day" : `${m / 1440} days`);
+const timeET = (sec: number) => new Date(sec * 1000).toLocaleString("en-US", {
+  timeZone: "America/New_York", month: "short", day: "numeric",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+});
 
 export function WebullUsage() {
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -75,7 +85,7 @@ export function WebullUsage() {
         {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <Activity size={13} style={{ color: "var(--accent-2)" }} />
         <span style={{ color: "var(--text)" }}>Webull calls</span>
-        <span>· last {usage.minutes} min:</span>
+        <span>· last {windowLabel(usage.minutes)}:</span>
         <span className="num" style={{ color: "var(--text)", fontWeight: 600 }}>{usage.total}</span>
         <span>({perMin.toFixed(1)}/min)</span>
         <span style={{ color: limitedTone }}>· {usage.rate_limited} rate-limited</span>
@@ -99,7 +109,7 @@ export function WebullUsage() {
                   color: minutes === m ? "var(--accent-2)" : "var(--muted)",
                 }}
               >
-                {m < 60 ? `${m} min` : "1 hr"}
+                {windowLabel(m)}
               </button>
             ))}
           </div>
@@ -207,9 +217,41 @@ export function WebullUsage() {
               )}
             </div>
           )}
+          {(usage.refusals ?? []).length > 0 && (
+            <div>
+              <div className="font-medium py-1" style={{ color: "var(--muted)" }}
+                   title="Many calls just before → too many at once. Spaced calls refused anyway → Webull counts stricter than Kopyya spaces them. Hardly any calls from Kopyya just before → something else is using your Webull app key.">
+                Refused calls (newest first)
+              </div>
+              <table className="w-full">
+                <thead>
+                  <tr style={{ color: "var(--muted)" }}>
+                    <th className="text-left font-medium py-1">Time (ET)</th>
+                    <th className="text-left font-medium py-1">What made the call</th>
+                    <th className="text-left font-medium py-1">Endpoint</th>
+                    <th className="text-right font-medium py-1">Waited for its turn</th>
+                    <th className="text-right font-medium py-1">Calls to it in the 2s before</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(usage.refusals ?? []).map((r, i) => (
+                    <tr key={`${r.at}-${i}`} style={{ borderTop: "1px solid var(--border)" }}>
+                      <td className="py-1 num whitespace-nowrap">{timeET(r.at)}</td>
+                      <td className="py-1" style={{ color: "var(--text)" }}>{r.caller}</td>
+                      <td className="py-1 font-mono text-[11px]">{r.endpoint}</td>
+                      <td className="py-1 text-right num" style={{ color: r.queue_full ? "var(--warn)" : undefined }}>
+                        {r.queue_full ? "queue full" : r.waited_s != null ? `${r.waited_s.toFixed(2)} s` : "—"}
+                      </td>
+                      <td className="py-1 text-right num">{r.calls_2s_before}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           <p className="text-[11px]" style={{ color: "var(--muted)" }}>
             Counted across the whole app (pages and background jobs) for your Webull app key.
-            Refreshes every 15 s; this readout itself never calls Webull.
+            Refreshes every 15 s; this readout itself never calls Webull. Kept for 3 days.
           </p>
         </div>
       )}

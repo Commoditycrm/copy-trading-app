@@ -194,10 +194,26 @@ def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> s
             "the position would otherwise be left unprotected",
             guard.symbol, price, msg[:160], quantity,
         )
+        _issue(guard, "refused",
+               f"Webull refused the stop at {price} ({_short(msg)}) — selling {quantity} at market "
+               "instead, so the position isn't left without a stop.")
         outcome = _exit_instead(db, guard, quantity, close_position)
         if is_stop_crossed(msg):
             _notify_crossed(db, guard, quantity, price, msg, outcome)
         return None
+
+
+def _issue(guard, kind: str, note: str) -> None:
+    """A line in the position's summary (services/position_events)."""
+    from app.services import position_events  # noqa: PLC0415
+
+    position_events.record_issue(kind, note, guard=guard)
+
+
+def _short(text) -> str:
+    from app.services import position_events  # noqa: PLC0415
+
+    return position_events.short_reason(text)
 
 
 def _exit_instead(db, guard, quantity, close_position) -> str:
@@ -307,6 +323,9 @@ def reconcile(
             # verdict on the stop: once that order has had time to go, place it.
             age = _recent_rejection_age_s(db, guard)
             if age is not None and age < _CONFLICT_RETRY_S:
+                _issue(guard, "waiting",
+                       "Stop not placed yet: Webull still holds the contracts for the order being "
+                       "replaced. Trying again in a few seconds.")
                 return "waiting (contracts still held by the order being replaced)"
             refusal = None
         if refusal is not None:
@@ -326,7 +345,13 @@ def reconcile(
                     "the last one (%s) — closing %s rather than leaving it open",
                     guard.symbol, refusal[:160], want_qty,
                 )
+                _issue(guard, "refused",
+                       f"No stop resting and Webull refused the last one ({_short(refusal)}) — "
+                       f"selling {want_qty} at market rather than leave it open.")
                 return _exit_instead(db, guard, want_qty, close_position)
+            _issue(guard, "waiting",
+                   f"No stop resting: Webull refused the last one ({_short(refusal)}). "
+                   "Waiting before trying again.")
             return "backing off (recent rejection)"
         oid = _place_or_close(
             db, guard, want_qty, want_price, place_stop, close_position

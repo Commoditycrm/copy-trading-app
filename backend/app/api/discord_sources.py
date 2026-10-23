@@ -27,6 +27,7 @@ confused: ``/internal/assignments`` hands out decrypted Discord sessions.
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import re
@@ -2275,8 +2276,21 @@ def _with_alert_reason(fn):
         # view from before its own order. An outer tick (auto-trim's own
         # alert, inside the P&L poller) is kept.
         token = None if risk_tick.active() else risk_tick.begin()
+        # An alert naming a whole contract: what Webull refuses on the way is
+        # recorded in that position's summary.
+        sig = getattr(msg, "parsed_signal", None) or {}
+        contract = None
         try:
-            with position_events.because(_alert_reason(db, msg), keep_outer=True):
+            from datetime import date as _date  # noqa: PLC0415
+
+            if sig.get("symbol") and sig.get("strike") and sig.get("option_type") and sig.get("expiration"):
+                contract = (user.id, sig["symbol"], Decimal(str(sig["strike"])),
+                            str(sig["option_type"]).lower(), _date.fromisoformat(str(sig["expiration"])[:10]))
+        except Exception:  # noqa: BLE001
+            contract = None
+        try:
+            with position_events.because(_alert_reason(db, msg), keep_outer=True), \
+                    (position_events.about(*contract) if contract else contextlib.nullcontext()):
                 result = fn(db, user, msg, background, request)
                 # Save what the alert changed WHILE its reason is still set: the
                 # caller commits later, after this block — and a stop it moved was

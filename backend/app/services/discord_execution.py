@@ -421,6 +421,11 @@ def _positions(adapter: Any, symbol: str) -> list:
                     f"Couldn't read your positions from the broker: {exc}"
                 ) from exc
             log.info("discord: positions read rate limited; retrying in %.1fs", delay)
+            from app.services import position_events  # noqa: PLC0415
+
+            position_events.record_issue(
+                "retried", f"Webull refused the alert's positions read (rate limit) — retried after {delay:g}s.",
+                dedupe_s=30)
             time.sleep(delay)
     raise AssertionError("unreachable")
 

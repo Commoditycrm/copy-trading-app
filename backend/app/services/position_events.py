@@ -62,14 +62,22 @@ def current_reason() -> str | None:
 
 def tagged(reason: str, *, keep_outer: bool = False):
     """Decorator form of ``because`` — for an API route or a loop's entry point.
-    Keeps the signature (FastAPI reads the wrapped function's)."""
+    Keeps the signature (FastAPI reads the wrapped function's).
+
+    A Positions route (one with ``broker_symbol`` and ``user``) also names the
+    position it acts on, so what Webull refuses along the way is recorded in
+    that position's summary (see ``about``)."""
     import functools  # noqa: PLC0415
     import inspect as _inspect  # noqa: PLC0415
 
     def deco(fn):
         @functools.wraps(fn)
         def _w(*args, **kwargs):
-            with because(reason, keep_outer=keep_outer):
+            position = None
+            user = kwargs.get("user")
+            if kwargs.get("broker_symbol") and getattr(user, "id", None) is not None:
+                position = position_from_broker_symbol(user.id, kwargs["broker_symbol"])
+            with because(reason, keep_outer=keep_outer), about(*position) if position else contextlib.nullcontext():
                 return fn(*args, **kwargs)
         # The route's annotations are strings (postponed); FastAPI would look
         # them up in THIS module. Resolve them now, in the route's own.
@@ -193,4 +201,127 @@ def install() -> None:
     _installed = True
 
 
-__all__ = ["install", "events_for", "because", "current_reason", "tagged"]
+# ── what went wrong along the way: refusals, rate limits, retries, waits ─────
+# Orders and stop changes record themselves. What didn't was everything in
+# between: Webull refusing a read (429), a stop or take-profit refused and
+# retried later, an exit sent because a stop was refused, a pass that waited for
+# Webull to confirm something. Recorded here, in the position's summary, so its
+# history says what was going on (the trader's ask, 2026-10-23).
+
+ISSUE_KINDS = {
+    "refused": "Refused",
+    "rate_limited": "Rate-limited",
+    "retried": "Retried",
+    "waiting": "Waiting",
+}
+
+# The position the code running now is acting on: (user_id, symbol, strike,
+# right, expiry). Set by a Positions route (tagged), the ladder's pass per
+# position, the trailing-stop loop and a Discord alert.
+_position: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("position_event_position", default=None)
+
+
+def _right_text(right) -> str | None:
+    v = getattr(right, "value", right)
+    return str(v).lower() if v else None
+
+
+@contextlib.contextmanager
+def about(user_id, symbol, strike=None, right=None, expiry=None):
+    """Attribute what goes wrong inside this block to this position."""
+    token = _position.set((user_id, (symbol or "").upper(), strike, _right_text(right), expiry))
+    try:
+        yield
+    finally:
+        _position.reset(token)
+
+
+def set_position(user_id=None, symbol=None, strike=None, right=None, expiry=None) -> None:
+    """``about`` for a loop that moves from position to position; ``None``
+    user clears it."""
+    _position.set(None if user_id is None else
+                  (user_id, (symbol or "").upper(), strike, _right_text(right), expiry))
+
+
+def current_position() -> tuple | None:
+    return _position.get()
+
+
+def position_from_broker_symbol(user_id, broker_symbol: str) -> tuple | None:
+    """(user_id, symbol, strike, right, expiry) from the broker's id for a
+    holding: an OCC option symbol, or a plain stock ticker."""
+    import re  # noqa: PLC0415
+    from datetime import date  # noqa: PLC0415
+
+    sym = (broker_symbol or "").upper().strip()
+    m = re.fullmatch(r"([A-Z.]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})", sym)
+    if m:
+        root, yy, mm, dd, cp, strike = m.groups()
+        try:
+            expiry = date(2000 + int(yy), int(mm), int(dd))
+        except ValueError:
+            return None
+        return (user_id, root, Decimal(strike) / Decimal(1000), "call" if cp == "C" else "put", expiry)
+    if re.fullmatch(r"[A-Z.]{1,6}", sym):
+        return (user_id, sym, None, None, None)
+    return None
+
+
+def short_reason(text: str | None, limit: int = 160) -> str:
+    """A broker refusal as a person reads it: Webull's "HTTP Status: 417,
+    Code: X, Msg: Y, RequestID: …" becomes "Y (X)"."""
+    import re  # noqa: PLC0415
+
+    t = " ".join(str(text or "").split())
+    m = re.search(r"Code:\s*([A-Z0-9_]+).*?Msg:\s*(.+?)(?:,\s*RequestID:.*)?$", t)
+    if m:
+        t = f"{m.group(2).rstrip('.')} ({m.group(1)})"
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+def record_issue(kind: str, note: str, *, position: tuple | None = None, guard=None,
+                 dedupe_s: int = 300) -> None:
+    """Write one line into a position's summary, in its own session — kept even
+    when the caller's work is rolled back. The same line within ``dedupe_s`` is
+    written once, so a pass that waits every few seconds says so once. Never
+    raises."""
+    if guard is not None:
+        position = (getattr(guard, "user_id", None), getattr(guard, "symbol", None),
+                    getattr(guard, "option_strike", None), getattr(guard, "option_right", None),
+                    getattr(guard, "option_expiry", None))
+    position = position or _position.get()
+    if not position or position[0] is None or not position[1]:
+        return
+    user_id, symbol, strike, right, expiry = position
+    right = _right_text(right)
+    note = (note or "")[:300]
+    try:
+        from datetime import timedelta  # noqa: PLC0415
+
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.database import SessionLocal  # noqa: PLC0415
+
+        now = datetime.now(timezone.utc)
+        with SessionLocal() as db:
+            q = select(PositionEvent.id).where(
+                PositionEvent.user_id == user_id, PositionEvent.symbol == symbol.upper(),
+                PositionEvent.kind == kind, PositionEvent.note == note,
+                PositionEvent.created_at >= now - timedelta(seconds=dedupe_s),
+            )
+            for col, val in ((PositionEvent.option_strike, strike), (PositionEvent.option_right, right),
+                             (PositionEvent.option_expiry, expiry)):
+                q = q.where(col.is_(None) if val is None else col == val)
+            if dedupe_s and db.execute(q.limit(1)).first() is not None:
+                return
+            db.add(PositionEvent(user_id=user_id, symbol=symbol.upper(), option_strike=strike,
+                                 option_right=right, option_expiry=expiry, kind=kind, note=note,
+                                 created_at=now))
+            db.commit()
+    except Exception:  # noqa: BLE001
+        log.warning("position events: could not record %s for %s", kind, symbol, exc_info=True)
+
+
+__all__ = ["install", "events_for", "because", "current_reason", "tagged", "ISSUE_KINDS", "about",
+           "set_position", "current_position", "position_from_broker_symbol", "short_reason",
+           "record_issue"]

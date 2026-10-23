@@ -1841,6 +1841,11 @@ def _read_positions_for_close(adapter: Any) -> list:
         if not is_rate_limit_error(exc):
             raise
         log.info("close: positions read throttled, retrying in %.1fs", _RATE_LIMIT_WAIT_S)
+        from app.services import position_events  # noqa: PLC0415
+
+        position_events.record_issue(
+            "retried", f"Webull refused the positions read (rate limit) — retried after {_RATE_LIMIT_WAIT_S:g}s.",
+            dedupe_s=30)
         time.sleep(_RATE_LIMIT_WAIT_S)
         return adapter.get_positions()
 

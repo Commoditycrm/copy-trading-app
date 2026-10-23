@@ -156,7 +156,14 @@ _EVENT_LABELS = {
     "trailing_exit_armed": "Trailing exit armed",
     "trailing_exit_cleared": "Trailing exit cleared",
     "ladder_closed": "Ladder finished",
+    # What went wrong along the way (position_events.record_issue).
+    "refused": "Refused",
+    "rate_limited": "Rate-limited",
+    "retried": "Retried",
+    "waiting": "Waiting",
 }
+# How the summary colours them: a refusal is bad news, a wait or retry a caution.
+_EVENT_TONES = {"refused": "bad", "rate_limited": "bad", "retried": "warn", "waiting": "warn"}
 
 
 def _event_detail(e: PositionEvent) -> str:
@@ -168,10 +175,20 @@ def _event_detail(e: PositionEvent) -> str:
         return f"{_s(e.quantity)} rides a {give} give-back from {_s(e.peak)}" + (f" (exits at {_s(e.price)})" if e.price else "")
     if e.kind == "trailing_exit_cleared":
         return f"{_s(e.quantity)} no longer trailing"
-    if e.kind == "ladder_closed":
-        return ""
+    if e.kind in ("ladder_closed", "refused", "rate_limited", "retried", "waiting"):
+        return ""                         # the note says it all
     moved = f"{_s(e.old_price)} → {_s(e.price)}" if e.old_price is not None else f"@ {_s(e.price)}"
     return moved + (f" · {trail}" if trail else "")
+
+
+def _with_refusal(o: Order, why: str | None) -> str | None:
+    """A rejected order's Why ends with what the broker said."""
+    if o.status != OrderStatus.REJECTED or not (o.reject_reason or "").strip():
+        return why
+    from app.services.position_events import short_reason  # noqa: PLC0415
+
+    refused = f"refused by the broker: {short_reason(o.reject_reason)}"
+    return f"{why} — {refused}" if why else refused
 
 
 def _fallback_reason(o: Order, filled: bool) -> str | None:
@@ -235,8 +252,10 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
         filled = Decimal(str(o.filled_quantity or 0))
         mine = str(o.id) in remaining
         if not mine:
-            if filled > 0 or o.status not in _UNFILLED_SHOWN or o.order_type in _STOP_TYPES:
+            if (filled > 0 or o.status not in _UNFILLED_SHOWN
+                    or (o.order_type in _STOP_TYPES and o.status != OrderStatus.REJECTED)):
                 continue                  # another holding's fill, a replaced order, a resting stop
+                                          # (a REFUSED stop is shown: that is news)
             if not inside(o.created_at):
                 continue
         buy = o.side == OrderSide.BUY
@@ -283,7 +302,8 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             # Realized P&L of a sell, in dollars (signed, 2 decimals).
             "pnl": (f"{pnl.quantize(Decimal('0.01')):f}" if pnl is not None else None),
             # Why it was placed: the alert, auto-trim, a stop, you on Positions …
-            "note": reasons.get(o.id) or _fallback_reason(o, mine),
+            # — and, for one the broker refused, what it said.
+            "note": _with_refusal(o, reasons.get(o.id) or _fallback_reason(o, mine)),
             # How a sell's P/L was worked out — shown in the Why column.
             "pnl_calc": calc,
             "detail": None,
@@ -312,6 +332,7 @@ def timeline(db: Session, user_id, broker_account_id, symbol: str, *, strike: De
             "avg_price": None, "pnl": None, "pnl_calc": None,
             "note": getattr(e, "note", None),
             "detail": _event_detail(e),
+            "tone": _EVENT_TONES.get(e.kind),
         }))
 
     items.sort(key=lambda it: (it[0] or datetime.min.replace(tzinfo=timezone.utc)))
