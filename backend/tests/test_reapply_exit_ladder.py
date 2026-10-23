@@ -123,13 +123,13 @@ def test_the_endpoint_clears_every_sell_and_restarts_the_ladder(world):
     assert world.holds == [world.guard_id, ("cleared", world.guard_id)], "held while it worked, then released"
 
 
-def test_a_position_assigned_to_self_has_no_ladder_to_reapply(world, monkeypatch):
-    from fastapi import HTTPException
-
+def test_a_position_taken_over_by_hand_goes_back_to_its_channel(world, monkeypatch):
+    """Reapply on a Self / taken-over position hands it back ("auto": the
+    channel whose alert opened it) and restarts the ladder."""
     monkeypatch.setattr(guards, "is_manual", lambda db, g: True)
-    with pytest.raises(HTTPException) as e:
-        _reapply(world)
-    assert e.value.status_code == 409 and world.calls == []
+    _reapply(world)
+    g = world.db.get(DiscordPositionGuard, world.guard_id)
+    assert g.source_id is None and g.sell_count == 0 and g.stop_price == D("0.66")
 
 
 def test_a_position_never_on_a_ladder_is_refused(world):
@@ -140,3 +140,53 @@ def test_a_position_never_on_a_ladder_is_refused(world):
     with pytest.raises(HTTPException) as e:
         _reapply(world, "QQQ261023C00999000")
     assert e.value.status_code == 409 and world.calls == []
+
+
+# ── Manual takeover ──────────────────────────────────────────────────────────
+
+def _takeover(w, symbol="QQQ261023C00716000"):
+    return api.manual_takeover(
+        broker_symbol=symbol, request=SimpleNamespace(headers={}, client=None),
+        broker_account_id=w.acct.id, db=w.db, user=w.user,
+    )
+
+
+def test_manual_takeover_cancels_everything_and_hands_the_position_over(world, monkeypatch):
+    handed = []
+    monkeypatch.setattr(guards, "hand_to_trader",
+                        lambda db, u, g, cancel: handed.append(g.id) or 2)
+    world.db.get(DiscordPositionGuard, world.guard_id)      # loaded, so the change below is tracked
+    out = _takeover(world)
+    assert handed == [world.guard_id]
+    g = world.db.get(DiscordPositionGuard, world.guard_id)
+    assert guards.is_manual(world.db, g), "assigned to Self: the ladder no longer acts on it"
+    assert ("sells", None) in world.calls, "every order on the contract — buys too, not only sells"
+    assert out["cancelled"] == 3 and out["ladder"] is True
+    assert world.holds == [world.guard_id, ("cleared", world.guard_id)]
+
+
+def test_manual_takeover_with_no_ladder_still_clears_the_orders(world):
+    world.pos.option_strike = D("999")
+    world.pos.broker_symbol = "QQQ261023C00999000"
+    out = _takeover(world, "QQQ261023C00999000")
+    assert out["ladder"] is False and ("sells", None) in world.calls
+
+
+def test_manual_takeover_clears_a_bracket_on_the_entry(world):
+    from app.models.order import Order, OrderSide, OrderStatus, OrderType
+
+    entry = Order(id=uuid.uuid4(), user_id=world.user.id, broker_account_id=world.acct.id,
+                  instrument_type=InstrumentType.OPTION, symbol="QQQ", option_strike=D("716"),
+                  option_right=OptionRight.CALL, option_expiry=EXP, side=OrderSide.BUY,
+                  order_type=OrderType.MARKET, quantity=D(9), status=OrderStatus.FILLED,
+                  filled_quantity=D(9), stop_loss_price=D("0.40"), take_profit_price=D("2.00"))
+    world.db.add(entry)
+    world.db.commit()
+    try:
+        out = _takeover(world)
+        world.db.refresh(entry)
+        assert (entry.stop_loss_price, entry.take_profit_price) == (None, None)
+        assert out["brackets_cleared"] == 1
+    finally:
+        world.db.delete(entry)
+        world.db.commit()

@@ -3,7 +3,7 @@
 import { Fragment, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Layers, Pencil, RotateCcw, Search, Shield, Target, TrendingDown, TrendingUp, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, ChevronUp, ChevronsUpDown, Hand, Layers, Pencil, RotateCcw, Search, Shield, Target, TrendingDown, TrendingUp, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { dayPnlIntervalMs, DEFAULT_DAY_PNL_INTERVAL_MS } from "@/lib/pnlRefresh";
 import { getSnapshot, setSnapshot, USER_SNAPSHOT_KEY } from "@/lib/swrCache";
@@ -304,7 +304,8 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
       `Reapply the exit ladder on ${label}?\n\n` +
       "Every stop and open sell order on it is cancelled, and the ladder starts over at T1 " +
       "from the position as it is now — its current size and average cost. The new stop and " +
-      "take-profit are placed within a few seconds. The position stays open."
+      "take-profit are placed within a few seconds. A position you took over by hand goes back " +
+      "to its channel. The position stays open."
     )) return;
     setReapplying(true);
     try {
@@ -319,6 +320,33 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
       onDone();
     } catch (e) { notify.fromError(e, "Could not reapply the exit ladder"); }
     finally { setReapplying(false); }
+  }
+
+  const [takingOver, setTakingOver] = useState(false);
+
+  /** Take the position over by hand: every stop and order on it goes, and the
+   *  ladder stops acting on it (assigned to Self) so you can exit it yourself.
+   *  "Reapply exit ladder" hands it back. */
+  async function manualTakeover() {
+    if (!confirm(
+      `Take over ${label} by hand?\n\n` +
+      "Every stop and open order on it is cancelled — the ladder's and your own — and the exit " +
+      "ladder stops acting on it, so you can exit it yourself. Channel alerts won't act on it either. " +
+      "The position stays open. Use \"Reapply exit ladder\" to hand it back."
+    )) return;
+    setTakingOver(true);
+    try {
+      const r = await api<{ cancelled: number }>(
+        `/api/positions/${encodeURIComponent(brokerSymbol)}/manual-takeover?broker_account_id=${brokerAccountId}`,
+        { method: "POST" },
+      );
+      notify.success(
+        `${label} is yours to exit` +
+        (r.cancelled ? ` — ${r.cancelled} order${r.cancelled === 1 ? "" : "s"} cancelled` : ""),
+      );
+      onDone();
+    } catch (e) { notify.fromError(e, "Could not take the position over"); }
+    finally { setTakingOver(false); }
   }
 
   const rows = [...items].sort((a, b) => PROTECTION_ORDER.indexOf(a.kind) - PROTECTION_ORDER.indexOf(b.kind));
@@ -377,6 +405,19 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
         >
           {reapplying ? <Spinner /> : <RotateCcw size={12} />}
           Reapply exit ladder
+        </button>
+      )}
+      {isOption && (
+        <button
+          type="button"
+          onClick={() => void manualTakeover()}
+          disabled={takingOver || reapplying || busy !== null}
+          title="Cancel every stop and order on this position and stop the exit ladder acting on it, so you can exit it yourself"
+          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 disabled:opacity-40"
+          style={{ border: "1px solid var(--border-strong)", color: "var(--text)" }}
+        >
+          {takingOver ? <Spinner /> : <Hand size={12} />}
+          Manual takeover exit ladder
         </button>
       )}
     </div>

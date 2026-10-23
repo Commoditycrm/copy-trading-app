@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import (client_ip, current_user, require_sell_all_access,
@@ -2285,8 +2285,9 @@ def reapply_exit_ladder(
         raise HTTPException(409, "This position has no exit ladder — it wasn't opened from a channel. "
                                  "Assign it to a channel first.")
     if guards.is_manual(db, guard):
-        raise HTTPException(409, "This position is assigned to Self, so its exits are yours — "
-                                 "there is no ladder to reapply.")
+        # Taken over by hand (Manual takeover, or assigned to Self): reapplying
+        # hands it back — to the channel whose alert opened it ("auto").
+        guard.source_id = None
     ts = dcs.for_guard(db, user.id, guard) or db.get(TraderSettings, user.id)
 
     # Keep the ladder's own pass off it while its orders come down and the
@@ -2319,6 +2320,84 @@ def reapply_exit_ladder(
         "stop": str(guard.stop_price) if guard.stop_price is not None else None,
         "cancelled": len(cancelled),
     }
+
+
+@router.post("/{broker_symbol}/manual-takeover")
+@_tagged("taken over by you on Positions (Manual takeover)")
+@ladder_hold.released_after
+def manual_takeover(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Take a position over by hand: clear every stop and order on it and stop
+    the exit ladder acting on it, so the trader can exit it themselves.
+
+    * the ladder hands it to the trader — assigned to Self, as the Channel
+      menu's "Self" does: from here nothing is placed or sold on its own, and
+      the channel's alerts don't act on it (a stop the trader sets later still
+      rests and fires);
+    * EVERY working order on the contract is cancelled — the ladder's stop and
+      take-profit, the trader's own resting sells and buys;
+    * a bracket stop-loss / take-profit on the entry is cleared, so nothing
+      fires on its own.
+
+    "Reapply exit ladder" hands it back. Open to the position's OWNER, trader or
+    subscriber — the account check below is what protects it.
+    """
+    from app.api import discord_sources  # noqa: PLC0415 — cycle
+    from app.services import audit  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    positions = _read_positions_for_close(adapter)
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        getattr(pos, "option_right", None), pos.option_expiry)
+    ladder_cancelled = 0
+    if guard is not None:
+        ladder_hold.hold_for_request(guard.id)
+        guard.source_id = discord_sources._self_source(db, user).id
+        ladder_cancelled = guards.hand_to_trader(db, user, guard, discord_sources._cancel_stop_order(db, user))
+        db.commit()
+    cancelled = _cancel_working_orders_for_position(
+        db, user, acct, adapter, pos,
+        reason="Cancelled when you took the position over by hand (Manual takeover).",
+    )
+    # A bracket's legs on the entry are stops too: the emulator would fire them.
+    brackets = 0
+    for o in db.execute(
+        select(Order).where(
+            Order.user_id == user.id, Order.broker_account_id == acct.id,
+            Order.symbol == pos.symbol, Order.side == OrderSide.BUY,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            or_(Order.stop_loss_price.isnot(None), Order.take_profit_price.isnot(None)),
+        )
+    ).scalars():
+        o.stop_loss_price = None
+        o.take_profit_price = None
+        brackets += 1
+    audit.record(
+        db, actor_user_id=user.id, action="positions.manual_takeover",
+        entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
+        metadata={"broker_symbol": pos.broker_symbol, "held": str(pos.quantity),
+                  "ladder_orders_cancelled": ladder_cancelled,
+                  "orders_cancelled": [str(c) for c in cancelled], "brackets_cleared": brackets},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return {"ok": True, "cancelled": ladder_cancelled + len(cancelled), "brackets_cleared": brackets,
+            "ladder": guard is not None}
 
 
 @router.post("/{broker_symbol}/stops/cancel")
