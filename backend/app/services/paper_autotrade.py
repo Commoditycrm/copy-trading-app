@@ -252,16 +252,21 @@ def reset_cap(account_id: uuid.UUID, r=None) -> None:  # noqa: ANN001
 # ── the guard on the adapter ──────────────────────────────────────────────
 
 
-def check(account_id: uuid.UUID, creds: dict, client: Any) -> None:
-    """Raise PaperGuardError unless this order may go to the broker."""
+def check(account_id: uuid.UUID, creds: dict, client: Any, *, opening: bool = True) -> None:
+    """Raise PaperGuardError unless this order may go to the broker.
+
+    The paper identity is required for every order. The volume caps only hold
+    back OPENING orders: a close, a stop or a trailing-stop move protects a
+    position, and the trail ratchet can move a stop many times a minute — a
+    tripped cap must never leave a position without its exit."""
     problem = verify_identity(account_id, creds, client)
-    if problem is None:
+    if problem is None and opening:
         try:
             problem = count_and_cap(account_id)
         except Exception as exc:  # noqa: BLE001 — can't count → can't prove the cap
             problem = f"order cap unavailable ({type(exc).__name__})"
     if problem:
-        _audit("paper_autotrade.order_refused", account_id, {"reason": problem})
+        _audit("paper_autotrade.order_refused", account_id, {"reason": problem, "opening": opening})
         raise PaperGuardError(f"QA paper guard refused the order: {problem}")
 
 
@@ -271,7 +276,10 @@ def attach(adapter: Any, account_id: uuid.UUID, creds: dict) -> Any:
     from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
 
     if isinstance(adapter, AlpacaAdapter):
-        adapter.paper_guard = lambda: check(account_id, creds, adapter._c())  # noqa: SLF001
+        def guard(req: Any = None, kind: str = "place") -> None:
+            opening = kind == "place" and not bool(getattr(req, "is_closing", False))
+            check(account_id, creds, adapter._c(), opening=opening)  # noqa: SLF001
+        adapter.paper_guard = guard
     return adapter
 
 

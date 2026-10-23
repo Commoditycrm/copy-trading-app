@@ -176,7 +176,7 @@ class AlpacaAdapter(BrokerAdapter):
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
         if self.paper_guard is not None:
-            self.paper_guard()
+            self.paper_guard(req, "place")
         # Build the symbol: OCC for options, plain ticker for stocks.
         if req.instrument_type == InstrumentType.OPTION:
             if not (req.option_expiry and req.option_strike and req.option_right):
@@ -374,7 +374,7 @@ class AlpacaAdapter(BrokerAdapter):
         the whole reason to prefer this over cancel+place for a re-price. Only the
         changed fields (qty / limit / stop) are sent; the rest carry over."""
         if self.paper_guard is not None:
-            self.paper_guard()
+            self.paper_guard(req, "replace")
         qty = (
             int(req.quantity)
             if req.instrument_type == InstrumentType.OPTION
