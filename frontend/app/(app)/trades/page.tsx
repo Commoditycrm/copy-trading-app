@@ -695,6 +695,31 @@ export default function TradesPage() {
     loadSignals();
   }, [tab, loadSignals]);
 
+  // The Discord badge has to be right BEFORE the tab is ever opened — every
+  // other tab's count comes from the DB aggregate on mount, so a Discord pill
+  // reading 0 until you click it reads as "no alerts" rather than "not asked
+  // yet". Alerts live behind their own endpoint, so this asks it for the count
+  // alone: one row, total kept, rows discarded. While the tab IS open,
+  // loadSignals owns the number and this stays out of the way.
+  useEffect(() => {
+    if (tab === "discord") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await api<{ items: DiscordSignal[]; total: number }>(
+          `/api/discord-sources/signals/page?limit=1&offset=0` +
+            (debouncedSearch ? `&search=${encodeURIComponent(debouncedSearch)}` : "")
+        );
+        if (!cancelled) setSignalsTotal(p.total);
+      } catch {
+        // Inbound Discord is off here (503) — the badge stays at zero, which
+        // is the truth in that environment.
+        if (!cancelled) setSignalsTotal(0);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tab, debouncedSearch]);
+
   // One grid for every tab. The Discord tab swaps the data source, not the
   // table — same columns, same row renderer, same sorting.
   const gridRows: Order[] = tab === "discord" ? signals.map(signalToOrder) : rows;
