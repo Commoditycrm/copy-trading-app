@@ -145,3 +145,12 @@ def aws_costs(_: User = Depends(require_admin)) -> dict[str, Any]:
     from app.services import aws_costs as svc  # noqa: PLC0415
 
     return svc.read_costs()
+
+
+@router.get("/storage")
+def storage(_: User = Depends(require_admin)) -> dict[str, Any]:
+    """Host disk usage by category, measured on the host every 15 minutes. A
+    file read; status=unavailable when the collector isn't installed."""
+    from app.services import host_storage  # noqa: PLC0415
+
+    return host_storage.read_storage()
