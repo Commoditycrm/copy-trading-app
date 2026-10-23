@@ -73,10 +73,19 @@ def twilio_usage(today: date, get: Callable = _get) -> dict:
             "unit": (this.get("price_unit") or "usd").upper()}
 
 
+# The message log also holds WhatsApp (and other channel) messages, addressed
+# "whatsapp:+1…"; they aren't SMS and Twilio bills them under other categories.
+_OTHER_CHANNELS = ("whatsapp:", "messenger:", "rcs:")
+
+
+def _is_sms(m: dict) -> bool:
+    return not any(str(m.get(k) or "").startswith(_OTHER_CHANNELS) for k in ("to", "from"))
+
+
 def twilio_messages(today: date, get: Callable = _get) -> dict:
-    """Outbound messages this month: delivery status, errors, segments, price."""
+    """Outbound SMS this month: delivery status, errors, segments, price."""
     status, errors = Counter(), Counter()
-    segments, cost, n, page = 0, Decimal(0), 0, 0
+    segments, cost, n, page, other = 0, Decimal(0), 0, 0, 0
     nxt: str | None = "/Messages.json"
     params: dict | None = {"DateSent>": today.replace(day=1).isoformat(), "PageSize": 1000}
     while nxt and n < MAX_MESSAGES:
@@ -84,6 +93,9 @@ def twilio_messages(today: date, get: Callable = _get) -> dict:
         params = None
         for m in data.get("messages") or []:
             if not str(m.get("direction", "")).startswith("outbound"):
+                continue
+            if not _is_sms(m):
+                other += 1
                 continue
             n += 1
             status[m.get("status") or "unknown"] += 1
@@ -94,7 +106,7 @@ def twilio_messages(today: date, get: Callable = _get) -> dict:
         nxt = data.get("next_page_uri")
         page += 1
     return {"sent": n, "status": dict(status), "errors": dict(errors.most_common(5)),
-            "segments": segments, "cost": cost, "truncated": bool(nxt)}
+            "segments": segments, "cost": cost, "truncated": bool(nxt), "other_channels": other}
 
 
 def tracked(db: Session, today: date) -> dict:
@@ -149,12 +161,12 @@ def build(db: Session, now: datetime, get: Callable = _get) -> dict[str, Any]:
                            "month": (last.get("start_date") or "")[:7]},
             "daily": [{"date": d["date"], "messages": d["messages"], "segments": d["segments"],
                        "cost_usd": _money(d["cost"])} for d in usage["days"]],
-            "delivery": {"sent": msgs["sent"], "delivered": msgs["status"].get("delivered", 0) + msgs["status"].get("read", 0),
+            "delivery": {"sent": msgs["sent"], "delivered": msgs["status"].get("delivered", 0),
                          "undelivered": msgs["status"].get("undelivered", 0), "failed": msgs["status"].get("failed", 0),
                          "in_flight": sum(v for k, v in msgs["status"].items() if k in ("queued", "accepted", "sending", "sent")),
                          "segments": msgs["segments"], "cost_usd": _money(msgs["cost"]),
                          "top_errors": [{"code": k, "count": v} for k, v in errors.items()],
-                         "truncated": msgs["truncated"]},
+                         "truncated": msgs["truncated"], "excluded_other_channels": msgs["other_channels"]},
             "unregistered_blocked": errors.get(30034, 0),
         },
         "projection": projection(usage["days"], today),

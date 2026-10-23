@@ -23,7 +23,8 @@ def fake_twilio(pages=None, fail=False):
         {"direction": "outbound-api", "status": "delivered", "num_segments": "2", "price": "-0.0158"},
         {"direction": "outbound-api", "status": "undelivered", "error_code": 30034, "num_segments": "2", "price": "-0.0158"},
         {"direction": "outbound-api", "status": "undelivered", "error_code": 30034, "num_segments": "1", "price": "-0.0079"},
-        {"direction": "outbound-api", "status": "read", "num_segments": "1", "price": None},
+        {"direction": "outbound-api", "status": "read", "to": "whatsapp:+15555550100", "num_segments": "1", "price": "-0.005"},
+        {"direction": "outbound-api", "status": "failed", "from": "whatsapp:+15555550199", "error_code": 63112, "num_segments": "1"},
         {"direction": "inbound", "status": "received", "num_segments": "1", "price": "-0.0079"},
     ], "next_page_uri": None}]
 
@@ -69,8 +70,9 @@ def test_twilio_billing_and_delivery_are_read_and_labelled(db):
     assert t["last_month"] == {"messages": 908, "cost_usd": "30.3570", "month": "2026-09"}
     assert [d["date"] for d in t["daily"]] == ["2026-10-21", "2026-10-22", "2026-10-23"]
     d = t["delivery"]
-    assert (d["sent"], d["delivered"], d["undelivered"], d["failed"]) == (4, 2, 2, 0)   # inbound excluded; read = delivered
-    assert d["segments"] == 6 and d["cost_usd"] == "0.0395"
+    # SMS only: inbound and WhatsApp (read / 63112) are left out
+    assert (d["sent"], d["delivered"], d["undelivered"], d["failed"]) == (3, 1, 2, 0)
+    assert d["segments"] == 5 and d["cost_usd"] == "0.0395" and d["excluded_other_channels"] == 2
     assert t["unregistered_blocked"] == 2 and d["top_errors"] == [{"code": 30034, "count": 2}]
 
 

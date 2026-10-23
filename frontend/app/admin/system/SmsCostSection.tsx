@@ -24,7 +24,8 @@ interface SmsCosts {
     last_month: { messages: number; cost_usd: string; month: string };
     daily: Day[];
     delivery: { sent: number; delivered: number; undelivered: number; failed: number; in_flight: number;
-                segments: number; cost_usd: string; top_errors: { code: number; count: number }[]; truncated: boolean };
+                segments: number; cost_usd: string; top_errors: { code: number; count: number }[]; truncated: boolean;
+                excluded_other_channels?: number };
     unregistered_blocked: number;
   };
   projection?: { estimate_usd: string | null; daily_average_usd?: string; basis: string };
@@ -133,7 +134,7 @@ export default function SmsCostSection() {
               <div className="text-sm font-semibold mb-2" style={{ color: "var(--text-2)" }}>Delivery this month</div>
               <table className="w-full text-xs tabular-nums">
                 <tbody>
-                  {[["Sent (outbound)", d.sent], ["Delivered or read", d.delivered], ["Undelivered", d.undelivered], ["Failed", d.failed],
+                  {[["Sent (outbound SMS)", d.sent], ["Delivered", d.delivered], ["Undelivered", d.undelivered], ["Failed", d.failed],
                     ["Segments", d.segments]].map(([k, v]) => (
                     <tr key={k as string} style={{ borderTop: "1px solid var(--border)" }}>
                       <td className="py-1">{k}</td><td className="text-right">{v as number}</td>
@@ -145,6 +146,9 @@ export default function SmsCostSection() {
                 <div className="text-xs mt-2" style={muted}>
                   Errors: {d.top_errors.map((e) => `${e.code}${errText[e.code] ? ` (${errText[e.code]})` : ""} × ${e.count}`).join(" · ")}
                 </div>
+              )}
+              {!!d.excluded_other_channels && (
+                <div className="text-xs mt-1" style={muted}>{d.excluded_other_channels} WhatsApp/other-channel messages left out (not SMS).</div>
               )}
               {d.truncated && <div className="text-xs mt-1" style={{ color: warn }}>Only the first 5,000 messages were read.</div>}
             </div>
