@@ -175,8 +175,8 @@ def _context(db: Session, order: Order, owner: User | None) -> str:
     if order.parent_order_id is not None:
         parent = db.get(Order, order.parent_order_id)
         trader = db.get(User, parent.user_id) if parent is not None else None
-        name = (trader.display_name or "your trader") if trader is not None else "your trader"
-        return f"Copy of {name[:30]}'s trade"
+        name = gsm_safe(trader.display_name or "") if trader is not None else ""
+        return f"Copy of {(name or 'your trader')[:30].rstrip()}'s trade"
     role = getattr(getattr(owner, "role", None), "value", "")
     return "Your trade" if role == "trader" else "Your order"
 
@@ -188,17 +188,44 @@ def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
     acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
     side = (order.side.value if order.side else "").upper()
     when = at.astimezone(_ET)
-    lines = [
+    head = [
         f"{brand}: {HEADING[outcome]}",
         _context(db, order, owner),
         contract_label(order),
         f"{side} {_quantity(order)}, {_order_type(order)}".strip(", "),
         f"Broker: {broker_label(acct)}",
-        f"Reason: {clean_reason(order.reject_reason, outcome)}",
+    ]
+    tail = [
         f"Time: {when:%b} {when.day}, {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET",
         f"Ref: {str(order.id).replace('-', '')[:8].upper()}",
     ]
-    return "\n".join(lines)
+    head = [gsm_safe(x) for x in head]
+    # the reason gets what's left of two segments once the opt-out is added
+    from app.services.sms import compose  # noqa: PLC0415
+
+    fixed = len(compose("\n".join(head + ["Reason: "] + tail)))
+    room = max(30, MAX_CHARS - fixed)
+    reason = gsm_safe(clean_reason(order.reject_reason, outcome))
+    if len(reason) > room:
+        reason = reason[:room - 3].rstrip() + "..."
+    return "\n".join(head + [f"Reason: {reason}"] + tail)
+
+
+# Two concatenated GSM-7 segments. One character outside GSM-7 (an emoji in a
+# display name) would switch the whole text to UCS-2 at 67 per segment.
+MAX_CHARS = 306
+_GSM7 = set(
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+
+
+def gsm_safe(text: str) -> str:
+    """Keep only GSM-7 characters (after the usual dash/quote folding)."""
+    from app.services.sms import _GSM_FOLD  # noqa: PLC0415
+
+    folded = text.translate(_GSM_FOLD)
+    return re.sub(r" {2,}", " ", "".join(ch for ch in folded if ch in _GSM7)).strip()
 
 
 def subject_key(order: Order) -> str:

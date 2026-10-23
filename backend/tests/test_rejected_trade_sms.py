@@ -220,6 +220,28 @@ def test_reasons_are_tidied_and_never_leak_account_numbers(raw, clean):
     assert rts.clean_reason(raw, "broker_rejected") == clean
 
 
+def test_the_worst_case_text_stays_gsm7_and_within_two_segments(world):
+    """An emoji in a display name would switch the text to UCS-2 (67 chars a
+    segment); a long broker reason would run to three segments."""
+    t = world.user(name="Jayyyyyyyy🐔 “The Sniper” — Options Desk Main")
+    s = world.user(role=UserRole.SUBSCRIBER)
+    parent = world.order(t, world.account(t), status=OrderStatus.FILLED)
+    child = world.order(s, world.account(s, BrokerName.SNAPTRADE, paper=False), parent=parent.id,
+                        otype=OrderType.STOP_LIMIT, qty="100", reason="x" * 400)
+    child.stop_price = Decimal("12.50")
+    final = sms.compose(rts.message_for(world.db, child, "broker_rejected", ET_1032))
+    assert len(final) <= rts.MAX_CHARS
+    assert set(final) <= rts._GSM7                                       # noqa: SLF001
+    assert "Reason: " in final and final.endswith("Reply STOP to opt out.")
+    assert "Copy of Jayyyyyyyy \"The Sniper\" - Opti's trade" in final     # emoji gone, then 30 chars
+
+
+def test_the_flag_and_label_default_off_and_blank():
+    from app.config import Settings
+    assert Settings.model_fields["rejected_trade_sms_enabled"].default is False
+    assert Settings.model_fields["sms_environment_label"].default == ""
+
+
 def test_the_broker_line_never_shows_the_account_label_or_number(world):
     t = world.user()
     acct = world.account(t, BrokerName.ALPACA, paper=False, label="Joint U99887766")
@@ -366,6 +388,30 @@ def test_a_text_waits_for_the_delay_then_goes_once(world):
     assert len(tw.sent) == 1 and tw.sent[0][0] == "+15555550123"
     [row] = world.rows(o)
     assert (row.status, row.twilio_sid, row.attempts, row.phone_last4, row.num_segments) == ("sent", "SM1", 1, "0123", 2)
+
+
+def test_two_sender_loops_at_once_send_a_text_once(world):
+    """SKIP LOCKED: overlapping passes (a restart while one runs) never both
+    send the same row."""
+    import threading
+    _, o, row = queued(world)
+    gate = threading.Barrier(2)
+    sent = []
+
+    def slow_send(to, body):
+        sent.append(to)
+        return sms.SmsResult(ok=True, sid="SMx", status="queued")
+
+    def run():
+        gate.wait()
+        sms_outbox.send_due(now=row.next_attempt_at, send=slow_send)
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(sent) == 1
+    assert world.rows(o)[0].status == "sent"
 
 
 @pytest.mark.parametrize("kw,why", [
