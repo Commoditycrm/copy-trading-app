@@ -142,6 +142,13 @@ def create_app() -> FastAPI:
 
     position_events.install()
 
+    # Tell the owner (in-app, and by text when they turned texts on) when the
+    # broker rejects an order it had already accepted
+    # (services/rejection_alerts.py).
+    from app.services import rejection_alerts
+
+    rejection_alerts.install()
+
     @app.middleware("http")
     async def _tag_webull_caller(request, call_next):  # noqa: ANN001, ANN202
         token = webull_usage.set_request_caller(request.method, request.url.path)
