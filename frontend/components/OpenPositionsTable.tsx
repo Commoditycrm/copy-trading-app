@@ -369,7 +369,10 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
           onClick={() => void reapplyLadder()}
           disabled={reapplying || busy !== null}
           title="Cancel every stop and open sell on this position and start the exit ladder over from T1, from the position as it is now"
-          className="ml-auto inline-flex items-center gap-1 rounded-md px-2 py-0.5 disabled:opacity-40"
+          // Right after the chips, not pushed to the row's far end: the row
+          // spans the whole (sideways-scrolling) table, so "far right" was
+          // off-screen.
+          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 disabled:opacity-40"
           style={{ border: "1px solid var(--border-strong)", color: "var(--text)" }}
         >
           {reapplying ? <Spinner /> : <RotateCcw size={12} />}
