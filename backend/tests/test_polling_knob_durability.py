@@ -208,3 +208,52 @@ def test_the_async_fanout_getter_never_blocks_on_the_database(store, monkeypatch
     from app.config import get_settings
     got = asyncio.run(pc.get_fanout_batch_threshold_async())
     assert got == get_settings().fanout_batch_threshold
+
+
+# ── end to end: a stored override reaches the loop that polls ────────────────
+
+def test_the_poller_uses_a_value_that_exists_only_in_the_database(store, monkeypatch):
+    """The whole point, in one test: an admin sets an interval, the cache is
+    then lost, and the P&L loop still polls at the configured cadence rather
+    than silently reverting to the env default.
+    """
+    from app.models.broker_account import BrokerName
+    from app.services import market_hours as mh, pnl_poller
+
+    redis, rows = store
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: True)
+
+    pc.set_int_knob(KNOB, 23)
+    redis.data.clear()                       # Redis restarted
+    pc._db_cache.clear()
+
+    assert pnl_poller._interval_for_broker(BrokerName.ALPACA) == 23.0
+
+
+def test_changing_the_knob_changes_the_next_poll_without_a_restart(store, monkeypatch):
+    """A change lands on the next tick: the loop re-reads per tick rather than
+    capturing the interval at startup."""
+    from app.models.broker_account import BrokerName
+    from app.services import market_hours as mh, pnl_poller
+
+    redis, rows = store
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: True)
+
+    pc.set_int_knob(KNOB, 30)
+    assert pnl_poller._interval_for_broker(BrokerName.ALPACA) == 30.0
+    pc.set_int_knob(KNOB, 7)                 # admin edits the page
+    pc._db_cache.clear()                     # (the TTL would expire on its own)
+    assert pnl_poller._interval_for_broker(BrokerName.ALPACA) == 7.0
+
+
+def test_clearing_the_override_returns_the_loop_to_the_env_default(store, monkeypatch):
+    from app.models.broker_account import BrokerName
+    from app.services import market_hours as mh, pnl_poller
+
+    redis, rows = store
+    monkeypatch.setattr(mh, "is_tradable_now", lambda *a, **k: True)
+
+    pc.set_int_knob(KNOB, 7)
+    pc.set_int_knob(KNOB, None)
+    pc._db_cache.clear()
+    assert pnl_poller._interval_for_broker(BrokerName.ALPACA) == float(_default())
