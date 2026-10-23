@@ -1,8 +1,8 @@
 """Host disk usage by category, for Admin → System → Storage.
 
 scripts/host_storage.py measures the disk on the host every 15 minutes and
-writes storage.json and storage-history.json into the read-only /host-metrics
-mount; this only reads them. No file means the collector isn't installed
+writes storage.json into the read-only /host-metrics mount; this only reads
+it. No file means the collector isn't installed
 (production, or QA before the install) — "unavailable", never zeros.
 """
 from __future__ import annotations
@@ -42,16 +42,9 @@ def read_storage(now: datetime | None = None) -> dict[str, Any]:
         age = (now - datetime.fromisoformat(data["collected_at"])).total_seconds()
     except (KeyError, TypeError, ValueError):
         age = None
-    try:
-        history = _read("storage-history.json")
-        if not isinstance(history, list):
-            history = []
-    except (OSError, ValueError):
-        history = []
     return {
         "status": "ok",
         **data,
-        "history": history[-90:],
         "age_seconds": None if age is None else max(0, int(age)),
         "stale": age is None or age > STALE_AFTER_S,
     }

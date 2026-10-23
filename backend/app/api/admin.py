@@ -1603,33 +1603,10 @@ def admin_rejected_orders(
             select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
         ).scalars()}
 
-    # Rejected-trade text for each row (services/rejected_trade_sms.py)
-    from app.models.sms_notification import SmsNotification  # noqa: PLC0415
-
-    order_ids = [o.id for o, _u in rows]
-    texts: dict[uuid.UUID, SmsNotification] = {}
-    if order_ids:
-        texts = {t.order_id: t for t in db.execute(
-            select(SmsNotification).where(SmsNotification.order_id.in_(order_ids))
-        ).scalars()}
-
     rejections = []
     for o, u in rows:
         acct = accounts.get(o.broker_account_id) if o.broker_account_id else None
-        t = texts.get(o.id)
         rejections.append({
-            "sms": None if t is None else {
-                "status": t.status,
-                "outcome": t.outcome,
-                "skip_reason": t.skip_reason,
-                "attempts": t.attempts,
-                "twilio_status": t.twilio_status,
-                "twilio_error_code": t.twilio_error_code,
-                "error": t.last_error,
-                "phone_last4": t.phone_last4,
-                "sent_at": t.sent_at.isoformat() if t.sent_at else None,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-            },
             "order_id": str(o.id),
             "user_id": str(o.user_id),
             "user_email": u.email if u else None,
@@ -1661,8 +1638,7 @@ def admin_rejected_orders(
             # reached the broker (rejected internally, e.g. credential decrypt).
             "broker_call_ms": o.broker_call_ms,
         })
-    return {"rejections": rejections, "truncated": truncated,
-            "sms_tracking_enabled": bool(get_settings().rejected_trade_sms_enabled)}
+    return {"rejections": rejections, "truncated": truncated}
 
 
 @router.get("/performance/by-broker")

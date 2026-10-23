@@ -3,8 +3,8 @@
 Every order that reaches REJECTED — at placement, from a broker stream or
 poll, after retries, from a background close — passes through the hook in
 services/rejection_alerts.py, which hands it here after the commit. This
-module decides what the rejection actually was, words the text, and queues it
-in sms_notifications (sent by services/sms_outbox.py).
+module decides what the rejection actually was, words the text and sends it
+once, in the background.
 
 What gets texted:
   broker_rejected  the broker refused the order (at placement or after accepting it)
@@ -17,19 +17,20 @@ Recorded but not texted:
                    short, copy turned off, loss limit, trader paused)
   internal         housekeeping (parent or broker account gone)
 
-One text per order: the row's dedup_key is the order id and inserts ignore a
-conflict, so the placement path, the stream, a poll and the fill sync seeing
-the same rejection make one row. Retry loops write a NEW order per attempt,
-so a text also waits SEND_DELAY and is dropped if the same contract was
-texted recently or a later attempt went through.
+One text per order: an sms_notifications row keyed on the order id is
+inserted first and only the insert that wins sends, so the placement path,
+the stream, a poll and the fill sync seeing the same rejection send once.
+Retry loops write a NEW order per attempt, so the same contract isn't texted
+again within REPEAT_WINDOW.
 
-All of this runs after the trade's own commit and swallows its errors: a
-failed or slow text never touches order processing.
+All of this runs in a background thread after the trade's own commit and
+swallows its errors: a failed or slow text never touches order processing.
 """
 from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -48,7 +49,6 @@ from app.services.order_retry import OUTCOME_UNKNOWN_REASON
 log = logging.getLogger(__name__)
 
 CATEGORY = "trade_rejected"
-SEND_DELAY = timedelta(seconds=60)      # lets a fallback/retry attempt land first
 REPEAT_WINDOW = timedelta(minutes=15)   # same contract already texted → don't again
 TEXTED = ("broker_rejected", "failed", "needs_review")
 _ET = ZoneInfo("America/New_York")
@@ -178,8 +178,6 @@ _VERB = {
 
 
 def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
-    label = get_settings().sms_environment_label.strip()
-    brand = f"Kopyya {label}".strip()
     acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
     side = (order.side.value if order.side else "").upper()
     qty = _num(order.quantity or 0)
@@ -187,7 +185,7 @@ def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
     stamp = f"{when:%b} {when.day} {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET"
     ref = str(order.id).replace("-", "")[:8].upper()
     base = get_settings().frontend_base_url.rstrip("/")
-    lead = gsm_safe(f"{brand}: {_whose(db, order)} {side} {qty} {contract_label(order)} order "
+    lead = gsm_safe(f"Kopyya: {_whose(db, order)} {side} {qty} {contract_label(order)} order "
                     f"({_order_type(order)}, {broker_label(acct)})")
     tail = f" {stamp}, Ref {ref}. View: {base}/trades"
     verb = _VERB[outcome]
@@ -228,88 +226,89 @@ def subject_key(order: Order) -> str:
                                      right, side))[:160]
 
 
-# ── queueing (after the trade's commit) ───────────────────────────────────
+# ── sending (after the trade's commit) ────────────────────────────────────
 
 
-def _insert_ignore(db: Session, values: dict) -> None:
+def _insert_once(db: Session, values: dict) -> bool:
+    """Insert the order's row; False when another path already did."""
     if db.bind.dialect.name == "postgresql":
         from sqlalchemy.dialects.postgresql import insert  # noqa: PLC0415
     else:
         from sqlalchemy.dialects.sqlite import insert  # noqa: PLC0415
-    db.execute(insert(SmsNotification).values(**values).on_conflict_do_nothing(index_elements=["dedup_key"]))
+    stmt = insert(SmsNotification).values(**values).on_conflict_do_nothing(index_elements=["dedup_key"])
+    return db.execute(stmt.returning(SmsNotification.id)).first() is not None
 
 
-def queue(db: Session, order: Order, previous: OrderStatus | None, now: datetime | None = None) -> None:
-    """Record this rejection once. Texted outcomes wait SEND_DELAY in
-    'pending'; the rest are kept as 'skipped' so the admin view shows why."""
+def _why_not(db: Session, user: User | None, subject: str, now: datetime) -> str | None:
+    """Why this text mustn't go, or None. The user's existing SMS settings
+    decide; a contract texted moments ago (a retry loop) isn't texted again."""
+    if user is None or not user.phone:
+        return "no_phone"
+    if not user.sms_notifications_enabled:
+        return "sms_disabled"
+    if not user.sms_on_trade_rejected:
+        return "category_disabled"
+    recent = db.scalar(select(SmsNotification.id).where(
+        SmsNotification.subject_key == subject, SmsNotification.status == "sent",
+        SmsNotification.sent_at >= now - REPEAT_WINDOW).limit(1))
+    return "repeat_within_15m" if recent is not None else None
+
+
+def handle(db: Session, order: Order, previous: OrderStatus | None, now: datetime | None = None,
+           send=None) -> str:  # noqa: ANN001
+    """Record this rejection once and text it if it should be. Returns the
+    row's final status ("sent" / "failed" / "skipped"), or "duplicate"."""
+    from app.services.sms import send_sms  # noqa: PLC0415
+
+    send = send or send_sms
     now = now or datetime.now(timezone.utc)
     outcome = classify(order, previous)
-    at = order.closed_at or order.updated_at or now
-    texted = outcome in TEXTED
-    _insert_ignore(db, {
-        "id": uuid.uuid4(), "user_id": order.user_id, "order_id": order.id,
-        "category": CATEGORY, "outcome": outcome, "dedup_key": f"{CATEGORY}:{order.id}",
-        "subject_key": subject_key(order), "body": message_for(db, order, outcome, at),
-        "status": "pending" if texted else "skipped",
-        "skip_reason": None if texted else f"not_texted_{outcome}",
-        "attempts": 0, "next_attempt_at": now + SEND_DELAY if texted else None,
+    user = db.get(User, order.user_id)
+    row_id = uuid.uuid4()
+    subject = subject_key(order)
+    body = message_for(db, order, outcome, order.closed_at or order.updated_at or now)
+    why = None if outcome in TEXTED else f"not_texted_{outcome}"
+    why = why or _why_not(db, user, subject, now)
+    if not _insert_once(db, {
+        "id": row_id, "user_id": order.user_id, "order_id": order.id, "category": CATEGORY,
+        "outcome": outcome, "dedup_key": f"{CATEGORY}:{order.id}", "subject_key": subject, "body": body,
+        "status": "skipped" if why else "pending", "skip_reason": why, "attempts": 0,
         "created_at": now, "updated_at": now,
-    })
+    }):
+        return "duplicate"
+    db.commit()                                   # claim the order before the slow send
+    if why:
+        return "skipped"
+    ok = send(user.phone, body)
+    row = db.get(SmsNotification, row_id)
+    row.status, row.attempts, row.updated_at = ("sent" if ok else "failed"), 1, now
+    row.sent_at = now if ok else None
+    row.phone_last4 = user.phone[-4:]
+    db.commit()
+    return row.status
+
+
+def _run(items: list[tuple[uuid.UUID, OrderStatus | None]]) -> None:
+    from app.database import SessionLocal  # noqa: PLC0415
+
+    for oid, previous in items:
+        try:
+            with SessionLocal() as db:
+                order = db.get(Order, oid)
+                if order is not None and order.status == OrderStatus.REJECTED and order.user_id is not None:
+                    handle(db, order, previous)
+        except Exception:  # noqa: BLE001
+            log.exception("rejected_trade_sms: could not handle order %s", oid)
 
 
 def queue_after_commit(items: list[tuple[uuid.UUID, OrderStatus | None]]) -> None:
-    """Called by the rejection hook once the rejection is committed. Own
-    session; never raises."""
-    from app.database import SessionLocal  # noqa: PLC0415
-
+    """Called by the rejection hook once the rejection is committed. Hands the
+    work to a background thread; never raises, never blocks the caller."""
     try:
-        with SessionLocal() as db:
-            for oid, previous in items:
-                order = db.get(Order, oid)
-                if order is None or order.status != OrderStatus.REJECTED or order.user_id is None:
-                    continue
-                queue(db, order, previous)
-            db.commit()
+        threading.Thread(target=_run, args=(items,), daemon=True, name="rejected-trade-sms").start()
     except Exception:  # noqa: BLE001
-        log.exception("rejected_trade_sms: could not queue %s", [str(i) for i, _ in items])
+        log.exception("rejected_trade_sms: could not start the sender")
 
 
-def still_worth_sending(db: Session, row: SmsNotification, now: datetime) -> str | None:
-    """Last look before the text goes: a reason to drop it, or None."""
-    order = db.get(Order, row.order_id) if row.order_id else None
-    if order is None:
-        return "order_gone"
-    if order.status != OrderStatus.REJECTED:
-        return "no_longer_rejected"           # e.g. adopted by a later lookup
-    if row.subject_key:
-        recent = db.scalar(select(SmsNotification.id).where(
-            SmsNotification.subject_key == row.subject_key,
-            SmsNotification.id != row.id,
-            SmsNotification.status.in_(("sent", "delivered", "undelivered")),
-            SmsNotification.sent_at >= now - REPEAT_WINDOW,
-        ).limit(1))
-        if recent is not None:
-            return "repeat_within_15m"
-    # A later attempt at the same thing that the broker took (market → limit
-    # fallback, a re-placed take-profit). A resting stop placed afterwards is
-    # a different order, not the same one going through.
-    stops = (OrderType.STOP, OrderType.STOP_LIMIT, OrderType.TRAILING_STOP)
-    same_kind = (Order.order_type.in_(stops) if order.order_type in stops
-                 else Order.order_type.notin_(stops))
-    later = db.scalar(select(Order.id).where(
-        Order.user_id == order.user_id, Order.id != order.id,
-        Order.symbol == order.symbol, Order.side == order.side,
-        Order.quantity == order.quantity, same_kind,
-        Order.option_expiry.is_not_distinct_from(order.option_expiry),
-        Order.option_strike.is_not_distinct_from(order.option_strike),
-        Order.option_right.is_not_distinct_from(order.option_right),
-        Order.created_at >= order.created_at,
-        Order.status.notin_((OrderStatus.REJECTED, OrderStatus.PENDING, OrderStatus.RETRY_PENDING)),
-    ).limit(1))
-    if later is not None:
-        return "superseded_by_later_attempt"
-    return None
-
-
-__all__ = ["classify", "clean_reason", "contract_label", "enabled", "message_for",
-           "queue", "queue_after_commit", "still_worth_sending"]
+__all__ = ["classify", "clean_reason", "contract_label", "enabled", "handle", "message_for",
+           "queue_after_commit"]

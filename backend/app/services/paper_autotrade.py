@@ -1,28 +1,24 @@
 """QA automatic Alpaca PAPER trading.
 
-Two switches, both needed: QA_PAPER_AUTOTRADE_ENABLED in the environment (so
-production, which never sets it, can't turn this on from the admin page) and
-the admin toggle stored in app_settings. Only the broker accounts listed in
-QA_PAPER_AUTOTRADE_ACCOUNTS are touched; everyone else trades exactly as before.
+QA_PAPER_AUTOTRADE_ENABLED turns it on (production never sets it) and only
+the broker accounts listed in QA_PAPER_AUTOTRADE_ACCOUNTS are touched;
+everyone else trades exactly as before.
 
-With the environment switch on, every order placed or replaced on a listed
-account first passes ``check()``:
+Every order placed or replaced on a listed account first passes ``check()``:
   - an Alpaca account marked paper, with paper credentials and a PK… key
   - the client pointed at Alpaca's paper host
   - Alpaca's own get_account() number starting PA and matching the number
     recorded when it was connected (re-read at most every IDENTITY_TTL_S)
   - not shared with another user
-  - under the per-minute and per-day order caps (a tripped cap holds the
-    account until an admin resets it)
 Any failure refuses the order — nothing is sent.
 
-With the admin toggle also on:
-  - an approved Discord alert on a listed account is sent to the broker even
-    when its channel is in Discord "paper" (simulate-only) mode; manual
-    channels still wait for approval, and every channel setting still applies
-  - copies of a listed account's orders go only to simulated (fake) accounts
-    and to Alpaca paper accounts that pass the same identity check; a live
-    account is skipped, never copied into
+On a listed account:
+  - an approved Discord alert is sent to the broker even when its channel is
+    in Discord "paper" (simulate-only) mode; manual channels still wait for
+    approval, and every channel setting still applies
+  - copies of its orders go only to simulated (fake) accounts and to Alpaca
+    paper accounts that pass the same identity check; a live account is
+    skipped, never copied into
 
 Orders always stay on their owner's own account: nothing is redirected.
 """
@@ -33,7 +29,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from app.config import get_settings
@@ -41,10 +36,8 @@ from app.models.broker_account import BrokerAccount, BrokerName
 
 log = logging.getLogger(__name__)
 
-TOGGLE_KEY = "qa_paper_autotrade"
 PAPER_HOST = "https://paper-api.alpaca.markets"
 IDENTITY_TTL_S = 60
-TRIP_TTL_S = 24 * 3600
 
 
 class PaperGuardError(Exception):
@@ -70,25 +63,9 @@ def allowed_ids() -> set[uuid.UUID]:
     return out
 
 
-def toggle_on() -> bool:
-    from app.services import app_settings  # noqa: PLC0415
-
-    return app_settings.flag(TOGGLE_KEY, False)
-
-
-def enabled() -> bool:
-    """Automation on: environment switch AND admin toggle."""
-    return env_enabled() and toggle_on()
-
-
-def guards(account_id: uuid.UUID | None) -> bool:
-    """Orders on this account must pass check() (environment switch on and listed)."""
-    return account_id is not None and env_enabled() and account_id in allowed_ids()
-
-
 def governs(account_id: uuid.UUID | None) -> bool:
-    """This account's trading is automated as paper (both switches, listed)."""
-    return guards(account_id) and toggle_on()
+    """Orders on this account are automated as paper and must pass check()."""
+    return account_id is not None and env_enabled() and account_id in allowed_ids()
 
 
 # ── identity ──────────────────────────────────────────────────────────────
@@ -180,93 +157,14 @@ def verify_identity(account_id: uuid.UUID, creds: dict, client: Any, *, force: b
     return problem
 
 
-def last_identity(account_id: uuid.UUID) -> dict | None:
-    with _lock:
-        hit = _identity.get(account_id)
-    if hit is None:
-        return None
-    return {"ok": hit.problem is None, "problem": hit.problem,
-            "number_masked": _mask(hit.number), "age_s": int(time.monotonic() - hit.at)}
-
-
-def _mask(number: str | None) -> str | None:
-    return None if not number else f"{number[:2]}***{number[-3:]}"
-
-
-# ── order volume ──────────────────────────────────────────────────────────
-
-
-def _redis():
-    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
-
-    return get_sync_redis()
-
-
-def _keys(account_id: uuid.UUID, at: datetime) -> tuple[str, str, str]:
-    return (f"paper_autotrade:min:{account_id}:{at:%Y%m%d%H%M}",
-            f"paper_autotrade:day:{account_id}:{at:%Y%m%d}",
-            f"paper_autotrade:tripped:{account_id}")
-
-
-def count_and_cap(account_id: uuid.UUID, at: datetime | None = None, r=None) -> str | None:  # noqa: ANN001
-    """Count this order; None if it's within the caps, else why not. A cap,
-    once hit, holds the account (TRIP_TTL_S) until an admin resets it."""
-    at = at or datetime.now(timezone.utc)
-    s = get_settings()
-    r = r or _redis()
-    k_min, k_day, k_trip = _keys(account_id, at)
-    tripped = r.get(k_trip)
-    if tripped:
-        return f"order cap tripped: {tripped.decode() if isinstance(tripped, bytes) else tripped}"
-    pipe = r.pipeline(transaction=False)
-    pipe.incr(k_min)
-    pipe.expire(k_min, 120)
-    pipe.incr(k_day)
-    pipe.expire(k_day, 2 * 86400)
-    n_min, _, n_day, _ = pipe.execute()
-    why = None
-    if n_min > s.qa_paper_autotrade_max_orders_per_minute:
-        why = f"{n_min} orders in one minute (cap {s.qa_paper_autotrade_max_orders_per_minute})"
-    elif n_day > s.qa_paper_autotrade_max_orders_per_day:
-        why = f"{n_day} orders today (cap {s.qa_paper_autotrade_max_orders_per_day})"
-    if why:
-        r.setex(k_trip, TRIP_TTL_S, why)
-        _audit("paper_autotrade.cap_tripped", account_id, {"reason": why})
-        log.error("paper_autotrade: account %s held — %s", account_id, why)
-    return why
-
-
-def counts(account_id: uuid.UUID, r=None) -> dict:  # noqa: ANN001
-    at = datetime.now(timezone.utc)
-    r = r or _redis()
-    k_min, k_day, k_trip = _keys(account_id, at)
-    vals = r.mget([k_min, k_day, k_trip])
-    dec = (lambda v: v.decode() if isinstance(v, bytes) else v)
-    return {"this_minute": int(dec(vals[0]) or 0), "today": int(dec(vals[1]) or 0), "tripped": dec(vals[2])}
-
-
-def reset_cap(account_id: uuid.UUID, r=None) -> None:  # noqa: ANN001
-    (r or _redis()).delete(_keys(account_id, datetime.now(timezone.utc))[2])
-
-
 # ── the guard on the adapter ──────────────────────────────────────────────
 
 
-def check(account_id: uuid.UUID, creds: dict, client: Any, *, opening: bool = True) -> None:
-    """Raise PaperGuardError unless this order may go to the broker.
-
-    The paper identity is required for every order. The volume caps only hold
-    back OPENING orders: a close, a stop or a trailing-stop move protects a
-    position, and the trail ratchet can move a stop many times a minute — a
-    tripped cap must never leave a position without its exit."""
+def check(account_id: uuid.UUID, creds: dict, client: Any) -> None:
+    """Raise PaperGuardError unless this order may go to the broker."""
     problem = verify_identity(account_id, creds, client)
-    if problem is None and opening:
-        try:
-            problem = count_and_cap(account_id)
-        except Exception as exc:  # noqa: BLE001 — can't count → can't prove the cap
-            problem = f"order cap unavailable ({type(exc).__name__})"
     if problem:
-        _audit("paper_autotrade.order_refused", account_id, {"reason": problem, "opening": opening})
+        log.error("paper_autotrade: refused an order on %s — %s", account_id, problem)
         raise PaperGuardError(f"QA paper guard refused the order: {problem}")
 
 
@@ -276,9 +174,8 @@ def attach(adapter: Any, account_id: uuid.UUID, creds: dict) -> Any:
     from app.brokers.alpaca import AlpacaAdapter  # noqa: PLC0415
 
     if isinstance(adapter, AlpacaAdapter):
-        def guard(req: Any = None, kind: str = "place") -> None:
-            opening = kind == "place" and not bool(getattr(req, "is_closing", False))
-            check(account_id, creds, adapter._c(), opening=opening)  # noqa: SLF001
+        def guard(req: Any = None, kind: str = "place") -> None:  # noqa: ARG001
+            check(account_id, creds, adapter._c())  # noqa: SLF001
         adapter.paper_guard = guard
     return adapter
 
@@ -291,15 +188,3 @@ def copy_target_problem(broker: Any, creds: dict | None) -> str | None:
     probs = static_problems(broker, None, creds)
     return "; ".join(probs) if probs else None
 
-
-def _audit(action: str, account_id: uuid.UUID, metadata: dict) -> None:
-    from app.database import SessionLocal  # noqa: PLC0415
-    from app.services import audit  # noqa: PLC0415
-
-    try:
-        with SessionLocal() as db:
-            audit.record(db, actor_user_id=None, action=action, entity_type="broker_account",
-                         entity_id=account_id, metadata=metadata)
-            db.commit()
-    except Exception:  # noqa: BLE001 — the refusal stands even if the audit row can't be written
-        log.exception("paper_autotrade: audit %s failed", action)

@@ -25,7 +25,6 @@ from app.api import (
     sms_costs as sms_costs_api,
     subscribers,
     system as system_api,
-    paper_autotrade as paper_autotrade_api,
     trades,
     ui_prefs,
 )
@@ -177,7 +176,6 @@ def create_app() -> FastAPI:
     app.include_router(market_data_api.router)
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
-    app.include_router(paper_autotrade_api.router)
     app.include_router(ui_prefs.router)
     app.include_router(sms_costs_api.router)
     app.include_router(subscriber_symbols.router)
@@ -403,18 +401,6 @@ def create_app() -> FastAPI:
             name="stale-order-canceller",
             daemon=True,
         ).start()
-
-        # Rejected-trade texts: sends what services/rejected_trade_sms queued
-        # and reads Twilio's delivery status back. Only with the flag on, so
-        # an environment without it runs exactly as before.
-        if get_settings().rejected_trade_sms_enabled:
-            from app.services import sms_outbox
-            threading.Thread(
-                target=sms_outbox.poll_loop,
-                kwargs={"shutdown_check": shutdown_event.is_set},
-                name="sms-outbox",
-                daemon=True,
-            ).start()
 
         # Discord entry reprice: a buy alert placed as a LIMIT can rest unfilled
         # while the contract moves, turning a good alert into a missed trade.

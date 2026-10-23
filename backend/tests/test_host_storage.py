@@ -1,6 +1,6 @@
 """Admin → System → Storage: the host collector's categories add up to the
-disk's used bytes with nothing counted twice, the trend keeps one point a day,
-AWS snapshot storage is reported apart, and the backend only reads the file."""
+disk's used bytes with nothing counted twice, and the backend only reads the
+file."""
 import importlib.util
 import json
 import sys
@@ -49,9 +49,6 @@ def disk(hs, monkeypatch):
         {"container": "copy-trading-app-worker-1", "bytes": 1 * 10**6, "app": True},
         {"container": "copy-trading-app-db-1", "bytes": 5 * 10**6, "app": False},
     ])
-    monkeypatch.setattr(hs, "docker_df", lambda: {"Build Cache": {"size": "15.43GB", "reclaimable": "10.62GB", "count": "183"}})
-    monkeypatch.setattr(hs, "largest", lambda: [{"path": "/var/lib/containerd", "bytes": int(20.68 * GB)}])
-    monkeypatch.setattr(hs, "aws_snapshots", lambda: None)
     return sizes
 
 
@@ -64,7 +61,7 @@ def test_categories_add_up_to_used_with_nothing_counted_twice(hs, disk):
         "/var/lib/docker/volumes/copy-trading-app_pgdata"] - 21 * 10**6
     assert cats["postgres"] == disk["/var/lib/docker/volumes/copy-trading-app_pgdata"]
     assert cats["app_logs"] == 16 * 10**6 and cats["docker_logs"] == 5 * 10**6
-    assert cats["redis"] == 0 and out["detail"]["redis_persistence"].startswith("off")
+    assert cats["redis"] == 0
     assert cats["swap"] == int(4.29 * GB)
     assert cats["os_other"] > 0                                  # the remainder, never negative
     assert [c["key"] for c in out["categories"]] == [
@@ -82,30 +79,6 @@ def test_measured_more_than_used_never_goes_negative(hs, disk, monkeypatch):
     monkeypatch.setattr(hs, "fs_usage", lambda root="/": {"total": 100, "used": 1, "available": 99})
     cats = {c["key"]: c["bytes"] for c in hs.collect()["categories"]}
     assert cats["os_other"] == 0
-
-
-def test_history_keeps_one_point_a_day(hs, tmp_path):
-    p = tmp_path / "h.json"
-    payload = {"collected_at": "2026-10-23T08:00:00+00:00", "filesystem": {"used": 1, "total": 9},
-               "categories": [{"key": "swap", "bytes": 1}]}
-    p.write_text(json.dumps(hs.update_history(payload, str(p))))
-    payload["collected_at"], payload["filesystem"]["used"] = "2026-10-23T09:00:00+00:00", 2
-    hist = hs.update_history(payload, str(p))
-    assert [(h["date"], h["used"]) for h in hist] == [("2026-10-23", 2)]
-    p.write_text(json.dumps([{"date": f"2026-01-{d:02d}", "used": d} for d in range(1, 32)] * 5))
-    assert len(hs.update_history(payload, str(p))) <= hs.HISTORY_DAYS
-
-
-def test_aws_snapshot_storage_comes_from_the_cost_collector(hs, tmp_path):
-    (tmp_path / "aws-costs.json").write_text(json.dumps({"periods": [{"month": "2026-10", "categories": [
-        {"category": "EBS Snapshots", "cost_usd": "0.45", "quantity": "8.9", "unit": "GB-Month"}]}]}))
-    assert hs.aws_snapshots(str(tmp_path)) == {"cost_usd": "0.45", "quantity": "8.9", "unit": "GB-Month",
-                                               "month": "2026-10", "attributed": True}
-    (tmp_path / "aws-costs.json").write_text(json.dumps({"periods": [{"month": "2026-10", "categories": []}],
-                                                         "attribution": {"warnings": [
-                                                             {"categories": ["EBS Snapshots"], "excluded_usd": "0.45"}]}}))
-    assert hs.aws_snapshots(str(tmp_path))["excluded_usd"] == "0.45"
-    assert hs.aws_snapshots(str(tmp_path / "none")) is None
 
 
 def test_container_logs_are_split_into_application_and_other(hs, tmp_path, monkeypatch):
@@ -133,13 +106,12 @@ def test_no_collector_means_unavailable(mdir):
     assert out["status"] == "unavailable" and "isn't installed" in out["reason"]
 
 
-def test_a_fresh_file_is_served_with_its_history(mdir):
+def test_a_fresh_file_is_served(mdir):
     (mdir / "storage.json").write_text(json.dumps({"collected_at": (NOW - timedelta(minutes=10)).isoformat(),
                                                    "filesystem": {"total": 9, "used": 3, "available": 6},
                                                    "categories": []}))
-    (mdir / "storage-history.json").write_text(json.dumps([{"date": "2026-10-23", "used": 3}]))
     out = reader.read_storage(NOW)
-    assert out["status"] == "ok" and out["stale"] is False and out["history"] == [{"date": "2026-10-23", "used": 3}]
+    assert out["status"] == "ok" and out["stale"] is False and out["filesystem"]["used"] == 3
 
 
 def test_an_old_file_is_stale(mdir):

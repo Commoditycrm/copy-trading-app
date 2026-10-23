@@ -22,9 +22,8 @@ KOPYYA_LOG_CLEANUP_ENABLED=true (/etc/kopyya/log-cleanup.env) every request is
 a dry run: the result says what would have been freed, nothing is touched.
 Every request — run, dry or refused — is appended to the host audit log.
 
-Retention (optional, /var/lib/kopyya-ops/retention.json): when enabled, rotated
-system logs older than N days are deleted on each run. Docker's own rotation
-(daemon.json max-size/max-file) already caps the container logs.
+Docker's own rotation (daemon.json max-size/max-file) already caps the
+container logs.
 
 Stdlib only. Outputs written atomically.
 """
@@ -110,7 +109,7 @@ def inventory(names: dict[str, str] | None = None) -> dict:
             if any(fnmatch.fnmatch(fn, pat) for pat in ROTATED):
                 p = os.path.join(dirpath, fn)
                 items.append({"category": "rotated_system_logs", "path": p, "container": None,
-                              "bytes": _size(p), "action": "delete", "mtime": os.path.getmtime(p)})
+                              "bytes": _size(p), "action": "delete"})
     ident = hashlib.sha256("\n".join(f"{i['category']}|{i['path']}|{i['action']}" for i in items).encode()).hexdigest()[:16]
     totals = {c: {"label": label, "files": 0, "bytes": 0} for c, label in CATEGORIES.items()}
     for i in items:
@@ -202,38 +201,11 @@ def handle_request(inv: dict) -> dict | None:
     return result
 
 
-def apply_retention(inv: dict) -> dict:
-    """Delete rotated system logs older than the configured days (if enabled)."""
-    cfg = _read_json(os.path.join(OPS_DIR, "retention.json")) or {}
-    out = {"enabled": bool(cfg.get("enabled")), "rotated_log_days": cfg.get("rotated_log_days"), "deleted": 0,
-           "freed_bytes": 0}
-    days = cfg.get("rotated_log_days")
-    if not out["enabled"] or not isinstance(days, int) or days < 1 or not ENABLED:
-        return out
-    cutoff = time.time() - days * 86400
-    for item in inv["items"]:
-        if item["category"] == "rotated_system_logs" and item.get("mtime", time.time()) < cutoff:
-            try:
-                os.unlink(item["path"])
-                out["deleted"] += 1
-                out["freed_bytes"] += item["bytes"]
-            except OSError:
-                pass
-    if out["deleted"]:
-        _audit({"event": "logs_retention", "deleted": out["deleted"], "freed_bytes": out["freed_bytes"],
-                "rotated_log_days": days})
-    return out
-
-
 def main() -> int:
     inv = inventory()
     handle_request(inv)
-    retention = apply_retention(inv)
     inv = inventory()                                                 # what's there now
-    inv["retention"] = retention
     inv["docker_rotation"] = (_read_json("/etc/docker/daemon.json") or {}).get("log-opts")
-    for i in inv["items"]:
-        i.pop("mtime", None)
     _write(inv, os.path.join(OUT_DIR, "logs-inventory.json"))
     return 0
 

@@ -1,71 +1,25 @@
-"""QA automatic Alpaca PAPER trading: the paper guard (identity, sharing,
-order caps), when it applies, copy targets, and the admin endpoints.
+"""QA automatic Alpaca PAPER trading: the paper guard (identity, sharing),
+when it applies, and copy targets.
 
-Alpaca and Redis are fakes; nothing is placed anywhere. Uses the database at
-DATABASE_URL for the account rows and audit records.
+Alpaca is a fake; nothing is placed anywhere. Uses the database at
+DATABASE_URL for the account rows.
 """
 import uuid
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
-from sqlalchemy import select
 
-from app.api import paper_autotrade as api
 from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter
 from app.config import get_settings
 from app.database import SessionLocal
-from app.models.audit_log import AuditLog
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.user import User, UserRole
-from app.services import app_settings, paper_autotrade as pa
+from app.services import paper_autotrade as pa
 from app.services.crypto import encrypt_json
 
 PAPER = {"api_key": "PKTEST123", "api_secret": "s", "paper": True}
 LIVE = {"api_key": "AKLIVE123", "api_secret": "s", "paper": False}
-
-
-class FakeRedis:
-    def __init__(self):
-        self.d = {}
-
-    def get(self, k):
-        return self.d.get(k)
-
-    def setex(self, k, ttl, v):
-        self.d[k] = v
-
-    def delete(self, k):
-        self.d.pop(k, None)
-
-    def mget(self, keys):
-        return [self.d.get(k) for k in keys]
-
-    def pipeline(self, transaction=False):
-        r = self
-
-        class P:
-            def __init__(self):
-                self.ops = []
-
-            def incr(self, k):
-                self.ops.append(("incr", k))
-
-            def expire(self, k, s):
-                self.ops.append(("expire", k))
-
-            def execute(self):
-                out = []
-                for op, k in self.ops:
-                    if op == "incr":
-                        r.d[k] = int(r.d.get(k) or 0) + 1
-                        out.append(r.d[k])
-                    else:
-                        out.append(True)
-                return out
-        return P()
 
 
 class FakeClient:
@@ -82,16 +36,10 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def isolate(monkeypatch):
-    r = FakeRedis()
-    monkeypatch.setattr(pa, "_redis", lambda: r)
     pa._identity.clear()                                            # noqa: SLF001
     s = get_settings()
     monkeypatch.setattr(s, "qa_paper_autotrade_enabled", False)
     monkeypatch.setattr(s, "qa_paper_autotrade_accounts", "")
-    monkeypatch.setattr(s, "qa_paper_autotrade_max_orders_per_minute", 3)
-    monkeypatch.setattr(s, "qa_paper_autotrade_max_orders_per_day", 5)
-    monkeypatch.setattr(app_settings, "flag", lambda key, default: default)
-    yield SimpleNamespace(redis=r)
 
 
 @pytest.fixture
@@ -115,11 +63,10 @@ def world(monkeypatch):
         db.commit()
         return a
 
-    def listing(*accts, toggle=False):
+    def listing(*accts):
         s = get_settings()
         monkeypatch.setattr(s, "qa_paper_autotrade_enabled", True)
         monkeypatch.setattr(s, "qa_paper_autotrade_accounts", ",".join(str(a.id) for a in accts))
-        monkeypatch.setattr(app_settings, "flag", lambda key, default: toggle if key == pa.TOGGLE_KEY else default)
 
     yield SimpleNamespace(db=db, user=user, account=account, listing=listing)
     db.rollback()
@@ -138,28 +85,24 @@ def world(monkeypatch):
 # ── switches ──────────────────────────────────────────────────────────────
 
 
-def test_off_by_default_and_production_can_never_turn_it_on():
+def test_off_by_default():
     from app.config import Settings
     assert Settings.model_fields["qa_paper_autotrade_enabled"].default is False
     assert Settings.model_fields["qa_paper_autotrade_accounts"].default == ""
-    assert not pa.env_enabled() and not pa.enabled()
+    assert not pa.env_enabled()
 
 
-def test_the_admin_toggle_alone_does_nothing_without_the_environment_switch(monkeypatch):
-    monkeypatch.setattr(app_settings, "flag", lambda key, default: True)
+def test_listing_alone_does_nothing_without_the_environment_switch(monkeypatch):
     acct = uuid.uuid4()
     monkeypatch.setattr(get_settings(), "qa_paper_autotrade_accounts", str(acct))
-    assert pa.toggle_on() and not pa.enabled() and not pa.guards(acct) and not pa.governs(acct)
+    assert not pa.governs(acct)
 
 
-def test_only_listed_accounts_are_guarded_and_governed(world):
+def test_only_listed_accounts_are_governed(world):
     t = world.user()
     listed, other = world.account(t), world.account(world.user(), number="PA2OTHER")
-    world.listing(listed, toggle=False)
-    assert pa.guards(listed.id) and not pa.governs(listed.id)     # guard on, automation off
-    assert not pa.guards(other.id)
-    world.listing(listed, toggle=True)
-    assert pa.governs(listed.id) and not pa.governs(other.id)
+    world.listing(listed)
+    assert pa.governs(listed.id) and not pa.governs(other.id) and not pa.governs(None)
 
 
 # ── identity ──────────────────────────────────────────────────────────────
@@ -216,38 +159,6 @@ def test_a_shared_brokerage_account_is_refused(world):
     assert "shared" in pa.verify_identity(a.id, PAPER, FakeClient(), force=True)
 
 
-# ── order caps ────────────────────────────────────────────────────────────
-
-
-def test_the_per_minute_cap_trips_and_holds_until_reset(world, isolate):
-    a = world.account(world.user())
-    at = datetime(2026, 10, 23, 14, 0, tzinfo=timezone.utc)
-    assert [pa.count_and_cap(a.id, at) for _ in range(3)] == [None, None, None]
-    assert "in one minute" in pa.count_and_cap(a.id, at)
-    later = datetime(2026, 10, 23, 14, 5, tzinfo=timezone.utc)
-    assert "tripped" in pa.count_and_cap(a.id, later)             # still held a minute later
-    pa.reset_cap(a.id)
-    assert pa.count_and_cap(a.id, later) is None
-    db = world.db
-    db.expire_all()
-    assert db.execute(select(AuditLog).where(AuditLog.action == "paper_autotrade.cap_tripped",
-                                             AuditLog.entity_id == str(a.id))).first() is not None
-
-
-def test_the_daily_cap(world):
-    a = world.account(world.user())
-    results = [pa.count_and_cap(a.id, datetime(2026, 10, 23, 14, m, tzinfo=timezone.utc)) for m in range(6)]
-    assert results[:5] == [None] * 5 and "today" in results[5]
-
-
-def test_no_redis_means_no_order(world, monkeypatch):
-    a = world.account(world.user())
-    monkeypatch.setattr(pa, "_redis", lambda: (_ for _ in ()).throw(ConnectionError("redis down")))
-    monkeypatch.setattr(pa, "verify_identity", lambda *a, **k: None)
-    with pytest.raises(pa.PaperGuardError, match="cap unavailable"):
-        pa.check(a.id, PAPER, FakeClient())
-
-
 # ── the guard on the adapter ──────────────────────────────────────────────
 
 
@@ -284,7 +195,6 @@ def test_a_verified_paper_order_passes_the_guard(world):
     adapter = adapter_for(a, PAPER)
     adapter._client = FakeClient()                                    # noqa: SLF001
     adapter.paper_guard()                                             # no exception
-    assert pa.counts(a.id)["this_minute"] == 1
 
 
 # ── copies ────────────────────────────────────────────────────────────────
@@ -301,61 +211,3 @@ def test_a_verified_paper_order_passes_the_guard(world):
 ])
 def test_copy_targets_are_paper_or_simulated_only(broker, creds, ok):
     assert (pa.copy_target_problem(broker, creds) is None) is ok
-
-
-# ── admin endpoints ───────────────────────────────────────────────────────
-
-
-def admin(world):
-    return world.user(role=UserRole.ADMIN)
-
-
-def test_status_lists_accounts_checks_and_switches(world):
-    a = world.account(world.user())
-    world.listing(a)
-    out = api.status(db=world.db, _=None)
-    assert out["env_enabled"] is True and out["effective"] is False
-    [v] = out["accounts"]
-    assert v["id"] == str(a.id) and v["problems"] == [] and v["number_masked"] == "PA***CCT"
-    assert out["limits"] == {"per_minute": 3, "per_day": 5}
-
-
-def test_the_toggle_is_refused_without_the_environment_switch(world):
-    with pytest.raises(HTTPException) as e:
-        api.toggle(api.ToggleIn(on=True), db=world.db, admin=admin(world))
-    assert e.value.status_code == 403
-
-
-def test_the_toggle_is_refused_while_a_listed_account_fails_its_checks(world):
-    a = world.account(world.user(), creds=LIVE, paper=False, number="12345")
-    world.listing(a)
-    with pytest.raises(HTTPException) as e:
-        api.toggle(api.ToggleIn(on=True), db=world.db, admin=admin(world))
-    assert e.value.status_code == 409
-
-
-def test_the_toggle_turns_on_and_is_audited(world, monkeypatch):
-    a = world.account(world.user())
-    world.listing(a)
-    stored = {}
-    monkeypatch.setattr(app_settings, "set_flag", lambda db, key, value: stored.update({key: value}))
-    who = admin(world)
-    assert api.toggle(api.ToggleIn(on=True), db=world.db, admin=who) == {"toggle_on": True}
-    assert stored == {pa.TOGGLE_KEY: True}
-    assert world.db.execute(select(AuditLog).where(AuditLog.action == "paper_autotrade.toggled",
-                                                   AuditLog.actor_user_id == who.id)).first() is not None
-
-
-def test_verify_calls_alpaca_read_only_and_records_the_result(world, monkeypatch):
-    a = world.account(world.user())
-    world.listing(a)
-    monkeypatch.setattr(AlpacaAdapter, "_c", lambda self: FakeClient())
-    out = api.verify(a.id, db=world.db, admin=admin(world))
-    assert out["ok"] is True and out["identity"]["number_masked"] == "PA***CCT"
-
-
-def test_verify_refuses_unlisted_accounts(world):
-    a = world.account(world.user())
-    with pytest.raises(HTTPException) as e:
-        api.verify(a.id, db=world.db, admin=admin(world))
-    assert e.value.status_code == 404

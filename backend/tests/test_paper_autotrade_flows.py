@@ -1,7 +1,7 @@
 """QA paper auto-trading through the real trading paths, with simulated
 placement (no broker, no Alpaca): Discord auto-execution on a governed paper
-account, which copies are allowed, and that the order cap never blocks a
-protective exit or stop move while the paper identity is always required."""
+account, which copies are allowed, and that the paper identity is required
+for every order, exits and stop moves included."""
 import asyncio
 import os
 import sys
@@ -115,50 +115,11 @@ def test_without_governance_copies_are_exactly_as_before(db, fanout_env, copies,
     assert all(getattr(i.adapter, "paper_guard", None) is None for i in copies.sent)
 
 
-# ── the cap never blocks a protective order ───────────────────────────────
-
-
-@pytest.fixture
-def held(monkeypatch):
-    from test_paper_autotrade import FakeRedis
-    r = FakeRedis()
-    monkeypatch.setattr(pa, "_redis", lambda: r)
-    monkeypatch.setattr(pa, "verify_identity", lambda *a, **k: None)
-    monkeypatch.setattr(pa, "_audit", lambda *a, **k: None)
-    aid = uuid.uuid4()
-    r.setex(pa._keys(aid, datetime.now(timezone.utc))[2], 60, "test trip")   # noqa: SLF001
-    adapter = pa.attach(AlpacaAdapter(PAPER), aid, PAPER)
-    adapter._client = object()                                             # noqa: SLF001
-    return SimpleNamespace(adapter=adapter, aid=aid, r=r)
-
-
-def test_a_tripped_cap_holds_new_positions(held):
-    with pytest.raises(pa.PaperGuardError, match="tripped"):
-        held.adapter.paper_guard(SimpleNamespace(is_closing=False), "place")
-
-
-def test_a_tripped_cap_never_blocks_an_exit_or_a_stop_move(held):
-    held.adapter.paper_guard(SimpleNamespace(is_closing=True), "place")    # close / stop-loss sell
-    held.adapter.paper_guard(SimpleNamespace(is_closing=False), "replace")  # trailing-stop move
-
-
-def test_a_fast_trailing_stop_never_trips_the_cap(monkeypatch):
-    from test_paper_autotrade import FakeRedis
-    r = FakeRedis()
-    monkeypatch.setattr(pa, "_redis", lambda: r)
-    monkeypatch.setattr(pa, "verify_identity", lambda *a, **k: None)
-    aid = uuid.uuid4()
-    adapter = pa.attach(AlpacaAdapter(PAPER), aid, PAPER)
-    adapter._client = object()                                             # noqa: SLF001
-    for _ in range(60):                                                    # a new high every second
-        adapter.paper_guard(SimpleNamespace(is_closing=True), "replace")
-    assert pa.counts(aid, r)["tripped"] is None
-    adapter.paper_guard(SimpleNamespace(is_closing=False), "place")        # entries still allowed
+# ── the paper identity is always required ─────────────────────────────
 
 
 def test_an_unproven_account_refuses_exits_too(monkeypatch):
     monkeypatch.setattr(pa, "verify_identity", lambda *a, **k: "client is not on the paper host")
-    monkeypatch.setattr(pa, "_audit", lambda *a, **k: None)
     adapter = pa.attach(AlpacaAdapter(LIVE), uuid.uuid4(), LIVE)
     adapter._client = object()                                             # noqa: SLF001
     for req, kind in ((SimpleNamespace(is_closing=True), "place"), (SimpleNamespace(is_closing=False), "replace")):

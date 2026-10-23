@@ -3,8 +3,7 @@
 /**
  * Admin System → "Storage". How the EC2 host's disk is used, measured on the
  * host every 15 minutes (scripts/host_storage.py). The categories don't
- * overlap and add up to "used"; AWS snapshot storage isn't on this disk and is
- * shown apart.
+ * overlap and add up to "used".
  */
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -18,16 +17,6 @@ interface Storage {
   collected_at?: string;
   filesystem?: { total: number; used: number; available: number };
   categories?: Category[];
-  detail?: {
-    journal_bytes: number;
-    redis_persistence: string;
-    docker: Record<string, { size: string; reclaimable: string; count: string }>;
-    container_logs: { container: string; bytes: number }[];
-  };
-  largest?: { path: string; bytes: number }[];
-  aws_snapshots?: { cost_usd: string | null; quantity: string | null; unit: string | null; month: string;
-                    attributed: boolean; excluded_usd?: string | null } | null;
-  history?: { date: string; used: number; total: number }[];
   stale?: boolean;
   age_seconds?: number | null;
 }
@@ -116,11 +105,6 @@ export default function StorageSection() {
                     <td className="py-1 pr-2">
                       <span className="inline-block w-2 h-2 rounded-sm mr-2" style={{ background: COLORS[i % COLORS.length] }} />
                       {c.label}
-                      {c.key === "redis" && <span style={muted}> · persistence {s.detail?.redis_persistence}</span>}
-                      {c.key === "docker" && s.detail?.docker?.["Build Cache"] && (
-                        <span style={muted}> · build cache {s.detail.docker["Build Cache"].size} ({s.detail.docker["Build Cache"].reclaimable} reclaimable)</span>
-                      )}
-                      {c.key === "system_logs" && <span style={muted}> · journal {fmtBytes(s.detail?.journal_bytes)}</span>}
                     </td>
                     <td className="text-right pr-2">{fmtBytes(c.bytes)}</td>
                     <td className="text-right pr-2">{c.pct_of_used != null ? `${c.pct_of_used.toFixed(1)}%` : "—"}</td>
@@ -137,46 +121,6 @@ export default function StorageSection() {
             </table>
           </div>
 
-          <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}>
-            <div className={card} style={cardStyle}>
-              <div className="text-sm font-semibold mb-2" style={{ color: "var(--text-2)" }}>Largest folders</div>
-              <table className="w-full text-xs tabular-nums">
-                <tbody>
-                  {(s.largest ?? []).map((r) => (
-                    <tr key={r.path} style={{ borderTop: "1px solid var(--border)" }}>
-                      <td className="py-1 pr-2 font-mono break-all">{r.path}</td>
-                      <td className="text-right whitespace-nowrap">{fmtBytes(r.bytes)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className={card} style={cardStyle}>
-              <div className="text-sm font-semibold mb-2" style={{ color: "var(--text-2)" }}>Used over time</div>
-              {(s.history ?? []).length < 2 ? (
-                <div className="text-xs" style={muted}>The trend starts with today&apos;s measurement; one point a day.</div>
-              ) : (
-                <table className="w-full text-xs tabular-nums">
-                  <tbody>
-                    {s.history!.slice(-14).reverse().map((h) => (
-                      <tr key={h.date} style={{ borderTop: "1px solid var(--border)" }}>
-                        <td className="py-1 pr-2">{h.date}</td>
-                        <td className="text-right">{fmtBytes(h.used)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-              <div className="text-sm font-semibold mt-4 mb-1" style={{ color: "var(--text-2)" }}>AWS snapshot storage (not on this disk)</div>
-              <div className="text-xs" style={muted}>
-                {s.aws_snapshots
-                  ? s.aws_snapshots.attributed
-                    ? `${s.aws_snapshots.quantity ?? "—"} ${s.aws_snapshots.unit ?? ""} billed in ${s.aws_snapshots.month}: $${s.aws_snapshots.cost_usd}`
-                    : `No EBS snapshot charges attributed to QA in ${s.aws_snapshots.month}${s.aws_snapshots.excluded_usd ? ` ($${s.aws_snapshots.excluded_usd} of snapshot charges couldn't be tied to QA — see AWS Testing costs)` : ""}.`
-                  : "Not available (AWS cost collector not installed)."}
-              </div>
-            </div>
-          </div>
           <div className="text-[11px]" style={muted}>Measured {s.collected_at ? new Date(s.collected_at).toLocaleString() : "—"}; refreshed every 15 minutes.</div>
         </>
       )}

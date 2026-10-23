@@ -30,21 +30,6 @@ interface Rejection {
   is_closing: boolean;
   broker_order_id: string | null;
   broker_call_ms: number | null;
-  // Rejected-trade text (null: none recorded — tracking off, or still retrying)
-  sms: SmsInfo | null;
-}
-
-interface SmsInfo {
-  status: "pending" | "sent" | "delivered" | "undelivered" | "failed" | "skipped";
-  outcome: string;            // broker_rejected | failed | needs_review | blocked | internal
-  skip_reason: string | null;
-  attempts: number;
-  twilio_status: string | null;
-  twilio_error_code: number | null;
-  error: string | null;
-  phone_last4: string | null;
-  sent_at: string | null;
-  created_at: string | null;
 }
 
 // Rebuild the order the way it was sent to the broker. The raw broker request
@@ -81,55 +66,6 @@ const ROLE_COLORS: Record<string, { bg: string; color: string }> = {
   subscriber: { bg: "rgba(34,197,94,0.12)",  color: "#22c55e" },
   admin:      { bg: "rgba(239,68,68,0.12)",   color: "#ef4444" },
 };
-
-const SMS_LABEL: Record<SmsInfo["status"], string> = {
-  pending: "queued", sent: "sent", delivered: "delivered",
-  undelivered: "undelivered", failed: "failed", skipped: "not sent",
-};
-
-const SMS_COLORS: Record<string, { bg: string; color: string }> = {
-  queued:      { bg: "rgba(255,200,87,0.14)", color: "#f59e0b" },
-  sent:        { bg: "rgba(10,115,168,0.15)", color: "var(--accent)" },
-  delivered:   { bg: "rgba(34,197,94,0.12)",  color: "#22c55e" },
-  undelivered: { bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
-  failed:      { bg: "rgba(239,68,68,0.12)",  color: "#ef4444" },
-};
-
-// Why a rejection wasn't texted, in words
-const SMS_WHY: Record<string, string> = {
-  not_texted_blocked: "Kopyya safeguard blocked it on purpose — not texted",
-  not_texted_internal: "Internal cleanup — not texted",
-  no_phone: "No phone number in the user's settings",
-  sms_disabled: "User has texts turned off",
-  category_disabled: "User has 'Trade rejected' texts turned off",
-  repeat_within_15m: "Same contract already texted in the last 15 minutes",
-  superseded_by_later_attempt: "A later attempt at the same order went through",
-  no_longer_rejected: "Order is no longer rejected",
-  order_gone: "Order no longer exists",
-};
-
-const OUTCOME_LABEL: Record<string, string> = {
-  broker_rejected: "Broker rejected",
-  failed: "Failed (not placed)",
-  needs_review: "Outcome unknown — needs review",
-  blocked: "Blocked by Kopyya",
-  internal: "Internal",
-};
-
-function smsLabel(r: Rejection, tracking: boolean): string {
-  if (r.sms) return SMS_LABEL[r.sms.status] ?? r.sms.status;
-  return tracking ? "—" : "off";
-}
-
-function smsTitle(r: Rejection, tracking: boolean): string {
-  const s = r.sms;
-  if (!s) return tracking ? "No text recorded for this order" : "Rejected-trade texts are turned off";
-  const parts = [OUTCOME_LABEL[s.outcome] ?? s.outcome];
-  if (s.skip_reason) parts.push(SMS_WHY[s.skip_reason] ?? s.skip_reason);
-  if (s.twilio_status) parts.push(`Twilio: ${s.twilio_status}`);
-  if (s.error) parts.push(s.error);
-  return parts.join(" · ");
-}
 
 const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
   rejected:      { bg: "rgba(239,68,68,0.12)", color: "#ef4444" },
@@ -185,7 +121,6 @@ function SortableTh({
 export default function AdminRejectedPage() {
   const [rows, setRows] = useState<Rejection[]>([]);
   const [truncated, setTruncated] = useState(false);
-  const [smsTracking, setSmsTracking] = useState(false);
   const [loading, setLoading] = useState(true);
   const [role, setRole] = useState<"all" | "trader" | "subscriber">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "rejected" | "retry_pending">("all");
@@ -216,12 +151,11 @@ export default function AdminRejectedPage() {
   async function load() {
     setLoading(true);
     try {
-      const res = await api<{ rejections: Rejection[]; truncated: boolean; sms_tracking_enabled?: boolean }>(
+      const res = await api<{ rejections: Rejection[]; truncated: boolean }>(
         "/api/admin/rejected-orders?limit=300",
       );
       setRows(res.rejections);
       setTruncated(res.truncated);
-      setSmsTracking(!!res.sms_tracking_enabled);
     } catch (e) {
       notify.fromError(e, "Could not load rejected orders");
     } finally {
@@ -401,8 +335,6 @@ export default function AdminRejectedPage() {
                 <SortableTh label="Trade"  colKey="symbol"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Broker" colKey="broker"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <SortableTh label="Status" colKey="status"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}
-                    title={smsTracking ? "Rejected-trade text to the order's owner" : "Rejected-trade texts are turned off"}>Text</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Reason</th>
                 <SortableTh label="When"   colKey="created_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
@@ -410,7 +342,7 @@ export default function AdminRejectedPage() {
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={7} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
                     No rejected trades match this filter.
                   </td>
                 </tr>
@@ -446,9 +378,6 @@ export default function AdminRejectedPage() {
                     </td>
                     <td className="px-4 py-3" style={{ color: "var(--text-2)" }}>{r.broker ?? "—"}</td>
                     <td className="px-4 py-3"><Badge text={r.status} map={STATUS_COLORS} /></td>
-                    <td className="px-4 py-3" title={smsTitle(r, smsTracking)}>
-                      <Badge text={smsLabel(r, smsTracking)} map={SMS_COLORS} />
-                    </td>
                     <td className="px-4 py-3" style={{ color: r.reject_reason ? "var(--bad)" : "var(--muted)", maxWidth: 360 }}>
                       <div className="truncate" style={{ maxWidth: 340 }}>{r.reject_reason ?? "—"}</div>
                     </td>
@@ -457,7 +386,7 @@ export default function AdminRejectedPage() {
 
                   {open && (
                     <tr style={{ borderBottom: border, background: "rgba(255,255,255,0.02)" }}>
-                      <td colSpan={8} className="px-4 pb-4 pt-1">
+                      <td colSpan={7} className="px-4 pb-4 pt-1">
                         <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
                           {/* Reconstructed payload */}
                           <div>
@@ -499,28 +428,6 @@ export default function AdminRejectedPage() {
                               style={{ background: "var(--panel-2)", border: "1px solid rgba(239,68,68,0.25)", color: "var(--bad)", fontFamily: "monospace", margin: 0 }}>
 {r.reject_reason ?? "—"}
                             </pre>
-
-                            <div className="text-xs font-semibold mt-3 mb-1" style={{ color: "var(--text-2)" }}>Text message</div>
-                            {r.sms ? (
-                              <div className="text-xs space-y-1" style={{ color: "var(--text-2)" }}>
-                                {([
-                                  ["Classified as", OUTCOME_LABEL[r.sms.outcome] ?? r.sms.outcome],
-                                  ["Status", smsLabel(r, smsTracking) + (r.sms.skip_reason ? ` — ${SMS_WHY[r.sms.skip_reason] ?? r.sms.skip_reason}` : "")],
-                                  ["Twilio", r.sms.twilio_status ? `${r.sms.twilio_status}${r.sms.twilio_error_code ? ` (error ${r.sms.twilio_error_code})` : ""}` : "—"],
-                                  ["To", r.sms.phone_last4 ? `•••${r.sms.phone_last4}` : "—"],
-                                  ["Attempts", String(r.sms.attempts)],
-                                  ["Sent", fmtTime(r.sms.sent_at)],
-                                ] as const).map(([k, v]) => (
-                                  <div key={k} className="flex justify-between gap-3">
-                                    <span style={{ color: "var(--muted)" }}>{k}</span>
-                                    <span className="text-right">{v}</span>
-                                  </div>
-                                ))}
-                                {r.sms.error && <div style={{ color: "var(--bad)" }}>{r.sms.error}</div>}
-                              </div>
-                            ) : (
-                              <div className="text-xs" style={{ color: "var(--muted)" }}>{smsTitle(r, smsTracking)}.</div>
-                            )}
                           </div>
                         </div>
                       </td>

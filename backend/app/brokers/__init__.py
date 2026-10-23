@@ -39,7 +39,7 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
         from app.services import paper_autotrade  # noqa: PLC0415
 
         adapter = AlpacaAdapter(credentials)
-        if paper_autotrade.guards(getattr(broker_account, "id", None)):
+        if paper_autotrade.governs(getattr(broker_account, "id", None)):
             paper_autotrade.attach(adapter, broker_account.id, credentials)
         return adapter
     if broker_account.broker == BrokerName.SNAPTRADE:

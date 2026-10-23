@@ -316,24 +316,16 @@ class Settings(BaseSettings):
     twilio_messaging_service_sid: str = ""
     twilio_from_number: str = ""
     # Rejected-trade texts from one place (services/rejected_trade_sms.py): every
-    # terminal rejection, once per order, tracked to Twilio delivery. OFF keeps
-    # today's behaviour exactly — only the three placement/after-accept notices
-    # text, fire-and-forget.
+    # terminal rejection, once per order. OFF keeps today's behaviour exactly —
+    # only the three placement/after-accept notices text, fire-and-forget.
     rejected_trade_sms_enabled: bool = False
-    # Shown in the text's heading, e.g. "QA" → "Kopyya QA: Trade Rejected".
-    # Blank in production.
-    sms_environment_label: str = ""
 
     # ── QA automatic Alpaca PAPER trading (services/paper_autotrade.py) ──
     # Off in production by never being set. With it on, the listed broker
-    # accounts are checked to be Alpaca paper before every order; automation
-    # also needs the admin toggle. Comma-separated broker_accounts ids.
+    # accounts (comma-separated broker_accounts ids) auto-trade and are checked
+    # to be Alpaca paper before every order.
     qa_paper_autotrade_enabled: bool = False
     qa_paper_autotrade_accounts: str = ""
-    # Runaway-volume caps per listed account; hitting one holds the account
-    # until an admin resets it.
-    qa_paper_autotrade_max_orders_per_minute: int = 10
-    qa_paper_autotrade_max_orders_per_day: int = 200
 
     # ── Inbound Discord alert-copying (browser listener) ──────────────────
     # Master switch for the whole inbound Discord feature. OFF by default so an

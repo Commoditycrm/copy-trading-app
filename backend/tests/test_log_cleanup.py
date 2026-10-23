@@ -1,16 +1,14 @@
 """Clear Logs: the host agent only ever touches the approved operational logs
 (container logs emptied in place, rotated system logs deleted), never security
 logs, the journal or live system logs; it acts only on a confirmed, fresh
-request matching the list the admin saw; dry-run until enabled; retention;
-and the backend's request/audit side.
+request matching the list the admin saw; dry-run until enabled; and the
+backend's request/audit side.
 
 Runs on disposable logs in a temp directory — no real log is touched.
 """
 import importlib.util
 import json
-import os
 import sys
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -159,35 +157,10 @@ def test_paths_in_a_request_are_ignored(agent, host, monkeypatch):
     assert not (host.v / "syslog.1").exists()
 
 
-# ── retention ─────────────────────────────────────────────────────────────
-
-
-def test_retention_deletes_only_old_rotated_system_logs(agent, host, monkeypatch):
-    monkeypatch.setattr(agent, "ENABLED", True)
-    old = time.time() - 30 * 86400
-    for name in ("syslog.1", "dmesg.1.gz", "auth.log.1"):
-        os.utime(host.v / name, (old, old))
-    (host.ops / "retention.json").write_text(json.dumps({"enabled": True, "rotated_log_days": 14}))
-    out = agent.apply_retention(agent.inventory())
-    assert out["deleted"] == 2
-    assert not (host.v / "syslog.1").exists() and not (host.v / "dmesg.1.gz").exists()
-    assert (host.v / "kern.log.1").exists()                            # recent
-    assert (host.v / "auth.log.1").exists()                            # protected, however old
-    assert (host.c / "aaa" / "aaa-json.log.1").exists()                # Docker rotates its own
-
-
-def test_retention_does_nothing_while_the_host_is_dry_run(agent, host):
-    old = time.time() - 30 * 86400
-    os.utime(host.v / "syslog.1", (old, old))
-    (host.ops / "retention.json").write_text(json.dumps({"enabled": True, "rotated_log_days": 14}))
-    assert agent.apply_retention(agent.inventory())["deleted"] == 0 and (host.v / "syslog.1").exists()
-
-
 def test_main_writes_the_inventory_for_the_backend(agent, host):
     agent.main()
     inv = json.loads((host.out / "logs-inventory.json").read_text())
-    assert inv["enabled"] is False and inv["retention"]["enabled"] is False
-    assert all("mtime" not in i for i in inv["items"])
+    assert inv["enabled"] is False and inv["items"]
 
 
 # ── backend ───────────────────────────────────────────────────────────────
@@ -259,14 +232,6 @@ def test_the_hosts_result_is_audited_once(backend, agent, host):
     assert len(rows) == 1 and rows[0].metadata_json["freed_bytes"] == 8000
 
 
-def test_retention_is_validated_saved_for_the_host_and_audited(backend, host):
-    b = backend
-    with pytest.raises(b.svc.CleanupRefused):
-        b.svc.set_retention(b.db, b.admin.id, True, 0)
-    assert b.svc.set_retention(b.db, b.admin.id, True, 30) == {"enabled": True, "rotated_log_days": 30}
-    assert json.loads((host.ops / "retention.json").read_text())["rotated_log_days"] == 30
-
-
 def test_no_agent_means_unavailable(tmp_path, monkeypatch):
     from app.services import log_cleanup as svc
     monkeypatch.setenv("HOST_METRICS_DIR", str(tmp_path))
@@ -277,6 +242,11 @@ def test_no_agent_means_unavailable(tmp_path, monkeypatch):
 def test_the_endpoints_are_admin_only():
     from app.api import system
     from app.api.deps import require_admin
-    for path in ("/logs", "/logs/cleanup", "/logs/retention"):
+    for path in ("/logs", "/logs/cleanup"):
         route = next(r for r in system.router.routes if r.path.endswith(path))
         assert any(d.call is require_admin for d in route.dependant.dependencies), path
+
+
+def test_there_is_no_retention_setting():
+    from app.api import system
+    assert not any(r.path.endswith("/logs/retention") for r in system.router.routes)

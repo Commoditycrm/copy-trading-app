@@ -22,8 +22,6 @@ slow/failing send never blocks the request.
 from __future__ import annotations
 
 import logging
-import re
-from dataclasses import dataclass
 
 import httpx
 
@@ -63,37 +61,17 @@ def compose(body: str) -> str:
     included the opt-out line won't get it twice.
     """
     text = body.translate(_GSM_FOLD).strip()
-    # "Kopyya:" or an environment-labelled "Kopyya QA:" both name the sender
-    if not re.match(rf"{_BRAND}\b[^:\n]{{0,12}}:", text):
+    if not text.startswith(f"{_BRAND}:"):
         text = f"{_BRAND}: {text}"
     if _OPT_OUT not in text:
         text = f"{text} {_OPT_OUT}"
     return text
 
 
-@dataclass(frozen=True)
-class SmsResult:
-    """What Twilio said about one send. ``transient`` = worth trying again
-    (network, 429, 5xx); a 4xx is Twilio refusing this message for good."""
-    ok: bool
-    sid: str | None = None
-    status: str | None = None          # Twilio message status, e.g. "queued"
-    error_code: int | None = None
-    error: str | None = None
-    transient: bool = False
-    num_segments: int | None = None
-
-
 def send_sms(to: str, body: str) -> bool:
     """Send one SMS to ``to`` (E.164, e.g. "+15551234567"). Returns True on a
     Twilio accept (HTTP 2xx), False otherwise. Never raises — SMS is
     best-effort; callers must not crash if Twilio is down."""
-    return send_sms_detailed(to, body).ok
-
-
-def send_sms_detailed(to: str, body: str) -> SmsResult:
-    """send_sms, keeping Twilio's message SID and error so a caller can track
-    delivery and decide whether to retry. Never raises."""
     s = get_settings()
     text = compose(body)
 
@@ -101,7 +79,7 @@ def send_sms_detailed(to: str, body: str) -> SmsResult:
         # No credentials — log instead of sending so dev/QA flows work.
         # Log the composed text so what dev sees is what prod would send.
         log.warning("sms: TWILIO creds not set; NOT sending. to=%s body=%r", to, text)
-        return SmsResult(ok=False, error="twilio not configured")
+        return False
 
     # Sender: a Messaging Service SID wins; else a from-number. One is required.
     data = {"To": to, "Body": text}
@@ -114,7 +92,7 @@ def send_sms_detailed(to: str, body: str) -> SmsResult:
             "sms: no sender configured (set TWILIO_MESSAGING_SERVICE_SID or "
             "TWILIO_FROM_NUMBER); NOT sending. to=%s", to,
         )
-        return SmsResult(ok=False, error="no sender configured")
+        return False
 
     url = f"{_API_ROOT}/Accounts/{s.twilio_account_sid}/Messages.json"
     try:
@@ -124,49 +102,15 @@ def send_sms_detailed(to: str, body: str) -> SmsResult:
             auth=(s.twilio_account_sid, s.twilio_auth_token),
             timeout=_TIMEOUT,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         log.exception("sms: Twilio request failed for to=%s", to)
-        return SmsResult(ok=False, error=f"request failed ({type(exc).__name__})", transient=True)
+        return False
 
-    body_json = _json(resp)
     if resp.status_code // 100 == 2:
         log.info("sms: sent to=%s status=%s", to, resp.status_code)
-        return SmsResult(ok=True, sid=body_json.get("sid"), status=body_json.get("status"),
-                         num_segments=_int(body_json.get("num_segments")))
+        return True
     log.error(
         "sms: Twilio rejected to=%s status=%s body=%s",
         to, resp.status_code, resp.text[:500],
     )
-    return SmsResult(ok=False, error_code=_int(body_json.get("code")),
-                     error=str(body_json.get("message") or f"HTTP {resp.status_code}")[:300],
-                     transient=resp.status_code == 429 or resp.status_code >= 500)
-
-
-def fetch_message(sid: str) -> dict | None:
-    """Twilio's current record for one message (status, error_code, price,
-    num_segments). None when it can't be read. Never raises."""
-    s = get_settings()
-    if not (s.twilio_account_sid and s.twilio_auth_token and sid):
-        return None
-    try:
-        resp = httpx.get(f"{_API_ROOT}/Accounts/{s.twilio_account_sid}/Messages/{sid}.json",
-                         auth=(s.twilio_account_sid, s.twilio_auth_token), timeout=_TIMEOUT)
-    except Exception:  # noqa: BLE001
-        log.warning("sms: status lookup failed for sid=%s", sid)
-        return None
-    return _json(resp) if resp.status_code == 200 else None
-
-
-def _json(resp) -> dict:  # noqa: ANN001
-    try:
-        data = resp.json()
-    except Exception:  # noqa: BLE001
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _int(v) -> int | None:  # noqa: ANN001
-    try:
-        return int(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
+    return False

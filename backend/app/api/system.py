@@ -159,7 +159,7 @@ def storage(_: User = Depends(require_admin)) -> dict[str, Any]:
     return host_storage.read_storage()
 
 
-# ── logs: clear and retain (the host agent does the deleting) ─────────────
+# ── logs: clear (the host agent does the deleting) ─────────────
 
 
 class CleanupIn(BaseModel):
@@ -168,15 +168,10 @@ class CleanupIn(BaseModel):
     confirm: bool = False
 
 
-class RetentionIn(BaseModel):
-    enabled: bool
-    rotated_log_days: int
-
-
 @router.get("/logs")
 def logs(db: Session = Depends(get_db), _: User = Depends(require_admin)) -> dict[str, Any]:
     """Which logs could be cleared (with every file and size), whether cleanup
-    is live or dry-run on this host, the retention setting, the last result."""
+    is live or dry-run on this host, the last result."""
     from app.services import log_cleanup  # noqa: PLC0415
 
     return log_cleanup.status(db)
@@ -191,12 +186,3 @@ def logs_cleanup(body: CleanupIn, db: Session = Depends(get_db), admin: User = D
     except log_cleanup.CleanupRefused as exc:
         raise HTTPException(409, str(exc)) from exc
 
-
-@router.put("/logs/retention")
-def logs_retention(body: RetentionIn, db: Session = Depends(get_db), admin: User = Depends(require_admin)) -> dict:
-    from app.services import log_cleanup  # noqa: PLC0415
-
-    try:
-        return log_cleanup.set_retention(db, admin.id, body.enabled, body.rotated_log_days)
-    except log_cleanup.CleanupRefused as exc:
-        raise HTTPException(422, str(exc)) from exc

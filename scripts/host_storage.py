@@ -11,8 +11,6 @@ categories don't overlap: Docker's directories are counted once with the
 Postgres/Redis volumes and the container logs taken out of them, /var/log is
 counted without the journal, and "OS and other system files" is what's left
 of the filesystem's used bytes — so the categories always add up to "used".
-AWS snapshot storage is not on this disk; it's reported apart, from the AWS
-cost collector's file.
 
 Stdlib only. Writes atomically.
 """
@@ -33,7 +31,6 @@ HOME = os.environ.get("KOPYYA_HOME", "/home/ubuntu")
 ROOT = os.environ.get("KOPYYA_FS_ROOT", "/")
 DOCKER_DIRS = ["/var/lib/docker", "/var/lib/containerd"]
 SWAP = "/swapfile"
-HISTORY_DAYS = 120
 # containers whose stdout is the application's own log
 APP_CONTAINERS = ("backend", "worker", "frontend", "discord-listener")
 
@@ -91,59 +88,6 @@ def container_logs(base: str = "/var/lib/docker/containers") -> list[dict]:
     return out
 
 
-def docker_df() -> dict:
-    """Docker's own accounting, for detail only (its image sizes share layers)."""
-    try:
-        out = subprocess.run(["docker", "system", "df", "--format", "{{json .}}"],
-                             capture_output=True, text=True, timeout=60).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    rows = {}
-    for line in out.splitlines():
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
-        rows[r.get("Type", "?")] = {"size": r.get("Size"), "reclaimable": r.get("Reclaimable"),
-                                    "count": r.get("TotalCount")}
-    return rows
-
-
-def largest(root: str = ROOT, depth: int = 3, n: int = 12) -> list[dict]:
-    """The biggest directories at a fixed depth (so a parent and its child
-    never both appear)."""
-    try:
-        out = subprocess.run(["du", "-x", "-B1", "-d", str(depth), root],
-                             capture_output=True, text=True, timeout=900).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    base = len([p for p in root.split("/") if p])
-    rows = []
-    for line in out.splitlines():
-        size, _, path = line.partition("\t")
-        if len([p for p in path.split("/") if p]) - base == depth:
-            rows.append({"path": path, "bytes": int(size)})
-    return sorted(rows, key=lambda r: -r["bytes"])[:n]
-
-
-def aws_snapshots(metrics_dir: str = OUT_DIR) -> dict | None:
-    """EBS snapshot storage as billed this month, from the AWS cost collector."""
-    try:
-        with open(os.path.join(metrics_dir, "aws-costs.json")) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    period = (data.get("periods") or [{}])[0]
-    for c in period.get("categories") or []:
-        if c.get("category") == "EBS Snapshots":
-            return {"cost_usd": c.get("cost_usd"), "quantity": c.get("quantity"), "unit": c.get("unit"),
-                    "month": period.get("month"), "attributed": True}
-    excluded = sum(float(w.get("excluded_usd") or 0) for w in (data.get("attribution") or {}).get("warnings") or []
-                   if "EBS Snapshots" in (w.get("categories") or []))
-    return {"cost_usd": "0.00", "quantity": None, "unit": None, "month": period.get("month"),
-            "attributed": False, "excluded_usd": f"{excluded:.2f}" if excluded else None}
-
-
 def collect() -> dict:
     fs = fs_usage()
     pg_vols = glob.glob("/var/lib/docker/volumes/*pgdata*")
@@ -154,7 +98,6 @@ def collect() -> dict:
     docker_total = du(DOCKER_DIRS)
     pg = du(pg_vols)
     redis = du(redis_vols)
-    journal = du(["/var/log/journal"])
     varlog = du(["/var/log"])
     backups = du(BACKUP_DIRS) + file_bytes(
         [p for pat in ("*.dump", "*.sql", "*.sql.gz", "*.tar.gz") for p in glob.glob(os.path.join(HOME, pat))])
@@ -181,31 +124,7 @@ def collect() -> dict:
                         "pct_of_used": round(100 * b / fs["used"], 2) if fs["used"] else None,
                         "pct_of_disk": round(100 * b / fs["total"], 2) if fs["total"] else None}
                        for k, label, b in cats],
-        "detail": {
-            "journal_bytes": journal,
-            "redis_persistence": "off (no volume)" if not redis_vols else "volume present",
-            "docker": docker_df(),
-            "container_logs": sorted(({"container": x["container"], "bytes": x["bytes"]} for x in logs),
-                                     key=lambda x: -x["bytes"])[:15],
-        },
-        "largest": largest(),
-        "aws_snapshots": aws_snapshots(),
     }
-
-
-def update_history(payload: dict, path: str) -> list[dict]:
-    try:
-        with open(path) as f:
-            hist = json.load(f)
-        if not isinstance(hist, list):
-            hist = []
-    except (OSError, ValueError):
-        hist = []
-    today = payload["collected_at"][:10]
-    entry = {"date": today, "used": payload["filesystem"]["used"], "total": payload["filesystem"]["total"],
-             "categories": {c["key"]: c["bytes"] for c in payload["categories"]}}
-    hist = [h for h in hist if h.get("date") != today] + [entry]
-    return sorted(hist, key=lambda h: h["date"])[-HISTORY_DAYS:]
 
 
 def write_json(obj, path: str) -> None:
@@ -223,8 +142,6 @@ def main() -> int:
     payload = collect()
     payload["took_s"] = round(time.monotonic() - t0, 1)
     write_json(payload, os.path.join(OUT_DIR, "storage.json"))
-    hist_path = os.path.join(OUT_DIR, "storage-history.json")
-    write_json(update_history(payload, hist_path), hist_path)
     print(f"storage: used={payload['filesystem']['used']} took={payload['took_s']}s")
     return 0
 

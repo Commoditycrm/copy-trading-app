@@ -76,7 +76,6 @@ const NAV = [
   { href: "/admin/rejected",     label: "Rejected",     Icon: IconAlert },
   { href: "/admin/copy-log",     label: "Copy Log",     Icon: IconActivity },
   { href: "/admin/load-test",    label: "Load Test",    Icon: IconFlask },
-  { href: "/admin/paper-autotrade", label: "Paper Auto", Icon: IconFlask },
   { href: "/admin/performance",  label: "Performance",  Icon: IconActivity },
   { href: "/admin/daily-pnl",    label: "Daily P&L",    Icon: IconActivity },
   { href: "/admin/system",       label: "System",       Icon: IconSliders },

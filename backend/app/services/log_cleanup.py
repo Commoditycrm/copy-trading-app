@@ -1,10 +1,9 @@
-"""Admin → System → Logs: what can be cleared, asking the host to clear it,
-and log retention.
+"""Admin → System → Logs: what can be cleared, and asking the host to clear it.
 
 The deleting is done on the host by scripts/host_log_cleanup.py, which decides
 which files are eligible; the backend never touches host files. It reads the
 agent's inventory and results from the read-only /host-metrics mount and
-writes requests (and the retention setting) into /host-ops, its one writable
+writes requests into /host-ops, its one writable
 host directory. Every request and its outcome go into the audit log.
 """
 from __future__ import annotations
@@ -70,10 +69,9 @@ def status(db: Session, now: datetime | None = None) -> dict[str, Any]:
     if result and result.get("request_id"):
         _record_outcome(db, result)
     pending = _read(os.path.join(_ops_dir(), "requests", "cleanup.json"))
-    retention = _read(os.path.join(_ops_dir(), "retention.json")) or {"enabled": False, "rotated_log_days": 14}
     if inv is None:
         return {"status": "unavailable", "reason": "The log-cleanup agent isn't installed on this server.",
-                "retention": retention, "last_result": result}
+                "last_result": result}
     age = _age(inv.get("generated_at"), now)
     return {
         "status": "ok",
@@ -85,8 +83,6 @@ def status(db: Session, now: datetime | None = None) -> dict[str, Any]:
         "items": inv.get("items") or [],
         "never_cleared": inv.get("never_cleared") or [],
         "docker_rotation": inv.get("docker_rotation"),
-        "retention": retention,
-        "retention_last_run": inv.get("retention"),
         "pending_request": pending.get("request_id") if isinstance(pending, dict) else None,
         "last_result": result,
     }
@@ -145,15 +141,3 @@ def _record_outcome(db: Session, result: dict) -> None:
                  | {"files": len(result.get("items") or [])})
     db.commit()
 
-
-def set_retention(db: Session, admin_id: uuid.UUID, enabled: bool, rotated_log_days: int) -> dict:
-    if not 1 <= rotated_log_days <= 365:
-        raise CleanupRefused("Keep rotated logs between 1 and 365 days.")
-    cfg = {"enabled": bool(enabled), "rotated_log_days": int(rotated_log_days)}
-    try:
-        _write(cfg, os.path.join(_ops_dir(), "retention.json"))
-    except OSError as exc:
-        raise CleanupRefused(f"The host settings folder isn't writable ({type(exc).__name__}).") from exc
-    audit.record(db, actor_user_id=admin_id, action="system.logs_retention_changed", metadata=cfg)
-    db.commit()
-    return cfg

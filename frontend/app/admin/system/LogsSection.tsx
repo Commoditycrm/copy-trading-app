@@ -2,8 +2,8 @@
 
 /**
  * Admin System → "Logs". Which operational logs could be cleared, a confirmed
- * cleanup that the host agent carries out (scripts/host_log_cleanup.py), and
- * the retention setting. The agent decides what is eligible; database records,
+ * cleanup that the host agent carries out (scripts/host_log_cleanup.py). The
+ * agent decides what is eligible; database records,
  * security logs and the journal are never touched. While cleanup is off on the
  * host, every request is a dry run.
  */
@@ -28,7 +28,6 @@ interface Logs {
   items?: Item[];
   never_cleared?: string[];
   docker_rotation?: Record<string, string> | null;
-  retention: { enabled: boolean; rotated_log_days: number };
   pending_request?: string | null;
   last_result?: Result | null;
 }
@@ -43,13 +42,10 @@ export default function LogsSection() {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [reviewing, setReviewing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [days, setDays] = useState(14);
 
   const load = useCallback(async () => {
     try {
-      const r = await api<Logs>("/api/admin/system/logs");
-      setS(r);
-      setDays(r.retention?.rotated_log_days ?? 14);
+      setS(await api<Logs>("/api/admin/system/logs"));
     } catch (e) {
       notify.fromError(e, "Could not load logs");
     }
@@ -78,18 +74,6 @@ export default function LogsSection() {
       setTimeout(load, 3000);
     } catch (e) {
       notify.fromError(e, "Cleanup refused");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function saveRetention(enabled: boolean) {
-    setBusy(true);
-    try {
-      await api("/api/admin/system/logs/retention", { method: "PUT", body: JSON.stringify({ enabled, rotated_log_days: days }) });
-      await load();
-    } catch (e) {
-      notify.fromError(e, "Retention not saved");
     } finally {
       setBusy(false);
     }
@@ -157,22 +141,6 @@ export default function LogsSection() {
             <div className="text-[11px] mt-2" style={muted}>
               Never cleared: {(s.never_cleared ?? []).join("; ")}.
               {s.docker_rotation && ` Docker already rotates container logs at ${s.docker_rotation["max-size"]} × ${s.docker_rotation["max-file"]} files.`}
-            </div>
-          </div>
-
-          <div className={card} style={cardStyle}>
-            <div className="text-sm font-semibold mb-2" style={{ color: "var(--text-2)" }}>Automatic retention</div>
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span>Delete rotated system logs older than</span>
-              <input type="number" min={1} max={365} value={days} onChange={(e) => setDays(Number(e.target.value))}
-                     className="w-16 px-2 py-1 rounded" style={{ background: "var(--panel)", border: "1px solid var(--border)" }} />
-              <span>days</span>
-              <button disabled={busy} onClick={() => saveRetention(!s.retention.enabled)}
-                      className="px-2 py-1 rounded" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
-                {s.retention.enabled ? "Turn off" : "Turn on"}
-              </button>
-              {s.retention.enabled && <button disabled={busy} onClick={() => saveRetention(true)} className="underline">Save days</button>}
-              <span style={muted}>currently {s.retention.enabled ? `on (${s.retention.rotated_log_days} days)` : "off"}{!s.enabled ? " · dry-run host: nothing is deleted" : ""}</span>
             </div>
           </div>
 
