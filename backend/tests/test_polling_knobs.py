@@ -121,6 +121,29 @@ def test_getter_clamps_a_rogue_stored_value(fake_redis):
         get_settings().snaptrade_pnl_poll_interval_s
 
 
+def test_the_legacy_alpaca_getter_clamps_too(fake_redis):
+    """The Alpaca interval has TWO doors onto one Redis key: the generic knob
+    the poller reads, and platform_config.get_alpaca_pnl_poll_interval_sync,
+    which api.admin and brokers.capabilities still use. Both must refuse a
+    rogue stored value — a clamp only the generic door applies would let
+    capabilities report a refresh interval the poller would never honour.
+    """
+    from app.config import get_settings
+    default = get_settings().alpaca_pnl_poll_interval_s
+    for rogue in ("0", "-5", "99999", "nonsense"):
+        fake_redis.data[pc._K_ALPACA_PNL_POLL_INTERVAL] = rogue
+        got = pc.get_alpaca_pnl_poll_interval_sync()
+        assert got == default, f"{rogue!r} should fall back, got {got}"
+
+
+def test_both_alpaca_doors_agree_on_an_in_range_value(fake_redis):
+    # A value the admin page sets must read back identically through the
+    # legacy door, or the two surfaces would disagree about the live cadence.
+    pc.set_int_knob("alpaca_pnl_poll_interval_s", 5)
+    assert pc.get_int_knob("alpaca_pnl_poll_interval_s") == 5
+    assert pc.get_alpaca_pnl_poll_interval_sync() == 5
+
+
 def test_getter_survives_garbage_and_dead_redis(monkeypatch):
     from app.config import get_settings
     default = get_settings().webull_pnl_poll_interval_s
