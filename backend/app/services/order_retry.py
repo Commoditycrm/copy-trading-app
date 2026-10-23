@@ -40,6 +40,20 @@ from app.models.order import InstrumentType, OrderSide
 log = logging.getLogger(__name__)
 
 
+def is_entry_blocked_by_opposite_order(exc: Exception) -> bool:
+    """True when a BUY was refused because an OPPOSITE-side order rests on the
+    same contract — Alpaca's wash-trade guard.
+
+    Deliberately narrower than :func:`is_order_conflict_error`. That one also
+    matches Webull/SnapTrade's vocabulary and the SAME-side "already reserved"
+    family; an entry must act on neither. An entry clearing its own path is a
+    privilege, so it is granted on the one rejection that means exactly "your
+    own sell is in the way" and nothing else.
+    """
+    m = str(exc).lower()
+    return "wash trade" in m or "opposite side" in m or "opposite-side" in m
+
+
 def is_order_conflict_error(exc: Exception) -> bool:
     """True when a broker rejected an order because ANOTHER working order for the
     same contract is blocking it — resolvable by cancelling that order and
