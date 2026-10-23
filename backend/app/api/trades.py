@@ -34,7 +34,11 @@ from app.schemas.order import (
 from app.schemas.pagination import Page
 from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters
 from app.services.crypto import decrypt_json
-from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
+from app.services.order_retry import (
+    is_entry_blocked_by_opposite_order,
+    is_order_conflict_error,
+    live_closeable_quantity,
+)
 from app.services.pnl import (
     alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_order,
 )
@@ -891,6 +895,53 @@ async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.
         db.commit()
 
 
+def _cancel_protective_stop(
+    db: Session, user: User, acct: BrokerAccount, adapter, entry_order: Order,
+) -> list[uuid.UUID]:
+    """Cancel ONLY the ladder's own protective stop for this contract.
+
+    Narrower than :func:`_cancel_conflicting_orders`, which clears everything in
+    the way of a CLOSE. An entry may not do that: a resting order could be the
+    trader's own, or a take-profit holding a target. So this takes just the
+    closing STOP the ladder placed — the one thing we put there ourselves and
+    will immediately put back, sized to the larger position, on the next pass.
+    """
+    rows = db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.broker_account_id == acct.id,
+            Order.instrument_type == entry_order.instrument_type,
+            Order.symbol == entry_order.symbol,
+            Order.option_expiry.is_not_distinct_from(entry_order.option_expiry),
+            Order.option_strike.is_not_distinct_from(entry_order.option_strike),
+            Order.option_right.is_not_distinct_from(entry_order.option_right),
+            Order.side == OrderSide.SELL,
+            Order.order_type == OrderType.STOP,
+            Order.is_closing.is_(True),
+            Order.status.in_(_CANCELLABLE_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars().all()
+    cancelled: list[uuid.UUID] = []
+    now = datetime.now(timezone.utc)
+    for o in rows:
+        try:
+            adapter.cancel_order(o.broker_order_id)
+        except Exception:  # noqa: BLE001
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).warning(
+                "entry: failed to cancel protective stop %s (broker_order=%s)",
+                o.id, o.broker_order_id,
+            )
+            continue
+        o.status = OrderStatus.CANCELED
+        o.closed_at = now
+        cancelled.append(o.id)
+    if cancelled:
+        db.flush()
+    return cancelled
+
+
 def _cancel_conflicting_orders(
     db: Session, user: User, acct: BrokerAccount, adapter, close_order: Order,
 ) -> list[uuid.UUID]:
@@ -1203,6 +1254,8 @@ def _place_trader_order(
         ),
     )
 
+    from app.brokers import broker_supports_exit_pair  # noqa: PLC0415
+
     _broker_t0 = time.perf_counter()
     # Auto-resolve wash-trade rejections on CLOSE orders: if the broker rejects
     # because an opposite-side order for this contract is still working, cancel
@@ -1210,6 +1263,7 @@ def _place_trader_order(
     # re-close. `resolve_wash_trade` gates this to close paths; we never
     # auto-cancel resting orders to force an ENTRY through.
     _cancelled_conflicts = False
+    _cancelled_entry_stop = False
     _reclamped_to_live = False
     _wash_retries = 0
     _rounded_whole = False
@@ -1281,6 +1335,36 @@ def _place_trader_order(
                         _wash_retries = 3
                 if _wash_retries > 0:
                     _wash_retries -= 1
+                    time.sleep(0.5)
+                    continue
+            # An ENTRY the broker refused because our OWN protective stop rests
+            # on the other side. Alpaca forbids that pairing; Webull does not,
+            # and can rest a linked take-profit/stop anyway — so this is gated on
+            # the CAPABILITY, never on a broker's name (reading the capability is
+            # what Issue #1 was: a name-blind check that silently did nothing).
+            # Clint's channels are built on averaging in, and without this the
+            # subscriber takes the first entry and none of the adds, so their
+            # basis drifts from the trader they mirror.
+            #
+            # Deliberately once, and deliberately narrow: only the ladder's own
+            # stop is cancelled, never a resting order of the trader's, and the
+            # ladder re-places it over the larger position on its next pass.
+            if (not _cancelled_entry_stop
+                    and order.side is OrderSide.BUY and not order.is_closing
+                    and is_entry_blocked_by_opposite_order(exc)
+                    and not broker_supports_exit_pair(getattr(acct, "broker", None))):
+                _cancelled_entry_stop = True
+                _stops = _cancel_protective_stop(db, trader, acct, adapter, order)
+                if _stops:
+                    audit.record(
+                        db, actor_user_id=trader.id,
+                        action="entry.cancelled_protective_stop",
+                        entity_type="order", entity_id=order.id,
+                        metadata={"cancelled_order_ids": [str(x) for x in _stops],
+                                  "symbol": order.symbol,
+                                  "reason": str(exc)[:200]},
+                        ip_address=client_ip(request),
+                    )
                     time.sleep(0.5)
                     continue
             order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
