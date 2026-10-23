@@ -243,13 +243,26 @@ def cut_exits(ts: Any) -> bool:
     return True if value is None else bool(value)
 
 
-def exit_mode(ts: Any) -> str:
+def exit_mode(ts: Any, *, exit_pair: bool = True) -> str:
     """"manual", "orders" (take-profit orders resting at the broker), "auto"
     (auto-trim) or "alerts" (wait for the channel's exit alerts). Manual wins,
-    then take-profit orders, then auto-trim."""
+    then take-profit orders, then auto-trim.
+
+    ``exit_pair`` is whether the BROKER can actually rest a linked
+    take-profit/stop pair (``brokers.broker_supports_exit_pair``). The setting
+    alone is not enough: discord_take_profit only places those orders where the
+    adapter supports the pair, so on a broker that cannot, "orders" would mean
+    trim alerts are ignored in favour of orders that are never placed — nothing
+    trims at all (QA 2026-10-22, Alpaca: 0 take-profit orders, three positions
+    stopped out at rung 0). Where the broker cannot, this falls through to
+    auto-trim or alerts, which is what the mode has always promised to do.
+
+    It defaults True so a DISPLAY caller, which only wants to name the
+    configured mode and has no broker to hand, reads exactly as before.
+    """
     if exits_manual(ts):
         return "manual"
-    if getattr(ts, "discord_tp_orders", False):
+    if getattr(ts, "discord_tp_orders", False) and exit_pair:
         return "orders"
     return "auto" if getattr(ts, "discord_auto_trim", False) else "alerts"
 
