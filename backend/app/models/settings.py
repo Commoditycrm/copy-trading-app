@@ -109,6 +109,7 @@ class TraderSettings(Base, TimestampMixin):
     #   "normal" — half size, as on any other day
     #   "half"   — half of the usual risky size (a quarter of a full entry)
     #   "full"   — ignore the risky words: a full-size entry
+    #   "skip"   — don't take it: a risky entry is not placed that day
     discord_last_day_risky: Mapped[str] = mapped_column(
         String(8), default="normal", server_default="normal", nullable=False,
     )
