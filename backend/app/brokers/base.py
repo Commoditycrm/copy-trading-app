@@ -189,6 +189,29 @@ class BrokerAdapter(ABC):
     @abstractmethod
     def get_order(self, broker_order_id: str) -> BrokerOrderResult: ...
 
+    # True when the broker refuses a second order carrying a client_order_id it
+    # has already accepted. Re-sending after a timeout then can't double-execute;
+    # the worst case is a duplicate-id rejection, which we resolve by lookup.
+    dedupes_client_order_id: bool = False
+
+    class AmbiguousMatch(LookupError):
+        """More than one broker order fits a contract-matched lookup."""
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+    ) -> BrokerOrderResult | None:
+        """The order a timed-out ``place_order(req)`` may have created.
+
+        None means the broker positively has no such order. Raises when the
+        lookup itself failed (outcome still unknown); NotImplementedError when
+        this adapter can't look orders up at all. ``placed_after`` bounds the
+        search for adapters that match by contract rather than client id;
+        those raise AmbiguousMatch when more than one order fits."""
+        raise NotImplementedError
+
     def cancel_order(self, broker_order_id: str) -> bool:
         """Cancel a working order.
 
@@ -239,6 +262,21 @@ class BrokerAdapter(ABC):
     # market/limit close. See services.trailing_stop_close. Default False so a
     # broker that hasn't implemented it is never handed a trailing stop.
     supports_trailing_stop: bool = False
+
+    # A take-profit LIMIT and a STOP resting on the SAME contracts, linked by
+    # the broker: when one fills the other is cancelled. Webull has it for
+    # options (a STOP_PROFIT + STOP_LOSS pair on a held position); a plain OCO
+    # there is stocks-only. Without it the two orders would each reserve the
+    # contracts, and the broker would refuse the second.
+    supports_exit_pair: bool = False
+
+    def place_exit_pair(
+        self, take_profit: "BrokerOrderRequest", stop_loss: "BrokerOrderRequest",
+    ) -> "tuple[BrokerOrderResult, BrokerOrderResult]":
+        """Place a linked take-profit / stop-loss pair on a held position, in
+        one broker call. Both requests are closes of the same contract and the
+        same quantity. Only on adapters with ``supports_exit_pair = True``."""
+        raise NotImplementedError
 
     def replace_order(self, broker_order_id: str, req: BrokerOrderRequest) -> BrokerOrderResult:
         """Modify a WORKING order's price/quantity in place, atomically, returning

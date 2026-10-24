@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import re
 
+from . import add_intent, cut_intent
 from ._util import parse_expiry, to_decimal
+from .compact_alert import DEFAULT_QUANTITY, _next_trading_day
 from .base import (
     AssetType,
     OptionType,
@@ -38,6 +40,7 @@ _SELL_WORDS = r"SELL|SOLD|STO|STC|CLOSE[DS]?|CLOSING|EXIT(?:ING|ED)?|TRIM(?:MING
 _ACTION_RE = re.compile(rf"\b(?P<buy>{_BUY_WORDS})\b|\b(?P<sell>{_SELL_WORDS})\b", re.IGNORECASE)
 
 _TICKER_RE = re.compile(r"\$?\b([A-Z]{1,6})\b")
+_ADD_WORD_RE = re.compile(r"add(?:s|ed|ing)?", re.IGNORECASE)
 # "250C" / "250P" / "250 CALL" / "250 PUT" / "STRIKE 250"
 _CONTRACT_RE = re.compile(
     r"\$?(?P<strike>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
@@ -55,6 +58,21 @@ _EXPIRY_RE = re.compile(
     r"\d{1,2}\s*(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC))\b",
     re.IGNORECASE,
 )
+# Same-day expiry said in words: "Today Expiry", "today's expiry", "expiring
+# today", "0DTE", "same day". Resolved to the ET date the alert was POSTED.
+_SAME_DAY_RE = re.compile(
+    r"\b(?:0DTE|ODTE|SAME[-\s]?DAY|TODAY(?:'?S)?(?:\s+EXP(?:IRY|IRATION|IRING|IRES)?)?|"
+    r"EXP(?:IRY|IRING|IRES)?\s+TODAY)\b",
+    re.IGNORECASE,
+)
+# Next-day expiry in words: "Tomorrow Expiry" and its common misspellings
+# ("Tommorow", "Tomorow", "Tommorrow"), "tmrw", "1DTE". Resolved to the next
+# trading day after the alert's ET posting date (weekends skipped).
+_NEXT_DAY_RE = re.compile(
+    r"\b(?:1DTE|TMRW|TOM+OR+OW(?:'?S)?(?:\s+EXP(?:IRY|IRATION|IRING|IRES)?)?|"
+    r"EXP(?:IRY|IRING|IRES)?\s+TOM+OR+OW)\b",
+    re.IGNORECASE,
+)
 _PRICE_RE = re.compile(r"@\s*\$?(?P<price>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)")
 _QTY_RE = re.compile(r"\b(?:X\s*)?(?P<qty>\d{1,5})\s*(?:CONTRACTS?|SHARES?|LOTS?)\b", re.IGNORECASE)
 _ACTION_QTY_RE = re.compile(rf"\b(?:{_BUY_WORDS}|{_SELL_WORDS})\s+(?P<qty>\d{{1,5}})\b", re.IGNORECASE)
@@ -68,10 +86,21 @@ _NOT_TICKERS = {
     "LONG", "SHORT", "CLOSE", "CLOSED", "CLOSING", "EXIT", "TRIM", "ADD", "ENTER", "LOTS",
     "CONTRACTS", "SHARES", "OPEN", "TP", "SL", "RISKY", "LOTTO", "SWING", "DAY",
     "TRIMMING", "TRIMMED", "CLOSING", "ENTERING", "ENTERED", "ADDING", "ADDED",
+    "TODAY", "FILLED", "ODTE", "TOMORROW", "TOMMOROW", "TOMOROW", "TOMMORROW", "TMRW",
     "HERE", "MORE", "AGAIN", "BACK", "SOON", "JUST", "ANOTHER",
     "SOON", "NOW", "HERE", "OUT", "IN", "ALL", "SOME", "MORE", "AT", "TO", "THE",
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT", "OCT", "NOV", "DEC",
 }
+
+
+def _et_date(ts):
+    """The US/Eastern calendar date of ``ts`` — an option's "today" is the
+    market's, and an evening ET post is already tomorrow in UTC."""
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    if ts.tzinfo is None:
+        return ts.date()
+    return ts.astimezone(ZoneInfo("America/New_York")).date()
 
 
 class GenericTextParser(Parser):
@@ -79,6 +108,11 @@ class GenericTextParser(Parser):
 
     def matches(self, message: ParsedMessage) -> bool:
         text = message.text
+        if cut_intent.classify(text).sells or add_intent.classify(text).adds:
+            # A committed cut is an exit, read by terse_alert. Here "...the 7800
+            # long... Going to cut remaining position here @ 2.6" was read as a
+            # BUY of "RAFAEL" @ 2.6 off the @mention (QA 2026-10-07).
+            return False
         return bool(_ACTION_RE.search(text) and _TICKER_RE.search(text.upper()))
 
     def parse(self, message: ParsedMessage) -> ParseResult:
@@ -89,6 +123,14 @@ class GenericTextParser(Parser):
         if not action_m:
             return ParseResult.ignored("no buy/sell instruction in this message")
         action = SignalAction.BUY if action_m.group("buy") else SignalAction.SELL
+        # "Add" is never a fresh entry here: an add has its own rules (compact_alert,
+        # terse_alert's add_intent) and averages into a position. Read as a buy it
+        # took the first word as a ticker — "This is my last add here" became a
+        # BUY of "THIS", "…most likely going to start adding…" a BUY of "I".
+        if action is SignalAction.BUY and all(
+                _ADD_WORD_RE.fullmatch(m.group("buy") or "") for m in _ACTION_RE.finditer(text)
+                if m.group("buy")):
+            return ParseResult.ignored("an add, not an entry — read by the add rules")
 
         symbol = self._symbol(upper)
         if not symbol:
@@ -155,11 +197,20 @@ class GenericTextParser(Parser):
             return ParseResult.invalid("the alert names a strike but not call or put")
 
         exp_m = _EXPIRY_RE.search(text)
-        if not exp_m:
+        if exp_m:
+            expiry, exp_err = parse_expiry(exp_m.group("exp"), posted_at=message.posted_at)
+            if exp_err:
+                return ParseResult.invalid(exp_err)
+        elif _SAME_DAY_RE.search(text):
+            if message.posted_at is None:
+                return ParseResult.invalid("the alert says today's expiry but has no timestamp")
+            expiry = _et_date(message.posted_at)
+        elif _NEXT_DAY_RE.search(text):
+            if message.posted_at is None:
+                return ParseResult.invalid("the alert says tomorrow's expiry but has no timestamp")
+            expiry = _next_trading_day(_et_date(message.posted_at))
+        else:
             return ParseResult.invalid("the alert has no expiry")
-        expiry, exp_err = parse_expiry(exp_m.group("exp"), posted_at=message.posted_at)
-        if exp_err:
-            return ParseResult.invalid(exp_err)
 
         return ParseResult.parsed(
             TradeSignal(
@@ -169,7 +220,17 @@ class GenericTextParser(Parser):
                 option_type=right,
                 strike=strike,
                 expiration=expiry,
-                quantity=qty,
+                # An option ENTRY that states no size is one contract, as in
+                # every other parser (compact_alert.DEFAULT_QUANTITY); your
+                # "Contracts per alert" then scales it. Without this,
+                # "BTO SPY 770 Calls Today Expiry @1.38" was refused at
+                # execution as "The alert states no quantity." An exit stays
+                # unsized: it is sized from the position held.
+                quantity=(
+                    qty if qty is not None
+                    else DEFAULT_QUANTITY if action is SignalAction.BUY
+                    else None
+                ),
                 # Exits go to market — see compact_alert. A limit sell can sit
                 # unfilled while the position moves against you.
                 order_type=(

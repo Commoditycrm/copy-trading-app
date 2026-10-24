@@ -29,6 +29,30 @@ x-hardening: &hardening
   cap_drop:
     - ALL
 
+# Shared definition for the hosted IBKR gateway containers (ibkr-gw-N below).
+x-ibkr-gw: &ibkr-gw
+  build: ./ibkr-gateway
+  # One image for every slot: built once (deploy builds ibkr-gw-1), reused by
+  # ibkr-gw-2… instead of five identical builds.
+  image: copy-trading-app/ibkr-gateway:latest
+  restart: unless-stopped
+  profiles:
+    - ibkr
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  sysctls:
+    - net.ipv6.conf.all.disable_ipv6=1
+    - net.ipv6.conf.default.disable_ipv6=1
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 768m
+
 services:
   backend:
     <<: *hardening
@@ -59,6 +83,13 @@ services:
     # once and reused everywhere — the trader confirms 2FA only on first connect.
     volumes:
       - webull_token:/data/webull_token
+      # Host telemetry for Admin → System, written by scripts/host_metrics.py
+      # on the host. Read-only; no collector = "unavailable" on the page.
+      - /var/lib/kopyya-metrics:/host-metrics:ro
+      # Log-cleanup requests and the retention setting for the host agent
+      # (scripts/host_log_cleanup.py). The only writable host path; the agent
+      # decides what may be deleted, never this container.
+      - /var/lib/kopyya-ops:/host-ops
     # Force IPv4 to outbound services (broker APIs); Lightsail has no IPv6 egress.
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
@@ -218,6 +249,36 @@ services:
       - backend
     ports:
       - "127.0.0.1:3000:3000"
+
+  # ── Kopyya-hosted IBKR Client Portal Gateways ──────────────────────────
+  # One container per IBKR login (see ibkr-gateway/Dockerfile and
+  # services/ibkr_hosted_gateway.py). Opt-in profile, like discord-listener:
+  #     COMPOSE_PROFILES=ibkr docker compose up -d        (or --profile ibkr)
+  # and set IBKR_GATEWAY_POOL_SIZE=<count> in backend/.env to match the number
+  # of ibkr-gw-N services below. The backend reaches slot N as
+  # https://ibkr-gw-N:5000; the owner signs in through the backend-proxied
+  # login page. Add capacity by appending ibkr-gw-6, -7 … and raising the pool
+  # size. Not read_only: the Java gateway writes logs/scratch under /gateway.
+  # Memory: a signed-in gateway idles around 300-400 MB; 768m leaves headroom.
+  ibkr-gw-1:
+    <<: *ibkr-gw
+
+  ibkr-gw-2:
+    <<: *ibkr-gw
+
+  # Spare capacity: QA runs two (IBKR_GATEWAY_POOL_SIZE=2); enable these with
+  # COMPOSE_PROFILES=...,ibkr-extra and raise the pool size to 5.
+  ibkr-gw-3:
+    <<: *ibkr-gw
+    profiles: [ibkr-extra]
+
+  ibkr-gw-4:
+    <<: *ibkr-gw
+    profiles: [ibkr-extra]
+
+  ibkr-gw-5:
+    <<: *ibkr-gw
+    profiles: [ibkr-extra]
 
 # Persistent named volume for the Webull OpenAPI token, shared by backend +
 # worker. Survives container recreation/deploys, so the verified token (and thus

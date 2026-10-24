@@ -32,7 +32,8 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
+from decimal import (ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal,
+                     InvalidOperation)
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -50,15 +51,20 @@ from app.services import market_hours
 from app.services.platform_config import get_fanout_batch_threshold_async
 from app.services.crypto import decrypt_json
 from app.services.order_retry import (
+    OUTCOME_UNKNOWN_REASON,
     classify_error,
     clean_broker_error,
+    is_duplicate_client_id_error,
     is_no_position_close_error,
     is_order_conflict_error,
+    is_outcome_unknown_error,
     is_rate_limit_error,
     is_replace_chain_pending_error,
     live_closeable_quantity,
+    lookup_placed_order,
 )
 from app.services.pnl import today_realized_pnl, today_realized_pnl_bulk
+from app.services.shared_accounts import self_mirror_account_ids
 
 log = logging.getLogger(__name__)
 
@@ -239,6 +245,24 @@ def exceeds_order_cap(total: "Decimal | None", cap: "Decimal | None") -> bool:
     if cap is None or total is None:
         return False
     return total > Decimal(str(cap))
+
+
+def fit_to_order_cap(
+    quantity: "Decimal | int", unit_price: "Decimal | None", is_option: bool,
+    cap: "Decimal | None",
+) -> Decimal:
+    """The largest whole quantity, up to ``quantity``, that fits under ``cap``.
+
+    An over-cap mirror is cut down rather than skipped, so the subscriber still
+    takes the trade at the size they can afford. Returns ``quantity`` untouched
+    when there is no cap or no price to measure against, and 0 when not even one
+    contract (share) fits — the caller skips that one.
+    """
+    qty = Decimal(str(quantity))
+    if not exceeds_order_cap(mirror_order_value(unit_price, qty, is_option), cap):
+        return qty
+    unit = Decimal(str(unit_price)) * (Decimal(100) if is_option else Decimal(1))
+    return min(qty, (Decimal(str(cap)) / unit).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -632,14 +656,14 @@ def _marketable_option_limit(
 
 
 def _live_option_premium(db: Any, trader: Any, trader_order: Order) -> "Decimal | None":
-    """Best-effort LIVE per-contract option premium for the max-per-contract gate,
-    used only when the trader's OWN price isn't recorded yet — a MARKET option
-    order fanned out in the ~ms window before its fill commits, so
-    ``filled_avg_price`` is None and there's no ``limit_price``. Without a price
-    the cap fails OPEN and lets over-cap options through (QA 2026-08: a $145/contract
-    AAPL market option slipped a $100 cap). Priced off the TRADER's Alpaca account
-    (the adapter that exposes option quotes). Returns None for a non-Alpaca trader
-    or when no quote is available — the gate then keeps its prior fail-open."""
+    """Best-effort LIVE per-contract option premium for the max-per-contract and
+    max-per-order gates, checked once per fanout for a MARKET option (see
+    _entry_gate_price). Before it, a market option fanned out in the ~ms window
+    before its fill committed had no price and the cap failed OPEN (QA 2026-08: a
+    $145/contract AAPL market option slipped a $100 cap). Priced off the TRADER's
+    Alpaca account (the adapter that exposes option quotes). Returns None for a
+    non-Alpaca trader or when no quote is available — the caller then falls back
+    to the live mark."""
     if not (trader_order.option_expiry and trader_order.option_strike and trader_order.option_right):
         return None
     acct = db.execute(
@@ -669,6 +693,35 @@ def _live_option_premium(db: Any, trader: Any, trader_order: Order) -> "Decimal 
     # Per-contract COST: a BUY pays the ask, a SELL receives the bid; fall back to
     # whichever side is quoted so a one-sided book still yields a price.
     return (ask or bid) if trader_order.side == OrderSide.BUY else (bid or ask)
+
+
+def _entry_gate_price(db: Any, trader: Any, trader_order: Order) -> "Decimal | None":
+    """The unit price the max-per-contract / max-per-order gates measure a mirror at.
+
+    A LIMIT pays at most its limit. A MARKET order pays the market, so it is
+    checked live, once per fanout: an option's ask from the trader's Alpaca
+    account, else the live mark from the market-data stream (also how a stock is
+    priced); the trader's own fill only when no live price is available.
+    """
+    if trader_order.order_type != OrderType.MARKET and trader_order.limit_price:
+        return Decimal(str(trader_order.limit_price))
+    px = None
+    if trader_order.instrument_type == InstrumentType.OPTION:
+        px = _live_option_premium(db, trader, trader_order)
+    if not px or px <= 0:
+        try:
+            from app.services import live_marks  # noqa: PLC0415
+
+            px = live_marks.contract_mark(
+                trader_order.symbol, trader_order.option_strike,
+                trader_order.option_right, trader_order.option_expiry,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("order caps: live price failed for %s", trader_order.symbol)
+            px = None
+    if px and px > 0:
+        return Decimal(str(px))
+    return trader_order.filled_avg_price or trader_order.limit_price
 
 
 def _option_market_no_quote(msg: str) -> bool:
@@ -792,6 +845,23 @@ def _retry_stock_market_as_limit(item: "_PendingMirror", req: BrokerOrderRequest
     item.request = retry
     log.info("mirror %s market refused (halt/illiquid) — retrying as LIMIT %s", req.symbol, limit)
     return item.adapter.place_order(retry)
+
+
+def _adopt_if_landed(
+    item: "_PendingMirror", exc: BaseException, sent_at: datetime,
+) -> BrokerOrderResult | None:
+    """After a timeout / duplicate-id refusal, the order this mirror's send
+    created, when a client-id lookup finds one. Contract-matched brokers are
+    left to retry_scheduler, which looks only after their order list settles."""
+    if not getattr(item.adapter, "dedupes_client_order_id", False):
+        return None
+    if not (is_outcome_unknown_error(exc) or is_duplicate_client_id_error(exc)):
+        return None
+    _, found = lookup_placed_order(item.adapter, item.request, placed_after=sent_at)
+    if found is not None:
+        log.warning("copy: mirror %s landed despite %s, adopting %s",
+                    item.child_order_id, type(exc).__name__, found.broker_order_id)
+    return found
 
 
 def _place_mirror_with_conflict_resolve(item: "_PendingMirror") -> BrokerOrderResult:
@@ -1128,6 +1198,202 @@ def _closeable_quantity(
 
     closeable = net_in_direction - reserved
     return closeable if closeable > 0 else Decimal(0)
+
+
+def _apply_symbol_caps(db: Session, user_ids, symbol, is_option_order: bool,
+                       per_contract: dict, per_order: dict) -> None:
+    """Overlay per-symbol caps onto the authoritative cap maps, in place.
+
+    Only for subscribers on ADVANCED settings — a parked rule must not bind
+    while they are on Risk Controls, or switching modes would silently change
+    their limits.
+
+    Two layers, as everywhere else: the ALL-Symbols common cap, then the
+    symbol's own on top. A rule that does not mention a cap leaves the one
+    below it standing, which is what makes a partial rule work.
+
+    Never raises: on any failure the subscriber's own caps stand, the behaviour
+    before symbol rules existed. A cap must fail CLOSED (keep protecting),
+    never open.
+    """
+    if not user_ids or not symbol:
+        return
+    try:
+        from app.models.settings import SubscriberSettings  # noqa: PLC0415
+        from app.models.subscriber_symbol_settings import SubscriberSymbolSettings  # noqa: PLC0415
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        ids = list(user_ids)
+        root = symbols.normalize(symbol)
+        # Who is actually on Advanced. One indexed read rather than one per
+        # subscriber — this runs inside the fanout for every order.
+        advanced = {
+            uid for uid, on in db.execute(
+                select(SubscriberSettings.user_id,
+                       SubscriberSettings.advanced_settings_enabled)
+                .where(SubscriberSettings.user_id.in_(ids))
+            ).all() if on
+        }
+        if not advanced:
+            return
+        rows = db.execute(
+            select(SubscriberSymbolSettings.user_id,
+                   SubscriberSymbolSettings.symbol,
+                   SubscriberSymbolSettings.settings)
+            .where(
+                SubscriberSymbolSettings.user_id.in_(list(advanced)),
+                SubscriberSymbolSettings.symbol.in_([root, symbols.ALL_SYMBOLS]),
+                SubscriberSymbolSettings.enabled.is_(True),
+            )
+        ).all()
+    except Exception:  # noqa: BLE001
+        log.warning("copy: per-symbol cap lookup failed for %s — using the "
+                    "subscribers' own caps", symbol, exc_info=True)
+        return
+
+    merged: dict = {}
+    for uid, sym, values in rows:
+        layer = merged.setdefault(uid, {})
+        if sym == symbols.ALL_SYMBOLS:
+            # The common layer goes UNDER anything the symbol itself set.
+            layer.update({k: v for k, v in (values or {}).items() if k not in layer})
+        else:
+            layer.update(values or {})
+
+    for uid, values in merged.items():
+        if "discord_max_per_contract" in values and is_option_order:
+            cap = _dec_or_none(values["discord_max_per_contract"])
+            if cap is None:
+                per_contract.pop(uid, None)      # this scope lifts the cap
+            else:
+                per_contract[uid] = cap
+        if "discord_max_per_order" in values:
+            cap = _dec_or_none(values["discord_max_per_order"])
+            if cap is None:
+                per_order.pop(uid, None)
+            else:
+                per_order[uid] = cap
+
+
+def _dec_or_none(raw) -> Decimal | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _open_symbol_ladder(db: Session, user_id, child) -> None:
+    """Start an exit ladder for a mirrored ENTRY, when its symbol has one.
+
+    Only for a symbol set to "Pre-defined ladder targets": on "On Alerts" the
+    subscriber's exits follow the trader and a ladder would be a second thing
+    selling the same position.
+
+    Entries only — a close has nothing to protect. The entry price is
+    provisional, exactly as it is on the Discord path: the real fill replaces it
+    through sync_entry_price on the next poller tick, which matters because a
+    mirror can fill away from the price it was sent at.
+
+    Never raises. A ladder that fails to open leaves the position exactly as a
+    mirrored position behaved before symbol rules existed — the trader's exits
+    still reach it — so this cannot cost the subscriber an exit.
+    """
+    try:
+        if child is None or getattr(child, "is_closing", False):
+            return
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        ts = symbols.resolve(db, user_id, child.symbol)
+        if symbols.exit_mode(ts) != "ladder":
+            return
+        guards.on_buy(
+            db, user_id, child.symbol,
+            child.option_strike, child.option_right, child.option_expiry,
+            entry_price=child.filled_avg_price or child.limit_price,
+            entry_order_id=child.id,
+        )
+        log.info("copy: opened a symbol ladder for %s on %s", child.symbol, user_id)
+    except Exception:  # noqa: BLE001
+        log.warning("copy: could not open the symbol ladder for %s",
+                    getattr(child, "symbol", "?"), exc_info=True)
+
+
+def _skip_trader_trim(db: Session, user_id, trader_order) -> bool:
+    """Should this subscriber ignore the trader's order?
+
+    True only for a TRIM on a symbol the subscriber has put on its own ladder.
+    Three things have to hold, and each one matters:
+
+      * it is a close — an entry is never suppressed;
+      * it is a PARTIAL close — a trader's full close must always reach the
+        subscriber, or a ladder could leave them holding what the trader has
+        exited;
+      * the symbol is on "Pre-defined ladder targets" — its own rungs decide
+        when to take profit, so mirroring the trim as well would sell the same
+        position twice over.
+    """
+    if not getattr(trader_order, "is_closing", False):
+        return False
+    if not bool(getattr(trader_order, "is_partial_close", False)):
+        return False
+    return not _trims_follow_trader(db, user_id, getattr(trader_order, "symbol", None))
+
+
+def _trims_follow_trader(db: Session, user_id, symbol) -> bool:
+    """Does this subscriber still take the trader's trims for ``symbol``?
+
+    True unless the symbol is on its own ladder. Never raises: on any failure
+    the trim is mirrored, which is the behaviour before symbol rules existed —
+    an exit that does not happen is worse than one that happens twice, because
+    the second is clamped to what is held and the first is not clamped at all.
+    """
+    try:
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        return symbols.trims_follow_trader(db, user_id, symbol)
+    except Exception:  # noqa: BLE001
+        log.warning("copy: per-symbol trim policy lookup failed for %s — "
+                    "mirroring the trim", symbol, exc_info=True)
+        return True
+
+
+def _fixed_entry_size(db: Session, sub, trader_order, is_closing: bool) -> Decimal | None:
+    """The contracts this ENTRY buys under Advanced settings, or None.
+
+    None means "size it the old way" — Advanced off, nothing configured for the
+    symbol, a close, or a dollar-sized entry, which needs a live price and is
+    resolved at placement rather than here.
+
+    Never raises: a lookup that fails falls back to scaling the trader's
+    quantity, which is what every mirror did before Advanced existed.
+    """
+    if sub is None or is_closing or getattr(trader_order, "is_closing", False):
+        return None
+    try:
+        from app.services import subscriber_symbol_settings as symbols  # noqa: PLC0415
+
+        # The cached subscriber already knows whether Advanced is on, so a
+        # subscriber on Risk Controls — nearly all of them — never reaches the
+        # database for this. Checked here rather than inside sizing_for so the
+        # common case costs no query at all.
+        if not symbols.advanced_enabled(sub):
+            return None
+        sizing = symbols.sizing_for(db, sub.user_id, getattr(trader_order, "symbol", None))
+        if not sizing or sizing.get("mode") != "contracts":
+            return None
+        contracts = sizing.get("contracts")
+        if contracts is None:
+            return None
+        qty = Decimal(str(contracts))
+        return qty if qty > 0 else None
+    except Exception:  # noqa: BLE001
+        log.warning("copy: advanced entry sizing failed for %s — scaling the "
+                    "trader's quantity instead",
+                    getattr(trader_order, "symbol", "?"), exc_info=True)
+        return None
 
 
 def _locked_instrument_multiplier(
@@ -1788,9 +2054,11 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
     limit (the ``trader_filled`` gate in _place_mirror_with_conflict_resolve), so
     a trader CANCEL just cancels the mirror instead of stranding a phantom fill.
     The flip side is this: when the trader's working order instead FILLS, we force
-    any mirror whose limit hasn't filled to market — cancel the resting order,
-    then place an immediate fill for the UNFILLED remainder (cancel-old +
-    place-new, the same shape as a modify).
+    any CLOSE mirror whose limit hasn't filled to market — cancel the resting
+    order, then place an immediate fill for the UNFILLED remainder (cancel-old +
+    place-new, the same shape as a modify). ENTRY mirrors are left resting at
+    their limit (see the note in the loop); the trader's fill only syncs their
+    status.
 
     NO-OP in the common cases — an order detected AT fill was already forced to
     market in fanout, and a mirror whose limit already filled is left alone. Only
@@ -1871,6 +2139,27 @@ def force_fill_mirrors_to_market(trader_order_id: uuid.UUID) -> None:
                 if remaining <= 0:
                     synced_any = True
                     continue
+            # ENTRIES are left resting (product decision, 2026-10-13). A
+            # subscriber whose entry limit hasn't reached keeps that limit
+            # working at its price; it is NOT swept into a cancel + marketable
+            # re-place. On brokers with no in-place modify (IBKR, SnapTrade) the
+            # sweep showed as a cancelled order plus a new one for every
+            # immediately-filled trader limit, and the re-place could fill
+            # worse than the limit the trader set. CLOSES are still forced below:
+            # a subscriber must never be left holding what the trader exited.
+            if not ch.is_closing:
+                audit.record(
+                    db, actor_user_id=ch.user_id,
+                    action="order.mirror_left_resting",
+                    entity_type="order", entity_id=ch.id,
+                    metadata={
+                        "parent_order_id": str(trader_order_id),
+                        "broker_order_id": ch.broker_order_id,
+                        "limit_price": str(ch.limit_price) if ch.limit_price is not None else None,
+                    },
+                )
+                synced_any = True
+                continue
             new_id = uuid.uuid4()
             # Immediate fill for the unfilled remainder — MARKET for a stock,
             # marketable-LIMIT for an option (via _to_immediate_close, which
@@ -2228,6 +2517,15 @@ def trader_can_trade(db: Session, trader: User) -> bool:
     return bool(settings and settings.trading_enabled)
 
 
+# A subscriber row that points at one of the TRADER's own broker accounts (same
+# broker + account number) must never get a mirror: it lands in the account the
+# trader's listener watches, comes back as a "new" trader order and fans out
+# again. QA 2026-10-21: one trade became 52 trader orders + 361 mirrors in 8 min.
+# Checked on every fanout, so pairings that predate the connect-time guard are
+# caught too. See services/shared_accounts.
+_warned_self_mirror: set[uuid.UUID] = set()
+
+
 # ── Async fanout (the live path used by BackgroundTasks) ──────────────────
 
 
@@ -2527,15 +2825,35 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             if _ocap is not None:
                 _fresh_order_caps[_uid] = _ocap
 
+        # A per-symbol rule overrides the caps for THIS order's symbol only.
+        # Applied on top of the authoritative read above, for the same reason
+        # that read exists: a risk cap has to bind on the very next trade, so it
+        # is never served from the fanout cache.
+        _apply_symbol_caps(db, _cap_ids, trader_order.symbol, _is_option_order,
+                           _fresh_caps, _fresh_order_caps)
+
     # Price the max-per-contract gate evaluates against. Prefer the trader's own
     # premium; for a MARKET option fanned out BEFORE its fill commits that isn't
     # recorded yet (filled_avg_price None, no limit_price) — which used to fail
     # the cap OPEN and let over-cap options through (QA 2026-08) — fall back to a
     # live option quote. Computed ONCE here (the contract's premium is the same
     # for every subscriber), and only when some subscriber actually has a cap.
-    _gate_px: "Decimal | None" = trader_order.filled_avg_price or trader_order.limit_price
-    if _gate_px is None and (_fresh_caps or _fresh_order_caps):
-        _gate_px = _live_option_premium(db, trader, trader_order)
+    #
+    # A MARKET mirror is priced at the MARKET: one live check here, before any
+    # subscriber buys, because that is what their order will pay — the trader's
+    # fill can be stale by the time the mirror goes in. A LIMIT is priced at its
+    # limit (the most it can pay).
+    _gate_px: "Decimal | None" = None
+    if _fresh_caps or _fresh_order_caps:
+        _gate_px = _entry_gate_price(db, trader, trader_order)
+
+    self_mirror_ids = self_mirror_account_ids(db, trader.id, _cap_ids)
+    # QA paper auto-trading: a listed paper account's orders are copied only
+    # into simulated accounts and Alpaca paper accounts (checked again at
+    # placement), never into a live one.
+    from app.services import paper_autotrade  # noqa: PLC0415
+
+    paper_parent = paper_autotrade.governs(trader_order.broker_account_id)
 
     for sub in [*subs, *paused_close_subs]:
         # Paused subscribers are admitted CLOSE-ONLY: skip every entry-side
@@ -2719,6 +3037,45 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             continue
 
         for acct in sub_accounts:
+            if acct.id in self_mirror_ids:
+                if acct.id not in _warned_self_mirror:
+                    _warned_self_mirror.add(acct.id)
+                    log.warning(
+                        "fanout: subscriber %s broker account %s is trader %s's own "
+                        "account — not mirroring into it (would loop via the listener)",
+                        sub.user_id, acct.id, trader.id,
+                    )
+                results.append(FanoutResult(
+                    subscriber_user_id=sub.user_id,
+                    broker_account_id=acct.id,
+                    order_id=None,
+                    status="skipped_self_mirror",
+                ))
+                continue
+
+            if paper_parent:
+                try:
+                    _target_creds = cache.decrypt_creds_cached(acct.id, acct.encrypted_credentials)
+                except Exception:  # noqa: BLE001
+                    _target_creds = None
+                _why = paper_autotrade.copy_target_problem(acct.broker, _target_creds)
+                if _why:
+                    log.warning("fanout: QA paper auto-trade — not copying into account %s (%s)",
+                                acct.id, _why)
+                    audit.record(
+                        db, actor_user_id=sub.user_id, action="paper_autotrade.copy_target_skipped",
+                        entity_type="broker_account", entity_id=acct.id,
+                        metadata={"parent_order_id": str(trader_order.id), "reason": _why},
+                    )
+                    results.append(FanoutResult(
+                        subscriber_user_id=sub.user_id,
+                        broker_account_id=acct.id,
+                        order_id=None,
+                        status="skipped_not_paper",
+                        detail=_why,
+                    ))
+                    continue
+
             # ── Externally-placed bracket handling (SnapTrade/Webull) ──
             # A trader bracket arrives as 3 linked orders: a TRIGGER entry (which
             # our listener stamps with take_profit_price/stop_loss_price) and its
@@ -2780,11 +3137,39 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # This keeps adds proportional and exits un-strandable when the
             # subscriber changes their multiplier mid-position, and falls back to
             # the live setting for legacy positions with no stored multiplier.
+            #
+            # A symbol rule does NOT change this multiplier: `multiplier` is not
+            # in SYMBOL_FIELDS, deliberately — the copy model scales the
+            # trader's quantity, and a per-symbol override would contradict the
+            # instrument lock. Advanced sizing replaces the scaled quantity
+            # outright instead, a few lines below in _fixed_entry_size.
             locked_mult = _locked_instrument_multiplier(db, sub.user_id, trader_order)
             scale_mult = locked_mult if locked_mult is not None else sub.multiplier
             scaled = _scale_quantity(
                 trader_order.quantity, scale_mult, acct.supports_fractional
             )
+            # Advanced settings size an ENTRY outright — a fixed number of
+            # contracts for this symbol — instead of scaling what the trader
+            # traded. Entries only: a close is sized from the position held,
+            # never from the other side's quantity, so overriding it here would
+            # strand or oversell part of a holding.
+            fixed = _fixed_entry_size(db, sub, trader_order, is_closing_effective)
+            if fixed is not None:
+                scaled = fixed
+
+            # A symbol on its own exit ladder does not take the trader's
+            # TRIMS: its rungs decide when to take profit, and mirroring the
+            # trim as well would sell the same position twice over. A trader's
+            # full close still flows — that is the line the ladder must not
+            # cross, or the subscriber is left holding what the trader exited.
+            if _skip_trader_trim(db, sub.user_id, trader_order):
+                results.append(FanoutResult(
+                    subscriber_user_id=sub.user_id,
+                    broker_account_id=acct.id,
+                    order_id=None,
+                    status="skipped_symbol_ladder_trim",
+                ))
+                continue
 
             # Close-only (paused) subscriber: admit ONLY genuine closes. An
             # entry (is_closing_effective False) is dropped here so a paused
@@ -2835,23 +3220,25 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     continue
 
             # ── Max per-ORDER value gate (opens only, stocks included) ───────
-            # Skip an OPENING mirror whose WHOLE value is above the subscriber's
-            # max_per_order. Distinct from the per-contract gate above and
-            # checked in its own right: that one asks what a contract costs,
-            # this one what the order costs, and a mirror can pass either and
-            # fail the other — a cheap contract scaled up by the multiplier is
-            # exactly the case a per-contract cap cannot see.
+            # FIT an OPENING mirror under the subscriber's max_per_order: an
+            # order whose WHOLE value is above it is cut to the most contracts
+            # (shares) that fit, priced at _gate_px (the market for a market
+            # order). Skipped only when not even one fits. Distinct from the
+            # per-contract gate above and checked in its own right: that one
+            # asks what a contract costs, this one what the order costs, and a
+            # mirror can pass either and fail the other — a cheap contract
+            # scaled up by the multiplier is exactly the case a per-contract cap
+            # cannot see.
             #
             # Sized off `scaled`, the quantity actually being mirrored, so the
             # multiplier counts toward it. A CLOSE always passes: they must be
             # able to exit whatever it is now worth.
             _mpo = _fresh_order_caps.get(sub.user_id)
             if not is_closing_effective:
-                _total = mirror_order_value(
-                    _gate_px, scaled,
-                    trader_order.instrument_type == InstrumentType.OPTION,
-                )
-                if exceeds_order_cap(_total, _mpo):
+                _is_opt = trader_order.instrument_type == InstrumentType.OPTION
+                _total = mirror_order_value(_gate_px, scaled, _is_opt)
+                _fit = fit_to_order_cap(scaled, _gate_px, _is_opt, _mpo)
+                if _fit < 1:
                     audit.record(
                         db, actor_user_id=sub.user_id,
                         action="copy.skipped_max_per_order",
@@ -2860,6 +3247,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                             "symbol": trade_symbol,
                             "order_value": str(_total),
                             "quantity": str(scaled),
+                            "unit_price": str(_gate_px),
                             "max_per_order": str(_mpo),
                         },
                     )
@@ -2870,6 +3258,30 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                         status="skipped_max_per_order",
                     ))
                     continue
+                if _fit < scaled:
+                    audit.record(
+                        db, actor_user_id=sub.user_id,
+                        action="copy.fitted_max_per_order",
+                        entity_type="order", entity_id=trader_order.id,
+                        metadata={
+                            "symbol": trade_symbol,
+                            "requested_qty": str(scaled),
+                            "quantity": str(_fit),
+                            "unit_price": str(_gate_px),
+                            "order_value": str(mirror_order_value(_gate_px, _fit, _is_opt)),
+                            "max_per_order": str(_mpo),
+                        },
+                    )
+                    # A fresh entry cut down locks the position at the size it
+                    # actually got (fit ÷ the trader's quantity), so the trader's
+                    # later trims scale against it and a half-trim sells half,
+                    # not everything. Rounded UP so the lock is never zero. An
+                    # add keeps the position's existing lock.
+                    if locked_mult is None and trader_order.quantity:
+                        scale_mult = (_fit / Decimal(str(trader_order.quantity))).quantize(
+                            Decimal("0.0001"), rounding=ROUND_UP,
+                        )
+                    scaled = _fit
 
             # Defense-in-depth: never mirror a CLOSE larger than the subscriber
             # actually holds. Clamp to the raw held position (not minus reserved):
@@ -3033,6 +3445,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 # cache DTO has the same .broker attribute it needs.
                 sub_creds = cache.decrypt_creds_cached(acct.id, acct.encrypted_credentials)
                 sub_adapter = adapter_for(acct, sub_creds)
+                if paper_parent:
+                    # the copy's own account is proven paper before it's sent
+                    paper_autotrade.attach(sub_adapter, acct.id, sub_creds)
             except Exception as exc:  # noqa: BLE001
                 child.status = OrderStatus.REJECTED
                 child.reject_reason = f"Broker credentials error: {exc}"[:480]
@@ -3092,6 +3507,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # INSERTs go to Postgres as a single transactional batch.
     if pending:
         db.flush()
+        # The mirror rows aren't committed until Phase 3, but a broker can echo
+        # the order onto a listener's stream within ms. Mark them so a listener
+        # never mistakes one for a fresh trader order (see is_mirror_echo).
+        order_intent.mark_app_originated_many(p.child_order_id for p in pending)
 
     # ── Phase 2: fire all broker calls in parallel via asyncio ────────────
     # _place_one returns the actual exception object (not just its string)
@@ -3105,6 +3524,7 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # success and error, so the Performance page can surface the raw
             # broker round-trip ("Broker Response" / broker_call_ms).
             start = time.perf_counter()
+            sent_at = datetime.now(timezone.utc)
             last_exc: BaseException | None = None
             for attempt in range(_RATE_LIMIT_ATTEMPTS):
                 try:
@@ -3126,6 +3546,9 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     if is_rate_limit_error(exc) and attempt < _RATE_LIMIT_ATTEMPTS - 1:
                         await asyncio.sleep(_RATE_LIMIT_BACKOFF_S * (attempt + 1))
                         continue
+                    adopted = await asyncio.to_thread(_adopt_if_landed, item, exc, sent_at)
+                    if adopted is not None:
+                        return item, adopted, None, int((time.perf_counter() - start) * 1000)
                     return item, None, exc, int((time.perf_counter() - start) * 1000)
             return item, None, last_exc, int((time.perf_counter() - start) * 1000)
 
@@ -3166,6 +3589,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
             # response itself, so capture the broker's execution time here too
             # — otherwise the fastest fills would be the ones missing it.
             child.broker_filled_at = resp.filled_at
+            # A symbol on its own exit ladder needs a ladder to run: the
+            # engine works off a position guard, and a mirrored position has
+            # never had one. Opened here, where every successful mirror passes.
+            _open_symbol_ladder(db, item.subscriber_user_id, child)
             # SnapTrade serves CACHED brokerage data, so a mirror can be filled
             # at the broker minutes before SnapTrade admits it (prod p90: 22
             # min). Nudge that connection to re-pull now and read it a few
@@ -3420,7 +3847,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 child.retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
                 # Preserve child.is_closing — resetting a close mirror to
                 # opening broke its retry interval + P&L basis (DEF-COPY-001).
-                child.reject_reason = "transient broker error, will retry"
+                # An unconfirmed send is flagged so the scheduler looks before
+                # it re-places.
+                child.reject_reason = (
+                    OUTCOME_UNKNOWN_REASON if is_outcome_unknown_error(exc)
+                    else "transient broker error, will retry"
+                )
                 # Don't set closed_at — order isn't terminal.
                 audit.record(
                     db,
@@ -3455,7 +3887,12 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                 # exception with its HTTP-header dump, and never blank (exc was
                 # None) — so the user sees a real sentence. The raw string is
                 # preserved verbatim in the audit metadata for debugging.
-                clean = clean_broker_error(err)
+                clean = (
+                    "The broker didn't confirm this order (timed out) — it may "
+                    "still have been placed. Check your broker account."
+                    if exc is not None and is_outcome_unknown_error(exc)
+                    else clean_broker_error(err)
+                )
                 child.status = OrderStatus.REJECTED
                 child.reject_reason = clean[:480]
                 child.closed_at = datetime.now(timezone.utc)
@@ -3482,7 +3919,10 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
     # status == "error" is a FINAL rejection; retries are notified separately
     # only once all attempts are exhausted (retry_scheduler), so no double-send.
     if any(r.status == "error" for r in results):
-        from app.services.notifications import create_notification  # noqa: PLC0415
+        from app.services.notifications import (  # noqa: PLC0415
+            create_notification,
+            instrument_label,
+        )
         _side = trader_order.side.value.upper()
         for r in results:
             if r.status != "error":
@@ -3504,13 +3944,15 @@ async def fanout_async(db: Session, trader_order: Order, trader: User) -> list[F
                     user_id=r.subscriber_user_id,
                     type="copy.rejected",
                     message=(
-                        f"Your copy of the {_side} {trader_order.symbol} order was "
+                        f"Your copy of the {_side} "
+                        f"{instrument_label(trader_order)} order was "
                         f"rejected: {reason}"
                     ),
                     metadata={
                         "parent_order_id": str(trader_order.id),
                         "order_id": str(r.order_id),
                         "symbol": trader_order.symbol,
+                        "instrument": instrument_label(trader_order),
                         "side": _side,
                         "reason": reason,
                         "trader_id": str(trader_order.user_id),

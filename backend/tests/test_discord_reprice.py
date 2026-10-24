@@ -88,6 +88,8 @@ def wired(monkeypatch):
                     return settings
                 return type("A", (), {"encrypted_credentials": "x", "broker": "WEBULL"})()
             def commit(self): state["committed"] += 1
+            def execute(self, stmt):       # the order's channel: none here → account settings
+                return type("R", (), {"scalar_one_or_none": lambda self: None})()
             def __enter__(self): return self
             def __exit__(self, *a): return False
 

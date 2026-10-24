@@ -544,20 +544,29 @@ def test_an_add_without_a_price_is_still_a_limit_order():
     "body",
     [
         "Leave room to add incase the want a bit more of a bounce",
-        "Adding more here",
         "might add later",
+        "Will be adding to SPY around 776.10",
     ],
 )
 def test_prose_about_adding_is_not_an_order(body):
-    """The word "add" appears constantly in commentary. An order needs a $ticker
-    or an explicit contract — otherwise this parser would trade on chatter."""
+    """The word "add" appears constantly in commentary. Only a committed add
+    acts (discord_parsers.add_intent) — otherwise this parser would trade on
+    chatter."""
     assert parse_message(text(body)).status is not ParseStatus.PARSED
+
+
+def test_a_committed_add_with_no_ticker_is_an_add_into_the_channel_s_position():
+    """"Adding more here" names no ticker: it means the position this channel is
+    in (2026-10-19, the trader's call — Julia's "Added to my position" and
+    Mark's "Added here" were being ignored)."""
+    s = parse_message(text("Adding more here")).signals[0]
+    assert s.action.value == "BUY" and s.add_to_latest and s.double_up and s.symbol is None
 
 
 def test_prose_about_adding_is_ignored_not_invalid():
     """INVALID is for things that look like an instruction. Commentary must not
     fill the review queue."""
-    assert parse_message(text("Adding more here")).status is ParseStatus.IGNORED
+    assert parse_message(text("might add later")).status is ParseStatus.IGNORED
 
 
 # ── Always limit, never market ───────────────────────────────────────────────
@@ -870,11 +879,20 @@ def test_the_expiry_first_ordering_takes_1dte_too():
     assert s.expiration == date(2026, 9, 25)
 
 
-@pytest.mark.parametrize("body", ["AAPL 337.5C 2DTE @2.19", "AAPL 337.5C 5DTE @2.19"])
-def test_other_dte_counts_are_not_guessed(body):
-    """Only 0DTE and 1DTE are used by these channels. Anything else is left
-    unparsed rather than resolved to a date the alert never named."""
-    assert parse_message(text(body, posted_at=_at(2026, 9, 24))).status is not ParseStatus.PARSED
+@pytest.mark.parametrize("body, expiry", [
+    ("AAPL 337.5C 2DTE @2.19", date(2026, 9, 28)),      # Thu 9/24 + 2 trading days = Mon 9/28
+    ("AAPL 337.5C 5DTE @2.19", date(2026, 10, 1)),
+])
+def test_other_dte_counts_are_trading_days_ahead(body, expiry):
+    """Channels now post 2DTE too (Mark, 2026-10-19: "NVDA 220C 2DTE @2.01").
+    NDTE names that many trading days after the alert (the trader's call); it
+    used to be left unparsed."""
+    assert parse_message(text(body, posted_at=_at(2026, 9, 24))).signal.expiration == expiry
+
+
+def test_a_dte_further_out_than_thirty_days_is_not_guessed():
+    assert parse_message(text("AAPL 337.5C 45DTE @2.19", posted_at=_at(2026, 9, 24))).status \
+        is not ParseStatus.PARSED
 
 
 # ── "averaging down": double the position already held ───────────────────────

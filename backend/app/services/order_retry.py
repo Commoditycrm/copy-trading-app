@@ -30,13 +30,28 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.brokers.base import BrokerAdapter, BrokerOrderRequest, BrokerOrderResult
 from app.models.order import InstrumentType, OrderSide
 
 log = logging.getLogger(__name__)
+
+
+def is_entry_blocked_by_opposite_order(exc: Exception) -> bool:
+    """True when a BUY was refused because an OPPOSITE-side order rests on the
+    same contract — Alpaca's wash-trade guard.
+
+    Deliberately narrower than :func:`is_order_conflict_error`. That one also
+    matches Webull/SnapTrade's vocabulary and the SAME-side "already reserved"
+    family; an entry must act on neither. An entry clearing its own path is a
+    privilege, so it is granted on the one rejection that means exactly "your
+    own sell is in the way" and nothing else.
+    """
+    m = str(exc).lower()
+    return "wash trade" in m or "opposite side" in m or "opposite-side" in m
 
 
 def is_order_conflict_error(exc: Exception) -> bool:
@@ -216,6 +231,12 @@ def live_closeable_quantity(
       * ``None`` when positions couldn't be read — callers must then NOT clamp
         (we can't prove the size is wrong, so leave the order untouched).
     """
+    # Read LIVE, not a positions read shared earlier in this alert or tick
+    # (risk_tick): the broker has just refused this close for its size, which
+    # is the moment the earlier view is in doubt. Only reached after a refusal.
+    from app.services import risk_tick  # noqa: PLC0415
+
+    risk_tick.invalidate()
     try:
         positions = adapter.get_positions()
     except Exception:  # noqa: BLE001
@@ -402,6 +423,108 @@ class RecoverableOrderError(Exception):
         self.original = original
 
 
+class OrderOutcomeUnknown(Exception):
+    """The send may have reached the broker and we couldn't prove either way,
+    on a broker that would NOT refuse a duplicate. Re-placing could double the
+    position, so the caller parks or escalates instead of retrying."""
+
+    def __init__(self, original: BaseException):
+        super().__init__(f"broker outcome unknown: {original}")
+        self.original = original
+
+
+class AdoptedOrderResult(BrokerOrderResult):
+    """A BrokerOrderResult for an order an earlier, unconfirmed send created —
+    found by lookup rather than returned by this call's place_order."""
+
+
+def _adopted(r: BrokerOrderResult) -> AdoptedOrderResult:
+    return AdoptedOrderResult(**{f.name: getattr(r, f.name) for f in fields(r)})
+
+
+# Failures where the request may have been delivered: read timeouts and
+# connections dropped mid-flight. Connect timeouts / refusals fail before the
+# send and stay plain-transient.
+_OUTCOME_UNKNOWN_RE = re.compile(
+    r"timed?[\s_-]*out|timeout|gateway[\s_-]*time"
+    r"|connection.*(reset|aborted)|remote(?:\s*end)?.*(closed|disconnected)",
+    re.I,
+)
+_OUTCOME_UNKNOWN_NAMES = {
+    "Timeout", "ReadTimeout", "TimeoutError", "RemoteDisconnected",
+    "ProtocolError", "ChunkedEncodingError", "ConnectionResetError",
+}
+_SENT_NOTHING_NAMES = {"ConnectTimeout", "ConnectionRefusedError", "NewConnectionError"}
+
+
+def _exc_chain(exc: BaseException | None):
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def is_outcome_unknown_error(exc: BaseException) -> bool:
+    """True when the order may have been placed despite the error. Walks the
+    cause chain because adapters wrap SDK errors (SnapTrade → RuntimeError)."""
+    chain = list(_exc_chain(exc))
+    if any(type(e).__name__ in _SENT_NOTHING_NAMES for e in chain):
+        return False
+    if any("connect timeout" in str(e).lower() for e in chain):
+        return False
+    return any(
+        type(e).__name__ in _OUTCOME_UNKNOWN_NAMES or _OUTCOME_UNKNOWN_RE.search(str(e))
+        for e in chain
+    )
+
+
+_DUPLICATE_CLIENT_ID_RE = re.compile(
+    r"client[\s_-]*order[\s_-]*id.{0,40}(?:unique|exist|duplicat|already)"
+    r"|duplicat\w*.{0,40}client[\s_-]*order[\s_-]*id",
+    re.I,
+)
+
+
+def is_duplicate_client_id_error(exc: BaseException) -> bool:
+    """The broker refused the order because one with this client_order_id
+    already exists — i.e. an earlier send DID land (Alpaca 422 "client_order_id
+    must be unique")."""
+    return bool(_DUPLICATE_CLIENT_ID_RE.search(str(exc)))
+
+
+# reject_reason of a mirror parked after an unconfirmed send. retry_scheduler
+# keys off it: such a mirror is looked up before any re-place.
+OUTCOME_UNKNOWN_REASON = "broker did not confirm the order, will verify before retrying"
+
+
+def lookup_placed_order(
+    adapter: BrokerAdapter,
+    request: BrokerOrderRequest,
+    *,
+    placed_after: datetime,
+) -> tuple[str, AdoptedOrderResult | None]:
+    """("found", result), ("absent", None), ("ambiguous", None) when several
+    broker orders fit, ("failed", None) when the lookup errored, or
+    ("unsupported", None) when the adapter can't look up."""
+    find = getattr(adapter, "find_placed_order", None)
+    if find is None:
+        return "unsupported", None
+    try:
+        found = find(request, placed_after=placed_after)
+    except NotImplementedError:
+        return "unsupported", None
+    except BrokerAdapter.AmbiguousMatch:
+        log.warning("order_retry: ambiguous order lookup for %s", request.client_order_id, exc_info=True)
+        return "ambiguous", None
+    except Exception:  # noqa: BLE001
+        log.warning("order_retry: order lookup failed for %s", request.client_order_id, exc_info=True)
+        return "failed", None
+    if found is None:
+        return "absent", None
+    return "found", _adopted(found)
+
+
 def place_order_with_recovery(
     adapter: BrokerAdapter,
     request: BrokerOrderRequest,
@@ -413,21 +536,48 @@ def place_order_with_recovery(
     """Call adapter.place_order() with retry on transient errors and clean
     messages on user-fixable errors. Re-raises unknown errors as-is.
 
+    A timeout is never retried blind. Where the broker dedupes client ids it is
+    asked whether the order landed: found → that order is returned (an
+    AdoptedOrderResult), absent → re-sent with the same id. Elsewhere
+    OrderOutcomeUnknown is raised at once; reconciling a contract match needs
+    the DB context retry_scheduler has.
+
     Raises:
         RecoverableOrderError — caller should record `.friendly_message` as
             the order's reject_reason. The original exception is preserved
             on `.original` for the audit log.
+        OrderOutcomeUnknown — see above.
         Exception — any other broker error, unchanged.
     """
     backoff = initial_backoff_s
     attempt = 0
     last_exc: BaseException | None = None
+    dedupes = getattr(adapter, "dedupes_client_order_id", False) and bool(request.client_order_id)
     while attempt < max_attempts:
         attempt += 1
+        sent_at = datetime.now(timezone.utc)
         try:
             return adapter.place_order(request)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if dedupes and is_duplicate_client_id_error(exc):
+                _, found = lookup_placed_order(adapter, request, placed_after=sent_at)
+                if found is not None:
+                    log.warning("order_retry: %s already at broker, adopting %s",
+                                request.client_order_id, found.broker_order_id)
+                    return found
+                raise
+            if is_outcome_unknown_error(exc):
+                if not dedupes:
+                    raise OrderOutcomeUnknown(exc) from exc
+                _, found = lookup_placed_order(adapter, request, placed_after=sent_at)
+                if found is not None:
+                    log.warning("order_retry: %s landed despite %s, adopting %s",
+                                request.client_order_id, type(exc).__name__,
+                                found.broker_order_id)
+                    return found
+                # Absent or unreadable, but a repeat of this client id is
+                # refused, so re-sending can't double the order.
             cls = classify_error(exc)
             if cls.clean_message is not None:
                 raise RecoverableOrderError(cls.clean_message, exc) from exc

@@ -1603,10 +1603,33 @@ def admin_rejected_orders(
             select(BrokerAccount).where(BrokerAccount.id.in_(acct_ids))
         ).scalars()}
 
+    # Rejected-trade text for each row (services/rejected_trade_sms.py)
+    from app.models.sms_notification import SmsNotification  # noqa: PLC0415
+
+    order_ids = [o.id for o, _u in rows]
+    texts: dict[uuid.UUID, SmsNotification] = {}
+    if order_ids:
+        texts = {t.order_id: t for t in db.execute(
+            select(SmsNotification).where(SmsNotification.order_id.in_(order_ids))
+        ).scalars()}
+
     rejections = []
     for o, u in rows:
         acct = accounts.get(o.broker_account_id) if o.broker_account_id else None
+        t = texts.get(o.id)
         rejections.append({
+            "sms": None if t is None else {
+                "status": t.status,
+                "outcome": t.outcome,
+                "skip_reason": t.skip_reason,
+                "attempts": t.attempts,
+                "twilio_status": t.twilio_status,
+                "twilio_error_code": t.twilio_error_code,
+                "error": t.last_error,
+                "phone_last4": t.phone_last4,
+                "sent_at": t.sent_at.isoformat() if t.sent_at else None,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            },
             "order_id": str(o.id),
             "user_id": str(o.user_id),
             "user_email": u.email if u else None,
@@ -1638,7 +1661,8 @@ def admin_rejected_orders(
             # reached the broker (rejected internally, e.g. credential decrypt).
             "broker_call_ms": o.broker_call_ms,
         })
-    return {"rejections": rejections, "truncated": truncated}
+    return {"rejections": rejections, "truncated": truncated,
+            "sms_tracking_enabled": bool(get_settings().rejected_trade_sms_enabled)}
 
 
 @router.get("/performance/by-broker")
@@ -2022,6 +2046,133 @@ def set_alpaca_poll_interval(
         payload.interval_s,
     )
     return get_alpaca_pnl_poll_interval_state()
+
+
+# ─── Polling configuration (all brokers) ─────────────────────────────────────
+#
+# The Alpaca route above predates this one and stays for compatibility; it
+# writes the SAME Redis key this route does, so the two never diverge. New
+# knobs go in platform_config.INT_KNOBS / BOOL_KNOBS and appear here with no
+# endpoint changes.
+#
+# Every knob is read on its loop's hot path, so a PATCH lands on the next tick
+# with no restart.
+#
+# This deliberately reports no request-rate estimate. One used to live here,
+# computed from the knob values, and it read like telemetry while being pure
+# arithmetic — it could not see a burst, a retry or a 429, and would happily
+# report the configured rate for a poller that was wedged. Actual per-request
+# counts exist only for Webull (services/webull_usage.py, surfaced at
+# GET /api/brokers/webull-usage).
+
+
+class PollingKnobOut(BaseModel):
+    name: str
+    group: str
+    # Matrix coordinates. `broker` is null for a sweep that is not per-broker.
+    broker: str | None
+    row: str
+    # "seconds" (a duration, unit picker offered) | "count" | "rate".
+    kind: str
+    unit_label: str
+    label: str
+    why: str
+    default: int
+    override: int | None
+    effective: int
+    min: int
+    max: int
+
+
+class PollingSwitchOut(BaseModel):
+    name: str
+    group: str
+    broker: str | None
+    row: str
+    label: str
+    why: str
+    default: bool
+    override: bool | None
+    effective: bool
+
+
+class BrokerColumnOut(BaseModel):
+    name: str
+    label: str
+
+
+class MatrixRowOut(BaseModel):
+    group: str
+    row: str
+
+
+class NaNoteOut(BaseModel):
+    """Why a particular cell is empty, where a bare dash would read as broken."""
+
+    broker: str
+    row: str
+    note: str
+
+
+class PollingConfigOut(BaseModel):
+    intervals: list[PollingKnobOut]
+    switches: list[PollingSwitchOut]
+    # Render order, decided here so the page doesn't hardcode a group list
+    # that drifts from the registry.
+    groups: list[str]
+    # Axes of the per-broker grid.
+    brokers: list[BrokerColumnOut]
+    matrix_rows: list[MatrixRowOut]
+    na_notes: list[NaNoteOut]
+
+
+class PollingConfigIn(BaseModel):
+    """One knob per call. ``value=null`` clears the override so the effective
+    value returns to the env default."""
+
+    name: str
+    value: int | bool | None = None
+
+
+@router.get("/config/polling", response_model=PollingConfigOut)
+def get_polling_config(
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import get_polling_knobs_state
+    return get_polling_knobs_state()
+
+
+@router.patch("/config/polling", response_model=PollingConfigOut)
+def set_polling_config(
+    payload: PollingConfigIn,
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.services.platform_config import (
+        BOOL_KNOBS,
+        INT_KNOBS,
+        get_polling_knobs_state,
+        set_bool_knob,
+        set_int_knob,
+    )
+    int_names = {k.name for k in INT_KNOBS}
+    bool_names = {k.name for k in BOOL_KNOBS}
+
+    if payload.name in int_names:
+        if isinstance(payload.value, bool):
+            raise HTTPException(422, f"{payload.name} takes a number of seconds")
+        try:
+            set_int_knob(payload.name, payload.value)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    elif payload.name in bool_names:
+        if payload.value is not None and not isinstance(payload.value, bool):
+            raise HTTPException(422, f"{payload.name} takes true, false or null")
+        set_bool_knob(payload.name, payload.value)
+    else:
+        raise HTTPException(404, f"unknown polling knob: {payload.name}")
+
+    log.info("admin set polling knob %s = %s", payload.name, payload.value)
+    return get_polling_knobs_state()
 
 
 # ─── SMS test (Twilio) ────────────────────────────────────────────────────────

@@ -85,6 +85,13 @@ class TradeSignal:
     # The expiry must then be resolved from the OPEN POSITION at execution time,
     # never guessed here. Display shows the contract without a date.
     expiry_unspecified: bool = False
+    # True when the alert stated NO expiry on an ENTRY and we filled in the
+    # message's own date. A same-day read is right for the channels that post
+    # "SPY 763c @ .55" and never write a date — but it is OUR assumption, not
+    # the trader's instruction. When nothing expires that day (NVDA has no
+    # Thursday expiry) execution shifts to the nearest listed expiry instead of
+    # refusing; a date the trader actually wrote is never shifted.
+    expiry_assumed: bool = False
     # True when the alert named ONLY a symbol ("META -> 100%") — no strike, no
     # call/put, no expiry. The entire contract has to come from the open
     # position; there is nothing here to identify it with.
@@ -111,6 +118,8 @@ class TradeSignal:
     # Acted on in discord_execution._resolve_quantity: the entry is taken at
     # HALF the size it otherwise would be.
     half_size: bool = False
+    # Fill this entry at MARKET ("@market", "out the gate"): see parse_message.
+    at_market: bool = False
     # "$SPY 768 PUT averaging down @0.48" — buy as much again as is already
     # held, so the position doubles. Distinct from half_size, which scales the
     # alert's own size; this one IGNORES it and sizes purely from the position,
@@ -130,12 +139,26 @@ class TradeSignal:
     # Opt-in per parser: execution buys the NEAREST listed expiry when set, and
     # refuses (as before) when not.
     nearest_expiry: bool = False
+    # "Stopped out of rest of SPY calls": close EVERY contract matching the
+    # symbol (and call/put, when named) that this channel opened and is still
+    # held — at market, in full. Several contracts are expected, not refused.
+    close_all_matching: bool = False
+    # With close_all_matching and no symbol ("Cutting @here", "Stopped out"):
+    # the contract is the one this channel is in — its latest buy still held.
+    latest_contract: bool = False
+    # An exit that names only the ticker ("$WMT @ 0.71 | 40%"): when several
+    # contracts in it are held, take the one THIS channel most recently bought
+    # and still holds; with none from the channel, the one held contract in the
+    # ticker as before. Acted on in discord_sources._execute_signal.
+    channel_contract_first: bool = False
 
     # A SELL that closes only part of a position ("Sold 3 … 2 of 5 still open").
     # Treating a trim as a full exit would flatten a position the trader still
     # holds, so this is tracked explicitly rather than inferred from quantity.
     is_partial_close: bool = False
     remaining_quantity: Decimal | None = None
+    # A partial CUT's share of the position ("cut half" = 0.5), from cut_intent.
+    cut_fraction: Decimal | None = None
 
     # What the source actually called it (ENTERING / TRIMMING / CLOSING / BTO …).
     # Kept for display and debugging; never drives execution.
@@ -156,6 +179,7 @@ class TradeSignal:
             "strike": str(self.strike) if self.strike is not None else None,
             "expiration": self.expiration.isoformat() if self.expiration else None,
             "is_partial_close": self.is_partial_close,
+            "cut_fraction": str(self.cut_fraction) if self.cut_fraction is not None else None,
             "remaining_quantity": (
                 str(self.remaining_quantity) if self.remaining_quantity is not None else None
             ),
@@ -173,11 +197,16 @@ class TradeSignal:
             ),
             "position_closed": self.position_closed,
             "half_size": self.half_size,
+            "at_market": self.at_market,
             "double_up": self.double_up,
             "flatten": self.flatten,
             "add_to_latest": self.add_to_latest,
             "nearest_expiry": self.nearest_expiry,
+            "close_all_matching": self.close_all_matching,
+            "latest_contract": self.latest_contract,
+            "channel_contract_first": self.channel_contract_first,
             "expiry_unspecified": self.expiry_unspecified,
+            "expiry_assumed": self.expiry_assumed,
             "contract_unspecified": self.contract_unspecified,
             "limit_price_unspecified": self.limit_price_unspecified,
             "source_action": self.source_action,
@@ -251,6 +280,12 @@ class ParsedMessage:
     # Reading a P&L update as an exit would fire three sells for one position,
     # so this is opt-in per source rather than a global guess.
     percent_means_exit: bool = False
+    # The source channel's name and label, for parsers scoped to one channel
+    # (dragon_alert). None when unknown — such parsers then never match.
+    channel: str | None = None
+    # Typed by the trader into the Discord popup (the Self channel). Dragon's
+    # ticker-only trims ("$MSFT @ 21.10 | 24% TRIMMING") are read here too.
+    self_channel: bool = False
 
     @property
     def text(self) -> str:

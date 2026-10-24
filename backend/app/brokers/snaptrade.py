@@ -39,7 +39,7 @@ trades on any of the user's connected brokers via SnapTrade's API.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -327,6 +327,30 @@ def parse_snaptrade_order_symbol(order_obj: Any) -> dict[str, Any]:
         "option_strike":   strike,
         "option_right":    right,
     }
+
+
+def _order_matches_request(order_obj: Any, req: BrokerOrderRequest) -> bool:
+    """Same instrument, side and quantity as ``req``."""
+    action = str(_attr(order_obj, "action", default="")).upper()
+    want = "BUY" if req.side == OrderSide.BUY else "SELL"
+    if want not in action:
+        return False
+    qty = _dec_or_none(_attr(order_obj, "total_quantity", "units"))
+    if qty is None or qty != Decimal(str(req.quantity)):
+        return False
+    sym = parse_snaptrade_order_symbol(order_obj)
+    if sym["instrument_type"] != req.instrument_type:
+        return False
+    if (sym["symbol"] or "").upper() != req.symbol.upper():
+        return False
+    if req.instrument_type == InstrumentType.OPTION:
+        if sym["option_expiry"] != req.option_expiry or sym["option_right"] != req.option_right:
+            return False
+        if sym["option_strike"] is None or req.option_strike is None:
+            return False
+        if Decimal(str(sym["option_strike"])) != Decimal(str(req.option_strike)):
+            return False
+    return True
 
 
 def _as_date(v: Any):
@@ -760,6 +784,58 @@ class SnapTradeAdapter(BrokerAdapter):
         raise LookupError(
             f"SnapTrade order {broker_order_id} not found in recent history"
         )
+
+    # Clock skew allowed between our "before the send" stamp and the broker's
+    # time_placed.
+    _LOOKUP_SKEW_S = 30
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+    ) -> BrokerOrderResult | None:
+        """SnapTrade takes no client id, so match the contract instead: same
+        instrument, side and quantity, placed since ``placed_after``. Two or
+        more fits can't be told apart, so that raises AmbiguousMatch."""
+        resp = self._c().account_information.get_user_account_orders(
+            user_id=self._user_id,
+            user_secret=self._user_secret,
+            account_id=self._account_id,
+        )
+        body = getattr(resp, "body", resp) or []
+        rows = list(body.get("orders") or []) if isinstance(body, dict) else list(body)
+        since = placed_after - timedelta(seconds=self._LOOKUP_SKEW_S)
+        hits = []
+        for o in rows:
+            if not _attr(o, "brokerage_order_id", "id"):
+                continue
+            placed = _as_dt(_attr(o, "time_placed", "created_at"))
+            if placed is None or placed < since:
+                continue
+            if _order_matches_request(o, req):
+                hits.append(o)
+        if len(hits) > 1:
+            raise self.AmbiguousMatch(
+                f"{len(hits)} SnapTrade orders match {req.side.value} {req.quantity} {req.symbol}"
+            )
+        return self._order_to_result(hits[0]) if hits else None
+
+    def get_orders_snapshot(self) -> dict[str, BrokerOrderResult]:
+        """Every order get_order could find, from the ONE list call it makes.
+
+        get_order has no by-id endpoint and pulls the whole history each time,
+        so fills_sync._refresh_open_orders paid one full list per working order
+        — a subscriber resting a stop and a take-profit cost two identical reads
+        of SnapTrade's shared quota per sweep. Keyed exactly as get_order
+        matches, so a miss here is a miss there; an empty map (the read failed)
+        sends the caller back to per-order reads.
+        """
+        out: dict[str, BrokerOrderResult] = {}
+        for o in self.list_recent_activities():
+            oid = str(_attr(o, "brokerage_order_id", "id"))
+            out.setdefault(oid, self._order_to_result(o))
+        return out
 
     def cancel_order(self, broker_order_id: str) -> bool:
         """SnapTrade's cancel endpoint takes brokerage_order_id.

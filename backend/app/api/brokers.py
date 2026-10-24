@@ -78,7 +78,7 @@ from app.schemas.broker import (
     StartSnaptradeOut,
     WebullAccountOut,
 )
-from app.services import audit, balance_sync, cache, listeners, snaptrade_listener
+from app.services import audit, balance_sync, cache, listeners, shared_accounts, snaptrade_listener
 from app.services.crypto import decrypt_json, encrypt_json
 from app.services.notifications import create_notification
 from app.services.redis_client import get_sync_redis
@@ -120,8 +120,9 @@ def _credentials_for(payload: ConnectBrokerIn, user_id: uuid.UUID) -> dict[str, 
         case BrokerName.IBKR:
             if not payload.ibkr:
                 raise HTTPException(422, "ibkr credentials required")
-            creds = payload.ibkr.model_dump()
-            # Validate via a live OAuth call before we persist. A bad
+            creds = payload.ibkr.model_dump(exclude_none=True)
+            # Validate via a live call (OAuth handshake, or the local gateway's
+            # login state) before we persist. A bad
             # consumer/token combo would otherwise sit silently and break
             # every subsequent listener poll + order placement.
             try:
@@ -441,6 +442,39 @@ def _after_release(released: list[BrokerAccount]) -> str | None:
     plural = "connections" if len(released) > 1 else "connection"
     return (f"Deactivated the other Webull {plural} using this app key ({names}) — "
             "Webull allows only one live connection per key.")
+
+
+def _refuse_shared_account(
+    db: Session, user: User, broker: BrokerName, number: str | None, request: Request,
+) -> None:
+    """409 when (broker, number) is the brokerage account of this user's trader
+    or of one of their followers. Runs before anything is written, on connect
+    AND activate — an inactive row coming back must pass the same check."""
+    if not shared_accounts.connect_conflict(db, user, broker, number):
+        return
+    who = "the trader you follow" if user.role == UserRole.SUBSCRIBER else "one of your subscribers"
+    log.warning("refused %s account for user %s: shared with %s", broker.value, user.id, who)
+    db.rollback()
+    audit.record(
+        db, actor_user_id=user.id, action="broker.connect_refused",
+        metadata={"broker": broker.value, "reason": "shared_broker_account", "account": number},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who=who))
+
+
+def _notices(*parts: str | None) -> str | None:
+    return " ".join(p for p in parts if p) or None
+
+
+def _shared_notice(db: Session, user: User, acct: BrokerAccount) -> str | None:
+    """A trader may connect an account some unrelated user also holds (no
+    follow between them, so no loop), but its listener stays quarantined. Say
+    so now rather than leaving them to find a silent "Broker offline"."""
+    if user.role != UserRole.TRADER or not shared_accounts.shared_with_another_user(db, acct):
+        return None
+    return shared_accounts.QUARANTINE_MESSAGE
 
 
 def _start_trader_listener(user: User, acct: BrokerAccount) -> None:
@@ -774,6 +808,7 @@ def snaptrade_finish(
         db.commit()
         raise HTTPException(400, f"snaptrade_verify_failed: {exc}")
 
+    _refuse_shared_account(db, user, acct.broker, acct.broker_account_number, request)
     db.add(acct)
     db.flush()
     audit.record(
@@ -921,6 +956,9 @@ def connect(
     # write path; mirror fills sync via services.webull_subscriber_reconciler).
     # The webull_direct_enabled server flag still gates it for everyone inside
     # _credentials_for below, so this stays fully inert with the flag off.
+    if payload.broker == BrokerName.IBKR and payload.ibkr is not None and payload.ibkr.mode == "hosted":
+        return _connect_hosted_ibkr(payload, request, db, user)
+
     creds = _credentials_for(payload, user.id)
 
     # Build an unsaved row so we can run verify_connection() against it.
@@ -984,6 +1022,7 @@ def connect(
     # round-trip, which for Webull includes the token/2FA flow and can run for
     # seconds. Verification has no side effects, so letting both requests verify
     # and serialising only the write is both safe and cheap.
+    _refuse_shared_account(db, user, acct.broker, acct.broker_account_number, request)
     _lock_user_brokers(db, user.id)
 
     # One ACTIVE broker per user. The current one goes inactive (kept, not
@@ -1026,7 +1065,7 @@ def connect(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
-    acct.notice = _after_release(released)
+    acct.notice = _notices(_after_release(released), _shared_notice(db, user, acct))
 
     # If the connecting user is a trader, spin up the listener so trades
     # placed directly at the broker propagate to subscribers. The
@@ -1043,12 +1082,111 @@ def connect(
     return acct
 
 
+def _connect_hosted_ibkr(
+    payload: ConnectBrokerIn, request: Request, db: Session, user: User,
+) -> BrokerAccount:
+    """Hosted IBKR: reserve a gateway slot and save the account PENDING. The
+    owner then signs in through the card's button and /ibkr-gateway/verify
+    activates it. Nothing is verified here because nobody is signed in yet."""
+    from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+    if not hosted.enabled():
+        raise HTTPException(400, "Hosted IBKR gateways are not enabled on this server.")
+    assert payload.ibkr is not None
+    _lock_user_brokers(db, user.id)
+    # One hosted IBKR row per user: reconnecting reuses the slot they hold.
+    existing = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id,
+            BrokerAccount.broker == BrokerName.IBKR,
+            BrokerAccount.ibkr_gateway_slot.is_not(None),
+        )
+    ).scalars().first()
+    try:
+        slot = existing.ibkr_gateway_slot if existing is not None else hosted.assign_slot(db)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    creds = {
+        "mode": "gateway",
+        "hosted": True,
+        "gateway_url": hosted.gateway_url(slot),
+        "account_id": payload.ibkr.account_id or "",
+        "paper": bool(payload.ibkr.paper),
+    }
+    # Never inherit a session: clear whatever the gateway holds.
+    hosted.logout(slot)
+    if existing is not None:
+        acct = existing
+        acct.label = payload.label
+        acct.is_paper = creds["paper"]
+        acct.encrypted_credentials = encrypt_json(creds)
+        acct.connection_status = "pending"
+        acct.last_error = None
+        acct.broker_account_number = payload.ibkr.account_id or None
+    else:
+        acct = BrokerAccount(
+            user_id=user.id,
+            broker=BrokerName.IBKR,
+            label=payload.label,
+            is_paper=creds["paper"],
+            supports_fractional=False,
+            encrypted_credentials=encrypt_json(creds),
+            connection_status="pending",
+            broker_account_number=payload.ibkr.account_id or None,
+            ibkr_gateway_slot=slot,
+        )
+        db.add(acct)
+    db.flush()
+    audit.record(
+        db, actor_user_id=user.id, action="broker.ibkr_gateway_assigned",
+        entity_type="broker_account", entity_id=acct.id,
+        metadata={"slot": slot, "label": payload.label, "is_paper": acct.is_paper},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(acct)
+    cache.invalidate_broker_accounts(user.id)
+    acct.notice = "Gateway reserved. Click \"Sign in to IBKR\" on the card to finish connecting."
+    return acct
+
+
+@router.get("/webull-usage")
+def webull_usage_summary(
+    minutes: int = Query(5, ge=1, le=3 * 24 * 60),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """How many requests went to Webull for YOUR app key(s) in the last
+    ``minutes``, split by what made them (Positions page, order poll, P&L poller,
+    auto-trim, sign-in …) and by Webull endpoint. Counted across the web and
+    worker processes; see services/webull_usage.py. Reads only our own counters
+    — it never calls Webull itself."""
+    from app.services import webull_usage  # noqa: PLC0415
+
+    keys = []
+    for acct in db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user.id, BrokerAccount.broker == BrokerName.WEBULL,
+        )
+    ).scalars():
+        try:
+            keys.append(str(decrypt_json(acct.encrypted_credentials).get("app_key") or ""))
+        except Exception:  # noqa: BLE001
+            continue
+    out = webull_usage.summary(keys, minutes)
+    out["has_webull"] = bool(keys)
+    return out
+
+
 @router.get("/features")
 def broker_features(user: User = Depends(current_user)) -> dict:
     """Client-facing broker feature flags for the Brokers page. Lets the picker
     hide the direct-Webull option when the server has it disabled (connect would
     otherwise 400)."""
-    return {"webull_direct_enabled": bool(get_settings().webull_direct_enabled)}
+    from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+    return {
+        "webull_direct_enabled": bool(get_settings().webull_direct_enabled),
+        "ibkr_hosted_enabled": hosted.enabled(),
+    }
 
 
 # A balance older than this is refreshed inline when the account list is read,
@@ -1056,6 +1194,13 @@ def broker_features(user: User = Depends(current_user)) -> dict:
 # broker call on every load. The Brokers page still force-refreshes via
 # /refresh-balance, and the background sweep (balance_sync) covers idle accounts.
 _BALANCE_STALE_S = 120
+
+
+def _balance_stale_s() -> float:
+    """Runtime knob (admin API page); _BALANCE_STALE_S is the fallback. Read
+    per request, so raising it cuts broker calls on the very next page load."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int_knob_or("broker_balance_stale_s", _BALANCE_STALE_S)
 
 
 @router.get("", response_model=list[BrokerAccountOut])
@@ -1076,7 +1221,7 @@ def list_my_brokers(
         if acct.connection_status != "connected":
             continue
         age = (now - acct.balance_updated_at).total_seconds() if acct.balance_updated_at else None
-        if age is None or age > _BALANCE_STALE_S:
+        if age is None or age > _balance_stale_s():
             try:
                 balance_sync.refresh_account_balance(
                     acct, decrypt_json(acct.encrypted_credentials)
@@ -1243,6 +1388,11 @@ def activate_broker(
             else f"broker_error: {exc}",
         ) from exc
 
+    # Same guard as connect: reactivating must not bring back a trader/follower
+    # shared account (QA 2026-10-21 11:16 restarted the loop exactly this way).
+    _refuse_shared_account(
+        db, user, acct.broker, info.broker_account_id or acct.broker_account_number, request,
+    )
     _lock_user_brokers(db, user.id)
     _deactivate_other_brokers(db, user, request, keep_id=acct.id, reason="switched")
     released = _release_webull_app_key(db, acct, creds, user, request)
@@ -1263,7 +1413,7 @@ def activate_broker(
     db.commit()
     db.refresh(acct)
     cache.invalidate_broker_accounts(user.id)
-    acct.notice = _after_release(released)
+    acct.notice = _notices(_after_release(released), _shared_notice(db, user, acct))
     _start_trader_listener(user, acct)
     return acct
 
@@ -1308,6 +1458,11 @@ def delete_broker(
     # Only the ACTIVE account has a listener. Deleting an inactive one must not
     # stop the listener that is servicing the active broker.
     was_active_trader = user.role == UserRole.TRADER and acct.connection_status == "connected"
+    if acct.ibkr_gateway_slot is not None:
+        # Hosted IBKR: end the gateway's session so the slot's next tenant can
+        # never inherit it. The row's deletion frees the slot.
+        from app.services import ibkr_hosted_gateway as hosted  # noqa: PLC0415
+        hosted.logout(acct.ibkr_gateway_slot)
     db.delete(acct)
     db.commit()
     cache.invalidate_broker_accounts(user.id)

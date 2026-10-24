@@ -28,6 +28,7 @@ callers cancel it before placing an exit of their own.
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -45,6 +46,10 @@ def desired_quantity(held: Decimal, guard) -> Decimal:
     rejected for insufficient quantity when it fires.
     """
     earmarked = Decimal(str(guard.trail_qty or 0))
+    # …and minus the slice a resting take-profit holds (discord_take_profit):
+    # that slice carries its own linked stop, and a second sell on the same
+    # contracts would be refused.
+    earmarked += Decimal(str(getattr(guard, "tp_qty", None) or 0))
     return max(Decimal(0), held - earmarked)
 
 
@@ -66,11 +71,99 @@ _TRANSIENT_MARKERS = (
 )
 
 
+# Rejections that mean "these contracts are still held by another resting sell"
+# — not that the market is through the stop. Webull reads a sell for more than
+# is free as OPENING a short and refuses it as a naked call; Alpaca calls it a
+# cash-secured put it can't fund. It happens when a stop or take-profit is
+# replaced and the broker has not finished releasing the old one. QA 2026-10-06:
+# moving SPY 779C's stop from 0.75 to 1.01 was refused this way while the 0.75
+# stop still held all 5, and the refusal was read as "the stop would have
+# fired" — the position was sold at market, below every trim.
+_CONFLICT_MARKERS = (
+    "naked call", "naked put", "net moeny not enough", "net money not enough",
+    "new naked", "cash-secured", "cash secured", "insufficient", "intent mismatch",
+    "position intent", "exceeds", "not enough position", "available quantity",
+    # Webull: "This order cannot be entered because it will reverse an existing
+    # position. You may need to close an open position, or cancel an open
+    # order" (OPENAPI_ORDER_NOT_SUPPORT_REVERSE_OPTION) — the contracts are
+    # held by another resting sell. QA 2026-10-23, TSLA 375P: a stop placed
+    # while the old take-profit pair still held both contracts was refused this
+    # way, read as "the stop will never rest", and a contract was sold at
+    # market — then again after each of two averages.
+    "reverse an existing position", "not support reverse", "cancel an open order",
+)
+
+
+def is_reservation_conflict(msg: str) -> bool:
+    """The broker refused a sell because the contracts are still reserved by
+    another resting order. A wait, never a reason to close the position."""
+    m = str(msg or "").lower().replace("_", " ")
+    return any(k in m for k in _CONFLICT_MARKERS)
+
+
+# A refusal for held-up contracts is retried once the old order has had time
+# to go — not every pass, in case something else is holding them.
+_CONFLICT_RETRY_S = 45
+
+
 def _is_transient(msg: str) -> bool:
     # Underscores normalised so a broker's own code name matches the phrase:
     # Webull says TOO_MANY_REQUESTS, not "too many requests".
     m = (msg or "").lower().replace("_", " ")
     return any(k in m for k in _TRANSIENT_MARKERS)
+
+
+# The broker refused a SELL stop because the market is already at or through it:
+# Webull "OPENAPI_STOP_PRICE_MUST_BE_LESS_THAN_MARKET_PRICE … (0.3)", Alpaca
+# "stop price must be less than …". Not a failure of protection — the stop would
+# have fired the moment it rested, and the ladder sells at market instead.
+_CROSSED_MARKERS = (
+    "stop price must be less than", "stop_price must be less than",
+    "stop price must not be greater", "must be less than market price",
+)
+_QUOTED_PRICE_RE = re.compile(r"[（(]\s*(\d+(?:\.\d+)?)\s*[)）]")
+
+
+def is_stop_crossed(msg: str) -> bool:
+    """Was this stop refused because the market had already crossed it?"""
+    m = str(msg or "").lower().replace("_", " ")
+    return any(k in m for k in _CROSSED_MARKERS)
+
+
+def _notify_crossed(db, guard, quantity, price, msg: str, outcome: str) -> None:
+    """Tell the trader what happened in plain words, in place of the broker's
+    "order was rejected" — which read as a failure when the app had in fact
+    sold at market a second later (QA 2026-10-12, 10-16, 10-19)."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from app.models.order import InstrumentType, OptionRight  # noqa: PLC0415
+    from app.services import notifications  # noqa: PLC0415
+
+    try:
+        label = notifications.instrument_label(SimpleNamespace(
+            symbol=guard.symbol,
+            instrument_type=InstrumentType.OPTION if guard.option_strike is not None else InstrumentType.STOCK,
+            option_right=OptionRight(guard.option_right) if guard.option_right else None,
+            option_strike=guard.option_strike, option_expiry=guard.option_expiry,
+        ))
+        quoted = _QUOTED_PRICE_RE.findall(msg or "")
+        market = f" (market {quoted[-1]})" if quoted else ""
+        qty = f"{Decimal(str(quantity)).normalize():f}"
+        stop = f"{Decimal(str(price)).quantize(Decimal('0.01'))}"
+        then = {
+            "exit sent": f"sold {qty} at market",
+            "exit already working": "an exit was already working for it",
+            "exit deferred to the regular session": f"the {qty} sell at market when the regular session opens",
+        }.get(outcome, f"selling {qty} at market")
+        notifications.create_notification(
+            db, user_id=guard.user_id, type="discord.stop_crossed",
+            message=f"{label}: the stop at {stop} was already crossed{market} — {then}.",
+            metadata={"symbol": guard.symbol, "instrument": label, "stop_price": stop,
+                      "quantity": qty, "outcome": outcome, "reason": str(msg)[:300]},
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("discord stop: could not send the crossed-stop notice for %s",
+                    getattr(guard, "symbol", "?"), exc_info=True)
 
 
 def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> str | None:
@@ -100,15 +193,35 @@ def _place_or_close(db, guard, quantity, price, place_stop, close_position) -> s
         return place_stop(quantity, price)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
-        if close_position is None or _is_transient(msg):
+        if close_position is None or _is_transient(msg) or is_reservation_conflict(msg):
+            # Retried on a later pass. The emulated stop covers the position
+            # meanwhile (discord_trailing_stop.decide: no stop resting).
             raise
         log.warning(
             "discord stop: %s refused a stop at %s (%s) — closing %s instead, "
             "the position would otherwise be left unprotected",
             guard.symbol, price, msg[:160], quantity,
         )
-        _exit_instead(db, guard, quantity, close_position)
+        _issue(guard, "refused",
+               f"Webull refused the stop at {price} ({_short(msg)}) — selling {quantity} at market "
+               "instead, so the position isn't left without a stop.")
+        outcome = _exit_instead(db, guard, quantity, close_position)
+        if is_stop_crossed(msg):
+            _notify_crossed(db, guard, quantity, price, msg, outcome)
         return None
+
+
+def _issue(guard, kind: str, note: str) -> None:
+    """A line in the position's summary (services/position_events)."""
+    from app.services import position_events  # noqa: PLC0415
+
+    position_events.record_issue(kind, note, guard=guard)
+
+
+def _short(text) -> str:
+    from app.services import position_events  # noqa: PLC0415
+
+    return position_events.short_reason(text)
 
 
 def _exit_instead(db, guard, quantity, close_position) -> str:
@@ -130,7 +243,10 @@ def _exit_instead(db, guard, quantity, close_position) -> str:
             return "exit deferred to the regular session"
     if working_exit(db, guard) is not None:
         return "exit already working"
-    close_position(quantity)
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("the broker refused the stop — exited instead of holding it unprotected"):
+        close_position(quantity)
     return "exit sent"
 
 
@@ -177,8 +293,13 @@ def reconcile(
                 "— treating it as removed by the trader, not re-placing",
                 guard.symbol, guard.stop_price,
             )
-            guard.stop_order_id = None
-            guard.stop_price = None
+            from app.services.position_events import because  # noqa: PLC0415
+
+            with because("cancelled outside the ladder (broker app, Order History or cancel all) — not put back"):
+                guard.stop_order_id = None
+                guard.stop_price = None
+                if hasattr(db, "flush"):
+                    db.flush()
             return "removed by the trader"
         guard.stop_order_id = None
         resting = None
@@ -205,6 +326,16 @@ def reconcile(
         # 29 of them, in the case that led to this guard. Back off instead and
         # let the cause be fixed.
         refusal = _recent_rejection_reason(db, guard)
+        if refusal is not None and is_reservation_conflict(refusal):
+            # The contracts were still held by the order being replaced. Not a
+            # verdict on the stop: once that order has had time to go, place it.
+            age = _recent_rejection_age_s(db, guard)
+            if age is not None and age < _CONFLICT_RETRY_S:
+                _issue(guard, "waiting",
+                       "Stop not placed yet: Webull still holds the contracts for the order being "
+                       "replaced. Trying again in a few seconds.")
+                return "waiting (contracts still held by the order being replaced)"
+            refusal = None
         if refusal is not None:
             # But "back off" cannot be the whole answer: we want a stop here,
             # the broker has refused one, and the position is open — so it is
@@ -222,7 +353,13 @@ def reconcile(
                     "the last one (%s) — closing %s rather than leaving it open",
                     guard.symbol, refusal[:160], want_qty,
                 )
+                _issue(guard, "refused",
+                       f"No stop resting and Webull refused the last one ({_short(refusal)}) — "
+                       f"selling {want_qty} at market rather than leave it open.")
                 return _exit_instead(db, guard, want_qty, close_position)
+            _issue(guard, "waiting",
+                   f"No stop resting: Webull refused the last one ({_short(refusal)}). "
+                   "Waiting before trying again.")
             return "backing off (recent rejection)"
         oid = _place_or_close(
             db, guard, want_qty, want_price, place_stop, close_position
@@ -241,23 +378,39 @@ def reconcile(
     if same_qty and same_price:
         return "in sync"
 
-    # The ladder moved the level, or a fill changed the size. Replace it.
-    # The old stop is cancelled FIRST, so a refusal here leaves the position
-    # barer than a failed first placement would — all the more reason to exit
-    # rather than leave it open with nothing resting.
+    # The ladder moved the level, or a fill changed the size. Replace it — in
+    # two passes. The old stop is cancelled now and the new one placed on the
+    # NEXT pass: a broker releases the contracts a cancelled order held only
+    # once the cancel completes, and a new stop placed in the same instant asks
+    # for contracts that are still taken. Webull refuses that as opening a
+    # naked call (QA 2026-10-06, SPY 779C). Until the next pass the emulated
+    # stop covers the position: with nothing resting, discord_trailing_stop
+    # enforces the level itself.
     cancel_stop(resting.id)
     guard.stop_order_id = None
-    oid = _place_or_close(
-        db, guard, want_qty, want_price, place_stop, close_position
-    )
-    if oid is None:
-        return "closed (stop refused on replace)"
-    guard.stop_order_id = oid
     log.info(
-        "discord stop: %s stop moved to %s x%s (was %s x%s)",
+        "discord stop: %s stop moving to %s x%s (was %s x%s) — placed next pass",
         guard.symbol, want_price, want_qty, resting.stop_price, resting.quantity,
     )
-    return f"replaced -> {want_qty} @ {want_price}"
+    return (f"cancelled {resting.quantity} @ {resting.stop_price}; "
+            f"{want_qty} @ {want_price} {REPLACING}")
+
+
+# Outcome marker: the stop was CANCELLED this pass and its replacement goes out
+# on the next one. Until that cancel completes the broker still holds the old
+# order's contracts, so nothing else may sell them yet — see is_replacing.
+REPLACING = "next pass"
+
+
+def is_replacing(outcome: str | None) -> bool:
+    """Did this reconcile just cancel the stop, with the new one still to come?
+
+    The contracts the cancelled stop held are not free yet. A sell placed in the
+    same instant asks for contracts that are still taken, and the broker refuses
+    it as opening a naked position (QA 2026-10-06; live 2026-10-13, a Trim 1
+    take-profit for 3 refused 32s after an On Fill stop took all 5).
+    """
+    return bool(outcome) and REPLACING in outcome
 
 
 # How long to wait after a rejected stop before trying again. Long enough that a
@@ -269,6 +422,58 @@ _REJECT_BACKOFF_S = 900
 def _recently_rejected(db: Session, guard) -> bool:
     """Whether a stop for this contract was rejected in the last backoff window."""
     return _recent_rejection_reason(db, guard) is not None
+
+
+def _recent_rejection_age_s(db: Session, guard) -> float | None:
+    """Seconds since the most recent refused stop for this contract, or None."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    from app.models.order import Order, OrderStatus, OrderType  # noqa: PLC0415
+    from sqlalchemy import select  # noqa: PLC0415
+
+    at = db.execute(
+        select(Order.created_at).where(
+            Order.user_id == guard.user_id,
+            Order.symbol == guard.symbol,
+            Order.option_strike.is_not_distinct_from(guard.option_strike),
+            Order.option_expiry.is_not_distinct_from(guard.option_expiry),
+            Order.order_type == OrderType.STOP,
+            Order.status == OrderStatus.REJECTED,
+        ).order_by(Order.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+    if at is None:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - at).total_seconds()
+
+
+def _latest_buy_at(db: Session, guard):
+    """When the latest filled BUY of this contract was placed, or None."""
+    from datetime import timezone  # noqa: PLC0415
+
+    from sqlalchemy import func, select  # noqa: PLC0415
+
+    from app.models.order import Order, OrderSide, OrderStatus  # noqa: PLC0415
+
+    try:
+        at = db.execute(
+            select(func.max(Order.created_at)).where(
+                Order.user_id == guard.user_id,
+                Order.symbol == guard.symbol,
+                Order.option_strike.is_not_distinct_from(guard.option_strike),
+                Order.option_expiry.is_not_distinct_from(guard.option_expiry),
+                Order.side == OrderSide.BUY,
+                Order.status.in_((OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)),
+            )
+        ).scalar_one_or_none()
+    except Exception:  # noqa: BLE001 — a stand-in session in tests, or no orders yet
+        return None
+    from datetime import datetime  # noqa: PLC0415
+
+    if not isinstance(at, datetime):
+        return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
 
 
 def _recent_rejection_reason(db: Session, guard) -> str | None:
@@ -295,6 +500,13 @@ def _recent_rejection_reason(db: Session, guard) -> str | None:
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         since = max(since, created)
+    # …nor further back than the latest BUY into this position. An average or an
+    # add changes what is held: a stop refused before it is about a position
+    # that no longer exists, and reading it as "refused, so sell" sold the new
+    # contract straight after each average (QA 2026-10-23, TSLA 375P).
+    last_buy = _latest_buy_at(db, guard)
+    if last_buy is not None:
+        since = max(since, last_buy)
     row = db.execute(
         select(Order.reject_reason).where(
             Order.user_id == guard.user_id,
@@ -332,9 +544,14 @@ def working_exit(db: Session, guard):
     from sqlalchemy import select  # noqa: PLC0415
 
     since = datetime.now(timezone.utc) - timedelta(seconds=_WORKING_EXIT_MAX_AGE_S)
+    # The ladder's own resting take-profit is not an exit in progress: it sits
+    # there by design, and its contracts are already kept out of the stop's size
+    # (tp_qty). Counting it would stop every stop being placed while it rests.
+    own_tp = getattr(guard, "tp_order_id", None)
     return db.execute(
         select(Order).where(
             Order.user_id == guard.user_id,
+            *([Order.id != own_tp] if own_tp is not None else []),
             Order.parent_order_id.is_(None),
             Order.symbol == guard.symbol,
             Order.option_strike.is_not_distinct_from(guard.option_strike),
@@ -363,11 +580,22 @@ def release_for_position(db: Session, user, pos) -> bool:
         db, user.id, pos.symbol, pos.option_strike,
         getattr(pos, "option_right", None), pos.option_expiry,
     )
-    if guard is None or not guard.stop_order_id:
+    if guard is None:
         return False
     from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
 
-    return release(db, guard, _cancel_stop_order(db, user))
+    cancel = _cancel_stop_order(db, user)
+    freed = False
+    # A resting take-profit and its linked stop reserve contracts exactly as the
+    # ladder stop does.
+    if getattr(guard, "tp_order_id", None) is not None or getattr(guard, "tp_stop_order_id", None) is not None:
+        from app.services import discord_take_profit  # noqa: PLC0415
+
+        freed = discord_take_profit.release(db, guard, cancel)
+        guard.tp_qty = None
+    if not guard.stop_order_id:
+        return freed
+    return release(db, guard, cancel) or freed
 
 
 def release(db: Session, guard, cancel_stop) -> bool:
@@ -390,4 +618,6 @@ def release(db: Session, guard, cancel_stop) -> bool:
     return True
 
 
-__all__ = ["desired_quantity", "reconcile", "release", "release_for_position", "working_exit"]
+__all__ = ["REPLACING", "desired_quantity", "is_replacing", "reconcile", "release",
+           "release_for_position", "working_exit",
+           "is_reservation_conflict"]

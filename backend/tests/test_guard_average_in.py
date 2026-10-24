@@ -96,8 +96,9 @@ def test_only_an_averaging_down_alert_re_averages():
     from app.api.discord_sources import _execute_signal
 
     src = inspect.getsource(_execute_signal)
-    assert 'if signal.get("double_up"):' in src
-    at = src.index('if signal.get("double_up"):')
+    gate = 'if signal.get("double_up") and (getattr(resolved, "held_quantity", None) or 0) > 0:'
+    assert gate in src            # …and only when something WAS held: a re-entry starts fresh
+    at = src.index(gate)
     assert "guards.average_in(" in src[at:at + 400]
     # And on_buy itself still refuses to re-price a live position.
     on_buy = inspect.getsource(g.on_buy)

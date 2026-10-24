@@ -1,26 +1,52 @@
 "use client";
 
 /**
- * Admin System → Usage — live telemetry for the Lightsail box this deployment
- * runs on (prod admin shows prod, QA admin shows QA). CPU / memory / disk / swap
- * / load / network, refreshed every few seconds. Read on-box via psutil; no AWS
- * credentials involved.
+ * Admin System → Usage — live telemetry for the host this deployment runs on
+ * (prod admin shows prod, QA admin shows QA), refreshed every few seconds.
+ * CPU / memory / disk / swap / uptime are host figures read in the backend;
+ * host network, processes, hostname and per-container stats come from the host
+ * collector and show as unavailable when it isn't running.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import AwsCostSection from "./AwsCostSection";
+import StorageSection from "./StorageSection";
+import LogsSection from "./LogsSection";
+import SmsCostSection from "./SmsCostSection";
+
+interface ContainerStat {
+  name: string;
+  service: string | null;
+  state: string | null;
+  health: string | null;
+  restarts: number;
+  started_at: string | null;
+  cpu_percent: number | null;
+  mem_used: number | null;
+  mem_limit: number | null;
+  mem_percent: number | null;
+  pids: number | null;
+  net_recv: number | null;
+  net_sent: number | null;
+}
 
 interface Usage {
   hostname: string;
+  hostname_scope: "host" | "container";
   sampled_at: string;
   boot_time: string;
   uptime_seconds: number;
-  process_count: number;
+  process_count: number | null;
+  host_metrics: { available: boolean; collected_at?: string; age_seconds?: number; reason?: string };
   cpu: { percent: number; cores: number; per_core: number[]; load_avg: number[] | null };
   memory: { total: number; used: number; available: number; percent: number };
   swap: { total: number; used: number; percent: number };
   disk: { mount: string; total: number; used: number; free: number; percent: number };
-  network: { bytes_sent: number; bytes_recv: number; packets_sent: number; packets_recv: number };
+  network: { interface: string | null; bytes_sent: number; bytes_recv: number; packets_sent: number; packets_recv: number } | null;
+  backend_container_network: { bytes_sent: number; bytes_recv: number };
+  containers: ContainerStat[];
+  containers_error: string | null;
 }
 
 const REFRESH_MS = 3000;
@@ -108,7 +134,8 @@ function MarketStreamsCard() {
 
 function fmtBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const u = ["B", "KB", "MB", "GB", "TB"];
+  // Divides by 1024, so the units are IEC (GiB), not decimal GB.
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
   const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
   return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
 }
@@ -151,6 +178,78 @@ function Meter({ label, pct, sub }: { label: string; pct: number; sub?: string }
   );
 }
 
+function healthColor(c: ContainerStat): string {
+  if (c.state !== "running" || c.health === "unhealthy") return "var(--bad, #b3261e)";
+  if (c.health === "starting" || c.restarts > 0) return "#b45309";
+  return "var(--good, #16794a)";
+}
+
+/** Per-container view, kept apart from the host figures above. */
+function ContainersCard({ u }: { u: Usage }) {
+  const cardStyle = { background: "var(--panel-2)", border: "1px solid var(--border)" };
+  const muted = { color: "var(--muted)" };
+  return (
+    <div className="rounded-xl p-4" style={cardStyle}>
+      <div className="flex items-baseline justify-between mb-3">
+        <div className="text-sm font-semibold" style={{ color: "var(--text-2)" }}>
+          Containers{u.containers.length ? ` (${u.containers.length})` : ""}
+        </div>
+        <div className="text-[11px]" style={muted}>
+          {u.host_metrics.collected_at
+            ? `collected ${Math.round(u.host_metrics.age_seconds ?? 0)}s ago`
+            : ""}
+        </div>
+      </div>
+      {u.containers_error && (
+        <div className="text-xs mb-2" style={{ color: "var(--bad, #b3261e)" }}>{u.containers_error}</div>
+      )}
+      {!u.containers.length ? (
+        <div className="text-xs" style={muted}>No container data.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs tabular-nums">
+            <thead>
+              <tr className="text-left" style={muted}>
+                <th className="py-1 pr-3 font-medium">Container</th>
+                <th className="py-1 pr-3 font-medium">Status</th>
+                <th className="py-1 pr-3 font-medium text-right">CPU</th>
+                <th className="py-1 pr-3 font-medium text-right">Memory</th>
+                {/* Docker's PIDs count includes threads: discord-listener is 16 processes, ~180 tasks. */}
+                <th className="py-1 pr-3 font-medium text-right" title="Processes and threads (Docker's PIDs count)">Tasks</th>
+                <th className="py-1 pr-3 font-medium text-right">Net in / out</th>
+                <th className="py-1 font-medium text-right">Restarts</th>
+              </tr>
+            </thead>
+            <tbody>
+              {u.containers.map((c) => (
+                <tr key={c.name} style={{ borderTop: "1px solid var(--border)" }}>
+                  <td className="py-1.5 pr-3 font-medium">{c.service ?? c.name}</td>
+                  <td className="py-1.5 pr-3" style={{ color: healthColor(c) }}>
+                    {c.state ?? "?"}{c.health ? ` · ${c.health}` : ""}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right">{c.cpu_percent == null ? "—" : `${c.cpu_percent.toFixed(1)}%`}</td>
+                  <td className="py-1.5 pr-3 text-right">
+                    {c.mem_used == null ? "—" : `${fmtBytes(c.mem_used)}${c.mem_limit ? ` / ${fmtBytes(c.mem_limit)}` : ""}`}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right">{c.pids ?? "—"}</td>
+                  <td className="py-1.5 pr-3 text-right">
+                    {c.net_recv == null ? "—" : `${fmtBytes(c.net_recv)} / ${fmtBytes(c.net_sent ?? 0)}`}
+                  </td>
+                  <td className="py-1.5 text-right">{c.restarts}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="text-[11px] mt-2" style={muted}>
+        Backend container&apos;s own traffic (incl. database/Redis, not just internet):{" "}
+        {fmtBytes(u.backend_container_network.bytes_recv)} in / {fmtBytes(u.backend_container_network.bytes_sent)} out.
+      </div>
+    </div>
+  );
+}
+
 export default function SystemUsagePage() {
   const [u, setU] = useState<Usage | null>(null);
   const [err, setErr] = useState(false);
@@ -186,7 +285,8 @@ export default function SystemUsagePage() {
         <div>
           <h2 className="text-xl font-bold">System · Usage</h2>
           <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
-            Live CPU, memory and disk for this server{u ? ` — ${u.hostname}` : ""}.
+            Live CPU, memory and disk for this server
+            {u ? ` — ${u.hostname}${u.hostname_scope === "container" ? " (container)" : ""}` : ""}.
             {u && <> Updated {new Date(u.sampled_at).toLocaleTimeString()}.</>}
           </p>
         </div>
@@ -204,6 +304,13 @@ export default function SystemUsagePage() {
       {err && !u && (
         <div className="rounded-xl p-4 text-sm" style={{ background: "var(--panel-2)", border: "1px solid var(--bad, #b3261e)", color: "var(--bad, #b3261e)" }}>
           Couldn&apos;t reach the server telemetry endpoint.
+        </div>
+      )}
+
+      {u && !u.host_metrics.available && (
+        <div className="rounded-xl p-3 text-xs" style={{ background: "var(--panel-2)", border: "1px solid #b45309", color: "#b45309" }}>
+          Host network, process count and container stats unavailable
+          ({u.host_metrics.reason ?? "no data"}). CPU, memory, disk, swap and uptime below are still the host&apos;s.
         </div>
       )}
 
@@ -260,20 +367,41 @@ export default function SystemUsagePage() {
               </div>
             </div>
             <div className={card} style={cardStyle}>
-              <div className="text-xs" style={{ color: "var(--muted)" }}>Processes</div>
-              <div className="text-lg font-semibold mt-1 tabular-nums">{u.process_count.toLocaleString()}</div>
+              <div className="text-xs" style={{ color: "var(--muted)" }}>Processes (host)</div>
+              <div className="text-lg font-semibold mt-1 tabular-nums">
+                {u.process_count == null ? "—" : u.process_count.toLocaleString()}
+              </div>
             </div>
             <div className={card} style={cardStyle}>
-              <div className="text-xs" style={{ color: "var(--muted)" }}>Network out (since boot)</div>
-              <div className="text-lg font-semibold mt-1 tabular-nums">{fmtBytes(u.network.bytes_sent)}</div>
+              <div className="text-xs" style={{ color: "var(--muted)" }}>
+                Network out (host{u.network?.interface ? ` ${u.network.interface}` : ""}, since boot)
+              </div>
+              <div className="text-lg font-semibold mt-1 tabular-nums">
+                {u.network ? fmtBytes(u.network.bytes_sent) : "—"}
+              </div>
             </div>
             <div className={card} style={cardStyle}>
-              <div className="text-xs" style={{ color: "var(--muted)" }}>Network in (since boot)</div>
-              <div className="text-lg font-semibold mt-1 tabular-nums">{fmtBytes(u.network.bytes_recv)}</div>
+              <div className="text-xs" style={{ color: "var(--muted)" }}>
+                Network in (host{u.network?.interface ? ` ${u.network.interface}` : ""}, since boot)
+              </div>
+              <div className="text-lg font-semibold mt-1 tabular-nums">
+                {u.network ? fmtBytes(u.network.bytes_recv) : "—"}
+              </div>
             </div>
           </div>
+
+          <ContainersCard u={u} />
         </>
       )}
+
+      {/* own slow timer; independent of the live usage above */}
+      <StorageSection />
+
+      <LogsSection />
+
+      <AwsCostSection />
+
+      <SmsCostSection />
     </div>
   );
 }

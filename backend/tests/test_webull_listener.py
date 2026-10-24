@@ -128,8 +128,9 @@ def test_safe_poll_interval_respects_rate_limit():
         in_window = math.floor(WINDOW_S / gap) + 1
         assert in_window <= WINDOW_CAP, (n, gap, in_window)
 
-    # and it must not have become gratuitously slow in the other direction
-    assert wl._safe_poll_interval(1) <= 6.0
+    # A backstop to the live events stream, so a 15s default — never slower
+    # than that for a single account.
+    assert wl._safe_poll_interval(1) <= 15.0
 
 
 def test_order_fingerprint_catches_modify():
@@ -342,3 +343,119 @@ def test_either_id_still_finds_the_row():
     src = inspect.getsource(wl.find_placed_order)
     assert "or_(" in src                      # matched on EITHER id
     assert 'i.replace("-", "")' in src        # and both dash spellings
+
+
+# ── subscribeType is a BITMASK, not an enum ─────────────────────────────────
+#
+# Webull Support told us twice, and the second answer was the right one:
+#
+#   1 (0b001)  order events — EQUITIES ONLY
+#   2 (0b010)  position events
+#   4 (0b100)  option / PnL events
+#
+# We believed the first answer ("1 is the only supported value"), forced 1, and
+# the gateway silently filtered out every OPTION event. The stream
+# authenticated, echoed "subscribeType: 1" back, sent Pings forever and
+# delivered nothing — 193 orders over 48h produced zero frames — because this
+# account trades options. On an options book that is indistinguishable from the
+# push scope being switched off, which is exactly what we spent two months
+# believing.
+
+def test_subscribe_mask_includes_options():
+    """ORDER events for OPTIONS arrive under 4, not 1. Subscribing with 1 alone
+    is what made an options account look like a dead stream."""
+    from app.services import webull_listener as wl
+    assert wl._SUBSCRIBE_ALL == 7
+    assert wl._SUBSCRIBE_ALL & wl._SUB_OPTIONS_PNL, \
+        "without bit 4 no option order event is ever delivered"
+    assert wl._SUBSCRIBE_ALL & wl._SUB_ORDERS_EQUITY, "equity orders still needed"
+
+
+def test_build_request_sends_the_full_mask():
+    """Pin the wire value — this is the single line that caused the outage."""
+    import inspect
+    from app.services import webull_listener as wl
+    src = inspect.getsource(wl._build_stoppable_client)
+    assert "subscribeType=_SUBSCRIBE_ALL" in src
+    assert "subscribeType=1" not in src, "forcing 1 filters out every option event"
+
+
+def test_non_order_frames_do_not_enter_the_order_path():
+    """With the full mask, POSITION and PnL frames arrive alongside orders. They
+    carry no order_id, and every step below — status mapping, dedup by
+    broker_order_id, fanout — is meaningless without one."""
+    import uuid as _uuid
+    from app.services import webull_listener as wl
+
+    seen = []
+    saved = wl._persist_and_fanout
+    wl._persist_and_fanout = lambda *a, **k: seen.append(a)
+    saved_shadow = wl._shadow
+    wl._shadow = lambda: False
+    try:
+        tid, aid = _uuid.uuid4(), _uuid.uuid4()
+        wl._generation[tid] = 1
+        # A position frame: no order_id.
+        wl._on_order_event(tid, aid, 1, {}, {"symbol": "NIO", "quantity": "2"},
+                           event_type="POSITION", subscribe_type=2)
+        assert seen == [], "a position frame must not be treated as an order"
+        # An option ORDER frame: has one, and must still flow.
+        wl._on_order_event(tid, aid, 1, {},
+                           {"order_id": "WB1", "symbol": "SPY",
+                            "order_status": "FILLED", "category": "US_OPTION"},
+                           event_type="ORDER", subscribe_type=4)
+        assert len(seen) == 1, "an option order frame must reach the order path"
+    finally:
+        wl._persist_and_fanout = saved
+        wl._shadow = saved_shadow
+        wl._generation.pop(tid, None)
+
+
+def test_stream_and_poll_frames_are_distinguishable_in_the_log():
+    """A poller frame was once read as proof the gRPC stream had come back.
+
+    The two reach _on_order_event identically — the only difference is that the
+    stream passes eventType/subscribeType and the poller calls positionally,
+    leaving both None. The log has to say which, or "is the stream working?"
+    stays unanswerable from the logs.
+    """
+    import logging
+    import uuid as _uuid
+    from app.services import webull_listener as wl
+
+    wl._seen_event_shapes.clear()
+    saved_persist, saved_shadow = wl._persist_and_fanout, wl._shadow
+    wl._persist_and_fanout = lambda *a, **k: None
+    wl._shadow = lambda: False
+    tid, aid = _uuid.uuid4(), _uuid.uuid4()
+    wl._generation[tid] = 1
+    records: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, r): records.append(r.getMessage())
+
+    h = _Cap()
+    wl.log.addHandler(h)
+    wl.log.setLevel(logging.INFO)
+    try:
+        order = {"order_id": "WB1", "symbol": "QQQ", "side": "BUY",
+                 "order_status": "FILLED", "filled_qty": "5", "filled_price": "0.52"}
+        # From the REST poller: called positionally, no event metadata.
+        wl._on_order_event(tid, aid, 1, {}, order)
+        # From the gRPC stream.
+        wl._on_order_event(tid, aid, 1, {}, order,
+                           event_type=1024, subscribe_type=1)
+    finally:
+        wl.log.removeHandler(h)
+        wl._persist_and_fanout, wl._shadow = saved_persist, saved_shadow
+        wl._generation.pop(tid, None)
+
+    joined = "\n".join(records)
+    assert "first poll frame" in joined, "a poller frame must be labelled poll"
+    assert "first stream frame" in joined, "a stream frame must be labelled stream"
+    # And every stream frame gets its own line, not just the first of its shape.
+    stream_lines = [r for r in records if "STREAM" in r]
+    assert len(stream_lines) == 1, "the stream frame logs once, per frame"
+    assert "QQQ" in stream_lines[0] and "WB1" in stream_lines[0]
+    assert not any("STREAM" in r and "poll" in r for r in records), \
+        "a poller frame must never be reported as a stream frame"

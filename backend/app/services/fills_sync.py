@@ -13,20 +13,24 @@ Caller commits the session.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.brokers import adapter_for
 from app.brokers.alpaca import AlpacaAdapter, _looks_like_occ, _parse_occ
+from app.database import release_connection
 from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
+from app.services import order_intent
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -93,7 +97,131 @@ _NON_TERMINAL_STATUSES = (
 )
 
 
-def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
+# How far back repair_unrecorded_fills looks. A fill older than this is left
+# alone: the repair is for the gap a confirmation left today, not an archive scan.
+_REPAIR_WINDOW = timedelta(hours=24)
+# At most this many broker reads per call, so a backlog cannot eat a
+# rate-limited broker's budget (direct Webull: ~10 requests / 30s).
+_REPAIR_MAX_READS = 3
+# An order the broker still cannot report as filled after this long is stamped
+# closed and left alone.
+_REPAIR_GIVE_UP = timedelta(hours=1)
+
+
+def repair_unrecorded_fills(db: Session, acct: BrokerAccount, adapter: Any) -> int:
+    """Fill in the price and time of orders we marked FILLED without them.
+
+    A sell confirmed by exit_confirm used to be recorded FILLED with no price and
+    no close time, and an order the sweep above never re-reads (it is terminal)
+    stayed that way: Closed today, which picks a day's sells by fill/close time,
+    and realized P&L both left it out. Each such order is read from the broker
+    once — the close time is stamped whether or not a price comes back, so it is
+    never read again.
+    """
+    from app.services.exit_confirm import record_fill_details  # noqa: PLC0415
+
+    rows = list(db.execute(
+        select(Order).where(
+            Order.broker_account_id == acct.id,
+            Order.status == OrderStatus.FILLED,
+            Order.closed_at.is_(None),
+            Order.broker_order_id.isnot(None),
+            Order.created_at >= datetime.now(timezone.utc) - _REPAIR_WINDOW,
+        ).order_by(Order.created_at).limit(_REPAIR_MAX_READS)
+    ).scalars())
+    repaired = 0
+    now = datetime.now(timezone.utc)
+    for order in rows:
+        try:
+            res = adapter.get_order(order.broker_order_id)
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: repair read of %s failed", order.id, exc_info=True)
+            res = None
+        if getattr(res, "status", None) != OrderStatus.FILLED:
+            # Unreadable, or the broker no longer says filled. Retried on later
+            # ticks for a while (a read can fail on a rate limit), then given up
+            # so one order the broker cannot find does not spend every tick.
+            created = order.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created is not None and now - created > _REPAIR_GIVE_UP:
+                order.closed_at = now
+                repaired += 1
+            continue
+        record_fill_details(order, res)
+        repaired += 1
+        log.info("fills_sync: recorded the fill of %s %s (price %s)",
+                 order.symbol, order.id, order.filled_avg_price)
+    repaired += _repair_cancelled_sells(db, acct, adapter, _REPAIR_MAX_READS - len(rows), now)
+    if repaired:
+        db.flush()
+    return repaired
+
+
+def _repair_cancelled_sells(db: Session, acct: BrokerAccount, adapter: Any,
+                            budget: int, now: datetime) -> int:
+    """Ask the broker once about each limit sell we recorded CANCELED with
+    nothing traded and no close time — the mark of a cancel we recorded
+    ourselves (an end the broker reports stamps a close time).
+
+    A take-profit can fill in the moment it is cancelled, and a cancel the
+    broker could not confirm was recorded as a cancel: QA 2026-10-19, QQQ 722P —
+    Trim 1 sold 8 @ 1.22 at Webull, and the sale was missing from the timeline,
+    Closed today and the day's P&L. A fill found is recorded as a fill; anything
+    else is stamped closed, so each order is read once.
+    """
+    from app.services.exit_confirm import _filled_quantity, record_fill_details  # noqa: PLC0415
+
+    if budget <= 0:
+        return 0
+    rows = list(db.execute(
+        select(Order).where(
+            Order.broker_account_id == acct.id,
+            Order.status == OrderStatus.CANCELED,
+            Order.side == OrderSide.SELL,
+            Order.order_type == OrderType.LIMIT,
+            Order.closed_at.is_(None),
+            Order.broker_order_id.isnot(None),
+            func.coalesce(Order.filled_quantity, 0) == 0,
+            Order.created_at >= now - _REPAIR_WINDOW,
+        ).order_by(Order.created_at.desc()).limit(budget)
+    ).scalars())
+    repaired = 0
+    for order in rows:
+        try:
+            res = adapter.get_order(order.broker_order_id)
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: re-read of cancelled %s failed", order.id, exc_info=True)
+            res = None
+        status = getattr(res, "status", None)
+        if status is None:
+            created = order.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created is not None and now - created > _REPAIR_GIVE_UP:
+                order.closed_at = now
+                repaired += 1
+            continue
+        got = _filled_quantity(res)
+        if status == OrderStatus.FILLED or got > 0:
+            if got > 0:
+                order.filled_quantity = got
+            if status == OrderStatus.FILLED:
+                order.status = OrderStatus.FILLED
+            record_fill_details(order, res)
+            log.warning("fills_sync: %s %s was recorded cancelled but %s at the broker "
+                        "(%s @ %s) — recorded the fill",
+                        order.symbol, order.id, getattr(status, "value", status),
+                        order.filled_quantity, order.filled_avg_price)
+        else:
+            order.closed_at = now
+        repaired += 1
+    return repaired
+
+
+def _refresh_open_orders(
+    db: Session, acct: BrokerAccount, adapter: Any, changed_out: "list[Order] | None" = None,
+) -> int:
     """Poll the broker's order endpoint for every non-terminal order on this
     account. Alpaca's order resource updates instantly on fill, while the
     activities feed can lag minutes. This keeps Order History fresh without
@@ -216,6 +344,8 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
                 dead_entries.append(order)
         if changed:
             refreshed += 1
+            if changed_out is not None:
+                changed_out.append(order)
 
     for order in newly_closed:
         try:
@@ -232,41 +362,84 @@ def _refresh_open_orders(db: Session, acct: BrokerAccount, adapter: Any) -> int:
                 "fills_sync: position.auto_closed publish failed for order=%s", order.id
             )
 
-    # Deferred-close hook (own sessions inside): a subscriber entry that just
-    # FILLED fires any close parked behind it; one that DIED cancels it.
+    # Deferred-close hook: a subscriber entry that just FILLED fires any close
+    # parked behind it; one that DIED cancels it. Run after the caller commits,
+    # off this thread — see _queue_entry_hooks.
     if filled_entries or dead_entries:
-        from app.services import copy_engine  # noqa: PLC0415
-        from app.services import events as _events  # noqa: PLC0415
-        for e in filled_entries:
-            # A mirror entry just filled → a new open position exists. The
-            # subscriber has no real-time listener, so this poll is the only
-            # place that fill is seen; publish order.placed (the same event the
-            # trader websocket emits on fill, and the one the positions table
-            # already refreshes on) so the position shows up live instead of
-            # only after a manual reload.
-            try:
-                _events.publish(e.user_id, copy_engine._order_event("order.placed", e))  # noqa: SLF001
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: order.placed publish failed for entry=%s", e.id)
-            try:
-                copy_engine.fire_deferred_closes_for_entry(e)
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: fire deferred closes failed for entry=%s", e.id)
-        for e in dead_entries:
-            try:
-                copy_engine.cancel_deferred_closes_for_entry(e)
-            except Exception:  # noqa: BLE001
-                log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
+        _queue_entry_hooks(db, filled_entries, dead_entries)
     return refreshed
 
 
-def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
+# The entry hooks open their own sessions. Run inline they made the caller —
+# holding a pool connection and, via sync_user_fills, the per-user advisory
+# lock — wait on a SECOND connection. QA 2026-10-21: requests queued on that
+# lock filled the pool, so each hook sat out pool_timeout while still holding
+# the lock, and the web tier 500'd until restart. Queued on the session and run
+# in a thread once its transaction commits; dropped on rollback, so the next
+# sweep sees the transition again.
+_ENTRY_HOOKS = "fills_sync.entry_hooks"
+
+
+def _queue_entry_hooks(db: Session, filled: "list[Order]", dead: "list[Order]") -> None:
+    # Column snapshots: the rows expire at commit and must not lazy-load
+    # through the caller's session from another thread.
+    def snap(o: Order) -> SimpleNamespace:
+        return SimpleNamespace(**{c.key: getattr(o, c.key) for c in Order.__mapper__.column_attrs})
+
+    q = db.info.setdefault(_ENTRY_HOOKS, ([], []))
+    q[0].extend(snap(e) for e in filled)
+    q[1].extend(snap(e) for e in dead)
+
+
+@event.listens_for(Session, "after_commit")
+def _entry_hooks_after_commit(session: Session) -> None:
+    if session.in_nested_transaction():
+        return
+    q = session.info.pop(_ENTRY_HOOKS, None)
+    if q:
+        threading.Thread(target=_run_entry_hooks, args=q, daemon=True,
+                         name="fills-entry-hooks").start()
+
+
+@event.listens_for(Session, "after_rollback")
+def _entry_hooks_after_rollback(session: Session) -> None:
+    if not session.in_nested_transaction():
+        session.info.pop(_ENTRY_HOOKS, None)
+
+
+def _run_entry_hooks(filled: "list[Any]", dead: "list[Any]") -> None:
+    from app.services import copy_engine  # noqa: PLC0415
+    from app.services import events as _events  # noqa: PLC0415
+    for e in filled:
+        # A mirror entry just filled → a new open position exists. The
+        # subscriber has no real-time listener, so this poll is the only
+        # place that fill is seen; publish order.placed (the same event the
+        # trader websocket emits on fill, and the one the positions table
+        # already refreshes on) so the position shows up live instead of
+        # only after a manual reload.
+        try:
+            _events.publish(e.user_id, copy_engine._order_event("order.placed", e))  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: order.placed publish failed for entry=%s", e.id)
+        try:
+            copy_engine.fire_deferred_closes_for_entry(e)
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: fire deferred closes failed for entry=%s", e.id)
+    for e in dead:
+        try:
+            copy_engine.cancel_deferred_closes_for_entry(e)
+        except Exception:  # noqa: BLE001
+            log.exception("fills_sync: cancel deferred closes failed for entry=%s", e.id)
+
+
+def sync_account_fills(db: Session, acct: BrokerAccount, adapter: Any = None) -> SyncResult:
     """Pull activities for `acct` from its broker and upsert fills locally.
-    Idempotent — re-runs are safe."""
-    creds = decrypt_json(acct.encrypted_credentials)
-    adapter = adapter_for(acct, creds)
-    if not isinstance(adapter, AlpacaAdapter):
-        return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
+    Idempotent — re-runs are safe. ``adapter`` may be a _Prefetched one, so
+    the writes here run without broker I/O (see sync_user_fills)."""
+    if adapter is None:
+        adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        if not isinstance(adapter, AlpacaAdapter):
+            return SyncResult(fills_added=0, orders_added=0, activities_seen=0, skipped=0)
 
     # Fast path: refresh status/qty/price for orders we placed that haven't
     # terminalized yet. Catches fills the moment they happen, instead of
@@ -373,6 +546,13 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
             # window). We deliberately DON'T add activity_id to `existing`, so
             # the next sync re-processes it.
             if (datetime.now(timezone.utc) - trade_at) < _SYNTH_ORDER_GRACE:
+                skipped += 1
+                continue
+            # Already recorded for ANOTHER user on this same brokerage account
+            # (a subscriber's mirror, or the other holder's own trade): not ours.
+            # Synthesizing it gave a trader a phantom order that the listener's
+            # backfill then fanned out, and double-counted shared-account P&L.
+            if order_intent.is_mirror_echo(db, acct.user_id, acct.id, broker_oid, None):
                 skipped += 1
                 continue
             order = Order(
@@ -503,18 +683,121 @@ def sync_account_fills(db: Session, acct: BrokerAccount) -> SyncResult:
     )
 
 
-def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
-    """Sync every connected broker for one app user."""
-    # Serialize concurrent fills-sync for the SAME user. Every calendar and
-    # positions load triggers this, so two requests can run it at once and race
-    # the check-then-insert in sync_account_fills, each synthesizing the same
-    # external order — the root cause of duplicate FILLED rows that double-count
-    # realized P&L. This transaction-scoped advisory lock makes the second wait;
-    # under READ COMMITTED its later SELECT then sees the first's committed row
-    # and updates it instead of inserting. Auto-released at transaction end.
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-               {"k": f"fills_sync:{user_id}"})
+# A user's sync is claimed in Redis for its whole run, broker reads included,
+# so concurrent page loads skip it without holding a DB connection. Outlives a
+# crashed holder by at most this long.
+_CLAIM_TTL_S = 120
+_RELEASE_CLAIM = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) end return 0"
+)
+_IN_PROGRESS = {"per_account": [], "fills_added": 0, "orders_added": 0, "in_progress": True}
 
+
+def _claim_key(user_id: uuid.UUID) -> str:
+    return f"fills_sync:claim:{user_id}"
+
+
+def _claim_sync(user_id: uuid.UUID) -> "tuple[bool, str | None]":
+    """(False, None): another sync for this user is running. Redis down →
+    (True, None): run unclaimed; the write-phase advisory lock still keeps
+    two syncs from writing the same rows."""
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    token = uuid.uuid4().hex
+    try:
+        if get_sync_redis().set(_claim_key(user_id), token, nx=True, ex=_CLAIM_TTL_S):
+            return True, token
+        return False, None
+    except Exception:  # noqa: BLE001
+        log.debug("fills_sync: redis claim unavailable", exc_info=True)
+        return True, None
+
+
+def _release_claim(user_id: uuid.UUID, token: str) -> None:
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    try:
+        get_sync_redis().eval(_RELEASE_CLAIM, 1, _claim_key(user_id), token)
+    except Exception:  # noqa: BLE001
+        log.debug("fills_sync: redis claim release failed", exc_info=True)
+
+
+class _Prefetched:
+    """An account's broker reads, taken before the write phase opens a
+    transaction, served to _refresh_open_orders / sync_account_fills from
+    memory."""
+
+    def __init__(self, orders: "dict[str, Any]", activities: list):
+        self._orders = orders
+        self._activities = activities
+
+    def get_orders_snapshot(self) -> "dict[str, Any]":
+        return self._orders
+
+    def get_order(self, broker_order_id: str) -> Any:
+        if broker_order_id not in self._orders:
+            raise LookupError(f"order {broker_order_id} not read this sync")
+        return self._orders[broker_order_id]
+
+    def list_recent_activities(self) -> list:
+        return self._activities
+
+
+def _prefetch(adapter: Any, open_ids: "list[str]") -> _Prefetched:
+    # Same reads the inline sweep made: one snapshot when there is more than
+    # one order to check, get_order for anything it missed.
+    orders: dict[str, Any] = {}
+    batch = getattr(adapter, "get_orders_snapshot", None)
+    if len(open_ids) > 1 and batch is not None:
+        try:
+            orders.update(batch() or {})
+        except Exception:  # noqa: BLE001
+            log.warning("fills_sync: batch order snapshot failed — per-order reads", exc_info=True)
+    for boid in open_ids:
+        if boid not in orders:
+            try:
+                orders[boid] = adapter.get_order(boid)
+            except Exception:  # noqa: BLE001
+                continue  # stale/cancelled id — as before, not worth failing the sync
+    return _Prefetched(orders, adapter.list_recent_activities())
+
+
+def _account_row(acct: BrokerAccount, res: "SyncResult | None" = None,
+                 exc: "Exception | None" = None) -> dict[str, Any]:
+    row: dict[str, Any] = {"broker_account_id": str(acct.id), "broker": acct.broker.value}
+    if exc is not None:
+        row["error"] = str(exc)[:300]
+    elif res is not None:
+        row.update(fills_added=res.fills_added, orders_added=res.orders_added, skipped=res.skipped)
+    return row
+
+
+def sync_user_fills(
+    db: Session, user_id: uuid.UUID, min_interval: timedelta | None = None,
+) -> dict[str, Any]:
+    """Sync every connected broker for one app user.
+
+    ``min_interval`` skips an account synced more recently than that (by any
+    process — the worker's poller stamps the same column).
+
+    Ends ``db``'s open transaction: the broker reads run with no pooled
+    connection checked out, between a short read and a short write."""
+    # One fills-sync per user at a time. Every calendar and positions load
+    # triggers this; a second one skips rather than waits (QA 2026-10-21: page
+    # loads queued behind a slow sync ran the pool dry).
+    claimed, token = _claim_sync(user_id)
+    if not claimed:
+        log.info("fills_sync: sync for user=%s already running — skipped", user_id)
+        return dict(_IN_PROGRESS)
+    try:
+        return _sync_user_fills(db, user_id, min_interval)
+    finally:
+        if token is not None:
+            _release_claim(user_id, token)
+
+
+def _sync_user_fills(db: Session, user_id: uuid.UUID, min_interval: timedelta | None) -> dict[str, Any]:
     accts = list(db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == user_id,
@@ -524,26 +807,63 @@ def sync_user_fills(db: Session, user_id: uuid.UUID) -> dict[str, Any]:
     ).scalars())
 
     per_account: list[dict[str, Any]] = []
+    plans: list[tuple[BrokerAccount, Any, list[str]]] = []
+    now = datetime.now(timezone.utc)
+    for acct in accts:
+        last = acct.last_activity_sync_at
+        if min_interval is not None and last is not None:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if now - last < min_interval:
+                continue
+        try:
+            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        except Exception as exc:  # noqa: BLE001
+            per_account.append(_account_row(acct, exc=exc))
+            continue
+        if not isinstance(adapter, AlpacaAdapter):
+            per_account.append(_account_row(acct, SyncResult(0, 0, 0, 0)))
+            continue
+        open_ids = list(db.execute(
+            select(Order.broker_order_id).where(
+                Order.broker_account_id == acct.id,
+                Order.status.in_(_NON_TERMINAL_STATUSES),
+                Order.broker_order_id.isnot(None),
+            )
+        ).scalars())
+        plans.append((acct, adapter, open_ids))
+
+    fetched: list[tuple[BrokerAccount, _Prefetched]] = []
+    if plans:
+        release_connection(db)
+        for acct, adapter, open_ids in plans:
+            try:
+                fetched.append((acct, _prefetch(adapter, open_ids)))
+            except Exception as exc:  # noqa: BLE001
+                per_account.append(_account_row(acct, exc=exc))
+
     total_fills = 0
     total_orders = 0
-    for acct in accts:
-        try:
-            res = sync_account_fills(db, acct)
-            per_account.append({
-                "broker_account_id": str(acct.id),
-                "broker": acct.broker.value,
-                "fills_added": res.fills_added,
-                "orders_added": res.orders_added,
-                "skipped": res.skipped,
-            })
+    if fetched:
+        # The check-then-insert that synthesizes external orders must not run
+        # twice at once — duplicate FILLED rows double-count realized P&L. The
+        # Redis claim normally guarantees that; this covers Redis being down.
+        # Only DB work happens under it, so it is held for milliseconds.
+        got = db.execute(text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"),
+                         {"k": f"fills_sync:{user_id}"}).scalar()
+        if not got:
+            log.info("fills_sync: another sync for user=%s is writing — skipped", user_id)
+            return dict(_IN_PROGRESS)
+        db.execute(text("SET LOCAL idle_in_transaction_session_timeout = '60s'"))
+        for acct, pre in fetched:
+            try:
+                res = sync_account_fills(db, acct, pre)
+            except Exception as exc:  # noqa: BLE001
+                per_account.append(_account_row(acct, exc=exc))
+                continue
+            per_account.append(_account_row(acct, res))
             total_fills += res.fills_added
             total_orders += res.orders_added
-        except Exception as exc:  # noqa: BLE001
-            per_account.append({
-                "broker_account_id": str(acct.id),
-                "broker": acct.broker.value,
-                "error": str(exc)[:300],
-            })
 
     return {
         "per_account": per_account,

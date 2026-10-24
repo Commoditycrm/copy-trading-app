@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
+    subscriber_symbols,
     admin as admin_api,
     auth,
     brokers,
@@ -21,8 +22,10 @@ from app.api import (
     performance,
     positions,
     settings,
+    sms_costs as sms_costs_api,
     subscribers,
     system as system_api,
+    paper_autotrade as paper_autotrade_api,
     trades,
     ui_prefs,
 )
@@ -129,9 +132,38 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Count every Webull request and tag it with the page / API route that made
+    # it (services/webull_usage.py). Background loops tag themselves.
+    from app.services import webull_usage
+
+    webull_usage.install()
+
+    # Keep a history of every position's stop for the Position summary
+    # (services/position_events.py).
+    from app.services import position_events
+
+    position_events.install()
+
+    # Tell the owner (in-app, and by text when they turned texts on) when the
+    # broker rejects an order it had already accepted
+    # (services/rejection_alerts.py).
+    from app.services import rejection_alerts
+
+    rejection_alerts.install()
+
+    @app.middleware("http")
+    async def _tag_webull_caller(request, call_next):  # noqa: ANN001, ANN202
+        token = webull_usage.set_request_caller(request.method, request.url.path)
+        try:
+            return await call_next(request)
+        finally:
+            webull_usage.reset_request_caller(token)
+
     app.include_router(admin_api.router)
     app.include_router(auth.router)
     app.include_router(brokers.router)
+    from app.api import ibkr_gateway as ibkr_gateway_api  # noqa: PLC0415
+    app.include_router(ibkr_gateway_api.router)
     app.include_router(discord_sources.router)
     app.include_router(trades.router)
     app.include_router(settings.router)
@@ -145,7 +177,10 @@ def create_app() -> FastAPI:
     app.include_router(market_data_api.router)
     app.include_router(notifications_api.router)
     app.include_router(system_api.router)
+    app.include_router(paper_autotrade_api.router)
     app.include_router(ui_prefs.router)
+    app.include_router(sms_costs_api.router)
+    app.include_router(subscriber_symbols.router)
 
     # Shared across the startup/shutdown hooks so the retry scheduler
     # thread can be signalled to exit cleanly when uvicorn shuts down.
@@ -176,6 +211,22 @@ def create_app() -> FastAPI:
                 thread_name_prefix="fanout",
             )
         )
+
+        # Carry any admin override that still lives only in Redis into the
+        # database. Redis is a cache for these (no persistence, LRU eviction),
+        # so without this the first deploy of DB-backed knobs would look exactly
+        # like the bug it fixes: every polling setting silently back at its env
+        # default. Idempotent and never overwrites an existing row, so running
+        # it in every web worker is harmless.
+        try:
+            from app.services.platform_config import (  # noqa: PLC0415
+                backfill_overrides_from_cache,
+            )
+            carried = await asyncio.to_thread(backfill_overrides_from_cache)
+            if carried:
+                log.info("platform config: carried %d override(s) into the database", carried)
+        except Exception:  # noqa: BLE001
+            log.exception("platform config: override backfill failed — defaults still apply")
 
         # ── Web/worker split ──────────────────────────────────────────────
         # Background singletons (broker listeners, P&L poller, retry
@@ -322,6 +373,16 @@ def create_app() -> FastAPI:
             except Exception:  # noqa: BLE001
                 log.exception("failed to start webull subscriber reconciler")
 
+        # IBKR subscriber mirror-status reconciler — same shape as the Alpaca
+        # and Webull ones. IBKR subscriber accounts have no listener, so this
+        # is the only thing that moves their mirrors from SUBMITTED to
+        # FILLED / CANCELED. Worker-only.
+        try:
+            from app.services import ibkr_subscriber_reconciler
+            ibkr_subscriber_reconciler.start_ibkr_subscriber_reconciler()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to start ibkr subscriber reconciler")
+
         # Start the retry scheduler in a daemon thread. It polls every 10s
         # for RETRY_PENDING orders whose retry_at has elapsed and runs the
         # broker call again. Daemon=True so the thread doesn't keep
@@ -359,6 +420,18 @@ def create_app() -> FastAPI:
             daemon=True,
         ).start()
 
+        # Rejected-trade texts: sends what services/rejected_trade_sms queued
+        # and reads Twilio's delivery status back. Only with the flag on, so
+        # an environment without it runs exactly as before.
+        if get_settings().rejected_trade_sms_enabled:
+            from app.services import sms_outbox
+            threading.Thread(
+                target=sms_outbox.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="sms-outbox",
+                daemon=True,
+            ).start()
+
         # Discord entry reprice: a buy alert placed as a LIMIT can rest unfilled
         # while the contract moves, turning a good alert into a missed trade.
         # Gives such an entry ONE attempt at a higher price. Gated on the same
@@ -391,11 +464,32 @@ def create_app() -> FastAPI:
                 daemon=True,
             ).start()
 
+            # Trailing stops: raise the resting stop within a second or two of a
+            # new high, on Alpaca's live price, instead of on the P&L poller's
+            # 15s pass. Inert without a trailing stop on a live position.
+            from app.services import trail_ratchet
+            threading.Thread(
+                target=trail_ratchet.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="trail-ratchet",
+                daemon=True,
+            ).start()
+
             from app.services import discord_edit
             threading.Thread(
                 target=discord_edit.poll_loop,
                 kwargs={"shutdown_check": shutdown_event.is_set},
                 name="discord-edit-retry",
+                daemon=True,
+            ).start()
+
+            # Tell the trader (in-app + SMS) when their Discord channels stop
+            # being read — a channel error, or the whole listener going quiet.
+            from app.services import discord_watchdog
+            threading.Thread(
+                target=discord_watchdog.poll_loop,
+                kwargs={"shutdown_check": shutdown_event.is_set},
+                name="discord-watchdog",
                 daemon=True,
             ).start()
 
@@ -430,6 +524,9 @@ def create_app() -> FastAPI:
                        alpaca_subscriber_reconciler.stop_alpaca_subscriber_reconciler)
         await _bounded("webull subscriber reconciler",
                        webull_subscriber_reconciler.stop_webull_subscriber_reconciler)
+        from app.services import ibkr_subscriber_reconciler  # noqa: PLC0415
+        await _bounded("ibkr subscriber reconciler",
+                       ibkr_subscriber_reconciler.stop_ibkr_subscriber_reconciler)
         await _bounded("market_data_stream", market_data_stream.stop_market_data_stream)
         await _bounded("webull_market_stream", webull_market_stream.stop_webull_market_stream)
         await _bounded("redis client", close_async_redis)

@@ -1,0 +1,10 @@
+[Unit]
+Description=Kopyya: list clearable logs, run an admin's log-cleanup request, apply log retention
+After=docker.service
+
+[Service]
+Type=oneshot
+# KOPYYA_LOG_CLEANUP_ENABLED=true here turns dry runs into real cleanups
+EnvironmentFile=-/etc/kopyya/log-cleanup.env
+ExecStart=/usr/bin/python3 /usr/local/lib/kopyya/host_log_cleanup.py
+Nice=10

@@ -67,6 +67,8 @@ class _AutoTrimOn:
     def __getattr__(self, name):
         if name == "discord_auto_trim":
             return True
+        if name == "discord_manual_exit":
+            return False               # the dry run shows the ladder regardless
         return getattr(self._ts, name, None)
 
 
@@ -88,6 +90,7 @@ def simulate(ts, cfg: guards.TrimConfig, entry: Decimal, qty: Decimal,
     guard = SimpleNamespace(
         sell_count=0, entry_price=entry, stop_price=None, stop_order_id=None,
         trail_qty=None, trail_amount=None, peak_price=None, armed_at=None,
+        stop_trail_pct=None, stop_peak=None,
     )
     settings = ts if auto_trim._enabled(ts) else _AutoTrimOn(ts)
     held = qty
@@ -142,8 +145,7 @@ def simulate(ts, cfg: guards.TrimConfig, entry: Decimal, qty: Decimal,
 
         before_stop = guard.stop_price
         plan = guards.plan_exit(guard, held, price, cfg)
-        if plan.new_stop_price is not None:
-            guard.stop_price = plan.new_stop_price
+        guards.apply_stop(guard, plan)
         stop_text = (
             f" Stop on the rest moved to {_p(guard.stop_price)}."
             if guard.stop_price is not None and guard.stop_price != before_stop else ""

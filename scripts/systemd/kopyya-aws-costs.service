@@ -1,0 +1,21 @@
+[Unit]
+Description=Kopyya: QA AWS cost snapshot for the admin System page (Cost Explorer, read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Optional: QA_COST_TAG_KEY / QA_COST_TAG_VALUE / QA_COST_REGION. QA resources
+# are discovered from this instance's identity; nothing instance-specific here.
+EnvironmentFile=-/etc/kopyya/aws-costs.env
+ExecStart=/usr/bin/python3 /usr/local/lib/kopyya/aws_costs.py
+Nice=10
+# Root like the host-metrics unit (the output dir is root-owned), but it only
+# needs the network, the output directory and its own ledger.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StateDirectory=kopyya-aws-costs
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/kopyya-metrics

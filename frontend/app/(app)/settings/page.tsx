@@ -10,6 +10,8 @@ import { PageLoading } from "@/components/PageLoading";
 import { ConfirmModal } from "@/components/ConfirmModal";
 import { PercentInput } from "@/components/PercentInput";
 import { SmsNotificationsForm } from "@/components/settings/SmsNotificationsForm";
+import { SettingsModeSwitch } from "@/components/settings/SettingsModeSwitch";
+import { SymbolRules } from "@/components/settings/SymbolRules";
 import type { FollowRequest, RetryInterval, SubscriberSettings, TraderSettings, User } from "@/lib/types";
 
 const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
@@ -1022,6 +1024,17 @@ export default function SettingsPage() {
             </button>
           </div>
 
+          {/* ── Which settings are live ──────────────────────────────────
+              At the top because it decides what the rest of the page means.
+              Standard is the default and what every existing subscriber is
+              on. Choosing Advanced hands SIZING to the per-symbol rules —
+              the daily limits and auto-liquidation below keep working either
+              way, so they are never disabled. */}
+          <SettingsModeSwitch
+            advanced={!!sub.advanced_settings_enabled}
+            onChange={(next) => setSub(s => s ? { ...s, advanced_settings_enabled: next } : s)}
+          />
+
           {/* ── Traders (request · follow · unfollow in one list) ─────────
               One row per trader with a single contextual action reflecting the
               subscriber's exact state. Following requires the trader's approval;
@@ -1032,8 +1045,11 @@ export default function SettingsPage() {
             hint="Request to follow a trader, then mirror their trades. Approved requests start following automatically — turn on copy trading to begin mirroring."
           >
             {/* Copy-size multiplier — applies to whoever you follow. A slick
-                inline panel: live value badge on the left, picker + save right. */}
-            {(() => {
+                inline panel: live value badge on the left, picker + save right.
+                Hidden on Advanced settings: the multiplier comes from the
+                per-symbol rules there, and showing a second one that does
+                nothing is worse than showing none. */}
+            {!sub.advanced_settings_enabled && (() => {
               const isDirty = parseFloat(multInput) !== parseFloat(sub.multiplier);
               return (
                 <div
@@ -1066,9 +1082,12 @@ export default function SettingsPage() {
                     </p>
                   </div>
 
-                  {/* Picker + save */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <div className="w-[5.5rem]">
+                  {/* Picker + save. On phones the badge + hint already eat the
+                      row, so this group takes a full line of its own (w-full)
+                      with the picker stretching to fill it; from sm up it sits
+                      inline on the right as before. */}
+                  <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                    <div className="flex-1 sm:flex-none sm:w-[5.5rem]">
                       <SelectInput
                         value={multInput}
                         onChange={setMultInput}
@@ -1346,6 +1365,10 @@ export default function SettingsPage() {
                 pctConsumed={maxPctConsumed}
               />
 
+              {/* Hidden on Advanced settings: this cap is set per symbol there.
+                  Daily limits above are NOT hidden — they keep applying in both
+                  modes, because Advanced has no per-symbol equivalent. */}
+              {!sub.advanced_settings_enabled && (
               <LimitRow
                 accent="#3b82f6"
                 icon={<IconLayers />}
@@ -1366,16 +1389,21 @@ export default function SettingsPage() {
                 thresholdUsdDisplay="—"
                 headroomDisplay="—"
               />
+              )}
 
               {/* Below max per contract, and deliberately separate: that one
                   asks what a CONTRACT costs, this what the ORDER costs. A
                   cheap contract scaled up by the multiplier passes the first
                   and can still fail this one. */}
+              {/* Hidden on Advanced settings: this cap is set per symbol there.
+                  Daily limits above are NOT hidden — they keep applying in both
+                  modes, because Advanced has no per-symbol equivalent. */}
+              {!sub.advanced_settings_enabled && (
               <LimitRow
                 accent="#3b82f6"
                 icon={<IconLayers />}
                 title="Max per order"
-                subtitle={"Skips copying an entry when the whole order's value (quantity × price, × 100 for options) is above this amount. Applies to stocks as well as options — closing trades always go through."}
+                subtitle={"Keeps each copied entry's value (quantity × price, × 100 for options) under this amount: a larger entry is cut to what fits, priced at the market for a market order, and skipped only if not even one fits. Applies to stocks as well as options — closing trades always go through."}
                 todayLabel="—"
                 todayValue="—"
                 inputPrefix="USD"
@@ -1388,8 +1416,24 @@ export default function SettingsPage() {
                 thresholdUsdDisplay="—"
                 headroomDisplay="—"
               />
+              )}
             </div>
           </Card>
+
+          {/* ── Advanced: per-symbol settings ────────────────────────────
+              Everything above applies to every symbol. This is where one
+              symbol can differ — its own size now, its own exit ladder next.
+              Empty by default, so a subscriber who never opens it is on
+              exactly the settings they had before. */}
+          {sub.advanced_settings_enabled && (
+          <Card
+            icon={<IconLayers />}
+            title="Advanced settings"
+            hint="Give an individual symbol its own rules. Anything you don't set here keeps using your settings above."
+          >
+            <SymbolRules advanced={!!sub.advanced_settings_enabled} />
+          </Card>
+          )}
 
           {/* ── Position exits — SL/TP & auto-close, its own surface ──────
               Moved out of Risk Controls so the daily caps card holds only

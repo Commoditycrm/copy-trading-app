@@ -3,6 +3,7 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -15,9 +16,9 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.config import get_settings
-from app.database import SessionLocal, get_db
+from app.database import SessionLocal, get_db, release_connection
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import InstrumentType, Order, OrderSide, OrderStatus
+from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import (
@@ -26,16 +27,23 @@ from app.schemas.order import (
     DailyPnL,
     OrderOut,
     PlaceOrderIn,
+    ReEnterIn,
     TradeScopeStats,
     TradeStatsOut,
 )
 from app.schemas.pagination import Page
 from app.services import audit, copy_engine, events, excel_export, fills_sync, market_hours, trade_filters
 from app.services.crypto import decrypt_json
-from app.services.order_retry import is_order_conflict_error, live_closeable_quantity
+from app.services.order_retry import (
+    is_entry_blocked_by_opposite_order,
+    is_order_conflict_error,
+    live_closeable_quantity,
+)
 from app.services.pnl import (
     alpaca_marked_by_day, calendar_series, frozen_marked_by_day, realized_pnl_by_order,
 )
+
+from app.services.position_events import tagged as _tagged  # noqa: E402
 
 router = APIRouter(prefix="/api", tags=["trades"])
 
@@ -174,15 +182,103 @@ def _fill_channels(db: Session, by_id: dict) -> None:
 
     rows = db.execute(
         select(DiscordMessage.order_id, DiscordAlertSource.label,
-               DiscordAlertSource.channel_name)
+               DiscordAlertSource.channel_name, DiscordAlertSource.channel_id)
         .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id,
               isouter=True)
         .where(DiscordMessage.order_id.in_(list(by_id)))
     ).all()
-    for order_id, label, channel_name in rows:
+    via_self: set = set()
+    for order_id, label, channel_name, channel_id in rows:
         name = (label or "").strip() or (channel_name or "").strip()
         if name and order_id in by_id:
             by_id[order_id].discord_channel = name
+            if channel_id == "self":
+                via_self.add(order_id)
+    _fill_closing_channels(db, by_id, via_self)
+
+
+def _fill_closing_channels(db: Session, by_id: dict, via_self: set) -> None:
+    """A CLOSE shows the channel of the position it closed.
+
+    A close made from the Positions page has no alert behind it, and an
+    auto-trim fires through Self — so on their own these read blank or "Self",
+    which says nothing about whose trade it was. Use, in order: the channel the
+    trader assigned the holding to, else the channel of the most recent Discord
+    entry on that contract at or before the close. A close that came from a
+    real channel's own exit alert keeps that channel.
+    """
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.models.discord_message import DiscordMessage  # noqa: PLC0415
+    from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
+
+    closes = [
+        o for o in by_id.values()
+        if getattr(o, "is_closing", False)
+        and (getattr(o, "discord_channel", None) is None or o.id in via_self)
+    ]
+    if not closes:
+        return
+    user_ids = {o.user_id for o in closes}
+    symbols = {(o.symbol or "").upper() for o in closes}
+
+    def _key(user_id, symbol, strike, right, expiry) -> tuple:
+        return (user_id, (symbol or "").upper(), strike, getattr(right, "value", right) or None, expiry)
+
+    def _when(o) -> datetime | None:
+        return o.submitted_at or o.created_at
+
+    placed_at = func.coalesce(Order.submitted_at, Order.created_at)
+    entries: dict = {}
+    for user_id, sym, strike, right, expiry, label, channel_name, at in db.execute(
+        select(
+            Order.user_id, Order.symbol, Order.option_strike, Order.option_right,
+            Order.option_expiry, DiscordAlertSource.label, DiscordAlertSource.channel_name,
+            placed_at,
+        )
+        .join(DiscordMessage, DiscordMessage.order_id == Order.id)
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordMessage.source_id)
+        .where(
+            Order.user_id.in_(user_ids), Order.symbol.in_(symbols),
+            Order.side == OrderSide.BUY, Order.is_closing.is_(False),
+            Order.filled_quantity > 0,
+        )
+        .order_by(placed_at.desc())                 # newest first
+    ).all():
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name:
+            entries.setdefault(_key(user_id, sym, strike, right, expiry), []).append((at, name))
+
+    assigned: dict = {}
+    for user_id, sym, strike, right, expiry, opened, closed, label, channel_name in db.execute(
+        select(
+            DiscordPositionGuard.user_id, DiscordPositionGuard.symbol,
+            DiscordPositionGuard.option_strike, DiscordPositionGuard.option_right,
+            DiscordPositionGuard.option_expiry, DiscordPositionGuard.created_at,
+            DiscordPositionGuard.closed_at, DiscordAlertSource.label,
+            DiscordAlertSource.channel_name,
+        )
+        .join(DiscordAlertSource, DiscordAlertSource.id == DiscordPositionGuard.source_id)
+        .where(DiscordPositionGuard.user_id.in_(user_ids), DiscordPositionGuard.symbol.in_(symbols))
+        .order_by(DiscordPositionGuard.created_at.desc())
+    ).all():
+        name = (label or "").strip() or (channel_name or "").strip()
+        if name:
+            assigned.setdefault(_key(user_id, sym, strike, right, expiry), []).append((opened, closed, name))
+
+    # A full exit retires its ladder just BEFORE the order goes out.
+    slack = timedelta(minutes=5)
+    for o in closes:
+        at = _when(o)
+        key = _key(o.user_id, o.symbol, o.option_strike, o.option_right, o.option_expiry)
+        name = None
+        if at is not None:
+            name = next(
+                (n for opened, closed, n in assigned.get(key, ())
+                 if (opened is None or opened <= at) and (closed is None or closed >= at - slack)),
+                None,
+            ) or next((n for e_at, n in entries.get(key, ()) if e_at is not None and e_at <= at), None)
+        if name:
+            o.discord_channel = name
 
 
 @router.get("/trades", response_model=list[OrderOut])
@@ -191,6 +287,10 @@ def list_trades(
     user: User = Depends(current_user),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
+    # Orders that FILLED on/after this ET date, whenever they were placed — a
+    # take-profit left working overnight that fills today counts as today's.
+    # The Positions page's "Closed today" table uses it; `from` goes by placement.
+    filled_from: date | None = Query(default=None),
     limit: int = Query(default=200, le=1000),
 ) -> list[Order]:
     q = (
@@ -210,6 +310,11 @@ def list_trades(
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) >= datetime.combine(from_, datetime.min.time(), tzinfo=_ET))
     if to:
         q = q.where(func.coalesce(Order.submitted_at, Order.created_at) < datetime.combine(to, datetime.min.time(), tzinfo=_ET))
+    if filled_from:
+        q = q.where(
+            func.coalesce(Order.broker_filled_at, Order.closed_at)
+            >= datetime.combine(filled_from, datetime.min.time(), tzinfo=_ET)
+        )
     orders = list(db.execute(q).scalars())
     _attach_realized_pnl(db, user, orders)
     _attach_reentry_flag(db, user, orders)
@@ -724,18 +829,20 @@ async def _run_rejection_notify_in_background(
 
         trader_label = trader.display_name or trader.email or "Trader"
         symbol = order.symbol or "—"
+        instrument = notif_svc.instrument_label(order)
         side = order.side.value.upper() if order.side else "?"
         qty = str(order.quantity) if order.quantity is not None else "?"
         reason = (order.reject_reason or "broker rejected").strip()
         # Keep the message concise — the notifications bell has limited
         # real estate. Detail goes in metadata for the deep-dive view.
         message = (
-            f"{trader_label} tried to {side} {qty} {symbol} — rejected by broker"
+            f"{trader_label} tried to {side} {qty} {instrument} — rejected by broker"
         )
         metadata = {
             "trader_id": str(trader.id),
             "trader_order_id": str(order.id),
             "symbol": symbol,
+            "instrument": instrument,
             "side": order.side.value if order.side else None,
             "order_type": order.order_type.value if order.order_type else None,
             "quantity": qty,
@@ -786,6 +893,53 @@ async def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.
             },
         )
         db.commit()
+
+
+def _cancel_protective_stop(
+    db: Session, user: User, acct: BrokerAccount, adapter, entry_order: Order,
+) -> list[uuid.UUID]:
+    """Cancel ONLY the ladder's own protective stop for this contract.
+
+    Narrower than :func:`_cancel_conflicting_orders`, which clears everything in
+    the way of a CLOSE. An entry may not do that: a resting order could be the
+    trader's own, or a take-profit holding a target. So this takes just the
+    closing STOP the ladder placed — the one thing we put there ourselves and
+    will immediately put back, sized to the larger position, on the next pass.
+    """
+    rows = db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.broker_account_id == acct.id,
+            Order.instrument_type == entry_order.instrument_type,
+            Order.symbol == entry_order.symbol,
+            Order.option_expiry.is_not_distinct_from(entry_order.option_expiry),
+            Order.option_strike.is_not_distinct_from(entry_order.option_strike),
+            Order.option_right.is_not_distinct_from(entry_order.option_right),
+            Order.side == OrderSide.SELL,
+            Order.order_type == OrderType.STOP,
+            Order.is_closing.is_(True),
+            Order.status.in_(_CANCELLABLE_STATUSES),
+            Order.broker_order_id.isnot(None),
+        )
+    ).scalars().all()
+    cancelled: list[uuid.UUID] = []
+    now = datetime.now(timezone.utc)
+    for o in rows:
+        try:
+            adapter.cancel_order(o.broker_order_id)
+        except Exception:  # noqa: BLE001
+            import logging  # noqa: PLC0415
+            logging.getLogger(__name__).warning(
+                "entry: failed to cancel protective stop %s (broker_order=%s)",
+                o.id, o.broker_order_id,
+            )
+            continue
+        o.status = OrderStatus.CANCELED
+        o.closed_at = now
+        cancelled.append(o.id)
+    if cancelled:
+        db.flush()
+    return cancelled
 
 
 def _cancel_conflicting_orders(
@@ -881,6 +1035,10 @@ def broker_request_for(
     )
 
 
+class _QuietRejection(Exception):
+    """Internal: skip the generic rejection notice (see ``quiet_rejection``)."""
+
+
 def _place_trader_order(
     db: Session,
     trader: User,
@@ -892,6 +1050,7 @@ def _place_trader_order(
     resolve_wash_trade: bool = False,
     partial_close: bool = False,
     skip_dedup: bool = False,
+    quiet_rejection: Callable[[str], bool] | None = None,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -1095,6 +1254,8 @@ def _place_trader_order(
         ),
     )
 
+    from app.brokers import broker_supports_exit_pair  # noqa: PLC0415
+
     _broker_t0 = time.perf_counter()
     # Auto-resolve wash-trade rejections on CLOSE orders: if the broker rejects
     # because an opposite-side order for this contract is still working, cancel
@@ -1102,6 +1263,7 @@ def _place_trader_order(
     # re-close. `resolve_wash_trade` gates this to close paths; we never
     # auto-cancel resting orders to force an ENTRY through.
     _cancelled_conflicts = False
+    _cancelled_entry_stop = False
     _reclamped_to_live = False
     _wash_retries = 0
     _rounded_whole = False
@@ -1175,6 +1337,36 @@ def _place_trader_order(
                     _wash_retries -= 1
                     time.sleep(0.5)
                     continue
+            # An ENTRY the broker refused because our OWN protective stop rests
+            # on the other side. Alpaca forbids that pairing; Webull does not,
+            # and can rest a linked take-profit/stop anyway — so this is gated on
+            # the CAPABILITY, never on a broker's name (reading the capability is
+            # what Issue #1 was: a name-blind check that silently did nothing).
+            # Clint's channels are built on averaging in, and without this the
+            # subscriber takes the first entry and none of the adds, so their
+            # basis drifts from the trader they mirror.
+            #
+            # Deliberately once, and deliberately narrow: only the ladder's own
+            # stop is cancelled, never a resting order of the trader's, and the
+            # ladder re-places it over the larger position on its next pass.
+            if (not _cancelled_entry_stop
+                    and order.side is OrderSide.BUY and not order.is_closing
+                    and is_entry_blocked_by_opposite_order(exc)
+                    and not broker_supports_exit_pair(getattr(acct, "broker", None))):
+                _cancelled_entry_stop = True
+                _stops = _cancel_protective_stop(db, trader, acct, adapter, order)
+                if _stops:
+                    audit.record(
+                        db, actor_user_id=trader.id,
+                        action="entry.cancelled_protective_stop",
+                        entity_type="order", entity_id=order.id,
+                        metadata={"cancelled_order_ids": [str(x) for x in _stops],
+                                  "symbol": order.symbol,
+                                  "reason": str(exc)[:200]},
+                        ip_address=client_ip(request),
+                    )
+                    time.sleep(0.5)
+                    continue
             order.broker_call_ms = int((time.perf_counter() - _broker_t0) * 1000)
             order.status = OrderStatus.REJECTED
             order.reject_reason = str(exc)[:480]
@@ -1187,23 +1379,33 @@ def _place_trader_order(
             # Notify the trader too — in-app + SMS for opted-in traders. Always
             # fired (not gated on will_fanout): the trader wants to know their
             # own order was rejected regardless of copy scope.
+            # …unless the caller handles this refusal itself and says so better:
+            # ``quiet_rejection(reason)`` True skips the generic notice (the
+            # Discord ladder's stop placer, for a stop the market had already
+            # crossed — it sells at market and explains that instead).
             try:
                 from app.services import notifications as notif_svc  # noqa: PLC0415
+                if quiet_rejection is not None and quiet_rejection(str(exc)):
+                    raise _QuietRejection
                 notif_svc.create_notification(
                     db,
                     user_id=trader.id,
                     type="order.rejected",
                     message=(
-                        f"Your {order.side.value.upper()} {order.symbol} order was "
+                        f"Your {order.side.value.upper()} "
+                        f"{notif_svc.instrument_label(order)} order was "
                         f"rejected: {str(exc)[:180]}"
                     ),
                     metadata={
                         "order_id": str(order.id),
                         "symbol": order.symbol,
+                        "instrument": notif_svc.instrument_label(order),
                         "side": order.side.value,
                         "reason": str(exc)[:300],
                     },
                 )
+            except _QuietRejection:
+                pass
             except Exception:  # noqa: BLE001
                 import logging  # noqa: PLC0415
                 logging.getLogger(__name__).exception(
@@ -1260,6 +1462,7 @@ def _place_trader_order(
 
 
 @router.post("/trades", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+@_tagged("placed by you (Trade panel)", keep_outer=True)
 def place_trade(
     payload: PlaceOrderIn,
     request: Request,
@@ -1269,6 +1472,103 @@ def place_trade(
     trader: User = Depends(require_trader),
 ) -> Order:
     return _place_trader_order(db, trader, payload, broker_account_id, background, request)
+
+
+@router.post("/trades/{order_id}/re-enter", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
+def re_enter_trade(
+    order_id: uuid.UUID,
+    payload: ReEnterIn,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Order:
+    """Buy back the contract (or stock) a filled close took off: a LIMIT buy of
+    ``quantity`` at ``limit_price`` — or a MARKET buy when ``order_type`` is
+    "market" (the Re-enter button's menu) — on the account the close was
+    placed on.
+
+    An ordinary buy on the user's own order path — the same one the Trade Panel
+    and "Average" use — so it is sized, risk-checked and copied like any entry.
+    Long positions only: re-entering a closed short would sell to open.
+    """
+    src = db.get(Order, order_id)
+    if src is None or src.user_id != user.id or src.hidden_at is not None:
+        raise HTTPException(404, "not_found")
+    if not src.filled_quantity or src.filled_quantity <= 0:
+        raise HTTPException(409, "That order never filled — there is nothing to re-enter.")
+    if src.side != OrderSide.SELL:
+        raise HTTPException(422, "Re-enter is for closed long positions — re-entering a short would sell to open.")
+    is_option = src.instrument_type == InstrumentType.OPTION
+    if is_option:
+        if src.option_expiry is not None and src.option_expiry < market_hours.now_et().date():
+            raise HTTPException(422, "This contract has expired — it can't be bought back.")
+        if payload.quantity != payload.quantity.to_integral_value():
+            raise HTTPException(422, "Options trade in whole contracts.")
+
+    # The account the close went out on; if that connection is gone, the one
+    # connected now (a reconnect replaces the account row).
+    acct = db.get(BrokerAccount, src.broker_account_id) if src.broker_account_id else None
+    if acct is None or acct.user_id != user.id or acct.connection_status != "connected":
+        acct = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars().first()
+    if acct is None:
+        raise HTTPException(409, "broker_not_connected")
+
+    order = _place_trader_order(
+        db, user,
+        PlaceOrderIn(
+            instrument_type=src.instrument_type,
+            symbol=src.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET if payload.order_type == "market" else OrderType.LIMIT,
+            quantity=payload.quantity,
+            limit_price=None if payload.order_type == "market" else payload.limit_price,
+            option_expiry=src.option_expiry if is_option else None,
+            option_strike=src.option_strike if is_option else None,
+            option_right=src.option_right if is_option else None,
+        ),
+        acct.id, background, request,
+    )
+    _restart_ladder_on_reentry(db, user, order, acct.id)
+    return order
+
+
+def _restart_ladder_on_reentry(db: Session, user: User, order: Order, account_id) -> None:
+    """A re-entry starts the position's exit ladder over (T1, entry and stop
+    recalculated) — see discord_position_guard.restart_ladder. Best-effort: the
+    order is placed; a ladder that doesn't restart is logged, not raised."""
+    if not getattr(order, "symbol", None) or getattr(order, "id", None) is None:
+        return
+    try:
+        from app.models.settings import TraderSettings  # noqa: PLC0415
+        from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+        from app.services import discord_position_guard as guards  # noqa: PLC0415
+        from app.services import position_history  # noqa: PLC0415
+
+        right = getattr(order.option_right, "value", order.option_right)
+        fills = position_history.holding(
+            db, user.id, account_id, order.symbol, strike=order.option_strike,
+            right=right, expiry=order.option_expiry,
+        )
+        held = Decimal(fills[-1]["remaining"]) if fills else Decimal(0)
+        live = guards.find(db, user.id, order.symbol, order.option_strike, order.option_right,
+                           order.option_expiry)
+        ts = (dcs.for_guard(db, user.id, live) if live is not None else None) or db.get(TraderSettings, user.id)
+        guards.restart_ladder(
+            db, user.id, order.symbol, order.option_strike, order.option_right, order.option_expiry,
+            entry_order_id=order.id, entry_price=order.limit_price, added_qty=order.quantity,
+            held_qty=held, ts=ts,
+        )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        if hasattr(db, "rollback"):
+            db.rollback()
+        logging.getLogger(__name__).exception("re-enter: could not restart the ladder for %s", order.symbol)
 
 
 @router.post("/trades/{order_id}/cancel", response_model=OrderOut)
@@ -2111,6 +2411,8 @@ def _live_unrealized_today(db: Session, user_id: uuid.UUID) -> Decimal | None:
     ).scalars().all()
     if not accts:
         return None
+    # Broker reads below; hand the connection back meanwhile.
+    release_connection(db)
     total = Decimal(0)
     n_got = 0
     for acct in accts:
@@ -2161,6 +2463,8 @@ def _live_day_pnl_today(
             return None  # a broker with no live day P&L → keep the calculated cell
         brokers.add(a.broker)
     source = f"{next(iter(brokers)).value}_live" if len(brokers) == 1 else "broker_live"
+    # Broker reads below; hand the connection back meanwhile.
+    release_connection(db)
     total = Decimal(0)
     day_start = Decimal(0)
     n_got = 0
@@ -2212,6 +2516,11 @@ def _last_marked_snapshot(
     return Decimal(row[0]), (Decimal(row[1]) if row[1] is not None else None), row[2]
 
 
+# The calendar page POSTs /trades/sync-fills on mount, then loads this, which
+# syncs again; skip accounts synced this recently (by that or the poller).
+_CALENDAR_SYNC_MIN_INTERVAL = timedelta(seconds=10)
+
+
 @router.get("/calendar/pnl", response_model=list[DailyPnL])
 def calendar_pnl(
     db: Session = Depends(get_db),
@@ -2248,7 +2557,7 @@ def calendar_pnl(
     # excluded from the P&L query and the day would look empty. Sync first
     # so freshly-filled mirrors land on the right day.
     try:
-        fills_sync.sync_user_fills(db, target_user_id)
+        fills_sync.sync_user_fills(db, target_user_id, min_interval=_CALENDAR_SYNC_MIN_INTERVAL)
         db.commit()
     except Exception:  # noqa: BLE001
         # Sync failures are non-fatal; we still return whatever P&L exists.

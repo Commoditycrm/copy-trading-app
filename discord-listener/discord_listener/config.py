@@ -46,6 +46,17 @@ class Config:
     # dropped them into a reconnect loop that burned still more CPU. Attaching
     # one at a time costs a few seconds of startup and removes the spike.
     connect_concurrency: int = 1
+    # Re-open each channel's page after this long (+ up to 30 min of jitter so
+    # they don't all recycle together). A Discord tab grows for hours; recycling
+    # caps that before memory pressure starts crashing / reloading pages.
+    # 0 disables it.
+    context_max_age_s: int = 4 * 3600
+    # A watcher that has STOPPED (e.g. it saw Discord's login page) is started
+    # again after this long, so a momentary bounce heals on its own instead of
+    # the channel staying down until it is toggled off and on.
+    restart_stopped_after_s: int = 300
+    # Seconds to wait before re-checking a login-page bounce (see watcher).
+    session_recheck_s: int = 5
     headless: bool = True
     # Print each ingested message (author, text, embed title/description/fields)
     # to the log instead of just per-batch counts. On by default because the
@@ -69,6 +80,9 @@ class Config:
             heartbeat_interval_s=_int("DISCORD_HEARTBEAT_INTERVAL_S", 30),
             flush_ms=_int("DISCORD_FLUSH_MS", 250),
             max_backoff_s=_int("DISCORD_MAX_BACKOFF_S", 300),
+            context_max_age_s=_int("DISCORD_CONTEXT_MAX_AGE_S", 4 * 3600),
+            restart_stopped_after_s=_int("DISCORD_RESTART_STOPPED_AFTER_S", 300),
+            session_recheck_s=_int("DISCORD_SESSION_RECHECK_S", 5),
             headless=(os.environ.get("DISCORD_HEADLESS", "true").lower() != "false"),
             log_messages=(os.environ.get("DISCORD_LOG_MESSAGES", "true").lower() != "false"),
         )

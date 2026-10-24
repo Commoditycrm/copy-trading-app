@@ -78,8 +78,11 @@ def _channel(db, owner=TRADER, channel_id="111", label="Sniper"):
 
 
 def _raw(content, mid="9001"):
+    # Posted just now: an alert that arrives late is held for approval
+    # (services/discord_freshness), which is not what these tests are about.
+    from datetime import datetime, timezone
     return {"message_id": mid, "channel_id": "111", "content": content,
-            "timestamp": "2026-09-30T16:13:33Z"}
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 # ── who gets it ──────────────────────────────────────────────────────────────
@@ -242,3 +245,73 @@ def test_a_subscriber_can_only_switch_a_channel_on_or_off():
     with pytest.raises(HTTPException) as e:
         discord_sources.update_source(mirror.id, DiscordSourceUpdateIn(label="Mine"), db, sub)
     assert e.value.status_code == 403
+
+
+def test_a_late_entry_is_held_for_the_subscriber_too():
+    """The backlog a reconnecting listener replays reaches subscribers as well;
+    their late entries wait for approval just like the trader's."""
+    import inspect
+    from app.services import discord_subscribers as subs
+    src = inspect.getsource(subs.relay_for_subscriber)
+    assert "discord_freshness.hold_if_stale(msg)" in src
+    assert src.index("hold_if_stale") < src.index("_execute_signal")
+
+
+# ── a channel the trader turned OFF still reaches subscribers who have it ON ──
+# QA 2026-10-08: Mark's channel off for the trader, so it was never read — and a
+# subscriber with Mark ON got none of Mark's trades.
+
+def _watched(db, monkeypatch):
+    monkeypatch.setattr(discord_sources, "decrypt_session", lambda s: {"cookies": []})
+    return {a.source_id for a in discord_sources.listener_assignments(db)}
+
+
+def _sessioned_channel(db):
+    acct = DiscordAccount(user_id=TRADER, encrypted_session="x", status="connected")
+    db.add(acct); db.flush()
+    src = _channel(db)
+    src.account_id = acct.id
+    db.commit()
+    return src
+
+
+def test_an_off_channel_is_still_watched_while_a_subscriber_has_it_on(monkeypatch):
+    db = _db()
+    src = _sessioned_channel(db)
+    src.is_enabled = False
+    db.commit()
+    assert src.id not in _watched(db, monkeypatch)              # no subscriber copy yet
+    sub = db.get(User, SUB)
+    mirror = ds.ensure_mirror(db, sub, src)
+    db.commit()
+    assert src.id in _watched(db, monkeypatch)                  # the subscriber has it on
+    mirror.is_enabled = False
+    db.commit()
+    assert src.id not in _watched(db, monkeypatch)              # nobody has it on
+
+
+def test_an_off_channels_alerts_are_relayed_but_not_traded_for_the_trader(monkeypatch):
+    from app.schemas.discord import DiscordMessageBatchIn
+
+    db = _db()
+    src = _channel(db)
+    src.is_enabled = False
+    db.commit()
+    relayed = []
+    monkeypatch.setattr(ds, "relay_batch", lambda db_, parent, batch: relayed.append(len(batch)) or 1)
+    monkeypatch.setattr(discord_sources, "_execute_signal",
+                        lambda *a, **k: pytest.fail("the trader's off channel must not trade"))
+    payload = DiscordMessageBatchIn(source_id=src.id, messages=[{**_raw(ENTRY), "channel_id": "111"}])
+    discord_sources.listener_messages(payload, SimpleNamespace(add_task=lambda *a, **k: None),
+                                      SimpleNamespace(headers={}, client=None), db)
+    assert relayed == [1]
+    msg = db.execute(select(DiscordMessage).where(DiscordMessage.source_id == src.id)).scalars().one()
+    assert msg.status is DiscordMessageStatus.IGNORED and "Channel off" in msg.status_reason
+
+
+def test_status_reads_off_for_a_channel_watched_only_for_subscribers():
+    src = SimpleNamespace(is_enabled=False, status="disconnected", last_error=None, last_heartbeat_at=None,
+                          last_seen_message_id=None, channel_name=None, guild_name=None,
+                          user_id=TRADER, id=uuid.uuid4())
+    discord_ingest.record_status(src, "connected")
+    assert src.status == "disconnected" and src.last_heartbeat_at is not None

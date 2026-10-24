@@ -55,6 +55,27 @@ DEFAULT_QUANTITY = Decimal(1)
 # variation selector, and both appear in the wild.
 _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 
+# "SPX 7750c 10/16pm @14.2": an index expiry can carry its settlement. On a
+# monthly expiration (the third Friday) SPX lists TWO contracts at the same
+# strike: the AM-settled monthly under SPX and the PM-settled weekly under SPXW.
+# "pm" picks the weekly. Without the suffix in these patterns the line failed to
+# match and a real alert was dropped as chatter (Rafael, QA 2026-10-14 15:11 ET);
+# "10/16 pm @14.2" matched but lost its price. Reading the date and ignoring the
+# "pm" would be worse: orders go out under the root the alert names, so it would
+# buy the monthly.
+_SETTLE = r"(?:\s*(?P<settle>[AP]M)\b)?"
+_PM_SETTLED_ROOT = {"SPX": "SPXW", "NDX": "NDXP", "RUT": "RUTW"}
+
+
+def _root(m: re.Match) -> str:
+    """The trading root for a matched line: its ticker, moved to the PM-settled
+    root when the expiry said "pm"."""
+    sym = m.group("symbol").upper()
+    if (m.groupdict().get("settle") or "").upper() == "PM":
+        return _PM_SETTLED_ROOT.get(sym, sym)
+    return sym
+
+
 # $TSLA 375 CALL 0DTE @0.95   /   $AAPL 330 CALL 09/04 @1.00
 #   AAPL $350 CALL 09/02        (no price — a market entry)
 #
@@ -67,7 +88,7 @@ _EXIT_MARKERS = ("✂", "\U0001F52A", "\U0001F6D1")
 _ENTRY_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -87,7 +108,7 @@ _ENTRY_RE = re.compile(
 # tried first, so the two cannot disagree about a line.
 _ENTRY_EXP_FIRST_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)\s+"
+    rf"(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE}\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -99,7 +120,7 @@ _EXIT_RE = re.compile(
     rf"^\s*(?P<marker>[✂\U0001F52A\U0001F6D1]️?)\s*"
     rf"\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
     rf"\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b\s*"
-    rf"(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@\s*\$?(?P<price>{_NUM}))?\s*"
     rf"(?:(?P<sign>[+\-−])\s*(?P<pct>{_NUM})\s*%)?"
     rf"(?P<trailing>[\s,;].*)?$",
@@ -127,9 +148,14 @@ _UPDATE_RE = re.compile(
 # (percent_means_exit). Anywhere else this shape is chatter, so the pattern is
 # deliberately strict: the line must be ONLY the ticker and the percentage.
 # Allowing trailing prose would turn "AMD 27% of the float is short" into a sell.
+#
+# The one exception is an exit word — "TSLA -90% Out" (Mark, 2026-10-07,
+# missed). That is the author saying they are OUT, which is unambiguous, so it
+# is allowed — and makes the exit a full close rather than a ladder trim.
 _PCT_BARE_RE = re.compile(
     rf"^\s*\$?(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})\s+"
-    rf"(?P<sign>[+\-\u2212])?\s*(?P<pct>{_NUM})\s*%\s*$",
+    rf"(?P<sign>[+\-\u2212])?\s*(?P<pct>{_NUM})\s*%\s*"
+    rf"(?:(?P<out>(?:all\s+)?out|closed?|done|exit(?:ed)?|sold|cut|stopped(?:\s+out)?)\b[\s!.]*)?$",
     re.IGNORECASE,
 )
 
@@ -199,10 +225,13 @@ def _strip_average_down(line: str) -> tuple[str, bool]:
 # Requires an explicit contract or a "$" ticker so prose like "leave room to add
 # in case they want a bit more of a bounce" isn't read as an order.
 _ADD_RE = re.compile(
-    rf"^\s*(?:ADD|ADDING)\s+"
+    # "Add" / "Adding" / "Added", with or without "to": "Added to TSLA, New avg
+    # @0.90" (Mark, 2026-10-07) — read as a STOCK buy by the free-text parser
+    # when this didn't match, and filled as TSLA shares.
+    rf"^\s*(?:ADD|ADDING|ADDED)\s+(?:TO\s+|ON\s+|MORE\s+)?"
     rf"(?:\$(?P<dsymbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}})|(?P<symbol>[A-Za-z][A-Za-z0-9.\-]{{0,9}}))"
     rf"(?:\s+\$?(?P<strike>{_NUM})\s*(?P<right>CALLS?|PUTS?|C|P)\b)?"
-    rf"\s*(?P<exp>[01O]DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?)?\s*"
+    rf"\s*(?:(?P<exp>(?:\d{{1,2}}|O)DTE|\d{{1,2}}[/-]\d{{1,2}}(?:[/-]\d{{2,4}})?){_SETTLE})?\s*"
     rf"(?:@?\s*\$?(?P<price>{_NUM})\b)?"
     rf"(?P<trailing>[\s,;].*)?$",
     re.IGNORECASE,
@@ -339,7 +368,7 @@ class CompactAlertParser(Parser):
         if strike is None or strike <= 0:
             return None, f"couldn't read the strike in {m.group(0).strip()!r}"
 
-        expiry, unspecified, err = _read_expiry(
+        expiry, unspecified, err, expiry_assumed = _read_expiry(
             m.group("exp"), message, allow_missing=average_down
         )
         if err:
@@ -350,11 +379,12 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=expiry,
                 expiry_unspecified=unspecified,
+                expiry_assumed=expiry_assumed,
                 # The format never states size; one lot is the convention —
                 # except on an average-down, where the position decides.
                 quantity=DEFAULT_QUANTITY,
@@ -380,23 +410,33 @@ class CompactAlertParser(Parser):
         strike = to_decimal(m.group("strike")) if m.group("strike") else None
         right = _right(m.group("right")) if m.group("right") else None
 
-        expiry, unspecified, err = _read_expiry(m.group("exp"), message, allow_missing=True)
+        expiry, unspecified, err, _assumed = _read_expiry(m.group("exp"), message, allow_missing=True)
         if err:
             return None, err
 
         price = to_decimal(m.group("price"))
+        if price is None and m.group("trailing"):
+            # "Added to TSLA, New avg @0.90": the price is written later, after
+            # an "@" — only an "@" price, never any number in the prose.
+            at = re.search(rf"@\s*\$?(?P<p>{_NUM})\b", m.group("trailing"))
+            price = to_decimal(at.group("p")) if at else None
+        unnamed = strike is None or right is None
         return (
             TradeSignal(
                 action=SignalAction.BUY,
                 asset_type=AssetType.OPTION,
-                symbol=symbol.upper(),
+                symbol=(_PM_SETTLED_ROOT.get(symbol.upper(), symbol.upper())
+                        if (m.group("settle") or "").upper() == "PM" else symbol.upper()),
                 option_type=right,
                 strike=strike,
                 expiration=expiry,
                 expiry_unspecified=unspecified,
                 # No strike/right stated ⇒ the contract itself has to come from
                 # the open position.
-                contract_unspecified=strike is None or right is None,
+                contract_unspecified=unnamed,
+                # Naming only the ticker means the contract this channel is in
+                # (its previous entry) — never the stock.
+                add_to_latest=unnamed,
                 quantity=DEFAULT_QUANTITY,
                 order_type=OrderKind.LIMIT,
                 limit_price_unspecified=price is None,
@@ -426,7 +466,7 @@ class CompactAlertParser(Parser):
                 # These channels trade options; the position lookup settles it
                 # either way, and nothing acts on this field before then.
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=None,
                 strike=None,
                 expiration=None,
@@ -466,7 +506,7 @@ class CompactAlertParser(Parser):
                 TradeSignal(
                     action=SignalAction.SELL,
                     asset_type=AssetType.OPTION,
-                    symbol=m.group("symbol").upper(),
+                    symbol=_root(m),
                     option_type=None,
                     strike=None,
                     expiration=None,
@@ -477,6 +517,9 @@ class CompactAlertParser(Parser):
                     limit_price=None,
                     pnl_percent=pct,
                     position_closed=True,
+                    # "TSLA -90% Out": the author is out — sell all of it,
+                    # whatever the ladder's gates would say about a trim.
+                    flatten=bool(m.groupdict().get("out")),
                     source_action="CLOSE",
                     parser=self.name,
                 ),
@@ -493,7 +536,7 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.SELL,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=None,
@@ -516,7 +559,7 @@ class CompactAlertParser(Parser):
 
         # An exit alert usually names no expiry — it assumes you know what you
         # hold. Leave it unset and let execution resolve it from the position.
-        expiry, unspecified, err = _read_expiry(
+        expiry, unspecified, err, _assumed = _read_expiry(
             m.group("exp"), message, allow_missing=True
         )
         if err:
@@ -531,7 +574,7 @@ class CompactAlertParser(Parser):
             TradeSignal(
                 action=SignalAction.SELL,
                 asset_type=AssetType.OPTION,
-                symbol=m.group("symbol").upper(),
+                symbol=_root(m),
                 option_type=_right(m.group("right")),
                 strike=strike,
                 expiration=expiry,
@@ -567,10 +610,36 @@ def _is_entry(m: re.Match, average_down: bool = False) -> bool:
     return not re.match(rf"^[+\-−]\s*(?:{_NUM})\s*%", trailing)
 
 
+# Capitalised words that follow "add to" without being a position.
+_NOT_ADD_TARGETS = {"WATCHLIST", "LIST", "CART", "NOTES", "CHAT", "ALL", "IT", "THIS", "THAT"}
+
+
 def _is_add(m: re.Match) -> bool:
-    """Guard against prose. An add needs either a "$" ticker or an explicit
-    contract — "leave room to add in case they want a bounce" has neither."""
-    return bool(m.group("dsymbol") or (m.group("strike") and m.group("right")))
+    """Guard against prose. An add needs a "$" ticker, an explicit contract, or
+    a ticker written as one (capitals) — "Added to TSLA, New avg @0.90".
+    "leave room to add in case they want a bounce" has none of them.
+
+    A bare ticker with NO price is accepted when nothing follows it: mentions
+    are stripped before this runs, so Mark's "Added to SPY @Mark" arrives as
+    "Added to SPY" with empty trailing, while musing ("Adding to SPY soon
+    because I think it bounces") still carries its prose and is refused. The
+    price is then left to execution, which fills it from the live quote or
+    goes at market — the same path a price-less entry takes.
+    """
+    if m.group("dsymbol") or (m.group("strike") and m.group("right")):
+        return True
+    sym = m.group("symbol") or ""
+    if not sym.isupper():
+        return False
+    at_price = m.group("price") or re.search(rf"@\s*\$?{_NUM}\b", m.group("trailing") or "")
+    if at_price:
+        return True
+    # No price: demand a ticker-shaped word and a clean end of line.
+    return (
+        len(sym) <= 5
+        and sym not in _NOT_ADD_TARGETS
+        and not (m.group("trailing") or "").strip()
+    )
 
 
 def _has_marker(line: str) -> bool:
@@ -597,8 +666,16 @@ def _next_trading_day(day: date) -> date:
     return nxt
 
 
+# The furthest "NDTE" read as an expiry. Alerts name days, not months, this way.
+_MAX_DTE = 30
+
+
 def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool = False):
-    """Returns ``(expiry, unspecified, error)``."""
+    """Returns ``(expiry, unspecified, error, assumed)``.
+
+    ``assumed`` is True only when the alert stated no expiry on an entry and
+    the message date was filled in for it — see TradeSignal.expiry_assumed.
+    """
     # "ODTE" with the letter O is a common mistype of "0DTE" and means the same
     # thing. Reading it as an unknown expiry rejects an otherwise valid alert.
     #
@@ -606,27 +683,38 @@ def _read_expiry(raw: str | None, message: ParsedMessage, *, allow_missing: bool
     # re-reading an old alert doesn't move its expiry.
     if raw and raw.upper() in ("0DTE", "ODTE"):
         if message.posted_at is None:
-            return None, False, "0DTE alert has no timestamp to resolve the expiry against"
-        return message.posted_at.date(), False, None
+            return None, False, "0DTE alert has no timestamp to resolve the expiry against", False
+        return message.posted_at.date(), False, None, False
 
-    if raw and raw.upper() == "1DTE":
+    # "1DTE", "2DTE" … "30DTE": that many TRADING days after the message (a
+    # Friday 2DTE is Tuesday). Holidays are not known here — see
+    # _next_trading_day; execution refuses an expiry that doesn't exist.
+    dte = re.fullmatch(r"(\d{1,2})DTE", raw.upper()) if raw else None
+    if dte:
+        days = int(dte.group(1))
+        if days > _MAX_DTE:
+            return None, False, f"{days}DTE is further out than an alert expiry is read ({_MAX_DTE} days)", False
         if message.posted_at is None:
-            return None, False, "1DTE alert has no timestamp to resolve the expiry against"
-        return _next_trading_day(message.posted_at.date()), False, None
+            return None, False, f"{days}DTE alert has no timestamp to resolve the expiry against", False
+        expiry = message.posted_at.date()
+        for _ in range(days):
+            expiry = _next_trading_day(expiry)
+        return expiry, False, None, False
 
     if not raw:
         if allow_missing:
-            return None, True, None
+            return None, True, None, False
         # An ENTRY that names a contract and a price but no expiry is a same-day
         # trade. Several channels post SPY scalps that way ("SPY 763c @ .55")
         # and never write the date at all, so refusing them rejects every alert
         # those channels send. The entry gate still requires a price here, which
         # is what keeps a bare contract mention from becoming an order.
         if message.posted_at is not None:
-            return message.posted_at.date(), False, None
-        return None, False, "the alert has no expiry and no timestamp to date it from"
+            # Ours, not the trader's — flagged so execution can shift it.
+            return message.posted_at.date(), False, None, True
+        return None, False, "the alert has no expiry and no timestamp to date it from", False
 
     expiry, err = parse_expiry(raw, posted_at=message.posted_at)
     if err:
-        return None, False, err
-    return expiry, False, None
+        return None, False, err, False
+    return expiry, False, None, False

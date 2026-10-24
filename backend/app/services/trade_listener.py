@@ -161,6 +161,10 @@ def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> N
       - a sync FastAPI handler thread (uses the loop captured by bind_loop
         at startup, scheduled via call_soon_threadsafe)
     """
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
+        return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
         # Already running for this trader. Restart cleanly so credentials
@@ -838,6 +842,7 @@ def _persist_and_fanout(
         # listener from inserting a duplicate parent + second fanout — the
         # API path owns this order's creation and fanout.
         coid = getattr(alpaca_order, "client_order_id", None)
+        app_oid = None
         if coid:
             try:
                 app_oid = uuid.UUID(str(coid))
@@ -850,6 +855,17 @@ def _persist_and_fanout(
                     trader_user_id, coid, broker_order_id,
                 )
                 return
+
+        # A subscriber mirror showing up on the TRADER's stream means the two
+        # share a broker account. Treating it as a new trader order fans it out
+        # into that same account again — the 2026-10-21 QA loop.
+        if order_intent.is_mirror_echo(db, trader_user_id, broker_account_id, broker_order_id, app_oid):
+            log.warning(
+                "listener[%s] ignoring echo of a known mirror/foreign order "
+                "(client_order_id=%s, broker_order=%s) — shared broker account?",
+                trader_user_id, coid, broker_order_id,
+            )
+            return
 
         order = _insert_order_from_alpaca(
             db, trader_user_id, broker_account_id, alpaca_order

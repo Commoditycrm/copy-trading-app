@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Kopyya log-cleanup agent as soon as an admin request arrives
+
+[Path]
+PathChanged=/var/lib/kopyya-ops/requests/cleanup.json
+Unit=kopyya-log-cleanup.service
+
+[Install]
+WantedBy=paths.target

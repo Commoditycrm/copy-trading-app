@@ -19,10 +19,11 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import client_ip, current_user, require_sell_all_access, require_trader
+from app.api.deps import (client_ip, current_user, require_sell_all_access,
+                          require_snapshot_access, require_trader)
 from app.api.trades import _place_trader_order
 from collections.abc import Callable
 from decimal import Decimal
@@ -30,8 +31,8 @@ from decimal import Decimal
 from app.brokers import adapter_for
 from app.brokers.capabilities import capabilities_for
 from app.brokers.base import BrokerPosition
-from app.database import get_db
-from app.models.broker_account import BrokerAccount
+from app.database import get_db, release_connection
+from app.models.broker_account import BrokerAccount, BrokerName
 from datetime import date, datetime, timezone
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderStatus, OrderType
 from app.models.settings import SubscriberSettings
@@ -40,8 +41,10 @@ from app.schemas.order import OrderOut, PlaceOrderIn
 from app.schemas.position import (
     AveragePositionIn,
     ClosePositionIn,
+    PositionChannelIn,
     PositionOut,
     PositionsPayload,
+    StaleAccount,
     UnreachableAccount,
 )
 from app.models.sell_all_snapshot import SellAllSnapshot
@@ -83,6 +86,9 @@ class _MinimalRequestShim:
         else:
             self.client = None
 
+from app.services.position_events import tagged as _tagged  # noqa: E402
+from app.services import ladder_hold  # noqa: E402
+
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
@@ -93,6 +99,10 @@ def list_positions(
     detail: bool = Query(
         False,
         description="Return {positions, unreachable} instead of a bare list.",
+    ),
+    fresh: bool = Query(
+        False,
+        description="Read live now rather than reuse a read from moments ago (the page asks right after a fill).",
     ),
 ) -> "list[PositionOut] | PositionsPayload":
     """Return positions across every connected broker account for the caller.
@@ -122,8 +132,12 @@ def list_positions(
         )
     ).scalars().all()
 
+    # Broker reads below; hand the connection back meanwhile — the attach
+    # steps after reopen one briefly.
+    release_connection(db)
     out: list[PositionOut] = []
     unreachable: list[UnreachableAccount] = []
+    stale: list[StaleAccount] = []
     for acct in accts:
         try:
             creds = decrypt_json(acct.encrypted_credentials)
@@ -140,7 +154,19 @@ def list_positions(
             # Webull rejects simultaneous position reads with 429, and this
             # endpoint is called up to four times per order event by the
             # positions table alone, plus the calendar independently.
-            for p in adapter.get_positions(cached_ok=True):
+            # Right after a fill the page asks for a FRESH read: a shared read
+            # from a few seconds ago would still show what was just sold.
+            held = (adapter.get_positions(cached_ok=True, fresh=True)
+                    if fresh and acct.broker == BrokerName.WEBULL
+                    else adapter.get_positions(cached_ok=True))
+            stale_age = getattr(held, "stale_age_s", None)
+            if stale_age is not None:
+                # Rate limited: these are the last positions read, not live.
+                stale.append(StaleAccount(
+                    broker_account_id=acct.id, broker=acct.broker.value,
+                    label=acct.label, age_s=int(stale_age),
+                ))
+            for p in held:
                 # Reference = previous session's market CLOSE for this stock.
                 ref = None
                 if prev_close_fn is not None and p.instrument_type == InstrumentType.STOCK:
@@ -199,8 +225,20 @@ def list_positions(
         _attach_ladder_stops(db, user.id, out)
     except Exception:  # noqa: BLE001
         log.warning("positions: could not attach ladder stops", exc_info=True)
+    try:
+        from app.services import position_protections  # noqa: PLC0415
+
+        from app.schemas.position import ProtectionOut  # noqa: PLC0415
+
+        position_protections.attach(db, user.id, out)
+        for p in out:
+            p.protections = [ProtectionOut(**i) for i in p.protections]
+    except Exception:  # noqa: BLE001
+        log.warning("positions: could not attach protections", exc_info=True)
+        for p in out:
+            p.protections = []
     if detail:
-        return PositionsPayload(positions=out, unreachable=unreachable)
+        return PositionsPayload(positions=out, unreachable=unreachable, stale=stale)
     return out
 
 
@@ -247,6 +285,68 @@ def today_realized(
     return {"realized_pnl": float(day.realized_pnl) if day else 0.0}
 
 
+# The account Day's P&L, shared for this long by every tab and process asking.
+# Each ask is a broker read (Webull: the balance endpoint, 2 calls per 2s per
+# key), and the Positions page asks from every open tab, on its own cadence and
+# again after every order event. Uncached, four tabs and a burst of order
+# events were ~500 Webull calls an hour, a sixth of them refused (QA 2026-10-06).
+_DAY_PNL_SHARE_S = 10
+
+
+def _day_pnl_share_s() -> int:
+    """How long one computed Day P&L is reused across tabs and processes.
+    Runtime knob (admin API page); _DAY_PNL_SHARE_S is the fallback."""
+    from app.services.platform_config import int_knob_or  # noqa: PLC0415
+    return int(int_knob_or("day_pnl_share_s", _DAY_PNL_SHARE_S))
+_DAY_PNL_LOCK_S = 5          # one request computes; the rest wait for its answer
+_DAY_PNL_WAIT_S = 3.0
+
+
+def _day_pnl_key(user_id) -> str:
+    return f"positions:day_pnl:{user_id}"
+
+
+def _shared_day_pnl(user_id, compute: Callable[[], dict]) -> dict:
+    """``compute()`` at most once per _DAY_PNL_SHARE_S per user, across every
+    tab and process. A burst that arrives together waits for the one request
+    computing it rather than each asking the broker. Redis trouble just means
+    computing directly — never a failed page."""
+    import json  # noqa: PLC0415
+
+    from app.services.redis_client import get_sync_redis  # noqa: PLC0415
+
+    key = _day_pnl_key(user_id)
+    try:
+        r = get_sync_redis()
+        hit = r.get(key)
+        if hit:
+            return json.loads(hit)
+        if not r.set(key + ":lock", "1", nx=True, ex=_DAY_PNL_LOCK_S):
+            deadline = time.monotonic() + _DAY_PNL_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                hit = r.get(key)
+                if hit:
+                    return json.loads(hit)
+    except Exception:  # noqa: BLE001
+        log.debug("day-pnl: shared read unavailable", exc_info=True)
+        return compute()
+    try:
+        out = compute()
+        try:
+            r.set(key, json.dumps(out), ex=_day_pnl_share_s())
+            r.delete(key + ":lock")
+        except Exception:  # noqa: BLE001
+            log.debug("day-pnl: shared write failed", exc_info=True)
+        return out
+    except Exception:
+        try:
+            r.delete(key + ":lock")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
 @router.get("/day-pnl")
 def account_day_pnl(
     db: Session = Depends(get_db),
@@ -259,16 +359,22 @@ def account_day_pnl(
     when the broker exposes no live day figure (UI shows '--'); a genuine broker
     0.00 comes back as 0.0; a failed live fetch falls back to the last-known
     broker value flagged stale — mirroring the calendar exactly."""
+    release_connection(db)  # may wait on another tab's broker read
+    return _shared_day_pnl(user.id, lambda: _account_day_pnl_now(db, user.id))
+
+
+def _account_day_pnl_now(db: Session, user_id) -> dict:
+    """The live figure, straight from the broker — see account_day_pnl."""
     from app.api.trades import _last_marked_snapshot, _live_day_pnl_today  # reuse resolver
     from app.services import market_hours  # noqa: PLC0415
     today = market_hours.now_et().date()
-    res = _live_day_pnl_today(db, user.id)  # (value, pct, source) | (None, None, source) | None
+    res = _live_day_pnl_today(db, user_id)  # (value, pct, source) | (None, None, source) | None
     if res is not None and res[0] is not None:
         return {"day_pnl": float(res[0]),
                 "day_pnl_pct": float(res[1]) if res[1] is not None else None,
                 "source": res[2], "quality": "authoritative"}
     if res is not None and res[0] is None:
-        stale = _last_marked_snapshot(db, user.id, today)
+        stale = _last_marked_snapshot(db, user_id, today)
         if stale is not None:
             return {"day_pnl": float(stale[0]),
                     "day_pnl_pct": float(stale[1]) if stale[1] is not None else None,
@@ -603,6 +709,62 @@ def _attach_position_channels(db: Session, user_id, positions: list) -> None:
             # The channel that opened the holding: the oldest non-Self entry.
             p.discord_channel = f"{others[-1][0]}-Self"
 
+    # A channel the trader assigned by hand wins over everything derived above —
+    # including for a position no alert opened at all.
+    assigned = {
+        ((sym or "").upper(), strike, getattr(right, "value", right) or None, expiry):
+            (label or "").strip() or (channel_name or "").strip()
+        for sym, strike, right, expiry, label, channel_name in db.execute(
+            select(
+                DiscordPositionGuard.symbol, DiscordPositionGuard.option_strike,
+                DiscordPositionGuard.option_right, DiscordPositionGuard.option_expiry,
+                DiscordAlertSource.label, DiscordAlertSource.channel_name,
+            )
+            .join(DiscordAlertSource, DiscordAlertSource.id == DiscordPositionGuard.source_id)
+            .where(
+                DiscordPositionGuard.user_id == user_id,
+                DiscordPositionGuard.closed_at.is_(None),
+                DiscordPositionGuard.symbol.in_(symbols),
+            )
+        ).all()
+    }
+    for p in positions:
+        name = assigned.get((
+            (p.symbol or "").upper(), p.option_strike,
+            getattr(p.option_right, "value", p.option_right) or None, p.option_expiry,
+        ))
+        if name:
+            p.discord_channel = name
+
+
+@router.get("/history")
+def position_history(
+    broker_account_id: uuid.UUID = Query(...),
+    symbol: str = Query(..., min_length=1, max_length=32),
+    option_strike: Decimal | None = Query(None),
+    option_right: str | None = Query(None, pattern=r"^(call|put)$"),
+    option_expiry: date | None = Query(None),
+    through_order_id: uuid.UUID | None = Query(None, description="A closing order: return the holding it belongs to"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """The position summary: everything that happened to this holding, oldest
+    first — its orders (requested and filled, Rem.Qty after each fill) and its
+    stop's history. Our own records only — no broker call."""
+    from app.services import position_history as _ph  # noqa: PLC0415
+
+    items = _ph.timeline(
+        db, user.id, broker_account_id, symbol, strike=option_strike, right=option_right,
+        expiry=option_expiry, through_order_id=through_order_id,
+    )
+    try:
+        rules = _ph.rules(db, user.id, symbol, strike=option_strike, right=option_right,
+                          expiry=option_expiry)
+    except Exception:  # noqa: BLE001 — the rules are context; the history is the point
+        log.warning("positions: could not read the rules for %s", symbol, exc_info=True)
+        rules = None
+    return {"rules": rules, "items": items}
+
 
 def _attach_ladder_stops(db: Session, user_id, positions: list) -> None:
     """Set .ladder_stop_price from each held contract's live Discord guard.
@@ -816,9 +978,11 @@ def _snapshot_detail(db: Session, snap: SellAllSnapshot, adapter, today_et: date
         except (ValueError, TypeError):
             return False
 
+    reentry = [_reentry_info(db, p) for p in snap.positions]
+    if adapter is not None:
+        release_connection(db)  # quotes below are broker reads
     positions = []
-    for p in snap.positions:
-        st, reentry_price, reentry_filled_at = _reentry_info(db, p)
+    for p, (st, reentry_price, reentry_filled_at) in zip(snap.positions, reentry):
         # Overlay expiry only on a not-yet-re-entered row; a filled/working one
         # keeps its status (it already has an order).
         if st == "pending" and _is_expired_option(p):
@@ -862,7 +1026,7 @@ def latest_sell_all_snapshot(
         description="Load a SPECIFIC snapshot from the history. Omit for the current (active/newest) one.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """One Sell-All snapshot with each position's live re-entry status
     (filled / working / pending / expired) + current price and a summary count.
@@ -889,7 +1053,7 @@ def latest_sell_all_snapshot(
 @router.get("/snapshots/today")
 def today_sell_all_snapshots(
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Every snapshot taken TODAY (ET), newest first, each fully priced like the
     `latest` endpoint. The Snapshot page shows these stacked so a fresh Exit
@@ -914,7 +1078,7 @@ def today_sell_all_snapshots(
 @router.get("/snapshots")
 def list_sell_all_snapshots(
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """History of the user's Sell-All snapshots, newest first: id, when it was
     taken, position count, and a status breakdown. Cheap — counts come from the
@@ -959,7 +1123,7 @@ def list_sell_all_snapshots(
 def delete_sell_all_snapshot(
     snapshot_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Delete one snapshot from the history. Only removes the re-entry record —
     it never touches any orders that were already placed."""
@@ -976,7 +1140,7 @@ def delete_snapshot_position(
     snapshot_id: uuid.UUID,
     index: int,
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Remove ONE order (by 0-based index) from a snapshot's re-entry list. If it
     was the last one, the whole snapshot is deleted. Only touches the re-entry
@@ -995,6 +1159,84 @@ def delete_snapshot_position(
     snap.positions = poss   # reassign so JSONB persists
     db.commit()
     return {"ok": True, "remaining": len(poss), "snapshot_deleted": False}
+
+
+def _held_for_protection(adapter) -> list:
+    """Positions for the Stop / T.Stop buttons: the shared read (one Webull call
+    serves every caller for a few seconds, and on a 429 the last snapshot) —
+    so arming protection does not fail because the broker is busy answering
+    the Positions page. Only what is held and its cost are taken from it; the
+    price comes from Alpaca (services/live_marks)."""
+    try:
+        return adapter.get_positions(cached_ok=True)
+    except TypeError:                     # brokers without the shared read
+        return adapter.get_positions()
+
+
+@router.post("/channel")
+def assign_position_channel(
+    payload: PositionChannelIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Assign a held position to one of the user's Discord channels, to Self, or
+    back to "auto" (the channel whose alert opened it).
+
+    More than a label: the assigned channel's exit settings and ladder apply to
+    the position from here on, and that channel's "adding" / "stopped out"
+    alerts reach it — exactly as if its alert had opened it. A position with no
+    exit ladder yet (opened by hand) gets one, starting from ``entry_price``.
+    """
+    from app.api import discord_sources  # noqa: PLC0415 — cycle
+    from app.models.discord_alert_source import DiscordAlertSource  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    discord_sources.require_discord_member(user=user, db=db)   # 403 without Discord trading
+
+    is_option = payload.option_strike is not None
+    args = (
+        payload.symbol.upper(),
+        payload.option_strike if is_option else None,
+        payload.option_right if is_option else None,
+        payload.option_expiry if is_option else None,
+    )
+    guard = guards.find(db, user.id, *args)
+
+    choice = payload.channel.strip().lower()
+    if choice == "auto":
+        if guard is not None and guard.source_id is not None:
+            guard.source_id = None
+            db.commit()
+        return {"channel": "auto", "discord_channel": None}
+
+    if choice == "self":
+        src = discord_sources._self_source(db, user)
+    else:
+        try:
+            src = db.get(DiscordAlertSource, uuid.UUID(payload.channel))
+        except ValueError:
+            src = None
+        if src is None or src.user_id != user.id:
+            raise HTTPException(404, "channel_not_found")
+
+    if guard is None:
+        guard = guards.on_buy(db, user.id, *args, entry_price=payload.entry_price)
+    was_self = guards.is_manual(db, guard)
+    guard.source_id = src.id
+    cancelled = 0
+    if choice == "self":
+        # Self = managed by you: the ladder's and the channel's orders go, and
+        # nothing is placed or sold on its own from here.
+        cancelled = guards.hand_to_trader(db, user, guard, discord_sources._cancel_stop_order(db, user))
+    elif was_self:
+        guard.tp_off = False            # back on a channel: its ladder takes over again
+    db.commit()
+    log.info("positions: %s assigned %s to channel %s", user.id, payload.symbol, src.id)
+    name = (src.label or "").strip() or (src.channel_name or "").strip() or None
+    out = {"channel": str(src.id), "discord_channel": name}
+    if choice == "self":
+        out["cancelled"] = cancelled          # the ladder's orders the hand-over cancelled
+    return out
 
 
 @router.post("/re-enter")
@@ -1031,7 +1273,7 @@ def re_enter_from_snapshot(
         description="'Trail down': rest a BUY LIMIT this % below the live price, then re-price it lower as the stock falls (ratchets DOWN only). Stock only; managed by trail_down_monitor. Wins over discount_percent/limit_price.",
     ),
     db: Session = Depends(get_db),
-    user: User = Depends(require_sell_all_access),
+    user: User = Depends(require_snapshot_access),
 ) -> dict:
     """Re-open the positions from a Sell-All snapshot, FILL-AWARE: only items not
     already back (or with a resting order) get a new buy. Long positions re-buy,
@@ -1194,6 +1436,11 @@ def re_enter_from_snapshot(
                 db, user, payload, acct.id, background, request,
                 skip_fanout=True, resolve_wash_trade=False,
             )
+            if side == OrderSide.BUY:
+                # Back in after Sell-All: the ladder starts over, as for any re-entry.
+                from app.api.trades import _restart_ladder_on_reentry  # noqa: PLC0415
+
+                _restart_ladder_on_reentry(db, user, order, acct.id)
             # Tag the row so trail_down_monitor re-prices it. The order itself is
             # a plain limit at the broker.
             if use_trail_down:
@@ -1578,9 +1825,43 @@ _RESERVING_STATUSES = (
 # exact moment the close needs it.
 _CANCEL_SETTLE_S = 0.6
 
+# Spacing between a close's two positions reads. Webull's positions endpoint
+# allows 2 calls per 2 s per account (it objects to bursts, not volume), and the
+# P&L poller and Positions page share that budget.
+_POSITIONS_READ_GAP_S = 1.2
+# How long to wait before the one retry of a throttled positions read.
+_RATE_LIMIT_WAIT_S = 2.0
+
+
+def _read_positions_for_close(adapter: Any) -> list:
+    """The account's live positions for a close, retried once if throttled.
+
+    A 429 is refused before anything happens, so retrying after the window has
+    passed is safe — and failing the close the user asked for over one
+    throttled READ was the worse outcome.
+    """
+    from app.services.order_retry import is_rate_limit_error  # noqa: PLC0415
+
+    try:
+        return adapter.get_positions()
+    except Exception as exc:  # noqa: BLE001
+        if not is_rate_limit_error(exc):
+            raise
+        log.info("close: positions read throttled, retrying in %.1fs", _RATE_LIMIT_WAIT_S)
+        from app.services import position_events  # noqa: PLC0415
+
+        position_events.record_issue(
+            "retried", f"Webull refused the positions read (rate limit) — retried after {_RATE_LIMIT_WAIT_S:g}s.",
+            dedupe_s=30)
+        time.sleep(_RATE_LIMIT_WAIT_S)
+        return adapter.get_positions()
+
 
 def _cancel_working_orders_for_position(
     db: Session, user: User, acct: BrokerAccount, adapter: Any, pos: BrokerPosition,
+    *, side: OrderSide | None = None,
+    reason: str = "Cancelled automatically to free the position for a close you placed "
+                  "from the positions table.",
 ) -> list[uuid.UUID]:
     """Cancel every still-working order on the SAME contract before closing it.
 
@@ -1616,6 +1897,7 @@ def _cancel_working_orders_for_position(
             Order.option_right.is_not_distinct_from(pos.option_right),
             Order.status.in_(_RESERVING_STATUSES),
             Order.broker_order_id.isnot(None),
+            *([Order.side == side] if side is not None else []),
         )
     ).scalars().all()
     if not rows:
@@ -1626,7 +1908,7 @@ def _cancel_working_orders_for_position(
     touched: list[Order] = []
     for o in rows:
         try:
-            adapter.cancel_order(o.broker_order_id)
+            accepted = adapter.cancel_order(o.broker_order_id)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "close: could not cancel %s order %s (broker_order=%s) blocking the "
@@ -1635,12 +1917,22 @@ def _cancel_working_orders_for_position(
                 str(exc)[:200],
             )
             continue
+        if accepted is False:
+            # Already terminal at the broker — often FILLED: a take-profit or
+            # stop that traded as Close was pressed. Record that sale rather
+            # than call it cancelled, or it vanishes from the position's history
+            # and Closed today (exit_confirm.record_cancel_outcome). It still
+            # counts as a change, so the close re-reads what is left.
+            from app.services.exit_confirm import record_cancel_outcome  # noqa: PLC0415
+
+            record_cancel_outcome(adapter, o, refused=True)
+            if o.status == OrderStatus.FILLED:
+                cancelled.append(o.id)
+                touched.append(o)
+                continue
         o.status = OrderStatus.CANCELED
         o.closed_at = now
-        o.reject_reason = (
-            "Cancelled automatically to free the position for a close you placed "
-            "from the positions table."
-        )[:480]
+        o.reject_reason = reason[:480]
         cancelled.append(o.id)
         touched.append(o)
 
@@ -1648,7 +1940,8 @@ def _cancel_working_orders_for_position(
         db.commit()
         for o in touched:
             db.refresh(o)
-            events.publish(user.id, copy_engine._order_event("order.cancelled", o))  # noqa: SLF001
+            kind = "order.updated" if o.status == OrderStatus.FILLED else "order.cancelled"
+            events.publish(user.id, copy_engine._order_event(kind, o))  # noqa: SLF001
         log.info(
             "close: cancelled %d working order(s) on %s before closing",
             len(cancelled), pos.broker_symbol,
@@ -1659,6 +1952,8 @@ def _cancel_working_orders_for_position(
 
 
 @router.post("/{broker_symbol}/close", response_model=OrderOut)
+@_tagged("closed by you on Positions")
+@ladder_hold.released_after
 def close_position(
     broker_symbol: str,
     payload: ClosePositionIn,
@@ -1687,7 +1982,8 @@ def close_position(
 
     creds = decrypt_json(acct.encrypted_credentials)
     adapter = adapter_for(acct, creds)
-    positions = adapter.get_positions()
+    positions = _read_positions_for_close(adapter)
+    first_read_at = time.monotonic()
 
     target = broker_symbol.upper()
     pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
@@ -1704,15 +2000,42 @@ def close_position(
     # read it as removed by the trader and forget the level — leaving whatever
     # the close doesn't sell without a stop. Released here, the reconciler
     # re-places a stop sized to the remainder once the close has settled.
+    released = False
     if pos.quantity > 0:
+        from app.services import discord_position_guard as _guards  # noqa: PLC0415
         from app.services import discord_stop_orders  # noqa: PLC0415
 
-        discord_stop_orders.release_for_position(db, user, pos)
+        # Hold the ladder off this position until the close has been sent:
+        # otherwise its next pass, finding nothing resting, puts the
+        # take-profit and stop straight back on the contracts this close is
+        # about to sell, and the broker refuses the close (QA 2026-10-22, CSCO
+        # 103P). Cleared when this request ends — see services/ladder_hold.py.
+        try:
+            _g = _guards.find(db, user.id, pos.symbol, pos.option_strike,
+                              getattr(pos, "option_right", None), pos.option_expiry)
+        except Exception:  # noqa: BLE001 — a hold is never worth failing a close for
+            log.warning("close: could not look up %s's ladder to hold it", pos.symbol, exc_info=True)
+            _g = None
+        if _g is not None:
+            ladder_hold.hold_for_request(_g.id)
+        released = bool(discord_stop_orders.release_for_position(db, user, pos))
         db.commit()
 
     # Anything still resting on this contract reserves the position at the
     # broker, so the close would be refused. Clear it first — see the helper.
     cancelled = _cancel_working_orders_for_position(db, user, acct, adapter, pos)
+
+    # The ladder's own stop / take-profit cancelled above count as cancels too.
+    # They were not counted, so when they were the ONLY resting orders the close
+    # skipped both the settle pause and the re-read below and went straight to
+    # the broker while the contracts were still reserved. Webull refused it, and
+    # the conflict handling then re-read positions and retried the place three
+    # times inside two seconds — the 429s on Positions-page closes (QA
+    # 2026-10-13). The helper pauses after its own cancels; this covers the case
+    # it had none.
+    if released and not cancelled:
+        time.sleep(_CANCEL_SETTLE_S)
+    cancelled = cancelled or released
 
     # RE-READ after cancelling. An order we just cancelled may have FILLED in
     # the moments before the cancel reached the broker — a resting stop is
@@ -1721,7 +2044,13 @@ def close_position(
     # becomes a SHORT. Only pay for the extra read when we actually cancelled
     # something; the common case (nothing resting) is unchanged.
     if cancelled:
-        positions = adapter.get_positions()
+        # Webull allows two positions reads per two seconds per account, and the
+        # P&L poller and the Positions page read the same endpoint. Keep this
+        # one clear of the first read rather than land the burst's third call.
+        wait = _POSITIONS_READ_GAP_S - (time.monotonic() - first_read_at)
+        if wait > 0:
+            time.sleep(wait)
+        positions = _read_positions_for_close(adapter)
         pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
         if pos is None or pos.quantity == 0:
             # The resting order closed it for us. Nothing left to sell, and
@@ -1809,21 +2138,28 @@ def close_position(
 
 
 @router.post("/{broker_symbol}/stop")
+@_tagged("set by you on Positions")
 def set_position_stop(
     broker_symbol: str,
     request: Request,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
     pnl_pct: Decimal = Query(..., ge=-99, le=1000, description="P&L level for the stop: -25 is 25% below entry, 0 break-even, +25 locks in 25%."),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> dict:
-    """Put the position's stop at a P&L level measured from entry.
+    """Put the position's stop at a P&L level measured from its average price.
 
     Sets the level on the position's ladder guard (creating one, as the
     trailing-stop action does, if the position has none). The stop reconciler
     then keeps a real STOP order resting at that level — one mechanism for
     every stop on the row, so a ladder stop and a second bracket stop never end
     up competing for the same contracts.
+    Open to the position's OWNER, trader or subscriber. What protects this is
+    the account check below — an account the caller does not own answers 404 —
+    not the role, since the endpoint can never reach another user's position.
+    It was trader-only, which left a subscriber able to arm a TRAILING stop on
+    a row but unable to set a plain one on that same row. Bulk actions that
+    target OTHER people's accounts stay trader-only.
     """
     from decimal import ROUND_DOWN  # noqa: PLC0415
 
@@ -1834,7 +2170,7 @@ def set_position_stop(
     acct = db.get(BrokerAccount, broker_account_id)
     if not acct or acct.user_id != user.id:
         raise HTTPException(404, "broker_account_not_found")
-    positions = adapter_for(acct, decrypt_json(acct.encrypted_credentials)).get_positions()
+    positions = _held_for_protection(adapter_for(acct, decrypt_json(acct.encrypted_credentials)))
     pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
@@ -1843,8 +2179,15 @@ def set_position_stop(
         raise HTTPException(422, "Stops from this row are for long positions only.")
 
     guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
-    entry = (guard.entry_price if guard is not None and guard.entry_price else None) \
-        or getattr(pos, "avg_entry_price", None)
+    # Measured from the position's AVERAGE price — the broker's, the "Avg entry"
+    # the row shows and the price the level was previewed against. The ladder's
+    # own entry is the OPENING order's price and stays put when the position is
+    # added to, so after an add the two differ: a 0% stop asked for at the
+    # average landed at the opening price instead (QA 2026-10-02). The ladder's
+    # entry is only the fallback, for a broker that reports no average.
+    avg = getattr(pos, "avg_entry_price", None)
+    entry = avg if avg is not None and Decimal(str(avg)) > 0 else (
+        guard.entry_price if guard is not None else None)
     if entry is None or Decimal(str(entry)) <= 0:
         raise HTTPException(422, "No entry price to measure the stop from.")
     entry = Decimal(str(entry))
@@ -1854,7 +2197,10 @@ def set_position_stop(
     price = (entry * (Decimal(1) + pnl_pct / Decimal(100))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     if price <= 0:
         raise HTTPException(422, "That level rounds to a $0 stop.")
-    mark = getattr(pos, "current_price", None)
+    # Judged against Alpaca's live quote, not the broker's last mark.
+    from app.services import live_marks  # noqa: PLC0415
+
+    mark = live_marks.position_mark(pos, user.id)
     if mark is not None and Decimal(str(mark)) > 0 and price >= Decimal(str(mark)):
         # A sell stop at or above the market fires at once; Alpaca refuses it.
         raise HTTPException(
@@ -1874,6 +2220,7 @@ def set_position_stop(
         db.add(guard)
     previous = guard.stop_price
     guard.stop_price = price
+    guards.clear_stop_trail(guard)        # a stop set by hand stays where it is put
     audit.record(
         db, actor_user_id=user.id, action="positions.stop_set",
         entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
@@ -1905,13 +2252,174 @@ def _resting_stop_orders(db: Session, user_id, pos) -> list:
     ).scalars())
 
 
+@router.post("/{broker_symbol}/reapply-ladder")
+@_tagged("exit ladder reapplied by you on Positions")
+@ladder_hold.released_after
+def reapply_exit_ladder(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Start the position's Discord exit ladder over from what is held now.
+
+    For a position worked on by hand — a stop moved or removed, a take-profit
+    cancelled, contracts added. Every resting SELL on the contract goes (the
+    ladder's stop and take-profit, and any other sell); resting buys stay. The
+    ladder then restarts at T1 from the position's current average cost: the
+    On Fill stop from that cost, the first take-profit sized from what is held.
+    The orders themselves go out on the ladder's next pass, which this wakes.
+
+    Open to the position's OWNER, trader or subscriber — the account check below
+    is what protects it.
+    """
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.models.settings import TraderSettings  # noqa: PLC0415
+    from app.services import audit, discord_stop_orders  # noqa: PLC0415
+    from app.services import discord_channel_settings as dcs  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+    from app.services import pnl_poller  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    positions = _read_positions_for_close(adapter)
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity <= 0:
+        raise HTTPException(404, "position_not_found")
+    if pos.instrument_type != InstrumentType.OPTION:
+        raise HTTPException(409, "The exit ladder runs on options only.")
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        getattr(pos, "option_right", None), pos.option_expiry)
+    if guard is None:
+        raise HTTPException(409, "This position has no exit ladder — it wasn't opened from a channel. "
+                                 "Assign it to a channel first.")
+    if guards.is_manual(db, guard):
+        # Taken over by hand (Manual takeover, or assigned to Self): reapplying
+        # hands it back — to the channel whose alert opened it ("auto").
+        guard.source_id = None
+    ts = dcs.for_guard(db, user.id, guard) or db.get(TraderSettings, user.id)
+
+    # Keep the ladder's own pass off it while its orders come down and the
+    # ladder is reset; it places the new ones once this request ends.
+    ladder_hold.hold_for_request(guard.id)
+    discord_stop_orders.release_for_position(db, user, pos)
+    db.commit()
+    cancelled = _cancel_working_orders_for_position(
+        db, user, acct, adapter, pos, side=OrderSide.SELL,
+        reason="Cancelled so the exit ladder could start over (Reapply exit ladder).",
+    )
+    guards.reapply(db, guard, ts, average_cost=getattr(pos, "avg_entry_price", None))
+    audit.record(
+        db, actor_user_id=user.id, action="positions.ladder_reapplied",
+        entity_type="discord_position_guard", entity_id=guard.id,
+        metadata={"broker_symbol": pos.broker_symbol, "held": str(pos.quantity),
+                  "entry": str(guard.entry_price), "stop": str(guard.stop_price),
+                  "cancelled": [str(c) for c in cancelled]},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    try:
+        pnl_poller.poll_now(acct.id)
+    except Exception:  # noqa: BLE001 — the regular pass places them anyway
+        log.warning("reapply: could not wake the ladder for %s", pos.symbol, exc_info=True)
+    return {
+        "ok": True,
+        "held": str(pos.quantity),
+        "entry": str(guard.entry_price) if guard.entry_price is not None else None,
+        "stop": str(guard.stop_price) if guard.stop_price is not None else None,
+        "cancelled": len(cancelled),
+    }
+
+
+@router.post("/{broker_symbol}/manual-takeover")
+@_tagged("taken over by you on Positions (Manual takeover)")
+@ladder_hold.released_after
+def manual_takeover(
+    broker_symbol: str,
+    request: Request,
+    broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Take a position over by hand: clear every stop and order on it and stop
+    the exit ladder acting on it, so the trader can exit it themselves.
+
+    * the ladder hands it to the trader — assigned to Self, as the Channel
+      menu's "Self" does: from here nothing is placed or sold on its own, and
+      the channel's alerts don't act on it (a stop the trader sets later still
+      rests and fires);
+    * EVERY working order on the contract is cancelled — the ladder's stop and
+      take-profit, the trader's own resting sells and buys;
+    * a bracket stop-loss / take-profit on the entry is cleared, so nothing
+      fires on its own.
+
+    "Reapply exit ladder" hands it back. Open to the position's OWNER, trader or
+    subscriber — the account check below is what protects it.
+    """
+    from app.api import discord_sources  # noqa: PLC0415 — cycle
+    from app.services import audit  # noqa: PLC0415
+    from app.services import discord_position_guard as guards  # noqa: PLC0415
+
+    acct = db.get(BrokerAccount, broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+    positions = _read_positions_for_close(adapter)
+    pos = next((p for p in positions if p.broker_symbol.upper() == broker_symbol.upper()), None)
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+
+    guard = guards.find(db, user.id, pos.symbol, pos.option_strike,
+                        getattr(pos, "option_right", None), pos.option_expiry)
+    ladder_cancelled = 0
+    if guard is not None:
+        ladder_hold.hold_for_request(guard.id)
+        guard.source_id = discord_sources._self_source(db, user).id
+        ladder_cancelled = guards.hand_to_trader(db, user, guard, discord_sources._cancel_stop_order(db, user))
+        db.commit()
+    cancelled = _cancel_working_orders_for_position(
+        db, user, acct, adapter, pos,
+        reason="Cancelled when you took the position over by hand (Manual takeover).",
+    )
+    # A bracket's legs on the entry are stops too: the emulator would fire them.
+    brackets = 0
+    for o in db.execute(
+        select(Order).where(
+            Order.user_id == user.id, Order.broker_account_id == acct.id,
+            Order.symbol == pos.symbol, Order.side == OrderSide.BUY,
+            Order.option_expiry.is_not_distinct_from(pos.option_expiry),
+            Order.option_strike.is_not_distinct_from(pos.option_strike),
+            Order.option_right.is_not_distinct_from(pos.option_right),
+            or_(Order.stop_loss_price.isnot(None), Order.take_profit_price.isnot(None)),
+        )
+    ).scalars():
+        o.stop_loss_price = None
+        o.take_profit_price = None
+        brackets += 1
+    audit.record(
+        db, actor_user_id=user.id, action="positions.manual_takeover",
+        entity_type="discord_position_guard", entity_id=getattr(guard, "id", None),
+        metadata={"broker_symbol": pos.broker_symbol, "held": str(pos.quantity),
+                  "ladder_orders_cancelled": ladder_cancelled,
+                  "orders_cancelled": [str(c) for c in cancelled], "brackets_cleared": brackets},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return {"ok": True, "cancelled": ladder_cancelled + len(cancelled), "brackets_cleared": brackets,
+            "ladder": guard is not None}
+
+
 @router.post("/{broker_symbol}/stops/cancel")
+@_tagged("removed by you (X.Stops)")
 def cancel_position_stops(
     broker_symbol: str,
     request: Request,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
     db: Session = Depends(get_db),
-    user: User = Depends(require_trader),
+    user: User = Depends(current_user),
 ) -> dict:
     """Remove every stop on one position, and keep them removed.
 
@@ -1924,6 +2432,12 @@ def cancel_position_stops(
 
     A bracket's SL leg is not touched here: the row clears that through the
     bracket endpoint, which keeps the entry's bracket state consistent.
+    Open to the position's OWNER, trader or subscriber. What protects this is
+    the account check below — an account the caller does not own answers 404 —
+    not the role, since the endpoint can never reach another user's position.
+    It was trader-only, which left a subscriber able to arm a TRAILING stop on
+    a row but unable to set a plain one on that same row. Bulk actions that
+    target OTHER people's accounts stay trader-only.
     """
     from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
     from app.services import audit, discord_stop_orders  # noqa: PLC0415
@@ -1946,6 +2460,7 @@ def cancel_position_stops(
             removed.append(f"stop @ {guard.stop_price}")
             discord_stop_orders.release(db, guard, cancel)
             guard.stop_price = None
+            guards.clear_stop_trail(guard)
         if guard.trail_qty is not None:
             removed.append(f"trailing exit on {guard.trail_qty}")
             guards.clear_trail(guard)
@@ -1970,6 +2485,7 @@ def cancel_position_stops(
 
 
 @router.post("/{broker_symbol}/average", response_model=OrderOut)
+@_tagged("averaged by you on Positions")
 def average_position(
     broker_symbol: str,
     payload: AveragePositionIn,
@@ -2033,13 +2549,25 @@ def average_position(
     added_price = limit if limit is not None else getattr(pos, "current_price", None)
     if (guard is not None and guard.entry_price is not None and added_price is not None
             and Decimal(str(added_price)) < guard.entry_price):
+        before = guard.entry_price
         guards.average_in(db, guard, held_qty=held, added_qty=payload.quantity,
                           added_price=Decimal(str(added_price)))
+        # The ladder's stop follows the new average (a hand-set stop doesn't).
+        try:
+            from app.models.settings import TraderSettings  # noqa: PLC0415
+            from app.services import discord_channel_settings as _dcs  # noqa: PLC0415
+
+            ts = _dcs.for_guard(db, user.id, guard) or db.get(TraderSettings, user.id)
+            if ts is not None:
+                guards.reprice_ladder_stop(guard, before, guard.entry_price, ts)
+        except Exception:  # noqa: BLE001 — the average is placed; the stop catches up on fill
+            log.warning("positions: could not move the ladder stop after averaging", exc_info=True)
     db.commit()
     return order
 
 
 @router.post("/{broker_symbol}/cancel-open")
+@_tagged("cancelled by you (Canc.Open Ord)")
 def cancel_position_open_orders(
     broker_symbol: str,
     request: Request,
@@ -2079,6 +2607,7 @@ def cancel_position_open_orders(
     if guard is not None and guard.stop_order_id in {o.id for o in orders}:
         guard.stop_order_id = None
         guard.stop_price = None
+        guards.clear_stop_trail(guard)
         db.commit()
     return result
 
@@ -2102,21 +2631,23 @@ def _position_open_orders(db: Session, user_id, acct_id, pos, statuses) -> list:
 
 
 @router.post("/{broker_symbol}/trailing-stop")
+@_tagged("armed by you on Positions (Trl.Stop)")
 def arm_trailing_stop(
     broker_symbol: str,
     request: Request,
     background: BackgroundTasks,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
-    trail_percent: Decimal = Query(..., gt=0, le=100, description="Trailing give-back % off the current market price."),
+    trail_percent: Decimal = Query(..., gt=0, le=100, description="Trailing give-back, as a % of the PROFIT: 30 keeps 70% of the best profit (cost 100, high 500 -> stop 380). Until the high is that % above cost, a fixed stop that % below cost."),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
     """Arm a trailing stop on one position, measured off the CURRENT market price.
 
     Stocks on trailing-capable brokers get a NATIVE trailing-stop order. Options
-    (which brokers reject for trailing stops) get an EMULATED trail — a guard the
-    P&L poller advances against the live mark and MARKET-closes when the price
-    retraces ``trail_percent`` % from its peak (same engine as Discord trims)."""
+    (which brokers reject for trailing stops) get a real STOP resting at the
+    broker for every contract held, ``trail_percent`` % below the market, which
+    the P&L poller raises as the price makes new highs. It takes over the exit
+    from the ladder's take-profit — see below."""
     from app.models.discord_position_guard import DiscordPositionGuard  # noqa: PLC0415
     from app.services import discord_position_guard as guards  # noqa: PLC0415
 
@@ -2128,21 +2659,30 @@ def arm_trailing_stop(
 
     creds = decrypt_json(acct.encrypted_credentials)
     adapter = adapter_for(acct, creds)
-    positions = adapter.get_positions()
+    positions = _held_for_protection(adapter)
     target = broker_symbol.upper()
     pos = next((p for p in positions if p.broker_symbol.upper() == target), None)
     if pos is None or pos.quantity == 0:
         raise HTTPException(404, "position_not_found")
 
-    raw_price = pos.current_price
-    if raw_price is None or Decimal(str(raw_price)) <= 0:
+    # The trail is anchored on Alpaca's live quote (the broker's mark only if
+    # Alpaca has none), and the poller ratchets it on the same feed.
+    from app.services import live_marks  # noqa: PLC0415
+
+    price = live_marks.position_mark(pos, user.id)
+    if price is None or price <= 0:
         raise HTTPException(422, "no_live_price_to_anchor_trail")
-    price = Decimal(str(raw_price))
     held = abs(Decimal(str(pos.quantity)))
     reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
 
     # Native trailing stop where the broker holds it (stocks on Alpaca). Trader-
     # only (skip_fanout) — arming a protective stop isn't a copy signal.
+    # The trail gives back a share of the PROFIT (the trader's rule,
+    # 2026-10-24) — see discord_position_guard.trail_level. A stock held by a
+    # broker's own trailing order can only trail a fixed % of the price, so
+    # that path keeps Alpaca's percent trail.
+    cost = getattr(pos, "avg_entry_price", None)
+    cost = Decimal(str(cost)) if cost is not None and Decimal(str(cost)) > 0 else None
     if trailing_stop_close.trailing_stop_supported(adapter, pos):
         payload = PlaceOrderIn(
             instrument_type=pos.instrument_type,
@@ -2159,9 +2699,25 @@ def arm_trailing_stop(
         db.commit()
         return {"mode": "native", "order_id": str(order.id), "trail_percent": str(trail_percent)}
 
-    # Emulated trail (options): arm/refresh a guard the P&L poller enforces. The
-    # dollar give-back is trail_percent % of the current mark; the peak seeds at
-    # the current price and ratchets up from there.
+    # Options (no broker takes a trailing-stop order on them): a real STOP that
+    # rests at the broker for EVERYTHING held, trail_percent below the market,
+    # raised by the P&L poller as the price makes new highs (ratchet_stop) — the
+    # ladder's own trailing stop, reconciled by discord_stop_orders.
+    #
+    # It used to arm an app-watched slice instead: checked once per poll (15s on
+    # Webull) and sold at market only after cancelling whatever rested on the
+    # contracts. Worse, it sat ALONGSIDE the ladder: the take-profit pair kept
+    # its contracts and its own fixed linked stop, and the old stop level stayed.
+    # QA 2026-10-14, SPY 773P: 2 held, a 5% trail armed at 1.375 (exit 1.3063),
+    # the take-profit still holding 1 of the 2 — sold at 1.21, 23s later.
+    #
+    # Now the trailing stop TAKES OVER the exit: the take-profit (and its linked
+    # stop) is released and stays off for this holding, the slice trail is
+    # cleared, and the one stop covers every contract. Mutually exclusive with
+    # the Stop button, which clears the trail when it sets a fixed level.
+    if reverse_side != OrderSide.SELL:
+        # The stop reconciler places SELL stops; a short needs a BUY stop.
+        raise HTTPException(422, "Trailing stops from this row are for long positions only.")
     guard = guards.find(db, user.id, pos.symbol, pos.option_strike, pos.option_right, pos.option_expiry)
     if guard is None:
         guard = DiscordPositionGuard(
@@ -2171,9 +2727,32 @@ def arm_trailing_stop(
             option_right=(pos.option_right.value if pos.option_right else None),
             option_expiry=pos.option_expiry,
             entry_price=getattr(pos, "avg_entry_price", None),
+            sell_count=0,
         )
         db.add(guard)
-    guard.trail_percent = trail_percent
-    guards.arm_trail(guard, held, (price * trail_percent / Decimal(100)), price)
+    stop = guards._to_tick(guards.trail_level(trail_percent, price, guard.entry_price or cost))
+    if stop is None or stop <= 0:
+        raise HTTPException(422, "That trail is more than the price — the stop would be at $0.")
+
+    from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
+    from app.services import discord_take_profit  # noqa: PLC0415
+
+    if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
+        discord_take_profit.release(db, guard, _cancel_stop_order(db, user))
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("armed by you on Positions (Trl.Stop) — "
+                 + guards.trail_explain(trail_percent, price, guard.entry_price or cost)):
+        guard.tp_off = True
+        guards.clear_trail(guard)
+        guard.trail_percent = trail_percent
+        guard.stop_price = stop
+        guard.stop_trail_pct = trail_percent
+        guard.stop_peak = price
+        if hasattr(db, "flush"):
+            db.flush()
     db.commit()
-    return {"mode": "emulated", "trail_percent": str(trail_percent), "peak": str(price)}
+    log.info("positions: trailing stop on %s — %s%% below %s, stop %s, all %s held",
+             pos.broker_symbol, trail_percent, price, stop, held)
+    return {"mode": "broker_stop", "trail_percent": str(trail_percent), "peak": str(price),
+            "stop_price": str(stop), "quantity": str(held)}

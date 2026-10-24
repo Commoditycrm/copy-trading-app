@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from alpaca.trading.enums import OrderSide as AlpacaSide
@@ -135,6 +136,9 @@ log = logging.getLogger(__name__)
 
 class AlpacaAdapter(BrokerAdapter):
     name = "alpaca"
+    # Set by services/paper_autotrade.attach on QA paper-autotrade accounts:
+    # raises before any place/replace that isn't provably on paper.
+    paper_guard = None
 
     def __init__(self, credentials: dict[str, Any]):
         self.credentials = credentials
@@ -171,6 +175,8 @@ class AlpacaAdapter(BrokerAdapter):
     # ── orders ────────────────────────────────────────────────────────────
 
     def place_order(self, req: BrokerOrderRequest) -> BrokerOrderResult:
+        if self.paper_guard is not None:
+            self.paper_guard(req, "place")
         # Build the symbol: OCC for options, plain ticker for stocks.
         if req.instrument_type == InstrumentType.OPTION:
             if not (req.option_expiry and req.option_strike and req.option_right):
@@ -308,7 +314,29 @@ class AlpacaAdapter(BrokerAdapter):
         )
 
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
-        resp = self._c().get_order_by_id(broker_order_id)
+        return self._to_result(self._c().get_order_by_id(broker_order_id))
+
+    # Alpaca 422s a reused client_order_id ("client_order_id must be unique").
+    dedupes_client_order_id = True
+
+    def find_placed_order(
+        self,
+        req: BrokerOrderRequest,
+        *,
+        placed_after: datetime,
+    ) -> BrokerOrderResult | None:
+        if not req.client_order_id:
+            raise NotImplementedError("alpaca lookup needs a client_order_id")
+        try:
+            resp = self._c().get_order_by_client_id(req.client_order_id)
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404 or "not found" in str(exc).lower():
+                return None
+            raise
+        return self._to_result(resp)
+
+    @staticmethod
+    def _to_result(resp: Any) -> BrokerOrderResult:
         return BrokerOrderResult(
             broker_order_id=str(resp.id),
             status=_STATUS_IN.get(resp.status, OrderStatus.SUBMITTED),
@@ -345,6 +373,8 @@ class AlpacaAdapter(BrokerAdapter):
         left working untouched. Never releases the position's share reservation —
         the whole reason to prefer this over cancel+place for a re-price. Only the
         changed fields (qty / limit / stop) are sent; the rest carry over."""
+        if self.paper_guard is not None:
+            self.paper_guard(req, "replace")
         qty = (
             int(req.quantity)
             if req.instrument_type == InstrumentType.OPTION

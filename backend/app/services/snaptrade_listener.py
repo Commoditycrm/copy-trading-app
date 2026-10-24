@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.brokers.snaptrade import SnapTradeAdapter, parse_snaptrade_order_symbol
@@ -123,9 +123,26 @@ def _should_force_resync(
 
 
 def _poll_interval() -> float:
-    """5s normally; 60s backstop when a webhook drives detection."""
-    from app.config import get_settings
-    return POLL_INTERVAL_BACKSTOP_S if get_settings().snaptrade_webhook_enabled else POLL_INTERVAL_S
+    """The active cadence, or the 60s backstop when a webhook drives detection.
+
+    Both the switch and the interval are runtime knobs (admin API page), read
+    on every tick so a change lands on the next one. Redis trouble falls back
+    to the env defaults — never to a tighter cadence than configured, since
+    this loop is the largest consumer of SnapTrade's shared quota."""
+    from app.services.platform_config import (  # noqa: PLC0415
+        get_bool_knob,
+        get_int_knob,
+    )
+    try:
+        if get_bool_knob("snaptrade_webhook_enabled"):
+            return POLL_INTERVAL_BACKSTOP_S
+        return float(get_int_knob("snaptrade_poll_interval_s"))
+    except Exception:  # noqa: BLE001
+        from app.config import get_settings  # noqa: PLC0415
+        s = get_settings()
+        if s.snaptrade_webhook_enabled:
+            return POLL_INTERVAL_BACKSTOP_S
+        return float(s.snaptrade_poll_interval_s)
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -163,6 +180,10 @@ async def start_all_listeners() -> None:
 
 
 def start_listener(trader_user_id: uuid.UUID, broker_account_id: uuid.UUID) -> None:
+    # Never listen on an account another user also holds — see services/shared_accounts.
+    from app.services import shared_accounts  # noqa: PLC0415
+    if shared_accounts.listener_blocked(broker_account_id):
+        return
     existing = _tasks.get(trader_user_id)
     if existing and not existing.done():
         log.info("snaptrade-listener[%s] restart requested", trader_user_id)
@@ -678,6 +699,15 @@ def _persist_and_fanout(
         if owner is not None and owner.role == UserRole.SUBSCRIBER:
             return
 
+        # Known subscriber mirror on the trader's feed = shared broker account.
+        # SnapTrade has no client_order_id, so this can only match on the id.
+        if order_intent.is_mirror_echo(db, trader_user_id, broker_account_id, broker_order_id, None):
+            log.warning(
+                "snaptrade-listener[%s] ignoring echo of a known mirror/foreign "
+                "order %s — shared broker account?", trader_user_id, broker_order_id,
+            )
+            return
+
         # Before creating a "new external order", check whether this is just OUR
         # OWN recently-placed order resurfacing under a different feed id.
         #
@@ -1100,7 +1130,11 @@ async def _run_subscriber_reconciler() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("snaptrade subscriber fill reconciler: tick failed")
-        await asyncio.sleep(_RECONCILE_INTERVAL_S)
+        # Runtime knob; _RECONCILE_INTERVAL_S is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "snaptrade_subscriber_reconcile_interval_s", _RECONCILE_INTERVAL_S,
+        ))
 
 
 def _reconcile_subscriber_fills_once() -> None:
@@ -1108,24 +1142,45 @@ def _reconcile_subscriber_fills_once() -> None:
     orders and re-pull their order status from SnapTrade. Only accounts with
     something pending are polled, so quota use is proportional to real work.
     Sequential + best-effort per account so one bad account can't stall the
-    rest or burst SnapTrade's shared rate limit."""
+    rest or burst SnapTrade's shared rate limit.
+
+    Pending work is a copy mirror anywhere, OR any working order on a SnapTrade
+    account. Mirrors alone used to be the test, and every order the copy engine
+    did not create carries a NULL parent — a Discord subscriber's ladder stop,
+    take-profit and limit entry among them. A subscriber whose only working
+    orders were those was never swept: a stop that fired at the broker stayed
+    "working" in our DB, so the ladder never saw the stop-out and the sell never
+    reached Closed today. Same fix the Alpaca / Webull / IBKR twins carry
+    (tests/test_subscriber_reconciler_scope.py).
+
+    Traders are excluded by role: their SnapTrade listener already reads their
+    orders, and a second reader would spend the shared quota twice."""
     with SessionLocal() as db:
+        snaptrade_accts = select(BrokerAccount.id).where(
+            BrokerAccount.broker == BrokerName.SNAPTRADE,
+        )
         working_user_ids = (
             select(Order.user_id)
             .where(
-                Order.parent_order_id.is_not(None),
                 Order.status.in_(_WORKING_STATUSES),
                 Order.broker_order_id.is_not(None),
+                or_(
+                    Order.parent_order_id.is_not(None),
+                    Order.broker_account_id.in_(snaptrade_accts),
+                ),
             )
             .distinct()
         )
         targets = [
             (a.user_id, a.id)
             for a in db.execute(
-                select(BrokerAccount).where(
+                select(BrokerAccount)
+                .join(User, User.id == BrokerAccount.user_id)
+                .where(
                     BrokerAccount.broker == BrokerName.SNAPTRADE,
                     BrokerAccount.connection_status == "connected",
                     BrokerAccount.user_id.in_(working_user_ids),
+                    User.role != UserRole.TRADER,
                 )
             ).scalars()
         ]

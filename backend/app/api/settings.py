@@ -34,7 +34,7 @@ from app.schemas.settings import (
     UnfilledTimeoutIn,
 )
 from app.services.pnl import today_realized_pnl
-from app.services import audit, cache, market_hours
+from app.services import audit, cache, market_hours, shared_accounts
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -77,6 +77,11 @@ def _to_out(db: Session, s: SubscriberSettings) -> SubscriberSettingsOut:
         following_trader_business_name=trader_business_name,
         following_trader_copy_active=trader_copy_active,
         copy_enabled=s.copy_enabled,
+        # Which mode the settings page shows as live. Omitted here it would
+        # default to False and the page would show Risk Controls for someone
+        # who had chosen Advanced — the stored value is right, the response
+        # was not.
+        advanced_settings_enabled=bool(s.advanced_settings_enabled),
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         daily_profit_limit=s.daily_profit_limit,
@@ -941,6 +946,8 @@ def follow_trader(
             ).scalar_one_or_none()
             if approved is None:
                 raise HTTPException(403, "follow_not_approved")
+        if shared_accounts.follow_conflict(db, user.id, payload.trader_id):
+            raise HTTPException(409, shared_accounts.CONFLICT_MESSAGE.format(who="this trader"))
     old_trader_id = s.following_trader_id
     s.following_trader_id = payload.trader_id
     audit.record(

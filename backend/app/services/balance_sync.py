@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session  # noqa: F401 — re-exported type hint convenience
 
 from app.brokers import adapter_for
+from app.brokers.ibkr import IBKRAdapter
 from app.brokers.alpaca import AlpacaAdapter
 from app.brokers.snaptrade import SnapTradeAdapter
 from app.brokers.webull import WebullAdapter
@@ -78,7 +79,7 @@ def refresh_account_balance(acct: BrokerAccount, creds: dict[str, Any]) -> bool:
     self-heals once the broker is reachable again."""
     try:
         adapter = adapter_for(acct, creds)
-        if not isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter)):
+        if not isinstance(adapter, (AlpacaAdapter, SnapTradeAdapter, WebullAdapter, IBKRAdapter)):
             return False
         bal = adapter.get_balance_snapshot()
         acct.cash = bal["cash"]
@@ -166,4 +167,8 @@ async def _run_loop() -> None:
             raise
         except Exception:  # noqa: BLE001
             log.exception("balance_sync: sweep failed")
-        await asyncio.sleep(BALANCE_SYNC_INTERVAL_S)
+        # Runtime knob; BALANCE_SYNC_INTERVAL_S is the fallback.
+        from app.services.platform_config import int_knob_or  # noqa: PLC0415
+        await asyncio.sleep(int_knob_or(
+            "balance_sync_interval_s", BALANCE_SYNC_INTERVAL_S,
+        ))

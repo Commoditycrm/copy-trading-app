@@ -8,6 +8,20 @@ from pydantic import BaseModel, Field, model_validator
 from app.models.order import InstrumentType, OptionRight, OrderType
 
 
+class ProtectionOut(BaseModel):
+    """One thing protecting a position — see services/position_protections."""
+    kind: str                         # "stop" | "trailing_stop" | "take_profit"
+    price: str | None = None          # the level now (a trailing stop's current stop)
+    quantity: str | None = None       # contracts / shares covered; None = the whole position
+    where: str = "app"                # the broker it rests at ("Webull", "Alpaca"), or "app"
+    order_id: str | None = None       # the resting order, when there is one
+    source: str = "order"             # "ladder" | "order" | "bracket"
+    note: str | None = None           # e.g. "Trim 2", "linked to the take-profit"
+    trail_pct: str | None = None
+    trail_amount: str | None = None
+    peak: str | None = None           # the high a trailing stop is measured from
+
+
 class PositionOut(BaseModel):
     broker_account_id: uuid.UUID
     broker_symbol: str                # canonical broker id (OCC for options, ticker for stocks)
@@ -43,6 +57,9 @@ class PositionOut(BaseModel):
     # That stop is its own order at the broker (not the entry's bracket SL), so
     # the row needs to know about it to offer "Cancel stop" for it.
     ladder_stop_price: Decimal | None = None
+    # Stops, trailing stops and take-profits on this position (Positions page
+    # icons + their details).
+    protections: list[ProtectionOut] = []
 
 
 class UnreachableAccount(BaseModel):
@@ -61,6 +78,16 @@ class UnreachableAccount(BaseModel):
     detail: str
 
 
+class StaleAccount(BaseModel):
+    """A broker account whose positions ARE listed, but from a recent snapshot:
+    the live read was rate-limited (Webull 429). Shown with its age rather than
+    leaving the account out."""
+    broker_account_id: uuid.UUID
+    broker: str
+    label: str | None = None
+    age_s: int
+
+
 class PositionsPayload(BaseModel):
     """Detailed form of GET /api/positions (``?detail=1``).
 
@@ -68,6 +95,24 @@ class PositionsPayload(BaseModel):
     only the UI that needs to SAY something about a failure opts in."""
     positions: list[PositionOut]
     unreachable: list[UnreachableAccount] = []
+    stale: list[StaleAccount] = []
+
+
+class PositionChannelIn(BaseModel):
+    """Assign a held position to a Discord channel (Positions → Channel).
+
+    ``channel`` is a channel's id, "self" for the trader's own Self channel, or
+    "auto" to go back to the channel whose alert opened the position.
+    ``entry_price`` is the position's average cost as the page shows it — used
+    only to start an exit ladder on a position that has none yet.
+    """
+
+    symbol: str = Field(min_length=1, max_length=40)
+    option_strike: Decimal | None = None
+    option_right: OptionRight | None = None
+    option_expiry: date | None = None
+    channel: str = Field(min_length=1, max_length=40)
+    entry_price: Decimal | None = Field(default=None, gt=0)
 
 
 class AveragePositionIn(BaseModel):

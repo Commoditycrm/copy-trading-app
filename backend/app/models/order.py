@@ -179,6 +179,17 @@ class Order(Base, TimestampMixin):
     broker_filled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # WHICH path last told us about this order: "stream" (the broker's realtime
+    # push) or "poll" (our REST sweep). NULL for brokers/paths that set neither.
+    #
+    # Exists because "is the realtime stream actually doing the work?" was
+    # unanswerable from the data. Both paths write through the same code and
+    # left no trace, so a stream that was connected but discarding every event
+    # looked exactly like one carrying the whole load — and we spent two months
+    # on the wrong side of that question. Per-order, this is the difference
+    # between measuring and guessing, and it is what decides whether the REST
+    # poller can be backed off.
+    detected_via: Mapped[str | None] = mapped_column(String(10), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # ── Copy-trade pipeline lifecycle timestamps (Performance page) ──────

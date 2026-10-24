@@ -90,3 +90,26 @@ def test_the_contract_is_never_guessed():
     s = _read("TSLA 60% @Mark", pct_exit=False).signals[0]
     assert s.strike is None and s.option_type is None and s.expiration is None
     assert s.contract_unspecified is True
+
+
+# ── "TSLA -90% Out @Mark" (live 2026-10-07, missed) ─────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "TSLA -90% Out @Mark", "TSLA -90% out", "TSLA +40% all out", "TSLA 25% closed",
+    "TSLA -50% stopped out", "TSLA 30% done!",
+])
+def test_an_exit_word_after_the_percent_is_a_full_close(text):
+    r = _read(text, pct_exit=False)
+    assert r.status is ParseStatus.PARSED
+    s = r.signals[0]
+    assert s.action is SignalAction.SELL and s.symbol == "TSLA" and s.flatten is True
+
+
+def test_without_an_exit_word_it_is_still_a_ladder_trim():
+    s = _read("TSLA -90% @Mark", pct_exit=False).signals[0]
+    assert s.flatten is False
+
+
+@pytest.mark.parametrize("text", ["TSLA -90% out of patience lol", "AMD 27% of the float is short"])
+def test_prose_after_the_percent_is_still_not_an_order(text):
+    assert _read(text, pct_exit=False).status is not ParseStatus.PARSED

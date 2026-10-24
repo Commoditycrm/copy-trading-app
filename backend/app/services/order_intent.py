@@ -67,6 +67,66 @@ def mark_app_originated(order_id: uuid.UUID) -> None:
         )
 
 
+def mark_app_originated_many(order_ids) -> None:
+    """mark_app_originated for a whole fanout batch, in one round trip."""
+    ids = list(order_ids)
+    if not ids:
+        return
+    try:
+        pipe = get_sync_redis().pipeline(transaction=False)
+        for oid in ids:
+            pipe.setex(_key(oid), _TTL_S, "1")
+        pipe.execute()
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "order_intent: failed to set app-originated markers for %d orders",
+            len(ids), exc_info=True,
+        )
+
+
+def is_mirror_echo(
+    db, trader_user_id, broker_account_id, broker_order_id: str | None, app_oid: uuid.UUID | None,
+) -> bool:
+    """True if a "new" order on a trader's feed is really one we already know as
+    a subscriber mirror (or someone else's order) — e.g. a subscriber connected
+    the trader's own account. Inserting it as a trader order would fan it out
+    again, and again. Covers the post-commit case; the Redis marker covers the
+    window before the mirror row commits."""
+    from sqlalchemy import func, or_, select  # noqa: PLC0415
+
+    from app.models.broker_account import BrokerAccount  # noqa: PLC0415
+    from app.models.order import Order  # noqa: PLC0415
+
+    not_trader_root = or_(Order.parent_order_id.isnot(None), Order.user_id != trader_user_id)
+    # client_order_id is our own uuid — a hit can only be our row
+    if app_oid is not None:
+        hit = db.execute(
+            select(Order.id).where(Order.id == app_oid, not_trader_root).limit(1)
+        ).first()
+        if hit is not None:
+            return True
+    # Broker ids aren't unique across brokerages, so only trust a match on a row
+    # that sits in this same brokerage account.
+    if broker_order_id and broker_account_id is not None:
+        src = db.get(BrokerAccount, broker_account_id)
+        num = (src.broker_account_number or "").strip() if src is not None else ""
+        if num:
+            hit = db.execute(
+                select(Order.id)
+                .join(BrokerAccount, BrokerAccount.id == Order.broker_account_id)
+                .where(
+                    Order.broker_order_id == str(broker_order_id),
+                    not_trader_root,
+                    BrokerAccount.broker == src.broker,
+                    func.trim(BrokerAccount.broker_account_number) == num,
+                )
+                .limit(1)
+            ).first()
+            if hit is not None:
+                return True
+    return False
+
+
 def is_app_originated(order_id: uuid.UUID) -> bool:
     """True if our app placed this order (marker still live). Returns False
     on any failure — failing open keeps the listener's broker_order_id
@@ -176,6 +236,8 @@ def adopt_app_placed_order(
 
 __all__ = [
     "mark_app_originated",
+    "mark_app_originated_many",
+    "is_mirror_echo",
     "is_app_originated",
     "consume_app_originated",
     "adopt_app_placed_order",

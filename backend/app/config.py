@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     # in the existing SnapTrade/Alpaca/IBKR paths changes. Turn on only in
     # environments where a trader has connected a direct Webull account.
     webull_direct_enabled: bool = False
+    # Kopyya-hosted IBKR gateways: how many gateway containers the compose stack
+    # runs (ibkr-gw-1 … ibkr-gw-N, profile "ibkr"). 0 = hosted mode off; the
+    # IBKR connect form then offers only "gateway on your machine" / OAuth.
+    ibkr_gateway_pool_size: int = 0
+    # Where slot N is reachable from the backend. {slot} is substituted.
+    ibkr_gateway_url_template: str = "https://ibkr-gw-{slot}:5000"
     # Shadow mode: when true, the Webull listener DETECTS + logs the
     # trader's orders but does NOT fan out to subscribers. Lets us verify
     # parity against the SnapTrade feed before trusting it with real
@@ -151,7 +157,28 @@ class Settings(BaseSettings):
     # account count (≈3.3s × accounts) — see webull_listener._safe_poll_interval.
     # 5s is safe for a single-account trader (6 calls / 30s) with headroom;
     # 4s also works (7.5 / 30s). Don't go below 3.5s.
-    webull_poll_interval_seconds: float = 5.0
+    # 15s, not 5s: the live events stream detects orders first; this poll is the
+    # backstop, and at 5s it was the largest share of a Webull key's request
+    # budget (every account under the key, every 5s).
+    webull_poll_interval_seconds: float = 15.0
+    # ── Market-closed polling slowdown ───────────────────────────────────
+    # Outside tradable hours (weekends + weekday <04:00 / ≥20:00 ET) prices,
+    # positions and account P&L can't move, so the data pollers back off to cut
+    # CPU + broker API calls. They return to full cadence automatically in
+    # pre-market (04:00 ET). Copy-trading/risk behaviour during tradable hours
+    # is unchanged. See market_hours.is_tradable_now.
+    #
+    # Webull order poll when the market is CLOSED. The faster "active" value is
+    # used when the trader still has working/pending orders worth monitoring.
+    webull_poll_interval_closed_seconds: float = 120.0
+    webull_poll_interval_closed_active_seconds: float = 20.0
+    # P&L poller (all brokers, incl. Alpaca REST) floor when the market is CLOSED.
+    pnl_poll_interval_closed_seconds: float = 180.0
+    # Discord auto-trim sweep when the market is CLOSED. Auto-trim only takes
+    # profit (fires ladder/AI trims) and sets on-fill stops — no trim can fill
+    # while the market is shut, so it backs off hard. Tradable cadence (15s) is
+    # unchanged; see discord_auto_trim.poll_loop / market_hours.is_tradable_now.
+    discord_auto_trim_closed_interval_seconds: float = 180.0
     # ── Webull token authorisation wait ──────────────────────────────────
     # Webull's SDK creates an access token in PENDING status and then BLOCKS,
     # polling until the account owner authorises it in their Webull app. Its own
@@ -213,6 +240,72 @@ class Settings(BaseSettings):
     # services.platform_config); env var sets the default. Bounds
     # enforced in the setter: 5-300s.
     alpaca_pnl_poll_interval_s: int = 10
+    # The other three brokers' pnl_poller intervals. Same env-default +
+    # Redis-override shape as alpaca_pnl_poll_interval_s above, so an admin can
+    # retune each broker independently without a restart; these values are the
+    # fallback when Redis is unreachable. The rationale for each default lives
+    # beside it in pnl_poller._INTERVAL_BY_BROKER, which stays as the
+    # last-resort map. Bounds enforced in the setters (services.platform_config):
+    #   webull 5-300s, snaptrade 30-600s, ibkr 5-300s.
+    # SnapTrade's floor is the highest because its 250/min quota is shared
+    # platform-wide — halving this interval doubles the spend for EVERY user,
+    # not just the account being tuned.
+    webull_pnl_poll_interval_s: int = 15
+    snaptrade_pnl_poll_interval_s: int = 60
+    ibkr_pnl_poll_interval_s: int = 15
+    # How often the SnapTrade order listener pulls list_recent_activities for
+    # each connected TRADER account. This is the single largest consumer of
+    # SnapTrade's shared quota (12 req/min per trader at the 5s default), which
+    # is why the setter floors it at 5s — it can be relaxed, never tightened
+    # past where it already is. Ignored while snaptrade_webhook_enabled is on:
+    # the listener then runs at its 60s backstop instead. Bounds: 5-120s.
+    snaptrade_poll_interval_s: int = 5
+    # ── Order feed / order status ───────────────────────────────────────
+    # IBKR order poll. Shares the user's single brokerage session with every
+    # other IBKR call, so a tight cadence competes with order placement rather
+    # than with a published quota. Bounds: 2-60s.
+    ibkr_order_poll_interval_s: int = 3
+    # How often the no-listener subscriber reconcilers refresh working mirror
+    # orders (one get_order each). Alpaca and SnapTrade run flat; Webull and
+    # IBKR use a fast cadence while an account has just traded and an idle one
+    # otherwise. Bounds: 10-300s flat, 2-120s fast, 10-600s idle.
+    alpaca_subscriber_reconcile_interval_s: int = 30
+    snaptrade_subscriber_reconcile_interval_s: int = 30
+    ibkr_subscriber_sync_interval_s: int = 5
+    ibkr_subscriber_sync_idle_interval_s: int = 30
+    # ── Account balance ─────────────────────────────────────────────────
+    # The background sweep that keeps stored equity current for accounts
+    # nobody is looking at. Bounds: 60-7200s.
+    balance_sync_interval_s: int = 900
+    # GET /api/brokers refreshes any balance older than this INLINE, so with a
+    # page open this is the effective balance cadence and the sweep above is
+    # nearly redundant. Raising it trades freshness for fewer calls on every
+    # page load. Bounds: 30-3600s.
+    broker_balance_stale_s: int = 120
+    # ── Positions ───────────────────────────────────────────────────────
+    # Webull display-read cache. Concurrent DISPLAY callers within this window
+    # share one answer; decision paths (liquidation, TP/SL, retry) always read
+    # live and are unaffected. Raising it cuts 429s on the positions page at
+    # the cost of showing a position that was just closed for longer.
+    # Bounds: 1-30s.
+    webull_positions_cache_ttl_s: int = 2
+    # ── Order fill (SnapTrade nudge) ────────────────────────────────────
+    # After placing a subscriber mirror, force_resync() fires at once and then
+    # we read back. These control that read-back, not the 30s sweep that also
+    # catches the fill. Bounds: 1-60s, 1-120s, 1-5 reads, 10-250 req/min.
+    snaptrade_nudge_read_delay_s: int = 4
+    snaptrade_nudge_retry_delay_s: int = 6
+    snaptrade_nudge_max_reads: int = 2
+    snaptrade_nudge_budget_per_min: int = 90
+    # ── Broker calendar ─────────────────────────────────────────────────
+    # The realized-P&L snapshot sweep the Calendar reads for past days.
+    # Bounds: 300-86400s.
+    pnl_snapshot_interval_s: int = 3600
+    # How long one computed account Day P&L is shared across every tab and
+    # process (GET /api/positions/day-pnl). This is the only thing stopping N
+    # open tabs becoming N broker calls, so lowering it multiplies page load.
+    # Bounds: 1-120s.
+    day_pnl_share_s: int = 10
     # Extended-hours (pre/post-market) mirror pricing. Alpaca is LIMIT-only then,
     # so a forced entry/close is routed as a marketable limit. When we know the
     # TRADER's fill price we anchor that limit to it ± this percent (a BUY bids
@@ -288,6 +381,25 @@ class Settings(BaseSettings):
     # number in E.164, e.g. +15551234567). One of the two must be set to send.
     twilio_messaging_service_sid: str = ""
     twilio_from_number: str = ""
+    # Rejected-trade texts from one place (services/rejected_trade_sms.py): every
+    # terminal rejection, once per order, tracked to Twilio delivery. OFF keeps
+    # today's behaviour exactly — only the three placement/after-accept notices
+    # text, fire-and-forget.
+    rejected_trade_sms_enabled: bool = False
+    # Shown in the text's heading, e.g. "QA" → "Kopyya QA: Trade Rejected".
+    # Blank in production.
+    sms_environment_label: str = ""
+
+    # ── QA automatic Alpaca PAPER trading (services/paper_autotrade.py) ──
+    # Off in production by never being set. With it on, the listed broker
+    # accounts are checked to be Alpaca paper before every order; automation
+    # also needs the admin toggle. Comma-separated broker_accounts ids.
+    qa_paper_autotrade_enabled: bool = False
+    qa_paper_autotrade_accounts: str = ""
+    # Runaway-volume caps per listed account; hitting one holds the account
+    # until an admin resets it.
+    qa_paper_autotrade_max_orders_per_minute: int = 10
+    qa_paper_autotrade_max_orders_per_day: int = 200
 
     # ── Inbound Discord alert-copying (browser listener) ──────────────────
     # Master switch for the whole inbound Discord feature. OFF by default so an
@@ -325,6 +437,16 @@ class Settings(BaseSettings):
     # Cap on a single intake batch from the listener. The observer flushes in
     # small batches; anything larger is a malformed or hostile payload.
     discord_ingest_max_batch: int = 50
+    # An ENTRY alert that reaches us more than this many seconds after it was
+    # posted is not placed automatically — it waits for the trader's approval
+    # instead. A restarted or reconnecting listener replays everything posted
+    # while it was away (so nothing is lost); buying those at whatever the
+    # price is now is not what anyone asked for. Exits are not held.
+    discord_max_alert_age_s: int = 120
+    # A channel posting the SAME entry again within this many seconds — a
+    # corrected price, a re-post after deleting the first — is a correction,
+    # not a second trade (services/discord_repost).
+    discord_repost_window_s: int = 180
     # How long a message's idempotency marker is held in Redis. Sized to cover a
     # listener restart / reconnect replaying the visible channel backlog, which
     # is the realistic duplicate window. The durable guard is the DB unique

@@ -79,7 +79,13 @@ export function RecentExecutions({ orders }: { orders: Order[] }) {
           <div className="text-xs">Executions will appear here as they happen.</div>
         </div>
       ) : (
-        <div className="space-y-1">
+        // Phones: the row keeps its single-line desktop layout (icon · symbol
+        // · P&L/status · timestamp) and the list scrolls sideways instead of
+        // wrapping each cell into a stack. The negative margin lets the scroll
+        // area bleed to the card's padding edge so the last column isn't
+        // clipped against the inner gutter.
+        <div className="overflow-x-auto -mx-5 px-5 sm:mx-0 sm:px-0 sm:overflow-visible">
+        <div className="space-y-1 min-w-[460px] sm:min-w-0">
           {rows.map((o, i) => {
             const buy = o.side === "buy";
             const tone = STATUS_TONE[o.status] ?? STATUS_TONE.pending;
@@ -116,7 +122,7 @@ export function RecentExecutions({ orders }: { orders: Order[] }) {
                       </span>
                     )}
                   </div>
-                  <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                  <div className="text-[11px] whitespace-nowrap" style={{ color: "var(--muted)" }}>
                     {buy ? "Buy" : "Sell"} {fmtNum(o.quantity, 0)} @ {fmtUsd(price)}
                   </div>
                 </div>
@@ -138,13 +144,14 @@ export function RecentExecutions({ orders }: { orders: Order[] }) {
                       {prettyStatus(o.status)}
                     </span>
                   )}
-                  <div className="text-[10px] mt-1" style={{ color: "var(--faint)" }}>
+                  <div className="text-[10px] mt-1 whitespace-nowrap" style={{ color: "var(--faint)" }}>
                     {fmtDateTime(o.created_at)}
                   </div>
                 </div>
               </motion.div>
             );
           })}
+        </div>
         </div>
       )}
     </div>

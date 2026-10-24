@@ -61,6 +61,13 @@ class CachedSubscriber:
     # Defaults mirror SubscriberSettings.
     eod_autoclose_enabled: bool = False
     eod_autoclose_minutes: int = 15
+    # Is this subscriber on Advanced (per-symbol) settings? Read in fanout to
+    # decide whether a symbol rule may override their sizing. MUST be cached:
+    # without it the fanout reads getattr(...)=False for everyone and the
+    # per-symbol multiplier silently never applies — the same failure the
+    # eod_autoclose flag above hit. Default False is the safe direction: it
+    # means "Risk Controls", which is the behaviour that predates symbol rules.
+    advanced_settings_enabled: bool = False
     # Per-contract dollar ceiling for OPTION entries (premium × 100). Read in
     # fanout: an opening option mirror whose contract value exceeds this is
     # skipped. None = no cap. MUST be cached so the fanout gate sees it.
@@ -117,6 +124,7 @@ def _sub_to_dict(s: SubscriberSettings | CachedSubscriber) -> dict[str, Any]:
         "copy_trader_bracket": bool(getattr(s, "copy_trader_bracket", False)),
         "eod_autoclose_enabled": bool(getattr(s, "eod_autoclose_enabled", False)),
         "eod_autoclose_minutes": int(getattr(s, "eod_autoclose_minutes", 15) or 15),
+        "advanced_settings_enabled": bool(getattr(s, "advanced_settings_enabled", False)),
         "max_per_contract": str(s.max_per_contract) if getattr(s, "max_per_contract", None) is not None else None,
         "max_per_order": str(s.max_per_order) if getattr(s, "max_per_order", None) is not None else None,
     }
@@ -137,6 +145,7 @@ def _sub_from_dict(d: dict[str, Any]) -> CachedSubscriber:
         copy_trader_bracket=bool(d.get("copy_trader_bracket", False)),
         eod_autoclose_enabled=bool(d.get("eod_autoclose_enabled", False)),
         eod_autoclose_minutes=int(d.get("eod_autoclose_minutes", 15) or 15),
+        advanced_settings_enabled=bool(d.get("advanced_settings_enabled", False)),
         max_per_contract=Decimal(d["max_per_contract"]) if d.get("max_per_contract") is not None else None,
         max_per_order=Decimal(d["max_per_order"]) if d.get("max_per_order") is not None else None,
     )
@@ -235,6 +244,7 @@ async def get_subscribers_for_trader(
             copy_trader_bracket=bool(row.copy_trader_bracket),
             eod_autoclose_enabled=bool(row.eod_autoclose_enabled),
             eod_autoclose_minutes=int(row.eod_autoclose_minutes or 15),
+            advanced_settings_enabled=bool(row.advanced_settings_enabled),
         )
         for row in rows
     ]
