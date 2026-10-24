@@ -87,7 +87,7 @@ def test_the_trailing_stop_is_a_real_stop_for_every_contract(arm):
     g = _guard()
     out = arm(g)
     assert out["mode"] == "broker_stop"
-    assert g.stop_price == Decimal("1.30")            # 5% below 1.375, to the tick
+    assert g.stop_price == Decimal("1.35")            # gives back 5% of the 0.305 profit from 1.375
     assert g.stop_trail_pct == Decimal("5") and g.stop_peak == Decimal("1.375")
     # Nothing earmarked away from it: the stop reconciler sizes it to all held.
     assert discord_stop_orders.desired_quantity(Decimal(2), g) == Decimal(2)
@@ -110,19 +110,19 @@ def test_the_app_watched_slice_is_gone(arm):
 
 def test_the_poller_raises_it_as_the_price_climbs():
     g = _guard()
-    g.stop_price, g.stop_trail_pct, g.stop_peak = Decimal("1.30"), Decimal("5"), Decimal("1.375")
+    g.stop_price, g.stop_trail_pct, g.stop_peak = Decimal("1.35"), Decimal("5"), Decimal("1.375")
     g.stop_order_id = uuid.uuid4()                    # resting at the broker
     g.tp_stop_order_id = None
     assert discord_trailing_stop.decide(g, Decimal("1.50"), Decimal(2)) is None
-    assert g.stop_price == Decimal("1.42")            # 5% below the new high, to the tick
+    assert g.stop_price == Decimal("1.47")            # gives back 5% of the 0.43 profit from the new high
     assert g.stop_peak == Decimal("1.50")
 
 
 def test_a_pullback_never_lowers_it():
     g = _guard()
-    g.stop_price, g.stop_trail_pct, g.stop_peak = Decimal("1.42"), Decimal("5"), Decimal("1.50")
+    g.stop_price, g.stop_trail_pct, g.stop_peak = Decimal("1.47"), Decimal("5"), Decimal("1.50")
     discord_trailing_stop.decide(g, Decimal("1.45"), Decimal(2))
-    assert g.stop_price == Decimal("1.42")
+    assert g.stop_price == Decimal("1.47")
 
 
 def test_a_short_is_refused(arm):

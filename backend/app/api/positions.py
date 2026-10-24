@@ -2637,7 +2637,7 @@ def arm_trailing_stop(
     request: Request,
     background: BackgroundTasks,
     broker_account_id: uuid.UUID = Query(..., description="Broker account holding the position"),
-    trail_percent: Decimal = Query(..., gt=0, le=100, description="Trailing give-back % off the current market price."),
+    trail_percent: Decimal = Query(..., gt=0, le=100, description="Trailing give-back, as a % of the PROFIT: 30 keeps 70% of the best profit (cost 100, high 500 -> stop 380). Until the high is that % above cost, a fixed stop that % below cost."),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -2677,6 +2677,12 @@ def arm_trailing_stop(
 
     # Native trailing stop where the broker holds it (stocks on Alpaca). Trader-
     # only (skip_fanout) — arming a protective stop isn't a copy signal.
+    # The trail gives back a share of the PROFIT (the trader's rule,
+    # 2026-10-24) — see discord_position_guard.trail_level. A stock held by a
+    # broker's own trailing order can only trail a fixed % of the price, so
+    # that path keeps Alpaca's percent trail.
+    cost = getattr(pos, "avg_entry_price", None)
+    cost = Decimal(str(cost)) if cost is not None and Decimal(str(cost)) > 0 else None
     if trailing_stop_close.trailing_stop_supported(adapter, pos):
         payload = PlaceOrderIn(
             instrument_type=pos.instrument_type,
@@ -2724,21 +2730,27 @@ def arm_trailing_stop(
             sell_count=0,
         )
         db.add(guard)
-    stop = guards._to_tick(price * (Decimal(1) - trail_percent / Decimal(100)))
+    stop = guards._to_tick(guards.trail_level(trail_percent, price, guard.entry_price or cost))
     if stop is None or stop <= 0:
-        raise HTTPException(422, "That trail rounds to a $0 stop.")
+        raise HTTPException(422, "That trail is more than the price — the stop would be at $0.")
 
     from app.api.discord_sources import _cancel_stop_order  # noqa: PLC0415
     from app.services import discord_take_profit  # noqa: PLC0415
 
     if guard.tp_order_id is not None or guard.tp_stop_order_id is not None:
         discord_take_profit.release(db, guard, _cancel_stop_order(db, user))
-    guard.tp_off = True
-    guards.clear_trail(guard)
-    guard.trail_percent = trail_percent
-    guard.stop_price = stop
-    guard.stop_trail_pct = trail_percent
-    guard.stop_peak = price
+    from app.services.position_events import because  # noqa: PLC0415
+
+    with because("armed by you on Positions (Trl.Stop) — "
+                 + guards.trail_explain(trail_percent, price, guard.entry_price or cost)):
+        guard.tp_off = True
+        guards.clear_trail(guard)
+        guard.trail_percent = trail_percent
+        guard.stop_price = stop
+        guard.stop_trail_pct = trail_percent
+        guard.stop_peak = price
+        if hasattr(db, "flush"):
+            db.flush()
     db.commit()
     log.info("positions: trailing stop on %s — %s%% below %s, stop %s, all %s held",
              pos.broker_symbol, trail_percent, price, stop, held)

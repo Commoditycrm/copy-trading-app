@@ -202,7 +202,8 @@ const TRIM_COLUMNS: { key: "profit_gate_pct" | "qty_pct" | "stop_pct"; label: st
   { key: "stop_pct", label: "Stop / trailing stop", min: "-100",
     hint: "Stop: where the stop sits after this stage, as a return from entry (-25% is 25% below, "
       + "0% is break-even, +10% locks in profit). Trail: follows the high after this stage and "
-      + "exits on a give-back of that %" },
+      + "gives back that % of the profit (30%: cost 1.00, high 5.00 → stop 3.80); until the price is up that %, "
+      + "a fixed stop that % below cost" },
 ];
 
 const MAX_TRIMS = 10;
@@ -260,7 +261,7 @@ function StopModeToggle({ trail, onChange, disabled, label }: {
           disabled={disabled}
           onClick={() => onChange(value)}
           title={value
-            ? "Trailing stop: follows the high and exits on a give-back of this %"
+            ? "Trailing stop: gives back this % of the profit from the high (fixed this % below cost until up this %)"
             : "Fixed stop: a return from entry"}
           className="px-2 text-[11px] focus-ring disabled:opacity-50"
           style={{
@@ -1875,7 +1876,7 @@ export default function DiscordPage() {
                           onChange={(e) => setFillStop(e.target.value)}
                           onKeyDown={(e) => { if (e.key === "Enter") saveSizing(ladderPatch()); }}
                           title={fillTrail
-                            ? "Trailing stop from the fill: 20 exits on a 20% give-back from the best price since the entry filled."
+                            ? "Trailing stop from the fill: 20 is a fixed stop 20% below your cost until the price is up 20%, then it gives back 20% of the profit."
                             : "Stop placed as soon as the entry fills, as a return from entry: -25 is 25% below. Leave empty for no stop until the first trim."}
                           className="w-full rounded-lg border py-1.5 text-[13px] bg-transparent focus-ring text-right"
                           style={{ borderColor: "var(--border-strong)", color: "var(--text)", paddingLeft: 8, paddingRight: 20 }}
@@ -2004,8 +2005,8 @@ export default function DiscordPage() {
                       its profit target; its stop applies to whatever is left after it.
                       A trim of 0% sells nothing: when its target is reached the stop moves and the
                       ladder goes on to the next trim.
-                      Stop is a level from entry; Trail follows the high and exits on a
-                      give-back of that %.
+                      Stop is a level from entry. Trail gives back that % of the profit from the high —
+                      30% on a cost of 1.00: fixed at 0.70 until 1.30, then 1.21 at a high of 1.30, 3.80 at 5.00.
                     </p>
                   </div>
                   </>

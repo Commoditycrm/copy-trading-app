@@ -41,7 +41,7 @@ class _Adapter:
 
 @pytest.fixture
 def world(monkeypatch):
-    """A user with a trailing stop at 1.30 (5% under 1.375) resting at the broker."""
+    """A user with a trailing stop at 1.35 (high 1.375 gives back 5% of the 0.305 profit over 1.07) resting at the broker."""
     db = SessionLocal()
     user = User(id=uuid.uuid4(), email=f"{uuid.uuid4().hex[:12]}@test.local",
                 password_hash="x", role=UserRole.SUBSCRIBER)
@@ -53,13 +53,13 @@ def world(monkeypatch):
     stop = Order(id=uuid.uuid4(), user_id=user.id, broker_account_id=acct.id,
                  instrument_type=InstrumentType.OPTION, symbol="SPY", option_strike=Decimal("773"),
                  option_right=OptionRight.PUT, option_expiry=EXP, side=OrderSide.SELL,
-                 order_type=OrderType.STOP, quantity=Decimal(2), stop_price=Decimal("1.30"),
+                 order_type=OrderType.STOP, quantity=Decimal(2), stop_price=Decimal("1.35"),
                  status=OrderStatus.SUBMITTED, is_closing=True, broker_order_id="B1")
     db.add(stop)
     db.flush()
     guard = DiscordPositionGuard(user_id=user.id, symbol="SPY", option_strike=Decimal("773"),
                                  option_right="put", option_expiry=EXP, sell_count=0,
-                                 entry_price=Decimal("1.07"), stop_price=Decimal("1.30"),
+                                 entry_price=Decimal("1.07"), stop_price=Decimal("1.35"),
                                  stop_trail_pct=Decimal("5"), stop_peak=Decimal("1.375"),
                                  stop_order_id=stop.id)
     db.add(guard)
@@ -95,18 +95,18 @@ def test_a_new_high_moves_the_resting_stop_in_place(world):
     world.price = Decimal("1.50")
     out = tr.ratchet_one(world.guard_id)
     g, o = _read(world)
-    assert g.stop_price == Decimal("1.42")                       # 5% under 1.50, to the tick
-    assert o.stop_price == Decimal("1.42")
-    assert [(b, s) for b, s, _ in world.adapter.replaced] == [("B1", Decimal("1.42"))]
+    assert g.stop_price == Decimal("1.47")                       # gives back 5% of the 0.43 profit from 1.50, to the tick
+    assert o.stop_price == Decimal("1.47")
+    assert [(b, s) for b, s, _ in world.adapter.replaced] == [("B1", Decimal("1.47"))]
     assert world.adapter.replaced[0][2] != str(world.stop_id), "the replacement needs its own client id"
-    assert "1.3 -> 1.42" in out and "(moved)" in out
+    assert "1.35 -> 1.47" in out and "(moved)" in out
 
 
 def test_no_new_high_does_nothing(world):
     world.price = Decimal("1.36")
     tr.ratchet_one(world.guard_id)
     g, o = _read(world)
-    assert g.stop_price == o.stop_price == Decimal("1.30")
+    assert g.stop_price == o.stop_price == Decimal("1.35")
     assert world.adapter.replaced == []
 
 
@@ -124,12 +124,12 @@ def test_modifies_are_spaced_but_the_level_still_rises(world):
     world.price = Decimal("1.60")                                # a second high, at once
     tr.ratchet_one(world.guard_id)
     g, o = _read(world)
-    assert g.stop_price == Decimal("1.52")
-    assert o.stop_price == Decimal("1.42") and len(world.adapter.replaced) == 1
+    assert g.stop_price == Decimal("1.57")
+    assert o.stop_price == Decimal("1.47") and len(world.adapter.replaced) == 1
     tr._last_modify.clear()                                      # the gap has passed
     tr.ratchet_one(world.guard_id)
     _, o = _read(world)
-    assert o.stop_price == Decimal("1.52") and len(world.adapter.replaced) == 2
+    assert o.stop_price == Decimal("1.57") and len(world.adapter.replaced) == 2
 
 
 def test_a_broker_without_in_place_replace_is_left_to_the_poller(world):
@@ -137,7 +137,7 @@ def test_a_broker_without_in_place_replace_is_left_to_the_poller(world):
     world.price = Decimal("1.50")
     tr.ratchet_one(world.guard_id)
     g, o = _read(world)
-    assert g.stop_price == Decimal("1.42") and o.stop_price == Decimal("1.30")
+    assert g.stop_price == Decimal("1.47") and o.stop_price == Decimal("1.35")
 
 
 def test_a_refused_modify_keeps_the_order_as_the_broker_has_it(world):
@@ -145,7 +145,7 @@ def test_a_refused_modify_keeps_the_order_as_the_broker_has_it(world):
     world.price = Decimal("1.50")
     tr.ratchet_one(world.guard_id)
     g, o = _read(world)
-    assert g.stop_price == Decimal("1.42") and o.stop_price == Decimal("1.30")
+    assert g.stop_price == Decimal("1.47") and o.stop_price == Decimal("1.35")
 
 
 def test_through_the_stop_with_nothing_resting_wakes_the_poller(world):
@@ -174,13 +174,13 @@ def test_a_user_the_poller_holds_is_skipped_this_second(world):
     try:
         tr.tick()
         g, _ = _read(world)
-        assert g.stop_price == Decimal("1.30"), "must not write while the poller holds the user"
+        assert g.stop_price == Decimal("1.35"), "must not write while the poller holds the user"
     finally:
         release.set()
         t.join()
     tr.tick()
     g, _ = _read(world)
-    assert g.stop_price == Decimal("1.42")
+    assert g.stop_price == Decimal("1.47")
 
 
 def test_the_poller_s_discord_pass_holds_the_same_lock():

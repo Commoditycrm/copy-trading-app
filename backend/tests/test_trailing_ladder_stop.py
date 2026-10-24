@@ -74,7 +74,7 @@ def test_a_trailing_trim_starts_its_stop_below_the_price_now():
     plan = guards.plan_exit(guard, D(2), D("3.00"), discord_ladder.trim_config(ts))
     guards.apply_stop(guard, plan)
     assert plan.sell_qty == D(1)
-    assert guard.stop_price == D("2.55")          # 15% under 3.00
+    assert guard.stop_price == D("2.85")          # gives back 15% of the 1.00 profit over the 2.00 cost
     assert guard.stop_trail_pct == D(15) and guard.stop_peak == D("3.00")
 
 
@@ -90,21 +90,21 @@ def test_a_fixed_trim_after_a_trailing_one_stops_trailing():
 # ── it follows the price up, never down ──────────────────────────────────────
 
 def test_the_stop_rises_with_a_new_high():
-    guard = _guard(stop_price=D("2.55"), stop_trail_pct=D(15), stop_peak=D("3.00"))
+    guard = _guard(stop_price=D("2.85"), stop_trail_pct=D(15), stop_peak=D("3.00"))
     assert guards.ratchet_stop(guard, D("3.50")) is True
-    assert guard.stop_peak == D("3.50") and guard.stop_price == D("2.97")
+    assert guard.stop_peak == D("3.50") and guard.stop_price == D("3.27")   # 3.50 - 15% of 1.50, to the tick
 
 
 def test_a_pullback_leaves_it_where_it_is():
-    guard = _guard(stop_price=D("2.97"), stop_trail_pct=D(15), stop_peak=D("3.50"))
+    guard = _guard(stop_price=D("3.27"), stop_trail_pct=D(15), stop_peak=D("3.50"))
     assert guards.ratchet_stop(guard, D("3.10")) is False
-    assert guard.stop_price == D("2.97") and guard.stop_peak == D("3.50")
+    assert guard.stop_price == D("3.27") and guard.stop_peak == D("3.50")
 
 
 def test_a_tiny_rise_does_not_churn_the_resting_order():
-    guard = _guard(stop_price=D("2.55"), stop_trail_pct=D(15), stop_peak=D("3.00"))
-    assert guards.ratchet_stop(guard, D("3.02")) is False     # 2.567 — under the 2% step
-    assert guard.stop_price == D("2.55") and guard.stop_peak == D("3.02")
+    guard = _guard(stop_price=D("2.85"), stop_trail_pct=D(15), stop_peak=D("3.00"))
+    assert guards.ratchet_stop(guard, D("3.02")) is False     # 2.867 — under the 2% step
+    assert guard.stop_price == D("2.85") and guard.stop_peak == D("3.02")
 
 
 def test_a_fixed_stop_never_moves():
@@ -113,11 +113,11 @@ def test_a_fixed_stop_never_moves():
 
 
 def test_the_poller_ratchets_before_judging_the_stop():
-    guard = _guard(stop_price=D("2.55"), stop_trail_pct=D(15), stop_peak=D("3.00"))
+    guard = _guard(stop_price=D("2.85"), stop_trail_pct=D(15), stop_peak=D("3.00"))
     assert discord_trailing_stop.decide(guard, D("4.00"), D(2)) is None
-    assert guard.stop_price == D("3.40")
+    assert guard.stop_price == D("3.70")
     kind, qty, level = discord_trailing_stop.decide(guard, D("3.30"), D(2))
-    assert kind == discord_trailing_stop.STOP and level == D("3.40")
+    assert kind == discord_trailing_stop.STOP and level == D("3.70")
 
 
 # ── On Fill ──────────────────────────────────────────────────────────────────
@@ -153,8 +153,9 @@ def test_a_take_profit_fill_starts_a_trailing_stop_from_its_fill_price():
     db = SimpleNamespace(get=lambda model, oid: tp if oid == tp.id else None)
     guard = _guard(tp_order_id=tp.id, tp_stop_order_id=None, tp_rung=1, tp_qty=D(1))
     discord_take_profit.settle(db, guard, ts, cancel=lambda oid: None)
-    # trim 1's -25 read as a 25% give-back from 2.40
-    assert guard.stop_price == D("1.80") and guard.stop_trail_pct == D(25) and guard.stop_peak == D("2.40")
+    # trim 1's -25 as a trail: 2.40 is under +25% (2.50), so still the fixed
+    # stop 25% below the 2.00 cost
+    assert guard.stop_price == D("1.50") and guard.stop_trail_pct == D(25) and guard.stop_peak == D("2.40")
 
 
 # ── the settings API ─────────────────────────────────────────────────────────

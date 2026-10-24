@@ -137,7 +137,7 @@ def test_stop_events_are_merged_in_time_order(db):
     rows = _timeline(db)
     assert [r["label"] for r in rows] == ["Entry", "Stop set", "T1", "Trailing stop raised"]
     assert rows[1]["detail"] == "@ 1.5"
-    assert rows[3]["detail"] == "1.5 → 1.8 · 15% below high 2.12"
+    assert rows[3]["detail"] == "1.5 → 1.8 · trailing 15% of the profit · high 2.12"
 
 
 def test_an_earlier_holding_s_events_stay_with_it(db):

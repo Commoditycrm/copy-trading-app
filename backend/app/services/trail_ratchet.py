@@ -141,7 +141,8 @@ def _ratchet(db, g) -> str | None:
     if price is None:
         return None
     before = Decimal(str(g.stop_price))
-    with because(f"trailing stop raised on a new high (live price {price})"):
+    peak_now = max(Decimal(str(g.stop_peak)), price) if g.stop_peak is not None else price
+    with because(f"new high {price} — " + guards.trail_explain(g.stop_trail_pct, peak_now, g.entry_price)):
         raised = guards.ratchet_stop(g, price)
         db.flush()
     outcome = f"{g.symbol} trailing stop {_px(before)} -> {_px(g.stop_price)}" if raised else None
