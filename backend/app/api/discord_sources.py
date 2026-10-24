@@ -1169,6 +1169,10 @@ def _settings_out(ts) -> DiscordSettingsOut:
     )
 
 
+class LastDayRiskySkip(Exception):
+    """A risky entry the Last Trading Day setting says not to take."""
+
+
 def _last_day_risky(ts, msg, signal: dict, sizing) -> dict:
     """Apply the last-trading-day rule in ``ts`` — the alert's channel's settings,
     its own or the account's — to a risky entry. Returns the signal to resolve
@@ -1179,6 +1183,8 @@ def _last_day_risky(ts, msg, signal: dict, sizing) -> dict:
       "half" — a quarter of a full entry (half of the usual half);
       "full" — the risky words are ignored: a full entry. Recorded on the alert
                too, so a later average treats the position as full-size.
+      "skip" — not taken at all (raises LastDayRiskySkip). Only a fresh ENTRY:
+               an average or an add sizes from the position, not the words.
     """
     if not signal.get("half_size"):
         return signal
@@ -1186,6 +1192,13 @@ def _last_day_risky(ts, msg, signal: dict, sizing) -> dict:
 
     mode = (getattr(ts, "discord_last_day_risky", None) or "normal") if ts is not None else "normal"
     if mode == "normal" or not market_hours.is_last_trading_day_of_week(market_hours.now_et().date()):
+        return signal
+    if mode == "skip":
+        if (signal.get("action") or "").upper() == "BUY" and not signal.get("double_up") \
+                and not signal.get("add_to_latest"):
+            raise LastDayRiskySkip(
+                "Not taken: a risky entry on the week's last trading day — your Last Trading Day "
+                "setting is \"Don't Take Risky Trades\".")
         return signal
     if mode == "half":
         sizing.risky_factor = Decimal("0.25")
@@ -2485,7 +2498,12 @@ def _execute_signal(
     # The week's last trading day: the alert's CHANNEL's choice (its own, or the
     # account's while it follows them) for an entry the author called risky /
     # light / a lotto (discord_last_day_risky).
-    signal = _last_day_risky(ts_for_sizing, msg, signal, sizing)
+    try:
+        signal = _last_day_risky(ts_for_sizing, msg, signal, sizing)
+    except LastDayRiskySkip as exc:
+        discord_execution.mark_failed(msg, str(exc))
+        log.info("discord: alert %s not placed — %s", msg.id, exc)
+        return
 
     try:
         resolved = discord_execution.resolve(db, user, signal, sizing)

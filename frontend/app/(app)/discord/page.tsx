@@ -102,7 +102,7 @@ type DiscordSettings = {
 
 /** The week's last trading day (usually Friday): "normal" — a risky alert is
  *  half size as on any day; "half" — half of that; "full" — risky words ignored. */
-type LastDayRisky = "normal" | "half" | "full";
+type LastDayRisky = "normal" | "half" | "full" | "skip";
 
 type LoginSession = {
   session_id: string;
@@ -1668,7 +1668,8 @@ export default function DiscordPage() {
                   </label>
                   <p className="text-[11px] mt-0.5 leading-snug" style={{ color: "var(--muted)" }}>
                     What an alert called risky, high risk, degen, a lotto, light or &ldquo;leave room to add&rdquo; buys on the
-                    week&rsquo;s last trading day (Thursday when Friday is a holiday). Other days it is half size.
+                    week&rsquo;s last trading day (Thursday when Friday is a holiday) &mdash; or that it isn&rsquo;t taken
+                    at all. Other days it is half size. Averages and adds aren&rsquo;t affected.
                     {scope ? " For this channel." : " For every channel that follows the account."}
                   </p>
                 </div>
@@ -1687,6 +1688,7 @@ export default function DiscordPage() {
                   <option value="normal">Do Nothing (half size, as usual)</option>
                   <option value="half">Half of Usual Risky Trade (a quarter)</option>
                   <option value="full">Ignore Risky Keywords, Do Full Trade</option>
+                  <option value="skip">Don&rsquo;t Take Risky Trades</option>
                 </select>
               </div>
 

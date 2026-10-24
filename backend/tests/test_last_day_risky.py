@@ -115,6 +115,37 @@ def test_an_ordinary_alert_is_untouched(monkeypatch):
     assert out["half_size"] is False and sizing.risky_factor == D("0.5")
 
 
+def test_dont_take_risky_trades_skips_a_risky_entry_on_the_last_day(monkeypatch):
+    with pytest.raises(ds.LastDayRiskySkip, match="Don't Take Risky Trades"):
+        _run(monkeypatch, "skip")
+
+
+def test_dont_take_risky_trades_leaves_other_days_alone(monkeypatch):
+    out, sizing, _ = _run(monkeypatch, "skip", friday=False)
+    assert out["half_size"] is True and sizing.risky_factor == D("0.5")
+
+
+def test_dont_take_risky_trades_leaves_an_ordinary_alert_alone(monkeypatch):
+    out, _sizing, _ = _run(monkeypatch, "skip", half=False)
+    assert out["half_size"] is False
+
+
+@pytest.mark.parametrize("extra", [{"double_up": True}, {"add_to_latest": True}])
+def test_dont_take_risky_trades_never_blocks_an_average_or_an_add(monkeypatch, extra):
+    """An average sizes from the position, not the words — it still goes."""
+    monkeypatch.setattr(market_hours, "now_et", lambda: datetime(2026, 10, 16, 10, 0))
+    sig = {"action": "BUY", "half_size": True, **extra}
+    out = ds._last_day_risky(SimpleNamespace(discord_last_day_risky="skip"),
+                             SimpleNamespace(parsed_signal=sig), sig, ex.Sizing(multiplier=4))
+    assert out is sig
+
+
+def test_dont_take_risky_trades_is_saved():
+    ts = TraderSettings(user_id=uuid.uuid4())
+    ds._apply_settings(ts, DiscordSettingsIn(last_day_risky="skip"), SimpleNamespace(id=uuid.uuid4()))
+    assert ts.discord_last_day_risky == "skip" and ds._settings_out(ts).last_day_risky == "skip"
+
+
 # ── the setting ─────────────────────────────────────────────────────────────
 
 def test_the_account_saves_it():
