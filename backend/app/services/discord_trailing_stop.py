@@ -149,7 +149,11 @@ def enforce(db: Session, user_id, adapter, close_position, positions=None) -> in
 
         from app.services.position_events import because  # noqa: PLC0415
 
-        with because(f"trailing stop follows a new high of {price}"):
+        _pk = getattr(guard, "stop_peak", None)
+        _peak = max(Decimal(str(_pk)), Decimal(str(price))) if _pk is not None else price
+        _why = (f"new high {price} — " + guards.trail_explain(guard.stop_trail_pct, _peak, guard.entry_price)
+                if getattr(guard, "stop_trail_pct", None) is not None else f"trailing stop follows a new high of {price}")
+        with because(_why):
             decision = decide(guard, price, held)
             if getattr(guard, "stop_trail_pct", None) is not None and hasattr(db, "flush"):
                 db.flush()                 # record a raise under this reason

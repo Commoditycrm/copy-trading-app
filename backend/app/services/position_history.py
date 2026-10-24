@@ -167,7 +167,10 @@ _EVENT_TONES = {"refused": "bad", "rate_limited": "bad", "retried": "warn", "wai
 
 
 def _event_detail(e: PositionEvent) -> str:
-    trail = f"{_s(e.trail_pct)}% below high {_s(e.peak)}" if e.trail_pct is not None and e.peak is not None else None
+    # A trail gives back a share of the PROFIT (2026-10-24); the Why says how
+    # this level was worked out.
+    trail = (f"trailing {_s(e.trail_pct)}% of the profit · high {_s(e.peak)}"
+             if e.trail_pct is not None and e.peak is not None else None)
     if e.kind == "stop_removed":
         return f"was {_s(e.old_price)}"
     if e.kind == "trailing_exit_armed":

@@ -365,7 +365,7 @@ function ProtectionRow({ colSpan, items, label, isOption, entryOrderId, brokerSy
         const { Icon, name, fg } = PROTECTION_STYLE[it.kind];
         const bits: string[] = [];
         if (it.note && it.note.startsWith("Trim")) bits.push(it.note.replace("Trim ", "T"));
-        if (it.kind === "trailing_stop" && it.trail_pct) bits.push(`${it.trail_pct}% from ${it.peak ?? "high"}`);
+        if (it.kind === "trailing_stop" && it.trail_pct) bits.push(`gives back ${it.trail_pct}% of the profit from ${it.peak ?? "the high"}`);
         else if (it.kind === "trailing_stop" && it.trail_amount) bits.push(`$${it.trail_amount} from ${it.peak ?? "high"}`);
         bits.push(it.quantity ? `${fmtNum(it.quantity, 0)} ${unit}${Number(it.quantity) === 1 ? "" : "s"}` : "all");
         bits.push(it.where === "app" ? "watched by Kopyya" : `at ${it.where}`);
@@ -453,7 +453,7 @@ function GroupLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** What the Trail box (Trl.Stop) starts at: 10% below the market. */
+/** What the Trail box (Trl.Stop) starts at: give back 10% of the profit. */
 const DEFAULT_TRAIL_PCT = "10";
 
 /** What Close % starts at on every position. */
@@ -514,10 +514,29 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
 
   const levelPrice = (pct: number) =>
     entryPrice != null ? Math.floor(entryPrice * (1 + pct / 100) * 100) / 100 : null;
-  // Where a trailing stop would start: that % under today's price.
+  // Where a trailing stop would start (2026-10-24): it gives back that % of
+  // the PROFIT. Until the price is that % above cost it is a fixed stop that %
+  // below cost; from there it keeps the rest of the profit (30%: cost 100, high
+  // 500 -> 380). With no known cost, that % below the price.
   const trailNum = parseFloat(trailPct);
-  const trailStart = marketPrice != null && trailNum > 0 && trailNum < 100
-    ? Math.floor(marketPrice * (1 - trailNum / 100) * 100) / 100 : null;
+  let trailStart: number | null = null;
+  let trailWhat = `${trailPct}% below the high`;
+  if (marketPrice != null && trailNum > 0 && trailNum < 100) {
+    const p = trailNum / 100;
+    let level: number;
+    if (entryPrice != null && entryPrice > 0) {
+      if (marketPrice >= entryPrice * (1 + p)) {
+        level = marketPrice - p * (marketPrice - entryPrice);
+        trailWhat = `keeps ${100 - trailNum}% of the profit over your ${entryPrice.toFixed(2)} cost`;
+      } else {
+        level = entryPrice * (1 - p);
+        trailWhat = `fixed ${trailNum}% below your ${entryPrice.toFixed(2)} cost until the price is up ${trailNum}%, then it keeps ${100 - trailNum}% of the profit`;
+      }
+    } else {
+      level = marketPrice * (1 - p);
+    }
+    trailStart = level > 0 ? Math.floor(level * 100) / 100 : null;
+  }
 
   async function setStop() {
     if (level == null) return;
@@ -678,9 +697,9 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               type="number" step="0.1" min="0.1" max="100"
               placeholder="%"
               title={trailStart != null
-                ? `Trailing stop starts at ${trailStart.toFixed(2)} (${trailPct}% below the market) and rises with new highs`
-                : "Trailing stop: % below the market price, rising with new highs"}
-              aria-label={`Trailing stop percent below market for ${label}`}
+                ? `Trailing stop starts at ${trailStart.toFixed(2)} (${trailWhat}) and rises with new highs`
+                : "Trailing stop: gives back this % of the profit from the high (a fixed stop this % below cost until up this %)"}
+              aria-label={`Trailing stop, percent of profit given back, for ${label}`}
               value={trailPct}
               onChange={e => setTrailPct(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && trailPct) void armTrail(); }}
@@ -692,7 +711,7 @@ function PositionStopRow({ columnIds, orderId, hasStop, ladderStop, entryPrice, 
               disabled={busy !== null || !trailPct}
               onClick={armTrail}
               title={trailStart != null
-                ? `Start a trailing stop at ${trailStart.toFixed(2)}, ${trailPct}% below the market`
+                ? `Start a trailing stop at ${trailStart.toFixed(2)}: ${trailWhat}`
                 : "Enter a trail % first"}
               className="btn-primary px-3 py-1 text-xs font-medium inline-flex items-center gap-1.5 disabled:opacity-40"
               style={{ borderRadius: 0, borderTopRightRadius: "var(--r-sm)", borderBottomRightRadius: "var(--r-sm)" }}

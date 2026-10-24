@@ -287,7 +287,7 @@ def plan_exit(
     stop_note = (
         "" if takes_everything or stop is None
         else f", stop {stop.quantize(Decimal('0.0001'))}"
-        + (f" trailing {trail_pct.normalize():f}%" if trail_pct is not None else "")
+        + (f" trailing — {trail_explain(trail_pct, peak, entry)}" if trail_pct is not None else "")
     )
     return TrimPlan(
         rung=rung, guard=guard, sell_qty=sell, exit_style=style,
@@ -370,17 +370,75 @@ def rung_stop(entry, rung_cfg: RungConfig, mark,
             return None, None, None
         return entry * (Decimal(1) + rung_cfg.stop_pct / Decimal(100)), None, None
     peak = mark if mark else (entry if anchor_to_entry else None)
-    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), peak)
+    return trailing_stop(abs(Decimal(str(rung_cfg.stop_pct))), peak, entry)
 
 
-def trailing_stop(pct: Decimal, peak) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
-    """A trailing stop ``pct`` % below ``peak``: (stop price, pct, peak)."""
+def trail_level(pct, peak, cost=None) -> Decimal | None:
+    """Where a ``pct`` % trailing stop sits under ``peak`` — a give-back of the
+    PROFIT (the trader's rule, 2026-10-24: "always 30% of the profits
+    trailing"):
+
+      * until the high is ``pct`` % above the cost basis, a FIXED stop ``pct``
+        % below cost — a trail on a few cents of profit would sell on noise;
+      * from there on, ``pct`` % of the profit (high − cost) is given back:
+        cost 100 with a 30% trail sits at 70 until 130, then 121 at a high of
+        130, 380 at 500, 485 at 650 — 70% of the best profit is always kept.
+
+    Without a cost basis it gives back ``pct`` % of the high itself. None when
+    the stop would be at or under $0."""
+    if peak is None or pct is None:
+        return None
+    peak, p = Decimal(str(peak)), abs(Decimal(str(pct))) / Decimal(100)
+    if peak <= 0 or p <= 0:
+        return None
+    cost = Decimal(str(cost)) if cost is not None else None
+    if cost is not None and cost > 0:
+        if peak >= cost * (Decimal(1) + p):
+            level = peak - p * (peak - cost)
+        else:
+            level = cost * (Decimal(1) - p)
+    else:
+        level = peak * (Decimal(1) - p)
+    return level if level > 0 else None
+
+
+def trail_explain(pct, peak, cost=None) -> str:
+    """The trail in words, for the position summary's Why: which phase it is
+    in and the numbers behind the level (see trail_level)."""
+    def f(v) -> str:
+        d = Decimal(str(v)).quantize(Decimal("0.0001")).normalize()
+        return format(d, "f")
+
+    if pct is None or peak is None:
+        return "trailing stop"
+    p = abs(Decimal(str(pct)))
+    keep = Decimal(100) - p
+    level = trail_level(pct, peak, cost)
+    lvl = f(level) if level is not None else "—"
+    if cost is None or Decimal(str(cost)) <= 0:
+        return f"{f(p)}% below the high {f(peak)} → stop {lvl}"
+    cost, peak = Decimal(str(cost)), Decimal(str(peak))
+    start = cost * (Decimal(1) + p / Decimal(100))
+    if peak < start:
+        return (f"fixed at {lvl}, {f(p)}% below the {f(cost)} cost, until the high reaches {f(start)} "
+                f"(+{f(p)}%); from there it keeps {f(keep)}% of the profit")
+    profit = peak - cost
+    return (f"keeps {f(keep)}% of the profit: high {f(peak)} − cost {f(cost)} = {f(profit)} profit, "
+            f"gives back {f(profit * p / Decimal(100))} → stop {lvl}")
+
+
+def trailing_stop(pct: Decimal, peak, cost=None) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+    """A ``pct`` % trailing stop under ``peak``, giving back that share of the
+    profit over ``cost``: (stop price, pct, peak). See trail_level."""
     if peak is None or pct <= 0:
         return None, None, None
     peak = Decimal(str(peak))
     if peak <= 0:
         return None, None, None
-    return peak * (Decimal(1) - pct / Decimal(100)), pct, peak
+    level = trail_level(pct, peak, cost)
+    if level is None:
+        return None, None, None
+    return level, pct, peak
 
 
 def apply_stop(guard: DiscordPositionGuard, plan: "TrimPlan") -> None:
@@ -414,7 +472,7 @@ def ratchet_stop(guard: DiscordPositionGuard, price) -> bool:
     peak = Decimal(str(peak)) if peak is not None else None
     if peak is None or price > peak:
         guard.stop_peak = peak = price
-    want = _to_tick(peak * (Decimal(1) - abs(Decimal(str(pct))) / Decimal(100)))
+    want = _to_tick(trail_level(pct, peak, getattr(guard, "entry_price", None)))
     current = Decimal(str(guard.stop_price))
     step = max(_RATCHET_MIN, current * _RATCHET_PCT / Decimal(100))
     if want is None or want <= 0 or want < current + step:
@@ -1051,5 +1109,5 @@ __all__ = [
     "MARKET", "NONE", "OPEN", "TRAIL", "RungConfig", "TrimConfig", "TrimPlan",
     "arm_trail", "armed", "clear_trail", "rung_stop", "trailing_stop", "apply_stop",
     "ratchet_stop", "clear_stop_trail", "find", "on_buy", "plan_exit",
-    "dormant", "reapply", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
+    "dormant", "reapply", "trail_explain", "trail_level", "retire", "retire_if_flat", "rollback_exit", "sync_entry_price", "restart_ladder",
 ]

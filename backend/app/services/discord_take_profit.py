@@ -192,8 +192,11 @@ def pass_stop_only_trims(db: Session, guard, held: Decimal, ts, mark: Decimal | 
         stop, trail_pct, peak = guards.rung_stop(entry, rung_cfg, mark)
         stop = guards._to_tick(stop)
         current = Decimal(str(guard.stop_price)) if guard.stop_price is not None else None
-        with because(f"Trim {rung} sells 0%: +{_n(gate)}% reached ({_px(mark)} ≥ {_px(target)}) — "
-                     "nothing to sell, the ladder moves on"):
+        why = (f"Trim {rung} sells 0%: +{_n(gate)}% reached ({_px(mark)} ≥ {_px(target)}) — "
+               "nothing to sell, the ladder moves on")
+        if trail_pct is not None:
+            why += "; stop trailing, " + guards.trail_explain(trail_pct, peak, entry)
+        with because(why):
             guard.sell_count = rung
             if stop is not None and stop > 0 and (current is None or stop > current):
                 guard.stop_price = stop
@@ -334,7 +337,10 @@ def settle(db: Session, guard, ts, cancel, *, in_session: bool = True,
         if stop is not None and stop > 0 and not flat:
             from app.services.position_events import because  # noqa: PLC0415
 
-            with because(f"Trim {rung} take-profit filled — the ladder's stop for what is left"):
+            why = f"Trim {rung} take-profit filled — the ladder's stop for what is left"
+            if trail_pct is not None:
+                why += ": trailing, " + guards.trail_explain(trail_pct, peak, guard.entry_price)
+            with because(why):
                 guard.stop_price = stop           # this trim's stop, on whatever is left
                 guard.stop_trail_pct, guard.stop_peak = trail_pct, peak
                 if hasattr(db, "flush"):

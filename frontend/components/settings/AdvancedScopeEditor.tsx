@@ -347,8 +347,8 @@ export function AdvancedScopeEditor({ scope, settings, effective, busy, onSave }
           takes a position of 4 down as 2, then 1, then 1. A trim only fires
           above its profit target; its stop applies to whatever is left after
           it. A trim of 0% sells nothing: at its target the stop moves and the
-          ladder goes on. Stop is a level from entry; Trail follows the high and exits on a
-          give-back of that %. Leave a box empty to inherit it.
+          ladder goes on. Stop is a level from entry; Trail gives back that % of the profit
+          from the high (fixed that % below cost until up that %). Leave a box empty to inherit it.
         </p>
       </div>
     </div>
