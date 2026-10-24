@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 
 _ACCEPTED = (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
 _KEY = "rejection_alerts.pending"
-# Every change INTO rejected, for services/rejected_trade_sms.py (flag-gated)
+# Every change INTO rejected, for services/rejected_trade_sms.py (SMS or
+# WhatsApp flag on)
 _SMS_KEY = "rejection_alerts.sms"
 _NEW = object()
 _installed = False
@@ -65,7 +66,7 @@ def _before_flush(session: Session, flush_context, instances) -> None:  # noqa: 
     from app.services import rejected_trade_sms  # noqa: PLC0415
 
     try:
-        sms_on = rejected_trade_sms.enabled()
+        sms_on = rejected_trade_sms.enabled() or rejected_trade_sms.whatsapp_enabled()
         for obj in list(session.dirty):
             if not isinstance(obj, Order):
                 continue

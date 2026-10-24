@@ -32,6 +32,8 @@ interface Rejection {
   broker_call_ms: number | null;
   // Rejected-trade text (null: none recorded — tracking off, or still retrying)
   sms: SmsInfo | null;
+  // Rejected-trade WhatsApp message, tracked separately from the text
+  whatsapp: SmsInfo | null;
 }
 
 interface SmsInfo {
@@ -106,6 +108,7 @@ const SMS_WHY: Record<string, string> = {
   superseded_by_later_attempt: "A later attempt at the same order went through",
   no_longer_rejected: "Order is no longer rejected",
   order_gone: "Order no longer exists",
+  whatsapp_not_opted_in: "User hasn't opted in to WhatsApp",
 };
 
 const OUTCOME_LABEL: Record<string, string> = {
@@ -116,14 +119,14 @@ const OUTCOME_LABEL: Record<string, string> = {
   internal: "Internal",
 };
 
-function smsLabel(r: Rejection, tracking: boolean): string {
-  if (r.sms) return SMS_LABEL[r.sms.status] ?? r.sms.status;
+// s: the order's text (r.sms) or WhatsApp message (r.whatsapp)
+function textLabel(s: SmsInfo | null, tracking: boolean): string {
+  if (s) return SMS_LABEL[s.status] ?? s.status;
   return tracking ? "—" : "off";
 }
 
-function smsTitle(r: Rejection, tracking: boolean): string {
-  const s = r.sms;
-  if (!s) return tracking ? "No text recorded for this order" : "Rejected-trade texts are turned off";
+function textTitle(s: SmsInfo | null, tracking: boolean, channel = "text"): string {
+  if (!s) return tracking ? `No ${channel} recorded for this order` : `Rejected-trade ${channel}s are turned off`;
   const parts = [OUTCOME_LABEL[s.outcome] ?? s.outcome];
   if (s.skip_reason) parts.push(SMS_WHY[s.skip_reason] ?? s.skip_reason);
   if (s.twilio_status) parts.push(`Twilio: ${s.twilio_status}`);
@@ -186,6 +189,7 @@ export default function AdminRejectedPage() {
   const [rows, setRows] = useState<Rejection[]>([]);
   const [truncated, setTruncated] = useState(false);
   const [smsTracking, setSmsTracking] = useState(false);
+  const [waTracking, setWaTracking] = useState(false);
   const [loading, setLoading] = useState(true);
   const [role, setRole] = useState<"all" | "trader" | "subscriber">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "rejected" | "retry_pending">("all");
@@ -216,12 +220,14 @@ export default function AdminRejectedPage() {
   async function load() {
     setLoading(true);
     try {
-      const res = await api<{ rejections: Rejection[]; truncated: boolean; sms_tracking_enabled?: boolean }>(
+      const res = await api<{ rejections: Rejection[]; truncated: boolean; sms_tracking_enabled?: boolean;
+                              whatsapp_tracking_enabled?: boolean }>(
         "/api/admin/rejected-orders?limit=300",
       );
       setRows(res.rejections);
       setTruncated(res.truncated);
       setSmsTracking(!!res.sms_tracking_enabled);
+      setWaTracking(!!res.whatsapp_tracking_enabled);
     } catch (e) {
       notify.fromError(e, "Could not load rejected orders");
     } finally {
@@ -403,6 +409,8 @@ export default function AdminRejectedPage() {
                 <SortableTh label="Status" colKey="status"     sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}
                     title={smsTracking ? "Rejected-trade text to the order's owner" : "Rejected-trade texts are turned off"}>Text</th>
+                <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}
+                    title={waTracking ? "Rejected-trade WhatsApp message to the order's owner" : "Rejected-trade WhatsApp messages are turned off"}>WhatsApp</th>
                 <th className="text-left px-4 py-3 font-semibold" style={{ color: "var(--text-2)" }}>Reason</th>
                 <SortableTh label="When"   colKey="created_at" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
               </tr>
@@ -410,7 +418,7 @@ export default function AdminRejectedPage() {
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={9} className="px-4 py-8 text-center" style={{ color: "var(--muted)" }}>
                     No rejected trades match this filter.
                   </td>
                 </tr>
@@ -446,8 +454,11 @@ export default function AdminRejectedPage() {
                     </td>
                     <td className="px-4 py-3" style={{ color: "var(--text-2)" }}>{r.broker ?? "—"}</td>
                     <td className="px-4 py-3"><Badge text={r.status} map={STATUS_COLORS} /></td>
-                    <td className="px-4 py-3" title={smsTitle(r, smsTracking)}>
-                      <Badge text={smsLabel(r, smsTracking)} map={SMS_COLORS} />
+                    <td className="px-4 py-3" title={textTitle(r.sms, smsTracking)}>
+                      <Badge text={textLabel(r.sms, smsTracking)} map={SMS_COLORS} />
+                    </td>
+                    <td className="px-4 py-3" title={textTitle(r.whatsapp, waTracking, "WhatsApp message")}>
+                      <Badge text={textLabel(r.whatsapp, waTracking)} map={SMS_COLORS} />
                     </td>
                     <td className="px-4 py-3" style={{ color: r.reject_reason ? "var(--bad)" : "var(--muted)", maxWidth: 360 }}>
                       <div className="truncate" style={{ maxWidth: 340 }}>{r.reject_reason ?? "—"}</div>
@@ -457,7 +468,7 @@ export default function AdminRejectedPage() {
 
                   {open && (
                     <tr style={{ borderBottom: border, background: "rgba(255,255,255,0.02)" }}>
-                      <td colSpan={8} className="px-4 pb-4 pt-1">
+                      <td colSpan={9} className="px-4 pb-4 pt-1">
                         <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
                           {/* Reconstructed payload */}
                           <div>
@@ -505,7 +516,7 @@ export default function AdminRejectedPage() {
                               <div className="text-xs space-y-1" style={{ color: "var(--text-2)" }}>
                                 {([
                                   ["Classified as", OUTCOME_LABEL[r.sms.outcome] ?? r.sms.outcome],
-                                  ["Status", smsLabel(r, smsTracking) + (r.sms.skip_reason ? ` — ${SMS_WHY[r.sms.skip_reason] ?? r.sms.skip_reason}` : "")],
+                                  ["Status", textLabel(r.sms, smsTracking) + (r.sms.skip_reason ? ` — ${SMS_WHY[r.sms.skip_reason] ?? r.sms.skip_reason}` : "")],
                                   ["Twilio", r.sms.twilio_status ? `${r.sms.twilio_status}${r.sms.twilio_error_code ? ` (error ${r.sms.twilio_error_code})` : ""}` : "—"],
                                   ["To", r.sms.phone_last4 ? `•••${r.sms.phone_last4}` : "—"],
                                   ["Attempts", String(r.sms.attempts)],
@@ -519,7 +530,7 @@ export default function AdminRejectedPage() {
                                 {r.sms.error && <div style={{ color: "var(--bad)" }}>{r.sms.error}</div>}
                               </div>
                             ) : (
-                              <div className="text-xs" style={{ color: "var(--muted)" }}>{smsTitle(r, smsTracking)}.</div>
+                              <div className="text-xs" style={{ color: "var(--muted)" }}>{textTitle(r.sms, smsTracking)}.</div>
                             )}
                           </div>
                         </div>

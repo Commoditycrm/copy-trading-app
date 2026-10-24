@@ -25,9 +25,15 @@ texted recently or a later attempt went through.
 
 All of this runs after the trade's own commit and swallows its errors: a
 failed or slow text never touches order processing.
+
+WhatsApp (REJECTED_TRADE_WHATSAPP_ENABLED) rides the same path: the same
+classification and wording go into a second row per order (its own category,
+dedup key and repeat window), sent as the approved template's variables.
+Either channel can be on without the other.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -48,6 +54,7 @@ from app.services.order_retry import OUTCOME_UNKNOWN_REASON
 log = logging.getLogger(__name__)
 
 CATEGORY = "trade_rejected"
+WA_CATEGORY = "trade_rejected_whatsapp"
 SEND_DELAY = timedelta(seconds=60)      # lets a fallback/retry attempt land first
 REPEAT_WINDOW = timedelta(minutes=15)   # same contract already texted → don't again
 TEXTED = ("broker_rejected", "failed", "needs_review")
@@ -67,6 +74,10 @@ _FAILED_PREFIXES = ("Broker credentials error:", "recovery_failed:")
 
 def enabled() -> bool:
     return bool(get_settings().rejected_trade_sms_enabled)
+
+
+def whatsapp_enabled() -> bool:
+    return bool(get_settings().rejected_trade_whatsapp_enabled)
 
 
 def classify(order: Order, previous: OrderStatus | None) -> str:
@@ -177,19 +188,29 @@ _VERB = {
 }
 
 
+def _stamp(at: datetime) -> str:
+    when = at.astimezone(_ET)
+    return f"{when:%b} {when.day} {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET"
+
+
+def _ref(order: Order) -> str:
+    return str(order.id).replace("-", "")[:8].upper()
+
+
+def _order_line(db: Session, order: Order) -> str:
+    """``Your BUY 2 TSLA 450C 10/23 order (LIMIT $5.1, Alpaca Paper)``"""
+    acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+    side = (order.side.value if order.side else "").upper()
+    return (f"{_whose(db, order)} {side} {_num(order.quantity or 0)} {contract_label(order)} order "
+            f"({_order_type(order)}, {broker_label(acct)})")
+
+
 def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
     label = get_settings().sms_environment_label.strip()
     brand = f"Kopyya {label}".strip()
-    acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
-    side = (order.side.value if order.side else "").upper()
-    qty = _num(order.quantity or 0)
-    when = at.astimezone(_ET)
-    stamp = f"{when:%b} {when.day} {when:%I}".replace(" 0", " ").rstrip() + f":{when:%M %p} ET"
-    ref = str(order.id).replace("-", "")[:8].upper()
     base = get_settings().frontend_base_url.rstrip("/")
-    lead = gsm_safe(f"{brand}: {_whose(db, order)} {side} {qty} {contract_label(order)} order "
-                    f"({_order_type(order)}, {broker_label(acct)})")
-    tail = f" {stamp}, Ref {ref}. View: {base}/trades"
+    lead = gsm_safe(f"{brand}: {_order_line(db, order)}")
+    tail = f" {_stamp(at)}, Ref {_ref(order)}. View: {base}/trades"
     verb = _VERB[outcome]
     if "{reason}" not in verb:
         return f"{lead} {verb}{tail}"
@@ -201,6 +222,25 @@ def message_for(db: Session, order: Order, outcome: str, at: datetime) -> str:
     if len(reason) > room:
         reason = reason[:room - 3].rstrip() + "..."
     return f"{lead} {verb.format(reason=reason)}".replace("....", "...") + tail
+
+
+# The approved template reads: "Kopyya trade alert: {{1}}. Status: {{2}}.
+# Time: {{3}}. Reference: {{4}}. View your trades at {{5}} for details."
+_WA_STATUS = {
+    "broker_rejected": "Rejected by the broker: {reason}",
+    "failed": "Could not be placed: {reason}",
+    "needs_review": "Not confirmed by the broker; it may have been placed. Check your broker before re-entering",
+    "blocked": "Not placed: {reason}",
+    "internal": "Not placed: {reason}",
+}
+
+
+def whatsapp_variables(db: Session, order: Order, outcome: str, at: datetime) -> dict[str, str]:
+    """The rejected-trade template's variables: {{1}} order, {{2}} status and
+    reason, {{3}} time, {{4}} reference, {{5}} link."""
+    status = _WA_STATUS[outcome].format(reason=clean_reason(order.reject_reason, outcome).rstrip("."))
+    base = get_settings().frontend_base_url.rstrip("/")
+    return {"1": _order_line(db, order), "2": status, "3": _stamp(at), "4": _ref(order), "5": f"{base}/trades"}
 
 
 # Two concatenated GSM-7 segments. One character outside GSM-7 (an emoji in a
@@ -240,21 +280,32 @@ def _insert_ignore(db: Session, values: dict) -> None:
 
 
 def queue(db: Session, order: Order, previous: OrderStatus | None, now: datetime | None = None) -> None:
-    """Record this rejection once. Texted outcomes wait SEND_DELAY in
-    'pending'; the rest are kept as 'skipped' so the admin view shows why."""
+    """Record this rejection once per enabled channel. Texted outcomes wait
+    SEND_DELAY in 'pending'; the rest are kept as 'skipped' so the admin view
+    shows why."""
     now = now or datetime.now(timezone.utc)
     outcome = classify(order, previous)
     at = order.closed_at or order.updated_at or now
     texted = outcome in TEXTED
-    _insert_ignore(db, {
-        "id": uuid.uuid4(), "user_id": order.user_id, "order_id": order.id,
-        "category": CATEGORY, "outcome": outcome, "dedup_key": f"{CATEGORY}:{order.id}",
-        "subject_key": subject_key(order), "body": message_for(db, order, outcome, at),
+    row = {
+        "user_id": order.user_id, "order_id": order.id, "outcome": outcome,
         "status": "pending" if texted else "skipped",
         "skip_reason": None if texted else f"not_texted_{outcome}",
         "attempts": 0, "next_attempt_at": now + SEND_DELAY if texted else None,
         "created_at": now, "updated_at": now,
-    })
+    }
+    if enabled():
+        _insert_ignore(db, {
+            **row, "id": uuid.uuid4(), "category": CATEGORY, "dedup_key": f"{CATEGORY}:{order.id}",
+            "subject_key": subject_key(order), "body": message_for(db, order, outcome, at),
+        })
+    if whatsapp_enabled():
+        # own subject key, so a WhatsApp message never counts as a recent text and vice versa
+        _insert_ignore(db, {
+            **row, "id": uuid.uuid4(), "category": WA_CATEGORY, "dedup_key": f"{WA_CATEGORY}:{order.id}",
+            "subject_key": f"wa|{subject_key(order)}"[:160],
+            "body": json.dumps(whatsapp_variables(db, order, outcome, at)),
+        })
 
 
 def queue_after_commit(items: list[tuple[uuid.UUID, OrderStatus | None]]) -> None:
@@ -312,4 +363,4 @@ def still_worth_sending(db: Session, row: SmsNotification, now: datetime) -> str
 
 
 __all__ = ["classify", "clean_reason", "contract_label", "enabled", "message_for",
-           "queue", "queue_after_commit", "still_worth_sending"]
+           "queue", "queue_after_commit", "still_worth_sending", "whatsapp_enabled", "whatsapp_variables"]

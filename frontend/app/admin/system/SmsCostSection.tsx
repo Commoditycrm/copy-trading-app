@@ -30,6 +30,13 @@ interface SmsCosts {
   };
   projection?: { estimate_usd: string | null; daily_average_usd?: string; basis: string };
   this_server?: { rejected_trade_texts: number; by_status: Record<string, number>; segments: number; cost: string | null };
+  whatsapp?: {
+    messages: number;
+    cost_usd: string;
+    last_month: { messages: number; cost_usd: string; month: string };
+    delivery: { sent: number; delivered: number; undelivered: number; failed: number };
+  };
+  whatsapp_this_server?: { rejected_trade_texts: number; cost: string | null };
   fetched_at?: string;
   cached_for_s?: number;
   last_error?: string;
@@ -112,6 +119,18 @@ export default function SmsCostSection() {
             <Stat label="Rejected-trade texts (this server)" value={String(c.this_server?.rejected_trade_texts ?? 0)}
                   sub={`${c.this_server?.segments ?? 0} segments · ${fmt(c.this_server?.cost)}`} />
           </div>
+
+          {c.whatsapp && (
+            <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))" }}>
+              <Stat label={`WhatsApp cost, ${t.month} (actual)`} value={fmt(c.whatsapp.cost_usd)}
+                    sub={`Meta template + Twilio fees · ${c.whatsapp.messages} messages`} />
+              <Stat label={`WhatsApp last month (${c.whatsapp.last_month.month || "—"})`} value={fmt(c.whatsapp.last_month.cost_usd)}
+                    sub={`${c.whatsapp.last_month.messages} messages`} />
+              <Stat label="WhatsApp delivered" value={`${c.whatsapp.delivery.delivered} / ${c.whatsapp.delivery.sent}`}
+                    sub={`${c.whatsapp.delivery.undelivered} undelivered · ${c.whatsapp.delivery.failed} failed`} />
+              <Stat label="Rejected-trade WhatsApp (this server)" value={String(c.whatsapp_this_server?.rejected_trade_texts ?? 0)} />
+            </div>
+          )}
 
           <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}>
             <div className={card} style={cardStyle}>

@@ -75,6 +75,12 @@ class User(Base, TimestampMixin):
     sms_on_broker_connection: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )
+    # WhatsApp rejected-trade alerts to the same phone, independent of SMS.
+    # whatsapp_opt_in_at records when the user consented (cleared on opt-out).
+    whatsapp_notifications_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    whatsapp_opt_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     broker_accounts = relationship(
         "BrokerAccount", back_populates="user", cascade="all, delete-orphan"

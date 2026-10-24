@@ -46,6 +46,10 @@ export interface User {
   sms_on_auto_actions: boolean;
   sms_on_trade_rejected: boolean;
   sms_on_broker_connection: boolean;
+  /** WhatsApp rejected-trade alerts to the same phone, independent of SMS. */
+  whatsapp_notifications_enabled: boolean;
+  /** When the user opted in to WhatsApp (null when off). */
+  whatsapp_opt_in_at: string | null;
 }
 
 export type FollowRequestStatus = "pending" | "approved" | "rejected";

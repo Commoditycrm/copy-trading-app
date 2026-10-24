@@ -8,7 +8,10 @@ Two sources, kept apart and labelled:
   This server      the texts this environment sent and tracked itself
                    (sms_notifications: rejected-trade texts, with the price
                    Twilio reported per message).
-The projection is an estimate — month to date plus the average of the last
+WhatsApp is reported apart from SMS: Twilio bills it under the
+channels-whatsapp (Meta template fees) and channels-messaging (Twilio's
+per-message fee) categories, and its messages are "whatsapp:"-addressed in the
+log. The projection is an estimate — month to date plus the average of the last
 seven billed days — and labelled as one. Twilio credentials never leave the
 backend; results are cached so reloading the page doesn't hit Twilio.
 """
@@ -73,6 +76,18 @@ def twilio_usage(today: date, get: Callable = _get) -> dict:
             "unit": (this.get("price_unit") or "usd").upper()}
 
 
+def whatsapp_usage(get: Callable = _get) -> dict:
+    """Billed WhatsApp usage, this month and last month."""
+    out = {}
+    for period in ("ThisMonth", "LastMonth"):
+        meta = (get(f"/Usage/Records/{period}.json", {"Category": "channels-whatsapp"}).get("usage_records") or [{}])[0]
+        fee = (get(f"/Usage/Records/{period}.json", {"Category": "channels-messaging"}).get("usage_records") or [{}])[0]
+        out[period] = {"messages": int(float(meta.get("count") or 0)),
+                       "cost": _dec(meta.get("price")) + _dec(fee.get("price")),
+                       "month": (meta.get("start_date") or fee.get("start_date") or "")[:7]}
+    return out
+
+
 # The message log also holds WhatsApp (and other channel) messages, addressed
 # "whatsapp:+1…"; they aren't SMS and Twilio bills them under other categories.
 _OTHER_CHANNELS = ("whatsapp:", "messenger:", "rcs:")
@@ -84,7 +99,7 @@ def _is_sms(m: dict) -> bool:
 
 def twilio_messages(today: date, get: Callable = _get) -> dict:
     """Outbound SMS this month: delivery status, errors, segments, price."""
-    status, errors = Counter(), Counter()
+    status, errors, wa_status = Counter(), Counter(), Counter()
     segments, cost, n, page, other = 0, Decimal(0), 0, 0, 0
     nxt: str | None = "/Messages.json"
     params: dict | None = {"DateSent>": today.replace(day=1).isoformat(), "PageSize": 1000}
@@ -96,6 +111,8 @@ def twilio_messages(today: date, get: Callable = _get) -> dict:
                 continue
             if not _is_sms(m):
                 other += 1
+                if str(m.get("to") or "").startswith("whatsapp:"):
+                    wa_status[m.get("status") or "unknown"] += 1
                 continue
             n += 1
             status[m.get("status") or "unknown"] += 1
@@ -106,16 +123,17 @@ def twilio_messages(today: date, get: Callable = _get) -> dict:
         nxt = data.get("next_page_uri")
         page += 1
     return {"sent": n, "status": dict(status), "errors": dict(errors.most_common(5)),
-            "segments": segments, "cost": cost, "truncated": bool(nxt), "other_channels": other}
+            "segments": segments, "cost": cost, "truncated": bool(nxt), "other_channels": other,
+            "whatsapp_status": dict(wa_status)}
 
 
-def tracked(db: Session, today: date) -> dict:
-    """Texts this server sent and tracked (rejected-trade texts)."""
+def tracked(db: Session, today: date, category: str = "trade_rejected") -> dict:
+    """Texts (or, by category, WhatsApp messages) this server sent and tracked."""
     start = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
     rows = db.execute(
         select(SmsNotification.status, func.count(), func.coalesce(func.sum(SmsNotification.num_segments), 0),
                func.coalesce(func.sum(SmsNotification.price), 0))
-        .where(SmsNotification.category == "trade_rejected", SmsNotification.created_at >= start)
+        .where(SmsNotification.category == category, SmsNotification.created_at >= start)
         .group_by(SmsNotification.status)
     ).all()
     by = {s: {"count": c, "segments": int(seg), "cost": _dec(p)} for s, c, seg, p in rows}
@@ -143,9 +161,12 @@ def build(db: Session, now: datetime, get: Callable = _get) -> dict[str, Any]:
     today = now.date()
     if not (s.twilio_account_sid and s.twilio_auth_token):
         return {"status": "unavailable", "reason": "Twilio isn't configured on this server.",
-                "this_server": _jsonable(tracked(db, today))}
+                "this_server": _jsonable(tracked(db, today)),
+                "whatsapp_this_server": _jsonable(tracked(db, today, "trade_rejected_whatsapp"))}
     usage = twilio_usage(today, get)
     msgs = twilio_messages(today, get)
+    wa = whatsapp_usage(get)
+    wa_st = msgs["whatsapp_status"]
     this, last = usage["this_month"], usage["last_month"]
     errors = msgs["errors"]
     return {
@@ -171,6 +192,14 @@ def build(db: Session, now: datetime, get: Callable = _get) -> dict[str, Any]:
         },
         "projection": projection(usage["days"], today),
         "this_server": _jsonable(tracked(db, today)),
+        "whatsapp": {
+            "messages": wa["ThisMonth"]["messages"], "cost_usd": _money(wa["ThisMonth"]["cost"]),
+            "last_month": {"messages": wa["LastMonth"]["messages"], "cost_usd": _money(wa["LastMonth"]["cost"]),
+                           "month": wa["LastMonth"]["month"]},
+            "delivery": {"sent": sum(wa_st.values()), "delivered": wa_st.get("delivered", 0) + wa_st.get("read", 0),
+                         "undelivered": wa_st.get("undelivered", 0), "failed": wa_st.get("failed", 0)},
+        },
+        "whatsapp_this_server": _jsonable(tracked(db, today, "trade_rejected_whatsapp")),
         "fetched_at": now.isoformat(),
     }
 

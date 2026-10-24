@@ -420,10 +420,10 @@ def create_app() -> FastAPI:
             daemon=True,
         ).start()
 
-        # Rejected-trade texts: sends what services/rejected_trade_sms queued
-        # and reads Twilio's delivery status back. Only with the flag on, so
-        # an environment without it runs exactly as before.
-        if get_settings().rejected_trade_sms_enabled:
+        # Rejected-trade texts / WhatsApp: sends what services/rejected_trade_sms
+        # queued and reads Twilio's delivery status back. Only with a flag on,
+        # so an environment without either runs exactly as before.
+        if get_settings().rejected_trade_sms_enabled or get_settings().rejected_trade_whatsapp_enabled:
             from app.services import sms_outbox
             threading.Thread(
                 target=sms_outbox.poll_loop,
