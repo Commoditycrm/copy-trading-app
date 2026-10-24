@@ -21,6 +21,7 @@ slow/failing send never blocks the request.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -115,7 +116,29 @@ def send_sms_detailed(to: str, body: str) -> SmsResult:
             "TWILIO_FROM_NUMBER); NOT sending. to=%s", to,
         )
         return SmsResult(ok=False, error="no sender configured")
+    return _post_message(data, to, "sms")
 
+
+def send_whatsapp_detailed(to: str, variables: dict[str, str]) -> SmsResult:
+    """One business-initiated WhatsApp message to ``to`` (E.164), sent as the
+    approved rejected-trade template with these variables. Same result and
+    never-raises contract as send_sms_detailed."""
+    s = get_settings()
+    if not (s.twilio_account_sid and s.twilio_auth_token):
+        log.warning("whatsapp: TWILIO creds not set; NOT sending. to=%s vars=%r", to, variables)
+        return SmsResult(ok=False, error="twilio not configured")
+    if not (s.twilio_whatsapp_from and s.twilio_whatsapp_rejected_template_sid):
+        log.error("whatsapp: sender or template not configured (TWILIO_WHATSAPP_FROM, "
+                  "TWILIO_WHATSAPP_REJECTED_TEMPLATE_SID); NOT sending. to=%s", to)
+        return SmsResult(ok=False, error="whatsapp not configured")
+    data = {"To": f"whatsapp:{to}", "From": s.twilio_whatsapp_from,
+            "ContentSid": s.twilio_whatsapp_rejected_template_sid,
+            "ContentVariables": json.dumps(variables)}
+    return _post_message(data, data["To"], "whatsapp")
+
+
+def _post_message(data: dict, to: str, kind: str) -> SmsResult:
+    s = get_settings()
     url = f"{_API_ROOT}/Accounts/{s.twilio_account_sid}/Messages.json"
     try:
         resp = httpx.post(
@@ -125,17 +148,17 @@ def send_sms_detailed(to: str, body: str) -> SmsResult:
             timeout=_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001
-        log.exception("sms: Twilio request failed for to=%s", to)
+        log.exception("%s: Twilio request failed for to=%s", kind, to)
         return SmsResult(ok=False, error=f"request failed ({type(exc).__name__})", transient=True)
 
     body_json = _json(resp)
     if resp.status_code // 100 == 2:
-        log.info("sms: sent to=%s status=%s", to, resp.status_code)
+        log.info("%s: sent to=%s status=%s", kind, to, resp.status_code)
         return SmsResult(ok=True, sid=body_json.get("sid"), status=body_json.get("status"),
                          num_segments=_int(body_json.get("num_segments")))
     log.error(
-        "sms: Twilio rejected to=%s status=%s body=%s",
-        to, resp.status_code, resp.text[:500],
+        "%s: Twilio rejected to=%s status=%s body=%s",
+        kind, to, resp.status_code, resp.text[:500],
     )
     return SmsResult(ok=False, error_code=_int(body_json.get("code")),
                      error=str(body_json.get("message") or f"HTTP {resp.status_code}")[:300],

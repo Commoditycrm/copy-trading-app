@@ -1,7 +1,8 @@
-"""Sends the queued texts in sms_notifications and reads back their delivery.
+"""Sends the queued texts (and WhatsApp messages) in sms_notifications and
+reads back their delivery.
 
 Runs in the worker (one daemon thread, started only when
-REJECTED_TRADE_SMS_ENABLED is on). Rows are claimed with SKIP LOCKED, so a
+REJECTED_TRADE_SMS_ENABLED or REJECTED_TRADE_WHATSAPP_ENABLED is on). Rows are claimed with SKIP LOCKED, so a
 row is never sent twice even if two loops overlapped. Nothing here touches
 orders: a Twilio outage only delays texts, it can't hold up trading.
 
@@ -11,6 +12,7 @@ checked again at send time, so turning texts off stops a queued one.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -49,14 +51,28 @@ def opt_in_problem(user: User | None, pref_attr: str = "sms_on_trade_rejected") 
     return None
 
 
+def whatsapp_opt_in_problem(user: User | None) -> str | None:
+    """WhatsApp needs its own recorded opt-in; the SMS switches don't count."""
+    if user is None:
+        return "no_user"
+    if not user.phone:
+        return "no_phone"
+    if not (user.whatsapp_notifications_enabled and user.whatsapp_opt_in_at):
+        return "whatsapp_not_opted_in"
+    return None
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def send_due(now: datetime | None = None, send=None) -> int:  # noqa: ANN001
+def send_due(now: datetime | None = None, send=None, send_whatsapp=None) -> int:  # noqa: ANN001
     """Send up to BATCH_SIZE due rows. Returns how many were attempted."""
+    from app.services import rejected_trade_sms  # noqa: PLC0415
+
     now = now or _now()
     send = send or sms.send_sms_detailed
+    send_whatsapp = send_whatsapp or sms.send_whatsapp_detailed
     attempted = 0
     with SessionLocal() as db:
         rows = list(db.execute(
@@ -70,11 +86,10 @@ def send_due(now: datetime | None = None, send=None) -> int:  # noqa: ANN001
         for row in rows:
             attempted += 1
             user = db.get(User, row.user_id)
-            problem = opt_in_problem(user)
+            whatsapp = row.category == rejected_trade_sms.WA_CATEGORY
+            problem = whatsapp_opt_in_problem(user) if whatsapp else opt_in_problem(user)
             row.updated_at = now
-            if problem is None and row.category == "trade_rejected":
-                from app.services import rejected_trade_sms  # noqa: PLC0415
-
+            if problem is None and row.category in (rejected_trade_sms.CATEGORY, rejected_trade_sms.WA_CATEGORY):
                 problem = rejected_trade_sms.still_worth_sending(db, row, now)
             if problem:
                 row.status, row.skip_reason = "skipped", problem
@@ -82,7 +97,7 @@ def send_due(now: datetime | None = None, send=None) -> int:  # noqa: ANN001
             row.attempts += 1
             row.phone_last4 = (user.phone or "")[-4:] or None
             try:
-                res = send(user.phone, row.body)
+                res = send_whatsapp(user.phone, json.loads(row.body)) if whatsapp else send(user.phone, row.body)
             except Exception as exc:  # noqa: BLE001 — send_sms_detailed never raises; belt and braces
                 res = sms.SmsResult(ok=False, error=f"{type(exc).__name__}", transient=True)
             if res.ok:

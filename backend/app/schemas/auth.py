@@ -1,5 +1,6 @@
 import re
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -127,6 +128,9 @@ class UpdateMeIn(BaseModel):
     sms_on_auto_actions: bool | None = None
     sms_on_trade_rejected: bool | None = None
     sms_on_broker_connection: bool | None = None
+    # WhatsApp rejected-trade alerts (independent of SMS). Turning it on
+    # records the consent time; it needs a phone.
+    whatsapp_notifications_enabled: bool | None = None
 
     @field_validator("display_name", "business_name", mode="before")
     @classmethod
@@ -212,6 +216,8 @@ class UserOut(BaseModel):
     sms_on_auto_actions: bool = True
     sms_on_trade_rejected: bool = True
     sms_on_broker_connection: bool = True
+    whatsapp_notifications_enabled: bool = False
+    whatsapp_opt_in_at: datetime | None = None
     is_active: bool
     email_verified: bool = True
     # Admin-controlled access to the Sell-All / Snapshot / Re-entry suite.

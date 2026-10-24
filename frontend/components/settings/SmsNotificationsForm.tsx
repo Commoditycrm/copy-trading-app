@@ -45,6 +45,7 @@ export function SmsNotificationsForm({ onUpdated }: { onUpdated?: (u: User) => v
   const [phone, setPhone] = useState("");
   const [sms, setSms] = useState(false);
   const [cats, setCats] = useState<SmsCats>(DEFAULT_CATS);
+  const [whatsapp, setWhatsapp] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -54,6 +55,7 @@ export function SmsNotificationsForm({ onUpdated }: { onUpdated?: (u: User) => v
         setPhone(u.phone ?? "");
         setSms(u.sms_notifications_enabled);
         setCats(pickCats(u));
+        setWhatsapp(u.whatsapp_notifications_enabled);
       })
       .catch(e => notify.fromError(e, "Could not load your SMS settings"))
       .finally(() => setLoading(false));
@@ -63,6 +65,7 @@ export function SmsNotificationsForm({ onUpdated }: { onUpdated?: (u: User) => v
     phone.trim() !== (user.phone ?? "")
     || sms !== user.sms_notifications_enabled
     || SMS_CATEGORIES.some(c => cats[c.key] !== user[c.key])
+    || whatsapp !== user.whatsapp_notifications_enabled
   );
 
   async function save() {
@@ -73,16 +76,19 @@ export function SmsNotificationsForm({ onUpdated }: { onUpdated?: (u: User) => v
       return;
     }
     if (sms && !p) { notify.warn("Add a phone number to receive SMS"); return; }
+    if (whatsapp && !p) { notify.warn("Add a phone number to receive WhatsApp messages"); return; }
     setSaving(true);
     try {
       const updated = await api<User>("/api/auth/me", {
         method: "PATCH",
-        body: JSON.stringify({ phone: p, sms_notifications_enabled: sms, ...cats }),
+        body: JSON.stringify({ phone: p, sms_notifications_enabled: sms, ...cats,
+                               whatsapp_notifications_enabled: whatsapp }),
       });
       setUser(updated);
       setPhone(updated.phone ?? "");
       setSms(updated.sms_notifications_enabled);
       setCats(pickCats(updated));
+      setWhatsapp(updated.whatsapp_notifications_enabled);
       onUpdated?.(updated);
       notify.success("SMS settings saved");
     } catch (e) {
@@ -192,6 +198,28 @@ export function SmsNotificationsForm({ onUpdated }: { onUpdated?: (u: User) => v
           Everything else — follow requests, filled orders — stays in the app only.
         </p>
       </div>
+
+      {/* WhatsApp is a separate opt-in (Meta requires its own consent); saving
+          with this checked records when the user agreed. Independent of SMS. */}
+      <label className="flex items-start gap-2 mt-4 pt-3 text-sm cursor-pointer select-none"
+             style={{ borderTop: "1px dashed var(--border)" }}>
+        <input
+          type="checkbox"
+          checked={whatsapp}
+          onChange={e => setWhatsapp(e.target.checked)}
+          className="mt-0.5 shrink-0"
+          aria-label="WhatsApp rejected-trade alerts"
+        />
+        <span>
+          Send me rejected-trade alerts on WhatsApp at the number above. I agree to receive these
+          WhatsApp messages from Kopyya and can turn them off here at any time.
+          {user.whatsapp_opt_in_at && whatsapp && (
+            <span className="block text-[11px] mt-0.5" style={{ color: "var(--muted)" }}>
+              Opted in {new Date(user.whatsapp_opt_in_at).toLocaleString()}.
+            </span>
+          )}
+        </span>
+      </label>
     </>
   );
 }

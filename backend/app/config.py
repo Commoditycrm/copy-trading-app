@@ -389,6 +389,13 @@ class Settings(BaseSettings):
     # Shown in the text's heading, e.g. "QA" → "Kopyya QA: Trade Rejected".
     # Blank in production.
     sms_environment_label: str = ""
+    # Rejected-trade WhatsApp messages: same pipeline as the texts above but
+    # independent of them. Business-initiated WhatsApp needs a Meta-approved
+    # utility template; this is its Content SID (HX…), with the variables built
+    # in services/rejected_trade_sms.whatsapp_variables. Sender: "whatsapp:+1…".
+    rejected_trade_whatsapp_enabled: bool = False
+    twilio_whatsapp_from: str = ""
+    twilio_whatsapp_rejected_template_sid: str = ""
 
     # ── QA automatic Alpaca PAPER trading (services/paper_autotrade.py) ──
     # Off in production by never being set. With it on, the listed broker

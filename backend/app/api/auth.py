@@ -375,6 +375,10 @@ def update_me(
         changed["business_name"] = payload.business_name
     if payload.phone is not None:
         # Already validated E.164 (or "") in UpdateMeIn. Empty clears it.
+        if (payload.phone or None) != user.phone and user.whatsapp_notifications_enabled:
+            # WhatsApp consent is for a number; a new number needs a new opt-in
+            user.whatsapp_notifications_enabled, user.whatsapp_opt_in_at = False, None
+            changed["whatsapp_notifications_enabled"] = False
         user.phone = payload.phone or None
         changed["phone"] = user.phone
     if payload.sms_notifications_enabled is not None:
@@ -387,6 +391,13 @@ def update_me(
         if value is not None:
             setattr(user, field, value)
             changed[field] = value
+    if payload.whatsapp_notifications_enabled is not None \
+            and payload.whatsapp_notifications_enabled != user.whatsapp_notifications_enabled:
+        if payload.whatsapp_notifications_enabled and not user.phone:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="whatsapp_needs_phone")
+        user.whatsapp_notifications_enabled = payload.whatsapp_notifications_enabled
+        user.whatsapp_opt_in_at = datetime.now(timezone.utc) if payload.whatsapp_notifications_enabled else None
+        changed["whatsapp_notifications_enabled"] = payload.whatsapp_notifications_enabled
 
     if not changed:
         return user
